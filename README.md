@@ -12,9 +12,9 @@ Although the bot works excellent, it's running on top of Telegram, a great platf
 
 At this point Nostr appears as a platform where a system like this can live without the possibility of being censored by a powerful entity. This document explains how we can create a censorship-resistant and non custodial lightning network peer-to-peer exchange without a single point of failure like a telegram bot.
 
-## Server
+## How it works?
 
-Mostro works with a simple server/client architecture on top of Nostr, the server will be the escrow that will allow buyer and seller operate reducing the risk for both parties.
+Mostro works with a p2p communication on top of Nostr, Mostro will be the escrow that will allow buyer and seller operate reducing the risk for both parties.
 
 Mostro will handle Bitcoin using a Lightning Network node, the node will create the hold invoices for sellers and pay the buyers lightning regular invoices.
 
@@ -42,13 +42,13 @@ Buyers and sellers will need Mostro's clients in order to buy/sell Bitcoin and a
 
 ## Removing the single point of failure
 
-For this idea to work we need to make it as easy as possible for anyone to be a server, we don't need dozens of servers but we do need the ones that are running to be reliable, that's why with this implementation we encourage to create your own Mostro and give more options to users.
+For this idea to work we need to make it as easy as possible for anyone to be a Mostro, we don't need dozens of Mostros but we do need the ones that are running to be reliable, that's why with this implementation we encourage to create your own Mostro and give more options to users.
 
-To handle a Mostro is not going to be that easy, a Mostro admin needs to have a lightning node up and running, it will need to have enough liquidity for users to operate lightning fast, the node MUST have uptime closer to 99.9%, all this requires resources that can be obtained by the fee that sellers pay on each successful order, this is a percentage that can vary between servers.
+To handle a Mostro is not going to be that easy, a Mostro admin needs to have a lightning node up and running, it will need to have enough liquidity for users to operate lightning fast, the node MUST have uptime closer to 99.9%, all this requires resources that can be obtained by the fee that sellers pay on each successful order, this is a percentage that can vary between Mostros.
 
-## Server reputation
+## Mostro's reputation
 
-Users will be able to rate servers and servers will compete to obtain more users in order to survive. Bad servers should be rejected by users and will lose incentives to keep existing.
+Users will be able to rate Mostros and Mostros will compete to obtain more users in order to survive. Bad Mostros should be rejected by users and will lose incentives to keep existing.
 
 ## Requirements:
 

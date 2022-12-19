@@ -66,6 +66,9 @@ $ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 
 Run it:
 
-```
+First you need to set an env var with the private key of your Mostro, then run it:
+
+```bash
+$ export NSEC_PRIVKEY="nsec1..."
 $ cargo run
 ```

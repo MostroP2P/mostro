@@ -1,22 +1,29 @@
-use nostr::util::nips::nip04::decrypt;
-use nostr::Event;
+use crate::types::{self, Order};
+use anyhow::Result;
+use log::info;
+use nostr::util::time::timestamp;
+use nostr::{EventBuilder, Kind};
 use nostr_sdk::nostr::Keys;
+use nostr_sdk::Client;
 
-use crate::types;
+pub async fn publish_order(client: &Client, keys: &Keys, order: &Order) -> Result<()> {
+    let order = Order::new(
+        order.kind,
+        types::Status::Pending,
+        order.amount,
+        order.fiat_code.to_owned(),
+        order.fiat_amount,
+        order.payment_method.to_owned(),
+        order.prime,
+        None,
+        Some(timestamp()),
+    );
+    let order = order.as_json().unwrap();
+    let event = EventBuilder::new(Kind::Custom(11000), &order, &[])
+        .to_event(keys)
+        .unwrap();
 
-pub fn handle_dm(keys: &Keys, event: &Event) {
-    if let Ok(msg) = decrypt(&keys.secret_key().unwrap(), &event.pubkey, &event.content) {
-        println!("New DM: {}", msg);
-        let message = types::Message::from_json(&msg);
-        if let Ok(msg) = message {
-            if msg.verify() {
-                println!(
-                    "User with pubkey {} sent this valid message: {:#?}",
-                    event.pubkey, msg,
-                );
-            }
-        }
-    } else {
-        log::error!("Impossible to decrypt direct message");
-    }
+    info!("Event published: {:#?}", event);
+
+    client.send_event(event).await
 }

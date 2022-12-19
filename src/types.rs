@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Orders can be only Buy or Sell
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 pub enum Kind {
     Buy,
     Sell,
@@ -27,7 +27,7 @@ pub enum Status {
 }
 
 /// Action is used to identify each message between Mostro and users
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Action {
     Order,
     PaymentRequest,
@@ -56,35 +56,34 @@ pub enum Content {
     PaymentRequest(String),
 }
 
+#[allow(dead_code)]
 impl Message {
     /// New message from json string
     pub fn from_json(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
     }
     /// Get message as json string
-    pub fn to_json(&self) -> Result<String> {
+    pub fn as_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&self)?)
     }
 
     /// Verify if is valid message
     pub fn verify(&self) -> bool {
         match &self.action {
-            Action::Order => {
-                if let Some(Content::Order(_)) = &self.content {
-                    true
-                } else {
-                    false
-                }
-            }
-            Action::PaymentRequest => {
-                if let Some(Content::PaymentRequest(_)) = &self.content {
-                    true
-                } else {
-                    false
-                }
-            }
+            Action::Order => matches!(&self.content, Some(Content::Order(_))),
+            Action::PaymentRequest => matches!(&self.content, Some(Content::PaymentRequest(_))),
             Action::FiatSent => true,
             Action::Release => true,
+        }
+    }
+
+    pub fn get_order(&self) -> Option<&Order> {
+        if self.action != Action::Order {
+            return None;
+        }
+        match &self.content {
+            Some(Content::Order(o)) => Some(o),
+            _ => None,
         }
     }
 }
@@ -99,18 +98,44 @@ pub struct Order {
     pub fiat_amount: u32,
     pub payment_method: String,
     pub prime: i8,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_request: Option<String>,
-    pub created_at: u64, // unix timestamp seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>, // unix timestamp seconds
 }
 
+#[allow(dead_code)]
 impl Order {
+    pub fn new(
+        kind: Kind,
+        status: Status,
+        amount: u32,
+        fiat_code: String,
+        fiat_amount: u32,
+        payment_method: String,
+        prime: i8,
+        payment_request: Option<String>,
+        created_at: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            status,
+            amount,
+            fiat_code,
+            fiat_amount,
+            payment_method,
+            prime,
+            payment_request,
+            created_at,
+        }
+    }
     /// New order from json string
     pub fn from_json(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
     }
 
     /// Get order as json string
-    pub fn to_json(&self) -> Result<String> {
+    pub fn as_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&self)?)
     }
 }

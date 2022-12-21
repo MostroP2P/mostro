@@ -86,6 +86,16 @@ impl Message {
             _ => None,
         }
     }
+
+    pub fn get_payment_request(&self) -> Option<String> {
+        if self.action != Action::PaymentRequest {
+            return None;
+        }
+        match &self.content {
+            Some(Content::PaymentRequest(pr)) => Some(pr.to_owned()),
+            _ => None,
+        }
+    }
 }
 
 /// Mostro Order

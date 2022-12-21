@@ -49,9 +49,19 @@ async fn main() -> anyhow::Result<()> {
                 if let Ok(m) = message {
                     let message = types::Message::from_json(&m);
                     if let Ok(msg) = message {
-                        if msg.verify() && msg.action == types::Action::Order {
-                            if let Some(order) = msg.get_order() {
-                                publish_order(&client, &my_keys, order).await?
+                        if msg.verify() {
+                            match msg.action {
+                                types::Action::Order => {
+                                    if let Some(order) = msg.get_order() {
+                                        publish_order(&client, &my_keys, order).await?
+                                    }
+                                }
+                                types::Action::PaymentRequest => {
+                                    // If a buyer sent me an lightning invoice we create assign the buyer pubkey to that order
+                                    if let Some(payment_request) = msg.get_payment_request() {}
+                                }
+                                types::Action::FiatSent => println!("FiatSent"),
+                                types::Action::Release => println!("Release"),
                             }
                         }
                     }

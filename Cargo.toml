@@ -8,6 +8,7 @@ description = "Lightning Network peer-to-peer nostr platform"
 
 [dependencies]
 anyhow = "1.0.66"
+env = "0.0.0"
 log = "0.4.17"
 nostr = "0.5.1"
 nostr-sdk = "0.5.1"

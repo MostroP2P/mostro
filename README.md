@@ -55,7 +55,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 0. You need Rust version 1.64 or higher to compile.
 1. You will need a lightning network node
 
-## Compile and execute it:
+## Install dependencies:
 
 To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/tools/install), then run the following commands:
 
@@ -64,11 +64,41 @@ $ sudo apt update
 $ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 ```
 
-Run it:
+## Install
 
-First you need to set an env var with the private key of your Mostro, then run it:
+Clone the repository and then create a new `.env` file based on `.env-sample` file.
+
+```
+$ git clone https://github.com/MostroP2P/mostro.git
+$ cd mostro
+$ cp .env-sample .env
+```
+
+To connect with a lnd node we need to set 4 variables in the `.env` file .
+
+_LND_CERT_FILE:_ LND node TLS certificate file path.
+
+_LND_MACAROON_FILE:_ Macaroon file path, the macaroon file contains permission for doing actions on the lnd node.
+
+_LND_GRPC_HOST:_ IP address or domain name from the LND node, example: `127.0.0.1`.
+
+_LND_GRPC_PORT:_ LND node port to connect, example: `10009`.
+
+### Database
+
+The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the env var `DATABASE_URL` on the `.env` file.
+
+Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
 ```bash
-$ export NSEC_PRIVKEY="nsec1..."
+$ cargo install sqlx-cli
+$ sqlx migrate run
+```
+
+Running it:
+
+Before run it you to set `NSEC_PRIVKEY` with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one, then run it:
+
+```bash
 $ cargo run
 ```

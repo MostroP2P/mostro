@@ -9,6 +9,12 @@ pub enum Kind {
     Sell,
 }
 
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// Each status that an order can have
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Status {
@@ -24,6 +30,12 @@ pub enum Status {
     Success,
     WaitingBuyerInvoice,
     WaitingPayment,
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 /// Action is used to identify each message between Mostro and users

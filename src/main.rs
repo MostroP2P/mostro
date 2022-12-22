@@ -7,11 +7,15 @@ use std::env;
 
 use crate::util::publish_order;
 
-mod types;
-mod util;
+pub mod db;
+pub mod types;
+pub mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    pretty_env_logger::init();
+    // Connect to database
+    let pool = crate::db::connect().await?;
     // From Bech32
     use nostr::key::FromBech32;
     // nostr private key
@@ -22,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let mut client = Client::new(&my_keys);
 
     // Add relays
-    // client.add_relay("wss://relay.grunch.dev", None)?;
-    client.add_relay("wss://relay.sovereign-stack.org", None)?;
+    client.add_relay("wss://relay.grunch.dev", None)?;
+    // client.add_relay("wss://relay.sovereign-stack.org", None)?;
     // client.add_relay("wss://relay.damus.io", None)?;
     // client.add_relay("wss://nostr.openchain.fr", None)?;
 
@@ -53,7 +57,8 @@ async fn main() -> anyhow::Result<()> {
                             match msg.action {
                                 types::Action::Order => {
                                     if let Some(order) = msg.get_order() {
-                                        publish_order(&client, &my_keys, order).await?
+                                        println!("recibí una orden {order:#?}");
+                                        publish_order(&pool, &client, &my_keys, order).await?
                                     }
                                 }
                                 types::Action::PaymentRequest => {
@@ -69,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    pool.close().await;
+
     Ok(())
 }
 

@@ -12,6 +12,11 @@ env = "0.0.0"
 log = "0.4.17"
 nostr = "0.5.1"
 nostr-sdk = "0.5.1"
+pretty_env_logger = "0.4.0"
 serde = { version = "1.0.149" }
 serde_json = "1.0.89"
+sqlx = { version = "0.6.2", features = [
+  "runtime-async-std-native-tls",
+  "sqlite",
+] }
 tokio = { version = "1.23.0", features = ["full"] }

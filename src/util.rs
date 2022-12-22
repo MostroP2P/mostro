@@ -5,8 +5,14 @@ use nostr::util::time::timestamp;
 use nostr::{EventBuilder, Kind};
 use nostr_sdk::nostr::Keys;
 use nostr_sdk::Client;
+use sqlx::SqlitePool;
 
-pub async fn publish_order(client: &Client, keys: &Keys, order: &Order) -> Result<()> {
+pub async fn publish_order(
+    pool: &SqlitePool,
+    client: &Client,
+    keys: &Keys,
+    order: &Order,
+) -> Result<()> {
     let order = Order::new(
         order.kind,
         types::Status::Pending,
@@ -18,12 +24,14 @@ pub async fn publish_order(client: &Client, keys: &Keys, order: &Order) -> Resul
         None,
         Some(timestamp()),
     );
-    let order = order.as_json().unwrap();
-    let event = EventBuilder::new(Kind::Custom(11000), &order, &[])
+    let order_string = order.as_json().unwrap();
+    let event = EventBuilder::new(Kind::Custom(11000), &order_string, &[])
         .to_event(keys)
         .unwrap();
 
     info!("Event published: {:#?}", event);
+    let order_id = crate::db::add_order(pool, &order).await?;
+    info!("New order saved Id: {order_id}");
 
     client.send_event(event).await
 }

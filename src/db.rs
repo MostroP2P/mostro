@@ -16,7 +16,7 @@ pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn add_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<i64> {
+pub async fn add_order(pool: &SqlitePool, order: &Order, event_id: &str) -> anyhow::Result<i64> {
     let mut conn = pool.acquire().await?;
     let kind = order.kind.to_string();
     let status = order.status.to_string();
@@ -24,6 +24,7 @@ pub async fn add_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<i64> 
         r#"
       INSERT INTO orders (
       kind,
+      event_id,
       buyer_pubkey,
       seller_pubkey,
       status,
@@ -32,9 +33,10 @@ pub async fn add_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<i64> 
       amount,
       fiat_code,
       fiat_amount
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
       "#,
         kind,
+        event_id,
         "buyer pubkey",
         "seller pubkey",
         status,

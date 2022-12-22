@@ -28,9 +28,10 @@ pub async fn publish_order(
     let event = EventBuilder::new(Kind::Custom(11000), &order_string, &[])
         .to_event(keys)
         .unwrap();
+    let event_id = event.id.to_string();
 
     info!("Event published: {:#?}", event);
-    let order_id = crate::db::add_order(pool, &order).await?;
+    let order_id = crate::db::add_order(pool, &order, &event_id).await?;
     info!("New order saved Id: {order_id}");
 
     client.send_event(event).await

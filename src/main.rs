@@ -57,12 +57,10 @@ async fn main() -> anyhow::Result<()> {
                             match msg.action {
                                 types::Action::Order => {
                                     if let Some(order) = msg.get_order() {
-                                        println!("recibí una orden {order:#?}");
                                         publish_order(&pool, &client, &my_keys, order).await?
                                     }
                                 }
                                 types::Action::PaymentRequest => {
-                                    // If a buyer sent me an lightning invoice we create assign the buyer pubkey to that order
                                     if let Some(payment_request) = msg.get_payment_request() {}
                                 }
                                 types::Action::FiatSent => println!("FiatSent"),

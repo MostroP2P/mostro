@@ -16,8 +16,20 @@ pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn add_order(pool: &SqlitePool, order: &Order, event_id: &str) -> anyhow::Result<i64> {
+pub async fn add_order(
+    pool: &SqlitePool,
+    order: &Order,
+    event_id: &str,
+    initiator_pubkey: &str,
+) -> anyhow::Result<i64> {
     let mut conn = pool.acquire().await?;
+    let mut buyer_pubkey = "";
+    let mut seller_pubkey = "";
+    if order.kind == crate::types::Kind::Buy {
+        buyer_pubkey = initiator_pubkey;
+    } else {
+        seller_pubkey = initiator_pubkey;
+    }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
     let id = sqlx::query!(
@@ -37,8 +49,8 @@ pub async fn add_order(pool: &SqlitePool, order: &Order, event_id: &str) -> anyh
       "#,
         kind,
         event_id,
-        "buyer pubkey",
-        "seller pubkey",
+        buyer_pubkey,
+        seller_pubkey,
         status,
         "description",
         order.payment_method,
@@ -51,4 +63,34 @@ pub async fn add_order(pool: &SqlitePool, order: &Order, event_id: &str) -> anyh
     .last_insert_rowid();
 
     Ok(id)
+}
+
+pub async fn edit_order(
+    pool: &SqlitePool,
+    status: &crate::types::Status,
+    event_id: &str,
+    buyer_pubkey: &str,
+    buyer_invoice: &str,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let status = status.to_string();
+    let rows_affected = sqlx::query!(
+        r#"
+    UPDATE orders
+    SET
+    buyer_pubkey = ?1,
+    status = ?2,
+    buyer_invoice = ?3
+    WHERE event_id = ?4
+    "#,
+        buyer_pubkey,
+        status,
+        buyer_invoice,
+        event_id
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
 }

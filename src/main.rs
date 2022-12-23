@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Add relays
     client.add_relay("wss://relay.grunch.dev", None)?;
-    // client.add_relay("wss://relay.sovereign-stack.org", None)?;
+    client.add_relay("wss://relay.sovereign-stack.org", None)?;
     // client.add_relay("wss://relay.damus.io", None)?;
     // client.add_relay("wss://nostr.openchain.fr", None)?;
 
@@ -57,11 +57,36 @@ async fn main() -> anyhow::Result<()> {
                             match msg.action {
                                 types::Action::Order => {
                                     if let Some(order) = msg.get_order() {
-                                        publish_order(&pool, &client, &my_keys, order).await?
+                                        publish_order(
+                                            &pool,
+                                            &client,
+                                            &my_keys,
+                                            order,
+                                            &event.pubkey.to_string(),
+                                        )
+                                        .await?
                                     }
                                 }
                                 types::Action::PaymentRequest => {
-                                    if let Some(payment_request) = msg.get_payment_request() {}
+                                    if let Some(payment_request) = msg.get_payment_request() {
+                                        let status = crate::types::Status::WaitingPayment;
+                                        let buyer_pubkey = event.pubkey.to_string();
+                                        let id = event.tags.iter().find(|t| {
+                                            matches!(t.kind(), Ok(nostr::event::tag::TagKind::E))
+                                        });
+                                        if id.is_none() {
+                                            continue;
+                                        }
+                                        let event_id = id.unwrap().content().unwrap();
+                                        crate::db::edit_order(
+                                            &pool,
+                                            &status,
+                                            event_id,
+                                            &buyer_pubkey,
+                                            &payment_request,
+                                        )
+                                        .await?;
+                                    }
                                 }
                                 types::Action::FiatSent => println!("FiatSent"),
                                 types::Action::Release => println!("Release"),

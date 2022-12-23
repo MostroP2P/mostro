@@ -12,6 +12,7 @@ pub async fn publish_order(
     client: &Client,
     keys: &Keys,
     order: &Order,
+    initiator_pubkey: &str,
 ) -> Result<()> {
     let order = Order::new(
         order.kind,
@@ -31,8 +32,12 @@ pub async fn publish_order(
     let event_id = event.id.to_string();
 
     info!("Event published: {:#?}", event);
-    let order_id = crate::db::add_order(pool, &order, &event_id).await?;
+    let order_id = crate::db::add_order(pool, &order, &event_id, initiator_pubkey).await?;
     info!("New order saved Id: {order_id}");
 
-    client.send_event(event).await
+    client
+        .send_event(event)
+        .await
+        .map(|_s| ())
+        .map_err(|err| err.into())
 }

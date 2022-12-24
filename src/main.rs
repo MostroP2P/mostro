@@ -27,13 +27,15 @@ async fn main() -> anyhow::Result<()> {
     let my_keys = Keys::from_bech32(&nsec1privkey)?;
 
     // Create new client
-    let mut client = Client::new(&my_keys);
+    let client = Client::new(&my_keys);
 
     // Add relays
-    // client.add_relay("wss://relay.grunch.dev", None)?;
-    client.add_relay("wss://relay.sovereign-stack.org", None)?;
-    // client.add_relay("wss://relay.damus.io", None)?;
-    // client.add_relay("wss://nostr.openchain.fr", None)?;
+    // client.add_relay("wss://relay.grunch.dev", None).await?;
+    client
+        .add_relay("wss://relay.sovereign-stack.org", None)
+        .await?;
+    // client.add_relay("wss://relay.damus.io", None).await?;
+    // client.add_relay("wss://nostr.openchain.fr", None).await?;
 
     // Connect to relays and keep connection alive
     client.connect().await?;

@@ -1,6 +1,7 @@
-# Mostro
+# Mostro 🧌
 
-This document explains how Mostro works.
+![Mostro-ascii](static/mostro.png)
+![Mostro-logo](static/logo.png)
 
 ## Overview
 

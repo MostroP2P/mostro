@@ -71,6 +71,8 @@ pub async fn edit_order(
     event_id: &str,
     buyer_pubkey: &str,
     buyer_invoice: &str,
+    preimage: &str,
+    hash: &str,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
@@ -80,12 +82,16 @@ pub async fn edit_order(
     SET
     buyer_pubkey = ?1,
     status = ?2,
-    buyer_invoice = ?3
-    WHERE event_id = ?4
+    buyer_invoice = ?3,
+    preimage = ?4,
+    hash = ?5
+    WHERE event_id = ?6
     "#,
         buyer_pubkey,
         status,
         buyer_invoice,
+        preimage,
+        hash,
         event_id
     )
     .execute(&mut conn)
@@ -93,4 +99,20 @@ pub async fn edit_order(
     .rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+pub async fn find_order(pool: &SqlitePool, event_id: &str) -> anyhow::Result<crate::models::Order> {
+    let order = sqlx::query_as!(
+        crate::models::Order,
+        r#"
+          SELECT *
+          FROM orders
+          WHERE event_id = ?1
+        "#,
+        event_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(order)
 }

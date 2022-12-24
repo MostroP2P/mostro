@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS orders (
   description varchar(1000) not null,
   payment_method varchar(500) not null,
   amount integer not null,
-  fiat_code varchar(5),
-  fiat_amount integer,
+  fiat_code varchar(5) not null,
+  fiat_amount integer not null,
   buyer_invoice text,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP not null
 );

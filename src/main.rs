@@ -1,3 +1,5 @@
+use nostr::hashes::hex::ToHex;
+use nostr::key::ToBech32;
 use nostr::util::nips::nip04::decrypt;
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
@@ -8,6 +10,8 @@ use std::env;
 use crate::util::publish_order;
 
 pub mod db;
+pub mod lightning;
+pub mod models;
 pub mod types;
 pub mod util;
 
@@ -26,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let mut client = Client::new(&my_keys);
 
     // Add relays
-    client.add_relay("wss://relay.grunch.dev", None)?;
+    // client.add_relay("wss://relay.grunch.dev", None)?;
     client.add_relay("wss://relay.sovereign-stack.org", None)?;
     // client.add_relay("wss://relay.damus.io", None)?;
     // client.add_relay("wss://nostr.openchain.fr", None)?;
@@ -62,15 +66,18 @@ async fn main() -> anyhow::Result<()> {
                                             &client,
                                             &my_keys,
                                             order,
-                                            &event.pubkey.to_string(),
+                                            &event.pubkey.to_bech32()?,
                                         )
                                         .await?
                                     }
                                 }
                                 types::Action::PaymentRequest => {
+                                    // If a buyer sent me a lightning invoice we look on db an order with
+                                    // that event id and save the buyer pubkey and invoice fields
                                     if let Some(payment_request) = msg.get_payment_request() {
+                                        // TODO: Verify if payment_request is a valid lightning invoice
                                         let status = crate::types::Status::WaitingPayment;
-                                        let buyer_pubkey = event.pubkey.to_string();
+                                        let buyer_pubkey = event.pubkey.to_bech32()?;
                                         let id = event.tags.iter().find(|t| {
                                             matches!(t.kind(), Ok(nostr::event::tag::TagKind::E))
                                         });
@@ -78,12 +85,36 @@ async fn main() -> anyhow::Result<()> {
                                             continue;
                                         }
                                         let event_id = id.unwrap().content().unwrap();
+                                        let db_order =
+                                            crate::db::find_order(&pool, event_id).await?;
+
+                                        // Now we generate the hold invoice the seller need pay
+                                        let (invoice_response, preimage, hash) =
+                                            crate::lightning::create_hold_invoice(
+                                                &db_order.description,
+                                                db_order.amount,
+                                            )
+                                            .await?;
                                         crate::db::edit_order(
                                             &pool,
                                             &status,
                                             event_id,
                                             &buyer_pubkey,
                                             &payment_request,
+                                            &preimage.to_hex(),
+                                            &hash.to_hex(),
+                                        )
+                                        .await?;
+                                        let seller_pubkey = db_order.seller_pubkey.unwrap();
+                                        let seller_keys = nostr::key::Keys::from_bech32_public_key(
+                                            &seller_pubkey,
+                                        )?;
+                                        // We send the hold invoice to the seller
+                                        crate::util::send_dm(
+                                            &client,
+                                            &my_keys,
+                                            &seller_keys,
+                                            invoice_response.payment_request,
                                         )
                                         .await?;
                                     }

@@ -41,3 +41,16 @@ pub async fn publish_order(
         .map(|_s| ())
         .map_err(|err| err.into())
 }
+
+pub async fn send_dm(
+    client: &Client,
+    sender_keys: &Keys,
+    receiver_keys: &Keys,
+    content: String,
+) -> Result<()> {
+    let event = EventBuilder::new_encrypted_direct_msg(sender_keys, receiver_keys, content)?
+        .to_event(&sender_keys)?;
+    client.send_event(event).await?;
+
+    Ok(())
+}

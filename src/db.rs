@@ -101,7 +101,10 @@ pub async fn edit_order(
     Ok(rows_affected > 0)
 }
 
-pub async fn find_order(pool: &SqlitePool, event_id: &str) -> anyhow::Result<crate::models::Order> {
+pub async fn find_order_by_event_id(
+    pool: &SqlitePool,
+    event_id: &str,
+) -> anyhow::Result<crate::models::Order> {
     let order = sqlx::query_as!(
         crate::models::Order,
         r#"
@@ -110,6 +113,25 @@ pub async fn find_order(pool: &SqlitePool, event_id: &str) -> anyhow::Result<cra
           WHERE event_id = ?1
         "#,
         event_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(order)
+}
+
+pub async fn find_order_by_hash(
+    pool: &SqlitePool,
+    hash: &str,
+) -> anyhow::Result<crate::models::Order> {
+    let order = sqlx::query_as!(
+        crate::models::Order,
+        r#"
+          SELECT *
+          FROM orders
+          WHERE hash = ?1
+        "#,
+        hash
     )
     .fetch_one(pool)
     .await?;

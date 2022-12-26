@@ -1,4 +1,7 @@
-#[derive(Debug)]
+use sqlx::FromRow;
+use sqlx_crud::SqlxCrud;
+
+#[derive(Debug, FromRow, SqlxCrud)]
 pub struct Order {
     pub id: i64,
     pub kind: String,

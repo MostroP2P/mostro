@@ -1,5 +1,11 @@
 use easy_hasher::easy_hasher::*;
+use log::info;
+use nostr::hashes::hex::{FromHex, ToHex};
+use nostr::key::FromBech32;
+use nostr_sdk::Client;
 use rand::RngCore;
+use sqlx::SqlitePool;
+use sqlx_crud::Crud;
 use std::env;
 use tonic_openssl_lnd::invoicesrpc::{AddHoldInvoiceRequest, AddHoldInvoiceResp};
 use tonic_openssl_lnd::{LndClient, LndClientError};
@@ -24,7 +30,7 @@ pub async fn create_hold_invoice(
     description: &str,
     amount: i64,
 ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), LndClientError> {
-    let mut client = connect().await.unwrap();
+    let mut client = connect().await.expect("failed to connect lightning node");
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
     let hash = raw_sha256(preimage.to_vec());
@@ -43,4 +49,98 @@ pub async fn create_hold_invoice(
         .into_inner();
 
     Ok((holdinvoice, preimage.to_vec(), hash.to_vec()))
+}
+
+pub async fn subscribe_invoice(
+    nostr_client: &Client,
+    pool: &SqlitePool,
+    hash: &str,
+) -> anyhow::Result<()> {
+    let mut client = connect().await.expect("failed to connect lightning node");
+    let hash = FromHex::from_hex(hash).expect("Wrong hash");
+    let mut invoice_stream = client
+        .invoices()
+        .subscribe_single_invoice(
+            tonic_openssl_lnd::invoicesrpc::SubscribeSingleInvoiceRequest { r_hash: hash },
+        )
+        .await
+        .expect("Failed to call subscribe_single_invoice")
+        .into_inner();
+
+    while let Some(invoice) = invoice_stream
+        .message()
+        .await
+        .expect("Failed to receive invoices")
+    {
+        if let Some(state) =
+            tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
+        {
+            let hash = invoice.r_hash.to_hex();
+            let mut order = crate::db::find_order_by_hash(&pool, &hash).await?;
+            let my_keys = crate::util::get_keys()?;
+            let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
+            let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey)?;
+            let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
+            let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+            // If this invoice was paid by the seller
+            if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Accepted {
+                info!(
+                    "Order Id: {} - Seller paid invoice with hash: {hash}",
+                    order.id
+                );
+                order.status = "Active".to_string();
+                order.update(&pool).await?;
+                // We send a confirmation message to seller
+                crate::util::send_dm(
+                    &nostr_client,
+                    &my_keys,
+                    &seller_keys,
+                    "We received your payment".to_string(),
+                )
+                .await?;
+                // We send a message to buyer saying seller paid
+                crate::util::send_dm(
+                    &nostr_client,
+                    &my_keys,
+                    &buyer_keys,
+                    "We received sats from seller, now you can send the fiat".to_string(),
+                )
+                .await?;
+            } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled {
+                // If this invoice was Settled we can do something with it
+                info!(
+                    "Order Id: {} - Seller released funds for invoice hash: {hash}",
+                    order.id
+                );
+                order.status = "SettledInvoice".to_string();
+                order.update(&pool).await?;
+                // We send a *funds released* message to seller
+                crate::util::send_dm(
+                    &nostr_client,
+                    &my_keys,
+                    &seller_keys,
+                    "Funds released!".to_string(),
+                )
+                .await?;
+                // We send a message to buyer saying seller released
+                crate::util::send_dm(
+                    &nostr_client,
+                    &my_keys,
+                    &buyer_keys,
+                    "Seller released funds, your sats are on the way".to_string(),
+                )
+                .await?;
+            } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled {
+                // If this invoice was Canceled
+                info!(
+                    "Order Id: {} - Invoice with hash: {hash} was canceled!",
+                    order.id
+                );
+                order.status = "Canceled".to_string();
+                order.update(&pool).await?;
+            }
+        }
+    }
+
+    Ok(())
 }

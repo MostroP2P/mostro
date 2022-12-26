@@ -1,13 +1,11 @@
+use crate::util::publish_order;
 use nostr::hashes::hex::ToHex;
+use nostr::key::FromBech32;
 use nostr::key::ToBech32;
 use nostr::util::nips::nip04::decrypt;
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
-use nostr_sdk::nostr::Keys;
 use nostr_sdk::{Client, RelayPoolNotifications};
-use std::env;
-
-use crate::util::publish_order;
 
 pub mod db;
 pub mod lightning;
@@ -20,11 +18,7 @@ async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     // Connect to database
     let pool = crate::db::connect().await?;
-    // From Bech32
-    use nostr::key::FromBech32;
-    // nostr private key
-    let nsec1privkey = env::var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
-    let my_keys = Keys::from_bech32(&nsec1privkey)?;
+    let my_keys = crate::util::get_keys()?;
 
     // Create new client
     let client = Client::new(&my_keys);
@@ -88,7 +82,8 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         let event_id = id.unwrap().content().unwrap();
                                         let db_order =
-                                            crate::db::find_order(&pool, event_id).await?;
+                                            crate::db::find_order_by_event_id(&pool, event_id)
+                                                .await?;
 
                                         // Now we generate the hold invoice the seller need pay
                                         let (invoice_response, preimage, hash) =
@@ -117,6 +112,12 @@ async fn main() -> anyhow::Result<()> {
                                             &my_keys,
                                             &seller_keys,
                                             invoice_response.payment_request,
+                                        )
+                                        .await?;
+                                        crate::lightning::subscribe_invoice(
+                                            &client,
+                                            &pool,
+                                            &hash.to_hex(),
                                         )
                                         .await?;
                                     }

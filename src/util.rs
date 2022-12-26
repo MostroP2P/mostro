@@ -55,3 +55,13 @@ pub async fn send_dm(
 
     Ok(())
 }
+
+pub fn get_keys() -> Result<nostr::Keys> {
+    use std::env;
+    // From Bech32
+    use nostr::key::FromBech32;
+    // nostr private key
+    let nsec1privkey = env::var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
+
+    Ok(Keys::from_bech32(&nsec1privkey)?)
+}

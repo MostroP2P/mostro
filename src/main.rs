@@ -1,4 +1,5 @@
 use crate::util::publish_order;
+use log::info;
 use nostr::hashes::hex::ToHex;
 use nostr::key::FromBech32;
 use nostr::key::ToBech32;
@@ -26,8 +27,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Add relays
     // client.add_relay("wss://relay.grunch.dev", None).await?;
+    client.add_relay("wss://nostr.fly.dev", None).await?;
     client
-        .add_relay("wss://relay.sovereign-stack.org", None)
+        .add_relay("wss://relay.cryptocculture.com", None)
         .await?;
     // client.add_relay("wss://relay.damus.io", None).await?;
     // client.add_relay("wss://nostr.openchain.fr", None).await?;
@@ -97,6 +99,11 @@ async fn main() -> anyhow::Result<()> {
                                             &hash.to_hex(),
                                         )
                                         .await?;
+                                        // We need to publish a new event with the new status
+                                        crate::util::update_order_event(
+                                            &pool, &client, &my_keys, status, &db_order,
+                                        )
+                                        .await?;
 
                                         let seller_pubkey =
                                             db_order.seller_pubkey.as_ref().unwrap();
@@ -139,9 +146,69 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 types::Action::FiatSent => {
-                                    let _event_id = crate::util::get_event_id_from_dm(&event)?;
+                                    // TODO: Add validations
+                                    // is the buyer pubkey?
+                                    let buyer_pubkey = event.pubkey.to_bech32()?;
+                                    let status = crate::types::Status::FiatSent;
+                                    let event_id = crate::util::get_event_id_from_dm(&event)?;
+
+                                    let db_order =
+                                        crate::db::find_order_by_event_id(&pool, &event_id).await?;
+                                    // We publish a new kind 11000 nostr event with the status updated
+                                    // and update on local database the status and new event id
+                                    crate::util::update_order_event(
+                                        &pool, &client, &my_keys, status, &db_order,
+                                    )
+                                    .await?;
+                                    let seller_pubkey = db_order.seller_pubkey.as_ref().unwrap();
+                                    let seller_keys =
+                                        nostr::key::Keys::from_bech32_public_key(seller_pubkey)?;
+                                    // We send a message to seller to release
+                                    let message = crate::messages::buyer_sentfiat(&buyer_pubkey);
+                                    crate::util::send_dm(&client, &my_keys, &seller_keys, message)
+                                        .await?;
+                                    // We send a message to buyer to wait
+                                    let message = crate::messages::you_sent_fiat(seller_pubkey);
+                                    let buyer_keys =
+                                        nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+                                    crate::util::send_dm(&client, &my_keys, &buyer_keys, message)
+                                        .await?;
                                 }
-                                types::Action::Release => println!("Release"),
+                                types::Action::Release => {
+                                    // TODO: Add validations
+                                    // is the seller pubkey?
+                                    let seller_pubkey = event.pubkey.to_bech32()?;
+                                    let status = crate::types::Status::SettledInvoice;
+                                    let event_id = crate::util::get_event_id_from_dm(&event)?;
+                                    let db_order =
+                                        crate::db::find_order_by_event_id(&pool, &event_id).await?;
+                                    if db_order.preimage.is_none() {
+                                        break;
+                                    }
+                                    let preimage = db_order.preimage.as_ref().unwrap();
+                                    crate::lightning::settle_hold_invoice(preimage).await?;
+                                    info!("Order Id: {} - Released sats", &db_order.id);
+                                    // We publish a new kind 11000 nostr event with the status updated
+                                    // and update on local database the status and new event id
+                                    crate::util::update_order_event(
+                                        &pool, &client, &my_keys, status, &db_order,
+                                    )
+                                    .await?;
+                                    let seller_keys =
+                                        nostr::key::Keys::from_bech32_public_key(&seller_pubkey)?;
+                                    // We send a message to seller
+                                    let buyer_pubkey = db_order.buyer_pubkey.as_ref().unwrap();
+                                    let message = crate::messages::sell_success(buyer_pubkey);
+                                    crate::util::send_dm(&client, &my_keys, &seller_keys, message)
+                                        .await?;
+
+                                    // We send a *funds released* message to buyer
+                                    let message = crate::messages::funds_released(&seller_pubkey);
+                                    let buyer_keys =
+                                        nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+                                    crate::util::send_dm(&client, &my_keys, &buyer_keys, message)
+                                        .await?;
+                                }
                             }
                         }
                     }

@@ -6,7 +6,9 @@ use nostr_sdk::Client;
 use rand::RngCore;
 use sqlx::SqlitePool;
 use std::env;
-use tonic_openssl_lnd::invoicesrpc::{AddHoldInvoiceRequest, AddHoldInvoiceResp};
+use tonic_openssl_lnd::invoicesrpc::{
+    AddHoldInvoiceRequest, AddHoldInvoiceResp, SettleInvoiceMsg, SettleInvoiceResp,
+};
 use tonic_openssl_lnd::{LndClient, LndClientError};
 
 pub async fn connect() -> Result<LndClient, LndClientError> {
@@ -156,4 +158,19 @@ pub async fn subscribe_invoice(
     }
 
     Ok(())
+}
+
+pub async fn settle_hold_invoice(preimage: &str) -> Result<SettleInvoiceResp, LndClientError> {
+    let preimage = FromHex::from_hex(preimage).expect("Wrong preimage");
+    let mut client = connect().await.expect("failed to connect lightning node");
+
+    let preimage = SettleInvoiceMsg { preimage };
+    let settle = client
+        .invoices()
+        .settle_invoice(preimage)
+        .await
+        .expect("Failed to add hold invoice")
+        .into_inner();
+
+    Ok(settle)
 }

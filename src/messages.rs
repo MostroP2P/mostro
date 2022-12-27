@@ -56,3 +56,7 @@ pub fn pending_payment_success(amount: i32, order_id: i64, preimage: &str) -> St
 pub fn order_canceled(order_id: i64) -> String {
     format!("Order Id: {order_id} was canceled")
 }
+
+pub fn you_sent_fiat(seller_pubkey: &str) -> String {
+    format!("🧌 I told  @{seller_pubkey} that you have sent fiat money once the seller confirms the money was received, the sats should be sent to you.")
+}

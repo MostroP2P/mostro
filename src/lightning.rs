@@ -76,7 +76,7 @@ pub async fn subscribe_invoice(
             tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
         {
             let hash = invoice.r_hash.to_hex();
-            let mut order = crate::db::find_order_by_hash(&pool, &hash).await?;
+            let mut order = crate::db::find_order_by_hash(pool, &hash).await?;
             let my_keys = crate::util::get_keys()?;
             let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
             let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey)?;
@@ -89,23 +89,13 @@ pub async fn subscribe_invoice(
                     order.id
                 );
                 order.status = "Active".to_string();
-                order.update(&pool).await?;
+                order.update(pool).await?;
                 // We send a confirmation message to seller
-                crate::util::send_dm(
-                    &nostr_client,
-                    &my_keys,
-                    &seller_keys,
-                    "We received your payment".to_string(),
-                )
-                .await?;
+                let message = crate::messages::buyer_took_order(&order, buyer_pubkey);
+                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
                 // We send a message to buyer saying seller paid
-                crate::util::send_dm(
-                    &nostr_client,
-                    &my_keys,
-                    &buyer_keys,
-                    "We received sats from seller, now you can send the fiat".to_string(),
-                )
-                .await?;
+                let message = crate::messages::get_in_touch_with_seller(&order, seller_pubkey);
+                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
             } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled {
                 // If this invoice was Settled we can do something with it
                 info!(
@@ -113,23 +103,13 @@ pub async fn subscribe_invoice(
                     order.id
                 );
                 order.status = "SettledInvoice".to_string();
-                order.update(&pool).await?;
+                order.update(pool).await?;
                 // We send a *funds released* message to seller
-                crate::util::send_dm(
-                    &nostr_client,
-                    &my_keys,
-                    &seller_keys,
-                    "Funds released!".to_string(),
-                )
-                .await?;
+                let message = crate::messages::sell_success(buyer_pubkey);
+                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
                 // We send a message to buyer saying seller released
-                crate::util::send_dm(
-                    &nostr_client,
-                    &my_keys,
-                    &buyer_keys,
-                    "Seller released funds, your sats are on the way".to_string(),
-                )
-                .await?;
+                let message = crate::messages::funds_released(seller_pubkey);
+                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
             } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled {
                 // If this invoice was Canceled
                 info!(
@@ -137,7 +117,16 @@ pub async fn subscribe_invoice(
                     order.id
                 );
                 order.status = "Canceled".to_string();
-                order.update(&pool).await?;
+                order.update(pool).await?;
+                // We send "order canceled" messages to both parties
+                let message = crate::messages::order_canceled(&order.event_id);
+                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message.clone()).await?;
+                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
+            } else {
+                info!(
+                    "Order Id: {} - Invoice with hash: {hash} subscribed!",
+                    order.id
+                );
             }
         }
     }

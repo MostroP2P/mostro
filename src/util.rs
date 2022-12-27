@@ -49,7 +49,7 @@ pub async fn send_dm(
     content: String,
 ) -> Result<()> {
     let event = EventBuilder::new_encrypted_direct_msg(sender_keys, receiver_keys, content)?
-        .to_event(&sender_keys)?;
+        .to_event(sender_keys)?;
     info!("Sending event: {event:#?}");
     client.send_event(event).await?;
 

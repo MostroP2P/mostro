@@ -9,6 +9,7 @@ use nostr_sdk::{Client, RelayPoolNotifications};
 
 pub mod db;
 pub mod lightning;
+pub mod messages;
 pub mod models;
 pub mod types;
 pub mod util;
@@ -102,18 +103,39 @@ async fn main() -> anyhow::Result<()> {
                                             &hash.to_hex(),
                                         )
                                         .await?;
-                                        let seller_pubkey = db_order.seller_pubkey.unwrap();
+
+                                        let seller_pubkey =
+                                            db_order.seller_pubkey.as_ref().unwrap();
                                         let seller_keys = nostr::key::Keys::from_bech32_public_key(
-                                            &seller_pubkey,
+                                            seller_pubkey,
                                         )?;
+                                        let message = crate::messages::payment_request(
+                                            &db_order,
+                                            &invoice_response.payment_request,
+                                        );
                                         // We send the hold invoice to the seller
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
                                             &seller_keys,
-                                            invoice_response.payment_request,
+                                            message,
                                         )
                                         .await?;
+                                        let message =
+                                            crate::messages::waiting_seller_to_pay_invoice(
+                                                &db_order.event_id,
+                                            );
+                                        let buyer_keys =
+                                            nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+                                        // We send a message to buyer to know that seller was requested to pay the invoice
+                                        crate::util::send_dm(
+                                            &client,
+                                            &my_keys,
+                                            &buyer_keys,
+                                            message,
+                                        )
+                                        .await?;
+                                        // We subscribe to the new hold invoice to know when change the state
                                         crate::lightning::subscribe_invoice(
                                             &client,
                                             &pool,

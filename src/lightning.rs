@@ -5,7 +5,6 @@ use nostr::key::FromBech32;
 use nostr_sdk::Client;
 use rand::RngCore;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use std::env;
 use tonic_openssl_lnd::invoicesrpc::{AddHoldInvoiceRequest, AddHoldInvoiceResp};
 use tonic_openssl_lnd::{LndClient, LndClientError};
@@ -76,7 +75,7 @@ pub async fn subscribe_invoice(
             tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
         {
             let hash = invoice.r_hash.to_hex();
-            let mut order = crate::db::find_order_by_hash(pool, &hash).await?;
+            let order = crate::db::find_order_by_hash(pool, &hash).await?;
             let my_keys = crate::util::get_keys()?;
             let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
             let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey)?;
@@ -88,8 +87,16 @@ pub async fn subscribe_invoice(
                     "Order Id: {} - Seller paid invoice with hash: {hash}",
                     order.id
                 );
-                order.status = "Active".to_string();
-                order.update(pool).await?;
+                // We publish a new kind 11000 nostr event with the status updated
+                // and update on local database the status and new event id
+                crate::util::update_order_event(
+                    pool,
+                    nostr_client,
+                    &my_keys,
+                    crate::types::Status::Active,
+                    &order,
+                )
+                .await?;
                 // We send a confirmation message to seller
                 let message = crate::messages::buyer_took_order(&order, buyer_pubkey);
                 crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
@@ -102,8 +109,17 @@ pub async fn subscribe_invoice(
                     "Order Id: {} - Seller released funds for invoice hash: {hash}",
                     order.id
                 );
-                order.status = "SettledInvoice".to_string();
-                order.update(pool).await?;
+
+                // We publish a new kind 11000 nostr event with the status updated
+                // and update on local database the status and new event id
+                crate::util::update_order_event(
+                    pool,
+                    nostr_client,
+                    &my_keys,
+                    crate::types::Status::SettledInvoice,
+                    &order,
+                )
+                .await?;
                 // We send a *funds released* message to seller
                 let message = crate::messages::sell_success(buyer_pubkey);
                 crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
@@ -116,10 +132,18 @@ pub async fn subscribe_invoice(
                     "Order Id: {} - Invoice with hash: {hash} was canceled!",
                     order.id
                 );
-                order.status = "Canceled".to_string();
-                order.update(pool).await?;
+                // We publish a new kind 11000 nostr event with the status updated
+                // and update on local database the status and new event id
+                crate::util::update_order_event(
+                    pool,
+                    nostr_client,
+                    &my_keys,
+                    crate::types::Status::Canceled,
+                    &order,
+                )
+                .await?;
                 // We send "order canceled" messages to both parties
-                let message = crate::messages::order_canceled(&order.event_id);
+                let message = crate::messages::order_canceled(order.id);
                 crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message.clone()).await?;
                 crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
             } else {

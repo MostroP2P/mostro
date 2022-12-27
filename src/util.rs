@@ -2,10 +2,12 @@ use crate::types::{self, Order};
 use anyhow::Result;
 use log::info;
 use nostr::util::time::timestamp;
-use nostr::{EventBuilder, Kind};
+use nostr::{Event, EventBuilder, Kind};
 use nostr_sdk::nostr::Keys;
 use nostr_sdk::Client;
 use sqlx::SqlitePool;
+use sqlx_crud::Crud;
+use std::str::FromStr;
 
 pub async fn publish_order(
     pool: &SqlitePool,
@@ -64,4 +66,61 @@ pub fn get_keys() -> Result<nostr::Keys> {
     let nsec1privkey = env::var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
 
     Ok(Keys::from_bech32(&nsec1privkey)?)
+}
+
+pub fn get_event_id_from_dm(event: &Event) -> Result<String> {
+    let id = event
+        .tags
+        .iter()
+        .find(|t| matches!(t.kind(), Ok(nostr::event::tag::TagKind::E)));
+
+    let id = id
+        .expect("This message is not related to another event")
+        .content()
+        .expect("No event related");
+
+    Ok(id.to_string())
+}
+
+pub async fn update_order_event(
+    pool: &SqlitePool,
+    client: &Client,
+    keys: &Keys,
+    status: types::Status,
+    order: &crate::models::Order,
+) -> Result<()> {
+    let kind = crate::types::Kind::from_str(&order.kind).unwrap();
+    let publish_order = Order::new(
+        kind,
+        status.clone(),
+        order.amount as u32,
+        order.fiat_code.to_owned(),
+        order.fiat_amount as u32,
+        order.payment_method.to_owned(),
+        0,
+        None,
+        Some(timestamp()),
+    );
+    let order_string = publish_order.as_json().unwrap();
+    let event = EventBuilder::new(Kind::Custom(11000), &order_string, &[])
+        .to_event(keys)
+        .unwrap();
+    let event_id = event.id.to_string();
+
+    info!(
+        "Order Id: {} updated Nostr Event to Id {}, new Status: {}",
+        order.id,
+        event_id,
+        status.to_string()
+    );
+    let mut order = crate::db::find_order_by_event_id(pool, &order.event_id).await?;
+    order.status = status.to_string();
+    order.event_id = event_id;
+    order.update(pool).await?;
+
+    client
+        .send_event(event)
+        .await
+        .map(|_s| ())
+        .map_err(|err| err.into())
 }

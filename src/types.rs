@@ -1,12 +1,25 @@
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 /// Orders can be only Buy or Sell
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Buy,
     Sell,
+}
+
+impl FromStr for Kind {
+    type Err = ();
+
+    fn from_str(kind: &str) -> std::result::Result<Kind, Self::Err> {
+        match kind {
+            "Buy" => std::result::Result::Ok(Kind::Buy),
+            "Sell" => std::result::Result::Ok(Kind::Sell),
+            _ => Err(()),
+        }
+    }
 }
 
 impl fmt::Display for Kind {
@@ -16,7 +29,7 @@ impl fmt::Display for Kind {
 }
 
 /// Each status that an order can have
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum Status {
     Active,
     Canceled,

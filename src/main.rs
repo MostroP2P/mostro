@@ -75,15 +75,9 @@ async fn main() -> anyhow::Result<()> {
                                         // TODO: Verify if payment_request is a valid lightning invoice
                                         let status = crate::types::Status::WaitingPayment;
                                         let buyer_pubkey = event.pubkey.to_bech32()?;
-                                        let id = event.tags.iter().find(|t| {
-                                            matches!(t.kind(), Ok(nostr::event::tag::TagKind::E))
-                                        });
-                                        if id.is_none() {
-                                            continue;
-                                        }
-                                        let event_id = id.unwrap().content().unwrap();
+                                        let event_id = crate::util::get_event_id_from_dm(&event)?;
                                         let db_order =
-                                            crate::db::find_order_by_event_id(&pool, event_id)
+                                            crate::db::find_order_by_event_id(&pool, &event_id)
                                                 .await?;
 
                                         // Now we generate the hold invoice the seller need pay
@@ -96,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
                                         crate::db::edit_order(
                                             &pool,
                                             &status,
-                                            event_id,
+                                            &event_id,
                                             &buyer_pubkey,
                                             &payment_request,
                                             &preimage.to_hex(),
@@ -123,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                                         .await?;
                                         let message =
                                             crate::messages::waiting_seller_to_pay_invoice(
-                                                &db_order.event_id,
+                                                db_order.id,
                                             );
                                         let buyer_keys =
                                             nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
@@ -144,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
                                         .await?;
                                     }
                                 }
-                                types::Action::FiatSent => println!("FiatSent"),
+                                types::Action::FiatSent => {
+                                    let _event_id = crate::util::get_event_id_from_dm(&event)?;
+                                }
                                 types::Action::Release => println!("Release"),
                             }
                         }

@@ -52,12 +52,10 @@ pub async fn create_hold_invoice(
     Ok((holdinvoice, preimage.to_vec(), hash.to_vec()))
 }
 
-pub async fn subscribe_invoice(
-    nostr_client: &Client,
-    pool: &SqlitePool,
-    hash: &str,
-) -> anyhow::Result<()> {
+pub async fn subscribe_invoice(hash: &str) {
     let mut client = connect().await.expect("failed to connect lightning node");
+    let nostr_client = crate::util::connect_nostr().await.unwrap();
+    let pool = crate::db::connect().await.unwrap();
     let hash = FromHex::from_hex(hash).expect("Wrong hash");
     let mut invoice_stream = client
         .invoices()
@@ -77,12 +75,12 @@ pub async fn subscribe_invoice(
             tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
         {
             let hash = invoice.r_hash.to_hex();
-            let order = crate::db::find_order_by_hash(pool, &hash).await?;
-            let my_keys = crate::util::get_keys()?;
+            let order = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+            let my_keys = crate::util::get_keys().unwrap();
             let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-            let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey)?;
+            let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey).unwrap();
             let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-            let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+            let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey).unwrap();
             // If this invoice was paid by the seller
             if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Accepted {
                 info!(
@@ -91,20 +89,25 @@ pub async fn subscribe_invoice(
                 );
                 // We publish a new kind 11000 nostr event with the status updated
                 // and update on local database the status and new event id
-                crate::util::update_order_event(
-                    pool,
-                    nostr_client,
-                    &my_keys,
-                    crate::types::Status::Active,
-                    &order,
-                )
-                .await?;
+                // crate::util::update_order_event(
+                //     &pool,
+                //     &nostr_client,
+                //     &my_keys,
+                //     crate::types::Status::Active,
+                //     &order,
+                // )
+                // .await
+                // .unwrap();
                 // We send a confirmation message to seller
                 let message = crate::messages::buyer_took_order(&order, buyer_pubkey);
-                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
+                crate::util::send_dm(&nostr_client, &my_keys, &seller_keys, message)
+                    .await
+                    .unwrap();
                 // We send a message to buyer saying seller paid
                 let message = crate::messages::get_in_touch_with_seller(&order, seller_pubkey);
-                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
+                crate::util::send_dm(&nostr_client, &my_keys, &buyer_keys, message)
+                    .await
+                    .unwrap();
             } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled {
                 // If this invoice was Settled we can do something with it
                 info!(
@@ -114,20 +117,25 @@ pub async fn subscribe_invoice(
 
                 // We publish a new kind 11000 nostr event with the status updated
                 // and update on local database the status and new event id
-                crate::util::update_order_event(
-                    pool,
-                    nostr_client,
-                    &my_keys,
-                    crate::types::Status::SettledInvoice,
-                    &order,
-                )
-                .await?;
+                // crate::util::update_order_event(
+                //     &pool,
+                //     &nostr_client,
+                //     &my_keys,
+                //     crate::types::Status::SettledInvoice,
+                //     &order,
+                // )
+                // .await
+                // .unwrap();
                 // We send a *funds released* message to seller
                 let message = crate::messages::sell_success(buyer_pubkey);
-                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message).await?;
+                crate::util::send_dm(&nostr_client, &my_keys, &seller_keys, message)
+                    .await
+                    .unwrap();
                 // We send a message to buyer saying seller released
                 let message = crate::messages::funds_released(seller_pubkey);
-                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
+                crate::util::send_dm(&nostr_client, &my_keys, &buyer_keys, message)
+                    .await
+                    .unwrap();
             } else if state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled {
                 // If this invoice was Canceled
                 info!(
@@ -136,18 +144,23 @@ pub async fn subscribe_invoice(
                 );
                 // We publish a new kind 11000 nostr event with the status updated
                 // and update on local database the status and new event id
-                crate::util::update_order_event(
-                    pool,
-                    nostr_client,
-                    &my_keys,
-                    crate::types::Status::Canceled,
-                    &order,
-                )
-                .await?;
+                // crate::util::update_order_event(
+                //     &pool,
+                //     &nostr_client,
+                //     &my_keys,
+                //     crate::types::Status::Canceled,
+                //     &order,
+                // )
+                // .await
+                // .unwrap();
                 // We send "order canceled" messages to both parties
                 let message = crate::messages::order_canceled(order.id);
-                crate::util::send_dm(nostr_client, &my_keys, &seller_keys, message.clone()).await?;
-                crate::util::send_dm(nostr_client, &my_keys, &buyer_keys, message).await?;
+                crate::util::send_dm(&nostr_client, &my_keys, &seller_keys, message.clone())
+                    .await
+                    .unwrap();
+                crate::util::send_dm(&nostr_client, &my_keys, &buyer_keys, message)
+                    .await
+                    .unwrap();
             } else {
                 info!(
                     "Order Id: {} - Invoice with hash: {hash} subscribed!",
@@ -156,8 +169,6 @@ pub async fn subscribe_invoice(
             }
         }
     }
-
-    Ok(())
 }
 
 pub async fn settle_hold_invoice(preimage: &str) -> Result<SettleInvoiceResp, LndClientError> {

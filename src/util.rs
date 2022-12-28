@@ -124,3 +124,24 @@ pub async fn update_order_event(
         .map(|_s| ())
         .map_err(|err| err.into())
 }
+
+pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
+    let my_keys = crate::util::get_keys()?;
+
+    // Create new client
+    let client = nostr_sdk::Client::new(&my_keys);
+
+    // Add relays
+    // client.add_relay("wss://relay.grunch.dev", None).await?;
+    client.add_relay("wss://nostr.fly.dev", None).await?;
+    client
+        .add_relay("wss://relay.cryptocculture.com", None)
+        .await?;
+    // client.add_relay("wss://relay.damus.io", None).await?;
+    // client.add_relay("wss://nostr.openchain.fr", None).await?;
+
+    // Connect to relays and keep connection alive
+    client.connect().await?;
+
+    Ok(client)
+}

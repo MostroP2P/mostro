@@ -20,6 +20,7 @@ pub async fn add_order(
     pool: &SqlitePool,
     order: &Order,
     event_id: &str,
+    event_kind: i64,
     initiator_pubkey: &str,
 ) -> anyhow::Result<i64> {
     let mut conn = pool.acquire().await?;
@@ -32,11 +33,13 @@ pub async fn add_order(
     }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
+
     let id = sqlx::query!(
         r#"
       INSERT INTO orders (
       kind,
       event_id,
+      event_kind,
       buyer_pubkey,
       seller_pubkey,
       status,
@@ -45,10 +48,11 @@ pub async fn add_order(
       amount,
       fiat_code,
       fiat_amount
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
       "#,
         kind,
         event_id,
+        event_kind,
         buyer_pubkey,
         seller_pubkey,
         status,
@@ -137,4 +141,26 @@ pub async fn find_order_by_hash(
     .await?;
 
     Ok(order)
+}
+
+pub async fn next_event_kind(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let order = sqlx::query!(
+        r#"
+          SELECT event_kind
+          FROM orders
+          ORDER BY event_kind DESC LIMIT 1
+        "#
+    )
+    .fetch_optional(pool)
+    .await?;
+    println!("order: {:?}", order);
+    if let Some(o) = order {
+        if let Some(kind) = o.event_kind {
+            Ok(kind + 1)
+        } else {
+            Ok(10000)
+        }
+    } else {
+        Ok(10000)
+    }
 }

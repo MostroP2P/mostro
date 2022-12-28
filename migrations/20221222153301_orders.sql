@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS orders (
   id integer primary key autoincrement not null,
   kind varchar(4) not null,
   event_id char(64) not null,
+  event_kind integer not null,
   hash char(64),
   preimage char(64),
   buyer_pubkey char(64),

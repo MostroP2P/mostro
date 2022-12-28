@@ -28,13 +28,15 @@ pub async fn publish_order(
         Some(timestamp()),
     );
     let order_string = order.as_json().unwrap();
-    let event = EventBuilder::new(Kind::Custom(11000), &order_string, &[])
+    let event_kind = crate::db::next_event_kind(pool).await?;
+    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[])
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();
 
     info!("Event published: {:#?}", event);
-    let order_id = crate::db::add_order(pool, &order, &event_id, initiator_pubkey).await?;
+    let order_id =
+        crate::db::add_order(pool, &order, &event_id, event_kind, initiator_pubkey).await?;
     info!("New order saved Id: {order_id}");
 
     client
@@ -102,7 +104,7 @@ pub async fn update_order_event(
         Some(timestamp()),
     );
     let order_string = publish_order.as_json().unwrap();
-    let event = EventBuilder::new(Kind::Custom(11000), &order_string, &[])
+    let event = EventBuilder::new(Kind::Custom(order.event_kind as u64), &order_string, &[])
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();

@@ -1,12 +1,12 @@
 use crate::util::publish_order;
 use log::info;
-use nostr::hashes::hex::{FromHex, ToHex};
+use nostr::hashes::hex::ToHex;
 use nostr::key::FromBech32;
 use nostr::key::ToBech32;
 use nostr::util::nips::nip04::decrypt;
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
-use nostr_sdk::{Client, RelayPoolNotifications};
+use nostr_sdk::RelayPoolNotifications;
 
 pub mod db;
 pub mod lightning;

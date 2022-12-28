@@ -2,9 +2,7 @@ use easy_hasher::easy_hasher::*;
 use log::info;
 use nostr::hashes::hex::{FromHex, ToHex};
 use nostr::key::FromBech32;
-use nostr_sdk::Client;
 use rand::RngCore;
-use sqlx::SqlitePool;
 use std::env;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, SettleInvoiceMsg, SettleInvoiceResp,

@@ -8,9 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  DATABASE_URL: sqlite://mostro.db
 
 jobs:
-  build:
+  tests:
 
     runs-on: ubuntu-latest
 

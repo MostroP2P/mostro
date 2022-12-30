@@ -7,15 +7,17 @@ use nostr::util::nips::nip04::decrypt;
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
 use nostr_sdk::RelayPoolNotifications;
+use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 
 pub mod db;
+pub mod flow;
 pub mod lightning;
 pub mod messages;
 pub mod models;
 pub mod types;
 pub mod util;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     // Connect to database
@@ -29,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .since(timestamp());
 
     client.subscribe(vec![subscription]).await?;
+    let mut ln_client = crate::lightning::LndConnector::new().await;
 
     loop {
         let mut notifications = client.notifications();
@@ -71,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
                                                     .await?;
 
                                             // Now we generate the hold invoice the seller need pay
-                                            let (invoice_response, preimage, hash) =
-                                                crate::lightning::create_hold_invoice(
+                                            let (invoice_response, preimage, hash) = ln_client
+                                                .create_hold_invoice(
                                                     &db_order.description,
                                                     db_order.amount,
                                                 )
@@ -127,10 +130,43 @@ async fn main() -> anyhow::Result<()> {
                                                 message,
                                             )
                                             .await?;
-                                            tokio::spawn(async move {
-                                                crate::lightning::subscribe_invoice(&hash.to_hex())
+                                            let mut ln_client_invoices =
+                                                crate::lightning::LndConnector::new().await;
+                                            let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+                                            let invoice_task = {
+                                                async move {
+                                                    ln_client_invoices
+                                                        .subscribe_invoice(hash, tx)
+                                                        .await;
+                                                }
+                                            };
+                                            tokio::spawn(invoice_task);
+                                            // Receiving msgs from the invoice subscrition.
+                                            while let Some(msg) = rx.recv().await {
+                                                let hash = msg.hash.to_hex();
+                                                // If this invoice was paid by the seller
+                                                if msg.state == InvoiceState::Accepted {
+                                                    crate::flow::hold_invoice_paid(
+                                                        &hash, &pool, &client,
+                                                    )
                                                     .await;
-                                            });
+                                                } else if msg.state == InvoiceState::Settled {
+                                                    // If this invoice was Settled we can do something with it
+                                                    crate::flow::hold_invoice_settlement(
+                                                        &hash, &pool, &client,
+                                                    )
+                                                    .await;
+                                                } else if msg.state == InvoiceState::Canceled {
+                                                    // If this invoice was Canceled
+                                                    crate::flow::hold_invoice_canceled(
+                                                        &hash, &pool, &client,
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    info!("Invoice with hash: {hash} subscribed!");
+                                                }
+                                            }
                                         }
                                     }
                                     types::Action::FiatSent => {
@@ -189,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
                                             break;
                                         }
                                         let preimage = db_order.preimage.as_ref().unwrap();
-                                        crate::lightning::settle_hold_invoice(preimage).await?;
+                                        ln_client.settle_hold_invoice(preimage).await?;
                                         info!("Order Id: {} - Released sats", &db_order.id);
                                         // We publish a new kind 11000 nostr event with the status updated
                                         // and update on local database the status and new event id

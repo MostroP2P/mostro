@@ -1,13 +1,21 @@
+use anyhow::Result;
 use easy_hasher::easy_hasher::*;
+use lightning_invoice::Invoice;
+use log::info;
 use nostr::hashes::hex::FromHex;
+use nostr::hashes::hex::ToHex;
 use nostr::key::FromBech32;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::str::FromStr;
 use tonic_openssl_lnd::invoicesrpc::{
-    AddHoldInvoiceRequest, AddHoldInvoiceResp, SettleInvoiceMsg, SettleInvoiceResp,
+    AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
+    SettleInvoiceMsg, SettleInvoiceResp,
 };
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
+use tonic_openssl_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use tonic_openssl_lnd::{LndClient, LndClientError};
 
 pub struct LndConnector {
@@ -108,15 +116,86 @@ impl LndConnector {
     ) -> Result<SettleInvoiceResp, LndClientError> {
         let preimage = FromHex::from_hex(preimage).expect("Wrong preimage");
 
-        let preimage = SettleInvoiceMsg { preimage };
+        let preimage_message = SettleInvoiceMsg { preimage };
         let settle = self
             .client
             .invoices()
-            .settle_invoice(preimage)
+            .settle_invoice(preimage_message)
             .await
-            .expect("Failed to add hold invoice")
+            .expect("Failed to settle hold invoice")
             .into_inner();
 
         Ok(settle)
     }
+
+    pub async fn cancel_hold_invoice(
+        &mut self,
+        hash: &str,
+    ) -> Result<CancelInvoiceResp, LndClientError> {
+        let payment_hash = FromHex::from_hex(hash).expect("Wrong payment hash");
+
+        let cancel_message = CancelInvoiceMsg { payment_hash };
+        let cancel = self
+            .client
+            .invoices()
+            .cancel_invoice(cancel_message)
+            .await
+            .expect("Failed to cancel hold invoice")
+            .into_inner();
+
+        Ok(cancel)
+    }
+
+    pub async fn send_payment(&mut self, payment_request: &str, amount: Option<&str>) {
+        let invoice = decode_invoice(payment_request).unwrap();
+        let payment_hash = invoice.payment_hash();
+        let payment_hash = payment_hash.to_vec();
+        let hash = payment_hash.to_hex();
+
+        let track_payment_req = TrackPaymentRequest {
+            payment_hash,
+            no_inflight_updates: true,
+        };
+        let track = self
+            .client
+            .router()
+            .track_payment_v2(track_payment_req)
+            .await;
+        // We only send the payment if it wasn't attempted before
+        if let Ok(_) = track {
+            println!("Aborting paying invoice with hash {} to buyer", hash);
+            return;
+        }
+
+        let request = SendPaymentRequest {
+            payment_request: payment_request.to_string(),
+            timeout_seconds: 60,
+            ..Default::default()
+        };
+
+        let mut stream = self
+            .client
+            .router()
+            .send_payment_v2(request)
+            .await
+            .expect("Failed sending payment")
+            .into_inner();
+
+        while let Some(payment) = stream.message().await.expect("Failed paying invoice") {
+            if let Some(status) = PaymentStatus::from_i32(payment.status) {
+                if status == PaymentStatus::Succeeded {
+                    info!("Invoice with hash: {hash} paid!");
+                    // TODO: send messages to parties
+                    // update order record
+                }
+            }
+        }
+    }
+}
+
+/// Decode a lightning invoice (bolt11)
+pub fn decode_invoice(payment_request: &str) -> Result<Invoice> {
+    let invoice = Invoice::from_str(payment_request)?;
+
+    Ok(invoice)
 }

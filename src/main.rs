@@ -237,8 +237,12 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         let preimage = db_order.preimage.as_ref().unwrap();
                                         ln_client.settle_hold_invoice(preimage).await?;
+                                        // We pay buyer's invoice
+                                        let payment_request =
+                                            db_order.buyer_invoice.as_ref().unwrap();
+                                        ln_client.send_payment(&payment_request, None).await;
                                         info!("Order Id: {} - Released sats", &db_order.id);
-                                        // We publish a new kind 11000 nostr event with the status updated
+                                        // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         crate::util::update_order_event(
                                             &pool, &client, &my_keys, status, &db_order,

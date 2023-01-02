@@ -1,4 +1,4 @@
-use crate::util::publish_order;
+use crate::util::{publish_order,print_orders_table};
 use log::info;
 use nostr::hashes::hex::ToHex;
 use nostr::key::FromBech32;
@@ -56,6 +56,29 @@ async fn main() -> anyhow::Result<()> {
                                                 &my_keys,
                                                 order,
                                                 &event.pubkey.to_bech32()?,
+                                            )
+                                            .await?
+                                        }
+                                    }                                
+                                    types::Action::ListOffers => {
+                                        if let Some(st) = msg.get_order_list_status(){
+                                            //Get pubkey of the client for dm
+                                            let client_pubkey = event.pubkey.to_bech32()?;
+                                            //Get orders from mostro database - selecting state - defaul is Pending
+                                            let orders_db = crate::db::find_orders_by_event_status(&pool,&st.to_string()).await?;                                
+
+                                            //Print table of orders
+                                            let message = print_orders_table(orders_db)?;  
+                                                                                    
+                                            let client_pubkey =
+                                                nostr::key::Keys::from_bech32_public_key(client_pubkey)?;
+
+                                            // We send a message with a list of pending orders
+                                            crate::util::send_dm(
+                                                &client,
+                                                &my_keys,
+                                                &client_pubkey,
+                                                message,
                                             )
                                             .await?
                                         }

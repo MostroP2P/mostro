@@ -164,3 +164,22 @@ pub async fn next_event_kind(pool: &SqlitePool) -> anyhow::Result<i64> {
         Ok(10000)
     }
 }
+
+pub async fn find_orders_by_event_status(
+    pool: &SqlitePool,
+    status: &String,
+) -> anyhow::Result<Vec<crate::models::Order>> {
+    let order = sqlx::query_as!(
+        crate::models::Order,
+        r#"
+          SELECT *
+          FROM orders
+          WHERE status = ?1
+        "#,
+        status
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
+}

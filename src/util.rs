@@ -8,6 +8,8 @@ use nostr_sdk::Client;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use comfy_table::*;
+use comfy_table::presets::UTF8_FULL;
 
 pub async fn publish_order(
     pool: &SqlitePool,
@@ -125,6 +127,46 @@ pub async fn update_order_event(
         .await
         .map(|_s| ())
         .map_err(|err| err.into())
+}
+
+pub fn print_orders_table(orderstable : Vec<crate::models::Order>) -> Result<String>{
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_width(80)
+        .set_header(vec![
+                    Cell::new("Buy/Sell").add_attribute(Attribute::Bold),
+                    Cell::new("Status").add_attribute(Attribute::Bold),
+                    Cell::new("Amount").add_attribute(Attribute::Bold),
+                    Cell::new("Fiat Code").add_attribute(Attribute::Bold),
+                    Cell::new("Fiat Amount").add_attribute(Attribute::Bold),
+                    Cell::new("Payment method").add_attribute(Attribute::Bold),                    
+                    Cell::new("Created").add_attribute(Attribute::Bold),
+        ]);
+     
+    //Table rows
+    let mut rows : Vec<Row> = Vec::new();
+
+    //Iterate to create table of orders
+    for singleorder in orderstable.into_iter(){
+        let r = Row::from(vec![
+            Cell::new(singleorder.kind.to_string()),
+            Cell::new(singleorder.status.to_string()),
+            Cell::new(singleorder.amount.to_string()),
+            Cell::new(singleorder.fiat_code.to_string()),
+            Cell::new(singleorder.fiat_amount.to_string()),
+            Cell::new(singleorder.payment_method.to_string()),
+            Cell::new(singleorder.created_at.to_string()),
+        ]);
+        rows.push(r);
+    }
+
+    table.add_rows(rows);
+
+    println!("{table}");
+
+    Ok(table.to_string())
 }
 
 pub async fn connect_nostr() -> Result<nostr_sdk::Client> {

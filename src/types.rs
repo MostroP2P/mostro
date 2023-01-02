@@ -58,6 +58,7 @@ pub enum Action {
     PaymentRequest,
     FiatSent,
     Release,
+    ListOffers,
 }
 
 impl fmt::Display for Action {
@@ -79,6 +80,7 @@ pub struct Message {
 pub enum Content {
     Order(Order),
     PaymentRequest(String),
+    OrderStatus(Status),
 }
 
 #[allow(dead_code)]
@@ -99,6 +101,7 @@ impl Message {
             Action::PaymentRequest => matches!(&self.content, Some(Content::PaymentRequest(_))),
             Action::FiatSent => true,
             Action::Release => true,
+            Action::ListOffers => true,
         }
     }
 
@@ -119,6 +122,16 @@ impl Message {
         match &self.content {
             Some(Content::PaymentRequest(pr)) => Some(pr.to_owned()),
             _ => None,
+        }
+    }
+
+    pub fn get_order_list_status(&self) -> Option<Status> {
+        if self.action != Action::ListOffers {
+            return None;
+        }
+        match &self.content {
+            Some(Content::OrderStatus(ord)) => Some(ord.to_owned()),
+            _ => Some(Status::Pending),
         }
     }
 }

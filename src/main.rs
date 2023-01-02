@@ -142,31 +142,42 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                             };
                                             tokio::spawn(invoice_task);
-                                            // Receiving msgs from the invoice subscrition.
-                                            while let Some(msg) = rx.recv().await {
-                                                let hash = msg.hash.to_hex();
-                                                // If this invoice was paid by the seller
-                                                if msg.state == InvoiceState::Accepted {
-                                                    crate::flow::hold_invoice_paid(
-                                                        &hash, &pool, &client,
-                                                    )
-                                                    .await;
-                                                } else if msg.state == InvoiceState::Settled {
-                                                    // If this invoice was Settled we can do something with it
-                                                    crate::flow::hold_invoice_settlement(
-                                                        &hash, &pool, &client,
-                                                    )
-                                                    .await;
-                                                } else if msg.state == InvoiceState::Canceled {
-                                                    // If this invoice was Canceled
-                                                    crate::flow::hold_invoice_canceled(
-                                                        &hash, &pool, &client,
-                                                    )
-                                                    .await;
-                                                } else {
-                                                    info!("Invoice with hash: {hash} subscribed!");
+                                            let subs = {
+                                                async move {
+                                                    // Receiving msgs from the invoice subscription.
+                                                    while let Some(msg) = rx.recv().await {
+                                                        let hash = msg.hash.to_hex();
+                                                        // If this invoice was paid by the seller
+                                                        if msg.state == InvoiceState::Accepted {
+                                                            crate::flow::hold_invoice_paid(&hash)
+                                                                .await;
+                                                            println!("Invoice with hash {hash} accepted!");
+                                                        } else if msg.state == InvoiceState::Settled
+                                                        {
+                                                            // If the payment was released by the seller
+                                                            println!(
+                                                                "Invoice with hash {hash} settled!"
+                                                            );
+                                                            crate::flow::hold_invoice_settlement(
+                                                                &hash,
+                                                            )
+                                                            .await;
+                                                        } else if msg.state
+                                                            == InvoiceState::Canceled
+                                                        {
+                                                            // If the payment was canceled
+                                                            println!("Invoice with hash {hash} canceled!");
+                                                            crate::flow::hold_invoice_canceled(
+                                                                &hash,
+                                                            )
+                                                            .await;
+                                                        } else {
+                                                            info!("Invoice with hash: {hash} subscribed!");
+                                                        }
+                                                    }
                                                 }
-                                            }
+                                            };
+                                            tokio::spawn(subs);
                                         }
                                     }
                                     types::Action::FiatSent => {

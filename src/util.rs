@@ -108,17 +108,26 @@ pub async fn update_order_event(
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();
-
+    let status = status.to_string();
     info!(
         "Order Id: {} updated Nostr Event to Id {}, new Status: {}",
-        order.id,
-        event_id,
-        status.to_string()
+        order.id, event_id, status
     );
-    let mut order = crate::db::find_order_by_event_id(pool, &order.event_id).await?;
-    order.status = status.to_string();
-    order.event_id = event_id;
-    order.update(pool).await?;
+    let mut conn = pool.acquire().await?;
+    sqlx::query!(
+        r#"
+    UPDATE orders
+    SET
+    status = ?1,
+    event_id = ?2
+    WHERE event_id = ?3
+    "#,
+        status,
+        event_id,
+        order.event_id,
+    )
+    .execute(&mut conn)
+    .await?;
 
     client
         .send_event(event)

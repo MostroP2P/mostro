@@ -1,5 +1,5 @@
 use log::info;
-use nostr::key::FromBech32;
+use nostr::util::nips::nip19::FromBech32;
 
 pub async fn hold_invoice_paid(hash: &str) {
     let pool = crate::db::connect().await.unwrap();
@@ -7,9 +7,13 @@ pub async fn hold_invoice_paid(hash: &str) {
     let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
     let my_keys = crate::util::get_keys().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey).unwrap();
+    let seller_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey).unwrap(),
+    );
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey).unwrap();
+    let buyer_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(buyer_pubkey).unwrap(),
+    );
 
     info!(
         "Order Id: {} - Seller paid invoice with hash: {hash}",
@@ -46,9 +50,13 @@ pub async fn hold_invoice_settlement(hash: &str) {
     let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
     let my_keys = crate::util::get_keys().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey).unwrap();
+    let seller_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey).unwrap(),
+    );
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey).unwrap();
+    let buyer_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(buyer_pubkey).unwrap(),
+    );
     info!(
         "Order Id: {} - Seller released funds for invoice hash: {hash}",
         order.id
@@ -83,9 +91,13 @@ pub async fn hold_invoice_canceled(hash: &str) {
     let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
     let my_keys = crate::util::get_keys().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_keys = nostr::key::Keys::from_bech32_public_key(seller_pubkey).unwrap();
+    let seller_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey).unwrap(),
+    );
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let buyer_keys = nostr::key::Keys::from_bech32_public_key(buyer_pubkey).unwrap();
+    let buyer_keys = nostr::key::Keys::from_public_key(
+        nostr::key::XOnlyPublicKey::from_bech32(buyer_pubkey).unwrap(),
+    );
     // If this invoice was Canceled
     info!(
         "Order Id: {} - Invoice with hash: {hash} was canceled!",

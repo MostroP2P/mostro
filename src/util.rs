@@ -1,8 +1,9 @@
 use crate::types::{self, Order};
 use anyhow::Result;
 use log::info;
+use nostr::key::FromSkStr;
 use nostr::util::time::timestamp;
-use nostr::{Event, EventBuilder, Kind};
+use nostr::{EventBuilder, Kind};
 use nostr_sdk::nostr::Keys;
 use nostr_sdk::Client;
 use sqlx::SqlitePool;
@@ -63,26 +64,11 @@ pub async fn send_dm(
 
 pub fn get_keys() -> Result<nostr::Keys> {
     use std::env;
-    // From Bech32
-    use nostr::key::FromBech32;
     // nostr private key
     let nsec1privkey = env::var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
+    let my_keys = nostr::key::Keys::from_sk_str(&nsec1privkey)?;
 
-    Ok(Keys::from_bech32(&nsec1privkey)?)
-}
-
-pub fn get_event_id_from_dm(event: &Event) -> Result<String> {
-    let id = event
-        .tags
-        .iter()
-        .find(|t| matches!(t.kind(), Ok(nostr::event::tag::TagKind::E)));
-
-    let id = id
-        .expect("This message is not related to another event")
-        .content()
-        .expect("No event related");
-
-    Ok(id.to_string())
+    Ok(my_keys)
 }
 
 pub async fn update_order_event(

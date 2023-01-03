@@ -1,9 +1,8 @@
 use crate::util::publish_order;
 use log::info;
 use nostr::hashes::hex::ToHex;
-use nostr::key::FromBech32;
-use nostr::key::ToBech32;
 use nostr::util::nips::nip04::decrypt;
+use nostr::util::nips::nip19::{FromBech32, ToBech32};
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
 use nostr_sdk::RelayPoolNotifications;
@@ -61,9 +60,10 @@ async fn main() -> anyhow::Result<()> {
                                             .await?
                                         }
                                     }
+                                    // TODO: Change this status to TakeSell
                                     types::Action::PaymentRequest => {
                                         // If a buyer sent me a lightning invoice we look on db an order with
-                                        // that event id and save the buyer pubkey and invoice fields
+                                        // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
                                             // TODO: Verify if payment_request is a valid lightning invoice
                                             let status = crate::types::Status::WaitingPayment;
@@ -96,13 +96,11 @@ async fn main() -> anyhow::Result<()> {
                                                 &pool, &client, &my_keys, status, &db_order,
                                             )
                                             .await?;
-
-                                            let seller_pubkey =
-                                                db_order.seller_pubkey.as_ref().unwrap();
-                                            let seller_keys =
-                                                nostr::key::Keys::from_bech32_public_key(
-                                                    seller_pubkey,
-                                                )?;
+                                            let seller_keys = nostr::key::Keys::from_public_key(
+                                                nostr::key::XOnlyPublicKey::from_bech32(
+                                                    db_order.seller_pubkey.as_ref().unwrap(),
+                                                )?,
+                                            );
                                             let message = crate::messages::payment_request(
                                                 &db_order,
                                                 &invoice_response.payment_request,
@@ -120,9 +118,8 @@ async fn main() -> anyhow::Result<()> {
                                                     db_order.id,
                                                 );
                                             let buyer_keys =
-                                                nostr::key::Keys::from_bech32_public_key(
-                                                    buyer_pubkey,
-                                                )?;
+                                                nostr::key::Keys::from_public_key(event.pubkey);
+
                                             // We send a message to buyer to know that seller was requested to pay the invoice
                                             crate::util::send_dm(
                                                 &client,
@@ -199,9 +196,9 @@ async fn main() -> anyhow::Result<()> {
                                         .await?;
                                         let seller_pubkey =
                                             db_order.seller_pubkey.as_ref().unwrap();
-                                        let seller_keys = nostr::key::Keys::from_bech32_public_key(
-                                            seller_pubkey,
-                                        )?;
+                                        let seller_keys = nostr::key::Keys::from_public_key(
+                                            nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey)?,
+                                        );
                                         // We send a message to seller to release
                                         let message =
                                             crate::messages::buyer_sentfiat(&buyer_pubkey);
@@ -214,8 +211,9 @@ async fn main() -> anyhow::Result<()> {
                                         .await?;
                                         // We send a message to buyer to wait
                                         let message = crate::messages::you_sent_fiat(seller_pubkey);
-                                        let buyer_keys =
-                                            nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+                                        let buyer_keys = nostr::key::Keys::from_public_key(
+                                            nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey)?,
+                                        );
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
@@ -245,9 +243,11 @@ async fn main() -> anyhow::Result<()> {
                                             &pool, &client, &my_keys, status, &db_order,
                                         )
                                         .await?;
-                                        let seller_keys = nostr::key::Keys::from_bech32_public_key(
-                                            &seller_pubkey,
-                                        )?;
+                                        let seller_keys = nostr::key::Keys::from_public_key(
+                                            nostr::key::XOnlyPublicKey::from_bech32(
+                                                &seller_pubkey,
+                                            )?,
+                                        );
                                         // We send a message to seller
                                         let buyer_pubkey = db_order.buyer_pubkey.as_ref().unwrap();
                                         let message = crate::messages::sell_success(buyer_pubkey);
@@ -262,8 +262,10 @@ async fn main() -> anyhow::Result<()> {
                                         // We send a *funds released* message to buyer
                                         let message =
                                             crate::messages::funds_released(&seller_pubkey);
-                                        let buyer_keys =
-                                            nostr::key::Keys::from_bech32_public_key(buyer_pubkey)?;
+                                        let buyer_keys = nostr::key::Keys::from_public_key(
+                                            nostr::key::XOnlyPublicKey::from_bech32(buyer_pubkey)?,
+                                        );
+
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,

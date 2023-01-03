@@ -4,9 +4,7 @@ use lightning_invoice::Invoice;
 use log::info;
 use nostr::hashes::hex::FromHex;
 use nostr::hashes::hex::ToHex;
-use nostr::key::FromBech32;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use std::env;
 use std::str::FromStr;
 use tonic_openssl_lnd::invoicesrpc::{
@@ -146,8 +144,9 @@ impl LndConnector {
         Ok(cancel)
     }
 
-    pub async fn send_payment(&mut self, payment_request: &str, amount: Option<&str>) {
+    pub async fn send_payment(&mut self, payment_request: &str, amount: i64) {
         let invoice = decode_invoice(payment_request).unwrap();
+
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
         let hash = payment_hash.to_hex();
@@ -162,17 +161,25 @@ impl LndConnector {
             .track_payment_v2(track_payment_req)
             .await;
         // We only send the payment if it wasn't attempted before
-        if let Ok(_) = track {
-            println!("Aborting paying invoice with hash {} to buyer", hash);
+        if track.is_ok() {
+            info!("Aborting paying invoice with hash {} to buyer", hash);
             return;
         }
 
-        let request = SendPaymentRequest {
+        let invoice_amount_milli = invoice.amount_milli_satoshis();
+        let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
             timeout_seconds: 60,
             ..Default::default()
         };
-
+        // We add amount to the request only if the invoice doesn't have amount
+        if invoice_amount_milli.is_none() {
+            request = SendPaymentRequest {
+                amt: amount,
+                ..request
+            };
+        }
+        println!("request => {request:#?}");
         let mut stream = self
             .client
             .router()

@@ -70,6 +70,7 @@ impl fmt::Display for Action {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Message {
     pub version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<i64>,
     pub action: Action,
     pub content: Option<Content>,
@@ -98,19 +99,19 @@ impl Message {
         match &self.action {
             Action::Order => matches!(&self.content, Some(Content::Order(_))),
             Action::PaymentRequest => {
-                if let None = &self.order_id {
+                if self.order_id.is_none() {
                     return false;
                 }
                 matches!(&self.content, Some(Content::PaymentRequest(_)))
             }
             Action::FiatSent => {
-                if let None = &self.order_id {
+                if self.order_id.is_none() {
                     return false;
                 }
                 true
             }
             Action::Release => {
-                if let None = &self.order_id {
+                if self.order_id.is_none() {
                     return false;
                 }
                 true

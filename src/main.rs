@@ -274,7 +274,9 @@ async fn main() -> anyhow::Result<()> {
                                         // Finally we try to pay buyer's invoice
                                         let payment_request =
                                             db_order.buyer_invoice.as_ref().unwrap();
-                                        ln_client.send_payment(&payment_request, None).await;
+                                        ln_client
+                                            .send_payment(payment_request, db_order.amount)
+                                            .await;
                                     }
                                 }
                             }

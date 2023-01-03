@@ -16,7 +16,7 @@ pub async fn publish_order(
     initiator_pubkey: &str,
 ) -> Result<()> {
     let event_kind = crate::db::next_event_kind(pool).await?;
-    let order_id = crate::db::add_order(pool, &order, &"", event_kind, initiator_pubkey).await?;
+    let order_id = crate::db::add_order(pool, order, "", event_kind, initiator_pubkey).await?;
     info!("New order saved Id: {order_id}");
     // Now we have the order id, we can create a new event adding this id to the Order object
     let order = Order::new(
@@ -38,7 +38,7 @@ pub async fn publish_order(
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(&pool, order_id, &types::Status::Pending, &event_id)
+    crate::db::update_order_event_id_status(pool, order_id, &types::Status::Pending, &event_id)
         .await?;
     client
         .send_event(event)
@@ -116,7 +116,7 @@ pub async fn update_order_event(
         order.id, status_str
     );
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(&pool, order.id, &status, &event_id).await?;
+    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id).await?;
 
     client
         .send_event(event)
@@ -133,12 +133,14 @@ pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
 
     // Add relays
     // client.add_relay("wss://relay.grunch.dev", None).await?;
-    client.add_relay("wss://nostr.fly.dev", None).await?;
     client
         .add_relay("wss://relay.cryptocculture.com", None)
         .await?;
-    // client.add_relay("wss://relay.damus.io", None).await?;
-    // client.add_relay("wss://nostr.openchain.fr", None).await?;
+    client.add_relay("wss://relay.damus.io", None).await?;
+    client.add_relay("wss://nostr.fly.dev", None).await?;
+    client.add_relay("wss://nostr.zebedee.cloud", None).await?;
+    client.add_relay("wss://nostr.fly.dev", None).await?;
+    client.add_relay("wss://nostr.openchain.fr", None).await?;
 
     // Connect to relays and keep connection alive
     client.connect().await?;

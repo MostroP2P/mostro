@@ -70,6 +70,7 @@ impl fmt::Display for Action {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Message {
     pub version: u8,
+    pub order_id: Option<i64>,
     pub action: Action,
     pub content: Option<Content>,
 }
@@ -96,9 +97,24 @@ impl Message {
     pub fn verify(&self) -> bool {
         match &self.action {
             Action::Order => matches!(&self.content, Some(Content::Order(_))),
-            Action::PaymentRequest => matches!(&self.content, Some(Content::PaymentRequest(_))),
-            Action::FiatSent => true,
-            Action::Release => true,
+            Action::PaymentRequest => {
+                if let None = &self.order_id {
+                    return false;
+                }
+                matches!(&self.content, Some(Content::PaymentRequest(_)))
+            }
+            Action::FiatSent => {
+                if let None = &self.order_id {
+                    return false;
+                }
+                true
+            }
+            Action::Release => {
+                if let None = &self.order_id {
+                    return false;
+                }
+                true
+            }
         }
     }
 
@@ -126,6 +142,8 @@ impl Message {
 /// Mostro Order
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Order {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
     pub kind: Kind,
     pub status: Status,
     pub amount: u32,
@@ -142,6 +160,7 @@ pub struct Order {
 #[allow(dead_code)]
 impl Order {
     pub fn new(
+        id: Option<i64>,
         kind: Kind,
         status: Status,
         amount: u32,
@@ -153,6 +172,7 @@ impl Order {
         created_at: Option<u64>,
     ) -> Self {
         Self {
+            id,
             kind,
             status,
             amount,

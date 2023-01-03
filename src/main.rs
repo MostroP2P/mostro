@@ -7,6 +7,7 @@ use nostr::util::nips::nip04::decrypt;
 use nostr::util::time::timestamp;
 use nostr::{Kind, KindBase, SubscriptionFilter};
 use nostr_sdk::RelayPoolNotifications;
+use sqlx_crud::Crud;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 
 pub mod db;
@@ -67,11 +68,11 @@ async fn main() -> anyhow::Result<()> {
                                             // TODO: Verify if payment_request is a valid lightning invoice
                                             let status = crate::types::Status::WaitingPayment;
                                             let buyer_pubkey = event.pubkey.to_bech32()?;
-                                            let event_id =
-                                                crate::util::get_event_id_from_dm(&event)?;
+                                            let order_id = msg.order_id.unwrap();
                                             let db_order =
-                                                crate::db::find_order_by_event_id(&pool, &event_id)
-                                                    .await?;
+                                                crate::models::Order::by_id(&pool, order_id)
+                                                    .await?
+                                                    .unwrap();
 
                                             // Now we generate the hold invoice the seller need pay
                                             let (invoice_response, preimage, hash) = ln_client
@@ -83,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
                                             crate::db::edit_order(
                                                 &pool,
                                                 &status,
-                                                &event_id,
+                                                order_id,
                                                 &buyer_pubkey,
                                                 &payment_request,
                                                 &preimage.to_hex(),
@@ -185,12 +186,12 @@ async fn main() -> anyhow::Result<()> {
                                         // is the buyer pubkey?
                                         let buyer_pubkey = event.pubkey.to_bech32()?;
                                         let status = crate::types::Status::FiatSent;
-                                        let event_id = crate::util::get_event_id_from_dm(&event)?;
+                                        let order_id = msg.order_id.unwrap();
+                                        let db_order = crate::models::Order::by_id(&pool, order_id)
+                                            .await?
+                                            .unwrap();
 
-                                        let db_order =
-                                            crate::db::find_order_by_event_id(&pool, &event_id)
-                                                .await?;
-                                        // We publish a new kind 11000 nostr event with the status updated
+                                        // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         crate::util::update_order_event(
                                             &pool, &client, &my_keys, status, &db_order,
@@ -228,19 +229,15 @@ async fn main() -> anyhow::Result<()> {
                                         // is the seller pubkey?
                                         let seller_pubkey = event.pubkey.to_bech32()?;
                                         let status = crate::types::Status::SettledInvoice;
-                                        let event_id = crate::util::get_event_id_from_dm(&event)?;
-                                        let db_order =
-                                            crate::db::find_order_by_event_id(&pool, &event_id)
-                                                .await?;
+                                        let order_id = msg.order_id.unwrap();
+                                        let db_order = crate::models::Order::by_id(&pool, order_id)
+                                            .await?
+                                            .unwrap();
                                         if db_order.preimage.is_none() {
                                             break;
                                         }
                                         let preimage = db_order.preimage.as_ref().unwrap();
                                         ln_client.settle_hold_invoice(preimage).await?;
-                                        // We pay buyer's invoice
-                                        let payment_request =
-                                            db_order.buyer_invoice.as_ref().unwrap();
-                                        ln_client.send_payment(&payment_request, None).await;
                                         info!("Order Id: {} - Released sats", &db_order.id);
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
@@ -274,6 +271,10 @@ async fn main() -> anyhow::Result<()> {
                                             message,
                                         )
                                         .await?;
+                                        // Finally we try to pay buyer's invoice
+                                        let payment_request =
+                                            db_order.buyer_invoice.as_ref().unwrap();
+                                        ln_client.send_payment(&payment_request, None).await;
                                     }
                                 }
                             }

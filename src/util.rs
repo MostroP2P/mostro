@@ -6,7 +6,6 @@ use nostr::{Event, EventBuilder, Kind};
 use nostr_sdk::nostr::Keys;
 use nostr_sdk::Client;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use std::str::FromStr;
 
 pub async fn publish_order(
@@ -16,7 +15,12 @@ pub async fn publish_order(
     order: &Order,
     initiator_pubkey: &str,
 ) -> Result<()> {
+    let event_kind = crate::db::next_event_kind(pool).await?;
+    let order_id = crate::db::add_order(pool, &order, &"", event_kind, initiator_pubkey).await?;
+    info!("New order saved Id: {order_id}");
+    // Now we have the order id, we can create a new event adding this id to the Order object
     let order = Order::new(
+        Some(order_id),
         order.kind,
         types::Status::Pending,
         order.amount,
@@ -28,17 +32,14 @@ pub async fn publish_order(
         Some(timestamp()),
     );
     let order_string = order.as_json().unwrap();
-    let event_kind = crate::db::next_event_kind(pool).await?;
     let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[])
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();
-
-    info!("Event published: {:#?}", event);
-    let order_id =
-        crate::db::add_order(pool, &order, &event_id, event_kind, initiator_pubkey).await?;
-    info!("New order saved Id: {order_id}");
-
+    info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
+    // We update the order id with the new event_id
+    crate::db::update_order_event_id_status(&pool, order_id, &types::Status::Pending, &event_id)
+        .await?;
     client
         .send_event(event)
         .await
@@ -93,6 +94,7 @@ pub async fn update_order_event(
 ) -> Result<()> {
     let kind = crate::types::Kind::from_str(&order.kind).unwrap();
     let publish_order = Order::new(
+        Some(order.id),
         kind,
         status.clone(),
         order.amount as u32,
@@ -108,26 +110,13 @@ pub async fn update_order_event(
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();
-    let status = status.to_string();
+    let status_str = status.to_string();
     info!(
-        "Order Id: {} updated Nostr Event to Id {}, new Status: {}",
-        order.id, event_id, status
+        "Order Id: {} updated Nostr new Status: {}",
+        order.id, status_str
     );
-    let mut conn = pool.acquire().await?;
-    sqlx::query!(
-        r#"
-    UPDATE orders
-    SET
-    status = ?1,
-    event_id = ?2
-    WHERE event_id = ?3
-    "#,
-        status,
-        event_id,
-        order.event_id,
-    )
-    .execute(&mut conn)
-    .await?;
+    // We update the order id with the new event_id
+    crate::db::update_order_event_id_status(&pool, order.id, &status, &event_id).await?;
 
     client
         .send_event(event)

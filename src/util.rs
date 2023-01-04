@@ -1,6 +1,6 @@
 use crate::types::{self, Order};
 use anyhow::Result;
-use log::info;
+use log::{error, info};
 use nostr::event::tag::{Tag, TagKind};
 use nostr::key::FromSkStr;
 use nostr::util::time::timestamp;
@@ -103,18 +103,18 @@ pub async fn update_order_event(
         .unwrap();
     let event_id = event.id.to_string();
     let status_str = status.to_string();
+    info!("Sending replaceable event: {event:#?}");
+    // We update the order id with the new event_id
+    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order.id, status_str
     );
-    // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id).await?;
 
-    client
-        .send_event(event)
-        .await
-        .map(|_s| ())
-        .map_err(|err| err.into())
+    client.send_event(event).await.map(|_s| ()).map_err(|err| {
+        error!("{}", err);
+        err.into()
+    })
 }
 
 pub async fn connect_nostr() -> Result<nostr_sdk::Client> {

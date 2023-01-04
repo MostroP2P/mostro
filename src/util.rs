@@ -95,15 +95,12 @@ pub async fn update_order_event(
         Some(timestamp()),
     );
     let order_string = publish_order.as_json().unwrap();
-    // nip33 d tag
+    // nip33 kind and d tag
+    let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order.id.to_string()]);
-    let event = EventBuilder::new(
-        Kind::Custom(order.event_kind as u64),
-        &order_string,
-        &[d_tag],
-    )
-    .to_event(keys)
-    .unwrap();
+    let event = EventBuilder::new(Kind::Custom(event_kind), &order_string, &[d_tag])
+        .to_event(keys)
+        .unwrap();
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!(

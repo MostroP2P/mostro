@@ -6,7 +6,6 @@ pub struct Order {
     pub id: i64,
     pub kind: String,
     pub event_id: String,
-    pub event_kind: i64,
     pub hash: Option<String>,
     pub preimage: Option<String>,
     pub buyer_pubkey: Option<String>,

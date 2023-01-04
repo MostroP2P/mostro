@@ -20,7 +20,6 @@ pub async fn add_order(
     pool: &SqlitePool,
     order: &Order,
     event_id: &str,
-    event_kind: i64,
     initiator_pubkey: &str,
 ) -> anyhow::Result<i64> {
     let mut conn = pool.acquire().await?;
@@ -39,7 +38,6 @@ pub async fn add_order(
       INSERT INTO orders (
       kind,
       event_id,
-      event_kind,
       buyer_pubkey,
       seller_pubkey,
       status,
@@ -52,7 +50,6 @@ pub async fn add_order(
       "#,
         kind,
         event_id,
-        event_kind,
         buyer_pubkey,
         seller_pubkey,
         status,

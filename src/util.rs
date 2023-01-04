@@ -17,8 +17,7 @@ pub async fn publish_order(
     order: &Order,
     initiator_pubkey: &str,
 ) -> Result<()> {
-    let event_kind = 30000;
-    let order_id = crate::db::add_order(pool, order, "", event_kind, initiator_pubkey).await?;
+    let order_id = crate::db::add_order(pool, order, "", initiator_pubkey).await?;
     info!("New order saved Id: {order_id}");
     // Now we have the order id, we can create a new event adding this id to the Order object
     let order = Order::new(
@@ -35,6 +34,7 @@ pub async fn publish_order(
     );
     let order_string = order.as_json().unwrap();
     // This tag (nip33) allows us to change this event in particular in the future
+    let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
     let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[d_tag])
         .to_event(keys)

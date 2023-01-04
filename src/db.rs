@@ -169,25 +169,3 @@ pub async fn find_order_by_hash(
 
     Ok(order)
 }
-
-pub async fn next_event_kind(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let order = sqlx::query!(
-        r#"
-          SELECT event_kind
-          FROM orders
-          ORDER BY event_kind DESC LIMIT 1
-        "#
-    )
-    .fetch_optional(pool)
-    .await?;
-    println!("order: {:?}", order);
-    if let Some(o) = order {
-        if let Some(kind) = o.event_kind {
-            Ok(kind + 1)
-        } else {
-            Ok(10000)
-        }
-    } else {
-        Ok(10000)
-    }
-}

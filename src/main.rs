@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let mut notifications = client.notifications();
+
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotifications::ReceivedEvent(event) = notification {
                 if let Kind::Base(KindBase::EncryptedDirectMessage) = event.kind {

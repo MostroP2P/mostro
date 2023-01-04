@@ -1,6 +1,7 @@
 use crate::types::{self, Order};
 use anyhow::Result;
 use log::info;
+use nostr::event::tag::{Tag, TagKind};
 use nostr::key::FromSkStr;
 use nostr::util::time::timestamp;
 use nostr::{EventBuilder, Kind};
@@ -16,7 +17,7 @@ pub async fn publish_order(
     order: &Order,
     initiator_pubkey: &str,
 ) -> Result<()> {
-    let event_kind = crate::db::next_event_kind(pool).await?;
+    let event_kind = 30000;
     let order_id = crate::db::add_order(pool, order, "", event_kind, initiator_pubkey).await?;
     info!("New order saved Id: {order_id}");
     // Now we have the order id, we can create a new event adding this id to the Order object
@@ -33,7 +34,9 @@ pub async fn publish_order(
         Some(timestamp()),
     );
     let order_string = order.as_json().unwrap();
-    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[])
+    // This tag (nip33) allows us to change this event in particular in the future
+    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
+    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[d_tag])
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();
@@ -92,9 +95,15 @@ pub async fn update_order_event(
         Some(timestamp()),
     );
     let order_string = publish_order.as_json().unwrap();
-    let event = EventBuilder::new(Kind::Custom(order.event_kind as u64), &order_string, &[])
-        .to_event(keys)
-        .unwrap();
+    // nip33 d tag
+    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order.id.to_string()]);
+    let event = EventBuilder::new(
+        Kind::Custom(order.event_kind as u64),
+        &order_string,
+        &[d_tag],
+    )
+    .to_event(keys)
+    .unwrap();
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!(
@@ -119,14 +128,14 @@ pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
 
     // Add relays
     // client.add_relay("wss://relay.grunch.dev", None).await?;
-    client
-        .add_relay("wss://relay.cryptocculture.com", None)
-        .await?;
-    client.add_relay("wss://relay.damus.io", None).await?;
-    client.add_relay("wss://nostr.fly.dev", None).await?;
+    // client
+    //     .add_relay("wss://relay.cryptocculture.com", None)
+    //     .await?;
+    // client.add_relay("wss://relay.damus.io", None).await?;
+    // client.add_relay("wss://nostr.fly.dev", None).await?;
     client.add_relay("wss://nostr.zebedee.cloud", None).await?;
-    client.add_relay("wss://nostr.fly.dev", None).await?;
-    client.add_relay("wss://nostr.openchain.fr", None).await?;
+    // client.add_relay("wss://nostr.fly.dev", None).await?;
+    // client.add_relay("wss://nostr.openchain.fr", None).await?;
 
     // Connect to relays and keep connection alive
     client.connect().await?;

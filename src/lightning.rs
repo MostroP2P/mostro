@@ -146,7 +146,6 @@ impl LndConnector {
 
     pub async fn send_payment(&mut self, payment_request: &str, amount: i64) {
         let invoice = decode_invoice(payment_request).unwrap();
-
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
         let hash = payment_hash.to_hex();
@@ -155,11 +154,13 @@ impl LndConnector {
             payment_hash,
             no_inflight_updates: true,
         };
+
         let track = self
             .client
             .router()
             .track_payment_v2(track_payment_req)
             .await;
+
         // We only send the payment if it wasn't attempted before
         if track.is_ok() {
             info!("Aborting paying invoice with hash {} to buyer", hash);
@@ -172,6 +173,7 @@ impl LndConnector {
             timeout_seconds: 60,
             ..Default::default()
         };
+
         // We add amount to the request only if the invoice doesn't have amount
         if invoice_amount_milli.is_none() {
             request = SendPaymentRequest {
@@ -179,7 +181,7 @@ impl LndConnector {
                 ..request
             };
         }
-        println!("request => {request:#?}");
+
         let mut stream = self
             .client
             .router()

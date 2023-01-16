@@ -68,7 +68,7 @@ pub async fn hold_invoice_settlement(hash: &str) {
         &pool,
         &client,
         &my_keys,
-        crate::types::Status::SettledInvoice,
+        crate::types::Status::SettledHoldInvoice,
         &order,
     )
     .await

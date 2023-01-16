@@ -38,7 +38,7 @@ pub enum Status {
     Dispute,
     Expired,
     FiatSent,
-    SettledInvoice,
+    SettledHoldInvoice,
     Pending,
     Success,
     WaitingBuyerInvoice,
@@ -55,7 +55,9 @@ impl fmt::Display for Status {
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Action {
     Order,
-    PaymentRequest,
+    TakeSell,
+    TakeBuy,
+    PayInvoice,
     FiatSent,
     Release,
 }
@@ -98,11 +100,17 @@ impl Message {
     pub fn verify(&self) -> bool {
         match &self.action {
             Action::Order => matches!(&self.content, Some(Content::Order(_))),
-            Action::PaymentRequest => {
+            Action::TakeSell => {
                 if self.order_id.is_none() {
                     return false;
                 }
                 matches!(&self.content, Some(Content::PaymentRequest(_)))
+            }
+            Action::TakeBuy => {
+                todo!()
+            }
+            Action::PayInvoice => {
+                todo!()
             }
             Action::FiatSent => {
                 if self.order_id.is_none() {
@@ -130,7 +138,7 @@ impl Message {
     }
 
     pub fn get_payment_request(&self) -> Option<String> {
-        if self.action != Action::PaymentRequest {
+        if self.action != Action::TakeSell {
             return None;
         }
         match &self.content {

@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                     // TODO: Change this status to TakeSell
-                                    types::Action::PaymentRequest => {
+                                    types::Action::TakeSell => {
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
@@ -179,6 +179,12 @@ async fn main() -> anyhow::Result<()> {
                                             tokio::spawn(subs);
                                         }
                                     }
+                                    types::Action::TakeBuy => {
+                                        todo!()
+                                    }
+                                    types::Action::PayInvoice => {
+                                        todo!()
+                                    }
                                     types::Action::FiatSent => {
                                         // TODO: Add validations
                                         // is the buyer pubkey?
@@ -227,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
                                         // TODO: Add validations
                                         // is the seller pubkey?
                                         let seller_pubkey = event.pubkey.to_bech32()?;
-                                        let status = crate::types::Status::SettledInvoice;
+                                        let status = crate::types::Status::SettledHoldInvoice;
                                         let order_id = msg.order_id.unwrap();
                                         let db_order = crate::models::Order::by_id(&pool, order_id)
                                             .await?
@@ -298,16 +304,15 @@ mod tests {
     #[test]
     fn test_order_deserialize_serialize() {
         let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1,"created_at":1640839235}"#;
-        let order = Order::from_json(&sample_order).unwrap();
+        let order = Order::from_json(sample_order).unwrap();
         let json_order = order.as_json().unwrap();
         assert_eq!(sample_order, json_order);
     }
 
     #[test]
     fn test_message_deserialize_serialize() {
-        let sample_message =
-            r#"{"version":0,"action":"PaymentRequest","content":{"PaymentRequest":"lnbc1..."}}"#;
-        let message = Message::from_json(&sample_message).unwrap();
+        let sample_message = r#"{"version":0,"order_id":54,"action":"TakeSell","content":{"PaymentRequest":"lnbc1..."}}"#;
+        let message = Message::from_json(sample_message).unwrap();
         assert!(message.verify());
         let json_message = message.as_json().unwrap();
         assert_eq!(sample_message, json_message);
@@ -315,8 +320,8 @@ mod tests {
 
     #[test]
     fn test_wrong_message_should_fail() {
-        let sample_message = r#"{"version":0,"action":"PaymentRequest","content":{"Order":{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1,"payment_request":null,"created_at":1640839235}}}"#;
-        let message = Message::from_json(&sample_message).unwrap();
+        let sample_message = r#"{"version":0,"action":"TakeSell","content":{"Order":{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1,"payment_request":null,"created_at":1640839235}}}"#;
+        let message = Message::from_json(sample_message).unwrap();
         assert!(!message.verify());
     }
 }

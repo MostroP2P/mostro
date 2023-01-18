@@ -1,13 +1,13 @@
+use dotenvy::var;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
-use std::env;
 
 use crate::types::Order;
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
-    let db_url = env::var("DATABASE_URL").expect("$DATABASE_URL is not set");
+    let db_url = var("DATABASE_URL").expect("$DATABASE_URL is not set");
     if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
         panic!("Not database found, please create a new one first!");
     }

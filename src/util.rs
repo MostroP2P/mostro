@@ -1,5 +1,6 @@
 use crate::types::{self, Order};
 use anyhow::Result;
+use dotenvy::var;
 use log::{error, info};
 use nostr::event::tag::{Tag, TagKind};
 use nostr::key::FromSkStr;
@@ -66,9 +67,8 @@ pub async fn send_dm(
 }
 
 pub fn get_keys() -> Result<nostr::Keys> {
-    use std::env;
     // nostr private key
-    let nsec1privkey = env::var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
+    let nsec1privkey = var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
     let my_keys = nostr::key::Keys::from_sk_str(&nsec1privkey)?;
 
     Ok(my_keys)

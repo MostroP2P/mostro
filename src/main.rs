@@ -1,4 +1,5 @@
 use crate::util::publish_order;
+use dotenvy::dotenv;
 use log::info;
 use nostr::hashes::hex::ToHex;
 use nostr::util::nips::nip04::decrypt;
@@ -19,6 +20,7 @@ pub mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv().ok();
     pretty_env_logger::init();
     // Connect to database
     let pool = crate::db::connect().await?;

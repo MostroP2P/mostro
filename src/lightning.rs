@@ -1,11 +1,11 @@
 use anyhow::Result;
+use dotenvy::var;
 use easy_hasher::easy_hasher::*;
 use lightning_invoice::Invoice;
 use log::info;
 use nostr::hashes::hex::FromHex;
 use nostr::hashes::hex::ToHex;
 use rand::RngCore;
-use std::env;
 use std::str::FromStr;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
@@ -28,13 +28,13 @@ pub struct InvoiceMessage {
 
 impl LndConnector {
     pub async fn new() -> Self {
-        let port: u32 = env::var("LND_GRPC_PORT")
+        let port: u32 = var("LND_GRPC_PORT")
             .expect("LND_GRPC_PORT must be set")
             .parse()
             .expect("port is not u32");
-        let host = env::var("LND_GRPC_HOST").expect("LND_GRPC_HOST must be set");
-        let tls_path = env::var("LND_CERT_FILE").expect("LND_CERT_FILE must be set");
-        let macaroon_path = env::var("LND_MACAROON_FILE").expect("LND_MACAROON_FILE must be set");
+        let host = var("LND_GRPC_HOST").expect("LND_GRPC_HOST must be set");
+        let tls_path = var("LND_CERT_FILE").expect("LND_CERT_FILE must be set");
+        let macaroon_path = var("LND_MACAROON_FILE").expect("LND_MACAROON_FILE must be set");
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
         let client = tonic_openssl_lnd::connect(host, port, tls_path, macaroon_path)

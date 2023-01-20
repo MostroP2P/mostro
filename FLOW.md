@@ -19,7 +19,7 @@ For this example the participants will use this keys:
 All messages to Mostro should be a Nostr event kind 4, and should have this fields:
 
 - `version`
-- `action` (Order/TakeSell/TakeBuy/FiatSent/Release)
+- `action` (Order/TakeSell/TakeBuy/PayInvoice/FiatSent/Release)
 - `content` (optional to be used on action `Order` or `PaymentRequest`)
 
 Example of a message from a buyer sending a lightning network invoice, the content of this message should be a JSON-serialized string (with no white space or line breaks) of the following structure:

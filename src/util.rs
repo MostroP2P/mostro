@@ -123,16 +123,66 @@ pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
     // Create new client
     let client = nostr_sdk::Client::new(&my_keys);
 
+    let relays = vec![
+        "wss://nostr.p2sh.co",
+        "wss://relay.nostr.vision",
+        "wss://nostr.itssilvestre.com",
+        "wss://nostr.drss.io",
+        "wss://nostr-pub.semisol.dev",
+        "wss://relay.nostr.info",
+        "wss://relay.nostr.pro",
+        "wss://nostr.zebedee.cloud",
+        "wss://nostr.fmt.wiz.biz",
+        "wss://public.nostr.swissrouting.com",
+        "wss://nostr.slothy.win",
+        "wss://nostr.rewardsbunny.com",
+        "wss://relay.nostropolis.xyz/websocket",
+        "wss://nostr.supremestack.xyz",
+        "wss://nostr-01.bolt.observer",
+        "wss://nostr.orba.ca",
+        "wss://nostr.mom",
+        "wss://nostr.yael.at",
+        "wss://nostr-relay.derekross.me",
+        "wss://nostr.shawnyeager.net",
+        "wss://nostr.jiashanlu.synology.me",
+        "wss://nostr1.tunnelsats.com",
+        "wss://relay.ryzizub.com",
+        "wss://relay.nostrmoto.xyz",
+        "wss://relay.boring.surf",
+        "wss://jiggytom.ddns.net",
+        "wss://nostr.sectiontwo.org",
+        "wss://nostr.roundrockbitcoiners.com",
+        "wss://nostr.utxo.lol",
+        "wss://nostr.orangepill.dev",
+        "wss://relay.nostrid.com",
+        "wss://nostr1.starbackr.me",
+        "wss://nostr-relay.schnitzel.world",
+        "wss://sg.qemura.xyz",
+        "wss://nostr.digitalreformation.info",
+        "wss://nostr-relay.usebitcoin.space",
+        "wss://nostr.bch.ninja",
+        "wss://nostr.demovement.net",
+        "wss://nostr.massmux.com",
+        "wss://relay.nostr.bg",
+        "wss://nostr.developer.li",
+        "wss://nostr.screaminglife.io",
+        "wss://nostr-pub1.southflorida.ninja",
+        "wss://nostr.itssilvestre.com",
+        "wss://nostr-1.nbo.angani.co",
+        "wss://relay.taxi",
+        "wss://relay.nostr.nu",
+        "wss://nostr.easydns.ca",
+        "wss://no-str.org",
+        "wss://nostr.milou.lol",
+        "wss://nostrical.com",
+        "wss://pow32.nostr.land",
+        "wss://student.chadpolytechnic.com",
+    ];
+
     // Add relays
-    // client.add_relay("wss://relay.grunch.dev", None).await?;
-    // client
-    //     .add_relay("wss://relay.cryptocculture.com", None)
-    //     .await?;
-    // client.add_relay("wss://relay.damus.io", None).await?;
-    // client.add_relay("wss://nostr.fly.dev", None).await?;
-    client.add_relay("wss://nostr.zebedee.cloud", None).await?;
-    // client.add_relay("wss://nostr.fly.dev", None).await?;
-    // client.add_relay("wss://nostr.openchain.fr", None).await?;
+    for r in relays {
+        client.add_relay(r, None).await?;
+    }
 
     // Connect to relays and keep connection alive
     client.connect().await?;

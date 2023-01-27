@@ -63,3 +63,7 @@ pub fn order_canceled(order_id: i64) -> String {
 pub fn you_sent_fiat(seller_pubkey: XOnlyPublicKey) -> Result<String> {
     Ok(format!("🧌 I told {} that you have sent fiat money once the seller confirms the money was received, the sats should be sent to you.", seller_pubkey.to_bech32()?))
 }
+
+pub fn invalid_invoice() -> Result<String> {
+    Ok("Invalid invoice!".to_string())
+}

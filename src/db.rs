@@ -1,4 +1,5 @@
 use dotenvy::var;
+use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
 use sqlx::Sqlite;
@@ -70,13 +71,14 @@ pub async fn edit_order(
     pool: &SqlitePool,
     status: &crate::types::Status,
     order_id: i64,
-    buyer_pubkey: &str,
+    buyer_pubkey: &XOnlyPublicKey,
     buyer_invoice: &str,
     preimage: &str,
     hash: &str,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
+    let buyer_pubkey = buyer_pubkey.to_bech32()?;
     let rows_affected = sqlx::query!(
         r#"
     UPDATE orders

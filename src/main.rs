@@ -1,4 +1,5 @@
 pub mod db;
+pub mod error;
 pub mod flow;
 pub mod lightning;
 pub mod messages;
@@ -7,6 +8,7 @@ pub mod types;
 pub mod util;
 
 use dotenvy::dotenv;
+use error::MostroError;
 use lightning::invoice::is_valid_invoice;
 use util::publish_order;
 
@@ -68,10 +70,26 @@ async fn main() -> anyhow::Result<()> {
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
                                             // Verify if invoice is valid
-                                            is_valid_invoice(&payment_request)?;
+                                            let is_valid = is_valid_invoice(&payment_request);
+                                            let buyer_pubkey = event.pubkey;
+                                            match is_valid {
+                                                Ok(_) => {}
+                                                Err(e) => match e {
+                                                    MostroError::ParsingInvoiceError => {
+                                                        crate::util::send_dm(
+                                                            &client,
+                                                            &my_keys,
+                                                            &buyer_pubkey,
+                                                            e.to_string(),
+                                                        )
+                                                        .await?;
+                                                        log::error!("{e}");
+                                                        break;
+                                                    }
+                                                },
+                                            }
 
                                             let status = crate::types::Status::WaitingPayment;
-                                            let buyer_pubkey = event.pubkey.to_bech32()?;
                                             let order_id = msg.order_id.unwrap();
                                             let db_order =
                                                 crate::models::Order::by_id(&pool, order_id)
@@ -119,7 +137,6 @@ async fn main() -> anyhow::Result<()> {
                                                 crate::messages::waiting_seller_to_pay_invoice(
                                                     db_order.id,
                                                 );
-                                            let buyer_pubkey = event.pubkey;
 
                                             // We send a message to buyer to know that seller was requested to pay the invoice
                                             crate::util::send_dm(

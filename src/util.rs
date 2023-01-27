@@ -124,7 +124,6 @@ pub async fn connect_nostr() -> Result<Client> {
         "wss://nostr.itssilvestre.com",
         "wss://nostr.drss.io",
         "wss://nostr.zebedee.cloud",
-        "wss://nostr.fmt.wiz.biz",
         "wss://public.nostr.swissrouting.com",
         "wss://nostr.slothy.win",
         "wss://nostr.rewardsbunny.com",

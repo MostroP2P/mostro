@@ -1,12 +1,9 @@
 use crate::util::publish_order;
 use dotenvy::dotenv;
 use log::info;
-use nostr::hashes::hex::ToHex;
-use nostr::util::nips::nip04::decrypt;
-use nostr::util::nips::nip19::{FromBech32, ToBech32};
-use nostr::util::time::timestamp;
-use nostr::{Kind, KindBase, SubscriptionFilter};
-use nostr_sdk::RelayPoolNotifications;
+use nostr_sdk::nostr::hashes::hex::ToHex;
+use nostr_sdk::nostr::util::time::timestamp;
+use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 
@@ -39,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotifications::ReceivedEvent(event) = notification {
-                if let Kind::Base(KindBase::EncryptedDirectMessage) = event.kind {
+            if let RelayPoolNotification::Event(_, event) = notification {
+                if let Kind::EncryptedDirectMessage = event.kind {
                     let message = decrypt(
                         &my_keys.secret_key().unwrap(),
                         &event.pubkey,
@@ -99,11 +96,9 @@ async fn main() -> anyhow::Result<()> {
                                                 &pool, &client, &my_keys, status, &db_order,
                                             )
                                             .await?;
-                                            let seller_keys = nostr::key::Keys::from_public_key(
-                                                nostr::key::XOnlyPublicKey::from_bech32(
-                                                    db_order.seller_pubkey.as_ref().unwrap(),
-                                                )?,
-                                            );
+                                            let seller_pubkey = XOnlyPublicKey::from_bech32(
+                                                db_order.seller_pubkey.as_ref().unwrap(),
+                                            )?;
                                             let message = crate::messages::payment_request(
                                                 &db_order,
                                                 &invoice_response.payment_request,
@@ -112,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                                             crate::util::send_dm(
                                                 &client,
                                                 &my_keys,
-                                                &seller_keys,
+                                                &seller_pubkey,
                                                 message,
                                             )
                                             .await?;
@@ -120,14 +115,13 @@ async fn main() -> anyhow::Result<()> {
                                                 crate::messages::waiting_seller_to_pay_invoice(
                                                     db_order.id,
                                                 );
-                                            let buyer_keys =
-                                                nostr::key::Keys::from_public_key(event.pubkey);
+                                            let buyer_pubkey = event.pubkey;
 
                                             // We send a message to buyer to know that seller was requested to pay the invoice
                                             crate::util::send_dm(
                                                 &client,
                                                 &my_keys,
-                                                &buyer_keys,
+                                                &buyer_pubkey,
                                                 message,
                                             )
                                             .await?;
@@ -190,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                                     types::Action::FiatSent => {
                                         // TODO: Add validations
                                         // is the buyer pubkey?
-                                        let buyer_pubkey = event.pubkey.to_bech32()?;
+                                        let buyer_pubkey = event.pubkey;
                                         let status = crate::types::Status::FiatSent;
                                         let order_id = msg.order_id.unwrap();
                                         let db_order = crate::models::Order::by_id(&pool, order_id)
@@ -203,30 +197,27 @@ async fn main() -> anyhow::Result<()> {
                                             &pool, &client, &my_keys, status, &db_order,
                                         )
                                         .await?;
-                                        let seller_pubkey =
-                                            db_order.seller_pubkey.as_ref().unwrap();
-                                        let seller_keys = nostr::key::Keys::from_public_key(
-                                            nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey)?,
-                                        );
+                                        let seller_pubkey = XOnlyPublicKey::from_bech32(
+                                            db_order.seller_pubkey.as_ref().unwrap(),
+                                        )?;
                                         // We send a message to seller to release
                                         let message =
-                                            crate::messages::buyer_sentfiat(&buyer_pubkey);
+                                            crate::messages::buyer_sentfiat(buyer_pubkey)?;
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
-                                            &seller_keys,
+                                            &seller_pubkey,
                                             message,
                                         )
                                         .await?;
                                         // We send a message to buyer to wait
-                                        let message = crate::messages::you_sent_fiat(seller_pubkey);
-                                        let buyer_keys = nostr::key::Keys::from_public_key(
-                                            nostr::key::XOnlyPublicKey::from_bech32(seller_pubkey)?,
-                                        );
+                                        let message =
+                                            crate::messages::you_sent_fiat(seller_pubkey)?;
+                                        let buyer_pubkey = seller_pubkey;
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
-                                            &buyer_keys,
+                                            &buyer_pubkey,
                                             message,
                                         )
                                         .await?;
@@ -234,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
                                     types::Action::Release => {
                                         // TODO: Add validations
                                         // is the seller pubkey?
-                                        let seller_pubkey = event.pubkey.to_bech32()?;
+                                        let seller_pubkey = event.pubkey;
                                         let status = crate::types::Status::SettledHoldInvoice;
                                         let order_id = msg.order_id.unwrap();
                                         let db_order = crate::models::Order::by_id(&pool, order_id)
@@ -252,33 +243,26 @@ async fn main() -> anyhow::Result<()> {
                                             &pool, &client, &my_keys, status, &db_order,
                                         )
                                         .await?;
-                                        let seller_keys = nostr::key::Keys::from_public_key(
-                                            nostr::key::XOnlyPublicKey::from_bech32(
-                                                &seller_pubkey,
-                                            )?,
-                                        );
                                         // We send a message to seller
-                                        let buyer_pubkey = db_order.buyer_pubkey.as_ref().unwrap();
-                                        let message = crate::messages::sell_success(buyer_pubkey);
+                                        let buyer_pubkey = XOnlyPublicKey::from_bech32(
+                                            db_order.buyer_pubkey.as_ref().unwrap(),
+                                        )?;
+                                        let message = crate::messages::sell_success(buyer_pubkey)?;
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
-                                            &seller_keys,
+                                            &seller_pubkey,
                                             message,
                                         )
                                         .await?;
 
                                         // We send a *funds released* message to buyer
                                         let message =
-                                            crate::messages::funds_released(&seller_pubkey);
-                                        let buyer_keys = nostr::key::Keys::from_public_key(
-                                            nostr::key::XOnlyPublicKey::from_bech32(buyer_pubkey)?,
-                                        );
-
+                                            crate::messages::funds_released(seller_pubkey)?;
                                         crate::util::send_dm(
                                             &client,
                                             &my_keys,
-                                            &buyer_keys,
+                                            &buyer_pubkey,
                                             message,
                                         )
                                         .await?;

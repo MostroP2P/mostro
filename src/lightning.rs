@@ -3,9 +3,8 @@ use dotenvy::var;
 use easy_hasher::easy_hasher::*;
 use lightning_invoice::Invoice;
 use log::info;
-use nostr::hashes::hex::FromHex;
-use nostr::hashes::hex::ToHex;
-use rand::RngCore;
+use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
+use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use std::str::FromStr;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,

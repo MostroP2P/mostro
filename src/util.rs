@@ -2,12 +2,8 @@ use crate::types::{self, Order};
 use anyhow::Result;
 use dotenvy::var;
 use log::{error, info};
-use nostr::event::tag::{Tag, TagKind};
-use nostr::key::FromSkStr;
-use nostr::util::time::timestamp;
-use nostr::{EventBuilder, Kind};
-use nostr_sdk::nostr::Keys;
-use nostr_sdk::Client;
+use nostr_sdk::nostr::util::time::timestamp;
+use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use std::str::FromStr;
 
@@ -55,10 +51,10 @@ pub async fn publish_order(
 pub async fn send_dm(
     client: &Client,
     sender_keys: &Keys,
-    receiver_keys: &Keys,
+    receiver_pubkey: &XOnlyPublicKey,
     content: String,
 ) -> Result<()> {
-    let event = EventBuilder::new_encrypted_direct_msg(sender_keys, receiver_keys, content)?
+    let event = EventBuilder::new_encrypted_direct_msg(sender_keys, *receiver_pubkey, content)?
         .to_event(sender_keys)?;
     info!("Sending event: {event:#?}");
     client.send_event(event).await?;
@@ -66,10 +62,10 @@ pub async fn send_dm(
     Ok(())
 }
 
-pub fn get_keys() -> Result<nostr::Keys> {
+pub fn get_keys() -> Result<Keys> {
     // nostr private key
     let nsec1privkey = var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
-    let my_keys = nostr::key::Keys::from_sk_str(&nsec1privkey)?;
+    let my_keys = Keys::from_sk_str(&nsec1privkey)?;
 
     Ok(my_keys)
 }
@@ -94,13 +90,12 @@ pub async fn update_order_event(
         None,
         Some(timestamp()),
     );
-    let order_string = publish_order.as_json().unwrap();
+    let order_string = publish_order.as_json()?;
     // nip33 kind and d tag
     let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order.id.to_string()]);
-    let event = EventBuilder::new(Kind::Custom(event_kind), &order_string, &[d_tag])
-        .to_event(keys)
-        .unwrap();
+    let event =
+        EventBuilder::new(Kind::Custom(event_kind), &order_string, &[d_tag]).to_event(keys)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");
@@ -117,11 +112,11 @@ pub async fn update_order_event(
     })
 }
 
-pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
+pub async fn connect_nostr() -> Result<Client> {
     let my_keys = crate::util::get_keys()?;
 
     // Create new client
-    let client = nostr_sdk::Client::new(&my_keys);
+    let client = Client::new(&my_keys);
 
     let relays = vec![
         "wss://nostr.p2sh.co",
@@ -172,12 +167,12 @@ pub async fn connect_nostr() -> Result<nostr_sdk::Client> {
     ];
 
     // Add relays
-    for r in relays {
+    for r in relays.into_iter() {
         client.add_relay(r, None).await?;
     }
 
     // Connect to relays and keep connection alive
-    client.connect().await?;
+    client.connect().await;
 
     Ok(client)
 }

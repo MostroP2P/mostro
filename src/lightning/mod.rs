@@ -1,11 +1,12 @@
+pub mod invoice;
+
+use crate::lightning::invoice::decode_invoice;
 use anyhow::Result;
 use dotenvy::var;
 use easy_hasher::easy_hasher::*;
-use lightning_invoice::Invoice;
 use log::info;
 use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
-use std::str::FromStr;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
@@ -199,11 +200,4 @@ impl LndConnector {
             }
         }
     }
-}
-
-/// Decode a lightning invoice (bolt11)
-pub fn decode_invoice(payment_request: &str) -> Result<Invoice> {
-    let invoice = Invoice::from_str(payment_request)?;
-
-    Ok(invoice)
 }

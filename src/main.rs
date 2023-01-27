@@ -1,5 +1,15 @@
-use crate::util::publish_order;
+pub mod db;
+pub mod flow;
+pub mod lightning;
+pub mod messages;
+pub mod models;
+pub mod types;
+pub mod util;
+
 use dotenvy::dotenv;
+use lightning::invoice::is_valid_invoice;
+use util::publish_order;
+
 use log::info;
 use nostr::hashes::hex::ToHex;
 use nostr::util::nips::nip04::decrypt;
@@ -9,14 +19,6 @@ use nostr::{Kind, KindBase, SubscriptionFilter};
 use nostr_sdk::RelayPoolNotifications;
 use sqlx_crud::Crud;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
-
-pub mod db;
-pub mod flow;
-pub mod lightning;
-pub mod messages;
-pub mod models;
-pub mod types;
-pub mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -68,7 +70,9 @@ async fn main() -> anyhow::Result<()> {
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
-                                            // TODO: Verify if payment_request is a valid lightning invoice
+                                            // Verify if invoice is valid
+                                            is_valid_invoice(&payment_request)?;
+
                                             let status = crate::types::Status::WaitingPayment;
                                             let buyer_pubkey = event.pubkey.to_bech32()?;
                                             let order_id = msg.order_id.unwrap();

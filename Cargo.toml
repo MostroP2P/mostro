@@ -1,6 +1,6 @@
 [package]
 name = "mostro"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 license = "MIT"
 authors = ["Francisco Calderón <fjcalderon@gmail.com>"]

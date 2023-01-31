@@ -64,7 +64,7 @@ pub async fn send_dm(
 
 pub fn get_keys() -> Result<Keys> {
     // nostr private key
-    let nsec1privkey = var("NSEC_PRIVKEY").expect("$NSEC_PRIVKEY is not set");
+    let nsec1privkey = var("NSEC_PRIVKEY").expect("NSEC_PRIVKEY is not set");
     let my_keys = Keys::from_sk_str(&nsec1privkey)?;
 
     Ok(my_keys)
@@ -130,7 +130,6 @@ pub async fn connect_nostr() -> Result<Client> {
         "wss://relay.nostropolis.xyz/websocket",
         "wss://nostr.supremestack.xyz",
         "wss://nostr.shawnyeager.net",
-        "wss://relay.ryzizub.com",
         "wss://relay.nostrmoto.xyz",
         "wss://jiggytom.ddns.net",
         "wss://nostr.roundrockbitcoiners.com",
@@ -142,7 +141,6 @@ pub async fn connect_nostr() -> Result<Client> {
         "wss://nostr.digitalreformation.info",
         "wss://nostr-relay.usebitcoin.space",
         "wss://nostr.bch.ninja",
-        "wss://nostr.demovement.net",
         "wss://nostr.massmux.com",
         "wss://nostr-pub1.southflorida.ninja",
         "wss://nostr.itssilvestre.com",

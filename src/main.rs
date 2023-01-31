@@ -64,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
                                             .await?
                                         }
                                     }
-                                    // TODO: Change this status to TakeSell
                                     types::Action::TakeSell => {
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
@@ -75,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
                                             match is_valid {
                                                 Ok(_) => {}
                                                 Err(e) => match e {
-                                                    MostroError::ParsingInvoiceError => {
+                                                    MostroError::ParsingInvoiceError
+                                                    | MostroError::InvoiceExpiredError
+                                                    | MostroError::MinExpirationTimeError
+                                                    | MostroError::MinAmountError => {
                                                         crate::util::send_dm(
                                                             &client,
                                                             &my_keys,
@@ -83,9 +85,9 @@ async fn main() -> anyhow::Result<()> {
                                                             e.to_string(),
                                                         )
                                                         .await?;
-                                                        log::error!("{e}");
                                                         break;
                                                     }
+                                                    _ => {}
                                                 },
                                             }
 

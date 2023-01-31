@@ -1,9 +1,9 @@
 [package]
 name = "mostro"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 license = "MIT"
-authors = ["Francisco Calderón <fjcalderon@gmail.com>"]
+authors = ["Francisco Calderón <negrunch@grunch.dev>"]
 description = "Lightning Network peer-to-peer nostr platform"
 
 [dependencies]

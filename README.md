@@ -93,8 +93,7 @@ Before start building we need to initialize the database, for this we need to us
 
 ```bash
 $ cargo install sqlx-cli
-$ sqlx db create
-$ sqlx migrate run
+$ ./init_db.sh
 ```
 
 Running it:

@@ -1,7 +1,9 @@
+use crate::models::NewOrder;
 use anyhow::{Ok, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use uuid::Uuid;
 
 /// Orders can be only Buy or Sell
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +75,7 @@ impl fmt::Display for Action {
 pub struct Message {
     pub version: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub order_id: Option<i64>,
+    pub order_id: Option<Uuid>,
     pub action: Action,
     pub content: Option<Content>,
 }
@@ -81,7 +83,7 @@ pub struct Message {
 /// Message content
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Content {
-    Order(Order),
+    Order(NewOrder),
     PaymentRequest(String),
 }
 
@@ -128,7 +130,7 @@ impl Message {
         }
     }
 
-    pub fn get_order(&self) -> Option<&Order> {
+    pub fn get_order(&self) -> Option<&NewOrder> {
         if self.action != Action::Order {
             return None;
         }
@@ -146,62 +148,5 @@ impl Message {
             Some(Content::PaymentRequest(pr)) => Some(pr.to_owned()),
             _ => None,
         }
-    }
-}
-
-/// Mostro Order
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Order {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<i64>,
-    pub kind: Kind,
-    pub status: Status,
-    pub amount: u32,
-    pub fiat_code: String,
-    pub fiat_amount: u32,
-    pub payment_method: String,
-    pub prime: i8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_request: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<u64>, // unix timestamp seconds
-}
-
-#[allow(dead_code)]
-impl Order {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: Option<i64>,
-        kind: Kind,
-        status: Status,
-        amount: u32,
-        fiat_code: String,
-        fiat_amount: u32,
-        payment_method: String,
-        prime: i8,
-        payment_request: Option<String>,
-        created_at: Option<u64>,
-    ) -> Self {
-        Self {
-            id,
-            kind,
-            status,
-            amount,
-            fiat_code,
-            fiat_amount,
-            payment_method,
-            prime,
-            payment_request,
-            created_at,
-        }
-    }
-    /// New order from json string
-    pub fn from_json(json: &str) -> Result<Self> {
-        Ok(serde_json::from_str(json)?)
-    }
-
-    /// Get order as json string
-    pub fn as_json(&self) -> Result<String> {
-        Ok(serde_json::to_string(&self)?)
     }
 }

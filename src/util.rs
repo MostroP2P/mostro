@@ -1,8 +1,8 @@
-use crate::types::{self, Order};
+use crate::models::{NewOrder, Order};
+use crate::types::{Kind as OrderKind, Status};
 use anyhow::Result;
 use dotenvy::var;
 use log::{error, info};
-use nostr_sdk::nostr::util::time::timestamp;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -11,25 +11,28 @@ pub async fn publish_order(
     pool: &SqlitePool,
     client: &Client,
     keys: &Keys,
-    order: &Order,
+    new_order: &NewOrder,
     initiator_pubkey: &str,
 ) -> Result<()> {
-    let order_id = crate::db::add_order(pool, order, "", initiator_pubkey).await?;
-    info!("New order saved Id: {order_id}");
+    let order = crate::db::add_order(pool, new_order, "", initiator_pubkey).await?;
+    let order_id = order.id;
+    info!("New order saved Id: {}", order_id);
     // Now we have the order id, we can create a new event adding this id to the Order object
-    let order = Order::new(
+    let order = NewOrder::new(
         Some(order_id),
-        order.kind,
-        types::Status::Pending,
+        OrderKind::from_str(&order.kind).unwrap(),
+        Status::Pending,
         order.amount,
-        order.fiat_code.to_owned(),
+        order.fiat_code,
         order.fiat_amount,
-        order.payment_method.to_owned(),
+        order.payment_method,
         order.prime,
-        None,
-        Some(timestamp()),
+        order.buyer_invoice,
+        Some(order.created_at),
     );
+
     let order_string = order.as_json().unwrap();
+    info!("serialized order: {order_string}");
     // This tag (nip33) allows us to change this event in particular in the future
     let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
@@ -39,8 +42,7 @@ pub async fn publish_order(
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order_id, &types::Status::Pending, &event_id)
-        .await?;
+    crate::db::update_order_event_id_status(pool, order_id, &Status::Pending, &event_id).await?;
     client
         .send_event(event)
         .await
@@ -74,21 +76,21 @@ pub async fn update_order_event(
     pool: &SqlitePool,
     client: &Client,
     keys: &Keys,
-    status: types::Status,
-    order: &crate::models::Order,
+    status: Status,
+    order: &Order,
 ) -> Result<()> {
-    let kind = crate::types::Kind::from_str(&order.kind).unwrap();
-    let publish_order = Order::new(
+    let kind = OrderKind::from_str(&order.kind).unwrap();
+    let publish_order = NewOrder::new(
         Some(order.id),
         kind,
         status.clone(),
-        order.amount as u32,
+        order.amount,
         order.fiat_code.to_owned(),
-        order.fiat_amount as u32,
+        order.fiat_amount,
         order.payment_method.to_owned(),
         0,
         None,
-        Some(timestamp()),
+        Some(order.created_at),
     );
     let order_string = publish_order.as_json()?;
     // nip33 kind and d tag
@@ -119,7 +121,6 @@ pub async fn connect_nostr() -> Result<Client> {
     let client = Client::new(&my_keys);
 
     let relays = vec![
-        "wss://nostr.p2sh.co",
         "wss://relay.nostr.vision",
         "wss://nostr.itssilvestre.com",
         "wss://nostr.drss.io",
@@ -131,11 +132,8 @@ pub async fn connect_nostr() -> Result<Client> {
         "wss://nostr.supremestack.xyz",
         "wss://nostr.shawnyeager.net",
         "wss://relay.nostrmoto.xyz",
-        "wss://jiggytom.ddns.net",
         "wss://nostr.roundrockbitcoiners.com",
         "wss://nostr.utxo.lol",
-        "wss://relay.nostrid.com",
-        "wss://nostr1.starbackr.me",
         "wss://nostr-relay.schnitzel.world",
         "wss://sg.qemura.xyz",
         "wss://nostr.digitalreformation.info",

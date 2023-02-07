@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
                                             // Now we generate the hold invoice the seller need pay
                                             let (invoice_response, preimage, hash) = ln_client
                                                 .create_hold_invoice(
-                                                    &db_order.description,
+                                                    "invoice description",
                                                     db_order.amount,
                                                 )
                                                 .await?;
@@ -308,19 +308,19 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{Message, Order};
+    use crate::types::Message;
 
     #[test]
     fn test_order_deserialize_serialize() {
-        let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1,"created_at":1640839235}"#;
-        let order = Order::from_json(sample_order).unwrap();
+        let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1}"#;
+        let order = crate::models::NewOrder::from_json(sample_order).unwrap();
         let json_order = order.as_json().unwrap();
         assert_eq!(sample_order, json_order);
     }
 
     #[test]
     fn test_message_deserialize_serialize() {
-        let sample_message = r#"{"version":0,"order_id":54,"action":"TakeSell","content":{"PaymentRequest":"lnbc1..."}}"#;
+        let sample_message = r#"{"version":0,"order_id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"TakeSell","content":{"PaymentRequest":"lnbc1..."}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(message.verify());
         let json_message = message.as_json().unwrap();

@@ -1,6 +1,7 @@
 use crate::models::Order;
 use anyhow::Result;
 use nostr_sdk::prelude::*;
+use uuid::Uuid;
 
 pub fn payment_request(order: &Order, hold_invoice: &str) -> String {
     format!(
@@ -13,7 +14,7 @@ pub fn payment_request(order: &Order, hold_invoice: &str) -> String {
     )
 }
 
-pub fn waiting_seller_to_pay_invoice(order_id: i64) -> String {
+pub fn waiting_seller_to_pay_invoice(order_id: Uuid) -> String {
     format!("I have sent a payment request to the seller so he sends your sats for the order Id: {order_id}, as soon as payment is made I will put you both in touch")
 }
 
@@ -48,7 +49,7 @@ pub fn funds_released(seller_pubkey: XOnlyPublicKey) -> Result<String> {
     Ok(format!("🕐 {} already released the satoshis, expect your invoice to be paid any time, remember your wallet needs to be online to receive through lighntning network.", seller_pubkey.to_bech32()?))
 }
 
-pub fn pending_payment_success(amount: i32, order_id: i64, preimage: &str) -> String {
+pub fn pending_payment_success(amount: i32, order_id: Uuid, preimage: &str) -> String {
     format!(
         "I have paid your lightning invoice for ${amount} satoshis, Order Id: ${order_id}!
 
@@ -56,7 +57,7 @@ pub fn pending_payment_success(amount: i32, order_id: i64, preimage: &str) -> St
     )
 }
 
-pub fn order_canceled(order_id: i64) -> String {
+pub fn order_canceled(order_id: Uuid) -> String {
     format!("Order Id: {order_id} was canceled")
 }
 

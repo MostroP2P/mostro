@@ -10,31 +10,33 @@ pub mod util;
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
-use util::publish_order;
+use util::{publish_order, send_dm, update_order_event};
 
 use log::info;
+use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::nostr::util::time::timestamp;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use types::Status;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
     pretty_env_logger::init();
     // Connect to database
-    let pool = crate::db::connect().await?;
+    let pool = db::connect().await?;
     // Connect to relays
-    let client = crate::util::connect_nostr().await?;
-    let my_keys = crate::util::get_keys()?;
+    let client = util::connect_nostr().await?;
+    let my_keys = util::get_keys()?;
 
     let subscription = SubscriptionFilter::new()
         .pubkey(my_keys.public_key())
         .since(timestamp());
 
     client.subscribe(vec![subscription]).await?;
-    let mut ln_client = crate::lightning::LndConnector::new().await;
+    let mut ln_client = lightning::LndConnector::new().await;
 
     loop {
         let mut notifications = client.notifications();
@@ -78,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
                                                     | MostroError::InvoiceExpiredError
                                                     | MostroError::MinExpirationTimeError
                                                     | MostroError::MinAmountError => {
-                                                        crate::util::send_dm(
+                                                        send_dm(
                                                             &client,
                                                             &my_keys,
                                                             &buyer_pubkey,
@@ -91,12 +93,10 @@ async fn main() -> anyhow::Result<()> {
                                                 },
                                             }
 
-                                            let status = crate::types::Status::WaitingPayment;
+                                            let status = Status::WaitingPayment;
                                             let order_id = msg.order_id.unwrap();
                                             let db_order =
-                                                crate::models::Order::by_id(&pool, order_id)
-                                                    .await?
-                                                    .unwrap();
+                                                Order::by_id(&pool, order_id).await?.unwrap();
 
                                             // Now we generate the hold invoice the seller need pay
                                             let (invoice_response, preimage, hash) = ln_client
@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
                                                     db_order.amount,
                                                 )
                                                 .await?;
-                                            crate::db::edit_order(
+                                            db::edit_order(
                                                 &pool,
                                                 &status,
                                                 order_id,
@@ -116,40 +116,29 @@ async fn main() -> anyhow::Result<()> {
                                             )
                                             .await?;
                                             // We need to publish a new event with the new status
-                                            crate::util::update_order_event(
+                                            update_order_event(
                                                 &pool, &client, &my_keys, status, &db_order,
                                             )
                                             .await?;
                                             let seller_pubkey = XOnlyPublicKey::from_bech32(
                                                 db_order.seller_pubkey.as_ref().unwrap(),
                                             )?;
-                                            let message = crate::messages::payment_request(
+                                            let message = messages::payment_request(
                                                 &db_order,
                                                 &invoice_response.payment_request,
                                             );
                                             // We send the hold invoice to the seller
-                                            crate::util::send_dm(
-                                                &client,
-                                                &my_keys,
-                                                &seller_pubkey,
-                                                message,
-                                            )
-                                            .await?;
-                                            let message =
-                                                crate::messages::waiting_seller_to_pay_invoice(
-                                                    db_order.id,
-                                                );
+                                            send_dm(&client, &my_keys, &seller_pubkey, message)
+                                                .await?;
+                                            let message = messages::waiting_seller_to_pay_invoice(
+                                                db_order.id,
+                                            );
 
                                             // We send a message to buyer to know that seller was requested to pay the invoice
-                                            crate::util::send_dm(
-                                                &client,
-                                                &my_keys,
-                                                &buyer_pubkey,
-                                                message,
-                                            )
-                                            .await?;
+                                            send_dm(&client, &my_keys, &buyer_pubkey, message)
+                                                .await?;
                                             let mut ln_client_invoices =
-                                                crate::lightning::LndConnector::new().await;
+                                                lightning::LndConnector::new().await;
                                             let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
                                             let invoice_task = {
@@ -167,8 +156,7 @@ async fn main() -> anyhow::Result<()> {
                                                         let hash = msg.hash.to_hex();
                                                         // If this invoice was paid by the seller
                                                         if msg.state == InvoiceState::Accepted {
-                                                            crate::flow::hold_invoice_paid(&hash)
-                                                                .await;
+                                                            flow::hold_invoice_paid(&hash).await;
                                                             println!("Invoice with hash {hash} accepted!");
                                                         } else if msg.state == InvoiceState::Settled
                                                         {
@@ -176,19 +164,15 @@ async fn main() -> anyhow::Result<()> {
                                                             println!(
                                                                 "Invoice with hash {hash} settled!"
                                                             );
-                                                            crate::flow::hold_invoice_settlement(
-                                                                &hash,
-                                                            )
-                                                            .await;
+                                                            flow::hold_invoice_settlement(&hash)
+                                                                .await;
                                                         } else if msg.state
                                                             == InvoiceState::Canceled
                                                         {
                                                             // If the payment was canceled
                                                             println!("Invoice with hash {hash} canceled!");
-                                                            crate::flow::hold_invoice_canceled(
-                                                                &hash,
-                                                            )
-                                                            .await;
+                                                            flow::hold_invoice_canceled(&hash)
+                                                                .await;
                                                         } else {
                                                             info!("Invoice with hash: {hash} subscribed!");
                                                         }
@@ -208,15 +192,14 @@ async fn main() -> anyhow::Result<()> {
                                         // TODO: Add validations
                                         // is the buyer pubkey?
                                         let buyer_pubkey = event.pubkey;
-                                        let status = crate::types::Status::FiatSent;
+                                        let status = types::Status::FiatSent;
                                         let order_id = msg.order_id.unwrap();
-                                        let db_order = crate::models::Order::by_id(&pool, order_id)
-                                            .await?
-                                            .unwrap();
+                                        let db_order =
+                                            Order::by_id(&pool, order_id).await?.unwrap();
 
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
-                                        crate::util::update_order_event(
+                                        update_order_event(
                                             &pool, &client, &my_keys, status, &db_order,
                                         )
                                         .await?;
@@ -224,36 +207,21 @@ async fn main() -> anyhow::Result<()> {
                                             db_order.seller_pubkey.as_ref().unwrap(),
                                         )?;
                                         // We send a message to seller to release
-                                        let message =
-                                            crate::messages::buyer_sentfiat(buyer_pubkey)?;
-                                        crate::util::send_dm(
-                                            &client,
-                                            &my_keys,
-                                            &seller_pubkey,
-                                            message,
-                                        )
-                                        .await?;
+                                        let message = messages::buyer_sentfiat(buyer_pubkey)?;
+                                        send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
-                                        let message =
-                                            crate::messages::you_sent_fiat(seller_pubkey)?;
+                                        let message = messages::you_sent_fiat(seller_pubkey)?;
                                         let buyer_pubkey = seller_pubkey;
-                                        crate::util::send_dm(
-                                            &client,
-                                            &my_keys,
-                                            &buyer_pubkey,
-                                            message,
-                                        )
-                                        .await?;
+                                        send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                     }
                                     types::Action::Release => {
                                         // TODO: Add validations
                                         // is the seller pubkey?
                                         let seller_pubkey = event.pubkey;
-                                        let status = crate::types::Status::SettledHoldInvoice;
+                                        let status = Status::SettledHoldInvoice;
                                         let order_id = msg.order_id.unwrap();
-                                        let db_order = crate::models::Order::by_id(&pool, order_id)
-                                            .await?
-                                            .unwrap();
+                                        let db_order =
+                                            Order::by_id(&pool, order_id).await?.unwrap();
                                         if db_order.preimage.is_none() {
                                             break;
                                         }
@@ -262,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
                                         info!("Order Id: {} - Released sats", &db_order.id);
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
-                                        crate::util::update_order_event(
+                                        update_order_event(
                                             &pool, &client, &my_keys, status, &db_order,
                                         )
                                         .await?;
@@ -270,25 +238,12 @@ async fn main() -> anyhow::Result<()> {
                                         let buyer_pubkey = XOnlyPublicKey::from_bech32(
                                             db_order.buyer_pubkey.as_ref().unwrap(),
                                         )?;
-                                        let message = crate::messages::sell_success(buyer_pubkey)?;
-                                        crate::util::send_dm(
-                                            &client,
-                                            &my_keys,
-                                            &seller_pubkey,
-                                            message,
-                                        )
-                                        .await?;
+                                        let message = messages::sell_success(buyer_pubkey)?;
+                                        send_dm(&client, &my_keys, &seller_pubkey, message).await?;
 
                                         // We send a *funds released* message to buyer
-                                        let message =
-                                            crate::messages::funds_released(seller_pubkey)?;
-                                        crate::util::send_dm(
-                                            &client,
-                                            &my_keys,
-                                            &buyer_pubkey,
-                                            message,
-                                        )
-                                        .await?;
+                                        let message = messages::funds_released(seller_pubkey)?;
+                                        send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                         // Finally we try to pay buyer's invoice
                                         let payment_request =
                                             db_order.buyer_invoice.as_ref().unwrap();
@@ -308,12 +263,13 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::NewOrder;
     use crate::types::Message;
 
     #[test]
     fn test_order_deserialize_serialize() {
         let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","prime":1}"#;
-        let order = crate::models::NewOrder::from_json(sample_order).unwrap();
+        let order = NewOrder::from_json(sample_order).unwrap();
         let json_order = order.as_json().unwrap();
         assert_eq!(sample_order, json_order);
     }

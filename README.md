@@ -1,6 +1,5 @@
 # Mostro 🧌
 
-![Mostro-ascii](static/mostro.png)
 ![Mostro-logo](static/logo.png)
 
 ## Overview

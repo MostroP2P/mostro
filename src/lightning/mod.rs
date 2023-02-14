@@ -7,12 +7,12 @@ use easy_hasher::easy_hasher::*;
 use log::info;
 use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
+use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
-use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
+use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, Payment};
 use tonic_openssl_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use tonic_openssl_lnd::{LndClient, LndClientError};
 
@@ -24,6 +24,11 @@ pub struct LndConnector {
 pub struct InvoiceMessage {
     pub hash: Vec<u8>,
     pub state: InvoiceState,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaymentMessage {
+    pub payment: Payment,
 }
 
 impl LndConnector {
@@ -70,11 +75,7 @@ impl LndConnector {
         Ok((holdinvoice, preimage.to_vec(), hash.to_vec()))
     }
 
-    pub async fn subscribe_invoice(
-        &mut self,
-        r_hash: Vec<u8>,
-        listener: tokio::sync::mpsc::Sender<InvoiceMessage>,
-    ) {
+    pub async fn subscribe_invoice(&mut self, r_hash: Vec<u8>, listener: Sender<InvoiceMessage>) {
         let mut invoice_stream = self
             .client
             .invoices()
@@ -144,7 +145,12 @@ impl LndConnector {
         Ok(cancel)
     }
 
-    pub async fn send_payment(&mut self, payment_request: &str, amount: i64) {
+    pub async fn send_payment(
+        &mut self,
+        payment_request: &str,
+        amount: i64,
+        listener: Sender<PaymentMessage>,
+    ) {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
@@ -191,13 +197,12 @@ impl LndConnector {
             .into_inner();
 
         while let Some(payment) = stream.message().await.expect("Failed paying invoice") {
-            if let Some(status) = PaymentStatus::from_i32(payment.status) {
-                if status == PaymentStatus::Succeeded {
-                    info!("Invoice with hash: {hash} paid!");
-                    // TODO: send messages to parties
-                    // update order record
-                }
-            }
+            let msg = PaymentMessage { payment };
+            listener
+                .clone()
+                .send(msg)
+                .await
+                .expect("Failed to send a message");
         }
     }
 }

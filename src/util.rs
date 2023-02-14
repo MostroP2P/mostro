@@ -123,12 +123,10 @@ pub async fn connect_nostr() -> Result<Client> {
     let relays = vec![
         "wss://relay.nostr.vision",
         "wss://nostr.itssilvestre.com",
-        "wss://nostr.drss.io",
         "wss://nostr.zebedee.cloud",
         "wss://public.nostr.swissrouting.com",
         "wss://nostr.slothy.win",
         "wss://nostr.rewardsbunny.com",
-        "wss://relay.nostropolis.xyz/websocket",
         "wss://nostr.supremestack.xyz",
         "wss://nostr.shawnyeager.net",
         "wss://relay.nostrmoto.xyz",
@@ -141,12 +139,11 @@ pub async fn connect_nostr() -> Result<Client> {
         "wss://nostr.bch.ninja",
         "wss://nostr.massmux.com",
         "wss://nostr-pub1.southflorida.ninja",
-        "wss://nostr.itssilvestre.com",
         "wss://relay.nostr.nu",
         "wss://nostr.easydns.ca",
         "wss://no-str.org",
         "wss://nostrical.com",
-        "wss://student.chadpolytechnic.com",
+        "wss://relay.damus.io",
     ];
 
     // Add relays

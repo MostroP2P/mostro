@@ -45,6 +45,14 @@ pub fn sell_success(buyer_pubkey: XOnlyPublicKey) -> Result<String> {
     ))
 }
 
+pub fn purchase_completed(seller_pubkey: XOnlyPublicKey) -> Result<String> {
+    Ok(format!("
+    🪙 Your satoshis purchase has been completed successful, {} has confirmed your fiat payment and I have paid your invoice, enjoy sound money!
+
+    ⚡️🍊⚡️
+    ", seller_pubkey.to_bech32()?))
+}
+
 pub fn funds_released(seller_pubkey: XOnlyPublicKey) -> Result<String> {
     Ok(format!("🕐 {} already released the satoshis, expect your invoice to be paid any time, remember your wallet needs to be online to receive through lighntning network.", seller_pubkey.to_bech32()?))
 }

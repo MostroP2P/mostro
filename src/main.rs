@@ -10,16 +10,16 @@ pub mod util;
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
-use util::{publish_order, send_dm, update_order_event};
-
 use log::info;
 use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::nostr::util::time::timestamp;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tokio::sync::mpsc::channel;
+use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
 use types::Status;
+use util::{publish_order, send_dm, update_order_event};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
                                                 .await?;
                                             let mut ln_client_invoices =
                                                 lightning::LndConnector::new().await;
-                                            let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+                                            let (tx, mut rx) = channel(100);
 
                                             let invoice_task = {
                                                 async move {
@@ -211,7 +211,6 @@ async fn main() -> anyhow::Result<()> {
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
                                         let message = messages::you_sent_fiat(seller_pubkey)?;
-                                        let buyer_pubkey = seller_pubkey;
                                         send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                     }
                                     types::Action::Release => {
@@ -227,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         let preimage = db_order.preimage.as_ref().unwrap();
                                         ln_client.settle_hold_invoice(preimage).await?;
-                                        info!("Order Id: {} - Released sats", &db_order.id);
+                                        info!("Order Id {}: Released sats", &db_order.id);
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         update_order_event(
@@ -246,10 +245,72 @@ async fn main() -> anyhow::Result<()> {
                                         send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                         // Finally we try to pay buyer's invoice
                                         let payment_request =
-                                            db_order.buyer_invoice.as_ref().unwrap();
-                                        ln_client
-                                            .send_payment(payment_request, db_order.amount)
-                                            .await;
+                                            db_order.buyer_invoice.as_ref().unwrap().to_string();
+                                        let mut ln_client_payment =
+                                            lightning::LndConnector::new().await;
+                                        let (tx, mut rx) = channel(100);
+                                        let payment_task = {
+                                            async move {
+                                                ln_client_payment
+                                                    .send_payment(
+                                                        &payment_request,
+                                                        db_order.amount,
+                                                        tx,
+                                                    )
+                                                    .await;
+                                            }
+                                        };
+                                        tokio::spawn(payment_task);
+                                        let payment = {
+                                            async move {
+                                                // We redeclare vars to use inside this block
+                                                let client = util::connect_nostr().await.unwrap();
+                                                let my_keys = util::get_keys().unwrap();
+                                                let buyer_pubkey = XOnlyPublicKey::from_bech32(
+                                                    db_order.buyer_pubkey.as_ref().unwrap(),
+                                                )
+                                                .unwrap();
+                                                let pool = db::connect().await.unwrap();
+                                                // Receiving msgs from send_payment()
+                                                while let Some(msg) = rx.recv().await {
+                                                    if let Some(status) =
+                                                        PaymentStatus::from_i32(msg.payment.status)
+                                                    {
+                                                        if status == PaymentStatus::Succeeded {
+                                                            info!(
+                                                                "Order Id {}: Invoice with hash: {} paid!",
+                                                                db_order.id,
+                                                                msg.payment.payment_hash
+                                                            );
+                                                            // Purchase completed message to buyer
+                                                            let message =
+                                                                messages::purchase_completed(
+                                                                    buyer_pubkey,
+                                                                )
+                                                                .unwrap();
+                                                            send_dm(
+                                                                &client,
+                                                                &my_keys,
+                                                                &buyer_pubkey,
+                                                                message,
+                                                            )
+                                                            .await
+                                                            .unwrap();
+                                                            let status = Status::Success;
+                                                            // We publish a new replaceable kind nostr event with the status updated
+                                                            // and update on local database the status and new event id
+                                                            update_order_event(
+                                                                &pool, &client, &my_keys, status,
+                                                                &db_order,
+                                                            )
+                                                            .await
+                                                            .unwrap();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        tokio::spawn(payment);
                                     }
                                 }
                             }

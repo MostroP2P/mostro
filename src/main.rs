@@ -10,7 +10,7 @@ pub mod util;
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
-use log::info;
+use log::{error, info};
 use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::nostr::util::time::timestamp;
@@ -71,9 +71,8 @@ async fn main() -> anyhow::Result<()> {
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
                                             // Verify if invoice is valid
-                                            let is_valid = is_valid_invoice(&payment_request);
                                             let buyer_pubkey = event.pubkey;
-                                            match is_valid {
+                                            match is_valid_invoice(&payment_request) {
                                                 Ok(_) => {}
                                                 Err(e) => match e {
                                                     MostroError::ParsingInvoiceError
@@ -87,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
                                                             e.to_string(),
                                                         )
                                                         .await?;
+                                                        error!("{e}");
                                                         break;
                                                     }
                                                     _ => {}
@@ -94,15 +94,37 @@ async fn main() -> anyhow::Result<()> {
                                             }
 
                                             let status = Status::WaitingPayment;
+                                            // Safe unwrap as we verified the message
                                             let order_id = msg.order_id.unwrap();
-                                            let db_order =
-                                                Order::by_id(&pool, order_id).await?.unwrap();
+                                            let order = match Order::by_id(&pool, order_id).await? {
+                                                Some(order) => order,
+                                                None => {
+                                                    error!("Order Id {order_id} not found!");
+                                                    break;
+                                                }
+                                            };
 
-                                            // Now we generate the hold invoice the seller need pay
+                                            if order.status != "Pending" {
+                                                send_dm(
+                                                    &client,
+                                                    &my_keys,
+                                                    &buyer_pubkey,
+                                                    "Order Id {order_id} was already taken!"
+                                                        .to_string(),
+                                                )
+                                                .await?;
+                                                break;
+                                            }
+                                            // Now we generate the hold invoice the seller need to pay
                                             let (invoice_response, preimage, hash) = ln_client
                                                 .create_hold_invoice(
-                                                    "invoice description",
-                                                    db_order.amount,
+                                                    &messages::hold_invoice_description(
+                                                        my_keys.public_key(),
+                                                        &order.id.to_string(),
+                                                        &order.fiat_code,
+                                                        &order.fiat_amount.to_string(),
+                                                    )?,
+                                                    order.amount,
                                                 )
                                                 .await?;
                                             db::edit_order(
@@ -117,22 +139,34 @@ async fn main() -> anyhow::Result<()> {
                                             .await?;
                                             // We need to publish a new event with the new status
                                             update_order_event(
-                                                &pool, &client, &my_keys, status, &db_order,
+                                                &pool, &client, &my_keys, status, &order,
                                             )
                                             .await?;
-                                            let seller_pubkey = XOnlyPublicKey::from_bech32(
-                                                db_order.seller_pubkey.as_ref().unwrap(),
-                                            )?;
+                                            let seller_pubkey = match order.seller_pubkey.as_ref() {
+                                                Some(pk) => pk,
+                                                None => {
+                                                    error!(
+                                                        "Seller pubkey not found for order {}!",
+                                                        order.id
+                                                    );
+                                                    break;
+                                                }
+                                            };
+
                                             let message = messages::payment_request(
-                                                &db_order,
+                                                &order,
                                                 &invoice_response.payment_request,
                                             );
                                             // We send the hold invoice to the seller
-                                            send_dm(&client, &my_keys, &seller_pubkey, message)
-                                                .await?;
-                                            let message = messages::waiting_seller_to_pay_invoice(
-                                                db_order.id,
-                                            );
+                                            send_dm(
+                                                &client,
+                                                &my_keys,
+                                                &XOnlyPublicKey::from_bech32(seller_pubkey)?,
+                                                message,
+                                            )
+                                            .await?;
+                                            let message =
+                                                messages::waiting_seller_to_pay_invoice(order.id);
 
                                             // We send a message to buyer to know that seller was requested to pay the invoice
                                             send_dm(&client, &my_keys, &buyer_pubkey, message)
@@ -194,17 +228,16 @@ async fn main() -> anyhow::Result<()> {
                                         let buyer_pubkey = event.pubkey;
                                         let status = types::Status::FiatSent;
                                         let order_id = msg.order_id.unwrap();
-                                        let db_order =
-                                            Order::by_id(&pool, order_id).await?.unwrap();
+                                        let order = Order::by_id(&pool, order_id).await?.unwrap();
 
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         update_order_event(
-                                            &pool, &client, &my_keys, status, &db_order,
+                                            &pool, &client, &my_keys, status, &order,
                                         )
                                         .await?;
                                         let seller_pubkey = XOnlyPublicKey::from_bech32(
-                                            db_order.seller_pubkey.as_ref().unwrap(),
+                                            order.seller_pubkey.as_ref().unwrap(),
                                         )?;
                                         // We send a message to seller to release
                                         let message = messages::buyer_sentfiat(buyer_pubkey)?;
@@ -219,23 +252,22 @@ async fn main() -> anyhow::Result<()> {
                                         let seller_pubkey = event.pubkey;
                                         let status = Status::SettledHoldInvoice;
                                         let order_id = msg.order_id.unwrap();
-                                        let db_order =
-                                            Order::by_id(&pool, order_id).await?.unwrap();
-                                        if db_order.preimage.is_none() {
+                                        let order = Order::by_id(&pool, order_id).await?.unwrap();
+                                        if order.preimage.is_none() {
                                             break;
                                         }
-                                        let preimage = db_order.preimage.as_ref().unwrap();
+                                        let preimage = order.preimage.as_ref().unwrap();
                                         ln_client.settle_hold_invoice(preimage).await?;
-                                        info!("Order Id {}: Released sats", &db_order.id);
+                                        info!("Order Id {}: Released sats", &order.id);
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         update_order_event(
-                                            &pool, &client, &my_keys, status, &db_order,
+                                            &pool, &client, &my_keys, status, &order,
                                         )
                                         .await?;
                                         // We send a message to seller
                                         let buyer_pubkey = XOnlyPublicKey::from_bech32(
-                                            db_order.buyer_pubkey.as_ref().unwrap(),
+                                            order.buyer_pubkey.as_ref().unwrap(),
                                         )?;
                                         let message = messages::sell_success(buyer_pubkey)?;
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
@@ -245,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
                                         send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                         // Finally we try to pay buyer's invoice
                                         let payment_request =
-                                            db_order.buyer_invoice.as_ref().unwrap().to_string();
+                                            order.buyer_invoice.as_ref().unwrap().to_string();
                                         let mut ln_client_payment =
                                             lightning::LndConnector::new().await;
                                         let (tx, mut rx) = channel(100);
@@ -254,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
                                                 ln_client_payment
                                                     .send_payment(
                                                         &payment_request,
-                                                        db_order.amount,
+                                                        order.amount,
                                                         tx,
                                                     )
                                                     .await;
@@ -267,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
                                                 let client = util::connect_nostr().await.unwrap();
                                                 let my_keys = util::get_keys().unwrap();
                                                 let buyer_pubkey = XOnlyPublicKey::from_bech32(
-                                                    db_order.buyer_pubkey.as_ref().unwrap(),
+                                                    order.buyer_pubkey.as_ref().unwrap(),
                                                 )
                                                 .unwrap();
                                                 let pool = db::connect().await.unwrap();
@@ -279,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
                                                         if status == PaymentStatus::Succeeded {
                                                             info!(
                                                                 "Order Id {}: Invoice with hash: {} paid!",
-                                                                db_order.id,
+                                                                order.id,
                                                                 msg.payment.payment_hash
                                                             );
                                                             // Purchase completed message to buyer
@@ -301,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
                                                             // and update on local database the status and new event id
                                                             update_order_event(
                                                                 &pool, &client, &my_keys, status,
-                                                                &db_order,
+                                                                &order,
                                                             )
                                                             .await
                                                             .unwrap();

@@ -15,10 +15,10 @@ pub enum Kind {
 impl FromStr for Kind {
     type Err = ();
 
-    fn from_str(kind: &str) -> std::result::Result<Kind, Self::Err> {
+    fn from_str(kind: &str) -> std::result::Result<Self, Self::Err> {
         match kind {
-            "Buy" => std::result::Result::Ok(Kind::Buy),
-            "Sell" => std::result::Result::Ok(Kind::Sell),
+            "Buy" => std::result::Result::Ok(Self::Buy),
+            "Sell" => std::result::Result::Ok(Self::Sell),
             _ => Err(()),
         }
     }
@@ -31,7 +31,7 @@ impl fmt::Display for Kind {
 }
 
 /// Each status that an order can have
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub enum Status {
     Active,
     Canceled,
@@ -50,6 +50,28 @@ pub enum Status {
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+impl FromStr for Status {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "Active" => std::result::Result::Ok(Self::Active),
+            "Canceled" => std::result::Result::Ok(Self::Active),
+            "CanceledByAdmin" => std::result::Result::Ok(Self::Active),
+            "CompletedByAdmin" => std::result::Result::Ok(Self::Active),
+            "Dispute" => std::result::Result::Ok(Self::Active),
+            "Expired" => std::result::Result::Ok(Self::Active),
+            "FiatSent" => std::result::Result::Ok(Self::Active),
+            "SettledHoldInvoice" => std::result::Result::Ok(Self::Active),
+            "Pending" => std::result::Result::Ok(Self::Active),
+            "Success" => std::result::Result::Ok(Self::Active),
+            "WaitingBuyerInvoice" => std::result::Result::Ok(Self::Active),
+            "WaitingPayment" => std::result::Result::Ok(Self::Active),
+            _ => Err(()),
+        }
     }
 }
 

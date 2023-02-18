@@ -7,6 +7,8 @@ pub mod models;
 pub mod types;
 pub mod util;
 
+use std::str::FromStr;
+
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
@@ -72,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
                                         if let Some(payment_request) = msg.get_payment_request() {
                                             // Verify if invoice is valid
                                             let buyer_pubkey = event.pubkey;
+                                            // TODO: Validate if the invoice amount is right
                                             match is_valid_invoice(&payment_request) {
                                                 Ok(_) => {}
                                                 Err(e) => match e {
@@ -93,29 +96,40 @@ async fn main() -> anyhow::Result<()> {
                                                 },
                                             }
 
-                                            let status = Status::WaitingPayment;
                                             // Safe unwrap as we verified the message
                                             let order_id = msg.order_id.unwrap();
                                             let order = match Order::by_id(&pool, order_id).await? {
                                                 Some(order) => order,
                                                 None => {
-                                                    error!("Order Id {order_id} not found!");
+                                                    error!(
+                                                        "TakeSell: Order Id {order_id} not found!"
+                                                    );
                                                     break;
                                                 }
                                             };
 
-                                            if order.status != "Pending" {
+                                            let order_status = match Status::from_str(&order.status)
+                                            {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    error!("Error: Order Id {order_id} wrong status: {e:?}");
+                                                    break;
+                                                }
+                                            };
+                                            // Buyer can take pending orders only
+                                            if order_status != Status::Pending {
                                                 send_dm(
                                                     &client,
                                                     &my_keys,
                                                     &buyer_pubkey,
-                                                    "Order Id {order_id} was already taken!"
-                                                        .to_string(),
+                                                    format!(
+                                                        "Order Id {order_id} was already taken!"
+                                                    ),
                                                 )
                                                 .await?;
                                                 break;
                                             }
-                                            // Now we generate the hold invoice the seller need to pay
+                                            // Now we generate the hold invoice that seller should pay
                                             let (invoice_response, preimage, hash) = ln_client
                                                 .create_hold_invoice(
                                                     &messages::hold_invoice_description(
@@ -129,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
                                                 .await?;
                                             db::edit_order(
                                                 &pool,
-                                                &status,
+                                                &Status::WaitingPayment,
                                                 order_id,
                                                 &buyer_pubkey,
                                                 &payment_request,
@@ -139,7 +153,11 @@ async fn main() -> anyhow::Result<()> {
                                             .await?;
                                             // We need to publish a new event with the new status
                                             update_order_event(
-                                                &pool, &client, &my_keys, status, &order,
+                                                &pool,
+                                                &client,
+                                                &my_keys,
+                                                Status::WaitingPayment,
+                                                &order,
                                             )
                                             .await?;
                                             let seller_pubkey = match order.seller_pubkey.as_ref() {
@@ -223,28 +241,51 @@ async fn main() -> anyhow::Result<()> {
                                         todo!()
                                     }
                                     types::Action::FiatSent => {
-                                        // TODO: Add validations
-                                        // is the buyer pubkey?
-                                        let buyer_pubkey = event.pubkey;
-                                        let status = types::Status::FiatSent;
                                         let order_id = msg.order_id.unwrap();
-                                        let order = Order::by_id(&pool, order_id).await?.unwrap();
+                                        let order = match Order::by_id(&pool, order_id).await? {
+                                            Some(order) => order,
+                                            None => {
+                                                error!("FiatSent: Order Id {order_id} not found!");
+                                                break;
+                                            }
+                                        };
+                                        if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
+                                            send_dm(
+                                                &client,
+                                                &my_keys,
+                                                &event.pubkey,
+                                                messages::cant_do(),
+                                            )
+                                            .await?;
+                                        }
 
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         update_order_event(
-                                            &pool, &client, &my_keys, status, &order,
+                                            &pool,
+                                            &client,
+                                            &my_keys,
+                                            Status::FiatSent,
+                                            &order,
                                         )
                                         .await?;
-                                        let seller_pubkey = XOnlyPublicKey::from_bech32(
-                                            order.seller_pubkey.as_ref().unwrap(),
-                                        )?;
+
+                                        let seller_pubkey = match order.seller_pubkey.as_ref() {
+                                            Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+                                            None => {
+                                                error!(
+                                                    "Seller pubkey not found for order {}!",
+                                                    order.id
+                                                );
+                                                break;
+                                            }
+                                        };
                                         // We send a message to seller to release
-                                        let message = messages::buyer_sentfiat(buyer_pubkey)?;
+                                        let message = messages::buyer_sentfiat(event.pubkey)?;
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
                                         let message = messages::you_sent_fiat(seller_pubkey)?;
-                                        send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
+                                        send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
                                     types::Action::Release => {
                                         // TODO: Add validations

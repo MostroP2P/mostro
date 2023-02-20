@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
                                                 Some(order) => order,
                                                 None => {
                                                     error!(
-                                                        "TakeSell Error: Order Id {order_id} not found!"
+                                                        "TakeSell: Order Id {order_id} not found!"
                                                     );
                                                     break;
                                                 }
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
                                             {
                                                 Ok(s) => s,
                                                 Err(e) => {
-                                                    error!("TakeSell Error: Order Id {order_id} wrong status: {e:?}");
+                                                    error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
                                                     break;
                                                 }
                                             };
@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                                                 Some(pk) => pk,
                                                 None => {
                                                     error!(
-                                                        "TakeSell Error: Seller pubkey not found for order {}!",
+                                                        "TakeSell: Seller pubkey not found for order {}!",
                                                         order.id
                                                     );
                                                     break;
@@ -290,22 +290,39 @@ async fn main() -> anyhow::Result<()> {
                                         send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
                                     types::Action::Release => {
-                                        // TODO: Add validations
-                                        // is the seller pubkey?
-                                        let seller_pubkey = event.pubkey;
-                                        let status = Status::SettledHoldInvoice;
                                         let order_id = msg.order_id.unwrap();
-                                        let order = Order::by_id(&pool, order_id).await?.unwrap();
+                                        let order = match Order::by_id(&pool, order_id).await? {
+                                            Some(order) => order,
+                                            None => {
+                                                error!("Release: Order Id {order_id} not found!");
+                                                break;
+                                            }
+                                        };
+                                        let seller_pubkey = event.pubkey;
+                                        if Some(seller_pubkey.to_bech32()?) != order.seller_pubkey {
+                                            send_dm(
+                                                &client,
+                                                &my_keys,
+                                                &event.pubkey,
+                                                messages::cant_do(),
+                                            )
+                                            .await?;
+                                        }
+
                                         if order.preimage.is_none() {
                                             break;
                                         }
                                         let preimage = order.preimage.as_ref().unwrap();
                                         ln_client.settle_hold_invoice(preimage).await?;
-                                        info!("Order Id {}: Released sats", &order.id);
+                                        info!("Release: Order Id {}: Released sats", &order.id);
                                         // We publish a new replaceable kind nostr event with the status updated
                                         // and update on local database the status and new event id
                                         update_order_event(
-                                            &pool, &client, &my_keys, status, &order,
+                                            &pool,
+                                            &client,
+                                            &my_keys,
+                                            Status::SettledHoldInvoice,
+                                            &order,
                                         )
                                         .await?;
                                         // We send a message to seller
@@ -353,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
                                                     {
                                                         if status == PaymentStatus::Succeeded {
                                                             info!(
-                                                                "Order Id {}: Invoice with hash: {} paid!",
+                                                                "Release: Order Id {}: Invoice with hash: {} paid!",
                                                                 order.id,
                                                                 msg.payment.payment_hash
                                                             );

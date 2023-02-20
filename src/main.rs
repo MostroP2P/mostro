@@ -72,15 +72,29 @@ async fn main() -> anyhow::Result<()> {
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
-                                            // Verify if invoice is valid
                                             let buyer_pubkey = event.pubkey;
-                                            // TODO: Validate if the invoice amount is right
-                                            match is_valid_invoice(&payment_request) {
+                                            // Safe unwrap as we verified the message
+                                            let order_id = msg.order_id.unwrap();
+                                            let order = match Order::by_id(&pool, order_id).await? {
+                                                Some(order) => order,
+                                                None => {
+                                                    error!(
+                                                        "TakeSell Error: Order Id {order_id} not found!"
+                                                    );
+                                                    break;
+                                                }
+                                            };
+                                            // Verify if invoice is valid
+                                            match is_valid_invoice(
+                                                &payment_request,
+                                                Some(order.amount as u64),
+                                            ) {
                                                 Ok(_) => {}
                                                 Err(e) => match e {
                                                     MostroError::ParsingInvoiceError
                                                     | MostroError::InvoiceExpiredError
                                                     | MostroError::MinExpirationTimeError
+                                                    | MostroError::WrongAmountError
                                                     | MostroError::MinAmountError => {
                                                         send_dm(
                                                             &client,
@@ -96,23 +110,11 @@ async fn main() -> anyhow::Result<()> {
                                                 },
                                             }
 
-                                            // Safe unwrap as we verified the message
-                                            let order_id = msg.order_id.unwrap();
-                                            let order = match Order::by_id(&pool, order_id).await? {
-                                                Some(order) => order,
-                                                None => {
-                                                    error!(
-                                                        "TakeSell: Order Id {order_id} not found!"
-                                                    );
-                                                    break;
-                                                }
-                                            };
-
                                             let order_status = match Status::from_str(&order.status)
                                             {
                                                 Ok(s) => s,
                                                 Err(e) => {
-                                                    error!("Error: Order Id {order_id} wrong status: {e:?}");
+                                                    error!("TakeSell Error: Order Id {order_id} wrong status: {e:?}");
                                                     break;
                                                 }
                                             };
@@ -164,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                                                 Some(pk) => pk,
                                                 None => {
                                                     error!(
-                                                        "Seller pubkey not found for order {}!",
+                                                        "TakeSell Error: Seller pubkey not found for order {}!",
                                                         order.id
                                                     );
                                                     break;

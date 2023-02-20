@@ -1,12 +1,13 @@
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MostroError {
     ParsingInvoiceError,
     ParsingNumberError,
     InvoiceExpiredError,
     MinExpirationTimeError,
     MinAmountError,
+    WrongAmountError,
 }
 
 impl std::error::Error for MostroError {}
@@ -19,6 +20,7 @@ impl fmt::Display for MostroError {
             MostroError::InvoiceExpiredError => write!(f, "Invoice has expired"),
             MostroError::MinExpirationTimeError => write!(f, "Minimal expiration time on invoice"),
             MostroError::MinAmountError => write!(f, "Minimal payment amount"),
+            MostroError::WrongAmountError => write!(f, "The amount on this invoice is wrong"),
         }
     }
 }

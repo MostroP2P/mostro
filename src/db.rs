@@ -1,5 +1,4 @@
 use dotenvy::var;
-use nostr_sdk::nostr::util::time::timestamp;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -29,7 +28,7 @@ pub async fn add_order(
     let uuid = Uuid::new_v4();
     let mut buyer_pubkey = "";
     let mut seller_pubkey = "";
-    let created_at = timestamp() as i64;
+    let created_at = Timestamp::now();
     if order.kind == crate::types::Kind::Buy {
         buyer_pubkey = initiator_pubkey;
     } else {
@@ -68,7 +67,7 @@ pub async fn add_order(
     .bind(order.amount)
     .bind(&order.fiat_code)
     .bind(order.fiat_amount)
-    .bind(created_at)
+    .bind(created_at.as_i64())
     .fetch_one(&mut conn)
     .await?;
 

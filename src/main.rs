@@ -15,7 +15,6 @@ use lightning::invoice::is_valid_invoice;
 use log::{error, info};
 use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
-use nostr_sdk::nostr::util::time::timestamp;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tokio::sync::mpsc::channel;
@@ -35,9 +34,9 @@ async fn main() -> anyhow::Result<()> {
 
     let subscription = SubscriptionFilter::new()
         .pubkey(my_keys.public_key())
-        .since(timestamp());
+        .since(Timestamp::now());
 
-    client.subscribe(vec![subscription]).await?;
+    client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
 
     loop {

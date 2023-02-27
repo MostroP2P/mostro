@@ -59,17 +59,17 @@ impl FromStr for Status {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "Active" => std::result::Result::Ok(Self::Active),
-            "Canceled" => std::result::Result::Ok(Self::Active),
-            "CanceledByAdmin" => std::result::Result::Ok(Self::Active),
-            "CompletedByAdmin" => std::result::Result::Ok(Self::Active),
-            "Dispute" => std::result::Result::Ok(Self::Active),
-            "Expired" => std::result::Result::Ok(Self::Active),
-            "FiatSent" => std::result::Result::Ok(Self::Active),
-            "SettledHoldInvoice" => std::result::Result::Ok(Self::Active),
-            "Pending" => std::result::Result::Ok(Self::Active),
-            "Success" => std::result::Result::Ok(Self::Active),
-            "WaitingBuyerInvoice" => std::result::Result::Ok(Self::Active),
-            "WaitingPayment" => std::result::Result::Ok(Self::Active),
+            "Canceled" => std::result::Result::Ok(Self::Canceled),
+            "CanceledByAdmin" => std::result::Result::Ok(Self::CanceledByAdmin),
+            "CompletedByAdmin" => std::result::Result::Ok(Self::CompletedByAdmin),
+            "Dispute" => std::result::Result::Ok(Self::Dispute),
+            "Expired" => std::result::Result::Ok(Self::Expired),
+            "FiatSent" => std::result::Result::Ok(Self::FiatSent),
+            "SettledHoldInvoice" => std::result::Result::Ok(Self::SettledHoldInvoice),
+            "Pending" => std::result::Result::Ok(Self::Pending),
+            "Success" => std::result::Result::Ok(Self::Success),
+            "WaitingBuyerInvoice" => std::result::Result::Ok(Self::WaitingBuyerInvoice),
+            "WaitingPayment" => std::result::Result::Ok(Self::WaitingPayment),
             _ => Err(()),
         }
     }

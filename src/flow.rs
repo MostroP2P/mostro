@@ -62,12 +62,12 @@ pub async fn hold_invoice_settlement(hash: &str) {
     .await
     .unwrap();
     // We send a *funds released* message to seller
-    let message = crate::messages::sell_success(buyer_pubkey).unwrap();
+    let message = crate::messages::sell_success(order.id, buyer_pubkey).unwrap();
     crate::util::send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller released
-    let message = crate::messages::funds_released(seller_pubkey).unwrap();
+    let message = crate::messages::funds_released(order.id, seller_pubkey).unwrap();
     crate::util::send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
         .unwrap();

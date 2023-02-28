@@ -38,28 +38,43 @@ pub fn get_in_touch_with_seller(order: &Order, seller_pubkey: XOnlyPublicKey) ->
     )
 }
 
-pub fn buyer_sentfiat(buyer_pubkey: XOnlyPublicKey) -> Result<String> {
-    Ok(format!("{} has informed that already sent you the fiat money, once you confirmed you received it, please release funds. You will not be able to create another order until you release funds.", buyer_pubkey.to_bech32()?))
+pub fn buyer_sentfiat(order_id: Uuid, buyer_pubkey: XOnlyPublicKey) -> Result<String> {
+    Ok(format!(
+    "🧌 Order Id: {}
+
+    {} has informed that already sent you the fiat money, once you confirmed you received it, please release funds. You will not be able to create another order until you release funds.",
+    order_id,
+    buyer_pubkey.to_bech32()?))
 }
 
-pub fn sell_success(buyer_pubkey: XOnlyPublicKey) -> Result<String> {
+pub fn sell_success(order_id: Uuid, buyer_pubkey: XOnlyPublicKey) -> Result<String> {
     Ok(format!(
-        "Your sale of sats has been completed after confirming payment from {} ⚡️🍊⚡️",
+        "🧌 Order Id: {}
+
+        Your sale of sats has been completed after confirming payment from {} ⚡️🍊⚡️",
+        order_id,
         buyer_pubkey.to_bech32()?
     ))
 }
 
-pub fn purchase_completed(seller_pubkey: XOnlyPublicKey) -> Result<String> {
-    Ok(format!("
+pub fn purchase_completed(order_id: Uuid, seller_pubkey: XOnlyPublicKey) -> Result<String> {
+    Ok(format!(
+        "🧌 Order Id: {}
+
         🪙 Your satoshis purchase has been completed successful, {} has confirmed your fiat payment and I have paid your invoice, enjoy sound money!
 
         ⚡️🍊⚡️",
+        order_id,
         seller_pubkey.to_bech32()?)
     )
 }
 
-pub fn funds_released(seller_pubkey: XOnlyPublicKey) -> Result<String> {
-    Ok(format!("🕐 {} already released the satoshis, expect your invoice to be paid any time, remember your wallet needs to be online to receive through lighntning network.", seller_pubkey.to_bech32()?))
+pub fn funds_released(order_id: Uuid, seller_pubkey: XOnlyPublicKey) -> Result<String> {
+    Ok(format!("🧌 Order Id: {}
+
+    🕐 {} already released the satoshis, expect your invoice to be paid any time, remember your wallet needs to be online to receive through lighntning network.",
+    order_id,
+    seller_pubkey.to_bech32()?))
 }
 
 pub fn pending_payment_success(amount: i32, order_id: Uuid, preimage: &str) -> String {
@@ -74,8 +89,13 @@ pub fn order_canceled(order_id: Uuid) -> String {
     format!("Order Id: {order_id} was canceled")
 }
 
-pub fn you_sent_fiat(seller_pubkey: XOnlyPublicKey) -> Result<String> {
-    Ok(format!("🧌 I told {} that you have sent fiat money once the seller confirms the money was received, the sats should be sent to you.", seller_pubkey.to_bech32()?))
+pub fn you_sent_fiat(order_id: Uuid, seller_pubkey: XOnlyPublicKey) -> Result<String> {
+    Ok(format!(
+    "🧌 Order Id: {}
+
+    I told {} that you have sent fiat money once the seller confirms the money was received, the sats should be sent to you.",
+    order_id,
+    seller_pubkey.to_bech32()?))
 }
 
 pub fn invalid_invoice() -> String {

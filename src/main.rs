@@ -282,10 +282,12 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         };
                                         // We send a message to seller to release
-                                        let message = messages::buyer_sentfiat(event.pubkey)?;
+                                        let message =
+                                            messages::buyer_sentfiat(order.id, event.pubkey)?;
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
-                                        let message = messages::you_sent_fiat(seller_pubkey)?;
+                                        let message =
+                                            messages::you_sent_fiat(order.id, seller_pubkey)?;
                                         send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
                                     types::Action::Release => {
@@ -324,16 +326,7 @@ async fn main() -> anyhow::Result<()> {
                                             &order,
                                         )
                                         .await?;
-                                        // We send a message to seller
-                                        let buyer_pubkey = XOnlyPublicKey::from_bech32(
-                                            order.buyer_pubkey.as_ref().unwrap(),
-                                        )?;
-                                        let message = messages::sell_success(buyer_pubkey)?;
-                                        send_dm(&client, &my_keys, &seller_pubkey, message).await?;
 
-                                        // We send a *funds released* message to buyer
-                                        let message = messages::funds_released(seller_pubkey)?;
-                                        send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
                                         // Finally we try to pay buyer's invoice
                                         let payment_request =
                                             order.buyer_invoice.as_ref().unwrap().to_string();
@@ -376,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
                                                             // Purchase completed message to buyer
                                                             let message =
                                                                 messages::purchase_completed(
+                                                                    order.id,
                                                                     buyer_pubkey,
                                                                 )
                                                                 .unwrap();

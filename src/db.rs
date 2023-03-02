@@ -36,6 +36,8 @@ pub async fn add_order(
     }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
+    let empty = String::new();
+    let buyer_invoice = order.buyer_invoice.as_ref().unwrap_or(&empty);
 
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -51,8 +53,9 @@ pub async fn add_order(
         amount,
         fiat_code,
         fiat_amount,
+        buyer_invoice,
         created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         RETURNING *
       "#,
     )
@@ -67,6 +70,7 @@ pub async fn add_order(
     .bind(order.amount)
     .bind(&order.fiat_code)
     .bind(order.fiat_amount)
+    .bind(buyer_invoice)
     .bind(created_at.as_i64())
     .fetch_one(&mut conn)
     .await?;
@@ -74,34 +78,59 @@ pub async fn add_order(
     Ok(order)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn edit_order(
     pool: &SqlitePool,
     status: &crate::types::Status,
     order_id: Uuid,
     buyer_pubkey: &XOnlyPublicKey,
-    buyer_invoice: &str,
+    seller_pubkey: &XOnlyPublicKey,
     preimage: &str,
     hash: &str,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
     let buyer_pubkey = buyer_pubkey.to_bech32()?;
+    let seller_pubkey = seller_pubkey.to_bech32()?;
     let rows_affected = sqlx::query!(
         r#"
     UPDATE orders
     SET
     buyer_pubkey = ?1,
-    status = ?2,
-    buyer_invoice = ?3,
+    seller_pubkey = ?2,
+    status = ?3,
     preimage = ?4,
     hash = ?5
     WHERE id = ?6
     "#,
         buyer_pubkey,
+        seller_pubkey,
         status,
-        buyer_invoice,
         preimage,
         hash,
+        order_id
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn edit_buyer_invoice_order(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    buyer_invoice: &str,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+    UPDATE orders
+    SET
+    buyer_invoice = ?1
+    WHERE id = ?2
+    "#,
+        buyer_invoice,
         order_id
     )
     .execute(&mut conn)

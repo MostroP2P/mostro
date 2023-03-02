@@ -7,8 +7,6 @@ pub mod models;
 pub mod types;
 pub mod util;
 
-use std::str::FromStr;
-
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
@@ -16,7 +14,9 @@ use log::{error, info};
 use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
 use types::Status;
@@ -130,39 +130,8 @@ async fn main() -> anyhow::Result<()> {
                                                 .await?;
                                                 break;
                                             }
-                                            // Now we generate the hold invoice that seller should pay
-                                            let (invoice_response, preimage, hash) = ln_client
-                                                .create_hold_invoice(
-                                                    &messages::hold_invoice_description(
-                                                        my_keys.public_key(),
-                                                        &order.id.to_string(),
-                                                        &order.fiat_code,
-                                                        &order.fiat_amount.to_string(),
-                                                    )?,
-                                                    order.amount,
-                                                )
-                                                .await?;
-                                            db::edit_order(
-                                                &pool,
-                                                &Status::WaitingPayment,
-                                                order_id,
-                                                &buyer_pubkey,
-                                                &payment_request,
-                                                &preimage.to_hex(),
-                                                &hash.to_hex(),
-                                            )
-                                            .await?;
-                                            // We need to publish a new event with the new status
-                                            update_order_event(
-                                                &pool,
-                                                &client,
-                                                &my_keys,
-                                                Status::WaitingPayment,
-                                                &order,
-                                            )
-                                            .await?;
                                             let seller_pubkey = match order.seller_pubkey.as_ref() {
-                                                Some(pk) => pk,
+                                                Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
                                                 None => {
                                                     error!(
                                                         "TakeSell: Seller pubkey not found for order {}!",
@@ -171,72 +140,70 @@ async fn main() -> anyhow::Result<()> {
                                                     break;
                                                 }
                                             };
-
-                                            let message = messages::payment_request(
-                                                &order,
-                                                &invoice_response.payment_request,
-                                            );
-                                            // We send the hold invoice to the seller
-                                            send_dm(
+                                            show_hold_invoice(
+                                                &pool,
                                                 &client,
                                                 &my_keys,
-                                                &XOnlyPublicKey::from_bech32(seller_pubkey)?,
-                                                message,
+                                                Some(&payment_request),
+                                                &buyer_pubkey,
+                                                &seller_pubkey,
+                                                &order,
                                             )
                                             .await?;
-                                            let message =
-                                                messages::waiting_seller_to_pay_invoice(order.id);
-
-                                            // We send a message to buyer to know that seller was requested to pay the invoice
-                                            send_dm(&client, &my_keys, &buyer_pubkey, message)
-                                                .await?;
-                                            let mut ln_client_invoices =
-                                                lightning::LndConnector::new().await;
-                                            let (tx, mut rx) = channel(100);
-
-                                            let invoice_task = {
-                                                async move {
-                                                    ln_client_invoices
-                                                        .subscribe_invoice(hash, tx)
-                                                        .await;
-                                                }
-                                            };
-                                            tokio::spawn(invoice_task);
-                                            let subs = {
-                                                async move {
-                                                    // Receiving msgs from the invoice subscription.
-                                                    while let Some(msg) = rx.recv().await {
-                                                        let hash = msg.hash.to_hex();
-                                                        // If this invoice was paid by the seller
-                                                        if msg.state == InvoiceState::Accepted {
-                                                            flow::hold_invoice_paid(&hash).await;
-                                                            println!("Invoice with hash {hash} accepted!");
-                                                        } else if msg.state == InvoiceState::Settled
-                                                        {
-                                                            // If the payment was released by the seller
-                                                            println!(
-                                                                "Invoice with hash {hash} settled!"
-                                                            );
-                                                            flow::hold_invoice_settlement(&hash)
-                                                                .await;
-                                                        } else if msg.state
-                                                            == InvoiceState::Canceled
-                                                        {
-                                                            // If the payment was canceled
-                                                            println!("Invoice with hash {hash} canceled!");
-                                                            flow::hold_invoice_canceled(&hash)
-                                                                .await;
-                                                        } else {
-                                                            info!("Invoice with hash: {hash} subscribed!");
-                                                        }
-                                                    }
-                                                }
-                                            };
-                                            tokio::spawn(subs);
+                                        } else {
+                                            break;
                                         }
                                     }
                                     types::Action::TakeBuy => {
-                                        todo!()
+                                        let seller_pubkey = event.pubkey;
+                                        // Safe unwrap as we verified the message
+                                        let order_id = msg.order_id.unwrap();
+                                        info!("takebuy: {order_id}");
+                                        let order = match Order::by_id(&pool, order_id).await? {
+                                            Some(order) => order,
+                                            None => {
+                                                error!("TakeB: Order Id {order_id} not found!");
+                                                break;
+                                            }
+                                        };
+                                        let order_status = match Status::from_str(&order.status) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
+                                                break;
+                                            }
+                                        };
+                                        // Buyer can take pending orders only
+                                        if order_status != Status::Pending {
+                                            send_dm(
+                                                &client,
+                                                &my_keys,
+                                                &seller_pubkey,
+                                                format!("Order Id {order_id} was already taken!"),
+                                            )
+                                            .await?;
+                                            break;
+                                        }
+                                        let buyer_pubkey = match order.buyer_pubkey.as_ref() {
+                                            Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+                                            None => {
+                                                error!(
+                                                    "TakeBuy: Buyer pubkey not found for order {}!",
+                                                    order.id
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        show_hold_invoice(
+                                            &pool,
+                                            &client,
+                                            &my_keys,
+                                            None,
+                                            &buyer_pubkey,
+                                            &seller_pubkey,
+                                            &order,
+                                        )
+                                        .await?;
                                     }
                                     types::Action::PayInvoice => {
                                         todo!()
@@ -407,6 +374,88 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+async fn show_hold_invoice(
+    pool: &SqlitePool,
+    client: &Client,
+    my_keys: &Keys,
+    payment_request: Option<&str>,
+    buyer_pubkey: &XOnlyPublicKey,
+    seller_pubkey: &XOnlyPublicKey,
+    order: &Order,
+) -> anyhow::Result<()> {
+    let mut ln_client = lightning::LndConnector::new().await;
+    // Now we generate the hold invoice that seller should pay
+    let (invoice_response, preimage, hash) = ln_client
+        .create_hold_invoice(
+            &messages::hold_invoice_description(
+                my_keys.public_key(),
+                &order.id.to_string(),
+                &order.fiat_code,
+                &order.fiat_amount.to_string(),
+            )?,
+            order.amount,
+        )
+        .await?;
+    if let Some(invoice) = payment_request {
+        db::edit_buyer_invoice_order(pool, order.id, invoice).await?;
+    };
+
+    db::edit_order(
+        pool,
+        &Status::WaitingPayment,
+        order.id,
+        buyer_pubkey,
+        seller_pubkey,
+        &preimage.to_hex(),
+        &hash.to_hex(),
+    )
+    .await?;
+    // We need to publish a new event with the new status
+    update_order_event(pool, client, my_keys, Status::WaitingPayment, order).await?;
+
+    let message = messages::payment_request(order, &invoice_response.payment_request);
+    // We send the hold invoice to the seller
+    send_dm(client, my_keys, seller_pubkey, message).await?;
+    let message = messages::waiting_seller_to_pay_invoice(order.id);
+
+    // We send a message to buyer to know that seller was requested to pay the invoice
+    send_dm(client, my_keys, buyer_pubkey, message).await?;
+    let mut ln_client_invoices = lightning::LndConnector::new().await;
+    let (tx, mut rx) = channel(100);
+
+    let invoice_task = {
+        async move {
+            ln_client_invoices.subscribe_invoice(hash, tx).await;
+        }
+    };
+    tokio::spawn(invoice_task);
+    let subs = {
+        async move {
+            // Receiving msgs from the invoice subscription.
+            while let Some(msg) = rx.recv().await {
+                let hash = msg.hash.to_hex();
+                // If this invoice was paid by the seller
+                if msg.state == InvoiceState::Accepted {
+                    flow::hold_invoice_paid(&hash).await;
+                    println!("Invoice with hash {hash} accepted!");
+                } else if msg.state == InvoiceState::Settled {
+                    // If the payment was released by the seller
+                    println!("Invoice with hash {hash} settled!");
+                    flow::hold_invoice_settlement(&hash).await;
+                } else if msg.state == InvoiceState::Canceled {
+                    // If the payment was canceled
+                    println!("Invoice with hash {hash} canceled!");
+                    flow::hold_invoice_canceled(&hash).await;
+                } else {
+                    info!("Invoice with hash: {hash} subscribed!");
+                }
+            }
+        }
+    };
+    tokio::spawn(subs);
+
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use crate::models::NewOrder;

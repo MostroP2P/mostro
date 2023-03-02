@@ -27,7 +27,7 @@ pub async fn publish_order(
         order.fiat_amount,
         order.payment_method,
         order.prime,
-        order.buyer_invoice,
+        None,
         Some(order.created_at),
     );
 

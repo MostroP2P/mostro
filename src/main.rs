@@ -214,9 +214,6 @@ async fn main() -> anyhow::Result<()> {
                                         )
                                         .await?;
                                     }
-                                    Action::PayInvoice => {
-                                        todo!()
-                                    }
                                     Action::FiatSent => {
                                         let order_id = msg.order_id.unwrap();
                                         let order = match Order::by_id(&pool, order_id).await? {
@@ -373,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
                                         };
                                         tokio::spawn(payment);
                                     }
+                                    Action::PayInvoice => todo!(),
                                 }
                             }
                         }

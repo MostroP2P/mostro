@@ -139,6 +139,12 @@ impl Message {
     pub fn verify(&self) -> bool {
         match &self.action {
             Action::Order => matches!(&self.content, Some(Content::Order(_))),
+            Action::PayInvoice => {
+                if self.order_id.is_none() {
+                    return false;
+                }
+                matches!(&self.content, Some(Content::PayHoldInvoice(_, _)))
+            }
             Action::TakeSell => {
                 if self.order_id.is_none() {
                     return false;
@@ -163,7 +169,6 @@ impl Message {
                 }
                 true
             }
-            _ => false,
         }
     }
 

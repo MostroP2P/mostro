@@ -107,11 +107,26 @@ pub struct Message {
 pub enum Content {
     Order(NewOrder),
     PaymentRequest(String),
+    PayHoldInvoice(NewOrder, String),
 }
 
 #[allow(dead_code)]
 impl Message {
-    /// New message from json string
+    /// New message
+    pub fn new(
+        version: u8,
+        order_id: Option<Uuid>,
+        action: Action,
+        content: Option<Content>,
+    ) -> Self {
+        Self {
+            version,
+            order_id,
+            action,
+            content,
+        }
+    }
+    /// Get message from json string
     pub fn from_json(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
     }

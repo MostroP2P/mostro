@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use crate::types::{Kind, Status};
 use anyhow::{Ok, Result};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,23 @@ pub struct Order {
     pub fiat_amount: i64,
     pub buyer_invoice: Option<String>,
     pub created_at: i64,
+}
+
+impl Order {
+    pub fn as_new_order(&self) -> NewOrder {
+        NewOrder::new(
+            Some(self.id),
+            Kind::from_str(&self.kind).unwrap(),
+            Status::from_str(&self.status).unwrap(),
+            self.amount,
+            self.fiat_code.clone(),
+            self.fiat_amount,
+            self.payment_method.clone(),
+            self.prime,
+            self.buyer_invoice.clone(),
+            Some(self.created_at),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

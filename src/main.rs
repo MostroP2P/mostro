@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
-use types::Status;
+use types::{Action, Content, Message, Status};
 use util::{publish_order, send_dm, update_order_event};
 
 #[tokio::main]
@@ -51,11 +51,11 @@ async fn main() -> anyhow::Result<()> {
                         &event.content,
                     );
                     if let Ok(m) = message {
-                        let message = types::Message::from_json(&m);
+                        let message = Message::from_json(&m);
                         if let Ok(msg) = message {
                             if msg.verify() {
                                 match msg.action {
-                                    types::Action::Order => {
+                                    Action::Order => {
                                         if let Some(order) = msg.get_order() {
                                             publish_order(
                                                 &pool,
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
                                             .await?
                                         }
                                     }
-                                    types::Action::TakeSell => {
+                                    Action::TakeSell => {
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
@@ -83,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
                                                     break;
                                                 }
                                             };
+                                            if order.kind != "Sell" {
+                                                error!("TakeSell: Order Id {order_id} wrong kind");
+                                                break;
+                                            }
                                             // Verify if invoice is valid
                                             match is_valid_invoice(
                                                 &payment_request,
@@ -154,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
                                             break;
                                         }
                                     }
-                                    types::Action::TakeBuy => {
+                                    Action::TakeBuy => {
                                         let seller_pubkey = event.pubkey;
                                         // Safe unwrap as we verified the message
                                         let order_id = msg.order_id.unwrap();
@@ -162,14 +166,19 @@ async fn main() -> anyhow::Result<()> {
                                         let order = match Order::by_id(&pool, order_id).await? {
                                             Some(order) => order,
                                             None => {
-                                                error!("TakeB: Order Id {order_id} not found!");
+                                                error!("TakeBuy: Order Id {order_id} not found!");
                                                 break;
                                             }
                                         };
+                                        if order.kind != "Buy" {
+                                            error!("TakeBuy: Order Id {order_id} wrong kind");
+                                            break;
+                                        }
+
                                         let order_status = match Status::from_str(&order.status) {
                                             Ok(s) => s,
                                             Err(e) => {
-                                                error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
+                                                error!("TakeBuy: Order Id {order_id} wrong status: {e:?}");
                                                 break;
                                             }
                                         };
@@ -205,10 +214,10 @@ async fn main() -> anyhow::Result<()> {
                                         )
                                         .await?;
                                     }
-                                    types::Action::PayInvoice => {
+                                    Action::PayInvoice => {
                                         todo!()
                                     }
-                                    types::Action::FiatSent => {
+                                    Action::FiatSent => {
                                         let order_id = msg.order_id.unwrap();
                                         let order = match Order::by_id(&pool, order_id).await? {
                                             Some(order) => order,
@@ -257,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
                                             messages::you_sent_fiat(order.id, seller_pubkey)?;
                                         send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
-                                    types::Action::Release => {
+                                    Action::Release => {
                                         let order_id = msg.order_id.unwrap();
                                         let order = match Order::by_id(&pool, order_id).await? {
                                             Some(order) => order,
@@ -412,8 +421,19 @@ async fn show_hold_invoice(
     .await?;
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, order).await?;
+    let new_order = order.as_new_order();
+    // We create a Message to send the hold invoice to seller
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::PayInvoice,
+        Some(Content::PayHoldInvoice(
+            new_order,
+            invoice_response.payment_request,
+        )),
+    );
+    let message = message.as_json()?;
 
-    let message = messages::payment_request(order, &invoice_response.payment_request);
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
     let message = messages::waiting_seller_to_pay_invoice(order.id);

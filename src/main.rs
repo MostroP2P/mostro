@@ -11,7 +11,7 @@ use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
 use log::{error, info};
-use models::Order;
+use models::{Order, Yadio};
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -21,6 +21,7 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
 use types::{Action, Content, Message, Status};
 use util::{publish_order, send_dm, update_order_event};
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -144,6 +145,13 @@ async fn main() -> anyhow::Result<()> {
                                                     break;
                                                 }
                                             };
+
+                                            // Add here check for market price
+                                            let req_string = format!("https://api.yadio.io/convert/{}/{}/BTC",order.fiat_amount,order.fiat_code);
+                                            let req = reqwest::get(req_string).await?.json::<Yadio>().await?;
+
+                                            order.amount = req.result;
+
                                             show_hold_invoice(
                                                 &pool,
                                                 &client,

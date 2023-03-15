@@ -7,6 +7,21 @@ use sqlx::FromRow;
 use sqlx_crud::SqlxCrud;
 use uuid::Uuid;
 
+#[derive(Serialize, Deserialize)]
+pub struct Yadio {
+    request: Request,
+    pub result: f64,
+    rate: f64,
+    timestamp: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Request {
+    amount: i64,
+    from: String,
+    to: String,
+}
+
 #[derive(Debug, FromRow, SqlxCrud, Deserialize, Serialize)]
 pub struct Order {
     pub id: Uuid,

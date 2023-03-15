@@ -33,3 +33,4 @@ uuid = { version = "1.3.0", features = [
   "macro-diagnostics",
   "serde",
 ] }
+reqwest = { version = "0.11", features = ["json"] }

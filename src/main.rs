@@ -20,7 +20,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
 use types::{Action, Content, Message, Status};
-use util::{publish_order, send_dm, update_order_event};
+use util::{get_market_quote, publish_order, send_dm, update_order_event};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,15 +74,16 @@ async fn main() -> anyhow::Result<()> {
                                             let buyer_pubkey = event.pubkey;
                                             // Safe unwrap as we verified the message
                                             let order_id = msg.order_id.unwrap();
-                                            let order = match Order::by_id(&pool, order_id).await? {
-                                                Some(order) => order,
-                                                None => {
-                                                    error!(
+                                            let mut order =
+                                                match Order::by_id(&pool, order_id).await? {
+                                                    Some(order) => order,
+                                                    None => {
+                                                        error!(
                                                         "TakeSell: Order Id {order_id} not found!"
                                                     );
-                                                    break;
-                                                }
-                                            };
+                                                        break;
+                                                    }
+                                                };
                                             if order.kind != "Sell" {
                                                 error!("TakeSell: Order Id {order_id} wrong kind");
                                                 break;
@@ -144,6 +145,16 @@ async fn main() -> anyhow::Result<()> {
                                                     break;
                                                 }
                                             };
+
+                                            // Check market price here
+                                            if order.amount == 0 {
+                                                order.amount = get_market_quote(
+                                                    &order.fiat_amount,
+                                                    &order.fiat_code,
+                                                )
+                                                .await?;
+                                            }
+
                                             show_hold_invoice(
                                                 &pool,
                                                 &client,

@@ -11,7 +11,7 @@ use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
 use log::{error, info};
-use models::{Order, Yadio};
+use models::Order;
 use nostr_sdk::nostr::hashes::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -20,8 +20,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, payment::PaymentStatus};
 use types::{Action, Content, Message, Status};
-use util::{publish_order, send_dm, update_order_event};
-
+use util::{get_market_quote, publish_order, send_dm, update_order_event};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -75,15 +74,16 @@ async fn main() -> anyhow::Result<()> {
                                             let buyer_pubkey = event.pubkey;
                                             // Safe unwrap as we verified the message
                                             let order_id = msg.order_id.unwrap();
-                                            let order = match Order::by_id(&pool, order_id).await? {
-                                                Some(order) => order,
-                                                None => {
-                                                    error!(
+                                            let mut order =
+                                                match Order::by_id(&pool, order_id).await? {
+                                                    Some(order) => order,
+                                                    None => {
+                                                        error!(
                                                         "TakeSell: Order Id {order_id} not found!"
                                                     );
-                                                    break;
-                                                }
-                                            };
+                                                        break;
+                                                    }
+                                                };
                                             if order.kind != "Sell" {
                                                 error!("TakeSell: Order Id {order_id} wrong kind");
                                                 break;
@@ -146,11 +146,14 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                             };
 
-                                            // Add here check for market price
-                                            let req_string = format!("https://api.yadio.io/convert/{}/{}/BTC",order.fiat_amount,order.fiat_code);
-                                            let req = reqwest::get(req_string).await?.json::<Yadio>().await?;
-
-                                            order.amount = req.result;
+                                            // Check market price here
+                                            if order.amount == 0 {
+                                                order.amount = get_market_quote(
+                                                    &order.fiat_amount,
+                                                    &order.fiat_code,
+                                                )
+                                                .await?;
+                                            }
 
                                             show_hold_invoice(
                                                 &pool,

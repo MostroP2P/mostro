@@ -1,11 +1,30 @@
-use crate::models::{NewOrder, Order};
+use crate::models::{NewOrder, Order, Yadio};
 use crate::types::{Kind as OrderKind, Status};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use std::str::FromStr;
+
+/// Request market quote from Yadio to have sats amount at actual market price
+pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str) -> Result<i64> {
+    // Add here check for market price
+    let req_string = format!(
+        "https://api.yadio.io/convert/{}/{}/BTC",
+        fiat_amount, fiat_code
+    );
+    let req = reqwest::get(req_string)
+        .await
+        .context("Something went wrong with API request, try again!")?
+        .json::<Yadio>()
+        .await
+        .context("Wrong JSON parse of the answer, check the currency")?;
+
+    let sats = req.result * 100_000_000_f64;
+
+    Ok(sats as i64)
+}
 
 pub async fn publish_order(
     pool: &SqlitePool,

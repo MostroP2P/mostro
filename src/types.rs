@@ -149,7 +149,7 @@ impl Message {
                 if self.order_id.is_none() {
                     return false;
                 }
-                matches!(&self.content, Some(Content::PaymentRequest(_)))
+                true
             }
             Action::TakeBuy => {
                 if self.order_id.is_none() {

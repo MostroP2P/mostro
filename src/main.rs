@@ -68,31 +68,32 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                     Action::TakeSell => {
+                                        // Safe unwrap as we verified the message
+                                        let order_id = msg.order_id.unwrap();
+                                        let mut order = match Order::by_id(&pool, order_id).await? {
+                                            Some(order) => order,
+                                            None => {
+                                                error!("TakeSell: Order Id {order_id} not found!");
+                                                break;
+                                            }
+                                        };
+                                        if order.kind != "Sell" {
+                                            error!("TakeSell: Order Id {order_id} wrong kind");
+                                            break;
+                                        }
+                                        let buyer_pubkey = event.pubkey;
+                                        let pr: Option<String>;
                                         // If a buyer sent me a lightning invoice we look on db an order with
                                         // that order id and save the buyer pubkey and invoice fields
                                         if let Some(payment_request) = msg.get_payment_request() {
-                                            let buyer_pubkey = event.pubkey;
-                                            // Safe unwrap as we verified the message
-                                            let order_id = msg.order_id.unwrap();
-                                            let mut order =
-                                                match Order::by_id(&pool, order_id).await? {
-                                                    Some(order) => order,
-                                                    None => {
-                                                        error!(
-                                                        "TakeSell: Order Id {order_id} not found!"
-                                                    );
-                                                        break;
-                                                    }
-                                                };
-                                            if order.kind != "Sell" {
-                                                error!("TakeSell: Order Id {order_id} wrong kind");
-                                                break;
-                                            }
+                                            let order_amount = if order.amount == 0 {
+                                                None
+                                            } else {
+                                                Some(order.amount as u64)
+                                            };
+
                                             // Verify if invoice is valid
-                                            match is_valid_invoice(
-                                                &payment_request,
-                                                Some(order.amount as u64),
-                                            ) {
+                                            match is_valid_invoice(&payment_request, order_amount) {
                                                 Ok(_) => {}
                                                 Err(e) => match e {
                                                     MostroError::ParsingInvoiceError
@@ -113,61 +114,59 @@ async fn main() -> anyhow::Result<()> {
                                                     _ => {}
                                                 },
                                             }
+                                            pr = Some(payment_request);
+                                        } else {
+                                            pr = None;
+                                        }
 
-                                            let order_status = match Status::from_str(&order.status)
-                                            {
-                                                Ok(s) => s,
-                                                Err(e) => {
-                                                    error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
-                                                    break;
-                                                }
-                                            };
-                                            // Buyer can take pending orders only
-                                            if order_status != Status::Pending {
-                                                send_dm(
-                                                    &client,
-                                                    &my_keys,
-                                                    &buyer_pubkey,
-                                                    format!(
-                                                        "Order Id {order_id} was already taken!"
-                                                    ),
-                                                )
-                                                .await?;
+                                        let order_status = match Status::from_str(&order.status) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
                                                 break;
                                             }
-                                            let seller_pubkey = match order.seller_pubkey.as_ref() {
-                                                Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
-                                                None => {
-                                                    error!(
-                                                        "TakeSell: Seller pubkey not found for order {}!",
-                                                        order.id
-                                                    );
-                                                    break;
-                                                }
-                                            };
-
-                                            // Check market price here
-                                            if order.amount == 0 {
-                                                order.amount = get_market_quote(
-                                                    &order.fiat_amount,
-                                                    &order.fiat_code,
-                                                )
-                                                .await?;
-                                            }
-
-                                            show_hold_invoice(
-                                                &pool,
+                                        };
+                                        // Buyer can take pending orders only
+                                        if order_status != Status::Pending {
+                                            send_dm(
                                                 &client,
                                                 &my_keys,
-                                                Some(&payment_request),
                                                 &buyer_pubkey,
-                                                &seller_pubkey,
-                                                &order,
+                                                format!("Order Id {order_id} was already taken!"),
                                             )
                                             .await?;
-                                        } else {
                                             break;
                                         }
+                                        let seller_pubkey = match order.seller_pubkey.as_ref() {
+                                            Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+                                            None => {
+                                                error!(
+                                                    "TakeSell: Seller pubkey not found for order {}!",
+                                                    order.id
+                                                );
+                                                break;
+                                            }
+                                        };
+
+                                        // Check market price here
+                                        if order.amount == 0 {
+                                            order.amount = get_market_quote(
+                                                &order.fiat_amount,
+                                                &order.fiat_code,
+                                            )
+                                            .await?;
+                                        }
+
+                                        show_hold_invoice(
+                                            &pool,
+                                            &client,
+                                            &my_keys,
+                                            pr,
+                                            &buyer_pubkey,
+                                            &seller_pubkey,
+                                            &order,
+                                        )
+                                        .await?;
                                     }
                                     Action::TakeBuy => {
                                         let seller_pubkey = event.pubkey;
@@ -396,7 +395,7 @@ async fn show_hold_invoice(
     pool: &SqlitePool,
     client: &Client,
     my_keys: &Keys,
-    payment_request: Option<&str>,
+    payment_request: Option<String>,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
     order: &Order,
@@ -415,7 +414,7 @@ async fn show_hold_invoice(
         )
         .await?;
     if let Some(invoice) = payment_request {
-        db::edit_buyer_invoice_order(pool, order.id, invoice).await?;
+        db::edit_buyer_invoice_order(pool, order.id, &invoice).await?;
     };
 
     db::edit_order(

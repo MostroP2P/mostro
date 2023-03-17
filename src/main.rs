@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         };
 
-                                        // Check market price here
+                                        // Check market price
                                         if order.amount == 0 {
                                             order.amount = get_market_quote(
                                                 &order.fiat_amount,
@@ -172,8 +172,7 @@ async fn main() -> anyhow::Result<()> {
                                         let seller_pubkey = event.pubkey;
                                         // Safe unwrap as we verified the message
                                         let order_id = msg.order_id.unwrap();
-                                        info!("takebuy: {order_id}");
-                                        let order = match Order::by_id(&pool, order_id).await? {
+                                        let mut order = match Order::by_id(&pool, order_id).await? {
                                             Some(order) => order,
                                             None => {
                                                 error!("TakeBuy: Order Id {order_id} not found!");
@@ -213,6 +212,15 @@ async fn main() -> anyhow::Result<()> {
                                                 break;
                                             }
                                         };
+                                        // Check market price
+                                        if order.amount == 0 {
+                                            order.amount = get_market_quote(
+                                                &order.fiat_amount,
+                                                &order.fiat_code,
+                                            )
+                                            .await?;
+                                        }
+
                                         show_hold_invoice(
                                             &pool,
                                             &client,

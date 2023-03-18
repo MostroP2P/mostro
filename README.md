@@ -102,3 +102,15 @@ Before run it you to set `NSEC_PRIVKEY` with the private key of your Mostro, if 
 ```bash
 $ cargo run
 ```
+
+If you want to run with with a private dockerized relay, you must:
+
+```bash
+cd relay
+docker compose up -d
+```
+
+This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
+
+
+So the relay URL you want to connect to is: `ws://localhost:7000`.

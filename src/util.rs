@@ -1,11 +1,18 @@
 use crate::models::{NewOrder, Order, Yadio};
-use crate::types::{Kind as OrderKind, Status};
+use crate::types::{Action, Content, Kind as OrderKind, Message, Status};
+use crate::{db, flow};
 use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
+use nostr_sdk::prelude::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use std::str::FromStr;
+use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+
+use crate::lightning;
+use crate::messages;
+use tokio::sync::mpsc::channel;
 
 /// Request market quote from Yadio to have sats amount at actual market price
 pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str) -> Result<i64> {
@@ -172,4 +179,98 @@ pub async fn connect_nostr() -> Result<Client> {
     client.connect().await;
 
     Ok(client)
+}
+
+pub async fn show_hold_invoice(
+    pool: &SqlitePool,
+    client: &Client,
+    my_keys: &Keys,
+    payment_request: Option<String>,
+    buyer_pubkey: &XOnlyPublicKey,
+    seller_pubkey: &XOnlyPublicKey,
+    order: &Order,
+) -> anyhow::Result<()> {
+    let mut ln_client = lightning::LndConnector::new().await;
+    // Now we generate the hold invoice that seller should pay
+    let (invoice_response, preimage, hash) = ln_client
+        .create_hold_invoice(
+            &messages::hold_invoice_description(
+                my_keys.public_key(),
+                &order.id.to_string(),
+                &order.fiat_code,
+                &order.fiat_amount.to_string(),
+            )?,
+            order.amount,
+        )
+        .await?;
+    if let Some(invoice) = payment_request {
+        db::edit_buyer_invoice_order(pool, order.id, &invoice).await?;
+    };
+
+    db::edit_order(
+        pool,
+        &Status::WaitingPayment,
+        order.id,
+        buyer_pubkey,
+        seller_pubkey,
+        &preimage.to_hex(),
+        &hash.to_hex(),
+    )
+    .await?;
+    // We need to publish a new event with the new status
+    update_order_event(pool, client, my_keys, Status::WaitingPayment, order).await?;
+    let new_order = order.as_new_order();
+    // We create a Message to send the hold invoice to seller
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::PayInvoice,
+        Some(Content::PayHoldInvoice(
+            new_order,
+            invoice_response.payment_request,
+        )),
+    );
+    let message = message.as_json()?;
+
+    // We send the hold invoice to the seller
+    send_dm(client, my_keys, seller_pubkey, message).await?;
+    let message = messages::waiting_seller_to_pay_invoice(order.id);
+
+    // We send a message to buyer to know that seller was requested to pay the invoice
+    send_dm(client, my_keys, buyer_pubkey, message).await?;
+    let mut ln_client_invoices = lightning::LndConnector::new().await;
+    let (tx, mut rx) = channel(100);
+
+    let invoice_task = {
+        async move {
+            ln_client_invoices.subscribe_invoice(hash, tx).await;
+        }
+    };
+    tokio::spawn(invoice_task);
+    let subs = {
+        async move {
+            // Receiving msgs from the invoice subscription.
+            while let Some(msg) = rx.recv().await {
+                let hash = msg.hash.to_hex();
+                // If this invoice was paid by the seller
+                if msg.state == InvoiceState::Accepted {
+                    flow::hold_invoice_paid(&hash).await;
+                    println!("Invoice with hash {hash} accepted!");
+                } else if msg.state == InvoiceState::Settled {
+                    // If the payment was released by the seller
+                    println!("Invoice with hash {hash} settled!");
+                    flow::hold_invoice_settlement(&hash).await;
+                } else if msg.state == InvoiceState::Canceled {
+                    // If the payment was canceled
+                    println!("Invoice with hash {hash} canceled!");
+                    flow::hold_invoice_canceled(&hash).await;
+                } else {
+                    info!("Invoice with hash: {hash} subscribed!");
+                }
+            }
+        }
+    };
+    tokio::spawn(subs);
+
+    Ok(())
 }

@@ -116,3 +116,14 @@ pub fn hold_invoice_description(
         "{} - Escrow amount Order #{order_id}: SELL BTC for {fiat_code} {fiat_amount} - It WILL FREEZE IN WALLET. It will release once you release. It will return if buyer does not confirm the payment", mostro_pubkey.to_bech32()?
     ))
 }
+
+pub fn send_invoice_for_market_price(order_id: Uuid, sats: i64) -> Result<String> {
+    Ok(format!(
+        "🧌 Order Id: {}
+
+    create a lightning invoice of {} sats and use sendinvoice command like this:
+    
+    sendinvoice --order orderid --invoice invoice_string",
+        order_id, sats
+    ))
+}

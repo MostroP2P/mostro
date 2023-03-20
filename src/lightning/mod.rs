@@ -1,6 +1,6 @@
 pub mod invoice;
-
 use crate::lightning::invoice::decode_invoice;
+
 use anyhow::Result;
 use dotenvy::var;
 use easy_hasher::easy_hasher::*;

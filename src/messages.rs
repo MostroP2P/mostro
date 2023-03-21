@@ -117,13 +117,15 @@ pub fn hold_invoice_description(
     ))
 }
 
-pub fn send_invoice_for_market_price(order_id: Uuid, sats: i64) -> Result<String> {
+pub fn send_buyer_invoice_req_market_price(order_id: Uuid, sats: i64, prime : i64) -> Result<String> {
     Ok(format!(
         "🧌 Order Id: {}
 
-    create a lightning invoice of {} sats and use sendinvoice command like this:
+    create a lightning invoice of {} sats , this value is calculated as market price added with requested premiun ( {}% ).
+    
+    Use sendinvoice command like this:
     
     sendinvoice --order orderid --invoice invoice_string",
-        order_id, sats
+        order_id, sats, prime
     ))
 }

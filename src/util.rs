@@ -15,7 +15,7 @@ use crate::messages;
 use tokio::sync::mpsc::channel;
 
 /// Request market quote from Yadio to have sats amount at actual market price
-pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, prime : &i64) -> Result<i64> {
+pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, prime: &i64) -> Result<i64> {
     // Add here check for market price
     let req_string = format!(
         "https://api.yadio.io/convert/{}/{}/BTC",
@@ -32,8 +32,8 @@ pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, prime : &i64) 
 
     // Added premium value to have correct sats value
     if *prime != 0 {
-        sats += (*prime as f64)/100_f64 * sats;
-    } 
+        sats += (*prime as f64) / 100_f64 * sats;
+    }
 
     Ok(sats as i64)
 }

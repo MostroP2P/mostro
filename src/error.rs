@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MostroError {
     ParsingInvoiceError,
     ParsingNumberError,

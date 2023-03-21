@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                                             .await?
                                         }
                                     }
-                                    Action::TakeSell => {
+                                    Action::TakeSell | Action::SendInvoice => {
                                         // Safe unwrap as we verified the message
                                         let order_id = msg.order_id.unwrap();
                                         let mut order = match Order::by_id(&pool, order_id).await? {
@@ -152,10 +152,11 @@ async fn main() -> anyhow::Result<()> {
                                             order.amount = get_market_quote(
                                                 &order.fiat_amount,
                                                 &order.fiat_code,
-                                                &order.prime
+                                                &order.prime,
                                             )
                                             .await?;
 
+                                            // Send a message to buyer with invoice amount at market price
                                             send_dm(
                                                 &client,
                                                 &my_keys,
@@ -163,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                                                 messages::send_buyer_invoice_req_market_price(
                                                     order_id,
                                                     order.amount,
-                                                    order.prime
+                                                    order.prime,
                                                 )
                                                 .unwrap(),
                                             )
@@ -239,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
                                             order.amount = get_market_quote(
                                                 &order.fiat_amount,
                                                 &order.fiat_code,
-                                                &order.prime
+                                                &order.prime,
                                             )
                                             .await?;
                                         }

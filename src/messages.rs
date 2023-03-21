@@ -117,7 +117,11 @@ pub fn hold_invoice_description(
     ))
 }
 
-pub fn send_buyer_invoice_req_market_price(order_id: Uuid, sats: i64, prime : i64) -> Result<String> {
+pub fn send_buyer_invoice_req_market_price(
+    order_id: Uuid,
+    sats: i64,
+    prime: i64,
+) -> Result<String> {
     Ok(format!(
         "🧌 Order Id: {}
 

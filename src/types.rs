@@ -31,7 +31,7 @@ impl fmt::Display for Kind {
 }
 
 /// Each status that an order can have
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub enum Status {
     Active,
     Canceled,
@@ -84,6 +84,7 @@ pub enum Action {
     PayInvoice,
     FiatSent,
     Release,
+    SendInvoice,
 }
 
 impl fmt::Display for Action {
@@ -144,6 +145,12 @@ impl Message {
                     return false;
                 }
                 matches!(&self.content, Some(Content::PayHoldInvoice(_, _)))
+            }
+            Action::SendInvoice => {
+                if self.order_id.is_none() {
+                    return false;
+                }
+                matches!(self.content, Some(Content::PaymentRequest(_)))
             }
             Action::TakeSell => {
                 if self.order_id.is_none() {

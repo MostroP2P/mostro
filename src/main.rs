@@ -126,15 +126,20 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         };
                                         // Buyer can take pending orders only
-                                        if order_status != Status::Pending {
-                                            send_dm(
-                                                &client,
-                                                &my_keys,
-                                                &buyer_pubkey,
-                                                format!("Order Id {order_id} was already taken!"),
-                                            )
-                                            .await?;
-                                            break;
+                                        match order_status {
+                                            Status::Pending | Status::WaitingBuyerInvoice => {}
+                                            _ => {
+                                                send_dm(
+                                                    &client,
+                                                    &my_keys,
+                                                    &buyer_pubkey,
+                                                    format!(
+                                                        "Order Id {order_id} was already taken!"
+                                                    ),
+                                                )
+                                                .await?;
+                                                break;
+                                            }
                                         }
                                         let seller_pubkey = match order.seller_pubkey.as_ref() {
                                             Some(pk) => XOnlyPublicKey::from_bech32(pk)?,

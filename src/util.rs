@@ -150,30 +150,8 @@ pub async fn connect_nostr() -> Result<Client> {
 
     // Create new client
     let client = Client::new(&my_keys);
-
-    let relays = vec![
-        "wss://relay.nostr.vision",
-        "wss://nostr.zebedee.cloud",
-        "wss://public.nostr.swissrouting.com",
-        "wss://nostr.slothy.win",
-        "wss://nostr.rewardsbunny.com",
-        "wss://nostr.supremestack.xyz",
-        "wss://nostr.shawnyeager.net",
-        "wss://relay.nostrmoto.xyz",
-        "wss://nostr.roundrockbitcoiners.com",
-        "wss://nostr.utxo.lol",
-        "wss://nostr-relay.schnitzel.world",
-        "wss://sg.qemura.xyz",
-        "wss://nostr.digitalreformation.info",
-        "wss://nostr-relay.usebitcoin.space",
-        "wss://nostr.bch.ninja",
-        "wss://nostr.massmux.com",
-        "wss://nostr-pub1.southflorida.ninja",
-        "wss://relay.nostr.nu",
-        "wss://nostr.easydns.ca",
-        "wss://nostrical.com",
-        "wss://relay.damus.io",
-    ];
+    let relays = var("RELAYS").expect("RELAYS is not set");
+    let relays = relays.split(',').collect::<Vec<&str>>();
 
     // Add relays
     for r in relays.into_iter() {

@@ -117,19 +117,33 @@ pub fn hold_invoice_description(
     ))
 }
 
-pub fn send_buyer_invoice_req_market_price(
+pub fn send_sell_request_invoice_req_market_price(
     order_id: Uuid,
     sats: i64,
     prime: i64,
 ) -> Result<String> {
     Ok(format!(
-        "🧌 Order Id: {}
+            "🧌 Order Id: {}
+    
+        create a lightning invoice of {} sats , this value is calculated as market price added with requested premiun ( {}% ).
+        
+        Use again takesell command like this:
+        
+        takesell --order orderid --invoice invoice_string",
+            order_id, sats, prime
+        ))
+}
 
-    create a lightning invoice of {} sats , this value is calculated as market price added with requested premiun ( {}% ).
-    
-    Use sendinvoice command like this:
-    
-    sendinvoice --order orderid --invoice invoice_string",
-        order_id, sats, prime
-    ))
+pub fn send_buy_request_invoice_req_market_price(
+    order_id: Uuid,
+    sats: i64,
+    _prime: i64,
+) -> Result<String> {
+    Ok(format!(
+            "We sent a hold invoice to the seller of order id : {} create a lightning invoice of {} sats to proceed.
+            
+            Check with getdm command when hold invoice is paid by seller before proceding."
+            , order_id, sats
+
+        ))
 }

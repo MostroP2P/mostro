@@ -73,7 +73,14 @@ pub async fn publish_order(
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order_id, &Status::Pending, &event_id).await?;
+    crate::db::update_order_event_id_status(
+        pool,
+        order_id,
+        &Status::Pending,
+        &event_id,
+        &order.amount,
+    )
+    .await?;
     client
         .send_event(event)
         .await
@@ -133,7 +140,8 @@ pub async fn update_order_event(
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id).await?;
+    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, &order.amount)
+        .await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order.id, status_str
@@ -256,4 +264,38 @@ pub async fn show_hold_invoice(
     tokio::spawn(subs);
 
     Ok(())
+}
+
+pub async fn set_market_order_sats_amount(
+    order: &mut Order,
+    buyer_pubkey: XOnlyPublicKey,
+    my_keys: &Keys,
+    pool: &SqlitePool,
+    client: &Client,
+) -> Result<i64> {
+    //Update amount order
+    let new_sats_amout =
+        get_market_quote(&order.fiat_amount, &order.fiat_code, &order.prime).await?;
+
+    // Send a message to buyer with invoice amount at market price
+    let message = match OrderKind::from_str(&order.kind).unwrap() {
+        OrderKind::Sell => messages::send_sell_request_invoice_req_market_price(
+            order.id,
+            new_sats_amout,
+            order.prime,
+        ),
+        OrderKind::Buy => messages::send_buy_request_invoice_req_market_price(
+            order.id,
+            new_sats_amout,
+            order.prime,
+        ),
+    };
+
+    send_dm(client, my_keys, &buyer_pubkey, message.unwrap()).await?;
+
+    //Update order with new sats value
+    order.amount = new_sats_amout;
+    update_order_event(pool, client, my_keys, Status::WaitingBuyerInvoice, order).await?;
+
+    Ok(order.amount)
 }

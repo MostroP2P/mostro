@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                                             .await?
                                         }
                                     }
-                                    Action::TakeSell | Action::SendInvoice => {
+                                    Action::TakeSell => {
                                         // Safe unwrap as we verified the message
                                         let order_id = msg.order_id.unwrap();
                                         let mut order = match Order::by_id(&pool, order_id).await? {
@@ -152,35 +152,14 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         };
 
-                                        // Check market price
+                                        // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
                                         if order.amount == 0 {
-                                            order.amount = get_market_quote(
-                                                &order.fiat_amount,
-                                                &order.fiat_code,
-                                                &order.prime,
-                                            )
-                                            .await?;
-
-                                            // Send a message to buyer with invoice amount at market price
-                                            send_dm(
-                                                &client,
+                                            order.amount = set_market_order_sats_amount(
+                                                &mut order,
+                                                buyer_pubkey,
                                                 &my_keys,
-                                                &buyer_pubkey,
-                                                messages::send_buyer_invoice_req_market_price(
-                                                    order_id,
-                                                    order.amount,
-                                                    order.prime,
-                                                )
-                                                .unwrap(),
-                                            )
-                                            .await?;
-
-                                            update_order_event(
                                                 &pool,
                                                 &client,
-                                                &my_keys,
-                                                Status::WaitingBuyerInvoice,
-                                                &order,
                                             )
                                             .await?;
                                         } else {
@@ -240,12 +219,14 @@ async fn main() -> anyhow::Result<()> {
                                                 break;
                                             }
                                         };
-                                        // Check market price
+                                        // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
                                         if order.amount == 0 {
-                                            order.amount = get_market_quote(
-                                                &order.fiat_amount,
-                                                &order.fiat_code,
-                                                &order.prime,
+                                            order.amount = set_market_order_sats_amount(
+                                                &mut order,
+                                                buyer_pubkey,
+                                                &my_keys,
+                                                &pool,
+                                                &client,
                                             )
                                             .await?;
                                         }

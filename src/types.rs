@@ -31,7 +31,7 @@ impl fmt::Display for Kind {
 }
 
 /// Each status that an order can have
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub enum Status {
     Active,
     Canceled,

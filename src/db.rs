@@ -145,6 +145,7 @@ pub async fn update_order_event_id_status(
     order_id: Uuid,
     status: &crate::types::Status,
     event_id: &str,
+    amount: &i64,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
@@ -153,10 +154,12 @@ pub async fn update_order_event_id_status(
             UPDATE orders
             SET
             status = ?1,
-            event_id = ?2
-            WHERE id = ?3
+            amount = ?2,
+            event_id = ?3
+            WHERE id = ?4
         "#,
         status,
+        amount,
         event_id,
         order_id,
     )

@@ -29,6 +29,7 @@ pub struct Order {
     pub event_id: String,
     pub hash: Option<String>,
     pub preimage: Option<String>,
+    pub creator_pubkey: String,
     pub buyer_pubkey: Option<String>,
     pub seller_pubkey: Option<String>,
     pub status: String,

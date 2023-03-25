@@ -57,11 +57,16 @@ impl LndConnector {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
+        let cltv_expiry: u64 = var("HOLD_INVOICE_CLTV_DELTA")
+            .expect("HOLD_INVOICE_CLTV_DELTA must be set")
+            .parse()
+            .expect("cltv delta is not i64");
 
         let invoice = AddHoldInvoiceRequest {
             hash: hash.to_vec(),
             memo: description.to_string(),
             value: amount,
+            cltv_expiry,
             ..Default::default()
         };
         let holdinvoice = self

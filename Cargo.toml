@@ -1,6 +1,6 @@
 [package]
 name = "mostro"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 license = "MIT"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
@@ -11,7 +11,7 @@ anyhow = "1.0.66"
 chrono = "0.4.23"
 dotenvy = "0.15.6"
 easy-hasher = "2.2.1"
-lightning-invoice = "0.21.0"
+lightning-invoice = "0.22.0"
 log = "0.4.17"
 nostr-sdk = "0.18.0"
 pretty_env_logger = "0.4.0"

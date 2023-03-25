@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS orders (
   event_id char(64) not null,
   hash char(64),
   preimage char(64),
+  creator_pubkey char(64),
   buyer_pubkey char(64),
   seller_pubkey char(64),
   status char(10) not null,

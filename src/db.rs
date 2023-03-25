@@ -45,6 +45,7 @@ pub async fn add_order(
         id,
         kind,
         event_id,
+        creator_pubkey,
         buyer_pubkey,
         seller_pubkey,
         status,
@@ -55,13 +56,14 @@ pub async fn add_order(
         fiat_amount,
         buyer_invoice,
         created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         RETURNING *
       "#,
     )
     .bind(uuid)
     .bind(kind)
     .bind(event_id)
+    .bind(initiator_pubkey)
     .bind(buyer_pubkey)
     .bind(seller_pubkey)
     .bind(status)

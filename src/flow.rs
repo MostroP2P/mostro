@@ -1,4 +1,5 @@
 use log::info;
+use mostro_core::Status;
 use nostr_sdk::prelude::*;
 
 pub async fn hold_invoice_paid(hash: &str) {
@@ -16,15 +17,9 @@ pub async fn hold_invoice_paid(hash: &str) {
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(
-        &pool,
-        &client,
-        &my_keys,
-        crate::types::Status::Active,
-        &order,
-    )
-    .await
-    .unwrap();
+    crate::util::update_order_event(&pool, &client, &my_keys, Status::Active, &order)
+        .await
+        .unwrap();
 
     // We send a confirmation message to seller
     let message = crate::messages::buyer_took_order(&order, buyer_pubkey).unwrap();
@@ -52,15 +47,9 @@ pub async fn hold_invoice_settlement(hash: &str) {
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(
-        &pool,
-        &client,
-        &my_keys,
-        crate::types::Status::SettledHoldInvoice,
-        &order,
-    )
-    .await
-    .unwrap();
+    crate::util::update_order_event(&pool, &client, &my_keys, Status::SettledHoldInvoice, &order)
+        .await
+        .unwrap();
     // We send a *funds released* message to seller
     let message = crate::messages::sell_success(order.id, buyer_pubkey).unwrap();
     crate::util::send_dm(&client, &my_keys, &seller_pubkey, message)
@@ -89,15 +78,9 @@ pub async fn hold_invoice_canceled(hash: &str) {
     );
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(
-        &pool,
-        &client,
-        &my_keys,
-        crate::types::Status::Canceled,
-        &order,
-    )
-    .await
-    .unwrap();
+    crate::util::update_order_event(&pool, &client, &my_keys, Status::Canceled, &order)
+        .await
+        .unwrap();
     // We send "order canceled" messages to both parties
     let message = crate::messages::order_canceled(order.id);
     crate::util::send_dm(&client, &my_keys, &seller_pubkey, message.clone())

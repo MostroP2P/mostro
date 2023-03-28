@@ -4,21 +4,23 @@ pub mod flow;
 pub mod lightning;
 pub mod messages;
 pub mod models;
-pub mod types;
+//pub mod types;
 pub mod util;
 
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
 use log::{error, info};
-use models::Order;
+//use models::Order;
 use nostr_sdk::prelude::*;
 
 use sqlx_crud::Crud;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
-use types::{Action, Message, Status};
+// use types::{Action, Message, Status};
+use mostro_core::order::Order;
+use mostro_core::{Action, Message, Status};
 use util::*;
 
 #[tokio::main]
@@ -452,8 +454,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::NewOrder;
-    use crate::types::Message;
+    use mostro_core::order::NewOrder;
+    use mostro_core::Message;
 
     #[test]
     fn test_order_deserialize_serialize() {

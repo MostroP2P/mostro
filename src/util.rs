@@ -1,9 +1,10 @@
-use crate::models::{NewOrder, Order, Yadio};
-use crate::types::{Action, Content, Kind as OrderKind, Message, Status};
+use crate::models::Yadio;
 use crate::{db, flow};
 use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
+use mostro_core::order::{NewOrder, Order};
+use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
 use nostr_sdk::prelude::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;

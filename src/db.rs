@@ -6,7 +6,8 @@ use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::models::{NewOrder, Order};
+use mostro_core::order::{NewOrder, Order};
+use mostro_core::{Kind, Status};
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let db_url = var("DATABASE_URL").expect("DATABASE_URL is not set");
@@ -29,7 +30,7 @@ pub async fn add_order(
     let mut buyer_pubkey = "";
     let mut seller_pubkey = "";
     let created_at = Timestamp::now();
-    if order.kind == crate::types::Kind::Buy {
+    if order.kind == Kind::Buy {
         buyer_pubkey = initiator_pubkey;
     } else {
         seller_pubkey = initiator_pubkey;
@@ -83,7 +84,7 @@ pub async fn add_order(
 #[allow(clippy::too_many_arguments)]
 pub async fn edit_order(
     pool: &SqlitePool,
-    status: &crate::types::Status,
+    status: &Status,
     order_id: Uuid,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
@@ -145,7 +146,7 @@ pub async fn edit_buyer_invoice_order(
 pub async fn update_order_event_id_status(
     pool: &SqlitePool,
     order_id: Uuid,
-    status: &crate::types::Status,
+    status: &Status,
     event_id: &str,
     amount: &i64,
 ) -> anyhow::Result<bool> {

@@ -1,5 +1,5 @@
-use crate::models::Order;
 use anyhow::Result;
+use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use uuid::Uuid;
 

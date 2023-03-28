@@ -251,6 +251,12 @@ async fn main() -> anyhow::Result<()> {
                                                 break;
                                             }
                                         };
+                                        // TODO: send to user a DM with the error
+                                        if order.status != "Active" {
+                                            error!("FiatSent: Order Id {order_id} wrong status");
+                                            break;
+                                        }
+                                        // Check if the pubkey is the buyer
                                         if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
                                             send_dm(
                                                 &client,

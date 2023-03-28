@@ -107,8 +107,8 @@ pub struct Message {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Content {
     Order(NewOrder),
-    PaymentRequest(String),
-    PayHoldInvoice(NewOrder, String),
+    PaymentRequest(Option<NewOrder>, String),
+    TextMessage(String),
 }
 
 #[allow(dead_code)]
@@ -144,7 +144,7 @@ impl Message {
                 if self.order_id.is_none() {
                     return false;
                 }
-                matches!(&self.content, Some(Content::PayHoldInvoice(_, _)))
+                matches!(&self.content, Some(Content::PaymentRequest(_, _)))
             }
             Action::TakeSell
             | Action::TakeBuy
@@ -174,7 +174,7 @@ impl Message {
             return None;
         }
         match &self.content {
-            Some(Content::PaymentRequest(pr)) => Some(pr.to_owned()),
+            Some(Content::PaymentRequest(_, pr)) => Some(pr.to_owned()),
             _ => None,
         }
     }

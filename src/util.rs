@@ -216,8 +216,8 @@ pub async fn show_hold_invoice(
         0,
         Some(order.id),
         Action::PayInvoice,
-        Some(Content::PayHoldInvoice(
-            new_order,
+        Some(Content::PaymentRequest(
+            Some(new_order),
             invoice_response.payment_request,
         )),
     );

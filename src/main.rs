@@ -6,22 +6,23 @@ pub mod messages;
 pub mod models;
 //pub mod types;
 pub mod util;
+pub mod scheduler;
 
 use dotenvy::dotenv;
 use error::MostroError;
 use lightning::invoice::is_valid_invoice;
 use log::{error, info};
-//use models::Order;
+
 use nostr_sdk::prelude::*;
 
 use sqlx_crud::Crud;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
-// use types::{Action, Message, Status};
 use mostro_core::order::Order;
 use mostro_core::{Action, Message, Status};
 use util::*;
+use scheduler::cron_scheduler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
 
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
+
+    //Start scheduler for tasks
+    cron_scheduler();
 
     loop {
         let mut notifications = client.notifications();

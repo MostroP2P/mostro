@@ -202,3 +202,17 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
 
     Ok(order)
 }
+
+pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          ORDER BY created_at ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
+}

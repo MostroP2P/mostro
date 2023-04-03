@@ -22,7 +22,7 @@ use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use mostro_core::order::Order;
 use mostro_core::{Action, Message, Status};
 use util::*;
-use scheduler::cron_scheduler;
+use scheduler::scheduler_mostro;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,11 +40,13 @@ async fn main() -> anyhow::Result<()> {
 
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
-
-    //Start scheduler for tasks
-    cron_scheduler();
+ 
+     //Start scheduler for tasks
+     scheduler_mostro();
 
     loop {
+        
+
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {

@@ -41,12 +41,11 @@ async fn main() -> anyhow::Result<()> {
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
  
-     //Start scheduler for tasks
-     scheduler_mostro();
+    //Start scheduler for tasks
+    scheduler_mostro(&client.clone(),&my_keys.clone());
 
     loop {
-        
-
+    
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {

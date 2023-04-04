@@ -204,21 +204,6 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
 }
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let order = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          ORDER BY created_at ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(order)
-}
-
-
-pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
     let exp_hours = var("EXP_HOURS").expect("EXP_HOURS is not set").as_str().parse::<u64>().unwrap();
     let expire_time = Timestamp::now() - (3600 * exp_hours);
     let order = sqlx::query_as::<_, Order>(

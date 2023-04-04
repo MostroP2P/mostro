@@ -41,13 +41,15 @@ pub async fn cron_scheduler(mut sched: JobScheduler) -> Result<(), anyhow::Error
         Box::pin(async move {
             info!("Create a pool to connect to db ");
             let pool = crate::db::connect().await;
+            
+            info!("Create a pool to connect to db ");
+            let pool = crate::db::connect().await;
             info!("I run async every 4 seconds id {:?}", uuid);
             let time = crate::db::find_order_by_date(&pool.unwrap()).await;
 
             for el in time.unwrap().iter(){
                 println!("Uid {} - created {}",el.id,el.created_at)
-            }
-
+            }            
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
                 Ok(Some(ts)) => info!("Next time for 4s is {:?}", ts),

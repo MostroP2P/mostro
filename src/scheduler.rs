@@ -24,7 +24,7 @@ pub fn scheduler_mostro() {
 
 async fn start() -> Result<(), Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::TRACE)
+        .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     info!("Creating scheduler");

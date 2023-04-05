@@ -214,7 +214,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
         r#"
           SELECT *
           FROM orders
-          WHERE created_at < ?1
+          WHERE created_at < ?1 AND status <> 'Expired'
         "#,
     )
     .bind(expire_time.to_string())

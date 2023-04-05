@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     // Connect to database
     let pool = db::connect().await?;
-    // // Connect to relays
+    // Connect to relays
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
  
-    //Start scheduler for tasks
+    // Start scheduler for tasks
     let _scheduler_module = start_scheduler().await.unwrap().start().await;
     
     loop {

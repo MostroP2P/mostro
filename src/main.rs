@@ -4,7 +4,6 @@ pub mod flow;
 pub mod lightning;
 pub mod messages;
 pub mod models;
-//pub mod types;
 pub mod scheduler;
 pub mod util;
 
@@ -42,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
 
     // Start scheduler for tasks
-    let _scheduler_module = start_scheduler().await.unwrap().start().await;
+    start_scheduler().await.unwrap().start().await?;
 
     loop {
         let mut notifications = client.notifications();

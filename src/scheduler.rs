@@ -11,15 +11,15 @@ pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     info!("Creating scheduler");
     let sched = JobScheduler::new().await?;
+    cron_scheduler(&sched).await?;
 
-    cron_scheduler(&sched).await;
     Ok(sched)
 }
 
 pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     let job_older_orders_1m = Job::new_async("0 * * * * *", move |uuid, mut l| {
         Box::pin(async move {
-            info!("Create a pool to connect to db ");
+            info!("Create a pool to connect to db");
             let pool = crate::db::connect().await;
             // Connect to relays
             let client = crate::util::connect_nostr().await;

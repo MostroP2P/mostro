@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     // Connect to database
     let pool = db::connect().await?;
-    // // Connect to relays
+    // Connect to relays
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
  
-    //Start scheduler for tasks
+    // Start scheduler for tasks
     let _scheduler_module = start_scheduler().await.unwrap().start().await;
     
     loop {
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_message_deserialize_serialize() {
-        let sample_message = r#"{"version":0,"order_id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"TakeSell","content":{"PaymentRequest":"lnbc1..."}}"#;
+        let sample_message = r#"{"version":0,"order_id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"TakeSell","content":{"PaymentRequest":[null,"lnbc1..."]}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(message.verify());
         let json_message = message.as_json().unwrap();

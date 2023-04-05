@@ -5,8 +5,8 @@ pub mod lightning;
 pub mod messages;
 pub mod models;
 //pub mod types;
-pub mod util;
 pub mod scheduler;
+pub mod util;
 
 use dotenvy::dotenv;
 use error::MostroError;
@@ -15,17 +15,14 @@ use log::{error, info};
 
 use nostr_sdk::prelude::*;
 
+use mostro_core::order::Order;
+use mostro_core::{Action, Message, Status};
+use scheduler::start_scheduler;
 use sqlx_crud::Crud;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
-use mostro_core::order::Order;
-use mostro_core::{Action, Message, Status};
 use util::*;
-use scheduler::start_scheduler;
-
-use tokio_cron_scheduler::{Job, JobScheduler};
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,10 +40,10 @@ async fn main() -> anyhow::Result<()> {
 
     client.subscribe(vec![subscription]).await;
     let mut ln_client = lightning::LndConnector::new().await;
- 
+
     // Start scheduler for tasks
     let _scheduler_module = start_scheduler().await.unwrap().start().await;
-    
+
     loop {
         let mut notifications = client.notifications();
 

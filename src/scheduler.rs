@@ -31,19 +31,19 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error>{
 
             info!("I run async every minute id {:?}", uuid);
 
-            let older_orders_list = crate::db::find_order_by_date(&pool.unwrap()).await;
+            let older_orders_list = crate::db::find_order_by_date(&pool.as_ref().unwrap()).await;
 
             for order in older_orders_list.unwrap().iter(){
                 println!("Uid {} - created at {}",order.id,order.created_at);
-                crate::db::find_order_by_date(&pool.unwrap()).await;
                 // We update the order id with the new event_id
-                crate::util::update_order_event(
-                    &pool.unwrap(),
-                    &client.unwrap(),
-                    &keys.unwrap(),
+                let res = crate::util::update_order_event(
+                    &pool.as_ref().unwrap(),
+                    &client.as_ref().unwrap(),
+                    &keys.as_ref().unwrap(),
                     mostro_core::Status::Expired,
                     order,
                 ).await;
+                //Send dm here???
             }           
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {

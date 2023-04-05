@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_message_deserialize_serialize() {
-        let sample_message = r#"{"version":0,"order_id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"TakeSell","content":{"PaymentRequest":"lnbc1..."}}"#;
+        let sample_message = r#"{"version":0,"order_id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"TakeSell","content":{"PaymentRequest":[null,"lnbc1..."]}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(message.verify());
         let json_message = message.as_json().unwrap();

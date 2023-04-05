@@ -22,7 +22,10 @@ use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use mostro_core::order::Order;
 use mostro_core::{Action, Message, Status};
 use util::*;
-use scheduler::scheduler_mostro;
+use scheduler::start_scheduler;
+
+use tokio_cron_scheduler::{Job, JobScheduler};
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     // Connect to database
     let pool = db::connect().await?;
-    // Connect to relays
+    // // Connect to relays
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 
@@ -42,10 +45,9 @@ async fn main() -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
  
     //Start scheduler for tasks
-    scheduler_mostro(&client.clone(),&my_keys.clone());
-
-    loop {
+    let _scheduler_module = start_scheduler().await.unwrap().start().await;
     
+    loop {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {

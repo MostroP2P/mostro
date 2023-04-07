@@ -418,31 +418,43 @@ async fn main() -> anyhow::Result<()> {
                                                 break;
                                             }
                                         };
-                                        // Validates if this user is the order creator
-                                        let user_pubkey = event.pubkey.to_bech32()?;
-                                        if user_pubkey != order.creator_pubkey {
-                                            send_dm(
+                                        if order.status == "Pending" {
+                                            // Validates if this user is the order creator
+                                            let user_pubkey = event.pubkey.to_bech32()?;
+                                            if user_pubkey != order.creator_pubkey {
+                                                send_dm(
+                                                    &client,
+                                                    &my_keys,
+                                                    &event.pubkey,
+                                                    messages::cant_do(),
+                                                )
+                                                .await?;
+                                                break;
+                                            }
+                                            // We publish a new replaceable kind nostr event with the status updated
+                                            // and update on local database the status and new event id
+                                            update_order_event(
+                                                &pool,
                                                 &client,
                                                 &my_keys,
-                                                &event.pubkey,
-                                                messages::cant_do(),
+                                                Status::Canceled,
+                                                &order,
                                             )
                                             .await?;
-                                            break;
+                                            // We send a message to seller to release
+                                            let message = messages::order_canceled(order.id);
+                                            send_dm(&client, &my_keys, &event.pubkey, message)
+                                                .await?;
+                                        } else if order.status == "Active"
+                                            || order.status == "FiatSent"
+                                            || order.status == "Dispute"
+                                        {
+                                            // TODO
+                                            unimplemented!()
+                                        } else {
+                                            // TODO
+                                            unimplemented!()
                                         }
-                                        // We publish a new replaceable kind nostr event with the status updated
-                                        // and update on local database the status and new event id
-                                        update_order_event(
-                                            &pool,
-                                            &client,
-                                            &my_keys,
-                                            Status::Canceled,
-                                            &order,
-                                        )
-                                        .await?;
-                                        // We send a message to seller to release
-                                        let message = messages::order_canceled(order.id);
-                                        send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
                                     Action::PayInvoice => todo!(),
                                 }

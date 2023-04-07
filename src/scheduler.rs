@@ -40,12 +40,11 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     order,
                 )
                 .await;
-                //Send dm here???
             }
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
                 Ok(Some(ts)) => info!("Next time for 1 minute is {:?}", ts),
-                _ => warn!("Could not get next tick for 4s job"),
+                _ => warn!("Could not get next tick for job"),
             }
         })
     })

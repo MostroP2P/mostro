@@ -1,3 +1,33 @@
 {
-  "db": "SQLite"
+  "db": "SQLite",
+  "0f0f1e46225de7a094cc1450847078c0c1d5070e8af44e1961172dc2d28e3380": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 4
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            event_id = ?3\n            WHERE id = ?4\n        "
+  },
+  "4465f33fba7d31a7154b9710438d9319d02018e873a54d720cda2f7eb07aece6": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 6
+      }
+    },
+    "query": "\n    UPDATE orders\n    SET\n    buyer_pubkey = ?1,\n    seller_pubkey = ?2,\n    status = ?3,\n    preimage = ?4,\n    hash = ?5\n    WHERE id = ?6\n    "
+  },
+  "80d5c92cc49d9bb29d87f493fcd801ec065b28b030091e1a3752a040f460d0ef": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n    UPDATE orders\n    SET\n    buyer_invoice = ?1\n    WHERE id = ?2\n    "
+  }
 }

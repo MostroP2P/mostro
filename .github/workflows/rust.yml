@@ -8,7 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  DATABASE_URL: sqlite://mostro.db
+  SQLX_OFFLINE: true
+  MIN_PAYMENT_AMT: 100
+  INVOICE_EXPIRATION_WINDOW: 3600
 
 jobs:
   tests:

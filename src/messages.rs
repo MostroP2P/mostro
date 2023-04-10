@@ -3,6 +3,7 @@ use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use uuid::Uuid;
 
+// Not being used yet
 pub fn payment_request(order: &Order, hold_invoice: &str) -> String {
     format!(
     "🧌 Somebody wants to buy you {} sats for {} {}.
@@ -77,6 +78,7 @@ pub fn funds_released(order_id: Uuid, seller_pubkey: XOnlyPublicKey) -> Result<S
     seller_pubkey.to_bech32()?))
 }
 
+// Not being used yet
 pub fn pending_payment_success(amount: i32, order_id: Uuid, preimage: &str) -> String {
     format!(
         "I have paid your lightning invoice for ${amount} satoshis, Order Id: ${order_id}!
@@ -98,6 +100,7 @@ pub fn you_sent_fiat(order_id: Uuid, seller_pubkey: XOnlyPublicKey) -> Result<St
     seller_pubkey.to_bech32()?))
 }
 
+// Not being used yet
 pub fn invalid_invoice() -> String {
     "Invalid invoice!".to_string()
 }

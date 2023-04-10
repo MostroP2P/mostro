@@ -95,6 +95,7 @@ pub async fn send_dm(
     receiver_pubkey: &XOnlyPublicKey,
     content: String,
 ) -> Result<()> {
+    info!("DM content: {content:#?}");
     let event = EventBuilder::new_encrypted_direct_msg(sender_keys, *receiver_pubkey, content)?
         .to_event(sender_keys)?;
     info!("Sending event: {event:#?}");
@@ -226,7 +227,14 @@ pub async fn show_hold_invoice(
 
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
-    let message = messages::waiting_seller_to_pay_invoice(order.id);
+    let text_message = messages::waiting_seller_to_pay_invoice(order.id);
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
     send_dm(client, my_keys, buyer_pubkey, message).await?;
@@ -274,12 +282,12 @@ pub async fn set_market_order_sats_amount(
     pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
-    //Update amount order
+    // Update amount order
     let new_sats_amout =
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.prime).await?;
 
-    // Send a message to buyer with invoice amount at market price
-    let message = match OrderKind::from_str(&order.kind).unwrap() {
+    // Get the text message to buyer with invoice amount at market price
+    let text_message = match OrderKind::from_str(&order.kind).unwrap() {
         OrderKind::Sell => messages::send_sell_request_invoice_req_market_price(
             order.id,
             new_sats_amout,
@@ -291,10 +299,20 @@ pub async fn set_market_order_sats_amount(
             order.prime,
         ),
     };
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::TakeSell,
+        Some(Content::TextMessage(
+            text_message.unwrap_or_else(|_| "".to_string()),
+        )),
+    );
+    let message = message.as_json()?;
 
-    send_dm(client, my_keys, &buyer_pubkey, message.unwrap()).await?;
+    send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
-    //Update order with new sats value
+    // Update order with new sats value
     order.amount = new_sats_amout;
     update_order_event(pool, client, my_keys, Status::WaitingBuyerInvoice, order).await?;
 

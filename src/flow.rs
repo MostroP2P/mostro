@@ -1,5 +1,6 @@
+use crate::util::send_dm;
 use log::info;
-use mostro_core::Status;
+use mostro_core::{Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
 
 pub async fn hold_invoice_paid(hash: &str) {
@@ -22,13 +23,30 @@ pub async fn hold_invoice_paid(hash: &str) {
         .unwrap();
 
     // We send a confirmation message to seller
-    let message = crate::messages::buyer_took_order(&order, buyer_pubkey).unwrap();
-    crate::util::send_dm(&client, &my_keys, &seller_pubkey, message)
+    let text_message = crate::messages::buyer_took_order(&order, buyer_pubkey).unwrap();
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::BuyerTookOrder,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json().unwrap();
+    send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller paid
-    let message = crate::messages::get_in_touch_with_seller(&order, seller_pubkey).unwrap();
-    crate::util::send_dm(&client, &my_keys, &buyer_pubkey, message)
+    let text_message = crate::messages::get_in_touch_with_seller(&order, seller_pubkey)
+        .unwrap_or_else(|_| "".to_string());
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::HoldInvoicePaymentAccepted,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json().unwrap();
+    send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
         .unwrap();
 }
@@ -51,13 +69,29 @@ pub async fn hold_invoice_settlement(hash: &str) {
         .await
         .unwrap();
     // We send a *funds released* message to seller
-    let message = crate::messages::sell_success(order.id, buyer_pubkey).unwrap();
-    crate::util::send_dm(&client, &my_keys, &seller_pubkey, message)
+    let text_message = crate::messages::sell_success(order.id, buyer_pubkey).unwrap();
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::HoldInvoicePaymentSettled,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json().unwrap();
+    send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller released
-    let message = crate::messages::funds_released(order.id, seller_pubkey).unwrap();
-    crate::util::send_dm(&client, &my_keys, &buyer_pubkey, message)
+    let text_message = crate::messages::funds_released(order.id, seller_pubkey).unwrap();
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::Release,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json().unwrap();
+    send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
         .unwrap();
 }
@@ -82,11 +116,19 @@ pub async fn hold_invoice_canceled(hash: &str) {
         .await
         .unwrap();
     // We send "order canceled" messages to both parties
-    let message = crate::messages::order_canceled(order.id);
-    crate::util::send_dm(&client, &my_keys, &seller_pubkey, message.clone())
+    let text_message = crate::messages::order_canceled(order.id);
+    // We create a Message
+    let message = Message::new(
+        0,
+        Some(order.id),
+        Action::HoldInvoicePaymentCanceled,
+        Some(Content::TextMessage(text_message)),
+    );
+    let message = message.as_json().unwrap();
+    send_dm(&client, &my_keys, &seller_pubkey, message.clone())
         .await
         .unwrap();
-    crate::util::send_dm(&client, &my_keys, &buyer_pubkey, message)
+    send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
         .unwrap();
 }

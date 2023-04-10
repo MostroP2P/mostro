@@ -15,7 +15,7 @@ use log::{error, info};
 use nostr_sdk::prelude::*;
 
 use mostro_core::order::Order;
-use mostro_core::{Action, Message, Status};
+use mostro_core::{Action, Content, Message, Status};
 use scheduler::start_scheduler;
 use sqlx_crud::Crud;
 use std::str::FromStr;
@@ -263,13 +263,17 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         // Check if the pubkey is the buyer
                                         if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
-                                            send_dm(
-                                                &client,
-                                                &my_keys,
-                                                &event.pubkey,
-                                                messages::cant_do(),
-                                            )
-                                            .await?;
+                                            let text_message = messages::cant_do();
+                                            // We create a Message
+                                            let message = Message::new(
+                                                0,
+                                                Some(order.id),
+                                                Action::CantDo,
+                                                Some(Content::TextMessage(text_message)),
+                                            );
+                                            let message = message.as_json()?;
+                                            send_dm(&client, &my_keys, &event.pubkey, message)
+                                                .await?;
                                         }
 
                                         // We publish a new replaceable kind nostr event with the status updated
@@ -294,12 +298,28 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         };
                                         // We send a message to seller to release
-                                        let message =
+                                        let text_message =
                                             messages::buyer_sentfiat(order.id, event.pubkey)?;
+                                        // We create a Message
+                                        let message = Message::new(
+                                            0,
+                                            Some(order.id),
+                                            Action::FiatSent,
+                                            Some(Content::TextMessage(text_message)),
+                                        );
+                                        let message = message.as_json().unwrap();
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
-                                        let message =
+                                        let text_message =
                                             messages::you_sent_fiat(order.id, seller_pubkey)?;
+                                        // We create a Message
+                                        let message = Message::new(
+                                            0,
+                                            Some(order.id),
+                                            Action::FiatSent,
+                                            Some(Content::TextMessage(text_message)),
+                                        );
+                                        let message = message.as_json()?;
                                         send_dm(&client, &my_keys, &event.pubkey, message).await?;
                                     }
                                     Action::Release => {
@@ -313,13 +333,17 @@ async fn main() -> anyhow::Result<()> {
                                         };
                                         let seller_pubkey = event.pubkey;
                                         if Some(seller_pubkey.to_bech32()?) != order.seller_pubkey {
-                                            send_dm(
-                                                &client,
-                                                &my_keys,
-                                                &event.pubkey,
-                                                messages::cant_do(),
-                                            )
-                                            .await?;
+                                            let text_message = messages::cant_do();
+                                            // We create a Message
+                                            let message = Message::new(
+                                                0,
+                                                Some(order.id),
+                                                Action::CantDo,
+                                                Some(Content::TextMessage(text_message)),
+                                            );
+                                            let message = message.as_json()?;
+                                            send_dm(&client, &my_keys, &event.pubkey, message)
+                                                .await?;
                                         }
 
                                         if order.preimage.is_none() {
@@ -379,12 +403,23 @@ async fn main() -> anyhow::Result<()> {
                                                                 msg.payment.payment_hash
                                                             );
                                                             // Purchase completed message to buyer
-                                                            let message =
+                                                            let text_message =
                                                                 messages::purchase_completed(
                                                                     order.id,
                                                                     buyer_pubkey,
                                                                 )
                                                                 .unwrap();
+                                                            // We create a Message
+                                                            let message = Message::new(
+                                                                0,
+                                                                Some(order.id),
+                                                                Action::PurchaseCompleted,
+                                                                Some(Content::TextMessage(
+                                                                    text_message,
+                                                                )),
+                                                            );
+                                                            let message =
+                                                                message.as_json().unwrap();
                                                             send_dm(
                                                                 &client,
                                                                 &my_keys,
@@ -422,13 +457,17 @@ async fn main() -> anyhow::Result<()> {
                                             // Validates if this user is the order creator
                                             let user_pubkey = event.pubkey.to_bech32()?;
                                             if user_pubkey != order.creator_pubkey {
-                                                send_dm(
-                                                    &client,
-                                                    &my_keys,
-                                                    &event.pubkey,
-                                                    messages::cant_do(),
-                                                )
-                                                .await?;
+                                                let text_message = messages::cant_do();
+                                                // We create a Message
+                                                let message = Message::new(
+                                                    0,
+                                                    Some(order.id),
+                                                    Action::CantDo,
+                                                    Some(Content::TextMessage(text_message)),
+                                                );
+                                                let message = message.as_json()?;
+                                                send_dm(&client, &my_keys, &event.pubkey, message)
+                                                    .await?;
                                                 break;
                                             }
                                             // We publish a new replaceable kind nostr event with the status updated
@@ -441,8 +480,16 @@ async fn main() -> anyhow::Result<()> {
                                                 &order,
                                             )
                                             .await?;
-                                            // We send a message to seller to release
-                                            let message = messages::order_canceled(order.id);
+                                            // We send a message
+                                            let text_message = messages::order_canceled(order.id);
+                                            // We create a Message
+                                            let message = Message::new(
+                                                0,
+                                                Some(order.id),
+                                                Action::Cancel,
+                                                Some(Content::TextMessage(text_message)),
+                                            );
+                                            let message = message.as_json()?;
                                             send_dm(&client, &my_keys, &event.pubkey, message)
                                                 .await?;
                                         } else if order.status == "Active"
@@ -457,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                     Action::PayInvoice => todo!(),
+                                    _ => todo!(),
                                 }
                             }
                         }

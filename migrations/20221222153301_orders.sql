@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS orders (
   buyer_pubkey char(64),
   seller_pubkey char(64),
   status char(10) not null,
-  prime integer not null,
+  premium integer not null,
   payment_method varchar(500) not null,
   amount integer not null,
   fiat_code varchar(5) not null,

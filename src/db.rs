@@ -50,7 +50,7 @@ pub async fn add_order(
         buyer_pubkey,
         seller_pubkey,
         status,
-        prime,
+        premium,
         payment_method,
         amount,
         fiat_code,
@@ -68,7 +68,7 @@ pub async fn add_order(
     .bind(buyer_pubkey)
     .bind(seller_pubkey)
     .bind(status)
-    .bind(order.prime)
+    .bind(order.premium)
     .bind(&order.payment_method)
     .bind(order.amount)
     .bind(&order.fiat_code)

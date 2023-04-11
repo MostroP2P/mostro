@@ -3,7 +3,7 @@ use crate::{db, flow};
 use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
-use mostro_core::order::{NewOrder, Order};
+use mostro_core::order::{NewOrder, Order, SmallOrder};
 use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
 use nostr_sdk::prelude::hex::ToHex;
 use nostr_sdk::prelude::*;
@@ -285,26 +285,23 @@ pub async fn set_market_order_sats_amount(
     // Update amount order
     let new_sats_amout =
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
-
-    // Get the text message to buyer with invoice amount at market price
-    let text_message = match OrderKind::from_str(&order.kind).unwrap() {
-        OrderKind::Sell => messages::send_sell_request_invoice_req_market_price(
-            order.id,
-            new_sats_amout,
-            order.premium,
-        ),
-        OrderKind::Buy => {
-            messages::send_buy_request_invoice_req_market_price(order.id, new_sats_amout)
-        }
-    };
+    // We send this data related to the order to the parties
+    let order_data = SmallOrder::new(
+        order.id,
+        new_sats_amout,
+        order.fiat_code.clone(),
+        order.fiat_amount,
+        order.payment_method.clone(),
+        order.premium,
+        None,
+        None,
+    );
     // We create a Message
     let message = Message::new(
         0,
         Some(order.id),
         Action::TakeSell,
-        Some(Content::TextMessage(
-            text_message.unwrap_or_else(|_| "".to_string()),
-        )),
+        Some(Content::SmallOrder(order_data)),
     );
     let message = message.as_json()?;
 

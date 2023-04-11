@@ -74,27 +74,13 @@ pub async fn hold_invoice_settlement(hash: &str) {
         .await
         .unwrap();
     // We send a *funds released* message to seller
-    let text_message = crate::messages::sell_success(order.id, buyer_pubkey).unwrap();
-    // We create a Message
-    let message = Message::new(
-        0,
-        Some(order.id),
-        Action::HoldInvoicePaymentSettled,
-        Some(Content::TextMessage(text_message)),
-    );
+    let message = Message::new(0, Some(order.id), Action::HoldInvoicePaymentSettled, None);
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller released
-    let text_message = crate::messages::funds_released(order.id, seller_pubkey).unwrap();
-    // We create a Message
-    let message = Message::new(
-        0,
-        Some(order.id),
-        Action::Release,
-        Some(Content::TextMessage(text_message)),
-    );
+    let message = Message::new(0, Some(order.id), Action::Release, None);
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
@@ -121,14 +107,7 @@ pub async fn hold_invoice_canceled(hash: &str) {
         .await
         .unwrap();
     // We send "order canceled" messages to both parties
-    let text_message = crate::messages::order_canceled(order.id);
-    // We create a Message
-    let message = Message::new(
-        0,
-        Some(order.id),
-        Action::HoldInvoicePaymentCanceled,
-        Some(Content::TextMessage(text_message)),
-    );
+    let message = Message::new(0, Some(order.id), Action::HoldInvoicePaymentCanceled, None);
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &seller_pubkey, message.clone())
         .await

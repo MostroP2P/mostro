@@ -227,13 +227,8 @@ pub async fn show_hold_invoice(
 
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
-    let text_message = messages::waiting_seller_to_pay_invoice(order.id);
-    let message = Message::new(
-        0,
-        Some(order.id),
-        Action::WaitingSellerToPay,
-        Some(Content::TextMessage(text_message)),
-    );
+
+    let message = Message::new(0, Some(order.id), Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice

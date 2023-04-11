@@ -15,7 +15,7 @@ use log::{error, info};
 use nostr_sdk::prelude::*;
 
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Status};
+use mostro_core::{Action, Content, Message, Peer, Status};
 use scheduler::start_scheduler;
 use sqlx_crud::Crud;
 use std::str::FromStr;
@@ -297,27 +297,26 @@ async fn main() -> anyhow::Result<()> {
                                                 break;
                                             }
                                         };
-                                        // We send a message to seller to release
-                                        let text_message =
-                                            messages::buyer_sentfiat(order.id, event.pubkey)?;
+                                        let peer = Peer::new(event.pubkey.to_bech32()?);
+
                                         // We create a Message
                                         let message = Message::new(
                                             0,
                                             Some(order.id),
                                             Action::FiatSent,
-                                            Some(Content::TextMessage(text_message)),
+                                            Some(Content::Peer(peer)),
                                         );
                                         let message = message.as_json().unwrap();
                                         send_dm(&client, &my_keys, &seller_pubkey, message).await?;
                                         // We send a message to buyer to wait
-                                        let text_message =
-                                            messages::you_sent_fiat(order.id, seller_pubkey)?;
+                                        let peer = Peer::new(seller_pubkey.to_bech32()?);
+
                                         // We create a Message
                                         let message = Message::new(
                                             0,
                                             Some(order.id),
                                             Action::FiatSent,
-                                            Some(Content::TextMessage(text_message)),
+                                            Some(Content::Peer(peer)),
                                         );
                                         let message = message.as_json()?;
                                         send_dm(&client, &my_keys, &event.pubkey, message).await?;
@@ -403,20 +402,11 @@ async fn main() -> anyhow::Result<()> {
                                                                 msg.payment.payment_hash
                                                             );
                                                             // Purchase completed message to buyer
-                                                            let text_message =
-                                                                messages::purchase_completed(
-                                                                    order.id,
-                                                                    buyer_pubkey,
-                                                                )
-                                                                .unwrap();
-                                                            // We create a Message
                                                             let message = Message::new(
                                                                 0,
                                                                 Some(order.id),
                                                                 Action::PurchaseCompleted,
-                                                                Some(Content::TextMessage(
-                                                                    text_message,
-                                                                )),
+                                                                None,
                                                             );
                                                             let message =
                                                                 message.as_json().unwrap();
@@ -480,14 +470,12 @@ async fn main() -> anyhow::Result<()> {
                                                 &order,
                                             )
                                             .await?;
-                                            // We send a message
-                                            let text_message = messages::order_canceled(order.id);
-                                            // We create a Message
+                                            // We create a Message for cancel
                                             let message = Message::new(
                                                 0,
                                                 Some(order.id),
                                                 Action::Cancel,
-                                                Some(Content::TextMessage(text_message)),
+                                                None,
                                             );
                                             let message = message.as_json()?;
                                             send_dm(&client, &my_keys, &event.pubkey, message)

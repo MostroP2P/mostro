@@ -16,7 +16,7 @@ use crate::messages;
 use tokio::sync::mpsc::channel;
 
 /// Request market quote from Yadio to have sats amount at actual market price
-pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, prime: &i64) -> Result<i64> {
+pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
     // Add here check for market price
     let req_string = format!(
         "https://api.yadio.io/convert/{}/{}/BTC",
@@ -32,8 +32,8 @@ pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, prime: &i64) -
     let mut sats = req.result * 100_000_000_f64;
 
     // Added premium value to have correct sats value
-    if *prime != 0 {
-        sats += (*prime as f64) / 100_f64 * sats;
+    if *premium != 0 {
+        sats += (*premium as f64) / 100_f64 * sats;
     }
 
     Ok(sats as i64)
@@ -58,7 +58,7 @@ pub async fn publish_order(
         order.fiat_code,
         order.fiat_amount,
         order.payment_method,
-        order.prime,
+        order.premium,
         None,
         Some(order.created_at),
     );
@@ -123,7 +123,7 @@ pub async fn update_order_event(
     let publish_order = NewOrder::new(
         Some(order.id),
         kind,
-        status.clone(),
+        status,
         order.amount,
         order.fiat_code.to_owned(),
         order.fiat_amount,
@@ -284,20 +284,18 @@ pub async fn set_market_order_sats_amount(
 ) -> Result<i64> {
     // Update amount order
     let new_sats_amout =
-        get_market_quote(&order.fiat_amount, &order.fiat_code, &order.prime).await?;
+        get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
 
     // Get the text message to buyer with invoice amount at market price
     let text_message = match OrderKind::from_str(&order.kind).unwrap() {
         OrderKind::Sell => messages::send_sell_request_invoice_req_market_price(
             order.id,
             new_sats_amout,
-            order.prime,
+            order.premium,
         ),
-        OrderKind::Buy => messages::send_buy_request_invoice_req_market_price(
-            order.id,
-            new_sats_amout,
-            order.prime,
-        ),
+        OrderKind::Buy => {
+            messages::send_buy_request_invoice_req_market_price(order.id, new_sats_amout)
+        }
     };
     // We create a Message
     let message = Message::new(

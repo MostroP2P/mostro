@@ -1,6 +1,6 @@
 use crate::util::send_dm;
 use log::info;
-use mostro_core::{Action, Content, Message, Status};
+use mostro_core::{order::SmallOrder, Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
 
 pub async fn hold_invoice_paid(hash: &str) {
@@ -21,29 +21,34 @@ pub async fn hold_invoice_paid(hash: &str) {
     crate::util::update_order_event(&pool, &client, &my_keys, Status::Active, &order)
         .await
         .unwrap();
-
+    // We send this data related to the order to the parties
+    let order_data = SmallOrder::new(
+        order.id,
+        order.amount,
+        order.fiat_code,
+        order.fiat_amount,
+        order.payment_method,
+        order.premium,
+        order.buyer_pubkey,
+        order.seller_pubkey,
+    );
     // We send a confirmation message to seller
-    let text_message = crate::messages::buyer_took_order(&order, buyer_pubkey).unwrap();
-    // We create a Message
     let message = Message::new(
         0,
         Some(order.id),
         Action::BuyerTookOrder,
-        Some(Content::TextMessage(text_message)),
+        Some(Content::SmallOrder(order_data.clone())),
     );
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller paid
-    let text_message = crate::messages::get_in_touch_with_seller(&order, seller_pubkey)
-        .unwrap_or_else(|_| "".to_string());
-    // We create a Message
     let message = Message::new(
         0,
         Some(order.id),
         Action::HoldInvoicePaymentAccepted,
-        Some(Content::TextMessage(text_message)),
+        Some(Content::SmallOrder(order_data)),
     );
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &buyer_pubkey, message)

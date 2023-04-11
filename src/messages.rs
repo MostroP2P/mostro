@@ -1,6 +1,5 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
-use uuid::Uuid;
 
 pub fn cant_do() -> String {
     "You can't do that!".to_string()

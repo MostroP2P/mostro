@@ -39,6 +39,7 @@ pub async fn add_order(
     let status = order.status.to_string();
     let empty = String::new();
     let buyer_invoice = order.buyer_invoice.as_ref().unwrap_or(&empty);
+    let price_from_api = order.amount == 0;
 
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -53,11 +54,12 @@ pub async fn add_order(
         premium,
         payment_method,
         amount,
+        price_from_api,
         fiat_code,
         fiat_amount,
         buyer_invoice,
         created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         RETURNING *
       "#,
     )
@@ -71,6 +73,7 @@ pub async fn add_order(
     .bind(order.premium)
     .bind(&order.payment_method)
     .bind(order.amount)
+    .bind(price_from_api)
     .bind(&order.fiat_code)
     .bind(order.fiat_amount)
     .bind(buyer_invoice)
@@ -148,7 +151,7 @@ pub async fn update_order_event_id_status(
     order_id: Uuid,
     status: &Status,
     event_id: &str,
-    amount: &i64,
+    amount: i64,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
@@ -222,4 +225,41 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     .await?;
 
     Ok(order)
+}
+
+pub async fn update_order_to_initial_state(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    amount: i64,
+    fee: i64,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let status = "Pending".to_string();
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            status = ?1,
+            amount = ?2,
+            fee = ?3,
+            hash = ?4,
+            preimage = ?5,
+            taken_at = ?6,
+            invoice_held_at = ?7
+            WHERE id = ?8
+        "#,
+        status,
+        amount,
+        fee,
+        "",
+        "",
+        0,
+        0,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
 }

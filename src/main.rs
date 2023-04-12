@@ -23,6 +23,8 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use util::*;
 
+use crate::db::update_order_to_initial_state;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -284,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
                                             &my_keys,
                                             Status::FiatSent,
                                             &order,
+                                            None,
                                         )
                                         .await?;
 
@@ -359,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
                                             &my_keys,
                                             Status::SettledHoldInvoice,
                                             &order,
+                                            None,
                                         )
                                         .await?;
 
@@ -423,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
                                                             // and update on local database the status and new event id
                                                             update_order_event(
                                                                 &pool, &client, &my_keys, status,
-                                                                &order,
+                                                                &order, None,
                                                             )
                                                             .await
                                                             .unwrap();
@@ -468,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
                                                 &my_keys,
                                                 Status::Canceled,
                                                 &order,
+                                                None,
                                             )
                                             .await?;
                                             // We create a Message for cancel
@@ -480,6 +485,68 @@ async fn main() -> anyhow::Result<()> {
                                             let message = message.as_json()?;
                                             send_dm(&client, &my_keys, &event.pubkey, message)
                                                 .await?;
+                                        } else if order.status == "WaitingBuyerInvoice" {
+                                            // We return funds to seller
+                                            let hash = order.hash.as_ref().unwrap();
+                                            ln_client.cancel_hold_invoice(hash).await?;
+                                            info!(
+                                                "Cancel: Order Id {}: Funds returned to seller",
+                                                &order.id
+                                            );
+                                            let creator = event.pubkey.to_bech32()?;
+                                            if &creator == order.buyer_pubkey.as_ref().unwrap() {
+                                                // We publish a new replaceable kind nostr event with the status updated
+                                                // and update on local database the status and new event id
+                                                update_order_event(
+                                                    &pool,
+                                                    &client,
+                                                    &my_keys,
+                                                    Status::Canceled,
+                                                    &order,
+                                                    None,
+                                                )
+                                                .await?;
+                                                // We create a Message for cancel
+                                                let message = Message::new(
+                                                    0,
+                                                    Some(order.id),
+                                                    Action::Cancel,
+                                                    None,
+                                                );
+                                                let message = message.as_json()?;
+                                                send_dm(&client, &my_keys, &event.pubkey, message)
+                                                    .await?;
+                                            } else {
+                                                // We re-publish the event with Pending status
+                                                // and update on local database
+                                                let mut amount = order.amount;
+                                                let mut fee = order.fee;
+                                                if order.price_from_api {
+                                                    amount = 0;
+                                                    fee = 0;
+                                                }
+                                                update_order_to_initial_state(
+                                                    &pool, order.id, amount, fee,
+                                                )
+                                                .await?;
+                                                update_order_event(
+                                                    &pool,
+                                                    &client,
+                                                    &my_keys,
+                                                    Status::Pending,
+                                                    &order,
+                                                    None,
+                                                )
+                                                .await?;
+                                                info!(
+                                                    "Buyer: {}: Canceled order Id {} republishing order",
+                                                    order.buyer_pubkey.as_ref().unwrap(),
+                                                    &order.id
+                                                );
+                                            }
+                                        } else if order.status == "WaitingPayment" {
+                                            // TODO
+                                            unimplemented!()
                                         } else if order.status == "Active"
                                             || order.status == "FiatSent"
                                             || order.status == "Dispute"

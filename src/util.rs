@@ -79,7 +79,7 @@ pub async fn publish_order(
         order_id,
         &Status::Pending,
         &event_id,
-        &order.amount,
+        order.amount,
     )
     .await?;
     client
@@ -118,17 +118,19 @@ pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
+    amount: Option<i64>,
 ) -> Result<()> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
+    let amount = amount.unwrap_or(order.amount);
     let publish_order = NewOrder::new(
         Some(order.id),
         kind,
         status,
-        order.amount,
+        amount,
         order.fiat_code.to_owned(),
         order.fiat_amount,
         order.payment_method.to_owned(),
-        0,
+        order.premium,
         None,
         Some(order.created_at),
     );
@@ -142,8 +144,7 @@ pub async fn update_order_event(
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");
     // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, &order.amount)
-        .await?;
+    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, amount).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order.id, status_str
@@ -211,7 +212,7 @@ pub async fn show_hold_invoice(
     )
     .await?;
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, order).await?;
+    update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
     let new_order = order.as_new_order();
     // We create a Message to send the hold invoice to seller
     let message = Message::new(
@@ -304,7 +305,15 @@ pub async fn set_market_order_sats_amount(
 
     // Update order with new sats value
     order.amount = new_sats_amout;
-    update_order_event(pool, client, my_keys, Status::WaitingBuyerInvoice, order).await?;
+    update_order_event(
+        pool,
+        client,
+        my_keys,
+        Status::WaitingBuyerInvoice,
+        order,
+        None,
+    )
+    .await?;
 
     Ok(order.amount)
 }

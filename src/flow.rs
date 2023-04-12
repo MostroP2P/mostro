@@ -18,7 +18,7 @@ pub async fn hold_invoice_paid(hash: &str) {
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, Status::Active, &order)
+    crate::util::update_order_event(&pool, &client, &my_keys, Status::Active, &order, None)
         .await
         .unwrap();
     // We send this data related to the order to the parties
@@ -70,9 +70,16 @@ pub async fn hold_invoice_settlement(hash: &str) {
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, Status::SettledHoldInvoice, &order)
-        .await
-        .unwrap();
+    crate::util::update_order_event(
+        &pool,
+        &client,
+        &my_keys,
+        Status::SettledHoldInvoice,
+        &order,
+        None,
+    )
+    .await
+    .unwrap();
     // We send a *funds released* message to seller
     let message = Message::new(0, Some(order.id), Action::HoldInvoicePaymentSettled, None);
     let message = message.as_json().unwrap();
@@ -103,7 +110,7 @@ pub async fn hold_invoice_canceled(hash: &str) {
     );
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, Status::Canceled, &order)
+    crate::util::update_order_event(&pool, &client, &my_keys, Status::Canceled, &order, None)
         .await
         .unwrap();
     // We send "order canceled" messages to both parties

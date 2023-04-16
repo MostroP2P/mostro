@@ -29,5 +29,15 @@
       }
     },
     "query": "\n    UPDATE orders\n    SET\n    buyer_invoice = ?1\n    WHERE id = ?2\n    "
+  },
+  "97414183485e04346f420960beed77912ebe76089f58d30f0f526e232ce4be25": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 8
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            taken_at = ?6,\n            invoice_held_at = ?7\n            WHERE id = ?8\n        "
   }
 }

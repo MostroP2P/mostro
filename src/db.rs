@@ -37,8 +37,7 @@ pub async fn add_order(
     }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
-    let empty = String::new();
-    let buyer_invoice = order.buyer_invoice.as_ref().unwrap_or(&empty);
+    let buyer_invoice = order.buyer_invoice.as_ref();
     let price_from_api = order.amount == 0;
 
     let order = sqlx::query_as::<_, Order>(

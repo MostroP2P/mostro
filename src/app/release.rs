@@ -14,7 +14,6 @@ use sqlx_crud::Crud;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 
-#[tokio::main]
 pub async fn release_action(
     msg: Message,
     event: &Event,

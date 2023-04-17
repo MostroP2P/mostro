@@ -19,7 +19,6 @@ use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-#[tokio::main]
 pub async fn run(
     my_keys: Keys,
     client: Client,
@@ -43,25 +42,35 @@ pub async fn run(
                             if msg.verify() {
                                 match msg.action {
                                     Action::Order => {
-                                        order_action(msg, &event, &my_keys, &client, &pool)?
+                                        order_action(msg, &event, &my_keys, &client, &pool).await?
                                     }
                                     Action::TakeSell => {
-                                        take_sell_action(msg, &event, &my_keys, &client, &pool)?
+                                        take_sell_action(msg, &event, &my_keys, &client, &pool)
+                                            .await?
                                     }
                                     Action::TakeBuy => {
-                                        take_buy_action(msg, &event, &my_keys, &client, &pool)?
+                                        take_buy_action(msg, &event, &my_keys, &client, &pool)
+                                            .await?
                                     }
                                     Action::FiatSent => {
-                                        fiat_sent_action(msg, &event, &my_keys, &client, &pool)?
+                                        fiat_sent_action(msg, &event, &my_keys, &client, &pool)
+                                            .await?
                                     }
-                                    Action::Release => release_action(
-                                        msg, &event, &my_keys, &client, &pool, ln_client,
-                                    )?,
-                                    Action::Cancel => cancel_action(
-                                        msg, &event, &my_keys, &client, &pool, ln_client,
-                                    )?,
+                                    Action::Release => {
+                                        release_action(
+                                            msg, &event, &my_keys, &client, &pool, ln_client,
+                                        )
+                                        .await?
+                                    }
+                                    Action::Cancel => {
+                                        cancel_action(
+                                            msg, &event, &my_keys, &client, &pool, ln_client,
+                                        )
+                                        .await?
+                                    }
                                     Action::AddInvoice => {
-                                        add_invoice_action(msg, &event, &my_keys, &client, &pool)?
+                                        add_invoice_action(msg, &event, &my_keys, &client, &pool)
+                                            .await?
                                     }
                                     Action::PayInvoice => todo!(),
                                     _ => todo!(),

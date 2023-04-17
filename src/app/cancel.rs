@@ -12,7 +12,6 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 
-#[tokio::main]
 pub async fn cancel_action(
     msg: Message,
     event: &Event,

@@ -6,7 +6,6 @@ use nostr_sdk::prelude::ToBech32;
 use nostr_sdk::{Client, Event, Keys};
 use sqlx::{Pool, Sqlite};
 
-#[tokio::main]
 pub async fn order_action(
     msg: Message,
     event: &Event,

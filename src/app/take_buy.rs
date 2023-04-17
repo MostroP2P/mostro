@@ -9,7 +9,6 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
 
-#[tokio::main]
 pub async fn take_buy_action(
     msg: Message,
     event: &Event,

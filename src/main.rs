@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // Start scheduler for tasks
     start_scheduler().await.unwrap().start().await?;
 
-    run(my_keys, client, &mut ln_client, pool)
+    run(my_keys, client, &mut ln_client, pool).await
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ pub async fn add_invoice_action(
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = msg.order_id.unwrap();
-    let order = match Order::by_id(&pool, order_id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("AddInvoice: Order Id {order_id} not found!");
@@ -53,7 +53,7 @@ pub async fn add_invoice_action(
                         Some(Content::TextMessage(e.to_string())),
                     );
                     let message = message.as_json()?;
-                    send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
+                    send_dm(client, my_keys, &buyer_pubkey, message).await?;
                     error!("{e}");
                     return Ok(());
                 }
@@ -87,7 +87,7 @@ pub async fn add_invoice_action(
                 ))),
             );
             let message = message.as_json()?;
-            send_dm(&client, &my_keys, &buyer_pubkey, message).await?;
+            send_dm(client, my_keys, &buyer_pubkey, message).await?;
             return Ok(());
         }
     }
@@ -112,7 +112,7 @@ pub async fn add_invoice_action(
     let message = message.as_json().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_str(&seller_pubkey).unwrap();
-    send_dm(&client, &my_keys, &seller_pubkey, message)
+    send_dm(client, my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller paid
@@ -123,13 +123,13 @@ pub async fn add_invoice_action(
         Some(Content::SmallOrder(order_data)),
     );
     let message = message.as_json().unwrap();
-    send_dm(&client, &my_keys, &buyer_pubkey, message)
+    send_dm(client, my_keys, &buyer_pubkey, message)
         .await
         .unwrap();
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, Status::Active, &order, None)
+    crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
         .await
         .unwrap();
     Ok(())

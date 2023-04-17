@@ -23,7 +23,7 @@ pub async fn release_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     let order_id = msg.order_id.unwrap();
-    let order = match Order::by_id(&pool, order_id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Release: Order Id {order_id} not found!");
@@ -41,7 +41,7 @@ pub async fn release_action(
             Some(Content::TextMessage(text_message)),
         );
         let message = message.as_json()?;
-        send_dm(&client, &my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
     }
 
     if order.preimage.is_none() {
@@ -53,9 +53,9 @@ pub async fn release_action(
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     update_order_event(
-        &pool,
-        &client,
-        &my_keys,
+        pool,
+        client,
+        my_keys,
         Status::SettledHoldInvoice,
         &order,
         None,

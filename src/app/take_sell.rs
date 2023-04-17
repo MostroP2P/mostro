@@ -21,7 +21,7 @@ pub async fn take_sell_action(
     // Safe unwrap as we verified the message
     let order_id = msg.order_id.unwrap();
 
-    let mut order = match Order::by_id(&pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("TakeSell: Order Id {order_id} not found!");
@@ -52,7 +52,7 @@ pub async fn take_sell_action(
                 | MostroError::MinExpirationTimeError
                 | MostroError::WrongAmountError
                 | MostroError::MinAmountError => {
-                    send_dm(&client, &my_keys, &buyer_pubkey, e.to_string()).await?;
+                    send_dm(client, my_keys, &buyer_pubkey, e.to_string()).await?;
                     error!("{e}");
                     return Ok(());
                 }
@@ -76,8 +76,8 @@ pub async fn take_sell_action(
         Status::Pending | Status::WaitingBuyerInvoice => {}
         _ => {
             send_dm(
-                &client,
-                &my_keys,
+                client,
+                my_keys,
                 &buyer_pubkey,
                 format!("Order Id {order_id} was already taken!"),
             )
@@ -96,13 +96,12 @@ pub async fn take_sell_action(
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
         order.amount =
-            set_market_order_sats_amount(&mut order, buyer_pubkey, &my_keys, &pool, &client)
-                .await?;
+            set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
     } else {
         show_hold_invoice(
-            &pool,
-            &client,
-            &my_keys,
+            pool,
+            client,
+            my_keys,
             pr,
             &buyer_pubkey,
             &seller_pubkey,

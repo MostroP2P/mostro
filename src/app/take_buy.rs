@@ -19,7 +19,7 @@ pub async fn take_buy_action(
     let seller_pubkey = event.pubkey;
     // Safe unwrap as we verified the message
     let order_id = msg.order_id.unwrap();
-    let mut order = match Order::by_id(&pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("TakeBuy: Order Id {order_id} not found!");
@@ -41,8 +41,8 @@ pub async fn take_buy_action(
     // Buyer can take pending orders only
     if order_status != Status::Pending {
         send_dm(
-            &client,
-            &my_keys,
+            client,
+            my_keys,
             &seller_pubkey,
             format!("Order Id {order_id} was already taken!"),
         )
@@ -59,14 +59,13 @@ pub async fn take_buy_action(
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
         order.amount =
-            set_market_order_sats_amount(&mut order, buyer_pubkey, &my_keys, &pool, &client)
-                .await?;
+            set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
     }
 
     show_hold_invoice(
-        &pool,
-        &client,
-        &my_keys,
+        pool,
+        client,
+        my_keys,
         None,
         &buyer_pubkey,
         &seller_pubkey,

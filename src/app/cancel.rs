@@ -21,7 +21,7 @@ pub async fn cancel_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     let order_id = msg.order_id.unwrap();
-    let order = match Order::by_id(&pool, order_id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Cancel: Order Id {order_id} not found!");
@@ -41,16 +41,16 @@ pub async fn cancel_action(
                 Some(Content::TextMessage(text_message)),
             );
             let message = message.as_json()?;
-            send_dm(&client, &my_keys, &event.pubkey, message).await?;
+            send_dm(client, my_keys, &event.pubkey, message).await?;
             return Ok(());
         }
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(&pool, &client, &my_keys, Status::Canceled, &order, None).await?;
+        update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
         // We create a Message for cancel
         let message = Message::new(0, Some(order.id), Action::Cancel, None);
         let message = message.as_json()?;
-        send_dm(&client, &my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
     } else if order.status == "WaitingBuyerInvoice" {
         // We return funds to seller
         let hash = order.hash.as_ref().unwrap();
@@ -60,11 +60,11 @@ pub async fn cancel_action(
         if &creator == order.buyer_pubkey.as_ref().unwrap() {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
-            update_order_event(&pool, &client, &my_keys, Status::Canceled, &order, None).await?;
+            update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
             // We create a Message for cancel
             let message = Message::new(0, Some(order.id), Action::Cancel, None);
             let message = message.as_json()?;
-            send_dm(&client, &my_keys, &event.pubkey, message).await?;
+            send_dm(client, my_keys, &event.pubkey, message).await?;
         } else {
             // We re-publish the event with Pending status
             // and update on local database
@@ -74,8 +74,8 @@ pub async fn cancel_action(
                 amount = 0;
                 fee = 0;
             }
-            update_order_to_initial_state(&pool, order.id, amount, fee).await?;
-            update_order_event(&pool, &client, &my_keys, Status::Pending, &order, None).await?;
+            update_order_to_initial_state(pool, order.id, amount, fee).await?;
+            update_order_event(pool, client, my_keys, Status::Pending, &order, None).await?;
             info!(
                 "Buyer: {}: Canceled order Id {} republishing order",
                 order.buyer_pubkey.as_ref().unwrap(),

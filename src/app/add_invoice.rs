@@ -111,10 +111,8 @@ pub async fn add_invoice_action(
     );
     let message = message.as_json().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_str(&seller_pubkey).unwrap();
-    send_dm(client, my_keys, &seller_pubkey, message)
-        .await
-        .unwrap();
+    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
+    send_dm(client, my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer saying seller paid
     let message = Message::new(
         0,

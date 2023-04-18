@@ -1,3 +1,4 @@
+use crate::db::edit_buyer_pubkey_order;
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
@@ -92,7 +93,9 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
-
+    let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
+    // Add buyer pubkey to order
+    edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
         order.amount =

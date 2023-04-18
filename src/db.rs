@@ -27,13 +27,13 @@ pub async fn add_order(
 ) -> anyhow::Result<Order> {
     let mut conn = pool.acquire().await?;
     let uuid = Uuid::new_v4();
-    let mut buyer_pubkey = "";
-    let mut seller_pubkey = "";
+    let mut buyer_pubkey: Option<String> = None;
+    let mut seller_pubkey: Option<String> = None;
     let created_at = Timestamp::now();
     if order.kind == Kind::Buy {
-        buyer_pubkey = initiator_pubkey;
+        buyer_pubkey = Some(initiator_pubkey.to_string());
     } else {
-        seller_pubkey = initiator_pubkey;
+        seller_pubkey = Some(initiator_pubkey.to_string());
     }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
@@ -130,12 +130,35 @@ pub async fn edit_buyer_invoice_order(
     let mut conn = pool.acquire().await?;
     let rows_affected = sqlx::query!(
         r#"
-    UPDATE orders
-    SET
-    buyer_invoice = ?1
-    WHERE id = ?2
-    "#,
+            UPDATE orders
+            SET
+            buyer_invoice = ?1
+            WHERE id = ?2
+        "#,
         buyer_invoice,
+        order_id
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn edit_buyer_pubkey_order(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    buyer_pubkey: Option<String>,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            buyer_pubkey = ?1
+            WHERE id = ?2
+        "#,
+        buyer_pubkey,
         order_id
     )
     .execute(&mut conn)
@@ -234,6 +257,8 @@ pub async fn update_order_to_initial_state(
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = "Pending".to_string();
+    let hash: Option<String> = None;
+    let preimage: Option<String> = None;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -250,8 +275,8 @@ pub async fn update_order_to_initial_state(
         status,
         amount,
         fee,
-        "",
-        "",
+        hash,
+        preimage,
         0,
         0,
         order_id,

@@ -20,7 +20,7 @@
     },
     "query": "\n    UPDATE orders\n    SET\n    buyer_pubkey = ?1,\n    seller_pubkey = ?2,\n    status = ?3,\n    preimage = ?4,\n    hash = ?5\n    WHERE id = ?6\n    "
   },
-  "80d5c92cc49d9bb29d87f493fcd801ec065b28b030091e1a3752a040f460d0ef": {
+  "77ea98f6af16fa6e5a7d604965593700c563f88d88cb10b348bdc4200c87ad1d": {
     "describe": {
       "columns": [],
       "nullable": [],
@@ -28,7 +28,17 @@
         "Right": 2
       }
     },
-    "query": "\n    UPDATE orders\n    SET\n    buyer_invoice = ?1\n    WHERE id = ?2\n    "
+    "query": "\n            UPDATE orders\n            SET\n            buyer_pubkey = ?1\n            WHERE id = ?2\n        "
+  },
+  "89253158dce7eb8ed1c4fce2120418909fde010398815c5e673fb7d406dc5b4f": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            buyer_invoice = ?1\n            WHERE id = ?2\n        "
   },
   "97414183485e04346f420960beed77912ebe76089f58d30f0f526e232ce4be25": {
     "describe": {

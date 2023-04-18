@@ -39,3 +39,6 @@ mostro-core = "0.2.1"
 tokio-cron-scheduler = "*"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
+
+[patch.crates-io]
+mostro-core = { path = "../mostro-core" }

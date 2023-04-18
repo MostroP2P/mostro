@@ -5,6 +5,7 @@ pub mod order;
 pub mod release;
 pub mod take_buy;
 pub mod take_sell;
+pub mod vote_user;
 
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::cancel::cancel_action;
@@ -13,6 +14,7 @@ use crate::app::order::order_action;
 use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
+use crate::app::vote_user::update_user_reputation_action;
 use crate::lightning::LndConnector;
 use anyhow::Result;
 use mostro_core::{Action, Message};
@@ -73,7 +75,11 @@ pub async fn run(
                                             .await?
                                     }
                                     Action::PayInvoice => todo!(),
+                                    Action::VoteUser => {
+                                        update_user_reputation_action(msg, &event, &my_keys, &client,&pool).await?;
+                                    },
                                     _ => todo!(),
+                                    }
                                 }
                             }
                         }
@@ -81,5 +87,5 @@ pub async fn run(
                 }
             }
         }
-    }
+    
 }

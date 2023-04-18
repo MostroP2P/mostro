@@ -229,6 +229,32 @@ pub async fn update_order_event_id_status(
     Ok(rows_affected > 0)
 }
 
+pub async fn update_order_event_id_vote_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    buyer_vote: bool,
+    seller_vote: bool,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            buyer_voted = ?1,
+            seller_voted = ?2            
+            WHERE id = ?3
+        "#,
+        buyer_vote,
+        seller_vote,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
 pub async fn find_order_by_event_id(pool: &SqlitePool, event_id: &str) -> anyhow::Result<Order> {
     let order = sqlx::query_as::<_, Order>(
         r#"

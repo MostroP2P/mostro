@@ -1,6 +1,6 @@
 use crate::models::Yadio;
 use crate::{db, flow};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, Ok};
 use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
@@ -14,6 +14,8 @@ use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use crate::lightning;
 use crate::messages;
 use tokio::sync::mpsc::channel;
+use uuid::Uuid;
+
 
 /// Request market quote from Yadio to have sats amount at actual market price
 pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
@@ -115,6 +117,27 @@ pub fn get_keys() -> Result<Keys> {
     Ok(my_keys)
 }
 
+pub async fn update_user_vote_event(user : &String ,buyer_vote : bool, seller_vote : bool, reputation : String , order_id : Uuid, keys :&Keys, client: &Client , pool : &SqlitePool) -> Result<()>{
+    // let reputation = reput
+    // nip33 kind and d tag
+    let event_kind = 30000;
+    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![user.to_string()]);
+    let event =
+        EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
+    info!("Sending replaceable event: {event:#?}");
+    // We update the order vote status
+    crate::db::update_order_event_id_vote_status(pool,order_id, buyer_vote, seller_vote).await?;
+    // info!(
+    //     "Order Id: {} updated Nostr new Status: {}",
+    //     order.id, status_str
+    // );
+
+    client.send_event(event).await.map(|_s| ()).map_err(|err| {
+        error!("{}", err);
+        err.into()
+    })
+}
+
 pub async fn update_order_event(
     pool: &SqlitePool,
     client: &Client,
@@ -208,7 +231,8 @@ pub async fn show_hold_invoice(
 
     db::edit_order(
         pool,
-        &Status::WaitingPayment,
+        // &Status::WaitingPayment,
+        &Status::Success,
         order.id,
         buyer_pubkey,
         seller_pubkey,
@@ -217,7 +241,7 @@ pub async fn show_hold_invoice(
     )
     .await?;
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
+    update_order_event(pool, client, my_keys, Status::Success, order, None).await?;
     let new_order = order.as_new_order();
     // We create a Message to send the hold invoice to seller
     let message = Message::new(
@@ -323,4 +347,20 @@ pub async fn set_market_order_sats_amount(
     .await?;
 
     Ok(order.amount)
+}
+
+/// Send message to buyer and seller to vote for counterpart
+pub async fn vote_counterpart(client : &Client, buyer_pubkey: &XOnlyPublicKey, seller_pubkey: &XOnlyPublicKey, my_keys :&Keys, order : NewOrder) -> Result<()>{
+
+    // Send dm to counterparts
+    // to buyer
+    let message_to_buyer = Message::new(0, order.id, Action::VoteUser, Some(Content::Order(order.clone())));
+    let message_to_buyer = message_to_buyer.as_json().unwrap();
+    send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
+    // to seller
+    let message_to_seller = Message::new(0, order.id, Action::VoteUser, Some(Content::Order(order.clone())));
+    let message_to_seller = message_to_seller.as_json().unwrap();
+    send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
+
+    Ok(())
 }

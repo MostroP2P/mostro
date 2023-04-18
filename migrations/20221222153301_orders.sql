@@ -29,5 +29,7 @@ CREATE TABLE IF NOT EXISTS orders (
   range_parent_id varchar(36),
   invoice_held_at integer default 0,
   taken_at integer default 0,
-  created_at integer not null
+  created_at integer not null,
+  buyer_voted integer default 0,
+  seller_voted integer default 0
 );

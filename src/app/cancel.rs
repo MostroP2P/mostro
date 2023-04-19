@@ -1,5 +1,7 @@
-use crate::db::edit_buyer_pubkey_order;
-use crate::db::update_order_to_initial_state;
+use crate::db::{
+    edit_buyer_pubkey_order, edit_seller_pubkey_order, init_cancel_order,
+    update_order_to_initial_state,
+};
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::util::{send_dm, update_order_event};
@@ -56,16 +58,90 @@ pub async fn cancel_action(
         cancel_add_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.status == "WaitingPayment" {
-        // TODO
-        unimplemented!()
-    } else if order.status == "Active" || order.status == "FiatSent" || order.status == "Dispute" {
-        // TODO
-        unimplemented!()
-    } else {
-        // TODO
-        Ok(())
+    if order.kind == "Buy" && order.status == "WaitingPayment" {
+        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
+
+    if order.status == "Active" || order.status == "FiatSent" || order.status == "Dispute" {
+        let user_pubkey = event.pubkey.to_bech32()?;
+        let buyer_pubkey_bech32 = order.buyer_pubkey.as_ref().unwrap();
+        let seller_pubkey_bech32 = order.seller_pubkey.as_ref().unwrap();
+        let counterparty_pubkey: String;
+        if buyer_pubkey_bech32 == &user_pubkey {
+            order.buyer_cooperativecancel = true;
+            counterparty_pubkey = seller_pubkey_bech32.to_string();
+        } else {
+            order.seller_cooperativecancel = true;
+            counterparty_pubkey = buyer_pubkey_bech32.to_string();
+        }
+
+        match order.cancel_initiator_pubkey {
+            Some(ref initiator_pubkey) => {
+                if initiator_pubkey == &user_pubkey {
+                    let text_message = messages::cant_do();
+                    // We create a Message
+                    let message = Message::new(
+                        0,
+                        Some(order.id),
+                        Action::CantDo,
+                        Some(Content::TextMessage(text_message)),
+                    );
+                    let message = message.as_json()?;
+                    send_dm(client, my_keys, &event.pubkey, message).await?;
+
+                    return Ok(());
+                } else {
+                    if order.hash.is_some() {
+                        // We return funds to seller
+                        let hash = order.hash.as_ref().unwrap();
+                        ln_client.cancel_hold_invoice(hash).await?;
+                        info!(
+                            "Cooperative cancel: Order Id {}: Funds returned to seller",
+                            &order.id
+                        );
+                    }
+                    init_cancel_order(pool, &order).await?;
+                    order.status = "Canceled".to_string();
+                    // We publish a new replaceable kind nostr event with the status updated
+                    // and update on local database the status and new event id
+                    update_order_event(pool, client, my_keys, Status::Canceled, &order, None)
+                        .await?;
+                    // We create a Message for an accepted cooperative cancel and send it to both parties
+                    let message =
+                        Message::new(0, Some(order.id), Action::CooperativeCancelAccepted, None);
+                    let message = message.as_json()?;
+                    send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+                    let counterparty_pubkey = XOnlyPublicKey::from_bech32(counterparty_pubkey)?;
+                    send_dm(client, my_keys, &counterparty_pubkey, message).await?;
+                    info!("Cancel: Order Id {order_id} canceled cooperatively!");
+                }
+            }
+            None => {
+                order.cancel_initiator_pubkey = Some(user_pubkey.clone());
+                // update db
+                init_cancel_order(pool, &order).await?;
+                // We create a Message to start a cooperative cancel and send it to both parties
+                let message = Message::new(
+                    0,
+                    Some(order.id),
+                    Action::CooperativeCancelInitiatedByYou,
+                    None,
+                );
+                let message = message.as_json()?;
+                send_dm(client, my_keys, &event.pubkey, message).await?;
+                let message = Message::new(
+                    0,
+                    Some(order.id),
+                    Action::CooperativeCancelInitiatedByPeer,
+                    None,
+                );
+                let message = message.as_json()?;
+                let counterparty_pubkey = XOnlyPublicKey::from_bech32(counterparty_pubkey)?;
+                send_dm(client, my_keys, &counterparty_pubkey, message).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn cancel_add_invoice(
@@ -123,8 +199,68 @@ pub async fn cancel_add_invoice(
         update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
         info!(
             "Buyer: {}: Canceled order Id {} republishing order",
-            order.buyer_pubkey.as_ref().unwrap(),
-            &order.id
+            buyer_pubkey_bech32, order.id
+        );
+        Ok(())
+    }
+}
+
+pub async fn cancel_pay_hold_invoice(
+    ln_client: &mut LndConnector,
+    order: &mut Order,
+    event: &Event,
+    pool: &Pool<Sqlite>,
+    client: &Client,
+    my_keys: &Keys,
+) -> Result<()> {
+    if order.hash.is_some() {
+        // We return funds to seller
+        let hash = order.hash.as_ref().unwrap();
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!("Cancel: Order Id {}: Funds returned to seller", &order.id);
+    }
+    let user_pubkey = event.pubkey.to_bech32()?;
+    let buyer_pubkey_bech32 = order.buyer_pubkey.as_ref().unwrap();
+    let seller_pubkey_bech32 = order.seller_pubkey.as_ref().unwrap();
+    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey_bech32)?;
+    if seller_pubkey_bech32 != &user_pubkey {
+        let text_message = messages::cant_do();
+        // We create a Message
+        let message = Message::new(
+            0,
+            Some(order.id),
+            Action::CantDo,
+            Some(Content::TextMessage(text_message)),
+        );
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+
+    if &order.creator_pubkey == seller_pubkey_bech32 {
+        // We publish a new replaceable kind nostr event with the status updated
+        // and update on local database the status and new event id
+        update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
+        // We create a Message for cancel
+        let message = Message::new(0, Some(order.id), Action::Cancel, None);
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+        send_dm(client, my_keys, &seller_pubkey, message).await?;
+        Ok(())
+    } else {
+        // We re-publish the event with Pending status
+        // and update on local database
+        if order.price_from_api {
+            order.amount = 0;
+            order.fee = 0;
+        }
+        edit_seller_pubkey_order(pool, order.id, None).await?;
+        update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
+        update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
+        info!(
+            "Seller: {}: Canceled order Id {} republishing order",
+            buyer_pubkey_bech32, order.id
         );
         Ok(())
     }

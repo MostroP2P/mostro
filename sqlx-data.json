@@ -30,6 +30,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            buyer_pubkey = ?1\n            WHERE id = ?2\n        "
   },
+  "878c89a9ccf7cf33910f32a9dd2c09f45364dd744dc9e5749a318825343be542": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 4
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            cancel_initiator_pubkey = ?1,\n            buyer_cooperativecancel = ?2,\n            seller_cooperativecancel = ?3\n            WHERE id = ?4\n        "
+  },
   "89253158dce7eb8ed1c4fce2120418909fde010398815c5e673fb7d406dc5b4f": {
     "describe": {
       "columns": [],
@@ -49,5 +59,15 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            taken_at = ?6,\n            invoice_held_at = ?7\n            WHERE id = ?8\n        "
+  },
+  "da72f298a426b1c65f7c67bf44436ba0b0878e52694cbd4cbca8585afcc665df": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            seller_pubkey = ?1\n            WHERE id = ?2\n        "
   }
 }

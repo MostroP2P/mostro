@@ -168,6 +168,29 @@ pub async fn edit_buyer_pubkey_order(
     Ok(rows_affected > 0)
 }
 
+pub async fn edit_seller_pubkey_order(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    seller_pubkey: Option<String>,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            seller_pubkey = ?1
+            WHERE id = ?2
+        "#,
+        seller_pubkey,
+        order_id
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
 pub async fn update_order_event_id_status(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -280,6 +303,29 @@ pub async fn update_order_to_initial_state(
         0,
         0,
         order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn init_cancel_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            cancel_initiator_pubkey = ?1,
+            buyer_cooperativecancel = ?2,
+            seller_cooperativecancel = ?3
+            WHERE id = ?4
+        "#,
+        order.cancel_initiator_pubkey,
+        order.buyer_cooperativecancel,
+        order.seller_cooperativecancel,
+        order.id,
     )
     .execute(&mut conn)
     .await?

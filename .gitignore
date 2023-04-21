@@ -5,3 +5,7 @@ mostro.db*
 
 # Relay data
 /relay/data/*
+
+# IDE's
+.idea
+.vscode

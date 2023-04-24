@@ -1,3 +1,4 @@
+use crate::db::edit_buyer_invoice_order;
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::send_dm;
@@ -33,8 +34,7 @@ pub async fn add_invoice_action(
     }
     let buyer_pubkey = event.pubkey;
     let pr: String;
-    // If a buyer sent me a lightning invoice we look on db an order with
-    // that order id and save the buyer pubkey and invoice fields
+    // If a buyer sent me a lightning invoice we get it
     if let Some(payment_request) = msg.get_payment_request() {
         // Verify if invoice is valid
         match is_valid_invoice(&payment_request, Some(order.amount as u64)) {
@@ -73,7 +73,7 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     };
-    // Buyer can take pending orders only
+    // Buyer can add invoice orders with WaitingBuyerInvoice status
     match order_status {
         Status::WaitingBuyerInvoice => {}
         _ => {
@@ -91,13 +91,14 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     }
+
     // We send this data related to the order to the parties
     let order_data = SmallOrder::new(
         order.id,
         order.amount,
         order.fiat_code.clone(),
         order.fiat_amount,
-        pr,
+        pr.clone(),
         order.premium,
         order.buyer_pubkey.as_ref().cloned(),
         order.seller_pubkey.as_ref().cloned(),
@@ -130,5 +131,8 @@ pub async fn add_invoice_action(
     crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
         .await
         .unwrap();
+    // Finally we save the invoice on db
+    edit_buyer_invoice_order(pool, order.id, &pr).await?;
+
     Ok(())
 }

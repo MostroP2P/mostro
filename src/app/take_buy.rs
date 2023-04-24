@@ -1,4 +1,4 @@
-use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
+use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
@@ -56,10 +56,10 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
-    // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
+    // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         order.amount =
-            set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
+            get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
     }
 
     show_hold_invoice(

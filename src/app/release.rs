@@ -104,9 +104,17 @@ pub async fn release_action(
                         update_order_event(&pool, &client, &my_keys, status, &order, None)
                             .await
                             .unwrap();
-                        
+
                         // Adding here voting process...
-                        vote_counterpart(&client, &buyer_pubkey, &seller_pubkey, &my_keys, order.as_new_order().clone()).await.unwrap();
+                        vote_counterpart(
+                            &client,
+                            &buyer_pubkey,
+                            &seller_pubkey,
+                            &my_keys,
+                            order.as_new_order().clone(),
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
             }

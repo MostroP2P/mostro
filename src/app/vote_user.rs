@@ -2,7 +2,7 @@ use crate::messages;
 use crate::util::{send_dm, update_user_vote_event};
 
 use anyhow::Result;
-use log::{error,info};
+use log::{error, info};
 use mostro_core::order::Order;
 use mostro_core::{Action, Content, Message, Review};
 use nostr_sdk::prelude::*;
@@ -11,7 +11,6 @@ use sqlx_crud::Crud;
 use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
-
 
 pub async fn send_relays_requests(client: &Client, filters: Filter) -> Option<Event> {
     let relays = client.relays().await;
@@ -34,11 +33,15 @@ pub async fn send_relays_requests(client: &Client, filters: Filter) -> Option<Ev
     // Get answers from relay
     for req in requests {
         let ev = req.await.unwrap();
-        if ev.is_some() { answers_requests.push(ev.unwrap())}
+        if ev.is_some() {
+            answers_requests.push(ev.unwrap())
+        }
     }
-    if answers_requests.is_empty() { return None };
-    
-    answers_requests.sort_by(|a,b| a.created_at.cmp(&b.created_at));
+    if answers_requests.is_empty() {
+        return None;
+    };
+
+    answers_requests.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Some(answers_requests[0].clone())
 }
 
@@ -51,8 +54,11 @@ pub async fn requests_relay(client: Client, relay: (Url, Relay), filters: Filter
     // Using a timeout of 3 seconds to avoid unresponsive relays to block the loop forever.
     if let Ok(rx) = timeout(Duration::from_secs(3), relrequest).await {
         match rx {
-            Some(m) => { res = Some(m) },
-            None => { res = None; info!("No requested events found on relay {}", relay.0.to_string()); },
+            Some(m) => res = Some(m),
+            None => {
+                res = None;
+                info!("No requested events found on relay {}", relay.0.to_string());
+            }
         }
     }
     res
@@ -63,9 +69,6 @@ pub async fn get_nip_33_event(
     filters: Vec<Filter>,
     client: Client,
 ) -> Option<Event> {
-
-    let mut ev: Option<Event> = None;
-
     // Subscribe
     info!(
         "Subscribing for all mostro orders to relay : {}",
@@ -82,6 +85,8 @@ pub async fn get_nip_33_event(
     // Wait notification from relays
     let mut notifications = client.notifications();
 
+    let mut ev = None;
+
     while let Ok(notification) = notifications.recv().await {
         if let RelayPoolNotification::Message(_, msg) = notification {
             match msg {
@@ -95,8 +100,7 @@ pub async fn get_nip_33_event(
                 }
                 RelayMessage::EndOfStoredEvents(subscription_id) => {
                     if subscription_id == id {
-                        ev = None
-                        // break;
+                        break;
                     }
                 }
                 _ => (),
@@ -105,23 +109,30 @@ pub async fn get_nip_33_event(
     }
 
     // Unsubscribe
-    relay.send_msg(ClientMessage::close(id), false).await;
+    relay.send_msg(ClientMessage::close(id), false).await.ok()?;
 
     ev
 }
 
-pub async fn get_counterpart_reputation(user : &String , my_keys : &Keys, client : &Client) -> Option<Review>{
-      // Request NIP33 of the counterparts 
-      let tag = format!("\"#d\" : \"{}\"", user);
-      let filter = Filter::new().author(my_keys.public_key()).hashtag(tag);
-      let event_nip33 = send_relays_requests(client,filter).await;
+pub async fn get_counterpart_reputation(
+    user: &String,
+    my_keys: &Keys,
+    client: &Client,
+) -> Option<Review> {
+    // Request NIP33 of the counterparts
 
-          
-      event_nip33.as_ref()?;
+    let filter = Filter::new()
+        .author(my_keys.public_key().to_string())
+        .kind(Kind::Custom(30000))
+        .identifier(user.to_string());
+    println!("Filter : {:?}", filter);
+    let event_nip33 = send_relays_requests(client, filter).await;
 
-      let reputation = Review::from_json(&event_nip33.unwrap().content).unwrap();
+    event_nip33.as_ref()?;
 
-      Some(reputation)
+    let reputation = Review::from_json(&event_nip33.unwrap().content).unwrap();
+
+    Some(reputation)
 }
 
 pub async fn update_user_reputation_action(
@@ -151,22 +162,25 @@ pub async fn update_user_reputation_action(
         return Ok(());
     }
     // Get counterpart pubkey
-    let mut counterpart : String = String::new();
-    let mut buyer_voting : bool = false;
-    let mut seller_voting : bool = false;
+    let mut counterpart: String = String::new();
+    let mut buyer_voting: bool = false;
+    let mut seller_voting: bool = false;
 
-    if  message_sender == buyer {counterpart = seller; buyer_voting = true}
-    else if message_sender == seller {counterpart = buyer; seller_voting = true};
-    
+    if message_sender == buyer {
+        counterpart = seller;
+        buyer_voting = true
+    } else if message_sender == seller {
+        counterpart = buyer;
+        seller_voting = true
+    };
 
+    // Add a check in case of no counterpart found
     // if counterpart.is_none() { return anyhow::Error::new(_) };
 
-    // let counterpart = counterpart.unwrap(); 
-
     // Check if content of Peer is the same of counterpart
-    let mut vote = 0;
+    let mut vote = 0_f64;
 
-    if let Content::Peer(p) = msg.content.unwrap(){ 
+    if let Content::Peer(p) = msg.content.unwrap() {
         if counterpart != p.pubkey {
             let text_message = messages::cant_do();
             // We create a Message
@@ -184,49 +198,43 @@ pub async fn update_user_reputation_action(
 
     let rep = get_counterpart_reputation(&counterpart, my_keys, client).await;
     //Here we have to update values of the review of the counterpart
-    if rep.is_none()
-    {   
-        let first = Review::new(1, vote, vote, vote, vote);
+    let mut reputation;
+
+    if rep.is_none() {
+        reputation = Review::new(1.0, vote, vote, vote, vote);
+    } else {
+        // Update user reputation
+        //Going on with calculation
+        reputation = rep.unwrap();
+        reputation.total_reviews += 1.0;
+        if vote > reputation.max_rate {
+            reputation.max_rate = vote
+        };
+        if vote < reputation.min_rate {
+            reputation.min_rate = vote
+        };
+        let new_rating =
+            reputation.last_rating + (vote - reputation.last_rating) / reputation.total_reviews;
+        reputation.last_rating = new_rating;
     }
 
-
-    let mut reputation= rep.unwrap();
-    reputation.total_rating += 1;
-    if vote > reputation.max_rate { reputation.max_rate = vote };
-    if vote < reputation.min_rate { reputation.min_rate = vote };
-
-    //Going on with calculation 
-
-
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    update_user_vote_event(&counterpart, buyer_voting, seller_voting, reputation.as_json().unwrap(),order.id, my_keys, client, &pool).await?;
-
-    //Update db with vote flag 
-    
-    
-    
-    // We create a Message
-
-    // let message = Message::new(
-    //     0,
-    //     Some(order.id),
-    //     Action::FiatSent,
-    //     Some(Content::Peer(peer)),
-    // );
-    // let message = message.as_json().unwrap();
-    // send_dm(client, my_keys, &seller_pubkey, message).await?;
-    // // We send a message to buyer to wait
-    // let peer = Peer::new(seller_pubkey.to_bech32()?);
-
-    // // We create a Message
-    // let message = Message::new(
-    //     0,
-    //     Some(order.id),
-    //     Action::FiatSent,
-    //     Some(Content::Peer(peer)),
-    // );
-    // let message = message.as_json()?;
-    // send_dm(client, my_keys, &event.pubkey, message).await?;
+    // Check if the order is not voted by the message sender and in case update NIP
+    let order_to_check_votes = crate::db::find_order_by_id(pool, order.id).await?;
+    if (seller_voting && !order_to_check_votes.seller_voted)
+        || (buyer_voting && !order_to_check_votes.buyer_voted)
+    {
+        //Update db with vote flags
+        update_user_vote_event(
+            &counterpart,
+            buyer_voting,
+            seller_voting,
+            reputation.as_json().unwrap(),
+            order.id,
+            my_keys,
+            client,
+            pool,
+        )
+        .await?;
+    }
     Ok(())
 }

@@ -413,3 +413,18 @@ pub async fn edit_master_seller_pubkey_order(
 
     Ok(rows_affected > 0)
 }
+
+pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Order> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(order)
+}

@@ -76,16 +76,18 @@ pub async fn run(
                                     }
                                     Action::PayInvoice => todo!(),
                                     Action::VoteUser => {
-                                        update_user_reputation_action(msg, &event, &my_keys, &client,&pool).await?;
-                                    },
-                                    _ => todo!(),
+                                        update_user_reputation_action(
+                                            msg, &event, &my_keys, &client, &pool,
+                                        )
+                                        .await?;
                                     }
+                                    _ => todo!(),
                                 }
                             }
                         }
-                    };
-                }
+                    }
+                };
             }
         }
-    
+    }
 }

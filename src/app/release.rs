@@ -37,6 +37,7 @@ pub async fn release_action(
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::CantDo,
             Some(Content::TextMessage(text_message)),
         );
@@ -92,7 +93,7 @@ pub async fn release_action(
                         );
                         // Purchase completed message to buyer
                         let message =
-                            Message::new(0, Some(order.id), Action::PurchaseCompleted, None);
+                            Message::new(0, Some(order.id), None, Action::PurchaseCompleted, None);
                         let message = message.as_json().unwrap();
                         send_dm(&client, &my_keys, &buyer_pubkey, message)
                             .await

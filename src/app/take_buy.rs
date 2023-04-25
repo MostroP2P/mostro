@@ -1,9 +1,11 @@
+use crate::db::edit_master_seller_pubkey_order;
+use crate::messages;
 use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
 use mostro_core::order::Order;
-use mostro_core::{Message, Status};
+use mostro_core::{Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -16,7 +18,6 @@ pub async fn take_buy_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let seller_pubkey = event.pubkey;
     // Safe unwrap as we verified the message
     let order_id = msg.order_id.unwrap();
     let mut order = match Order::by_id(pool, order_id).await? {
@@ -26,6 +27,27 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
+    // We check if the message have a pubkey
+    if msg.pubkey.is_none() {
+        let text_message = messages::cant_do();
+        // We create a Message
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::CantDo,
+            Some(Content::TextMessage(text_message)),
+        );
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+
+    // We update the master pubkey
+    edit_master_seller_pubkey_order(pool, order.id, msg.pubkey).await?;
+    let seller_pubkey = event.pubkey;
+
     if order.kind != "Buy" {
         error!("TakeBuy: Order Id {order_id} wrong kind");
         return Ok(());
@@ -38,15 +60,16 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
-    // Buyer can take pending orders only
+    // Seller can take pending orders only
     if order_status != Status::Pending {
         send_dm(
             client,
             my_keys,
             &seller_pubkey,
-            format!("Order Id {order_id} was already taken!"),
+            format!("Order Id {order_id} was already taken!"), // TODO: send a Message
         )
         .await?;
+
         return Ok(());
     }
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {

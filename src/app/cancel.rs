@@ -38,6 +38,7 @@ pub async fn cancel_action(
             let message = Message::new(
                 0,
                 Some(order.id),
+                None,
                 Action::CantDo,
                 Some(Content::TextMessage(text_message)),
             );
@@ -49,7 +50,7 @@ pub async fn cancel_action(
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
         // We create a Message for cancel
-        let message = Message::new(0, Some(order.id), Action::Cancel, None);
+        let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
     }
@@ -83,6 +84,7 @@ pub async fn cancel_action(
                     let message = Message::new(
                         0,
                         Some(order.id),
+                        None,
                         Action::CantDo,
                         Some(Content::TextMessage(text_message)),
                     );
@@ -107,8 +109,13 @@ pub async fn cancel_action(
                     update_order_event(pool, client, my_keys, Status::Canceled, &order, None)
                         .await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
-                    let message =
-                        Message::new(0, Some(order.id), Action::CooperativeCancelAccepted, None);
+                    let message = Message::new(
+                        0,
+                        Some(order.id),
+                        None,
+                        Action::CooperativeCancelAccepted,
+                        None,
+                    );
                     let message = message.as_json()?;
                     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
                     let counterparty_pubkey = XOnlyPublicKey::from_bech32(counterparty_pubkey)?;
@@ -124,6 +131,7 @@ pub async fn cancel_action(
                 let message = Message::new(
                     0,
                     Some(order.id),
+                    None,
                     Action::CooperativeCancelInitiatedByYou,
                     None,
                 );
@@ -132,6 +140,7 @@ pub async fn cancel_action(
                 let message = Message::new(
                     0,
                     Some(order.id),
+                    None,
                     Action::CooperativeCancelInitiatedByPeer,
                     None,
                 );
@@ -168,6 +177,7 @@ pub async fn cancel_add_invoice(
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::CantDo,
             Some(Content::TextMessage(text_message)),
         );
@@ -182,7 +192,7 @@ pub async fn cancel_add_invoice(
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
         // We create a Message for cancel
-        let message = Message::new(0, Some(order.id), Action::Cancel, None);
+        let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;
@@ -229,6 +239,7 @@ pub async fn cancel_pay_hold_invoice(
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::CantDo,
             Some(Content::TextMessage(text_message)),
         );
@@ -243,7 +254,7 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
         // We create a Message for cancel
-        let message = Message::new(0, Some(order.id), Action::Cancel, None);
+        let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;

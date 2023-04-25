@@ -1,12 +1,13 @@
-use crate::db::edit_buyer_pubkey_order;
+use crate::db::{edit_buyer_pubkey_order, edit_master_buyer_pubkey_order};
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
+use crate::messages;
 use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
 use mostro_core::order::Order;
-use mostro_core::{Message, Status};
+use mostro_core::{Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -33,6 +34,25 @@ pub async fn take_sell_action(
         error!("TakeSell: Order Id {order_id} wrong kind");
         return Ok(());
     }
+    // We check if the message have a pubkey
+    if msg.pubkey.is_none() {
+        let text_message = messages::cant_do();
+        // We create a Message
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::CantDo,
+            Some(Content::TextMessage(text_message)),
+        );
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+    // We update the master pubkey
+    edit_master_buyer_pubkey_order(pool, order.id, msg.pubkey.clone()).await?;
+
     let buyer_pubkey = event.pubkey;
     let pr: Option<String>;
     // If a buyer sent me a lightning invoice we look on db an order with

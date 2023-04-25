@@ -24,20 +24,24 @@ pub async fn add_order(
     order: &NewOrder,
     event_id: &str,
     initiator_pubkey: &str,
+    master_pubkey: &str,
 ) -> anyhow::Result<Order> {
     let mut conn = pool.acquire().await?;
     let uuid = Uuid::new_v4();
     let mut buyer_pubkey: Option<String> = None;
+    let mut master_buyer_pubkey: Option<String> = None;
     let mut seller_pubkey: Option<String> = None;
+    let mut master_seller_pubkey: Option<String> = None;
     let created_at = Timestamp::now();
     if order.kind == Kind::Buy {
         buyer_pubkey = Some(initiator_pubkey.to_string());
+        master_buyer_pubkey = Some(master_pubkey.to_string());
     } else {
         seller_pubkey = Some(initiator_pubkey.to_string());
+        master_seller_pubkey = Some(master_pubkey.to_string());
     }
     let kind = order.kind.to_string();
     let status = order.status.to_string();
-    let buyer_invoice = order.buyer_invoice.as_ref();
     let price_from_api = order.amount == 0;
 
     let order = sqlx::query_as::<_, Order>(
@@ -48,7 +52,9 @@ pub async fn add_order(
         event_id,
         creator_pubkey,
         buyer_pubkey,
+        master_buyer_pubkey,
         seller_pubkey,
+        master_seller_pubkey,
         status,
         premium,
         payment_method,
@@ -58,7 +64,7 @@ pub async fn add_order(
         fiat_amount,
         buyer_invoice,
         created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         RETURNING *
       "#,
     )
@@ -67,7 +73,9 @@ pub async fn add_order(
     .bind(event_id)
     .bind(initiator_pubkey)
     .bind(buyer_pubkey)
+    .bind(master_buyer_pubkey)
     .bind(seller_pubkey)
+    .bind(master_seller_pubkey)
     .bind(status)
     .bind(order.premium)
     .bind(&order.payment_method)
@@ -75,7 +83,7 @@ pub async fn add_order(
     .bind(price_from_api)
     .bind(&order.fiat_code)
     .bind(order.fiat_amount)
-    .bind(buyer_invoice)
+    .bind(order.buyer_invoice.as_ref())
     .bind(created_at.as_i64())
     .fetch_one(&mut conn)
     .await?;
@@ -326,6 +334,52 @@ pub async fn init_cancel_order(pool: &SqlitePool, order: &Order) -> anyhow::Resu
         order.buyer_cooperativecancel,
         order.seller_cooperativecancel,
         order.id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn edit_master_buyer_pubkey_order(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    master_buyer_pubkey: Option<String>,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            master_buyer_pubkey = ?1
+            WHERE id = ?2
+        "#,
+        master_buyer_pubkey,
+        order_id
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn edit_master_seller_pubkey_order(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    master_seller_pubkey: Option<String>,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            master_seller_pubkey = ?1
+            WHERE id = ?2
+        "#,
+        master_seller_pubkey,
+        order_id
     )
     .execute(&mut conn)
     .await?

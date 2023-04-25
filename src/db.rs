@@ -232,20 +232,20 @@ pub async fn update_order_event_id_status(
 pub async fn update_order_event_id_vote_status(
     pool: &SqlitePool,
     order_id: Uuid,
-    buyer_vote: bool,
-    seller_vote: bool,
+    buyer_sent_rate: bool,
+    seller_sent_rate: bool,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
             SET
-            buyer_voted = ?1,
-            seller_voted = ?2            
+            buyer_sent_rate = ?1,
+            seller_sent_rate = ?2            
             WHERE id = ?3
         "#,
-        buyer_vote,
-        seller_vote,
+        buyer_sent_rate,
+        seller_sent_rate,
         order_id,
     )
     .execute(&mut conn)

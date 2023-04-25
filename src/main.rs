@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 
-    println!("pub {}",my_keys.public_key().to_bech32().unwrap());
+    println!("pub {}", my_keys.public_key().to_bech32().unwrap());
 
     let subscription = Filter::new()
         .pubkey(my_keys.public_key())

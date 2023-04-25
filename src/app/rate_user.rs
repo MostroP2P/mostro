@@ -1,10 +1,10 @@
 use crate::messages;
-use crate::util::{send_dm, update_user_vote_event};
+use crate::util::{send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use log::{error, info};
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Review};
+use mostro_core::{Action, Content, Message, Rating};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -118,7 +118,7 @@ pub async fn get_counterpart_reputation(
     user: &String,
     my_keys: &Keys,
     client: &Client,
-) -> Option<Review> {
+) -> Option<Rating> {
     // Request NIP33 of the counterparts
 
     let filter = Filter::new()
@@ -130,7 +130,7 @@ pub async fn get_counterpart_reputation(
 
     event_nip33.as_ref()?;
 
-    let reputation = Review::from_json(&event_nip33.unwrap().content).unwrap();
+    let reputation = Rating::from_json(&event_nip33.unwrap().content).unwrap();
 
     Some(reputation)
 }
@@ -163,22 +163,22 @@ pub async fn update_user_reputation_action(
     }
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
-    let mut buyer_voting: bool = false;
-    let mut seller_voting: bool = false;
+    let mut buyer_rating: bool = false;
+    let mut seller_rating: bool = false;
 
     if message_sender == buyer {
         counterpart = seller;
-        buyer_voting = true
+        buyer_rating = true
     } else if message_sender == seller {
         counterpart = buyer;
-        seller_voting = true
+        seller_rating = true
     };
 
     // Add a check in case of no counterpart found
     // if counterpart.is_none() { return anyhow::Error::new(_) };
 
     // Check if content of Peer is the same of counterpart
-    let mut vote = 0_f64;
+    let mut rating = 0_f64;
 
     if let Content::Peer(p) = msg.content.unwrap() {
         if counterpart != p.pubkey {
@@ -193,41 +193,42 @@ pub async fn update_user_reputation_action(
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
         }
-        vote = p.vote.unwrap();
+        rating = p.rating.unwrap();
     }
 
+    // Ask counterpart reputation
     let rep = get_counterpart_reputation(&counterpart, my_keys, client).await;
     //Here we have to update values of the review of the counterpart
     let mut reputation;
 
     if rep.is_none() {
-        reputation = Review::new(1.0, vote, vote, vote, vote);
+        reputation = Rating::new(1.0, rating, rating, rating, rating);
     } else {
         // Update user reputation
         //Going on with calculation
         reputation = rep.unwrap();
         reputation.total_reviews += 1.0;
-        if vote > reputation.max_rate {
-            reputation.max_rate = vote
+        if rating > reputation.max_rate {
+            reputation.max_rate = rating
         };
-        if vote < reputation.min_rate {
-            reputation.min_rate = vote
+        if rating < reputation.min_rate {
+            reputation.min_rate = rating
         };
         let new_rating =
-            reputation.last_rating + (vote - reputation.last_rating) / reputation.total_reviews;
+            reputation.last_rating + (rating - reputation.last_rating) / reputation.total_reviews;
         reputation.last_rating = new_rating;
     }
 
     // Check if the order is not voted by the message sender and in case update NIP
-    let order_to_check_votes = crate::db::find_order_by_id(pool, order.id).await?;
-    if (seller_voting && !order_to_check_votes.seller_voted)
-        || (buyer_voting && !order_to_check_votes.buyer_voted)
+    let order_to_check_ratings = crate::db::find_order_by_id(pool, order.id).await?;
+    if (seller_rating && !order_to_check_ratings.seller_sent_rate)
+        || (buyer_rating && !order_to_check_ratings.buyer_sent_rate)
     {
         //Update db with vote flags
-        update_user_vote_event(
+        update_user_rating_event(
             &counterpart,
-            buyer_voting,
-            seller_voting,
+            buyer_rating,
+            seller_rating,
             reputation.as_json().unwrap(),
             order.id,
             my_keys,

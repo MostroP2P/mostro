@@ -30,6 +30,6 @@ CREATE TABLE IF NOT EXISTS orders (
   invoice_held_at integer default 0,
   taken_at integer default 0,
   created_at integer not null,
-  buyer_voted integer default 0,
-  seller_voted integer default 0
+  buyer_sent_rate integer default 0,
+  seller_sent_rate integer default 0
 );

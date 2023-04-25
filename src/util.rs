@@ -117,10 +117,10 @@ pub fn get_keys() -> Result<Keys> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn update_user_vote_event(
+pub async fn update_user_rating_event(
     user: &String,
-    buyer_vote: bool,
-    seller_vote: bool,
+    buyer_sent_rate: bool,
+    seller_sent_rate: bool,
     reputation: String,
     order_id: Uuid,
     keys: &Keys,
@@ -134,7 +134,7 @@ pub async fn update_user_vote_event(
     let event = EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
-    crate::db::update_order_event_id_vote_status(pool, order_id, buyer_vote, seller_vote).await?;
+    crate::db::update_order_event_id_vote_status(pool, order_id, buyer_sent_rate, seller_sent_rate).await?;
     // Send event to relay
     client.send_event(event).await.map(|_s| ()).map_err(|err| {
         error!("{}", err);
@@ -365,7 +365,7 @@ pub async fn vote_counterpart(
     let message_to_buyer = Message::new(
         0,
         order.id,
-        Action::VoteUser,
+        Action::RateUser,
         Some(Content::Order(order.clone())),
     );
     let message_to_buyer = message_to_buyer.as_json().unwrap();
@@ -374,7 +374,7 @@ pub async fn vote_counterpart(
     let message_to_seller = Message::new(
         0,
         order.id,
-        Action::VoteUser,
+        Action::RateUser,
         Some(Content::Order(order.clone())),
     );
     let message_to_seller = message_to_seller.as_json().unwrap();

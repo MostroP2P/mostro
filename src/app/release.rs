@@ -2,7 +2,7 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::util::{connect_nostr, get_keys};
-use crate::util::{send_dm, update_order_event, vote_counterpart};
+use crate::util::{send_dm, update_order_event, rate_counterpart};
 
 use anyhow::Result;
 use log::{error, info};
@@ -106,7 +106,7 @@ pub async fn release_action(
                             .unwrap();
 
                         // Adding here voting process...
-                        vote_counterpart(
+                        rate_counterpart(
                             &client,
                             &buyer_pubkey,
                             &seller_pubkey,

@@ -187,6 +187,7 @@ pub async fn update_user_reputation_action(
             let message = Message::new(
                 0,
                 Some(order.id),
+                None,
                 Action::CantDo,
                 Some(Content::TextMessage(text_message)),
             );

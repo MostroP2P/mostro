@@ -229,6 +229,32 @@ pub async fn update_order_event_id_status(
     Ok(rows_affected > 0)
 }
 
+pub async fn update_order_event_id_rate_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    buyer_sent_rate: bool,
+    seller_sent_rate: bool,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            buyer_sent_rate = ?1,
+            seller_sent_rate = ?2            
+            WHERE id = ?3
+        "#,
+        buyer_sent_rate,
+        seller_sent_rate,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
 pub async fn find_order_by_event_id(pool: &SqlitePool, event_id: &str) -> anyhow::Result<Order> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -386,4 +412,19 @@ pub async fn edit_master_seller_pubkey_order(
     .rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Order> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(order)
 }

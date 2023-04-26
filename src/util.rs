@@ -1,6 +1,6 @@
 use crate::models::Yadio;
 use crate::{db, flow};
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
 use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
@@ -14,6 +14,7 @@ use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use crate::lightning;
 use crate::messages;
 use tokio::sync::mpsc::channel;
+use uuid::Uuid;
 
 /// Request market quote from Yadio to have sats amount at actual market price
 pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
@@ -113,6 +114,33 @@ pub fn get_keys() -> Result<Keys> {
     let my_keys = Keys::from_sk_str(&nsec1privkey)?;
 
     Ok(my_keys)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_user_rating_event(
+    user: &String,
+    buyer_sent_rate: bool,
+    seller_sent_rate: bool,
+    reputation: String,
+    order_id: Uuid,
+    keys: &Keys,
+    client: &Client,
+    pool: &SqlitePool,
+) -> Result<()> {
+    // let reputation = reput
+    // nip33 kind and d tag
+    let event_kind = 30000;
+    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![user.to_string()]);
+    let event = EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
+    info!("Sending replaceable event: {event:#?}");
+    // We update the order vote status
+    crate::db::update_order_event_id_rate_status(pool, order_id, buyer_sent_rate, seller_sent_rate)
+        .await?;
+    // Send event to relay
+    client.send_event(event).await.map(|_s| ()).map_err(|err| {
+        error!("{}", err);
+        err.into()
+    })
 }
 
 pub async fn update_order_event(
@@ -323,4 +351,37 @@ pub async fn set_market_order_sats_amount(
     .await?;
 
     Ok(order.amount)
+}
+
+/// Send message to buyer and seller to vote for counterpart
+pub async fn rate_counterpart(
+    client: &Client,
+    buyer_pubkey: &XOnlyPublicKey,
+    seller_pubkey: &XOnlyPublicKey,
+    my_keys: &Keys,
+    order: NewOrder,
+) -> Result<()> {
+    // Send dm to counterparts
+    // to buyer
+    let message_to_buyer = Message::new(
+        0,
+        order.id,
+        None,
+        Action::RateUser,
+        Some(Content::Order(order.clone())),
+    );
+    let message_to_buyer = message_to_buyer.as_json().unwrap();
+    send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
+    // to seller
+    let message_to_seller = Message::new(
+        0,
+        order.id,
+        None,
+        Action::RateUser,
+        Some(Content::Order(order.clone())),
+    );
+    let message_to_seller = message_to_seller.as_json().unwrap();
+    send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
+
+    Ok(())
 }

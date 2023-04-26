@@ -2,6 +2,7 @@ pub mod add_invoice;
 pub mod cancel;
 pub mod fiat_sent;
 pub mod order;
+pub mod rate_user;
 pub mod release;
 pub mod take_buy;
 pub mod take_sell;
@@ -10,6 +11,7 @@ use crate::app::add_invoice::add_invoice_action;
 use crate::app::cancel::cancel_action;
 use crate::app::fiat_sent::fiat_sent_action;
 use crate::app::order::order_action;
+use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
@@ -73,12 +75,18 @@ pub async fn run(
                                             .await?
                                     }
                                     Action::PayInvoice => todo!(),
+                                    Action::RateUser => {
+                                        update_user_reputation_action(
+                                            msg, &event, &my_keys, &client, &pool,
+                                        )
+                                        .await?;
+                                    }
                                     _ => todo!(),
                                 }
                             }
                         }
-                    };
-                }
+                    }
+                };
             }
         }
     }

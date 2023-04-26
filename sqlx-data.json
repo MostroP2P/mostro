@@ -20,6 +20,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            event_id = ?3\n            WHERE id = ?4\n        "
   },
+  "27d872e32619954a76458fc8f68d6a0ecbc4e16b8cc6fa2bbf6c0073e81862b7": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 3
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            buyer_sent_rate = ?1,\n            seller_sent_rate = ?2            \n            WHERE id = ?3\n        "
+  },
   "4465f33fba7d31a7154b9710438d9319d02018e873a54d720cda2f7eb07aece6": {
     "describe": {
       "columns": [],

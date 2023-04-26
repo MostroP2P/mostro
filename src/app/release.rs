@@ -2,7 +2,7 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::util::{connect_nostr, get_keys};
-use crate::util::{send_dm, update_order_event};
+use crate::util::{rate_counterpart, send_dm, update_order_event};
 
 use anyhow::Result;
 use log::{error, info};
@@ -104,6 +104,17 @@ pub async fn release_action(
                         update_order_event(&pool, &client, &my_keys, status, &order, None)
                             .await
                             .unwrap();
+
+                        // Adding here voting process...
+                        rate_counterpart(
+                            &client,
+                            &buyer_pubkey,
+                            &seller_pubkey,
+                            &my_keys,
+                            order.as_new_order().clone(),
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
             }

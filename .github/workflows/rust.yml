@@ -19,10 +19,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    
+    - env:
+        SQLX_OFFLINE: true
+       
     - name: Create database offline
       run: |
-        cargo install --version=0.6.0 sqlx-cli
+        cargo install --version=0.6.0 sqlx-cli --no-default-features
         cargo sqlx prepare
     
     - name: Run tests

@@ -2,7 +2,7 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::util::{connect_nostr, get_keys};
-use crate::util::{send_dm, update_order_event, rate_counterpart};
+use crate::util::{rate_counterpart, send_dm, update_order_event};
 
 use anyhow::Result;
 use log::{error, info};

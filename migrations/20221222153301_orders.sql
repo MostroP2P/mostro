@@ -10,8 +10,6 @@ CREATE TABLE IF NOT EXISTS orders (
   master_buyer_pubkey char(64),
   seller_pubkey char(64),
   master_seller_pubkey char(64),
-  buyer_sent_rate integer default 0,
-  seller_sent_rate integer default 0,
   status char(10) not null,
   price_from_api integer not null default 0,
   premium integer not null,

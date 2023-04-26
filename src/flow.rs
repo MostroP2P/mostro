@@ -15,6 +15,13 @@ pub async fn hold_invoice_paid(hash: &str) {
         "Order Id: {} - Seller paid invoice with hash: {hash}",
         order.id
     );
+    let mut master_buyer_pubkey: Option<String> = None;
+    let mut master_seller_pubkey: Option<String> = None;
+    // If this is a sell order we show the master identities
+    if order.kind == "Sell" {
+        master_buyer_pubkey = order.master_buyer_pubkey.clone();
+        master_seller_pubkey = order.master_seller_pubkey.clone();
+    }
 
     // We send this data related to the order to the parties
     let order_data = SmallOrder::new(
@@ -24,8 +31,8 @@ pub async fn hold_invoice_paid(hash: &str) {
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
-        order.buyer_pubkey.as_ref().cloned(),
-        order.seller_pubkey.as_ref().cloned(),
+        master_buyer_pubkey,
+        master_seller_pubkey,
     );
     let status;
     println!("buyer_invoice {:#?}", order.buyer_invoice);
@@ -34,6 +41,7 @@ pub async fn hold_invoice_paid(hash: &str) {
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::BuyerTookOrder,
             Some(Content::SmallOrder(order_data.clone())),
         );
@@ -45,6 +53,7 @@ pub async fn hold_invoice_paid(hash: &str) {
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::HoldInvoicePaymentAccepted,
             Some(Content::SmallOrder(order_data)),
         );
@@ -58,6 +67,7 @@ pub async fn hold_invoice_paid(hash: &str) {
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::AddInvoice,
             Some(Content::SmallOrder(order_data.clone())),
         );
@@ -66,7 +76,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             .await
             .unwrap();
         // We send a message to seller we are waiting for buyer invoice
-        let message = Message::new(0, Some(order.id), Action::WaitingBuyerInvoice, None);
+        let message = Message::new(0, Some(order.id), None, Action::WaitingBuyerInvoice, None);
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await
@@ -105,13 +115,19 @@ pub async fn hold_invoice_settlement(hash: &str) {
     .await
     .unwrap();
     // We send a *funds released* message to seller
-    let message = Message::new(0, Some(order.id), Action::HoldInvoicePaymentSettled, None);
+    let message = Message::new(
+        0,
+        Some(order.id),
+        None,
+        Action::HoldInvoicePaymentSettled,
+        None,
+    );
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &seller_pubkey, message)
         .await
         .unwrap();
     // We send a message to buyer saying seller released
-    let message = Message::new(0, Some(order.id), Action::Release, None);
+    let message = Message::new(0, Some(order.id), None, Action::Release, None);
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &buyer_pubkey, message)
         .await
@@ -138,7 +154,13 @@ pub async fn hold_invoice_canceled(hash: &str) {
         .await
         .unwrap();
     // We send "order canceled" messages to both parties
-    let message = Message::new(0, Some(order.id), Action::HoldInvoicePaymentCanceled, None);
+    let message = Message::new(
+        0,
+        Some(order.id),
+        None,
+        Action::HoldInvoicePaymentCanceled,
+        None,
+    );
     let message = message.as_json().unwrap();
     send_dm(&client, &my_keys, &seller_pubkey, message.clone())
         .await

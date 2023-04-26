@@ -45,8 +45,9 @@ pub async fn publish_order(
     keys: &Keys,
     new_order: &NewOrder,
     initiator_pubkey: &str,
+    master_pubkey: &str,
 ) -> Result<()> {
-    let order = crate::db::add_order(pool, new_order, "", initiator_pubkey).await?;
+    let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Now we have the order id, we can create a new event adding this id to the Order object
@@ -59,6 +60,8 @@ pub async fn publish_order(
         order.fiat_amount,
         order.payment_method,
         order.premium,
+        None,
+        None,
         None,
         Some(order.created_at),
     );
@@ -131,6 +134,8 @@ pub async fn update_order_event(
         order.fiat_amount,
         order.payment_method.to_owned(),
         order.premium,
+        None,
+        None,
         None,
         Some(order.created_at),
     );
@@ -218,6 +223,7 @@ pub async fn show_hold_invoice(
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::PayInvoice,
         Some(Content::PaymentRequest(
             Some(new_order),
@@ -229,7 +235,7 @@ pub async fn show_hold_invoice(
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
 
-    let message = Message::new(0, Some(order.id), Action::WaitingSellerToPay, None);
+    let message = Message::new(0, Some(order.id), None, Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -296,6 +302,7 @@ pub async fn set_market_order_sats_amount(
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::TakeSell,
         Some(Content::SmallOrder(order_data)),
     );

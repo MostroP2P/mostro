@@ -49,6 +49,7 @@ pub async fn add_invoice_action(
                     let message = Message::new(
                         0,
                         Some(order.id),
+                        None,
                         Action::CantDo,
                         Some(Content::TextMessage(e.to_string())),
                     );
@@ -81,6 +82,7 @@ pub async fn add_invoice_action(
             let message = Message::new(
                 0,
                 Some(order.id),
+                None,
                 Action::CantDo,
                 Some(Content::TextMessage(format!(
                     "Order Id {order_id} status must be WaitingBuyerInvoice!"
@@ -107,6 +109,7 @@ pub async fn add_invoice_action(
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::BuyerTookOrder,
         Some(Content::SmallOrder(order_data.clone())),
     );
@@ -118,6 +121,7 @@ pub async fn add_invoice_action(
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::HoldInvoicePaymentAccepted,
         Some(Content::SmallOrder(order_data)),
     );

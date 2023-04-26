@@ -36,11 +36,14 @@ pub async fn fiat_sent_action(
         let message = Message::new(
             0,
             Some(order.id),
+            None,
             Action::CantDo,
             Some(Content::TextMessage(text_message)),
         );
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
     }
 
     // We publish a new replaceable kind nostr event with the status updated
@@ -54,24 +57,26 @@ pub async fn fiat_sent_action(
             return Ok(());
         }
     };
-    let peer = Peer::new(event.pubkey.to_bech32()?);
+    let peer = Peer::new(event.pubkey.to_bech32()?, None);
 
     // We create a Message
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::FiatSent,
         Some(Content::Peer(peer)),
     );
     let message = message.as_json().unwrap();
     send_dm(client, my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer to wait
-    let peer = Peer::new(seller_pubkey.to_bech32()?);
+    let peer = Peer::new(seller_pubkey.to_bech32()?, None);
 
     // We create a Message
     let message = Message::new(
         0,
         Some(order.id),
+        None,
         Action::FiatSent,
         Some(Content::Peer(peer)),
     );

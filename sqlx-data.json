@@ -1,5 +1,15 @@
 {
   "db": "SQLite",
+  "0000b9b802fb5639a06762bf8c041dd0a942d54b503c801e2f1d1cb788789a44": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
+  },
   "0f0f1e46225de7a094cc1450847078c0c1d5070e8af44e1961172dc2d28e3380": {
     "describe": {
       "columns": [],
@@ -59,6 +69,16 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            taken_at = ?6,\n            invoice_held_at = ?7\n            WHERE id = ?8\n        "
+  },
+  "c5bc1af1d462bfdbda706928ee4f8c6ea73fed4d84154f3f7975f96aa515ef3b": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            master_buyer_pubkey = ?1\n            WHERE id = ?2\n        "
   },
   "da72f298a426b1c65f7c67bf44436ba0b0878e52694cbd4cbca8585afcc665df": {
     "describe": {

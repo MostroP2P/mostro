@@ -245,7 +245,7 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that voted
-        let message = Message::new(0, Some(order.id), None, Action::MessageReceived, None);
+        let message = Message::new(0, Some(order.id), None, Action::Received, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
     }

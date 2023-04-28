@@ -166,35 +166,36 @@ pub async fn update_user_reputation_action(
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
+    // Find the counterpart pubid
     if message_sender == buyer {
         counterpart = seller;
-        buyer_rating = true
+        buyer_rating = true;
     } else if message_sender == seller {
         counterpart = buyer;
-        seller_rating = true
+        seller_rating = true;
     };
 
     // Add a check in case of no counterpart found
-    // if counterpart.is_none() { return anyhow::Error::new(_) };
+    if counterpart.is_empty() {
+        let text_message = messages::cant_do();
+        // We create a Message
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::CantDo,
+            Some(Content::TextMessage(text_message)),
+        );
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+        return Ok(());
+    };
 
     // Check if content of Peer is the same of counterpart
-    let mut rating = 0_f64;
+    let mut rating = 0_u64;
 
-    if let Content::Peer(p) = msg.content.unwrap() {
-        if counterpart != p.pubkey {
-            let text_message = messages::cant_do();
-            // We create a Message
-            let message = Message::new(
-                0,
-                Some(order.id),
-                None,
-                Action::CantDo,
-                Some(Content::TextMessage(text_message)),
-            );
-            let message = message.as_json()?;
-            send_dm(client, my_keys, &event.pubkey, message).await?;
-        }
-        rating = p.rating.unwrap();
+    if let Content::RatingUser(v) = msg.content.unwrap() {
+        rating = v;
     }
 
     // Ask counterpart reputation
@@ -203,21 +204,26 @@ pub async fn update_user_reputation_action(
     let mut reputation;
 
     if rep.is_none() {
-        reputation = Rating::new(1.0, rating, rating, rating, rating);
+        reputation = Rating::new(1, rating as f64, rating, rating, rating);
     } else {
         // Update user reputation
         //Going on with calculation
         reputation = rep.unwrap();
-        reputation.total_reviews += 1.0;
+        reputation.total_reviews += 1;
         if rating > reputation.max_rate {
             reputation.max_rate = rating
         };
         if rating < reputation.min_rate {
             reputation.min_rate = rating
         };
-        let new_rating =
-            reputation.last_rating + (rating - reputation.last_rating) / reputation.total_reviews;
-        reputation.last_rating = new_rating;
+        let calculation = (reputation.last_rating as f64)
+            + ((rating as f64 - reputation.total_rating) / reputation.total_reviews as f64);
+
+        // Format with two decimals
+        let new_rating = format!("{:.2}", calculation).parse::<f64>().unwrap();
+
+        // Assing new total rating to review
+        reputation.total_rating = new_rating;
     }
 
     // Check if the order is not voted by the message sender and in case update NIP
@@ -237,6 +243,11 @@ pub async fn update_user_reputation_action(
             pool,
         )
         .await?;
+
+        // Send confirmation message to user that voted
+        let message = Message::new(0, Some(order.id), None, Action::Received, None);
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
     }
     Ok(())
 }

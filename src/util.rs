@@ -373,13 +373,7 @@ pub async fn rate_counterpart(
     let message_to_buyer = message_to_buyer.as_json().unwrap();
     send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
     // to seller
-    let message_to_seller = Message::new(
-        0,
-        order.id,
-        None,
-        Action::RateUser,
-        Some(Content::Order(order.clone())),
-    );
+    let message_to_seller = Message::new(0, order.id, None, Action::RateUser, None);
     let message_to_seller = message_to_seller.as_json().unwrap();
     send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
 

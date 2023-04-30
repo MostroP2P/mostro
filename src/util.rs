@@ -134,8 +134,13 @@ pub async fn update_user_rating_event(
     let event = EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
-    crate::db::update_order_event_id_rate_status(pool, order_id, buyer_sent_rate, seller_sent_rate)
-        .await?;
+    if buyer_sent_rate {
+        crate::db::update_order_event_buyer_vote(pool, order_id, buyer_sent_rate).await?;
+    }
+    if seller_sent_rate {
+        crate::db::update_order_event_seller_vote(pool, order_id, seller_sent_rate).await?;
+    }
+
     // Send event to relay
     client.send_event(event).await.map(|_s| ()).map_err(|err| {
         error!("{}", err);

@@ -228,14 +228,19 @@ pub async fn update_user_reputation_action(
 
     // Check if the order is not voted by the message sender and in case update NIP
     let order_to_check_ratings = crate::db::find_order_by_id(pool, order.id).await?;
-    if (seller_rating && !order_to_check_ratings.seller_sent_rate)
-        || (buyer_rating && !order_to_check_ratings.buyer_sent_rate)
-    {
+    // Check what vote status needs update
+    let update_seller_vote = seller_rating && !order_to_check_ratings.seller_sent_rate;
+    let update_buyer_vote = buyer_rating && !order_to_check_ratings.buyer_sent_rate;
+    if update_buyer_vote && update_seller_vote {
+        return Ok(());
+    };
+
+    if buyer_rating || seller_rating {
         //Update db with vote flags
         update_user_rating_event(
             &counterpart,
-            buyer_rating,
-            seller_rating,
+            update_buyer_vote,
+            update_seller_vote,
             reputation.as_json().unwrap(),
             order.id,
             my_keys,
@@ -243,11 +248,12 @@ pub async fn update_user_reputation_action(
             pool,
         )
         .await?;
-
-        // Send confirmation message to user that voted
-        let message = Message::new(0, Some(order.id), None, Action::Received, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
     }
+
+    // Send confirmation message to user that voted
+    let message = Message::new(0, Some(order.id), None, Action::Received, None);
+    let message = message.as_json()?;
+    send_dm(client, my_keys, &event.pubkey, message).await?;
+
     Ok(())
 }

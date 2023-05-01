@@ -1,4 +1,3 @@
-use crate::messages;
 use crate::util::{send_dm, update_user_rating_event};
 
 use anyhow::Result;
@@ -146,7 +145,7 @@ pub async fn update_user_reputation_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("FiatSent: Order Id {order_id} not found!");
+            error!("RateUser: Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -156,9 +155,12 @@ pub async fn update_user_reputation_action(
     let seller = order.seller_pubkey.unwrap();
     let message_sender = event.pubkey.to_bech32()?;
 
-    // TODO: send to user a DM with the error
     if order.status != "Success" {
-        error!("FiatSent: Order Id {order_id} wrong status");
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+        error!("RateUser: Order Id {order_id} wrong status");
+
         return Ok(());
     }
     // Get counterpart pubkey
@@ -166,7 +168,7 @@ pub async fn update_user_reputation_action(
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
-    // Find the counterpart pubid
+    // Find the counterpart public key
     if message_sender == buyer {
         counterpart = seller;
         buyer_rating = true;
@@ -177,22 +179,29 @@ pub async fn update_user_reputation_action(
 
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
-        let text_message = messages::cant_do();
         // We create a Message
-        let message = Message::new(
-            0,
-            Some(order.id),
-            None,
-            Action::CantDo,
-            Some(Content::TextMessage(text_message)),
-        );
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
         return Ok(());
     };
 
+    // Check if the order is not rated by the message sender
+    let order = crate::db::find_order_by_id(pool, order.id).await?;
+    // Check what rate status needs update
+    let mut update_seller_rate = false;
+    let mut update_buyer_rate = false;
+    if seller_rating && !order.seller_sent_rate {
+        update_seller_rate = true;
+    } else if buyer_rating && !order.buyer_sent_rate {
+        update_buyer_rate = true;
+    };
+    if !update_buyer_rate && !update_seller_rate {
+        return Ok(());
+    };
+
     // Check if content of Peer is the same of counterpart
-    let mut rating = 0_u64;
+    let mut rating = 0_u8;
 
     if let Content::RatingUser(v) = msg.content.unwrap() {
         rating = v;
@@ -200,43 +209,34 @@ pub async fn update_user_reputation_action(
 
     // Ask counterpart reputation
     let rep = get_counterpart_reputation(&counterpart, my_keys, client).await;
-    //Here we have to update values of the review of the counterpart
+    // Here we have to update values of the review of the counterpart
     let mut reputation;
+    // min_rate is 1 and max_rate is 5
+    let min_rate = 1;
+    let max_rate = 5;
 
     if rep.is_none() {
-        reputation = Rating::new(1, rating as f64, rating, rating, rating);
+        reputation = Rating::new(1, rating as f64, min_rate, max_rate, rating);
     } else {
         // Update user reputation
-        //Going on with calculation
+        // Going on with calculation
         reputation = rep.unwrap();
-        reputation.total_reviews += 1;
-        if rating > reputation.max_rate {
-            reputation.max_rate = rating
-        };
-        if rating < reputation.min_rate {
-            reputation.min_rate = rating
-        };
-        let calculation = (reputation.last_rating as f64)
-            + ((rating as f64 - reputation.total_rating) / reputation.total_reviews as f64);
+        let old_rating = reputation.total_rating;
+        let last_rating = reputation.last_rating;
+        let new_rating =
+            old_rating + (last_rating as f64 - old_rating) / (reputation.total_reviews as f64);
 
+        reputation.last_rating = rating;
+        reputation.total_reviews += 1;
         // Format with two decimals
-        let new_rating = format!("{:.2}", calculation).parse::<f64>().unwrap();
+        let new_rating = format!("{:.2}", new_rating).parse::<f64>().unwrap();
 
         // Assing new total rating to review
         reputation.total_rating = new_rating;
     }
 
-    // Check if the order is not rated by the message sender and in case update NIP
-    let order_to_check_ratings = crate::db::find_order_by_id(pool, order.id).await?;
-    // Check what rate status needs update
-    let update_seller_rate = seller_rating && !order_to_check_ratings.seller_sent_rate;
-    let update_buyer_rate = buyer_rating && !order_to_check_ratings.buyer_sent_rate;
-    if update_buyer_rate && update_seller_rate {
-        return Ok(());
-    };
-
     if buyer_rating || seller_rating {
-        //Update db with vote flags
+        // Update db with rate flags
         update_user_rating_event(
             &counterpart,
             update_buyer_rate,
@@ -249,7 +249,7 @@ pub async fn update_user_reputation_action(
         )
         .await?;
 
-        // Send confirmation message to user that voted
+        // Send confirmation message to user that rated
         let message = Message::new(0, Some(order.id), None, Action::Received, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;

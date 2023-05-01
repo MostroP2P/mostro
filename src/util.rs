@@ -368,13 +368,7 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    let message_to_buyer = Message::new(
-        0,
-        order.id,
-        None,
-        Action::RateUser,
-        Some(Content::Order(order.clone())),
-    );
+    let message_to_buyer = Message::new(0, order.id, None, Action::RateUser, None);
     let message_to_buyer = message_to_buyer.as_json().unwrap();
     send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
     // to seller

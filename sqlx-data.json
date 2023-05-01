@@ -20,15 +20,15 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            event_id = ?3\n            WHERE id = ?4\n        "
   },
-  "27d872e32619954a76458fc8f68d6a0ecbc4e16b8cc6fa2bbf6c0073e81862b7": {
+  "301fbda63c61bf75d60bc330d5b1aacae80248c253a2fe9e97f5a74a7acafe75": {
     "describe": {
       "columns": [],
       "nullable": [],
       "parameters": {
-        "Right": 3
+        "Right": 2
       }
     },
-    "query": "\n            UPDATE orders\n            SET\n            buyer_sent_rate = ?1,\n            seller_sent_rate = ?2            \n            WHERE id = ?3\n        "
+    "query": "\n            UPDATE orders\n            SET\n            buyer_sent_rate = ?1\n            WHERE id = ?2\n        "
   },
   "4465f33fba7d31a7154b9710438d9319d02018e873a54d720cda2f7eb07aece6": {
     "describe": {
@@ -39,6 +39,16 @@
       }
     },
     "query": "\n    UPDATE orders\n    SET\n    buyer_pubkey = ?1,\n    seller_pubkey = ?2,\n    status = ?3,\n    preimage = ?4,\n    hash = ?5\n    WHERE id = ?6\n    "
+  },
+  "567a4d6906624fb39ff9719c0f15626b42d215d6648b6274bda052cfc9f48102": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            seller_sent_rate = ?1\n            WHERE id = ?2\n        "
   },
   "77ea98f6af16fa6e5a7d604965593700c563f88d88cb10b348bdc4200c87ad1d": {
     "describe": {

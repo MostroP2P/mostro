@@ -134,8 +134,13 @@ pub async fn update_user_rating_event(
     let event = EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
-    crate::db::update_order_event_id_rate_status(pool, order_id, buyer_sent_rate, seller_sent_rate)
-        .await?;
+    if buyer_sent_rate {
+        crate::db::update_order_event_buyer_vote(pool, order_id, buyer_sent_rate).await?;
+    }
+    if seller_sent_rate {
+        crate::db::update_order_event_seller_vote(pool, order_id, seller_sent_rate).await?;
+    }
+
     // Send event to relay
     client.send_event(event).await.map(|_s| ()).map_err(|err| {
         error!("{}", err);
@@ -363,13 +368,7 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    let message_to_buyer = Message::new(
-        0,
-        order.id,
-        None,
-        Action::RateUser,
-        Some(Content::Order(order.clone())),
-    );
+    let message_to_buyer = Message::new(0, order.id, None, Action::RateUser, None);
     let message_to_buyer = message_to_buyer.as_json().unwrap();
     send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
     // to seller

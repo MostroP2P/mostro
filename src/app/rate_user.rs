@@ -226,12 +226,12 @@ pub async fn update_user_reputation_action(
         reputation.total_rating = new_rating;
     }
 
-    // Check if the order is not voted by the message sender and in case update NIP
+    // Check if the order is not rated by the message sender and in case update NIP
     let order_to_check_ratings = crate::db::find_order_by_id(pool, order.id).await?;
-    // Check what vote status needs update
-    let update_seller_vote = seller_rating && !order_to_check_ratings.seller_sent_rate;
-    let update_buyer_vote = buyer_rating && !order_to_check_ratings.buyer_sent_rate;
-    if update_buyer_vote && update_seller_vote {
+    // Check what rate status needs update
+    let update_seller_rate = seller_rating && !order_to_check_ratings.seller_sent_rate;
+    let update_buyer_rate = buyer_rating && !order_to_check_ratings.buyer_sent_rate;
+    if update_buyer_rate && update_seller_rate {
         return Ok(());
     };
 
@@ -239,8 +239,8 @@ pub async fn update_user_reputation_action(
         //Update db with vote flags
         update_user_rating_event(
             &counterpart,
-            update_buyer_vote,
-            update_seller_vote,
+            update_buyer_rate,
+            update_seller_rate,
             reputation.as_json().unwrap(),
             order.id,
             my_keys,

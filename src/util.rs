@@ -135,10 +135,10 @@ pub async fn update_user_rating_event(
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
-        crate::db::update_order_event_buyer_vote(pool, order_id, buyer_sent_rate).await?;
+        crate::db::update_order_event_buyer_rate(pool, order_id, buyer_sent_rate).await?;
     }
     if seller_sent_rate {
-        crate::db::update_order_event_seller_vote(pool, order_id, seller_sent_rate).await?;
+        crate::db::update_order_event_seller_rate(pool, order_id, seller_sent_rate).await?;
     }
 
     // Send event to relay

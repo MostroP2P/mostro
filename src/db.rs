@@ -229,7 +229,7 @@ pub async fn update_order_event_id_status(
     Ok(rows_affected > 0)
 }
 
-pub async fn update_order_event_seller_vote(
+pub async fn update_order_event_seller_rate(
     pool: &SqlitePool,
     order_id: Uuid,
     seller_sent_rate: bool,
@@ -252,7 +252,7 @@ pub async fn update_order_event_seller_vote(
     Ok(rows_affected > 0)
 }
 
-pub async fn update_order_event_buyer_vote(
+pub async fn update_order_event_buyer_rate(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_sent_rate: bool,

@@ -187,7 +187,6 @@ pub async fn update_user_reputation_action(
     };
 
     // Check if the order is not rated by the message sender
-    let order = crate::db::find_order_by_id(pool, order.id).await?;
     // Check what rate status needs update
     let mut update_seller_rate = false;
     let mut update_buyer_rate = false;

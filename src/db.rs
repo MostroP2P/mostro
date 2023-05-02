@@ -448,3 +448,49 @@ pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Ord
 
     Ok(order)
 }
+
+pub async fn update_order_buyer_dispute(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    buyer_dispute: bool,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            buyer_dispute = ?1
+            WHERE id = ?2
+        "#,
+        buyer_dispute,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn update_order_seller_dispute(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    seller_dispute: bool,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            seller_dispute = ?1
+            WHERE id = ?2
+        "#,
+        seller_dispute,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}

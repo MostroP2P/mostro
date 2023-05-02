@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS orders (
   preimage char(64),
   creator_pubkey char(64),
   cancel_initiator_pubkey char(64),
+  dispute_initiator_pubkey char(64),
   buyer_pubkey char(64),
   master_buyer_pubkey char(64),
   seller_pubkey char(64),

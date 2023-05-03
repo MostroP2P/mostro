@@ -326,6 +326,27 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     Ok(order)
 }
 
+pub async fn find_order_by_minutes(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let exp_hours = var("EXP_MINUTES")
+        .expect("EXP_MINTE is not set")
+        .as_str()
+        .parse::<u64>()
+        .unwrap();
+    let expire_time = Timestamp::now() - (3600 * exp_hours);
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE created_at < ?1 AND status == 'Pending'
+        "#,
+    )
+    .bind(expire_time.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
+}
+
 pub async fn update_order_to_initial_state(
     pool: &SqlitePool,
     order_id: Uuid,

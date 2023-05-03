@@ -3,12 +3,11 @@ use crate::db::{
     update_order_to_initial_state,
 };
 use crate::lightning::LndConnector;
-use crate::messages;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
 use log::{error, info};
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Status};
+use mostro_core::{Action, Message, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -33,17 +32,11 @@ pub async fn cancel_action(
         let user_pubkey = event.pubkey.to_bech32()?;
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
-            let text_message = messages::cant_do();
             // We create a Message
-            let message = Message::new(
-                0,
-                Some(order.id),
-                None,
-                Action::CantDo,
-                Some(Content::TextMessage(text_message)),
-            );
+            let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
+
             return Ok(());
         }
         // We publish a new replaceable kind nostr event with the status updated
@@ -79,15 +72,8 @@ pub async fn cancel_action(
         match order.cancel_initiator_pubkey {
             Some(ref initiator_pubkey) => {
                 if initiator_pubkey == &user_pubkey {
-                    let text_message = messages::cant_do();
                     // We create a Message
-                    let message = Message::new(
-                        0,
-                        Some(order.id),
-                        None,
-                        Action::CantDo,
-                        Some(Content::TextMessage(text_message)),
-                    );
+                    let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
                     let message = message.as_json()?;
                     send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -172,15 +158,8 @@ pub async fn cancel_add_invoice(
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
     if buyer_pubkey_bech32 != &user_pubkey {
-        let text_message = messages::cant_do();
         // We create a Message
-        let message = Message::new(
-            0,
-            Some(order.id),
-            None,
-            Action::CantDo,
-            Some(Content::TextMessage(text_message)),
-        );
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -234,15 +213,8 @@ pub async fn cancel_pay_hold_invoice(
     let seller_pubkey_bech32 = order.seller_pubkey.as_ref().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey_bech32)?;
     if seller_pubkey_bech32 != &user_pubkey {
-        let text_message = messages::cant_do();
         // We create a Message
-        let message = Message::new(
-            0,
-            Some(order.id),
-            None,
-            Action::CantDo,
-            Some(Content::TextMessage(text_message)),
-        );
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

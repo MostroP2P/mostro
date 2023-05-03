@@ -20,6 +20,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            event_id = ?3\n            WHERE id = ?4\n        "
   },
+  "1a4f24e4d6c6447e7f6b9c7207bd12bc23e87f37d2c8676bffd8f4eb86c31405": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            seller_dispute = ?1\n            WHERE id = ?2\n        "
+  },
   "301fbda63c61bf75d60bc330d5b1aacae80248c253a2fe9e97f5a74a7acafe75": {
     "describe": {
       "columns": [],
@@ -79,6 +89,16 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            buyer_invoice = ?1\n            WHERE id = ?2\n        "
+  },
+  "900597cf1e8ed114cb383856d398ffb23b1d15e48c1708fc2b40cfcc649df9fc": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            buyer_dispute = ?1\n            WHERE id = ?2\n        "
   },
   "97414183485e04346f420960beed77912ebe76089f58d30f0f526e232ce4be25": {
     "describe": {

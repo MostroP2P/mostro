@@ -48,6 +48,7 @@ pub async fn dispute_action(
         let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
+
         return Ok(());
     };
 

@@ -1,4 +1,3 @@
-use crate::messages;
 use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
@@ -31,15 +30,8 @@ pub async fn fiat_sent_action(
     }
     // Check if the pubkey is the buyer
     if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
-        let text_message = messages::cant_do();
         // We create a Message
-        let message = Message::new(
-            0,
-            Some(order.id),
-            None,
-            Action::CantDo,
-            Some(Content::TextMessage(text_message)),
-        );
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

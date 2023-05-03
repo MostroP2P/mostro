@@ -1,5 +1,4 @@
 use crate::db::edit_master_seller_pubkey_order;
-use crate::messages;
 use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
@@ -29,15 +28,8 @@ pub async fn take_buy_action(
     };
     // We check if the message have a pubkey
     if msg.pubkey.is_none() {
-        let text_message = messages::cant_do();
         // We create a Message
-        let message = Message::new(
-            0,
-            Some(order.id),
-            None,
-            Action::CantDo,
-            Some(Content::TextMessage(text_message)),
-        );
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -62,13 +54,18 @@ pub async fn take_buy_action(
     };
     // Seller can take pending orders only
     if order_status != Status::Pending {
-        send_dm(
-            client,
-            my_keys,
-            &seller_pubkey,
-            format!("Order Id {order_id} was already taken!"), // TODO: send a Message
-        )
-        .await?;
+        // We create a Message
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::FiatSent,
+            Some(Content::TextMessage(format!(
+                "Order Id {order_id} was already taken!"
+            ))),
+        );
+        let message = message.as_json().unwrap();
+        send_dm(client, my_keys, &seller_pubkey, message).await?;
 
         return Ok(());
     }

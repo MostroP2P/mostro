@@ -37,6 +37,8 @@ pub async fn run(
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event(_, event) = notification {
                 if let Kind::EncryptedDirectMessage = event.kind {
+                    // We validates if the event is correctly signed
+                    event.verify()?;
                     let message = decrypt(
                         &my_keys.secret_key().unwrap(),
                         &event.pubkey,

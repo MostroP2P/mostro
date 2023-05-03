@@ -1,10 +1,6 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 
-pub fn cant_do() -> String {
-    "You can't do that!".to_string()
-}
-
 pub fn hold_invoice_description(
     mostro_pubkey: XOnlyPublicKey,
     order_id: &str,

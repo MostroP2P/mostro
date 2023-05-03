@@ -1,4 +1,5 @@
 pub mod add_invoice;
+pub mod admin_cancel;
 pub mod cancel;
 pub mod dispute;
 pub mod fiat_sent;
@@ -9,6 +10,7 @@ pub mod take_buy;
 pub mod take_sell;
 
 use crate::app::add_invoice::add_invoice_action;
+use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::cancel::cancel_action;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
@@ -48,35 +50,35 @@ pub async fn run(
                             if msg.verify() {
                                 match msg.action {
                                     Action::Order => {
-                                        order_action(msg, &event, &my_keys, &client, &pool).await?
+                                        order_action(msg, &event, &my_keys, &client, &pool).await?;
                                     }
                                     Action::TakeSell => {
                                         take_sell_action(msg, &event, &my_keys, &client, &pool)
-                                            .await?
+                                            .await?;
                                     }
                                     Action::TakeBuy => {
                                         take_buy_action(msg, &event, &my_keys, &client, &pool)
-                                            .await?
+                                            .await?;
                                     }
                                     Action::FiatSent => {
                                         fiat_sent_action(msg, &event, &my_keys, &client, &pool)
-                                            .await?
+                                            .await?;
                                     }
                                     Action::Release => {
                                         release_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
-                                        .await?
+                                        .await?;
                                     }
                                     Action::Cancel => {
                                         cancel_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
-                                        .await?
+                                        .await?;
                                     }
                                     Action::AddInvoice => {
                                         add_invoice_action(msg, &event, &my_keys, &client, &pool)
-                                            .await?
+                                            .await?;
                                     }
                                     Action::PayInvoice => todo!(),
                                     Action::RateUser => {
@@ -87,7 +89,13 @@ pub async fn run(
                                     }
                                     Action::Dispute => {
                                         dispute_action(msg, &event, &my_keys, &client, &pool)
-                                            .await?
+                                            .await?;
+                                    }
+                                    Action::AdminCancel => {
+                                        admin_cancel_action(
+                                            msg, &event, &my_keys, &client, &pool, ln_client,
+                                        )
+                                        .await?;
                                     }
                                     _ => todo!(),
                                 }

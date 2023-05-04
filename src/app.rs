@@ -1,5 +1,6 @@
 pub mod add_invoice;
 pub mod admin_cancel;
+pub mod admin_settle;
 pub mod cancel;
 pub mod dispute;
 pub mod fiat_sent;
@@ -11,6 +12,7 @@ pub mod take_sell;
 
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_cancel::admin_cancel_action;
+use crate::app::admin_settle::admin_settle_action;
 use crate::app::cancel::cancel_action;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
@@ -93,6 +95,12 @@ pub async fn run(
                                     }
                                     Action::AdminCancel => {
                                         admin_cancel_action(
+                                            msg, &event, &my_keys, &client, &pool, ln_client,
+                                        )
+                                        .await?;
+                                    }
+                                    Action::AdminSettle => {
+                                        admin_settle_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
                                         .await?;

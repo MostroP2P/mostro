@@ -1,6 +1,6 @@
 use crate::db::{self};
 use crate::lightning::LndConnector;
-use crate::util::{connect_nostr, get_keys};
+use crate::util::{connect_nostr, get_keys, settle_seller_hold_invoice};
 use crate::util::{rate_counterpart, send_dm, update_order_event};
 
 use anyhow::Result;
@@ -30,32 +30,30 @@ pub async fn release_action(
         }
     };
     let seller_pubkey = event.pubkey;
-    if Some(seller_pubkey.to_bech32()?) != order.seller_pubkey {
-        // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+    let status = Status::SettledHoldInvoice;
+    let action = Action::Release;
 
-        return Ok(());
-    }
-
-    if order.preimage.is_none() {
-        return Ok(());
-    }
-    let preimage = order.preimage.as_ref().unwrap();
-    ln_client.settle_hold_invoice(preimage).await?;
-    info!("Release: Order Id {}: Released sats", &order.id);
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    update_order_event(
-        pool,
-        client,
-        my_keys,
-        Status::SettledHoldInvoice,
-        &order,
-        None,
+    settle_seller_hold_invoice(
+        event, my_keys, client, pool, ln_client, status, action, true, &order,
     )
     .await?;
+
+    // We send a HoldInvoicePaymentSettled message to seller, the client should
+    // indicate *funds released* message to seller
+    let message = Message::new(
+        0,
+        Some(order.id),
+        None,
+        Action::HoldInvoicePaymentSettled,
+        None,
+    );
+    let message = message.as_json()?;
+    send_dm(client, my_keys, &seller_pubkey, message).await?;
+    // We send a message to buyer indicating seller released funds
+    let message = Message::new(0, Some(order.id), None, Action::Release, None);
+    let message = message.as_json()?;
+    let buyer_pubkey = XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap())?;
+    send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
@@ -99,7 +97,7 @@ pub async fn release_action(
                             .await
                             .unwrap();
 
-                        // Adding here voting process...
+                        // Adding here rate process
                         rate_counterpart(
                             &client,
                             &buyer_pubkey,

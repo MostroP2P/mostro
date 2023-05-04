@@ -49,7 +49,7 @@ pub async fn admin_cancel_action(
     // and update on local database the status and new event id
     update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;
     // We create a Message
-    let message = Message::new(0, Some(order.id), None, Action::CanceledByAdmin, None);
+    let message = Message::new(0, Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

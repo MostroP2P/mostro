@@ -326,13 +326,13 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     Ok(order)
 }
 
-pub async fn find_order_by_minutes(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let exp_hours = var("EXP_MINUTES")
+pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let exp_seconds = var("EXP_SECONDS")
         .expect("EXP_MINTE is not set")
         .as_str()
         .parse::<u64>()
         .unwrap();
-    let expire_time = Timestamp::now() - (3600 * exp_hours);
+    let expire_time = Timestamp::now() - exp_seconds;
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *

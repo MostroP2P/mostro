@@ -328,7 +328,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
 
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
     let exp_seconds = var("EXP_SECONDS")
-        .expect("EXP_MINTE is not set")
+        .expect("EXP_SECONDS is not set")
         .as_str()
         .parse::<u64>()
         .unwrap();
@@ -337,7 +337,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
         r#"
           SELECT *
           FROM orders
-          WHERE created_at < ?1 AND status == 'Pending'
+          WHERE created_at < ?1 AND ( status == 'WaitingBuyerInvoice' OR status == 'WaitingPayment' )
         "#,
     )
     .bind(expire_time.to_string())

@@ -1,3 +1,6 @@
+use crate::lightning;
+use crate::lightning::LndConnector;
+use crate::messages;
 use crate::models::Yadio;
 use crate::{db, flow, RATE_EVENT_LIST};
 use anyhow::{Context, Ok, Result};
@@ -8,12 +11,10 @@ use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
 use nostr_sdk::prelude::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
+use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
-
-use crate::lightning;
-use crate::messages;
 use tokio::sync::mpsc::channel;
+use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use uuid::Uuid;
 
 /// Request market quote from Yadio to have sats amount at actual market price
@@ -290,12 +291,10 @@ pub async fn show_hold_invoice(
                     flow::hold_invoice_paid(&hash).await;
                     info!("Invoice with hash {hash} accepted!");
                 } else if msg.state == InvoiceState::Settled {
-                    // If the payment was released by the seller
-                    info!("Invoice with hash {hash} settled!");
+                    // If the payment was settled
                     flow::hold_invoice_settlement(&hash).await;
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    info!("Invoice with hash {hash} canceled!");
                     flow::hold_invoice_canceled(&hash).await;
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
@@ -373,6 +372,50 @@ pub async fn rate_counterpart(
     let message_to_seller = Message::new(0, order.id, None, Action::RateUser, None);
     let message_to_seller = message_to_seller.as_json().unwrap();
     send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
+
+    Ok(())
+}
+
+/// Settle a seller hold invoice
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_seller_hold_invoice(
+    event: &Event,
+    my_keys: &Keys,
+    client: &Client,
+    pool: &Pool<Sqlite>,
+    ln_client: &mut LndConnector,
+    status: Status,
+    action: Action,
+    is_admin: bool,
+    order: &Order,
+) -> Result<()> {
+    let mut pubkey = String::new();
+    // It can be settle only by a seller or by admin
+    if is_admin {
+        pubkey = my_keys.public_key().to_bech32()?;
+    } else {
+        pubkey = order.seller_pubkey.as_ref().unwrap().to_string();
+    }
+    // Check if the pubkey is right
+    if event.pubkey.to_bech32()? != pubkey {
+        // We create a Message
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+    if order.preimage.is_none() {
+        return Ok(());
+    }
+
+    // Settling the hold invoice
+    let preimage = order.preimage.as_ref().unwrap();
+    ln_client.settle_hold_invoice(preimage).await?;
+    info!("{action}: Order Id {}: hold invoice settled", order.id);
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    update_order_event(pool, client, my_keys, status, order, None).await?;
 
     Ok(())
 }

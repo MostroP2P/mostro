@@ -244,7 +244,6 @@ pub async fn update_user_reputation_action(
             reputation.as_json().unwrap(),
             order.id,
             my_keys,
-            client,
             pool,
         )
         .await?;

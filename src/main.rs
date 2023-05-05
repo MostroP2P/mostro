@@ -9,12 +9,19 @@ pub mod scheduler;
 pub mod util;
 
 use crate::app::run;
-
 use anyhow::Result;
 use dotenvy::dotenv;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use tokio::sync::Mutex;
+
+#[macro_use]
+extern crate lazy_static;
+
+lazy_static! {
+    static ref RATE_EVENT_LIST: Mutex<Vec<Event>> = Mutex::new(vec![]);
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {

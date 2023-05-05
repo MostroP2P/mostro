@@ -1,6 +1,7 @@
 use crate::db::{edit_buyer_pubkey_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
+use crate::RATE_EVENT_LIST;
 use anyhow::Result;
 use mostro_core::Status;
 use std::error::Error;
@@ -123,9 +124,37 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     })
     .unwrap();
 
+    let job_update_rate_events = Job::new_async("0 0 * * * *", move |uuid, mut l| {
+        Box::pin(async move {
+            // Connect to relays
+            let client = crate::util::connect_nostr().await.unwrap();
+
+            info!("I run async every hour - update rate event of users",);
+
+            for ev in RATE_EVENT_LIST.lock().await.iter() {
+                // Send event to relay
+                match client.send_event(ev.clone()).await {
+                    Ok(id) => {
+                        info!("Updated rate event with id {:?}", id)
+                    }
+                    Err(e) => {
+                        info!("Error on updating rate event {:?}", e.to_string())
+                    }
+                }
+            }
+            let next_tick = l.next_tick_for_job(uuid).await;
+            match next_tick {
+                Ok(Some(ts)) => info!("Next time for 1 hour is {:?}", ts),
+                _ => warn!("Could not get next tick for job"),
+            }
+        })
+    })
+    .unwrap();
+
     // Add the task to the scheduler
     sched.add(job_older_orders_1m).await?;
     sched.add(job_remove_pending_orders).await?;
+    sched.add(job_update_rate_events).await?;
 
     Ok(())
 }

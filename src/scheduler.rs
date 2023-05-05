@@ -142,6 +142,9 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     }
                 }
             }
+            // Clear list
+            RATE_EVENT_LIST.lock().await.clear();
+
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
                 Ok(Some(ts)) => info!("Next time for 1 hour is {:?}", ts),

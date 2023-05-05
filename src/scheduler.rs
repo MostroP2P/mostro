@@ -8,6 +8,7 @@ use std::error::Error;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+use std::env::var;
 
 pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -67,6 +68,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
             let client = crate::util::connect_nostr().await;
             let keys = crate::util::get_keys();
             let mut ln_client = LndConnector::new().await;
+            let exp_seconds = var("EXP_SECONDS").unwrap().parse::<u64>().unwrap() / 60;
 
 
             info!("I run async every minute id {:?} - check for order to republish for late actions", uuid);
@@ -106,7 +108,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     keys.as_ref().unwrap(),
                             Status::Pending,
                                 &order,
-                                 None)
+                                 Some(updated_order_amount))
                                 .await.unwrap();
                     info!(
                         "Canceled order Id {} republishing order not received regular invoice in time",
@@ -117,7 +119,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
             }
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
-                Ok(Some(ts)) => info!("Next time for 15 minutes is {:?}", ts),
+                Ok(Some(ts)) => info!("Checking orders stuck for more than {} minutes - next check is at {:?}",exp_seconds.to_string(), ts ),
                 _ => warn!("Could not get next tick for job"),
             }
         })

@@ -515,3 +515,28 @@ pub async fn update_order_seller_dispute(
 
     Ok(rows_affected > 0)
 }
+
+pub async fn update_order_created_time(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    created_at: i64,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let created_at = Timestamp::now();
+
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            seller_dispute = ?1
+            WHERE id = ?2
+        "#,
+        seller_dispute,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}

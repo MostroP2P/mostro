@@ -1,14 +1,18 @@
-use crate::db::{edit_buyer_pubkey_order, update_order_to_initial_state};
+use crate::db::{
+    edit_buyer_pubkey_order, edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order,
+    edit_seller_pubkey_order, update_order_to_initial_state,
+};
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 use crate::RATE_EVENT_LIST;
 use anyhow::Result;
 use mostro_core::Status;
+use std::env::var;
 use std::error::Error;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
-use std::env::var;
+use nostr_sdk::Timestamp;
 
 pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -31,10 +35,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
             let client = crate::util::connect_nostr().await;
             let keys = crate::util::get_keys();
 
-            info!(
-                "I run async every minute id {:?} - check older orders and mark them Expired",
-                uuid
-            );
+            info!("Check older orders and mark them Expired - check is done every minute");
 
             let older_orders_list = crate::db::find_order_by_date(pool.as_ref().unwrap()).await;
 
@@ -68,12 +69,16 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
             let client = crate::util::connect_nostr().await;
             let keys = crate::util::get_keys();
             let mut ln_client = LndConnector::new().await;
-            let exp_seconds = var("EXP_SECONDS").unwrap().parse::<u64>().unwrap() / 60;
+            let exp_seconds = var("EXP_SECONDS").unwrap().parse::<u64>().unwrap_or(900) / 60;
 
-
-            info!("I run async every minute id {:?} - check for order to republish for late actions", uuid);
+            info!("Check for order to republish for late actions of users");
 
             let older_orders_list = crate::db::find_order_by_seconds(pool.as_ref().unwrap()).await;
+
+            // for or in older_orders_list.unwrap().into_iter(){
+            //     let a = serde_json::to_string(&or).unwrap();
+            //     println!("{:?}", a);
+            // }
 
             for order in older_orders_list.unwrap().into_iter() {
                 // Check if order is a sell order and Buyer is not sending the invoice for too much time.
@@ -94,11 +99,43 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                         updated_order_amount = 0;
                         updated_order_fee = 0;
                     }
-                    // Reset buyer pubkey to none
-                    edit_buyer_pubkey_order(pool.as_ref().unwrap(),
-                         order.id,
-                         None)
-                         .await.unwrap();
+
+                    let mut new_status = Status::Pending;
+                    let created_at = Timestamp::now();
+
+                    if order.status == "WaitingBuyerInvoice" {
+                        if order.kind == "Sell"{
+                            // Reset buyer pubkey to none
+                            edit_buyer_pubkey_order(pool.as_ref().unwrap(),
+                                order.id,
+                                None)
+                                .await.unwrap();
+                            edit_master_buyer_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            new_status = if !order.price_from_api { Status::Canceled } else { Status::Pending };
+                        }
+                        if order.kind == "Buy"{
+                            edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            new_status = Status::Canceled;
+                        };
+                    };
+
+                    if order.status == "WaitingPayment" {
+                        if order.kind == "Sell"{
+                            edit_buyer_pubkey_order(pool.as_ref().unwrap(),
+                            order.id,
+                            None)
+                            .await.unwrap();
+                            edit_master_buyer_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            new_status = Status::Canceled;
+                        };
+
+                        if order.kind == "Buy"{
+                            edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                        };
+                    }
+
                     update_order_to_initial_state(pool.as_ref().unwrap(),
                          order.id,
                          updated_order_amount,
@@ -106,7 +143,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     update_order_event(pool.as_ref().unwrap(),
                     client.as_ref().unwrap(),
                     keys.as_ref().unwrap(),
-                            Status::Pending,
+                    new_status,
                                 &order,
                                  Some(updated_order_amount))
                                 .await.unwrap();

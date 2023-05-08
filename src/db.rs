@@ -326,6 +326,27 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     Ok(order)
 }
 
+pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let exp_seconds = var("EXP_SECONDS")
+        .expect("EXP_SECONDS is not set")
+        .as_str()
+        .parse::<u64>()
+        .unwrap();
+    let expire_time = Timestamp::now() - exp_seconds;
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE taken_at < ?1 AND ( status == 'WaitingBuyerInvoice' OR status == 'WaitingPayment' )
+        "#,
+    )
+    .bind(expire_time.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
+}
+
 pub async fn update_order_to_initial_state(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -486,6 +507,27 @@ pub async fn update_order_seller_dispute(
             WHERE id = ?2
         "#,
         seller_dispute,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let taken_at = 0;
+
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            taken_at = ?1
+            WHERE id = ?2
+        "#,
+        taken_at,
         order_id,
     )
     .execute(&mut conn)

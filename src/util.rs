@@ -2,8 +2,7 @@ use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
-use crate::{db, flow};
-
+use crate::{db, flow, RATE_EVENT_LIST};
 use anyhow::{Context, Ok, Result};
 use dotenvy::var;
 use log::{error, info};
@@ -126,7 +125,6 @@ pub async fn update_user_rating_event(
     reputation: String,
     order_id: Uuid,
     keys: &Keys,
-    client: &Client,
     pool: &SqlitePool,
 ) -> Result<()> {
     // let reputation = reput
@@ -143,11 +141,10 @@ pub async fn update_user_rating_event(
         crate::db::update_order_event_seller_rate(pool, order_id, seller_sent_rate).await?;
     }
 
-    // Send event to relay
-    client.send_event(event).await.map(|_s| ()).map_err(|err| {
-        error!("{}", err);
-        err.into()
-    })
+    // Add event message to global list
+    RATE_EVENT_LIST.lock().await.push(event);
+
+    Ok(())
 }
 
 pub async fn update_order_event(

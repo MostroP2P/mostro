@@ -182,7 +182,6 @@ pub async fn update_order_event(
     info!("Sending replaceable event: {event:#?}");
     // We update the order id with the new event_id
     crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, amount).await?;
-    crate::db::update_order_taken_at_time(pool, order.id, Timestamp::now().as_i64()).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order.id, status_str
@@ -390,13 +389,12 @@ pub async fn settle_seller_hold_invoice(
     is_admin: bool,
     order: &Order,
 ) -> Result<()> {
-    let mut pubkey = String::new();
     // It can be settle only by a seller or by admin
-    if is_admin {
-        pubkey = my_keys.public_key().to_bech32()?;
+    let pubkey = if is_admin {
+        my_keys.public_key().to_bech32()?
     } else {
-        pubkey = order.seller_pubkey.as_ref().unwrap().to_string();
-    }
+        order.seller_pubkey.as_ref().unwrap().to_string()
+    };
     // Check if the pubkey is right
     if event.pubkey.to_bech32()? != pubkey {
         // We create a Message

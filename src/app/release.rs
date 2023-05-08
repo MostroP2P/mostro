@@ -34,7 +34,7 @@ pub async fn release_action(
     let action = Action::Release;
 
     settle_seller_hold_invoice(
-        event, my_keys, client, pool, ln_client, status, action, true, &order,
+        event, my_keys, client, pool, ln_client, status, action, false, &order,
     )
     .await?;
 

@@ -88,6 +88,10 @@ pub async fn hold_invoice_paid(hash: &str) {
     crate::util::update_order_event(&pool, &client, &my_keys, status, &order, None)
         .await
         .unwrap();
+    // Update the invoice_held_at field
+    crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_i64())
+        .await
+        .unwrap();
 }
 
 pub async fn hold_invoice_settlement(hash: &str) {

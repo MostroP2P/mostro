@@ -128,9 +128,6 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                         info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                     }
 
-                    // Reset taken_at time
-                    reset_order_taken_at_time(pool.as_ref().unwrap(), order.id).await.unwrap();
-
                     update_order_to_initial_state(pool.as_ref().unwrap(),
                          order.id,
                          updated_order_amount,

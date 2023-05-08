@@ -79,7 +79,7 @@ pub async fn take_buy_action(
 
     // Timestamp order take time
     if order.taken_at == 0 {
-        order.taken_at = Timestamp::now().as_i64()
+        crate::db::update_order_taken_at_time(pool, order.id, Timestamp::now().as_i64()).await?;
     }
 
     // Check market price value in sats - if order was with market price then calculate

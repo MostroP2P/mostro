@@ -108,6 +108,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                             edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
                             new_status = Status::Canceled;
                         };
+                        info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                     };
 
                     if order.status == "WaitingPayment" {
@@ -124,6 +125,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                             edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
                             edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
                         };
+                        info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                     }
 
                     // Reset taken_at time

@@ -182,6 +182,7 @@ pub async fn update_order_event(
     info!("Sending replaceable event: {event:#?}");
     // We update the order id with the new event_id
     crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, amount).await?;
+    crate::db::update_order_taken_at_time(pool, order.id, Timestamp::now().as_i64()).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order.id, status_str

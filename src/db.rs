@@ -516,6 +516,29 @@ pub async fn update_order_seller_dispute(
     Ok(rows_affected > 0)
 }
 
+pub async fn update_order_taken_at_time(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    taken_at: i64,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            taken_at = ?1
+            WHERE id = ?2
+        "#,
+        taken_at,
+        order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
 pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let taken_at = 0;

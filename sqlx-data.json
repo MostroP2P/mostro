@@ -110,6 +110,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            taken_at = ?6,\n            invoice_held_at = ?7\n            WHERE id = ?8\n        "
   },
+  "b047209f67b1c1fad80c1d812c0ad0fa4116d16175fa2569962cd13c0ca05ac3": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            invoice_held_at = ?1\n            WHERE id = ?2\n        "
+  },
   "bc86a8ab2ce2b27ca5d1dde6b5622c7f00ee761fe5b475bda0e9145093fc2810": {
     "describe": {
       "columns": [],

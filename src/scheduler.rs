@@ -91,6 +91,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                         updated_order_fee = 0;
                     }
 
+                    // Initialize reset status to pending, change in case of specifici needs of order
                     let mut new_status = Status::Pending;
 
                     if order.status == "WaitingBuyerInvoice" {
@@ -101,7 +102,6 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                                 None)
                                 .await.unwrap();
                             edit_master_buyer_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
-                            new_status = if !order.price_from_api { Status::Canceled } else { Status::Pending };
                         }
                         if order.kind == "Buy"{
                             edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();

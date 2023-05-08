@@ -337,7 +337,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
         r#"
           SELECT *
           FROM orders
-          WHERE created_at < ?1 AND ( status == 'WaitingBuyerInvoice' OR status == 'WaitingPayment' )
+          WHERE taken_at < ?1 AND ( status == 'WaitingBuyerInvoice' OR status == 'WaitingPayment' )
         "#,
     )
     .bind(expire_time.to_string())
@@ -516,22 +516,18 @@ pub async fn update_order_seller_dispute(
     Ok(rows_affected > 0)
 }
 
-pub async fn update_order_created_time(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    created_at: i64,
-) -> anyhow::Result<bool> {
+pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
-    let created_at = Timestamp::now();
+    let taken_at = 0;
 
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
             SET
-            seller_dispute = ?1
+            taken_at = ?1
             WHERE id = ?2
         "#,
-        seller_dispute,
+        taken_at,
         order_id,
     )
     .execute(&mut conn)

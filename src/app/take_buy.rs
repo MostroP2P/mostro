@@ -76,6 +76,12 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
+
+    // Timestamp order take time
+    if order.taken_at == 0 {
+        order.taken_at = Timestamp::now().as_i64()
+    }
+
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         order.amount =

@@ -1,7 +1,4 @@
-use crate::db::{
-    edit_buyer_pubkey_order, edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order,
-    edit_seller_pubkey_order, update_order_to_initial_state,
-};
+use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 use crate::RATE_EVENT_LIST;
@@ -12,7 +9,6 @@ use std::error::Error;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
-use nostr_sdk::Timestamp;
 
 pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -75,11 +71,6 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
 
             let older_orders_list = crate::db::find_order_by_seconds(pool.as_ref().unwrap()).await;
 
-            // for or in older_orders_list.unwrap().into_iter(){
-            //     let a = serde_json::to_string(&or).unwrap();
-            //     println!("{:?}", a);
-            // }
-
             for order in older_orders_list.unwrap().into_iter() {
                 // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                 // Same if seller is not paying hold invoice
@@ -101,7 +92,6 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     }
 
                     let mut new_status = Status::Pending;
-                    let created_at = Timestamp::now();
 
                     if order.status == "WaitingBuyerInvoice" {
                         if order.kind == "Sell"{
@@ -135,6 +125,9 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                             edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
                         };
                     }
+
+                    // Reset taken_at time
+                    reset_order_taken_at_time(pool.as_ref().unwrap(), order.id).await.unwrap();
 
                     update_order_to_initial_state(pool.as_ref().unwrap(),
                          order.id,

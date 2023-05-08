@@ -108,6 +108,10 @@ pub async fn take_sell_action(
     let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
     // Add buyer pubkey to order
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;
+    // Timestamp take order time
+    if order.taken_at == 0 {
+        order.taken_at = Timestamp::now().as_i64()
+    }
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
         order.amount =

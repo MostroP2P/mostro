@@ -1,4 +1,6 @@
 pub mod invoice;
+use std::cmp::Ordering;
+
 use crate::lightning::invoice::decode_invoice;
 
 use anyhow::Result;
@@ -161,6 +163,19 @@ impl LndConnector {
         let payment_hash = payment_hash.to_vec();
         let hash = payment_hash.to_hex();
 
+        // We need to set a max fee amount
+        // If the amount is small we use a different max routing fee
+        let max_fee = match amount.cmp(&100) {
+            Ordering::Less | Ordering::Equal => amount as f64 * 0.1,
+            Ordering::Greater => {
+                amount as f64
+                    * var("MAX_ROUTING_FEE")
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap_or(0.001)
+            }
+        };
+
         let track_payment_req = TrackPaymentRequest {
             payment_hash,
             no_inflight_updates: true,
@@ -182,6 +197,7 @@ impl LndConnector {
         let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
             timeout_seconds: 60,
+            fee_limit_sat: max_fee as i64,
             ..Default::default()
         };
 

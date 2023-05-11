@@ -36,10 +36,6 @@ pub async fn take_buy_action(
         return Ok(());
     }
 
-    // We update the master pubkey
-    edit_master_seller_pubkey_order(pool, order.id, msg.pubkey).await?;
-    let seller_pubkey = event.pubkey;
-
     if order.kind != "Buy" {
         error!("TakeBuy: Order Id {order_id} wrong kind");
         return Ok(());
@@ -52,6 +48,24 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
+    let buyer_pubkey = match order.buyer_pubkey.as_ref() {
+        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+        None => {
+            error!("TakeBuy: Buyer pubkey not found for order {}!", order.id);
+            return Ok(());
+        }
+    };
+    if buyer_pubkey == event.pubkey {
+        // We create a Message
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = message.as_json().unwrap();
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+    // We update the master pubkey
+    edit_master_seller_pubkey_order(pool, order.id, msg.pubkey).await?;
+    let seller_pubkey = event.pubkey;
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
@@ -69,13 +83,6 @@ pub async fn take_buy_action(
 
         return Ok(());
     }
-    let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
-        None => {
-            error!("TakeBuy: Buyer pubkey not found for order {}!", order.id);
-            return Ok(());
-        }
-    };
 
     // Timestamp order take time
     if order.taken_at == 0 {

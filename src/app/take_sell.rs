@@ -42,8 +42,6 @@ pub async fn take_sell_action(
 
         return Ok(());
     }
-    // We update the master pubkey
-    edit_master_buyer_pubkey_order(pool, order.id, msg.pubkey.clone()).await?;
 
     let buyer_pubkey = event.pubkey;
     let pr: Option<String>;
@@ -105,6 +103,16 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
+    if seller_pubkey == event.pubkey {
+        // We create a Message
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
+    // We update the master pubkey
+    edit_master_buyer_pubkey_order(pool, order.id, msg.pubkey.clone()).await?;
     let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
     // Add buyer pubkey to order
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;

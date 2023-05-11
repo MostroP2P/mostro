@@ -28,11 +28,7 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     };
-    if order.kind != "Buy" {
-        error!("AddInvoice: Order Id {order_id} wrong kind");
-        return Ok(());
-    }
-    let buyer_pubkey = event.pubkey;
+
     let pr: String;
     // If a buyer sent me a lightning invoice we get it
     if let Some(payment_request) = msg.get_payment_request() {
@@ -54,7 +50,7 @@ pub async fn add_invoice_action(
                         Some(Content::TextMessage(e.to_string())),
                     );
                     let message = message.as_json()?;
-                    send_dm(client, my_keys, &buyer_pubkey, message).await?;
+                    send_dm(client, my_keys, &event.pubkey, message).await?;
                     error!("{e}");
                     return Ok(());
                 }
@@ -74,6 +70,22 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     };
+    let buyer_pubkey = match order.buyer_pubkey.as_ref() {
+        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+        None => {
+            error!("TakeBuy: Buyer pubkey not found for order {}!", order.id);
+            return Ok(());
+        }
+    };
+    // Only the buyer can add an invoice
+    if buyer_pubkey != event.pubkey {
+        // We create a Message
+        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = message.as_json().unwrap();
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     match order_status {
         Status::WaitingBuyerInvoice => {}

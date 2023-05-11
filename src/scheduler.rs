@@ -23,25 +23,26 @@ pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
 }
 
 pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
-    let job_older_orders_1m = Job::new_async("0 * * * * *", move |uuid, mut l| {
+    // This job find older Pending orders and mark them Expired
+    let job_expire_pending_older_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
         Box::pin(async move {
             info!("Create a pool to connect to db");
-            let pool = crate::db::connect().await;
+            let pool = crate::db::connect().await.unwrap();
             // Connect to relays
-            let client = crate::util::connect_nostr().await;
-            let keys = crate::util::get_keys();
+            let client = crate::util::connect_nostr().await.unwrap();
+            let keys = crate::util::get_keys().unwrap();
 
             info!("Check older orders and mark them Expired - check is done every minute");
 
-            let older_orders_list = crate::db::find_order_by_date(pool.as_ref().unwrap()).await;
+            let older_orders_list = crate::db::find_order_by_date(&pool).await;
 
             for order in older_orders_list.unwrap().iter() {
                 println!("Uid {} - created at {}", order.id, order.created_at);
                 // We update the order id with the new event_id
                 let _res = crate::util::update_order_event(
-                    pool.as_ref().unwrap(),
-                    client.as_ref().unwrap(),
-                    keys.as_ref().unwrap(),
+                    &pool,
+                    &client,
+                    &keys,
                     mostro_core::Status::Expired,
                     order,
                     None,
@@ -57,19 +58,20 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     })
     .unwrap();
 
-    let job_remove_pending_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
+    // This job is used to cancel or republish pending orders that are not updated for more than EXP_SECONDS seconds
+    let job_cancel_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
         Box::pin(async move {
             info!("Create a pool to connect to db");
-            let pool = crate::db::connect().await;
+            let pool = crate::db::connect().await.unwrap();
             // Connect to relays
-            let client = crate::util::connect_nostr().await;
-            let keys = crate::util::get_keys();
+            let client = crate::util::connect_nostr().await.unwrap();
+            let keys = crate::util::get_keys().unwrap();
             let mut ln_client = LndConnector::new().await;
             let exp_seconds = var("EXP_SECONDS").unwrap().parse::<u64>().unwrap_or(900) / 60;
 
             info!("Check for order to republish for late actions of users");
 
-            let older_orders_list = crate::db::find_order_by_seconds(pool.as_ref().unwrap()).await;
+            let older_orders_list = crate::db::find_order_by_seconds(&pool).await;
 
             for order in older_orders_list.unwrap().into_iter() {
                 // Check if order is a sell order and Buyer is not sending the invoice for too much time.
@@ -97,15 +99,15 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
                     if order.status == "WaitingBuyerInvoice" {
                         if order.kind == "Sell"{
                             // Reset buyer pubkey to none
-                            edit_buyer_pubkey_order(pool.as_ref().unwrap(),
+                            edit_buyer_pubkey_order(&pool,
                                 order.id,
                                 None)
                                 .await.unwrap();
-                            edit_master_buyer_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
                         }
                         if order.kind == "Buy"{
-                            edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
-                            edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                            edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
                             new_status = Status::Canceled;
                         };
                         info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
@@ -113,36 +115,40 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
 
                     if order.status == "WaitingPayment" {
                         if order.kind == "Sell"{
-                            edit_buyer_pubkey_order(pool.as_ref().unwrap(),
+                            edit_buyer_pubkey_order(&pool,
                             order.id,
                             None)
                             .await.unwrap();
-                            edit_master_buyer_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
                             new_status = Status::Canceled;
                         };
 
                         if order.kind == "Buy"{
-                            edit_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
-                            edit_master_seller_pubkey_order(pool.as_ref().unwrap(), order.id, None).await.unwrap();
+                            edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                            edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
                         };
                         info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                     }
-
-                    update_order_to_initial_state(pool.as_ref().unwrap(),
-                         order.id,
-                         updated_order_amount,
-                         updated_order_fee).await.unwrap();
-                    update_order_event(pool.as_ref().unwrap(),
-                    client.as_ref().unwrap(),
-                    keys.as_ref().unwrap(),
-                    new_status,
-                                &order,
-                                 Some(updated_order_amount))
-                                .await.unwrap();
-                    info!(
-                        "Canceled order Id {} republishing order not received regular invoice in time",
-                         order.id
-                    );
+                    if new_status == Status::Pending {
+                        update_order_to_initial_state(&pool,order.id,updated_order_amount,updated_order_fee).await.unwrap();
+                        info!(
+                            "Republishing order Id {}, not received regular invoice in time",
+                             order.id
+                        );
+                    } else {
+                        info!(
+                            "Canceled order Id {}, not received regular invoice in time",
+                             order.id
+                        );
+                    }
+                    update_order_event(
+                        &pool,
+                        &client,
+                        &keys,
+                        new_status,
+                        &order,
+                        Some(updated_order_amount)
+                    ).await.unwrap();
                 }
 
             }
@@ -186,8 +192,8 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     .unwrap();
 
     // Add the task to the scheduler
-    sched.add(job_older_orders_1m).await?;
-    sched.add(job_remove_pending_orders).await?;
+    sched.add(job_expire_pending_older_orders).await?;
+    sched.add(job_cancel_orders).await?;
     sched.add(job_update_rate_events).await?;
 
     Ok(())

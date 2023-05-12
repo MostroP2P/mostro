@@ -6,7 +6,7 @@ use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 use anyhow::Result;
 use log::error;
 use mostro_core::order::Order;
-use mostro_core::{Action, Message, Status};
+use mostro_core::{Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -55,7 +55,7 @@ pub async fn take_sell_action(
         };
 
         // Verify if invoice is valid
-        match is_valid_invoice(&payment_request, order_amount) {
+        match is_valid_invoice(&payment_request, order_amount, Some(order.fee as u64)) {
             Ok(_) => {}
             Err(e) => match e {
                 MostroError::ParsingInvoiceError
@@ -63,7 +63,16 @@ pub async fn take_sell_action(
                 | MostroError::MinExpirationTimeError
                 | MostroError::WrongAmountError
                 | MostroError::MinAmountError => {
-                    send_dm(client, my_keys, &buyer_pubkey, e.to_string()).await?;
+                    // We create a Message
+                    let message = Message::new(
+                        0,
+                        Some(order.id),
+                        None,
+                        Action::CantDo,
+                        Some(Content::TextMessage(e.to_string())),
+                    );
+                    let message = message.as_json()?;
+                    send_dm(client, my_keys, &buyer_pubkey, message).await?;
                     error!("{e}");
                     return Ok(());
                 }
@@ -82,7 +91,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
-    // Buyer can take pending orders only
+    // Buyer can take Pending or WaitingBuyerInvoice orders only
     match order_status {
         Status::Pending | Status::WaitingBuyerInvoice => {}
         _ => {
@@ -122,8 +131,7 @@ pub async fn take_sell_action(
     }
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
-        order.amount =
-            set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
+        set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
     } else {
         show_hold_invoice(
             pool,

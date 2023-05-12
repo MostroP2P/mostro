@@ -1,4 +1,5 @@
 use crate::util::send_dm;
+use dotenvy::var;
 use log::info;
 use mostro_core::{order::SmallOrder, Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
@@ -24,7 +25,7 @@ pub async fn hold_invoice_paid(hash: &str) {
     }
 
     // We send this data related to the order to the parties
-    let order_data = SmallOrder::new(
+    let mut order_data = SmallOrder::new(
         order.id,
         order.amount,
         order.fiat_code.clone(),
@@ -63,6 +64,9 @@ pub async fn hold_invoice_paid(hash: &str) {
             .unwrap();
         status = Status::Active;
     } else {
+        let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
+        let new_amount = order_data.amount as f64 - (buyer_fee * order_data.amount as f64);
+        order_data.amount = new_amount as i64;
         // We ask to buyer for a new invoice
         let message = Message::new(
             0,

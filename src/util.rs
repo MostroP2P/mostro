@@ -223,7 +223,7 @@ pub async fn show_hold_invoice(
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
     // Add fee of seller to hold invoice
-    let seller_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.03) / 2.0;
+    let seller_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
     let seller_total_amout = (seller_fee * order.amount as f64) + order.amount as f64;
 
     // Now we generate the hold invoice that seller should pay
@@ -323,7 +323,7 @@ pub async fn set_market_order_sats_amount(
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
 
     // Add fee of seller to hold invoice
-    let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.03) / 2.0;
+    let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
     let buyer_total_amout = new_sats_amout as f64 - (buyer_fee * new_sats_amout as f64);
 
     // We send this data related to the order to the parties

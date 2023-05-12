@@ -33,7 +33,11 @@ pub async fn add_invoice_action(
     // If a buyer sent me a lightning invoice we get it
     if let Some(payment_request) = msg.get_payment_request() {
         // Verify if invoice is valid
-        match is_valid_invoice(&payment_request, Some(order.amount as u64)) {
+        match is_valid_invoice(
+            &payment_request,
+            Some(order.amount as u64),
+            Some(order.fee as u64),
+        ) {
             Ok(_) => {}
             Err(e) => match e {
                 MostroError::ParsingInvoiceError

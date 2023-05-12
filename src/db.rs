@@ -208,17 +208,23 @@ pub async fn update_order_event_id_status(
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
+    // We calculate the bot fee
+    let fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
+    let fee = fee * amount as f64;
+
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
             SET
             status = ?1,
             amount = ?2,
-            event_id = ?3
-            WHERE id = ?4
+            fee = ?3,
+            event_id = ?4
+            WHERE id = ?5
         "#,
         status,
         amount,
+        fee,
         event_id,
         order_id,
     )

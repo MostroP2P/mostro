@@ -10,16 +10,6 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
-  "0f0f1e46225de7a094cc1450847078c0c1d5070e8af44e1961172dc2d28e3380": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 4
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            event_id = ?3\n            WHERE id = ?4\n        "
-  },
   "1a4f24e4d6c6447e7f6b9c7207bd12bc23e87f37d2c8676bffd8f4eb86c31405": {
     "describe": {
       "columns": [],
@@ -149,5 +139,15 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            seller_pubkey = ?1\n            WHERE id = ?2\n        "
+  },
+  "f7e4e95f502724efa0a7b67e3d69fb77c84c141ab9482a99ff254f0964b6eff2": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 5
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            event_id = ?4\n            WHERE id = ?5\n        "
   }
 }

@@ -222,6 +222,10 @@ pub async fn show_hold_invoice(
     order: &Order,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
+    // Add fee of seller to hold invoice
+    let seller_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
+    let seller_total_amout = (seller_fee * order.amount as f64) + order.amount as f64;
+
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
         .create_hold_invoice(
@@ -231,7 +235,7 @@ pub async fn show_hold_invoice(
                 &order.fiat_code,
                 &order.fiat_amount.to_string(),
             )?,
-            order.amount,
+            seller_total_amout as i64,
         )
         .await?;
     if let Some(invoice) = payment_request {
@@ -317,10 +321,15 @@ pub async fn set_market_order_sats_amount(
     // Update amount order
     let new_sats_amout =
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
+
+    // Add fee of seller to hold invoice
+    let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
+    let buyer_total_amout = new_sats_amout as f64 - (buyer_fee * new_sats_amout as f64);
+
     // We send this data related to the order to the parties
     let order_data = SmallOrder::new(
         order.id,
-        new_sats_amout,
+        buyer_total_amout as i64,
         order.fiat_code.clone(),
         order.fiat_amount,
         order.payment_method.clone(),
@@ -341,7 +350,7 @@ pub async fn set_market_order_sats_amount(
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
     // Update order with new sats value
-    order.amount = new_sats_amout;
+    order.amount = buyer_total_amout as i64;
     update_order_event(
         pool,
         client,

@@ -48,6 +48,7 @@ pub async fn publish_order(
     new_order: &NewOrder,
     initiator_pubkey: &str,
     master_pubkey: &str,
+    ack_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
     let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
     let order_id = order.id;
@@ -87,6 +88,19 @@ pub async fn publish_order(
         order.amount,
     )
     .await?;
+
+    // Send message as ack with small order
+    let ack_message = Message::new(
+        0,
+        order.id,
+        None,
+        Action::Order,
+        Some(Content::Order(order.clone())),
+    );
+    let ack_message = ack_message.as_json()?;
+
+    send_dm(client, keys, &ack_pubkey, ack_message).await?;
+
     client
         .send_event(event)
         .await

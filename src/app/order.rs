@@ -34,6 +34,7 @@ pub async fn order_action(
             order,
             &initiator_ephemeral_pubkey,
             master_pubkey,
+            event.pubkey,
         )
         .await?;
     }

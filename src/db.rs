@@ -209,8 +209,9 @@ pub async fn update_order_event_id_status(
     let mut conn = pool.acquire().await?;
     let status = status.to_string();
     // We calculate the bot fee
-    let fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
-    let fee = fee * amount as f64;
+    let fee = var("FEE").unwrap().parse::<f32>().unwrap() / 2.0;
+    let fee = fee * amount as f32;
+    let fee = fee.round() as i64;
 
     let rows_affected = sqlx::query!(
         r#"

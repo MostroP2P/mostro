@@ -357,7 +357,7 @@ pub async fn set_market_order_sats_amount(
         0,
         Some(order.id),
         None,
-        Action::TakeSell,
+        Action::AddInvoice,
         Some(Content::SmallOrder(order_data)),
     );
     let message = message.as_json()?;

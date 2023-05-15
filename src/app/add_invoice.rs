@@ -1,7 +1,7 @@
 use crate::db::edit_buyer_invoice_order;
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::send_dm;
+use crate::util::{send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
@@ -109,50 +109,63 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     }
-
-    // We send this data related to the order to the parties
-    let order_data = SmallOrder::new(
-        order.id,
-        order.amount,
-        order.fiat_code.clone(),
-        order.fiat_amount,
-        pr.clone(),
-        order.premium,
-        order.buyer_pubkey.as_ref().cloned(),
-        order.seller_pubkey.as_ref().cloned(),
-    );
-    // We send a confirmation message to seller
-    let message = Message::new(
-        0,
-        Some(order.id),
-        None,
-        Action::BuyerTookOrder,
-        Some(Content::SmallOrder(order_data.clone())),
-    );
-    let message = message.as_json().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
-    send_dm(client, my_keys, &seller_pubkey, message).await?;
-    // We send a message to buyer saying seller paid
-    let message = Message::new(
-        0,
-        Some(order.id),
-        None,
-        Action::HoldInvoicePaymentAccepted,
-        Some(Content::SmallOrder(order_data)),
-    );
-    let message = message.as_json().unwrap();
-    send_dm(client, my_keys, &buyer_pubkey, message)
-        .await
-        .unwrap();
-
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
-        .await
-        .unwrap();
-    // Finally we save the invoice on db
+    // We save the invoice on db
     edit_buyer_invoice_order(pool, order.id, &pr).await?;
+    if order.preimage.is_some() {
+        // We send this data related to the order to the parties
+        let order_data = SmallOrder::new(
+            order.id,
+            order.amount,
+            order.fiat_code.clone(),
+            order.fiat_amount,
+            pr.clone(),
+            order.premium,
+            order.buyer_pubkey.as_ref().cloned(),
+            order.seller_pubkey.as_ref().cloned(),
+        );
+        // We send a confirmation message to seller
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::BuyerTookOrder,
+            Some(Content::SmallOrder(order_data.clone())),
+        );
+        let message = message.as_json().unwrap();
+
+        send_dm(client, my_keys, &seller_pubkey, message).await?;
+        // We send a message to buyer saying seller paid
+        let message = Message::new(
+            0,
+            Some(order.id),
+            None,
+            Action::HoldInvoicePaymentAccepted,
+            Some(Content::SmallOrder(order_data)),
+        );
+        let message = message.as_json().unwrap();
+        send_dm(client, my_keys, &buyer_pubkey, message)
+            .await
+            .unwrap();
+
+        // We publish a new replaceable kind nostr event with the status updated
+        // and update on local database the status and new event id
+        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
+            .await
+            .unwrap();
+    } else {
+        show_hold_invoice(
+            pool,
+            client,
+            my_keys,
+            None,
+            &buyer_pubkey,
+            &seller_pubkey,
+            &order,
+        )
+        .await?;
+    }
 
     Ok(())
 }

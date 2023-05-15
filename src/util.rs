@@ -311,6 +311,7 @@ pub async fn show_hold_invoice(
     Ok(())
 }
 
+/// Set market order sats amount, this used when a buyer take a sell order
 pub async fn set_market_order_sats_amount(
     order: &mut Order,
     buyer_pubkey: XOnlyPublicKey,
@@ -324,12 +325,12 @@ pub async fn set_market_order_sats_amount(
 
     // We calculate the bot fee
     let fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
-    let buyer_total_amount = new_sats_amount as f64 - (fee * new_sats_amount as f64);
+    let buyer_final_amount = new_sats_amount as f64 - (fee * new_sats_amount as f64);
 
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         order.id,
-        buyer_total_amount as i64,
+        buyer_final_amount as i64,
         order.fiat_code.clone(),
         order.fiat_amount,
         order.payment_method.clone(),
@@ -350,7 +351,7 @@ pub async fn set_market_order_sats_amount(
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
     // Update order with new sats value
-    order.amount = buyer_total_amount as i64;
+    order.amount = new_sats_amount;
     update_order_event(
         pool,
         client,

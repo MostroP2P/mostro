@@ -3,7 +3,7 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::{db, flow, RATE_EVENT_LIST};
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
@@ -13,17 +13,18 @@ use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
+use std::thread;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use uuid::Uuid;
 
-pub async fn retries_yadio_request(req_string : &String) -> Result<reqwest::Response> {
+pub async fn retries_yadio_request(req_string: &String) -> Result<reqwest::Response> {
     let res = reqwest::get(req_string)
         .await
         .context("Something went wrong with API request, try again!")?;
-        // .json::<Yadio>()
-        // .await
-        // .context("Wrong JSON parse of the answer, check the currency");
+    // .json::<Yadio>()
+    // .await
+    // .context("Wrong JSON parse of the answer, check the currency");
 
     Ok(res)
 }
@@ -32,29 +33,35 @@ pub async fn retries_yadio_request(req_string : &String) -> Result<reqwest::Resp
 pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
     // Add here check for market price
     let req_string = format!(
-        "https://api.yadio.io/convert/{}/{}/BTC",
+        "https://api.yadio1.io/convert/{}/{}/BTC",
         fiat_amount, fiat_code
     );
 
-    let req;
+    let mut req = None;
     // Retry for 4 times
     for retries_num in 1..=4 {
-        match retries_yadio_request(&req_string).await{
-            Ok(response)=> {
-                req = response;
+        match retries_yadio_request(&req_string).await {
+            Ok(response) => {
+                req = Some(response);
                 break;
-            },
-            Err(e) => {
-                println!("Retrying request Yadio - {} - Error : {}",retries_num,e);
-                if retries_num == 4
-                {
-                    return Err(e)
-                }
-            },
+            }
+            Err(_e) => {
+                println!(
+                    "API price request failed retrying - {} tentatives left.",
+                    (4 - retries_num)
+                );
+                thread::sleep(std::time::Duration::from_secs(2));
+            }
         };
-    };
+    }
 
-    let quote = req.json::<Yadio>().await?;
+    // Case no answers from Yadio
+    if req.is_none() {
+        println!("Send dm to user to signal no API response");
+        return Err(Error::msg("Send dm to user to signal no API response"));
+    }
+
+    let quote = req.unwrap().json::<Yadio>().await?;
 
     let mut sats = quote.result * 100_000_000_f64;
 

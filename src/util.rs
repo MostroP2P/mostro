@@ -3,7 +3,7 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::{db, flow, RATE_EVENT_LIST};
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
@@ -17,6 +17,17 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use uuid::Uuid;
 
+pub async fn retries_yadio_request(req_string : &String) -> Result<reqwest::Response> {
+    let res = reqwest::get(req_string)
+        .await
+        .context("Something went wrong with API request, try again!")?;
+        // .json::<Yadio>()
+        // .await
+        // .context("Wrong JSON parse of the answer, check the currency");
+
+    Ok(res)
+}
+
 /// Request market quote from Yadio to have sats amount at actual market price
 pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
     // Add here check for market price
@@ -24,14 +35,28 @@ pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64)
         "https://api.yadio.io/convert/{}/{}/BTC",
         fiat_amount, fiat_code
     );
-    let req = reqwest::get(req_string)
-        .await
-        .context("Something went wrong with API request, try again!")?
-        .json::<Yadio>()
-        .await
-        .context("Wrong JSON parse of the answer, check the currency")?;
 
-    let mut sats = req.result * 100_000_000_f64;
+    let req;
+    // Retry for 4 times
+    for retries_num in 1..=4 {
+        match retries_yadio_request(&req_string).await{
+            Ok(response)=> {
+                req = response;
+                break;
+            },
+            Err(e) => {
+                println!("Retrying request Yadio - {} - Error : {}",retries_num,e);
+                if retries_num == 4
+                {
+                    return Err(e)
+                }
+            },
+        };
+    };
+
+    let quote = req.json::<Yadio>().await?;
+
+    let mut sats = quote.result * 100_000_000_f64;
 
     // Added premium value to have correct sats value
     if *premium != 0 {

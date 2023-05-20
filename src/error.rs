@@ -8,6 +8,7 @@ pub enum MostroError {
     MinExpirationTimeError,
     MinAmountError,
     WrongAmountError,
+    NoAPIResponse,
 }
 
 impl std::error::Error for MostroError {}
@@ -21,6 +22,7 @@ impl fmt::Display for MostroError {
             MostroError::MinExpirationTimeError => write!(f, "Minimal expiration time on invoice"),
             MostroError::MinAmountError => write!(f, "Minimal payment amount"),
             MostroError::WrongAmountError => write!(f, "The amount on this invoice is wrong"),
+            MostroError::NoAPIResponse => write!(f, "Price API not answered - retry"),
         }
     }
 }
@@ -40,5 +42,11 @@ impl From<lightning_invoice::ParseOrSemanticError> for MostroError {
 impl From<std::num::ParseIntError> for MostroError {
     fn from(_: std::num::ParseIntError) -> Self {
         MostroError::ParsingNumberError
+    }
+}
+
+impl From<reqwest::Error> for MostroError {
+    fn from(_: reqwest::Error) -> Self {
+        MostroError::NoAPIResponse
     }
 }

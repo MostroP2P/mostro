@@ -1,9 +1,10 @@
+use crate::error::MostroError;
 use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::{db, flow, RATE_EVENT_LIST};
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
 use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
@@ -13,25 +14,58 @@ use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
+use std::thread;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use uuid::Uuid;
 
+pub async fn retries_yadio_request(req_string: &String) -> Result<reqwest::Response> {
+    let res = reqwest::get(req_string)
+        .await
+        .context("Something went wrong with API request, try again!")?;
+
+    Ok(res)
+}
+
 /// Request market quote from Yadio to have sats amount at actual market price
-pub async fn get_market_quote(fiat_amount: &i64, fiat_code: &str, premium: &i64) -> Result<i64> {
+pub async fn get_market_quote(
+    fiat_amount: &i64,
+    fiat_code: &str,
+    premium: &i64,
+) -> Result<i64, MostroError> {
     // Add here check for market price
     let req_string = format!(
         "https://api.yadio.io/convert/{}/{}/BTC",
         fiat_amount, fiat_code
     );
-    let req = reqwest::get(req_string)
-        .await
-        .context("Something went wrong with API request, try again!")?
-        .json::<Yadio>()
-        .await
-        .context("Wrong JSON parse of the answer, check the currency")?;
 
-    let mut sats = req.result * 100_000_000_f64;
+    let mut req = None;
+    // Retry for 4 times
+    for retries_num in 1..=4 {
+        match retries_yadio_request(&req_string).await {
+            Ok(response) => {
+                req = Some(response);
+                break;
+            }
+            Err(_e) => {
+                println!(
+                    "API price request failed retrying - {} tentatives left.",
+                    (4 - retries_num)
+                );
+                thread::sleep(std::time::Duration::from_secs(2));
+            }
+        };
+    }
+
+    // Case no answers from Yadio
+    if req.is_none() {
+        println!("Send dm to user to signal no API response");
+        return Err(MostroError::NoAPIResponse);
+    }
+
+    let quote = req.unwrap().json::<Yadio>().await?;
+
+    let mut sats = quote.result * 100_000_000_f64;
 
     // Added premium value to have correct sats value
     if *premium != 0 {
@@ -238,7 +272,11 @@ pub async fn show_hold_invoice(
     let mut ln_client = lightning::LndConnector::new().await;
     // Add fee of seller to hold invoice
     let seller_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
-    let seller_total_amount = (seller_fee * order.amount as f64) + order.amount as f64;
+    let add_fee = seller_fee * order.amount as f64;
+    let rounded_fee = add_fee.round();
+    let new_amount = order.amount + rounded_fee as i64;
+
+    let seller_total_amount = new_amount;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -339,7 +377,10 @@ pub async fn set_market_order_sats_amount(
 
     // We calculate the bot fee
     let fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
-    let buyer_final_amount = new_sats_amount as f64 - (fee * new_sats_amount as f64);
+    let sub_fee = fee * new_sats_amount as f64;
+    let rounded_fee = sub_fee.round();
+
+    let buyer_final_amount = new_sats_amount - rounded_fee as i64;
 
     // We send this data related to the buyer
     let order_data = SmallOrder::new(

@@ -65,8 +65,11 @@ pub async fn hold_invoice_paid(hash: &str) {
         status = Status::Active;
     } else {
         let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
-        let new_amount = order_data.amount as f64 - (buyer_fee * order_data.amount as f64);
-        order_data.amount = new_amount as i64;
+        let sub_fee = buyer_fee * order_data.amount as f64;
+        let rounded_fee = sub_fee.round();
+        let new_amount = order_data.amount - rounded_fee as i64;
+        order_data.amount = new_amount;
+
         // We ask to buyer for a new invoice
         let message = Message::new(
             0,

@@ -108,7 +108,9 @@ pub async fn publish_order(
     // This tag (nip33) allows us to change this event in particular in the future
     let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
-    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[d_tag])
+    // This tag helps client to subscribe to sell/buy order type notifications
+    let k_tag = Tag::Generic(TagKind::Custom("k".to_string()), vec![order.kind.to_string()]);
+    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[d_tag,k_tag])
         .to_event(keys)
         .unwrap();
     let event_id = event.id.to_string();

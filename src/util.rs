@@ -109,10 +109,22 @@ pub async fn publish_order(
     let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
     // This tag helps client to subscribe to sell/buy order type notifications
-    let k_tag = Tag::Generic(TagKind::Custom("k".to_string()), vec![order.kind.to_string()]);
-    let event = EventBuilder::new(Kind::Custom(event_kind as u64), &order_string, &[d_tag,k_tag])
-        .to_event(keys)
-        .unwrap();
+    let k_tag = Tag::Generic(
+        TagKind::Custom("k".to_string()),
+        vec![order.kind.to_string()],
+    );
+    // This tag helps client to subscribe to fiat(shit) coin name
+    let f_tag = Tag::Generic(
+        TagKind::Custom("f".to_string()),
+        vec![order.fiat_code.clone()],
+    );
+    let event = EventBuilder::new(
+        Kind::Custom(event_kind as u64),
+        &order_string,
+        &[d_tag, k_tag, f_tag],
+    )
+    .to_event(keys)
+    .unwrap();
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id

@@ -78,8 +78,10 @@ pub async fn get_nip_33_event(
 
     info!("Message sent : {:?}", msg);
 
+    let wait_time = Duration::from_secs(0);
+
     // Send msg to relay
-    relay.send_msg(msg.clone(), false).await.unwrap();
+    relay.send_msg(msg.clone(), Some(wait_time)).await.unwrap();
 
     // Wait notification from relays
     let mut notifications = client.notifications();
@@ -107,8 +109,10 @@ pub async fn get_nip_33_event(
         }
     }
 
+    let wait_time = Duration::from_secs(0);
+
     // Unsubscribe
-    relay.send_msg(ClientMessage::close(id), false).await.ok()?;
+    relay.send_msg(msg.clone(), Some(wait_time)).await.unwrap();
 
     ev
 }

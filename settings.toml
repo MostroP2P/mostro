@@ -1,0 +1,34 @@
+[lightning]
+# path to tls.cert file
+lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
+# path to macaroon file
+lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
+lnd_grpc_port = 10001
+lnd_grpc_host = '127.0.0.1'
+# lightning invoice expiration time in seconds
+invoice_expiration_window = 3600
+# Hold invoice cltv delta (expiration time in blocks)
+hold_invoice_cltv_delta = 144
+# lightning hold invoice expiration time in seconds
+hold_invoice_expiration_window = 300
+
+[nostr]
+nsec_privkey = 'nsec1...'
+relays = ['ws://localhost:7000']
+
+[mostro]
+# Mostro Fee
+fee = 0
+# Max routing fee that we want to pay to the network, 0.001 = 0.1%
+max_routing_fee = 0.001
+# Max order amount (sats)
+max_order_amount = 1000000
+# Minimum amount for a payment in satoshis
+min_payment_amount = 100
+# Expiration order hours
+expiration_hours = 24
+# Expiration of pending orders
+expiration_seconds = 900
+
+[database]
+url = "sqlite://mostro.db"

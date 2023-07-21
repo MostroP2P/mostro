@@ -1,10 +1,11 @@
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::settings::Settings;
 use crate::util::update_order_event;
 use crate::RATE_EVENT_LIST;
+
 use anyhow::Result;
 use mostro_core::Status;
-use std::env::var;
 use std::error::Error;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn, Level};
@@ -67,7 +68,8 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
             let client = crate::util::connect_nostr().await.unwrap();
             let keys = crate::util::get_keys().unwrap();
             let mut ln_client = LndConnector::new().await;
-            let exp_seconds = var("EXP_SECONDS").unwrap().parse::<u64>().unwrap_or(900) / 60;
+            let mostro_settings = Settings::get_mostro().unwrap();
+            let exp_seconds = mostro_settings.expiration_seconds;
 
             info!("Check for order to republish for late actions of users");
 

@@ -1,7 +1,8 @@
 use crate::error::MostroError;
+use crate::settings::Settings;
+
 use chrono::prelude::*;
 use chrono::Duration;
-use dotenvy::var;
 use lightning_invoice::{Invoice, SignedRawInvoice};
 use std::str::FromStr;
 
@@ -19,9 +20,8 @@ pub fn is_valid_invoice(
     fee: Option<u64>,
 ) -> Result<Invoice, MostroError> {
     let invoice = Invoice::from_str(payment_request)?;
-    let min_payment_amount = var("MIN_PAYMENT_AMT")
-        .expect("MIN_PAYMENT_AMT is not set")
-        .parse::<u64>()?;
+    let mostro_settings = Settings::get_mostro().unwrap();
+    let ln_settings = Settings::get_ln().unwrap();
 
     let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);
@@ -31,7 +31,7 @@ pub fn is_valid_invoice(
             return Err(MostroError::WrongAmountError);
         }
     }
-    if amount_msat > 0 && amount_msat < min_payment_amount {
+    if amount_msat > 0 && amount_msat < mostro_settings.min_payment_amount as u64 {
         return Err(MostroError::MinAmountError);
     }
     if invoice.is_expired() {
@@ -41,9 +41,7 @@ pub fn is_valid_invoice(
 
     let (parsed_invoice, _, _) = parsed.into_parts();
 
-    let expiration_window = var("INVOICE_EXPIRATION_WINDOW")
-        .expect("INVOICE_EXPIRATION_WINDOW is not set")
-        .parse::<i64>()?;
+    let expiration_window = ln_settings.invoice_expiration_window as i64;
     let latest_date = Utc::now() + Duration::seconds(expiration_window);
     let latest_date = latest_date.timestamp() as u64;
     let expires_at =

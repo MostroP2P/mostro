@@ -2,9 +2,9 @@ pub mod invoice;
 use std::cmp::Ordering;
 
 use crate::lightning::invoice::decode_invoice;
+use crate::settings::Settings;
 
 use anyhow::Result;
-use dotenvy::var;
 use easy_hasher::easy_hasher::*;
 use log::info;
 use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
@@ -35,18 +35,17 @@ pub struct PaymentMessage {
 
 impl LndConnector {
     pub async fn new() -> Self {
-        let port: u32 = var("LND_GRPC_PORT")
-            .expect("LND_GRPC_PORT must be set")
-            .parse()
-            .expect("port is not u32");
-        let host = var("LND_GRPC_HOST").expect("LND_GRPC_HOST must be set");
-        let tls_path = var("LND_CERT_FILE").expect("LND_CERT_FILE must be set");
-        let macaroon_path = var("LND_MACAROON_FILE").expect("LND_MACAROON_FILE must be set");
+        let ln_settings = Settings::get_ln().unwrap();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
-        let client = tonic_openssl_lnd::connect(host, port, tls_path, macaroon_path)
-            .await
-            .expect("Failed connecting to LND");
+        let client = tonic_openssl_lnd::connect(
+            ln_settings.lnd_grpc_host,
+            ln_settings.lnd_grpc_port,
+            ln_settings.lnd_cert_file,
+            ln_settings.lnd_macaroon_file,
+        )
+        .await
+        .expect("Failed connecting to LND");
 
         Self { client }
     }
@@ -59,10 +58,8 @@ impl LndConnector {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
-        let cltv_expiry: u64 = var("HOLD_INVOICE_CLTV_DELTA")
-            .expect("HOLD_INVOICE_CLTV_DELTA must be set")
-            .parse()
-            .expect("cltv delta is not i64");
+        let ln_settings = Settings::get_ln().unwrap();
+        let cltv_expiry = ln_settings.hold_invoice_cltv_delta as u64;
 
         let invoice = AddHoldInvoiceRequest {
             hash: hash.to_vec(),
@@ -162,18 +159,13 @@ impl LndConnector {
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
         let hash = payment_hash.to_hex();
+        let mostro_settings = Settings::get_mostro().unwrap();
 
         // We need to set a max fee amount
         // If the amount is small we use a different max routing fee
         let max_fee = match amount.cmp(&100) {
             Ordering::Less | Ordering::Equal => amount as f64 * 0.1,
-            Ordering::Greater => {
-                amount as f64
-                    * var("MAX_ROUTING_FEE")
-                        .unwrap()
-                        .parse::<f64>()
-                        .unwrap_or(0.001)
-            }
+            Ordering::Greater => amount as f64 * mostro_settings.max_routing_fee,
         };
 
         let track_payment_req = TrackPaymentRequest {

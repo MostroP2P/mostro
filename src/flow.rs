@@ -1,5 +1,6 @@
+use crate::settings::Settings;
 use crate::util::send_dm;
-use dotenvy::var;
+
 use log::info;
 use mostro_core::{order::SmallOrder, Action, Content, Message, Status};
 use nostr_sdk::prelude::*;
@@ -64,8 +65,8 @@ pub async fn hold_invoice_paid(hash: &str) {
             .unwrap();
         status = Status::Active;
     } else {
-        let buyer_fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
-        let sub_fee = buyer_fee * order_data.amount as f64;
+        let mostro_settings = Settings::get_mostro().unwrap();
+        let sub_fee = mostro_settings.fee * order_data.amount as f64;
         let rounded_fee = sub_fee.round();
         let new_amount = order_data.amount - rounded_fee as i64;
         order_data.amount = new_amount;

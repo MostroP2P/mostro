@@ -6,12 +6,11 @@ pub mod lightning;
 pub mod messages;
 pub mod models;
 pub mod scheduler;
+pub mod settings;
 pub mod util;
 
 use crate::app::run;
-use crate::util::check_env_vars;
 use anyhow::Result;
-use dotenvy::dotenv;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
@@ -26,8 +25,6 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
-    check_env_vars()?;
     pretty_env_logger::init();
     // Connect to database
     let pool = db::connect().await?;
@@ -35,7 +32,7 @@ async fn main() -> Result<()> {
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 
-    println!("pub {}", my_keys.public_key().to_bech32().unwrap());
+    // println!("pub {}", my_keys.public_key().to_bech32().unwrap());
 
     let subscription = Filter::new()
         .pubkey(my_keys.public_key())
@@ -52,10 +49,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use dotenvy::dotenv;
     use mostro_core::order::NewOrder;
     use mostro_core::Message;
-    use std::env::var;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -84,12 +79,7 @@ mod tests {
 
     #[test]
     fn test_fee_rounding() {
-        dotenv().ok();
-        let fee = var("FEE")
-            .unwrap_or(0.003.to_string())
-            .parse::<f64>()
-            .unwrap_or(0.003)
-            / 2.0;
+        let fee = 0.003 / 2.0;
 
         let mut amt = SystemTime::now()
             .duration_since(UNIX_EPOCH)

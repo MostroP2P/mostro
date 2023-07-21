@@ -3,9 +3,10 @@ use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
+use crate::settings::Settings;
 use crate::{db, flow, RATE_EVENT_LIST};
+
 use anyhow::{Context, Result};
-use dotenvy::var;
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
 use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
@@ -172,9 +173,9 @@ pub async fn send_dm(
 }
 
 pub fn get_keys() -> Result<Keys> {
+    let nostr_settings = Settings::get_nostr()?;
     // nostr private key
-    let nsec1privkey = var("NSEC_PRIVKEY").expect("NSEC_PRIVKEY is not set");
-    let my_keys = Keys::from_sk_str(&nsec1privkey)?;
+    let my_keys = Keys::from_sk_str(&nostr_settings.nsec_privkey)?;
 
     Ok(my_keys)
 }
@@ -257,11 +258,10 @@ pub async fn update_order_event(
 
 pub async fn connect_nostr() -> Result<Client> {
     let my_keys = crate::util::get_keys()?;
-
+    let nostr_settings = Settings::get_nostr()?;
     // Create new client
     let client = Client::new(&my_keys);
-    let relays = var("RELAYS").expect("RELAYS is not set");
-    let relays = relays.split(',').collect::<Vec<&str>>();
+    let relays = nostr_settings.relays;
 
     // Add relays
     for r in relays.into_iter() {
@@ -284,12 +284,12 @@ pub async fn show_hold_invoice(
     order: &Order,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
+    let mostro_settings = Settings::get_mostro()?;
     // Add fee of seller to hold invoice
-    let seller_fee = var("FEE").unwrap().parse::<f64>().unwrap_or(0.003) / 2.0;
+    let seller_fee = mostro_settings.fee / 2.0;
     let add_fee = seller_fee * order.amount as f64;
     let rounded_fee = add_fee.round();
     let new_amount = order.amount + rounded_fee as i64;
-
     let seller_total_amount = new_amount;
 
     // Now we generate the hold invoice that seller should pay
@@ -301,7 +301,7 @@ pub async fn show_hold_invoice(
                 &order.fiat_code,
                 &order.fiat_amount.to_string(),
             )?,
-            seller_total_amount as i64,
+            seller_total_amount,
         )
         .await?;
     if let Some(invoice) = payment_request {
@@ -385,12 +385,13 @@ pub async fn set_market_order_sats_amount(
     pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
+    let mostro_settings = Settings::get_mostro()?;
     // Update amount order
     let new_sats_amount =
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
 
     // We calculate the bot fee
-    let fee = var("FEE").unwrap().parse::<f64>().unwrap() / 2.0;
+    let fee = mostro_settings.fee / 2.0;
     let sub_fee = fee * new_sats_amount as f64;
     let rounded_fee = sub_fee.round();
 
@@ -494,57 +495,6 @@ pub async fn settle_seller_hold_invoice(
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     update_order_event(pool, client, my_keys, status, order, None).await?;
-
-    Ok(())
-}
-
-pub fn check_env_vars() -> Result<()> {
-    // Mandatory env vars
-    let _ = var("NSEC_PRIVKEY")
-        .context("Missing NSEC_PRIVKEY env variable from env file - add mostro private key")?;
-    let _ = var("RELAYS")
-        .context("Missing RELAYS env variable from env file - add relay list comma separated")?;
-    let _ = var("DATABASE_URL").context("Missing DATABASE_URL from env file - Add a path")?;
-    let _ = var("LND_CERT_FILE").context("Missing LND_CERT_FILE from env file - Add a path")?;
-    let _ =
-        var("LND_MACAROON_FILE").context("Missing LND_MACAROON_FILE from env file - Add a path")?;
-    let _ = var("LND_GRPC_PORT")
-        .context("Missing LND_GRPC_PORT from env file - Add port value")?
-        .parse::<u64>()
-        .context("Error parsing LND_GRPC_PORT")?;
-    let _ = var("LND_GRPC_HOST").context("Missing LND_GRPC_HOST from env file - set host value")?;
-    let _ = var("INVOICE_EXPIRATION_WINDOW")
-        .context("Missing INVOICE_EXPIRATION_WINDOW from env file - Add expiration value")?
-        .parse::<u64>()
-        .context("Error parsing INVOICE_EXPIRATION_WINDOW")?;
-    let _ = var("HOLD_INVOICE_CLTV_DELTA")
-        .context("Missing HOLD_INVOICE_CLTV_DELTA from env file - Add cltv invoice value")?
-        .parse::<u64>()
-        .context("Error parsing HOLD_INVOICE_CLTV_DELTA")?;
-    let _ = var("MIN_PAYMENT_AMT")
-        .context("Missing MIN_PAYMENT_AMT from env file - Add min payment value")?
-        .parse::<u64>()
-        .context("Error parsing MIN_PAYMENT_AMT")?;
-    let _ = var("EXP_SECONDS")
-        .context("Missing EXP_SECONDS from env file - Add expiration invoice seconds value")?
-        .parse::<u64>()
-        .context("Error parsing EXP_SECONDS")?;
-    let _ = var("EXP_HOURS")
-        .context("Missing EXP_HOURS from env file - Add expiration order hours value")?
-        .parse::<u64>()
-        .context("Error parsing EXP_HOURS")?;
-    let _ = var("MAX_ROUTING_FEE")
-        .context("Missing MAX_ROUTING_FEE from env file - Add routing fees value")?
-        .parse::<f64>()
-        .context("Error parsing MAX_ROUTING_FEE")?;
-    let _ = var("FEE")
-        .context("Missing FEE from env file - Add mostro fees value")?
-        .parse::<f64>()
-        .context("Error parsing FEE")?;
-    let _ = var("MAX_ORDER_AMOUNT")
-        .context("Missing MAX_ORDER_AMOUNT from env file - Limit publish orders to a max amount")?
-        .parse::<f64>()
-        .context("Error parsing MAX_ORDER_AMOUNT")?;
 
     Ok(())
 }

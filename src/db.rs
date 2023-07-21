@@ -1,4 +1,5 @@
-use dotenvy::var;
+use mostro_core::order::{NewOrder, Order};
+use mostro_core::{Kind, Status};
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -6,11 +7,11 @@ use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use mostro_core::order::{NewOrder, Order};
-use mostro_core::{Kind, Status};
+use crate::settings::Settings;
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
-    let db_url = var("DATABASE_URL").expect("DATABASE_URL is not set");
+    let db_settings = Settings::get_db().unwrap();
+    let db_url = db_settings.url;
     if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
         panic!("Not database found, please create a new one first!");
     }
@@ -207,10 +208,11 @@ pub async fn update_order_event_id_status(
     amount: i64,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
+    let mostro_settings = Settings::get_mostro()?;
     let status = status.to_string();
     // We calculate the bot fee
-    let fee = var("FEE").unwrap().parse::<f32>().unwrap() / 2.0;
-    let fee = fee * amount as f32;
+    let fee = mostro_settings.fee / 2.0;
+    let fee = fee * amount as f64;
     let fee = fee.round() as i64;
 
     let rows_affected = sqlx::query!(
@@ -313,11 +315,8 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
 }
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let exp_hours = var("EXP_HOURS")
-        .expect("EXP_HOURS is not set")
-        .as_str()
-        .parse::<u64>()
-        .unwrap();
+    let mostro_settings = Settings::get_mostro()?;
+    let exp_hours = mostro_settings.expiration_hours as u64;
     let expire_time = Timestamp::now() - (3600 * exp_hours);
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -334,11 +333,8 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
 }
 
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let exp_seconds = var("EXP_SECONDS")
-        .expect("EXP_SECONDS is not set")
-        .as_str()
-        .parse::<u64>()
-        .unwrap();
+    let mostro_settings = Settings::get_mostro()?;
+    let exp_seconds = mostro_settings.expiration_seconds as u64;
     let expire_time = Timestamp::now() - exp_seconds;
     let order = sqlx::query_as::<_, Order>(
         r#"

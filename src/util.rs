@@ -400,7 +400,7 @@ pub async fn set_market_order_sats_amount(
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         order.id,
-        buyer_final_amount as i64,
+        buyer_final_amount,
         order.fiat_code.clone(),
         order.fiat_amount,
         order.payment_method.clone(),

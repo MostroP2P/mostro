@@ -1,8 +1,8 @@
 [lightning]
 # path to tls.cert file
-lnd_cert_file = '/home/grunch/.polar/networks/1/volumes/lnd/alice/tls.cert'
+lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
 # path to macaroon file
-lnd_macaroon_file = '/home/grunch/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
+lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
 lnd_grpc_port = 10001
 lnd_grpc_host = '127.0.0.1'
 # lightning invoice expiration time in seconds
@@ -13,7 +13,7 @@ hold_invoice_cltv_delta = 144
 hold_invoice_expiration_window = 300
 
 [nostr]
-nsec_privkey = 'nsec1kxaut9eq22w060dx6kgp4pg755t0plkq09a7twshmhvc0d2kjrxqwc4gpg'
+nsec_privkey = 'nsec1...'
 relays = ['ws://localhost:7000']
 
 [mostro]

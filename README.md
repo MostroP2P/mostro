@@ -66,27 +66,27 @@ $ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 
 ## Install
 
-Clone the repository and then create a new `.env` file based on `.env-sample` file.
+Clone the repository and then create a new `settings.dev.toml` file based on `settings.toml` file.
 
 ```
 $ git clone https://github.com/MostroP2P/mostro.git
 $ cd mostro
-$ cp .env-sample .env
+$ cp settings.toml settings.dev.toml
 ```
 
-To connect with a lnd node we need to set 4 variables in the `.env` file .
+To connect with a lnd node we need to set 4 variables in the `[lightning]` section in `settings.dev.toml` file.
 
-_LND_CERT_FILE:_ LND node TLS certificate file path.
+_lnd_cert_file:_ LND node TLS certificate file path.
 
-_LND_MACAROON_FILE:_ Macaroon file path, the macaroon file contains permission for doing actions on the lnd node.
+_lnd_macaroon_file:_ Macaroon file path, the macaroon file contains permission for doing actions on the lnd node.
 
-_LND_GRPC_HOST:_ IP address or domain name from the LND node, example: `127.0.0.1`.
+_lnd_grpc_host:_ IP address or domain name from the LND node, example: `127.0.0.1`.
 
-_LND_GRPC_PORT:_ LND node port to connect, example: `10009`.
+_lnd_grpc_port:_ LND node port to connect, example: `10009`.
 
 ### Database
 
-The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the env var `DATABASE_URL` on the `.env` file.
+The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.dev.toml` file.
 
 Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
@@ -97,7 +97,7 @@ $ ./init_db.sh
 
 Running it:
 
-Before run it you to set `NSEC_PRIVKEY` with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one, then run it:
+Before run it you to set `nsec_privkey` with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one, then run it:
 
 ```bash
 $ cargo run
@@ -111,6 +111,5 @@ docker compose up -d
 ```
 
 This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
-
 
 So the relay URL you want to connect to is: `ws://localhost:7000`.

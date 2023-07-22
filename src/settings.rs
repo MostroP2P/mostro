@@ -1,7 +1,7 @@
 use anyhow::Error;
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
-
+use std::env;
 #[derive(Debug, Deserialize)]
 pub struct Database {
     pub url: String,
@@ -84,8 +84,10 @@ pub struct Settings {
 
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
+        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
+        let file_name = format!("settings.{}.toml", run_mode);
         let s = Config::builder()
-            .add_source(File::with_name("settings"))
+            .add_source(File::with_name(&file_name).required(true))
             // Add in settings from the environment (with a prefix of APP)
             // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
             .add_source(Environment::with_prefix("app"))

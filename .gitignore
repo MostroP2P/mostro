@@ -9,3 +9,7 @@ mostro.db*
 # IDE's
 .idea
 .vscode
+
+# settings file
+settings.dev.toml
+settings.prod.toml

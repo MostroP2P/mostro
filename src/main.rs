@@ -14,6 +14,8 @@ use anyhow::Result;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use settings::init_default_dir;
+use std::env::args;
 use tokio::sync::Mutex;
 
 #[macro_use]
@@ -27,24 +29,49 @@ lazy_static! {
 async fn main() -> Result<()> {
     pretty_env_logger::init();
     // Connect to database
-    let pool = db::connect().await?;
-    // Connect to relays
-    let client = util::connect_nostr().await?;
-    let my_keys = util::get_keys()?;
+    // let pool = db::connect().await?;
+    // // Connect to relays
+    // let client = util::connect_nostr().await?;
+    // let my_keys = util::get_keys()?;
+    let mut config_path = String::new();
+
+    let args: Vec<String> = args().collect();
+    // Create install path string
+    match args.len() {
+        1 => {
+            // No dir parameter on cli
+            init_default_dir(None, &mut config_path);
+        },
+        2 => {
+            if args[1] == "dir" {
+                init_default_dir(Some(&args[2]), &mut config_path);
+            }
+        },
+        _ => {
+            println!("Can't get what you're sayin! Run mostro or mostro --dir /path/to_config_file")
+        }
+    }
+
+    println!("{:?}", config_path);
+    Ok(())
+
+    //println!("Default dir : {:?}",settings_dir_default);
 
     // println!("pub {}", my_keys.public_key().to_bech32().unwrap());
 
-    let subscription = Filter::new()
-        .pubkey(my_keys.public_key())
-        .since(Timestamp::now());
+    // Ok(())
 
-    client.subscribe(vec![subscription]).await;
-    let mut ln_client = LndConnector::new().await;
+    // let subscription = Filter::new()
+    //     .pubkey(my_keys.public_key())
+    //     .since(Timestamp::now());
 
-    // Start scheduler for tasks
-    start_scheduler().await.unwrap().start().await?;
+    // client.subscribe(vec![subscription]).await;
+    // let mut ln_client = LndConnector::new().await;
 
-    run(my_keys, client, &mut ln_client, pool).await
+    // // Start scheduler for tasks
+    // start_scheduler().await.unwrap().start().await?;
+
+    // run(my_keys, client, &mut ln_client, pool).await
 }
 
 #[cfg(test)]

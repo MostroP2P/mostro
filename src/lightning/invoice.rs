@@ -20,8 +20,8 @@ pub fn is_valid_invoice(
     fee: Option<u64>,
 ) -> Result<Invoice, MostroError> {
     let invoice = Invoice::from_str(payment_request)?;
-    let mostro_settings = Settings::get_mostro().unwrap();
-    let ln_settings = Settings::get_ln().unwrap();
+    let mostro_settings = Settings::get_mostro();
+    let ln_settings = Settings::get_ln();
 
     let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);

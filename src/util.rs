@@ -173,7 +173,7 @@ pub async fn send_dm(
 }
 
 pub fn get_keys() -> Result<Keys> {
-    let nostr_settings = Settings::get_nostr()?;
+    let nostr_settings = Settings::get_nostr();
     // nostr private key
     let my_keys = Keys::from_sk_str(&nostr_settings.nsec_privkey)?;
 
@@ -258,13 +258,13 @@ pub async fn update_order_event(
 
 pub async fn connect_nostr() -> Result<Client> {
     let my_keys = crate::util::get_keys()?;
-    let nostr_settings = Settings::get_nostr()?;
+    let nostr_settings = Settings::get_nostr();
     // Create new client
     let client = Client::new(&my_keys);
-    let relays = nostr_settings.relays;
+    let relays = &nostr_settings.relays;
 
     // Add relays
-    for r in relays.into_iter() {
+    for r in relays.iter() {
         client.add_relay(r, None).await?;
     }
 
@@ -284,7 +284,7 @@ pub async fn show_hold_invoice(
     order: &Order,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
-    let mostro_settings = Settings::get_mostro()?;
+    let mostro_settings = Settings::get_mostro();
     // Add fee of seller to hold invoice
     let seller_fee = mostro_settings.fee / 2.0;
     let add_fee = seller_fee * order.amount as f64;
@@ -385,7 +385,7 @@ pub async fn set_market_order_sats_amount(
     pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
-    let mostro_settings = Settings::get_mostro()?;
+    let mostro_settings = Settings::get_mostro();
     // Update amount order
     let new_sats_amount =
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;

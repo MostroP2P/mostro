@@ -65,7 +65,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             .unwrap();
         status = Status::Active;
     } else {
-        let mostro_settings = Settings::get_mostro().unwrap();
+        let mostro_settings = Settings::get_mostro();
         let sub_fee = mostro_settings.fee * order_data.amount as f64;
         let rounded_fee = sub_fee.round();
         let new_amount = order_data.amount - rounded_fee as i64;

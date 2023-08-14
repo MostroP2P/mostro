@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
 use std::path::PathBuf;
 use std::process;
+use std::os::unix::ffi::OsStrExt;
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Database {
@@ -86,9 +87,19 @@ pub fn init_global_settings(setting: Settings) {
 }
 
 impl Settings {
-    pub fn new(config_path: PathBuf) -> Result<Self, ConfigError> {
+    pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
-        let file_name = format!("{}settings.{}.toml", config_path.display(), run_mode);
+        let file_name = {
+            if config_path.as_os_str().as_bytes().last() != Some(&b'/'){        
+                let tmp = format!("settings.{}.toml", run_mode);
+                config_path.push(tmp);
+                format!("{}",tmp)
+            }
+            else{
+                format!("{}settings.{}.toml", config_path.display(), run_mode)
+            }
+        };
+       
         let s = Config::builder()
             .add_source(File::with_name(&file_name).required(true))
             // Add in settings from the environment (with a prefix of APP)

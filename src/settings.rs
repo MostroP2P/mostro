@@ -1,3 +1,4 @@
+use crate::MOSTRO_CONFIG;
 use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
@@ -5,14 +6,10 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
-lazy_static! {
-    static ref CONFIG_PATH: PathBuf = PathBuf::new();
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Database {
     pub url: String,
 }
@@ -21,13 +18,11 @@ impl TryFrom<Settings> for Database {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        let db_settings = Settings::new()?;
-
-        Ok(db_settings.database)
+        Ok(MOSTRO_CONFIG.lock().unwrap().database.clone())
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Lightning {
     pub lnd_cert_file: String,
     pub lnd_macaroon_file: String,
@@ -42,13 +37,11 @@ impl TryFrom<Settings> for Lightning {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        let ln_settings = Settings::new()?;
-
-        Ok(ln_settings.lightning)
+        Ok(MOSTRO_CONFIG.lock().unwrap().lightning.clone())
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Nostr {
     pub nsec_privkey: String,
     pub relays: Vec<String>,
@@ -58,13 +51,11 @@ impl TryFrom<Settings> for Nostr {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        let nostr_settings = Settings::new()?;
-
-        Ok(nostr_settings.nostr)
+        Ok(MOSTRO_CONFIG.lock().unwrap().nostr.clone())
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Mostro {
     pub fee: f64,
     pub max_routing_fee: f64,
@@ -78,13 +69,11 @@ impl TryFrom<Settings> for Mostro {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        let mostro_settings = Settings::new()?;
-
-        Ok(mostro_settings.mostro)
+        Ok(MOSTRO_CONFIG.lock().unwrap().mostro.clone())
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub database: Database,
     pub nostr: Nostr,
@@ -92,10 +81,14 @@ pub struct Settings {
     pub lightning: Lightning,
 }
 
+pub fn init_global_settings(setting: Settings) {
+    *MOSTRO_CONFIG.lock().unwrap() = setting
+}
+
 impl Settings {
-    pub fn new() -> Result<Self, ConfigError> {
+    pub fn new(config_path: PathBuf) -> Result<Self, ConfigError> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
-        let file_name = format!("settings.{}.toml", run_mode);
+        let file_name = format!("{}settings.{}.toml", config_path.display(), run_mode);
         let s = Config::builder()
             .add_source(File::with_name(&file_name).required(true))
             // Add in settings from the environment (with a prefix of APP)
@@ -107,61 +100,43 @@ impl Settings {
         s.try_deserialize()
     }
 
-    pub fn set_val() -> Result<Self, ConfigError> {
-        // let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
-        let file_name = format!("settings.toml");
-        let s = Config::builder()
-            .add_source(File::with_name(&file_name).required(true))
-            // Add in settings from the environment (with a prefix of APP)
-            // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
-            .set_override("database.config_path", "/.mostro")?
-            .build()?;
-
-        // You can deserialize the entire configuration as
-        s.try_deserialize()
+    pub fn get_ln() -> Lightning {
+        MOSTRO_CONFIG.lock().unwrap().lightning.clone()
     }
 
-    pub fn get_ln() -> Result<Lightning, Error> {
-        let settings = Settings::new()?;
-
-        Ok(settings.lightning)
+    pub fn get_mostro() -> Mostro {
+        MOSTRO_CONFIG.lock().unwrap().mostro.clone()
     }
 
-    pub fn get_mostro() -> Result<Mostro, Error> {
-        let settings = Settings::new()?;
-
-        Ok(settings.mostro)
+    pub fn get_db() -> Database {
+        MOSTRO_CONFIG.lock().unwrap().database.clone()
     }
 
-    pub fn get_db() -> Result<Database, Error> {
-        let settings = Settings::new()?;
-
-        Ok(settings.database)
-    }
-
-    pub fn get_nostr() -> Result<Nostr, Error> {
-        let settings = Settings::new()?;
-
-        Ok(settings.nostr)
+    pub fn get_nostr() -> Nostr {
+        MOSTRO_CONFIG.lock().unwrap().nostr.clone()
     }
 }
 
-pub fn init_default_dir(config_path: Option<&String>, final_path : &mut String) -> Result<()> {
+pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
+    // , final_path : &mut PathBuf) -> Result<()> {
     // Dir prefix
-    let home_dir;
+    let home_dir: OsString;
     // Complete path to file variable
     let mut settings_dir_default = std::path::PathBuf::new();
 
-    if config_path.is_none() {
+    if let Some(path) = config_path {
+        // Os String
+        home_dir = path.to_string().into();
+        // Create default path from custom path
+        settings_dir_default.push(home_dir);
+    } else {
         // Get $HOME from env
-        home_dir = std::env::var("HOME").unwrap();
+        let tmp = std::env::var("HOME").unwrap();
+        // Os String
+        home_dir = tmp.into();
         // Create default path with default .mostro value
         settings_dir_default.push(home_dir);
         settings_dir_default.push(".mostro");
-    } else {
-        home_dir = config_path.unwrap().to_string();
-        // Create default path from custom path
-        settings_dir_default.push(home_dir);
     }
 
     // Check if default folder exists
@@ -187,7 +162,7 @@ pub fn init_default_dir(config_path: Option<&String>, final_path : &mut String) 
         match user_input.to_lowercase().as_str().trim_end() {
             "y" | "" => {
                 fs::create_dir(settings_dir_default.clone())?;
-                println!("Ok you have created the folder for settings file");
+                println!("Ok! You have created the folder for settings file");
                 println!("Copy the settings.toml file with template in {:?} folder than edit field with correct values",settings_dir_default);
                 process::exit(0);
             }
@@ -201,16 +176,7 @@ pub fn init_default_dir(config_path: Option<&String>, final_path : &mut String) 
             }
         };
     } else {
-        // Get kind of config file from .env var
-        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
-        let file_name = format!("settings.{}.toml", run_mode);
-        settings_dir_default.push(file_name);
-        // Check file existence
-        if settings_dir_default.exists() {
-            Ok(settings_dir_default)
-        } else {
-            println!("Settings file is not present in the requested path {:?} check file and copy it inside folder",settings_dir_default);
-            std::process::exit(0)
-        }
+        // Set path
+        Ok(settings_dir_default)
     }
 }

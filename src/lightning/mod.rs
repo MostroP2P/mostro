@@ -7,7 +7,7 @@ use crate::settings::Settings;
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
 use log::info;
-use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
+use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
@@ -158,7 +158,7 @@ impl LndConnector {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
-        let hash = payment_hash.to_hex();
+        let hash = String::from_utf8(payment_hash.clone()).unwrap();
         let mostro_settings = Settings::get_mostro();
 
         // We need to set a max fee amount

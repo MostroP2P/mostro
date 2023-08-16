@@ -6,9 +6,42 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
-use std::path::PathBuf;
-use std::process;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process;
+
+#[cfg(windows)]
+fn has_trailing_slash(p: &Path) -> bool {
+    let last = p.as_os_str().encode_wide().last();
+    last == Some(b'\\' as u16) || last == Some(b'/' as u16)
+}
+#[cfg(unix)]
+fn has_trailing_slash(p: &Path) -> bool {
+    p.as_os_str().as_bytes().last() == Some(&b'/')
+}
+
+fn add_trailing_slash(p: &mut PathBuf) {
+    let fname = p.file_name();
+    let dirname = if let Some(fname) = fname {
+        let mut s = OsString::with_capacity(fname.len() + 1);
+        s.push(fname);
+        if cfg!(windows) {
+            s.push("\\");
+        } else {
+            s.push("/");
+        }
+        s
+    } else {
+        OsString::new()
+    };
+
+    if p.pop() {
+        p.push(dirname);
+    }
+}
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Database {
@@ -90,16 +123,15 @@ impl Settings {
     pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
         let file_name = {
-            if config_path.as_os_str().as_bytes().last() != Some(&b'/'){        
-                let tmp = format!("settings.{}.toml", run_mode);
-                config_path.push(tmp);
-                format!("{}",tmp)
-            }
-            else{
+            if !has_trailing_slash(config_path.as_path()) {
+                add_trailing_slash(&mut config_path);
+                let tmp = format!("{}settings.{}.toml", config_path.display(), run_mode);
+                tmp
+            } else {
                 format!("{}settings.{}.toml", config_path.display(), run_mode)
             }
         };
-       
+
         let s = Config::builder()
             .add_source(File::with_name(&file_name).required(true))
             // Add in settings from the environment (with a prefix of APP)
@@ -156,8 +188,8 @@ pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
     // If settings dir is not existing
     if !folder_default {
         println!(
-            "Creating .mostro default settings dir {:?}",
-            settings_dir_default
+            "Creating .mostro default settings dir {}",
+            settings_dir_default.display()
         );
         print!("Are you sure? (Y/n) > ");
 
@@ -174,7 +206,7 @@ pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
             "y" | "" => {
                 fs::create_dir(settings_dir_default.clone())?;
                 println!("Ok! You have created the folder for settings file");
-                println!("Copy the settings.toml file with template in {:?} folder than edit field with correct values",settings_dir_default);
+                println!("Copy the settings.toml file with template in {} folder than edit field with correct values",settings_dir_default.display());
                 process::exit(0);
             }
             "n" => {

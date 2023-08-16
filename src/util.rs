@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
 use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
-use nostr_sdk::prelude::hex::ToHex;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
@@ -314,8 +313,8 @@ pub async fn show_hold_invoice(
         order.id,
         buyer_pubkey,
         seller_pubkey,
-        &preimage.to_hex(),
-        &hash.to_hex(),
+        std::str::from_utf8(&preimage).unwrap(),
+        std::str::from_utf8(&hash).unwrap(),
     )
     .await?;
     // We need to publish a new event with the new status
@@ -355,17 +354,17 @@ pub async fn show_hold_invoice(
         async move {
             // Receiving msgs from the invoice subscription.
             while let Some(msg) = rx.recv().await {
-                let hash = msg.hash.to_hex();
+                let hash = std::str::from_utf8(&msg.hash).unwrap();
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    flow::hold_invoice_paid(&hash).await;
+                    flow::hold_invoice_paid(hash).await;
                     info!("Invoice with hash {hash} accepted!");
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    flow::hold_invoice_settlement(&hash).await;
+                    flow::hold_invoice_settlement(hash).await;
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    flow::hold_invoice_canceled(&hash).await;
+                    flow::hold_invoice_canceled(hash).await;
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
                 }

@@ -14,6 +14,9 @@ use anyhow::Result;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use settings::Settings;
+use settings::{init_default_dir, init_global_settings};
+use std::{env::args, path::PathBuf};
 use tokio::sync::Mutex;
 
 #[macro_use]
@@ -21,14 +24,40 @@ extern crate lazy_static;
 
 lazy_static! {
     static ref RATE_EVENT_LIST: Mutex<Vec<Event>> = Mutex::new(vec![]);
+    // Global var
+    static ref MOSTRO_CONFIG : std::sync::Mutex<Settings> = std::sync::Mutex::new(Settings { database: Default::default(), nostr: Default::default(), mostro: Default::default(), lightning: Default::default() });
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
+
+    // File settings path
+    let mut config_path = PathBuf::new();
+
+    let args: Vec<String> = args().collect();
+    // Create install path string
+    match args.len() {
+        1 => {
+            // No dir parameter on cli
+            config_path = init_default_dir(None)?;
+        }
+        3 => {
+            if args[1] == "--dir" {
+                config_path = init_default_dir(Some(&args[2]))?;
+            }
+        }
+        _ => {
+            println!("Can't get what you're sayin! Run mostro or mostro --dir /path/to_config_file")
+        }
+    }
+
+    // Create config global var
+    init_global_settings(Settings::new(config_path)?);
+
     // Connect to database
     let pool = db::connect().await?;
-    // Connect to relays
+    // // Connect to relays
     let client = util::connect_nostr().await?;
     let my_keys = util::get_keys()?;
 

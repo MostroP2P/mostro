@@ -15,7 +15,7 @@ pub async fn order_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     if let Some(order) = msg.get_order() {
-        let mostro_settings = Settings::get_mostro()?;
+        let mostro_settings = Settings::get_mostro();
         let quote = get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await?;
         if quote > mostro_settings.max_order_amount as i64 {
             let message = Message::new(0, order.id, None, Action::CantDo, None);

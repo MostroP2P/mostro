@@ -20,8 +20,8 @@ pub fn is_valid_invoice(
     fee: Option<u64>,
 ) -> Result<Invoice, MostroError> {
     let invoice = Invoice::from_str(payment_request)?;
-    let mostro_settings = Settings::get_mostro().unwrap();
-    let ln_settings = Settings::get_ln().unwrap();
+    let mostro_settings = Settings::get_mostro();
+    let ln_settings = Settings::get_ln();
 
     let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);
@@ -56,8 +56,11 @@ pub fn is_valid_invoice(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::env::set_var;
+
     use super::is_valid_invoice;
-    use crate::error::MostroError;
+    use crate::{error::MostroError, settings::{init_global_settings, Settings}};
 
     #[test]
     fn test_wrong_amount_invoice() {
@@ -75,7 +78,10 @@ mod tests {
 
     #[test]
     fn test_min_amount_invoice() {
-        let payment_request = "lnbcrt10n1p3l8ysvpp5scf3rd8e8j2f9k7qktfjmpqr4xazj5dr5ygp84wa22sen3wxcevsdqqcqzpgxqyz5vqsp55wp60pzn4889l56538zt7jcr2sgag4xreen3yuzpudlmac3acqls9qyyssqu8rmewmly2xyuqn03vttwsysnnelr0thjstavk2qu6ygs7ampe08h74u9a7qlkuudagpy6mc06gz6qgmq3x582u54rd8gdx3nfvxmlqqrttwdj";
+        let test_path = PathBuf::from("./");
+        set_var("RUN_MODE", "tpl");
+        init_global_settings(Settings::new(test_path).unwrap());
+        let payment_request = "lnbcrt10n1pjwqagdpp5qwa89czezks35s73fkjspxdssh7h4mmfs4643ey7fgxlng4d3jxqdqqcqzpgxqyz5vqsp5jjlmj6hlq0zxsg5t7n6h6a95ux3ej2w3w2csvdgcpndyvut3aaqs9qyyssqg6py7mmjlcgrscvvq4x3c6kr6f6reqanwkk7rjajm4wepggh4lnku3msrjt3045l0fsl4trh3ctg8ew756wq86mz72mguusey7m0a5qq83t8n6";
         let min_amount_err = is_valid_invoice(payment_request, None, None);
         assert_eq!(Err(MostroError::MinAmountError), min_amount_err);
     }

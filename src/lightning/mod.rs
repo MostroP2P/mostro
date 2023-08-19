@@ -7,7 +7,7 @@ use crate::settings::Settings;
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
 use log::info;
-use nostr_sdk::nostr::hashes::hex::{FromHex, ToHex};
+use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
@@ -35,7 +35,7 @@ pub struct PaymentMessage {
 
 impl LndConnector {
     pub async fn new() -> Self {
-        let ln_settings = Settings::get_ln().unwrap();
+        let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
         let client = tonic_openssl_lnd::connect(
@@ -58,7 +58,7 @@ impl LndConnector {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
-        let ln_settings = Settings::get_ln().unwrap();
+        let ln_settings = Settings::get_ln();
         let cltv_expiry = ln_settings.hold_invoice_cltv_delta as u64;
 
         let invoice = AddHoldInvoiceRequest {
@@ -158,8 +158,8 @@ impl LndConnector {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
-        let hash = payment_hash.to_hex();
-        let mostro_settings = Settings::get_mostro().unwrap();
+        let hash = String::from_utf8(payment_hash.clone()).unwrap();
+        let mostro_settings = Settings::get_mostro();
 
         // We need to set a max fee amount
         // If the amount is small we use a different max routing fee

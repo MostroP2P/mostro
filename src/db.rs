@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::settings::Settings;
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
-    let db_settings = Settings::get_db().unwrap();
+    let db_settings = Settings::get_db();
     let db_url = db_settings.url;
     if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
         panic!("Not database found, please create a new one first!");
@@ -208,7 +208,7 @@ pub async fn update_order_event_id_status(
     amount: i64,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
-    let mostro_settings = Settings::get_mostro()?;
+    let mostro_settings = Settings::get_mostro();
     let status = status.to_string();
     // We calculate the bot fee
     let fee = mostro_settings.fee / 2.0;
@@ -315,7 +315,7 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
 }
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let mostro_settings = Settings::get_mostro()?;
+    let mostro_settings = Settings::get_mostro();
     let exp_hours = mostro_settings.expiration_hours as u64;
     let expire_time = Timestamp::now() - (3600 * exp_hours);
     let order = sqlx::query_as::<_, Order>(
@@ -333,7 +333,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
 }
 
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let mostro_settings = Settings::get_mostro()?;
+    let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
     let expire_time = Timestamp::now() - exp_seconds;
     let order = sqlx::query_as::<_, Order>(

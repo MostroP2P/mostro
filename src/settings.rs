@@ -188,7 +188,7 @@ pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
     // If settings dir is not existing
     if !folder_default {
         println!(
-            "Creating .mostro default settings dir {}",
+            "Creating .mostro default directory {}",
             settings_dir_default.display()
         );
         print!("Are you sure? (Y/n) > ");
@@ -205,16 +205,16 @@ pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
         match user_input.to_lowercase().as_str().trim_end() {
             "y" | "" => {
                 fs::create_dir(settings_dir_default.clone())?;
-                println!("Ok! You have created the folder for settings file");
-                println!("Copy the settings.toml file with template in {} folder than edit field with correct values",settings_dir_default.display());
+                println!("You have created mostro default directory!");
+                println!("Please, copy settings.tpl.toml file in {} folder then edit fields with right values (see README.md)", settings_dir_default.display());
                 process::exit(0);
             }
             "n" => {
-                println!("Ok try again with another folder...");
+                println!("Try again with another folder...");
                 process::exit(0);
             }
             &_ => {
-                println!("Can't get what you're sayin!");
+                println!("Can't get what you're saying!");
                 process::exit(0);
             }
         };

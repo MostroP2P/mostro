@@ -66,7 +66,7 @@ $ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 
 ## Install
 
-Clone the repository and then create a new `settings.dev.toml` file based on `settings.toml` file.
+Clone the repository and then create a new `settings.dev.toml` file based on `settings.tpl.toml` file.
 
 ```
 $ git clone https://github.com/MostroP2P/mostro.git

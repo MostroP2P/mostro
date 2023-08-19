@@ -60,7 +60,7 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     .unwrap();
 
     // This job is used to cancel or republish pending orders that are not updated for more than `expiration_seconds` seconds
-    let job_cancel_orders = Job::new_async("* * * * * *", move |uuid, mut l| {
+    let job_cancel_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
         Box::pin(async move {
             info!("Create a pool to connect to db");
             let pool = crate::db::connect().await.unwrap();

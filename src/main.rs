@@ -16,16 +16,16 @@ use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use settings::Settings;
 use settings::{init_default_dir, init_global_settings};
-use std::{env::args, path::PathBuf};
+use std::{env::args, path::PathBuf, sync::OnceLock};
 use tokio::sync::Mutex;
+
+static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 
 #[macro_use]
 extern crate lazy_static;
 
 lazy_static! {
     static ref RATE_EVENT_LIST: Mutex<Vec<Event>> = Mutex::new(vec![]);
-    // Global var
-    static ref MOSTRO_CONFIG : std::sync::Mutex<Settings> = std::sync::Mutex::new(Settings { database: Default::default(), nostr: Default::default(), mostro: Default::default(), lightning: Default::default() });
 }
 
 #[tokio::main]

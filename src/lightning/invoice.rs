@@ -56,11 +56,14 @@ pub fn is_valid_invoice(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::env::set_var;
+    use std::path::PathBuf;
 
     use super::is_valid_invoice;
-    use crate::{error::MostroError, settings::{init_global_settings, Settings}};
+    use crate::{
+        error::MostroError,
+        settings::{init_global_settings, Settings},
+    };
 
     #[test]
     fn test_wrong_amount_invoice() {

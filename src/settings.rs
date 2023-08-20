@@ -52,7 +52,7 @@ impl TryFrom<Settings> for Database {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        Ok(MOSTRO_CONFIG.lock().unwrap().database.clone())
+        Ok(MOSTRO_CONFIG.get().unwrap().database.clone())
     }
 }
 
@@ -71,7 +71,7 @@ impl TryFrom<Settings> for Lightning {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        Ok(MOSTRO_CONFIG.lock().unwrap().lightning.clone())
+        Ok(MOSTRO_CONFIG.get().unwrap().lightning.clone())
     }
 }
 
@@ -85,7 +85,7 @@ impl TryFrom<Settings> for Nostr {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        Ok(MOSTRO_CONFIG.lock().unwrap().nostr.clone())
+        Ok(MOSTRO_CONFIG.get().unwrap().nostr.clone())
     }
 }
 
@@ -103,7 +103,7 @@ impl TryFrom<Settings> for Mostro {
     type Error = Error;
 
     fn try_from(_: Settings) -> Result<Self, Error> {
-        Ok(MOSTRO_CONFIG.lock().unwrap().mostro.clone())
+        Ok(MOSTRO_CONFIG.get().unwrap().mostro.clone())
     }
 }
 
@@ -115,8 +115,8 @@ pub struct Settings {
     pub lightning: Lightning,
 }
 
-pub fn init_global_settings(setting: Settings) {
-    *MOSTRO_CONFIG.lock().unwrap() = setting
+pub fn init_global_settings(s: Settings) {
+    MOSTRO_CONFIG.set(s).unwrap()
 }
 
 impl Settings {
@@ -137,6 +137,10 @@ impl Settings {
             // Add in settings from the environment (with a prefix of APP)
             // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
             .add_source(Environment::with_prefix("app"))
+            .set_override(
+                "database.url",
+                format!("sqlite://{}", config_path.display()),
+            )?
             .build()?;
 
         // You can deserialize the entire configuration as
@@ -144,19 +148,19 @@ impl Settings {
     }
 
     pub fn get_ln() -> Lightning {
-        MOSTRO_CONFIG.lock().unwrap().lightning.clone()
+        MOSTRO_CONFIG.get().unwrap().lightning.clone()
     }
 
     pub fn get_mostro() -> Mostro {
-        MOSTRO_CONFIG.lock().unwrap().mostro.clone()
+        MOSTRO_CONFIG.get().unwrap().mostro.clone()
     }
 
     pub fn get_db() -> Database {
-        MOSTRO_CONFIG.lock().unwrap().database.clone()
+        MOSTRO_CONFIG.get().unwrap().database.clone()
     }
 
     pub fn get_nostr() -> Nostr {
-        MOSTRO_CONFIG.lock().unwrap().nostr.clone()
+        MOSTRO_CONFIG.get().unwrap().nostr.clone()
     }
 }
 
@@ -206,7 +210,7 @@ pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
             "y" | "" => {
                 fs::create_dir(settings_dir_default.clone())?;
                 println!("You have created mostro default directory!");
-                println!("Please, copy settings.tpl.toml file in {} folder then edit fields with right values (see README.md)", settings_dir_default.display());
+                println!("Please, copy settings.tpl.toml and mostro.db too files in {} folder then edit settings file fields with right values (see README.md)", settings_dir_default.display());
                 process::exit(0);
             }
             "n" => {

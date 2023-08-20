@@ -1,6 +1,6 @@
 #!/bin/sh
 echo "Reading database URL from settings.toml..."
-DATABASE_URL=$(awk -F'"' '/url *= */ {print $2}' settings.toml)
+DATABASE_URL=$(awk -F'"' '/url *= */ {print $2}' settings.tpl.toml)
 export DATABASE_URL
 echo "Database URL is: $DATABASE_URL"
 if ls mostro.db* 1> /dev/null 2>&1; then

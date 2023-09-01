@@ -11,7 +11,8 @@ use crate::settings::Settings;
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let db_settings = Settings::get_db();
-    let db_url = db_settings.url;
+    let mut db_url = db_settings.url;
+    db_url.push_str("mostro.db");
     if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
         panic!("Not database found, please create a new one first!");
     }

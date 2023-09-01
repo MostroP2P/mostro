@@ -52,7 +52,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 
 ## Requirements:
 
-0. You need Rust version 1.64 or higher to compile.
+0. You need Rust version 1.70 or higher to compile.
 1. You will need a lightning network node
 
 ## Install dependencies:

@@ -4,7 +4,7 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::settings::Settings;
-use crate::{db, flow, RATE_EVENT_LIST};
+use crate::{db, flow};
 
 use anyhow::{Context, Result};
 use log::{error, info};
@@ -188,6 +188,7 @@ pub async fn update_user_rating_event(
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
+    rate_list: &mut Vec<Event>,
 ) -> Result<()> {
     // let reputation = reput
     // nip33 kind and d tag
@@ -204,7 +205,7 @@ pub async fn update_user_rating_event(
     }
 
     // Add event message to global list
-    RATE_EVENT_LIST.lock().await.push(event);
+    rate_list.push(event);
 
     Ok(())
 }

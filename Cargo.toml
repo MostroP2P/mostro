@@ -1,6 +1,6 @@
 [package]
 name = "mostro"
-version = "0.7.9"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
@@ -38,5 +38,4 @@ mostro-core = "0.2.7"
 tokio-cron-scheduler = "*"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
-lazy_static = "1.4.0"
 config = "0.13.3"

@@ -2,7 +2,8 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::settings::Settings;
 use crate::util::update_order_event;
-use crate::RATE_EVENT_LIST;
+use crate::CLEAR_USER_VEC;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use mostro_core::Status;
@@ -165,24 +166,10 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
 
     let job_update_rate_events = Job::new_async("0 0 * * * *", move |uuid, mut l| {
         Box::pin(async move {
-            // Connect to relays
-            let client = crate::util::connect_nostr().await.unwrap();
+            info!("I run async every hour - update rate event of users");
 
-            info!("I run async every hour - update rate event of users",);
-
-            for ev in RATE_EVENT_LIST.lock().await.iter() {
-                // Send event to relay
-                match client.send_event(ev.clone()).await {
-                    Ok(id) => {
-                        info!("Updated rate event with id {:?}", id)
-                    }
-                    Err(e) => {
-                        info!("Error on updating rate event {:?}", e.to_string())
-                    }
-                }
-            }
-            // Clear list
-            RATE_EVENT_LIST.lock().await.clear();
+            // Clear list after sending
+            CLEAR_USER_VEC.store(true, Ordering::Relaxed);
 
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {

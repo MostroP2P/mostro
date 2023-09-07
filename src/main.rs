@@ -16,15 +16,17 @@ use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use settings::Settings;
 use settings::{init_default_dir, init_global_settings};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{env::args, path::PathBuf, sync::OnceLock};
+use tokio::sync::Mutex;
 
-static CLEAR_USER_VEC: AtomicBool = AtomicBool::new(false);
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
+
+    let rate_list: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
 
     // File settings path
     let mut config_path = PathBuf::new();
@@ -65,9 +67,13 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await;
 
     // Start scheduler for tasks
-    start_scheduler().await.unwrap().start().await?;
+    start_scheduler(rate_list.clone())
+        .await
+        .unwrap()
+        .start()
+        .await?;
 
-    run(my_keys, client, &mut ln_client, pool).await
+    run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
 }
 
 #[cfg(test)]

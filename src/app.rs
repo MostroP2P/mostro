@@ -22,7 +22,7 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::lightning::LndConnector;
-// use crate::CLEAR_USER_VEC;
+
 use anyhow::Result;
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
@@ -39,15 +39,6 @@ pub async fn run(
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
-
-        // let mut rate_list: Vec<Event> = vec![];
-
-        // Check if we can send user rates updates
-        // if CLEAR_USER_VEC.load(Ordering::Relaxed) {
-        //     send_user_rates(&rate_list, &client).await?;
-        //     CLEAR_USER_VEC.store(false, Ordering::Relaxed);
-        //     rate_list.clear();
-        // }
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event(_, event) = notification {

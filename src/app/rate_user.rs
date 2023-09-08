@@ -260,18 +260,3 @@ pub async fn update_user_reputation_action(
 
     Ok(())
 }
-
-// pub async fn send_user_rates(rate_list: &[Event], client: &Client) -> Result<()> {
-//     for ev in rate_list.iter() {
-//         // Send event to relay
-//         match client.send_event(ev.clone()).await {
-//             Ok(id) => {
-//                 info!("Updated rate event with id {:?}", id)
-//             }
-//             Err(e) => {
-//                 info!("Error on updating rate event {:?}", e.to_string())
-//             }
-//         }
-//     }
-//     Ok(())
-// }

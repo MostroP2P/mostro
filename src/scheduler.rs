@@ -2,29 +2,35 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::settings::Settings;
 use crate::util::update_order_event;
-use crate::CLEAR_USER_VEC;
-use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use mostro_core::Status;
+use nostr_sdk::Event;
 use std::error::Error;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-pub async fn start_scheduler() -> Result<JobScheduler, Box<dyn Error>> {
+pub async fn start_scheduler(
+    rate_list: Arc<Mutex<Vec<Event>>>,
+) -> Result<JobScheduler, Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     info!("Creating scheduler");
     let sched = JobScheduler::new().await?;
-    cron_scheduler(&sched).await?;
+    cron_scheduler(&sched, rate_list).await?;
 
     Ok(sched)
 }
 
-pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
+pub async fn cron_scheduler(
+    sched: &JobScheduler,
+    rate_list: Arc<Mutex<Vec<Event>>>,
+) -> Result<(), anyhow::Error> {
     // This job find older Pending orders and mark them Expired
     let job_expire_pending_older_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
         Box::pin(async move {
@@ -165,11 +171,29 @@ pub async fn cron_scheduler(sched: &JobScheduler) -> Result<(), anyhow::Error> {
     .unwrap();
 
     let job_update_rate_events = Job::new_async("0 0 * * * *", move |uuid, mut l| {
+        // Clone for closure owning with Arc
+        let inner_list = rate_list.clone();
+
         Box::pin(async move {
+            // Connect to relays
+            let client = crate::util::connect_nostr().await.unwrap();
+
             info!("I run async every hour - update rate event of users");
 
-            // Clear list after sending
-            CLEAR_USER_VEC.store(true, Ordering::Relaxed);
+            for ev in inner_list.lock().await.iter() {
+                // Send event to relay
+                match client.send_event(ev.clone()).await {
+                    Ok(id) => {
+                        info!("Updated rate event with id {:?}", id)
+                    }
+                    Err(e) => {
+                        info!("Error on updating rate event {:?}", e.to_string())
+                    }
+                }
+            }
+
+            // Clear list after send events
+            inner_list.lock().await.clear();
 
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {

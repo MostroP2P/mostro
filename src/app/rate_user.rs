@@ -7,7 +7,9 @@ use mostro_core::{Action, Content, Message, Rating};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -140,7 +142,7 @@ pub async fn update_user_reputation_action(
     my_keys: &Keys,
     client: &Client,
     pool: &Pool<Sqlite>,
-    rate_list: &mut Vec<Event>,
+    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     let order_id = msg.order_id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
@@ -256,20 +258,5 @@ pub async fn update_user_reputation_action(
         send_dm(client, my_keys, &event.pubkey, message).await?;
     }
 
-    Ok(())
-}
-
-pub async fn send_user_rates(rate_list: &[Event], client: &Client) -> Result<()> {
-    for ev in rate_list.iter() {
-        // Send event to relay
-        match client.send_event(ev.clone()).await {
-            Ok(id) => {
-                info!("Updated rate event with id {:?}", id)
-            }
-            Err(e) => {
-                info!("Error on updating rate event {:?}", e.to_string())
-            }
-        }
-    }
     Ok(())
 }

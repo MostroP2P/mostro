@@ -14,8 +14,10 @@ use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
+use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use uuid::Uuid;
 
@@ -188,7 +190,7 @@ pub async fn update_user_rating_event(
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
-    rate_list: &mut Vec<Event>,
+    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // let reputation = reput
     // nip33 kind and d tag
@@ -205,7 +207,7 @@ pub async fn update_user_rating_event(
     }
 
     // Add event message to global list
-    rate_list.push(event);
+    rate_list.lock().await.push(event);
 
     Ok(())
 }

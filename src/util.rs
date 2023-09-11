@@ -309,6 +309,8 @@ pub async fn show_hold_invoice(
     if let Some(invoice) = payment_request {
         db::edit_buyer_invoice_order(pool, order.id, &invoice).await?;
     };
+    let preimage: String = preimage.iter().map(|b| format!("{:02x}", b)).collect();
+    let hash_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
 
     db::edit_order(
         pool,
@@ -316,8 +318,8 @@ pub async fn show_hold_invoice(
         order.id,
         buyer_pubkey,
         seller_pubkey,
-        std::str::from_utf8(&preimage).unwrap(),
-        std::str::from_utf8(&hash).unwrap(),
+        &preimage,
+        &hash_str,
     )
     .await?;
     // We need to publish a new event with the new status

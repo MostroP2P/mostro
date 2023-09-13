@@ -42,20 +42,20 @@ pub async fn cron_scheduler(
 
             info!("Check older orders and mark them Expired - check is done every minute");
 
-            let older_orders_list = crate::db::find_order_by_date(&pool).await;
-
-            for order in older_orders_list.unwrap().iter() {
-                println!("Uid {} - created at {}", order.id, order.created_at);
-                // We update the order id with the new event_id
-                let _res = crate::util::update_order_event(
-                    &pool,
-                    &client,
-                    &keys,
-                    mostro_core::Status::Expired,
-                    order,
-                    None,
-                )
-                .await;
+            if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
+                for order in older_orders_list.iter() {
+                    println!("Uid {} - created at {}", order.id, order.created_at);
+                    // We update the order id with the new event_id
+                    let _res = crate::util::update_order_event(
+                        &pool,
+                        &client,
+                        &keys,
+                        mostro_core::Status::Expired,
+                        order,
+                        None,
+                    )
+                    .await;
+                }
             }
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
@@ -80,86 +80,87 @@ pub async fn cron_scheduler(
 
             info!("Check for order to republish for late actions of users");
 
-            let older_orders_list = crate::db::find_order_by_seconds(&pool).await;
+            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(&pool).await{
 
-            for order in older_orders_list.unwrap().into_iter() {
-                // Check if order is a sell order and Buyer is not sending the invoice for too much time.
-                // Same if seller is not paying hold invoice
-                if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
-                    // If hold invoice is payed return funds to seller
-                    if order.hash.is_some() {
-                        // We return funds to seller
-                        let hash = order.hash.as_ref().unwrap();
-                        ln_client.cancel_hold_invoice(hash).await.unwrap();
-                        info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
-                    };
-                    // We re-publish the event with Pending status
-                    // and update on local database
-                    let mut updated_order_amount = order.amount;
-                    let mut updated_order_fee = order.fee;
-                    if order.price_from_api {
-                        updated_order_amount = 0;
-                        updated_order_fee = 0;
-                    }
+                for order in older_orders_list.into_iter() {
+                    // Check if order is a sell order and Buyer is not sending the invoice for too much time.
+                    // Same if seller is not paying hold invoice
+                    if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
+                        // If hold invoice is payed return funds to seller
+                        if order.hash.is_some() {
+                            // We return funds to seller
+                            let hash = order.hash.as_ref().unwrap();
+                            ln_client.cancel_hold_invoice(hash).await.unwrap();
+                            info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
+                        };
+                        // We re-publish the event with Pending status
+                        // and update on local database
+                        let mut updated_order_amount = order.amount;
+                        let mut updated_order_fee = order.fee;
+                        if order.price_from_api {
+                            updated_order_amount = 0;
+                            updated_order_fee = 0;
+                        }
 
-                    // Initialize reset status to pending, change in case of specifici needs of order
-                    let mut new_status = Status::Pending;
+                        // Initialize reset status to pending, change in case of specifici needs of order
+                        let mut new_status = Status::Pending;
 
-                    if order.status == "WaitingBuyerInvoice" {
-                        if order.kind == "Sell"{
-                            // Reset buyer pubkey to none
-                            edit_buyer_pubkey_order(&pool,
+                        if order.status == "WaitingBuyerInvoice" {
+                            if order.kind == "Sell"{
+                                // Reset buyer pubkey to none
+                                edit_buyer_pubkey_order(&pool,
+                                    order.id,
+                                    None)
+                                    .await.unwrap();
+                                edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
+                            }
+                            if order.kind == "Buy"{
+                                edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                                edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                                new_status = Status::Canceled;
+                            };
+                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                        };
+
+                        if order.status == "WaitingPayment" {
+                            if order.kind == "Sell"{
+                                edit_buyer_pubkey_order(&pool,
                                 order.id,
                                 None)
                                 .await.unwrap();
-                            edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
+                                edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
+                                new_status = Status::Canceled;
+                            };
+
+                            if order.kind == "Buy"{
+                                edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                                edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
+                            };
+                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                         }
-                        if order.kind == "Buy"{
-                            edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                            edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                            new_status = Status::Canceled;
-                        };
-                        info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                    };
-
-                    if order.status == "WaitingPayment" {
-                        if order.kind == "Sell"{
-                            edit_buyer_pubkey_order(&pool,
-                            order.id,
-                            None)
-                            .await.unwrap();
-                            edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
-                            new_status = Status::Canceled;
-                        };
-
-                        if order.kind == "Buy"{
-                            edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                            edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                        };
-                        info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                        if new_status == Status::Pending {
+                            update_order_to_initial_state(&pool,order.id,updated_order_amount,updated_order_fee).await.unwrap();
+                            info!(
+                                "Republishing order Id {}, not received regular invoice in time",
+                                order.id
+                            );
+                        } else {
+                            info!(
+                                "Canceled order Id {}, not received regular invoice in time",
+                                order.id
+                            );
+                        }
+                        update_order_event(
+                            &pool,
+                            &client,
+                            &keys,
+                            new_status,
+                            &order,
+                            Some(updated_order_amount)
+                        ).await.unwrap();
                     }
-                    if new_status == Status::Pending {
-                        update_order_to_initial_state(&pool,order.id,updated_order_amount,updated_order_fee).await.unwrap();
-                        info!(
-                            "Republishing order Id {}, not received regular invoice in time",
-                             order.id
-                        );
-                    } else {
-                        info!(
-                            "Canceled order Id {}, not received regular invoice in time",
-                             order.id
-                        );
-                    }
-                    update_order_event(
-                        &pool,
-                        &client,
-                        &keys,
-                        new_status,
-                        &order,
-                        Some(updated_order_amount)
-                    ).await.unwrap();
+
                 }
-
             }
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {

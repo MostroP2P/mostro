@@ -359,17 +359,17 @@ pub async fn show_hold_invoice(
         async move {
             // Receiving msgs from the invoice subscription.
             while let Some(msg) = rx.recv().await {
-                let hash = std::str::from_utf8(&msg.hash).unwrap();
+                let hash: String = msg.hash.iter().map(|b| format!("{:02x}", b)).collect();
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    flow::hold_invoice_paid(hash).await;
+                    flow::hold_invoice_paid(&hash).await;
                     info!("Invoice with hash {hash} accepted!");
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    flow::hold_invoice_settlement(hash).await;
+                    flow::hold_invoice_settlement(&hash).await;
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    flow::hold_invoice_canceled(hash).await;
+                    flow::hold_invoice_canceled(&hash).await;
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
                 }

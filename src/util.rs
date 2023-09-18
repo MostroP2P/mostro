@@ -165,8 +165,9 @@ pub async fn send_dm(
     content: String,
 ) -> Result<()> {
     info!("DM content: {content:#?}");
-    let event = EventBuilder::new_encrypted_direct_msg(sender_keys, *receiver_pubkey, content)?
-        .to_event(sender_keys)?;
+    let event =
+        EventBuilder::new_encrypted_direct_msg(sender_keys, *receiver_pubkey, content, None)?
+            .to_event(sender_keys)?;
     info!("Sending event: {event:#?}");
     client.send_event(event).await?;
 
@@ -263,10 +264,10 @@ pub async fn connect_nostr() -> Result<Client> {
     let nostr_settings = Settings::get_nostr();
     // Create new client
     let client = Client::new(&my_keys);
-    let relays = &nostr_settings.relays;
+    let relays = nostr_settings.relays;
 
     // Add relays
-    for r in relays.iter() {
+    for r in relays.into_iter() {
         client.add_relay(r, None).await?;
     }
 

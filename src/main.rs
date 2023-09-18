@@ -16,15 +16,23 @@ use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use settings::Settings;
 use settings::{init_default_dir, init_global_settings};
+use std::env;
 use std::sync::Arc;
 use std::{env::args, path::PathBuf, sync::OnceLock};
 use tokio::sync::Mutex;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    pretty_env_logger::init();
+    env::set_var("RUST_LOG", "none,mostro=info");
+
+    // Tracing using RUST_LOG
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
 
     let rate_list: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
 

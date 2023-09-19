@@ -9,7 +9,7 @@ use crate::{db, flow};
 use anyhow::{Context, Result};
 use log::{error, info};
 use mostro_core::order::{NewOrder, Order, SmallOrder};
-use mostro_core::{Action, Content, Kind as OrderKind, Message, Status};
+use mostro_core::{Action, Content, Kind as OrderKind, Message, Status, NOSTR_REPLACEABLE_EVENT_KIND};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
@@ -108,7 +108,6 @@ pub async fn publish_order(
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
     // This tag (nip33) allows us to change this event in particular in the future
-    let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
     // This tag helps client to subscribe to sell/buy order type notifications
     let k_tag = Tag::Generic(
@@ -121,7 +120,7 @@ pub async fn publish_order(
         vec![order.fiat_code.clone()],
     );
     let event = EventBuilder::new(
-        Kind::Custom(event_kind as u64),
+        Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
         &order_string,
         &[d_tag, k_tag, f_tag],
     )
@@ -195,9 +194,8 @@ pub async fn update_user_rating_event(
 ) -> Result<()> {
     // let reputation = reput
     // nip33 kind and d tag
-    let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![user.to_string()]);
-    let event = EventBuilder::new(Kind::Custom(event_kind), reputation, &[d_tag]).to_event(keys)?;
+    let event = EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), reputation, &[d_tag]).to_event(keys)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -239,10 +237,9 @@ pub async fn update_order_event(
     );
     let order_string = publish_order.as_json()?;
     // nip33 kind and d tag
-    let event_kind = 30000;
     let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order.id.to_string()]);
     let event =
-        EventBuilder::new(Kind::Custom(event_kind), &order_string, &[d_tag]).to_event(keys)?;
+        EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), &order_string, &[d_tag]).to_event(keys)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");

@@ -3,7 +3,7 @@ use crate::util::{send_dm, update_user_rating_event};
 use anyhow::Result;
 use log::{error, info};
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Rating};
+use mostro_core::{Action, Content, Message, Rating,NOSTR_REPLACEABLE_EVENT_KIND};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -90,7 +90,6 @@ pub async fn get_nip_33_event(
     let mut notifications = client.notifications();
 
     let mut ev = None;
-
     while let Ok(notification) = notifications.recv().await {
         if let RelayPoolNotification::Message(_, msg) = notification {
             match msg {
@@ -130,7 +129,7 @@ pub async fn get_counterpart_reputation(
 
     let filter = Filter::new()
         .author(my_keys.public_key().to_string())
-        .kind(Kind::Custom(30000))
+        .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
         .identifier(user.to_string());
     println!("Filter : {:?}", filter);
     let event_nip33 = send_relays_requests(client, filter).await;

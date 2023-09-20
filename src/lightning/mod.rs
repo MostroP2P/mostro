@@ -1,8 +1,8 @@
 pub mod invoice;
 use std::cmp::Ordering;
 
+use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::settings::Settings;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;

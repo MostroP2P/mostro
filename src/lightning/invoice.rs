@@ -1,5 +1,5 @@
+use crate::cli::settings::Settings;
 use crate::error::MostroError;
-use crate::settings::Settings;
 
 use chrono::prelude::*;
 use chrono::Duration;
@@ -60,13 +60,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::is_valid_invoice;
-    use crate::{
-        error::MostroError,
-        settings::{init_global_settings, Settings},
-    };
+    use crate::{cli::settings::Settings, error::MostroError, MOSTRO_CONFIG};
+
+    fn init_settings_test() {
+        let test_path = PathBuf::from("./");
+        set_var("RUN_MODE", "tpl");
+        MOSTRO_CONFIG.get_or_init(|| Settings::new(test_path).unwrap());
+    }
 
     #[test]
     fn test_wrong_amount_invoice() {
+        init_settings_test();
         let payment_request = "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4sdqqcqzpgxqyz5vqsp5a3axmz77s5vafmheq56uh49rmy59r9a3d0dm0220l8lzdp5jrtxs9qyyssqu0ft47j0r4lu997zuqgf92y8mppatwgzhrl0hzte7mzmwrqzf2238ylch82ehhv7pfcq6qcyu070dg85vu55het2edyljuezvcw5pzgqfncf3d";
         let wrong_amount_err = is_valid_invoice(payment_request, Some(23), None);
         assert_eq!(Err(MostroError::WrongAmountError), wrong_amount_err);
@@ -74,6 +78,7 @@ mod tests {
 
     #[test]
     fn test_is_expired_invoice() {
+        init_settings_test();
         let payment_request = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n";
         let expired_err = is_valid_invoice(payment_request, None, None);
         assert_eq!(Err(MostroError::InvoiceExpiredError), expired_err);
@@ -81,9 +86,7 @@ mod tests {
 
     #[test]
     fn test_min_amount_invoice() {
-        let test_path = PathBuf::from("./");
-        set_var("RUN_MODE", "tpl");
-        init_global_settings(Settings::new(test_path).unwrap());
+        init_settings_test();
         let payment_request = "lnbcrt10n1pjwqagdpp5qwa89czezks35s73fkjspxdssh7h4mmfs4643ey7fgxlng4d3jxqdqqcqzpgxqyz5vqsp5jjlmj6hlq0zxsg5t7n6h6a95ux3ej2w3w2csvdgcpndyvut3aaqs9qyyssqg6py7mmjlcgrscvvq4x3c6kr6f6reqanwkk7rjajm4wepggh4lnku3msrjt3045l0fsl4trh3ctg8ew756wq86mz72mguusey7m0a5qq83t8n6";
         let min_amount_err = is_valid_invoice(payment_request, None, None);
         assert_eq!(Err(MostroError::MinAmountError), min_amount_err);

@@ -1,4 +1,4 @@
-use crate::settings::Settings;
+use crate::cli::settings::Settings;
 use crate::util::send_dm;
 
 use log::info;

@@ -1,6 +1,6 @@
+use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
-use crate::settings::Settings;
 use crate::util::update_order_event;
 
 use anyhow::Result;

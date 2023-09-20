@@ -164,7 +164,7 @@ impl Settings {
     }
 }
 
-pub fn init_default_dir(config_path: Option<&String>) -> Result<PathBuf> {
+pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
     // , final_path : &mut PathBuf) -> Result<()> {
     // Dir prefix
     let home_dir: OsString;

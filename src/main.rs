@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cli;
 pub mod db;
 pub mod error;
 pub mod flow;
@@ -6,19 +7,18 @@ pub mod lightning;
 pub mod messages;
 pub mod models;
 pub mod scheduler;
-pub mod settings;
 pub mod util;
 
 use crate::app::run;
+use crate::cli::settings::{init_global_settings, Settings};
+use crate::cli::settings_init;
 use anyhow::Result;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
-use settings::Settings;
-use settings::{init_default_dir, init_global_settings};
 use std::env;
 use std::sync::Arc;
-use std::{env::args, path::PathBuf, sync::OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -36,25 +36,8 @@ async fn main() -> Result<()> {
 
     let rate_list: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
 
-    // File settings path
-    let mut config_path = PathBuf::new();
-
-    let args: Vec<String> = args().collect();
-    // Create install path string
-    match args.len() {
-        1 => {
-            // No dir parameter on cli
-            config_path = init_default_dir(None)?;
-        }
-        3 => {
-            if args[1] == "--dir" {
-                config_path = init_default_dir(Some(&args[2]))?;
-            }
-        }
-        _ => {
-            println!("Can't get what you're sayin! Run mostro or mostro --dir /path/to_config_file")
-        }
-    }
+    // Init path from cli
+    let config_path = settings_init()?;
 
     // Create config global var
     init_global_settings(Settings::new(config_path)?);

@@ -1,5 +1,5 @@
+use crate::cli::settings::Settings;
 use crate::error::MostroError;
-use crate::settings::Settings;
 
 use chrono::prelude::*;
 use chrono::Duration;

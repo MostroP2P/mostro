@@ -1,9 +1,9 @@
+use crate::cli::settings::Settings;
 use crate::error::MostroError;
 use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
-use crate::settings::Settings;
 use crate::{db, flow};
 
 use anyhow::{Context, Result};

@@ -3,7 +3,7 @@ use crate::util::{send_dm, update_user_rating_event};
 use anyhow::Result;
 use log::{error, info};
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Rating,NOSTR_REPLACEABLE_EVENT_KIND};
+use mostro_core::{Action, Content, Message, Rating, NOSTR_REPLACEABLE_EVENT_KIND};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;

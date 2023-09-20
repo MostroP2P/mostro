@@ -13,7 +13,8 @@ pub fn decode_invoice(payment_request: &str) -> Result<Invoice, MostroError> {
     Ok(invoice)
 }
 
-/// Verify if a buyer invoice is valid
+/// Verify if a buyer invoice is valid,
+/// if the invoice have amount we check if the amount minus fee is the same
 pub fn is_valid_invoice(
     payment_request: &str,
     amount: Option<u64>,
@@ -23,20 +24,26 @@ pub fn is_valid_invoice(
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
-    let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
+    let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);
+    // We receive the total order fee, we divide by 2 because we split the fee
+    let fee = fee as f64 / 2.0;
+    let fee = fee.round() as u64;
 
     if let Some(amt) = amount {
-        if amount_msat > 0 && amount_msat != (amt - fee) {
+        if amount_sat > 0 && amount_sat != (amt - fee) {
             return Err(MostroError::WrongAmountError);
         }
     }
-    if amount_msat > 0 && amount_msat < mostro_settings.min_payment_amount as u64 {
+
+    if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
         return Err(MostroError::MinAmountError);
     }
+
     if invoice.is_expired() {
         return Err(MostroError::InvoiceExpiredError);
     }
+
     let parsed = payment_request.parse::<SignedRawInvoice>()?;
 
     let (parsed_invoice, _, _) = parsed.into_parts();

@@ -1,4 +1,4 @@
-use crate::settings::Settings;
+use crate::cli::settings::Settings;
 use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;

@@ -1,6 +1,6 @@
+use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
-use crate::settings::Settings;
 use crate::util::update_order_event;
 
 use anyhow::Result;
@@ -10,16 +10,11 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
 
 pub async fn start_scheduler(
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<JobScheduler, Box<dyn Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     info!("Creating scheduler");
     let sched = JobScheduler::new().await?;
     cron_scheduler(&sched, rate_list).await?;

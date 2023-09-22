@@ -7,7 +7,7 @@ use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::settings::Settings;
+use crate::cli::settings::Settings;
 
 pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let db_settings = Settings::get_db();

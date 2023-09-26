@@ -484,7 +484,8 @@ pub async fn update_order_buyer_dispute(
         r#"
             UPDATE orders
             SET
-            buyer_dispute = ?1
+            buyer_dispute = ?1,
+            status = 'Dispute'
             WHERE id = ?2
         "#,
         buyer_dispute,
@@ -507,7 +508,8 @@ pub async fn update_order_seller_dispute(
         r#"
             UPDATE orders
             SET
-            seller_dispute = ?1
+            seller_dispute = ?1,
+            status = 'Dispute'
             WHERE id = ?2
         "#,
         seller_dispute,

@@ -10,16 +10,6 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
-  "1a4f24e4d6c6447e7f6b9c7207bd12bc23e87f37d2c8676bffd8f4eb86c31405": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 2
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            seller_dispute = ?1\n            WHERE id = ?2\n        "
-  },
   "301fbda63c61bf75d60bc330d5b1aacae80248c253a2fe9e97f5a74a7acafe75": {
     "describe": {
       "columns": [],
@@ -40,6 +30,16 @@
     },
     "query": "\n    UPDATE orders\n    SET\n    buyer_pubkey = ?1,\n    seller_pubkey = ?2,\n    status = ?3,\n    preimage = ?4,\n    hash = ?5\n    WHERE id = ?6\n    "
   },
+  "45bc1577516315db37be5481594323e87e6bd406f2248b5b44015eaf3ff34a14": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            buyer_dispute = ?1,\n            status = 'Dispute'\n            WHERE id = ?2\n        "
+  },
   "567a4d6906624fb39ff9719c0f15626b42d215d6648b6274bda052cfc9f48102": {
     "describe": {
       "columns": [],
@@ -49,6 +49,16 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            seller_sent_rate = ?1\n            WHERE id = ?2\n        "
+  },
+  "6850cc0e71b2fc6d8632e96513f661de41349ee483172db98ddea8e5999d5329": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE orders\n            SET\n            seller_dispute = ?1,\n            status = 'Dispute'\n            WHERE id = ?2\n        "
   },
   "77ea98f6af16fa6e5a7d604965593700c563f88d88cb10b348bdc4200c87ad1d": {
     "describe": {
@@ -79,16 +89,6 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            buyer_invoice = ?1\n            WHERE id = ?2\n        "
-  },
-  "900597cf1e8ed114cb383856d398ffb23b1d15e48c1708fc2b40cfcc649df9fc": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 2
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            buyer_dispute = ?1\n            WHERE id = ?2\n        "
   },
   "97414183485e04346f420960beed77912ebe76089f58d30f0f526e232ce4be25": {
     "describe": {

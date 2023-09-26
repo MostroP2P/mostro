@@ -212,7 +212,7 @@ pub async fn update_order_event_id_status(
     let mostro_settings = Settings::get_mostro();
     let status = status.to_string();
     // We calculate the bot fee
-    let fee = mostro_settings.fee / 2.0;
+    let fee = mostro_settings.fee;
     let fee = fee * amount as f64;
     let fee = fee.round() as i64;
 
@@ -484,7 +484,8 @@ pub async fn update_order_buyer_dispute(
         r#"
             UPDATE orders
             SET
-            buyer_dispute = ?1
+            buyer_dispute = ?1,
+            status = 'Dispute'
             WHERE id = ?2
         "#,
         buyer_dispute,
@@ -507,7 +508,8 @@ pub async fn update_order_seller_dispute(
         r#"
             UPDATE orders
             SET
-            seller_dispute = ?1
+            seller_dispute = ?1,
+            status = 'Dispute'
             WHERE id = ?2
         "#,
         seller_dispute,

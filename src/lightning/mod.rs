@@ -158,7 +158,11 @@ impl LndConnector {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
-        let hash = String::from_utf8(payment_hash.clone()).unwrap();
+        let hash: String = payment_hash
+            .clone()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
         let mostro_settings = Settings::get_mostro();
 
         // We need to set a max fee amount

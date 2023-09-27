@@ -6,6 +6,10 @@ license = "MIT"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
 description = "Lightning Network peer-to-peer nostr platform"
 
+[[bin]]
+name = "mostrod"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.66"
 chrono = "0.4.23"

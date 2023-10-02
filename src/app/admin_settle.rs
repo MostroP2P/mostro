@@ -3,8 +3,8 @@ use crate::util::{send_dm, settle_seller_hold_invoice};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::order::Order;
-use mostro_core::{Action, Message, Status};
+use mostro_core::order::{Order, Status};
+use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;

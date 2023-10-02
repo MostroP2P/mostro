@@ -2,7 +2,8 @@ use crate::cli::settings::Settings;
 use crate::util::send_dm;
 
 use log::info;
-use mostro_core::{order::SmallOrder, Action, Content, Message, Status};
+use mostro_core::order::Status;
+use mostro_core::{order::SmallOrder, Action, Content, Message};
 use nostr_sdk::prelude::*;
 
 pub async fn hold_invoice_paid(hash: &str) {

@@ -8,10 +8,8 @@ use crate::{db, flow};
 
 use anyhow::{Context, Result};
 use log::{error, info};
-use mostro_core::order::{NewOrder, Order, SmallOrder};
-use mostro_core::{
-    Action, Content, Kind as OrderKind, Message, Status, NOSTR_REPLACEABLE_EVENT_KIND,
-};
+use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
+use mostro_core::{Action, Content, Message, NOSTR_REPLACEABLE_EVENT_KIND};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};

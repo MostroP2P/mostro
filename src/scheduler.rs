@@ -4,7 +4,7 @@ use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 
 use anyhow::Result;
-use mostro_core::Status;
+use mostro_core::order::Status;
 use nostr_sdk::Event;
 use std::error::Error;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ pub async fn cron_scheduler(
                         &pool,
                         &client,
                         &keys,
-                        mostro_core::Status::Expired,
+                        Status::Expired,
                         order,
                         None,
                     )

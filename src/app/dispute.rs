@@ -1,8 +1,9 @@
-use crate::db::{update_order_buyer_dispute, update_order_seller_dispute};
+use crate::db::{add_dispute, update_order_buyer_dispute, update_order_seller_dispute};
 use crate::util::send_dm;
 
 use anyhow::Result;
 use log::error;
+use mostro_core::dispute::{Dispute, Status};
 use mostro_core::order::Order;
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
@@ -64,6 +65,14 @@ pub async fn dispute_action(
     if !update_buyer_dispute && !update_seller_dispute {
         return Ok(());
     };
+    let dispute = Dispute {
+        order_id,
+        status: Status::Pending,
+        solver_pubkey: None,
+        created_at: 0,
+        taken_at: 0,
+    };
+    add_dispute(&dispute, &pool).await?;
 
     Ok(())
 }

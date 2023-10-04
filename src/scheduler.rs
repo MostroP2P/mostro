@@ -52,6 +52,10 @@ pub async fn cron_scheduler(
                     .await;
                 }
             }
+
+            // Drop threads of client to avoid memory usage go up
+            let _ = client.shutdown().await;
+
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
                 Ok(Some(ts)) => info!("Next time for 1 minute is {:?}", ts),
@@ -157,6 +161,10 @@ pub async fn cron_scheduler(
 
                 }
             }
+
+            // Drop threads of client to avoid memory usage go up
+            let _ = client.shutdown().await;
+
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {
                 Ok(Some(ts)) => info!("Checking orders stuck for more than {} minutes - next check is at {:?}",exp_seconds.to_string(), ts ),
@@ -190,6 +198,9 @@ pub async fn cron_scheduler(
 
             // Clear list after send events
             inner_list.lock().await.clear();
+
+            // Drop threads of client to avoid memory usage go up
+            let _ = client.shutdown().await;
 
             let next_tick = l.next_tick_for_job(uuid).await;
             match next_tick {

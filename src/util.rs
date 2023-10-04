@@ -4,12 +4,13 @@ use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
+use crate::nip33::new_event;
 use crate::{db, flow};
 
 use anyhow::{Context, Result};
 use log::{error, info};
 use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
-use mostro_core::{Action, Content, Message, NOSTR_REPLACEABLE_EVENT_KIND};
+use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
@@ -107,25 +108,14 @@ pub async fn publish_order(
 
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
-    // This tag (nip33) allows us to change this event in particular in the future
-    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order_id.to_string()]);
-    // This tag helps client to subscribe to sell/buy order type notifications
-    let k_tag = Tag::Generic(
-        TagKind::Custom("k".to_string()),
-        vec![order.kind.to_string()],
-    );
-    // This tag helps client to subscribe to fiat(shit) coin name
-    let f_tag = Tag::Generic(
-        TagKind::Custom("f".to_string()),
-        vec![order.fiat_code.clone()],
-    );
-    let event = EventBuilder::new(
-        Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
-        &order_string,
-        &[d_tag, k_tag, f_tag],
-    )
-    .to_event(keys)
-    .unwrap();
+    // nip33 kind with d, k and f tags
+    let event = new_event(
+        keys,
+        order_string,
+        order_id.to_string(),
+        Some(order.kind.to_string()),
+        Some(order.fiat_code.clone()),
+    )?;
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
@@ -192,15 +182,8 @@ pub async fn update_user_rating_event(
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    // let reputation = reput
     // nip33 kind and d tag
-    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![user.to_string()]);
-    let event = EventBuilder::new(
-        Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
-        reputation,
-        &[d_tag],
-    )
-    .to_event(keys)?;
+    let event = new_event(keys, reputation, user.to_string(), None, None)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -242,13 +225,8 @@ pub async fn update_order_event(
     );
     let order_string = publish_order.as_json()?;
     // nip33 kind and d tag
-    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![order.id.to_string()]);
-    let event = EventBuilder::new(
-        Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
-        &order_string,
-        &[d_tag],
-    )
-    .to_event(keys)?;
+    // FIXME: check if we need to send k and f tags here too
+    let event = new_event(keys, order_string, order.id.to_string(), None, None)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");

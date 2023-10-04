@@ -72,7 +72,7 @@ pub async fn dispute_action(
         created_at: 0,
         taken_at: 0,
     };
-    add_dispute(&dispute, &pool).await?;
+    add_dispute(&dispute, pool).await?;
 
     Ok(())
 }

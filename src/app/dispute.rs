@@ -73,6 +73,7 @@ pub async fn dispute_action(
         taken_at: 0,
     };
     add_dispute(&dispute, pool).await?;
+
     // We create a Message for the initiator
     let message = Message::new(0, Some(order.id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;

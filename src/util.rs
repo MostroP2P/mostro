@@ -4,7 +4,7 @@ use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
-use crate::nip33::new_event;
+use crate::nip33::{new_event, order_to_tags};
 use crate::{db, flow};
 
 use anyhow::{Context, Result};
@@ -90,6 +90,8 @@ pub async fn publish_order(
     let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
+    // We transform the order fields to tags to use in the event
+    let tags = order_to_tags(&order);
     // Now we have the order id, we can create a new event adding this id to the Order object
     let order = NewOrder::new(
         Some(order_id),
@@ -105,18 +107,10 @@ pub async fn publish_order(
         None,
         Some(order.created_at),
     );
-
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
-    // nip33 kind with d, k, f, s tags
-    let event = new_event(
-        keys,
-        order_string,
-        order_id.to_string(),
-        Some(order.kind.to_string()),
-        Some(order.fiat_code.clone()),
-        Some(order.status.to_string()),
-    )?;
+    // nip33 kind with order fields as tags and order id as identifier
+    let event = new_event(keys, order_string, order_id.to_string(), tags)?;
     info!("Event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
@@ -184,8 +178,8 @@ pub async fn update_user_rating_event(
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    // nip33 kind and d tag
-    let event = new_event(keys, reputation, user.to_string(), None, None, None)?;
+    // nip33 kind with user as identifier
+    let event = new_event(keys, reputation, user.to_string(), vec![])?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -226,9 +220,10 @@ pub async fn update_order_event(
         Some(order.created_at),
     );
     let order_content = publish_order.as_json()?;
-    // nip33 kind and d tag
-    // FIXME: check if we need to send k, f and s tags here too
-    let event = new_event(keys, order_content, order.id.to_string(), None, None, None)?;
+    // We transform the order fields to tags to use in the event
+    let tags = order_to_tags(order);
+    // nip33 kind with order id as identifier and order fields as tags
+    let event = new_event(keys, order_content, order.id.to_string(), tags)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");

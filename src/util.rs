@@ -108,14 +108,16 @@ pub async fn publish_order(
 
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
-    // nip33 kind with d, k and f tags
+    // nip33 kind with d, k, f, s tags
     let event = new_event(
         keys,
         order_string,
         order_id.to_string(),
         Some(order.kind.to_string()),
         Some(order.fiat_code.clone()),
+        Some(order.status.to_string()),
     )?;
+    info!("Event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
@@ -183,7 +185,7 @@ pub async fn update_user_rating_event(
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // nip33 kind and d tag
-    let event = new_event(keys, reputation, user.to_string(), None, None)?;
+    let event = new_event(keys, reputation, user.to_string(), None, None, None)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -223,10 +225,10 @@ pub async fn update_order_event(
         None,
         Some(order.created_at),
     );
-    let order_string = publish_order.as_json()?;
+    let order_content = publish_order.as_json()?;
     // nip33 kind and d tag
-    // FIXME: check if we need to send k and f tags here too
-    let event = new_event(keys, order_string, order.id.to_string(), None, None)?;
+    // FIXME: check if we need to send k, f and s tags here too
+    let event = new_event(keys, order_content, order.id.to_string(), None, None, None)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");

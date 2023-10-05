@@ -6,6 +6,7 @@ pub mod flow;
 pub mod lightning;
 pub mod messages;
 pub mod models;
+pub mod nip33;
 pub mod scheduler;
 pub mod util;
 

@@ -220,8 +220,11 @@ pub async fn update_order_event(
         Some(order.created_at),
     );
     let order_content = publish_order.as_json()?;
+    let mut order = order.clone();
+    // update order.status with new status
+    order.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(order);
+    let tags = order_to_tags(&order);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, order_content, order.id.to_string(), tags)?;
     let event_id = event.id.to_string();

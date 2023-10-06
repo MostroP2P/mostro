@@ -4,13 +4,13 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, show_hold_invoice};
 
 use anyhow::Result;
+use clap::ValueEnum;
 use log::error;
 use mostro_core::order::{Order, Status};
 use mostro_core::{order::SmallOrder, Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::str::FromStr;
 
 pub async fn add_invoice_action(
     msg: Message,
@@ -67,7 +67,7 @@ pub async fn add_invoice_action(
         return Ok(());
     }
 
-    let order_status = match Status::from_str(&order.status) {
+    let order_status = match Status::from_str(&order.status, true) {
         Ok(s) => s,
         Err(e) => {
             error!("AddInvoice: Order Id {order_id} wrong status: {e:?}");

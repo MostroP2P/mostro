@@ -8,13 +8,13 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::{db, flow};
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use log::{error, info};
 use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
 use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
@@ -95,7 +95,7 @@ pub async fn publish_order(
     // Now we have the order id, we can create a new event adding this id to the Order object
     let order = NewOrder::new(
         Some(order_id),
-        OrderKind::from_str(&order.kind).unwrap(),
+        OrderKind::from_str(&order.kind, true).unwrap(),
         Status::Pending,
         order.amount,
         order.fiat_code,
@@ -203,7 +203,7 @@ pub async fn update_order_event(
     order: &Order,
     amount: Option<i64>,
 ) -> Result<()> {
-    let kind = OrderKind::from_str(&order.kind).unwrap();
+    let kind = OrderKind::from_str(&order.kind, true).unwrap();
     let amount = amount.unwrap_or(order.amount);
     let publish_order = NewOrder::new(
         Some(order.id),

@@ -3,12 +3,12 @@ use crate::error::MostroError;
 
 use chrono::prelude::*;
 use chrono::Duration;
-use lightning_invoice::{Invoice, SignedRawInvoice};
+use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 use std::str::FromStr;
 
 /// Decode a lightning invoice (bolt11)
-pub fn decode_invoice(payment_request: &str) -> Result<Invoice, MostroError> {
-    let invoice = Invoice::from_str(payment_request)?;
+pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroError> {
+    let invoice = Bolt11Invoice::from_str(payment_request)?;
 
     Ok(invoice)
 }
@@ -19,8 +19,8 @@ pub fn is_valid_invoice(
     payment_request: &str,
     amount: Option<u64>,
     fee: Option<u64>,
-) -> Result<Invoice, MostroError> {
-    let invoice = Invoice::from_str(payment_request)?;
+) -> Result<Bolt11Invoice, MostroError> {
+    let invoice = decode_invoice(payment_request)?;
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
@@ -44,7 +44,7 @@ pub fn is_valid_invoice(
         return Err(MostroError::InvoiceExpiredError);
     }
 
-    let parsed = payment_request.parse::<SignedRawInvoice>()?;
+    let parsed = payment_request.parse::<SignedRawBolt11Invoice>()?;
 
     let (parsed_invoice, _, _) = parsed.into_parts();
 

@@ -40,13 +40,22 @@ pub fn new_event(
 ///
 pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
     let tags = vec![
+        // kind (k) - The order kind (buy or sell)
         ("k".to_string(), order.kind.to_string()),
+        // fiat_code (f) - The fiat code of the order
         ("f".to_string(), order.fiat_code.to_string()),
+        // status (s) - The order status
         ("s".to_string(), order.status.to_string()),
+        // amount (amt) - The amount of sats
         ("amt".to_string(), order.amount.to_string()),
+        // fiat_amount (fa) - The fiat amount
         ("fa".to_string(), order.fiat_amount.to_string()),
+        // payment_method (pm) - The payment method
         ("pm".to_string(), order.payment_method.to_string()),
+        // premium (premium) - The premium
         ("premium".to_string(), order.premium.to_string()),
+        // Label to identify this is a Mostro's order
+        ("l".to_string(), "mostroP2P".to_string()),
     ];
 
     tags

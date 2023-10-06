@@ -27,8 +27,8 @@ impl fmt::Display for MostroError {
     }
 }
 
-impl From<lightning_invoice::ParseError> for MostroError {
-    fn from(_: lightning_invoice::ParseError) -> Self {
+impl From<lightning_invoice::Bolt11ParseError> for MostroError {
+    fn from(_: lightning_invoice::Bolt11ParseError) -> Self {
         MostroError::ParsingInvoiceError
     }
 }

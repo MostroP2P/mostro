@@ -2,13 +2,13 @@ use crate::db::edit_master_seller_pubkey_order;
 use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
+use clap::ValueEnum;
 use log::error;
 use mostro_core::order::{Order, Status};
 use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::str::FromStr;
 
 pub async fn take_buy_action(
     msg: Message,
@@ -41,7 +41,7 @@ pub async fn take_buy_action(
         return Ok(());
     }
 
-    let order_status = match Status::from_str(&order.status) {
+    let order_status = match Status::from_str(&order.status, true) {
         Ok(s) => s,
         Err(e) => {
             error!("TakeBuy: Order Id {order_id} wrong status: {e:?}");

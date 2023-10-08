@@ -4,13 +4,13 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
-use clap::ValueEnum;
 use log::error;
 use mostro_core::order::{Order, Status};
 use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 
 pub async fn take_sell_action(
     msg: Message,
@@ -84,7 +84,7 @@ pub async fn take_sell_action(
         pr = None;
     }
 
-    let order_status = match Status::from_str(&order.status, true) {
+    let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
             error!("TakeSell: Order Id {order_id} wrong status: {e:?}");

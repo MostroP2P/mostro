@@ -59,11 +59,7 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await;
 
     // Start scheduler for tasks
-    start_scheduler(rate_list.clone())
-        .await
-        .unwrap()
-        .start()
-        .await?;
+    start_scheduler(rate_list.clone(), &client).await;
 
     run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
 }

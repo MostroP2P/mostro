@@ -3,327 +3,28 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 
-use anyhow::Result;
-use chrono::Duration;
 use mostro_core::order::Status;
-use nostr_sdk::{Event,Client};
-use std::error::Error;
+use nostr_sdk::{Client, Event};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
-use async_utility::thread;
+use tracing::info;
 
-pub fn start_scheduler(
-    rate_list: Arc<Mutex<Vec<Event>>>,
-    client: Client,
-) -> Result<(), Box<dyn Error>> {
+pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client) {
     info!("Creating scheduler");
 
-    job_expire_pending_older_orders(client.clone())?;
-    // job_cancel_orders(client.clone())?;
+    job_expire_pending_older_orders(client.clone()).await;
+    job_update_rate_events(client.clone(), rate_list).await;
+    job_cancel_orders(client.clone()).await;
 
-
-    Ok(())
+    info!("Scheduler Started");
 }
 
+async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>>) {
+    // Clone for closure owning with Arc
+    let inner_list = rate_list.clone();
 
-// fn job_cancel_orders(client: Client) -> Result<()>{
-
-//     info!("Create a pool to connect to db");
-
-//     let pool = crate::db::connect().await.unwrap();
-//     let keys = crate::util::get_keys().unwrap();
-//     let mut ln_client = LndConnector::new().await;
-//     let mostro_settings = Settings::get_mostro();
-//     let exp_minutes = mostro_settings.expiration_seconds/60;
-
-//     thread::spawn(async move { |pool, |
-
-//         info!("Check for order to republish for late actions of users");
-
-//         if let Ok(older_orders_list) = crate::db::find_order_by_seconds(&pool).await{
-
-//             for order in older_orders_list.into_iter() {
-//                 // Check if order is a sell order and Buyer is not sending the invoice for too much time.
-//                 // Same if seller is not paying hold invoice
-//                 if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
-//                     // If hold invoice is payed return funds to seller
-//                     if order.hash.is_some() {
-//                         // We return funds to seller
-//                         let hash = order.hash.as_ref().unwrap();
-//                         ln_client.cancel_hold_invoice(hash).await.unwrap();
-//                         info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
-//                     };
-//                     // We re-publish the event with Pending status
-//                     // and update on local database
-//                     let mut updated_order_amount = order.amount;
-//                     let mut updated_order_fee = order.fee;
-//                     if order.price_from_api {
-//                         updated_order_amount = 0;
-//                         updated_order_fee = 0;
-//                     }
-
-//                     // Initialize reset status to pending, change in case of specifici needs of order
-//                     let mut new_status = Status::Pending;
-
-//                     if order.status == "WaitingBuyerInvoice" {
-//                         if order.kind == "Sell"{
-//                             // Reset buyer pubkey to none
-//                             edit_buyer_pubkey_order(&pool,
-//                                 order.id,
-//                                 None)
-//                                 .await.unwrap();
-//                             edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
-//                         }
-//                         if order.kind == "Buy"{
-//                             edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-//                             edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-//                             new_status = Status::Canceled;
-//                         };
-//                         info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-//                     };
-
-//                     if order.status == "WaitingPayment" {
-//                         if order.kind == "Sell"{
-//                             edit_buyer_pubkey_order(&pool,
-//                             order.id,
-//                             None)
-//                             .await.unwrap();
-//                             edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
-//                             new_status = Status::Canceled;
-//                         };
-
-//                         if order.kind == "Buy"{
-//                             edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-//                             edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-//                         };
-//                         info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-//                     }
-//                     if new_status == Status::Pending {
-//                         update_order_to_initial_state(&pool,order.id,updated_order_amount,updated_order_fee).await.unwrap();
-//                         info!(
-//                             "Republishing order Id {}, not received regular invoice in time",
-//                             order.id
-//                         );
-//                     } else {
-//                         info!(
-//                             "Canceled order Id {}, not received regular invoice in time",
-//                             order.id
-//                         );
-//                     }
-//                     update_order_event(
-//                         &pool,
-//                         &client,
-//                         &keys,
-//                         new_status,
-//                         &order,
-//                         Some(updated_order_amount)
-//                     ).await.unwrap();
-//                 }
-
-//             }
-//         }
-//     }
-//     Ok(())
-// }
-
-async fn job_expire_pending_older_orders(client: Client) -> Result<()>{
-
-    let pool = crate::db::connect().await.unwrap();
-    let keys = crate::util::get_keys().unwrap();
-
-
-    thread::spawn(async move{
-
-        loop{
-            info!("Create a pool to connect to db");
-            // let pool = crate::db::connect().await.unwrap();
-            // Connect to relays
-
-            info!("Check older orders and mark them Expired - check is done every minute");
-
-            if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
-                for order in older_orders_list.iter() {
-                    println!("Uid {} - created at {}", order.id, order.created_at);
-                    // We update the order id with the new event_id
-                    let _res = crate::util::update_order_event(
-                        &pool,
-                        &client,
-                        &keys,
-                        Status::Expired,
-                        order,
-                        None,
-                    )
-                    .await;
-                }
-            }
-            thread::sleep(std::time::Duration::from_secs(60));
-        }
-    });
-
-    Ok(())
-}
-
-pub async fn cron_scheduler(
-    sched: &JobScheduler,
-    rate_list: Arc<Mutex<Vec<Event>>>,
-) -> Result<(), anyhow::Error> {
-    // This job find older Pending orders and mark them Expired
-    let job_expire_pending_older_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
-        Box::pin(async move {
-            info!("Create a pool to connect to db");
-            let pool = crate::db::connect().await.unwrap();
-            // Connect to relays
-            let client = crate::util::connect_nostr().await.unwrap();
-            let keys = crate::util::get_keys().unwrap();
-
-            info!("Check older orders and mark them Expired - check is done every minute");
-
-            if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
-                for order in older_orders_list.iter() {
-                    println!("Uid {} - created at {}", order.id, order.created_at);
-                    // We update the order id with the new event_id
-                    let _res = crate::util::update_order_event(
-                        &pool,
-                        &client,
-                        &keys,
-                        Status::Expired,
-                        order,
-                        None,
-                    )
-                    .await;
-                }
-            }
-
-            // Drop threads of client to avoid memory usage go up
-            let _ = client.shutdown().await;
-
-            let next_tick = l.next_tick_for_job(uuid).await;
-            match next_tick {
-                Ok(Some(ts)) => info!("Next time for 1 minute is {:?}", ts),
-                _ => warn!("Could not get next tick for job"),
-            }
-        })
-    })
-    .unwrap();
-
-    // This job is used to cancel or republish pending orders that are not updated for more than `expiration_seconds` seconds
-    let job_cancel_orders = Job::new_async("0 * * * * *", move |uuid, mut l| {
-        Box::pin(async move {
-            info!("Create a pool to connect to db");
-            let pool = crate::db::connect().await.unwrap();
-            // Connect to relays
-            let client = crate::util::connect_nostr().await.unwrap();
-            let keys = crate::util::get_keys().unwrap();
-            let mut ln_client = LndConnector::new().await;
-            let mostro_settings = Settings::get_mostro();
-            let exp_minutes = mostro_settings.expiration_seconds/60;
-
-            info!("Check for order to republish for late actions of users");
-
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(&pool).await{
-
-                for order in older_orders_list.into_iter() {
-                    // Check if order is a sell order and Buyer is not sending the invoice for too much time.
-                    // Same if seller is not paying hold invoice
-                    if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
-                        // If hold invoice is payed return funds to seller
-                        if order.hash.is_some() {
-                            // We return funds to seller
-                            let hash = order.hash.as_ref().unwrap();
-                            ln_client.cancel_hold_invoice(hash).await.unwrap();
-                            info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
-                        };
-                        // We re-publish the event with Pending status
-                        // and update on local database
-                        let mut updated_order_amount = order.amount;
-                        let mut updated_order_fee = order.fee;
-                        if order.price_from_api {
-                            updated_order_amount = 0;
-                            updated_order_fee = 0;
-                        }
-
-                        // Initialize reset status to pending, change in case of specifici needs of order
-                        let mut new_status = Status::Pending;
-
-                        if order.status == "WaitingBuyerInvoice" {
-                            if order.kind == "Sell"{
-                                // Reset buyer pubkey to none
-                                edit_buyer_pubkey_order(&pool,
-                                    order.id,
-                                    None)
-                                    .await.unwrap();
-                                edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
-                            }
-                            if order.kind == "Buy"{
-                                edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                                edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                                new_status = Status::Canceled;
-                            };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                        };
-
-                        if order.status == "WaitingPayment" {
-                            if order.kind == "Sell"{
-                                edit_buyer_pubkey_order(&pool,
-                                order.id,
-                                None)
-                                .await.unwrap();
-                                edit_master_buyer_pubkey_order(&pool, order.id, None).await.unwrap();
-                                new_status = Status::Canceled;
-                            };
-
-                            if order.kind == "Buy"{
-                                edit_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                                edit_master_seller_pubkey_order(&pool, order.id, None).await.unwrap();
-                            };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                        }
-                        if new_status == Status::Pending {
-                            update_order_to_initial_state(&pool,order.id,updated_order_amount,updated_order_fee).await.unwrap();
-                            info!(
-                                "Republishing order Id {}, not received regular invoice in time",
-                                order.id
-                            );
-                        } else {
-                            info!(
-                                "Canceled order Id {}, not received regular invoice in time",
-                                order.id
-                            );
-                        }
-                        update_order_event(
-                            &pool,
-                            &client,
-                            &keys,
-                            new_status,
-                            &order,
-                            Some(updated_order_amount)
-                        ).await.unwrap();
-                    }
-
-                }
-            }
-
-            // Drop threads of client to avoid memory usage go up
-            let _ = client.shutdown().await;
-
-            let next_tick = l.next_tick_for_job(uuid).await;
-            match next_tick {
-                Ok(Some(ts)) => info!("Checking orders stuck for more than {} minutes - next check is at {:?}",exp_minutes.to_string(), ts ),
-                _ => warn!("Could not get next tick for job"),
-            }
-        })
-    })
-    .unwrap();
-
-    let job_update_rate_events = Job::new_async("0 0 * * * *", move |uuid, mut l| {
-        // Clone for closure owning with Arc
-        let inner_list = rate_list.clone();
-
-        Box::pin(async move {
-            // Connect to relays
-            let client = crate::util::connect_nostr().await.unwrap();
-
+    tokio::spawn(async move {
+        loop {
             info!("I run async every hour - update rate event of users");
 
             for ev in inner_list.lock().await.iter() {
@@ -340,23 +41,147 @@ pub async fn cron_scheduler(
 
             // Clear list after send events
             inner_list.lock().await.clear();
+            // let next_tick = tokio::time::Instant::
 
-            // Drop threads of client to avoid memory usage go up
-            let _ = client.shutdown().await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+        }
+    });
+}
 
-            let next_tick = l.next_tick_for_job(uuid).await;
-            match next_tick {
-                Ok(Some(ts)) => info!("Next time for 1 hour is {:?}", ts),
-                _ => warn!("Could not get next tick for job"),
+async fn job_cancel_orders(client: Client) {
+    info!("Create a pool to connect to db");
+
+    let pool = crate::db::connect().await.unwrap();
+    let keys = crate::util::get_keys().unwrap();
+    let mut ln_client = LndConnector::new().await;
+    let mostro_settings = Settings::get_mostro();
+    let exp_seconds = mostro_settings.expiration_seconds;
+
+    tokio::spawn(async move {
+        loop {
+            info!("Check for order to republish for late actions of users");
+
+            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(&pool).await {
+                for order in older_orders_list.into_iter() {
+                    // Check if order is a sell order and Buyer is not sending the invoice for too much time.
+                    // Same if seller is not paying hold invoice
+                    if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
+                        // If hold invoice is payed return funds to seller
+                        if order.hash.is_some() {
+                            // We return funds to seller
+                            let hash = order.hash.as_ref().unwrap();
+                            let _ = ln_client.cancel_hold_invoice(hash).await;
+                            info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
+                        };
+                        // We re-publish the event with Pending status
+                        // and update on local database
+                        let mut updated_order_amount = order.amount;
+                        let mut updated_order_fee = order.fee;
+
+                        if order.price_from_api {
+                            updated_order_amount = 0;
+                            updated_order_fee = 0;
+                        }
+
+                        // Initialize reset status to pending, change in case of specifici needs of order
+                        let mut new_status = Status::Pending;
+
+                        if order.status == "WaitingBuyerInvoice" {
+                            if order.kind == "Sell" {
+                                // Reset buyer pubkey to none
+                                edit_buyer_pubkey_order(&pool, order.id, None)
+                                    .await
+                                    .unwrap();
+                                let _ = edit_master_buyer_pubkey_order(&pool, order.id, None).await;
+                            }
+                            if order.kind == "Buy" {
+                                let _ = edit_seller_pubkey_order(&pool, order.id, None).await;
+                                let _ =
+                                    edit_master_seller_pubkey_order(&pool, order.id, None).await;
+                                new_status = Status::Canceled;
+                            };
+                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                        };
+
+                        if order.status == "WaitingPayment" {
+                            if order.kind == "Sell" {
+                                edit_buyer_pubkey_order(&pool, order.id, None)
+                                    .await
+                                    .unwrap();
+                                let _ = edit_master_buyer_pubkey_order(&pool, order.id, None).await;
+                                new_status = Status::Canceled;
+                            };
+
+                            if order.kind == "Buy" {
+                                edit_seller_pubkey_order(&pool, order.id, None)
+                                    .await
+                                    .unwrap();
+                                edit_master_seller_pubkey_order(&pool, order.id, None)
+                                    .await
+                                    .unwrap();
+                            };
+                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                        }
+                        if new_status == Status::Pending {
+                            let _ = update_order_to_initial_state(
+                                &pool,
+                                order.id,
+                                updated_order_amount,
+                                updated_order_fee,
+                            )
+                            .await;
+                            info!(
+                                "Republishing order Id {}, not received regular invoice in time",
+                                order.id
+                            );
+                        } else {
+                            info!(
+                                "Canceled order Id {}, not received regular invoice in time",
+                                order.id
+                            );
+                        }
+                        let _ = update_order_event(
+                            &pool,
+                            &client,
+                            &keys,
+                            new_status,
+                            &order,
+                            Some(updated_order_amount),
+                        )
+                        .await;
+                    }
+                }
             }
-        })
-    })
-    .unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
+        }
+    });
+}
 
-    // Add the task to the scheduler
-    sched.add(job_expire_pending_older_orders).await?;
-    sched.add(job_cancel_orders).await?;
-    sched.add(job_update_rate_events).await?;
+async fn job_expire_pending_older_orders(client: Client) {
+    let pool = crate::db::connect().await.unwrap();
+    let keys = crate::util::get_keys().unwrap();
 
-    Ok(())
+    tokio::spawn(async move {
+        loop {
+            info!("Create a pool to connect to db");
+            info!("Check older orders and mark them Expired - check is done every minute");
+
+            if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
+                for order in older_orders_list.iter() {
+                    println!("Uid {} - created at {}", order.id, order.created_at);
+                    // We update the order id with the new event_id
+                    let _res = crate::util::update_order_event(
+                        &pool,
+                        &client,
+                        &keys,
+                        Status::Expired,
+                        order,
+                        None,
+                    )
+                    .await;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
 }

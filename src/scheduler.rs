@@ -3,6 +3,7 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 
+use chrono::{Duration, Utc};
 use mostro_core::order::Status;
 use nostr_sdk::{Client, Event};
 use std::sync::Arc;
@@ -41,9 +42,15 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
 
             // Clear list after send events
             inner_list.lock().await.clear();
-            // let next_tick = tokio::time::Instant::
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+            let now = Utc::now();
+            let next_tick = now.checked_add_signed(Duration::hours(1)).unwrap();
+            info!(
+                "Next tick for update users rating is {}",
+                next_tick.format("%a %b %e %T %Y")
+            );
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
         }
     });
 }
@@ -152,6 +159,14 @@ async fn job_cancel_orders(client: Client) {
                     }
                 }
             }
+            let now = Utc::now();
+            let next_tick = now
+                .checked_add_signed(Duration::seconds(exp_seconds as i64))
+                .unwrap();
+            info!(
+                "Next tick for late action users check is {}",
+                next_tick.format("%a %b %e %T %Y")
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
         }
     });
@@ -163,9 +178,7 @@ async fn job_expire_pending_older_orders(client: Client) {
 
     tokio::spawn(async move {
         loop {
-            info!("Create a pool to connect to db");
             info!("Check older orders and mark them Expired - check is done every minute");
-
             if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
                 for order in older_orders_list.iter() {
                     println!("Uid {} - created at {}", order.id, order.created_at);
@@ -181,6 +194,12 @@ async fn job_expire_pending_older_orders(client: Client) {
                     .await;
                 }
             }
+            let now = Utc::now();
+            let next_tick = now.checked_add_signed(Duration::minutes(1)).unwrap();
+            info!(
+                "Next tick for removal of older orders is {}",
+                next_tick.format("%a %b %e %T %Y")
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });

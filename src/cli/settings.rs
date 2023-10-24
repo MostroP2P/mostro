@@ -1,8 +1,6 @@
 use crate::MOSTRO_CONFIG;
-use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
@@ -12,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::{env, fmt};
 
 #[cfg(windows)]
 fn has_trailing_slash(p: &Path) -> bool {
@@ -43,15 +42,52 @@ fn add_trailing_slash(p: &mut PathBuf) {
     }
 }
 
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::io;
+
+#[derive(Debug)]
+pub struct MostroSettingsError {
+    pub path: Option<Box<Path>>,
+    pub kind: FromConfigErrorKind,
+}
+
+impl Display for MostroSettingsError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.path {
+            Some(path) => write!(f, "error reading `{}`", path.display()),
+            None => write!(f, "Missing path"),
+        }
+    }
+}
+
+impl Error for MostroSettingsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            FromConfigErrorKind::Io(e) => Some(e),
+            FromConfigErrorKind::TomlFileError { source } => Some(source),
+            FromConfigErrorKind::Env { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FromConfigErrorKind {
+    Io(io::Error),
+    TomlFileError { source: ConfigError },
+    Env { source: env::VarError },
+    //Parse(ParseError),
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Database {
     pub url: String,
 }
 
 impl TryFrom<Settings> for Database {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().database.clone())
     }
 }
@@ -68,9 +104,9 @@ pub struct Lightning {
 }
 
 impl TryFrom<Settings> for Lightning {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().lightning.clone())
     }
 }
@@ -82,9 +118,9 @@ pub struct Nostr {
 }
 
 impl TryFrom<Settings> for Nostr {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().nostr.clone())
     }
 }
@@ -100,9 +136,9 @@ pub struct Mostro {
 }
 
 impl TryFrom<Settings> for Mostro {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().mostro.clone())
     }
 }
@@ -120,7 +156,8 @@ pub fn init_global_settings(s: Settings) {
 }
 
 impl Settings {
-    pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
+    pub fn new(mut config_path: PathBuf) -> Result<Self, MostroSettingsError> {
+        //Unwrap is protected and safe by default fallback
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
         let file_name = {
             if !has_trailing_slash(config_path.as_path()) {
@@ -132,21 +169,33 @@ impl Settings {
             }
         };
 
-        let s = Config::builder()
-            .add_source(File::with_name(&file_name).required(true))
-            // Add in settings from the environment (with a prefix of APP)
-            // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
-            .add_source(Environment::with_prefix("app"))
-            .set_override(
-                "database.url",
-                format!("sqlite://{}", config_path.display()),
-            )?
-            .build()?;
+        let s = (|| {
+            Config::builder()
+                .add_source(File::with_name(&file_name).required(true))
+                // Add in settings from the environment (with a prefix of APP)
+                // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
+                .add_source(Environment::with_prefix("app"))
+                .set_override(
+                    "database.url",
+                    format!("sqlite://{}", config_path.display()),
+                )
+                .map_err(|source| FromConfigErrorKind::TomlFileError { source })?
+                .build()
+                .map_err(|source| FromConfigErrorKind::TomlFileError { source })
+        })()
+        .map_err(|kind| MostroSettingsError {
+            path: Some(config_path.clone().into()),
+            kind,
+        })?;
 
         // You can deserialize the entire configuration as
-        s.try_deserialize()
+        s.try_deserialize().map_err(|source| MostroSettingsError {
+            path: Some(config_path.into()),
+            kind: FromConfigErrorKind::TomlFileError { source },
+        })
     }
 
+    // Getter functions for struct MOSTRO unwrap here should be safe because we yet deserialized it.
     pub fn get_ln() -> Lightning {
         MOSTRO_CONFIG.get().unwrap().lightning.clone()
     }
@@ -164,7 +213,7 @@ impl Settings {
     }
 }
 
-pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
+pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroSettingsError> {
     // , final_path : &mut PathBuf) -> Result<()> {
     // Dir prefix
     let home_dir: OsString;
@@ -178,7 +227,10 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
         settings_dir_default.push(home_dir);
     } else {
         // Get $HOME from env
-        let tmp = std::env::var("HOME").unwrap();
+        let tmp = std::env::var("HOME").map_err(|source| MostroSettingsError {
+            path: None,
+            kind: FromConfigErrorKind::Env { source },
+        })?;
         // Os String
         home_dir = tmp.into();
         // Create default path with default .mostro value
@@ -201,16 +253,29 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
         let mut user_input = String::new();
         let _input = stdin();
 
-        stdout().flush()?;
+        stdout().flush().map_err(|err| MostroSettingsError {
+            path: None,
+            kind: FromConfigErrorKind::Io(err),
+        })?;
 
         let mut answer = stdin().lock();
-        answer.read_line(&mut user_input)?;
+        answer
+            .read_line(&mut user_input)
+            .map_err(|err| MostroSettingsError {
+                path: None,
+                kind: FromConfigErrorKind::Io(err),
+            })?;
 
         match user_input.to_lowercase().as_str().trim_end() {
             "y" | "" => {
-                fs::create_dir(settings_dir_default.clone())?;
+                fs::create_dir(settings_dir_default.clone()).map_err(|err| {
+                    MostroSettingsError {
+                        path: Some(settings_dir_default.clone().into()),
+                        kind: FromConfigErrorKind::Io(err),
+                    }
+                })?;
                 println!("You have created mostro default directory!");
-                println!("Please, copy settings.tpl.toml and mostro.db too files in {} folder then edit settings file fields with right values (see README.md)", settings_dir_default.display());
+                println!("Please, copy settings.tpl.toml and mostro.db too files in {} folder then edit settings file fields with right values (see README.md)", settings_dir_default.clone().display());
                 process::exit(0);
             }
             "n" => {

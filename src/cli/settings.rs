@@ -49,7 +49,7 @@ use std::io;
 
 #[derive(Debug)]
 pub struct MostroSettingsError {
-	pub path: Box<Path>,
+	pub path: Option<Box<Path>>,
 	pub kind: FromConfigErrorKind,
 }
 
@@ -168,7 +168,7 @@ impl Settings {
             }
         };
 
-        let s = || { 
+        let s = ( || { 
                 Config::builder()
                 .add_source(File::with_name(&file_name).required(true))
                 // Add in settings from the environment (with a prefix of APP)
@@ -179,11 +179,11 @@ impl Settings {
                     format!("sqlite://{}", config_path.display()),
                 ).map_err(|source| FromConfigErrorKind::TomlFileError { source })?
                 .build().map_err(|source| FromConfigErrorKind::TomlFileError { source })
-            }();//.map_err(|kind| MostroSettingsError{ path : config_path.into(), kind, })?;
+            })().map_err(|kind| MostroSettingsError{ path: config_path.into(), kind })?;
         
 
         // You can deserialize the entire configuration as
-        s.try_deserialize()//.map_err(|source| FromConfigErrorKind::TomlFileError { source })?
+        s.try_deserialize().map_err(|source| MostroSettingsError{path: config_path.into(), kind: FromConfigErrorKind::TomlFileError { source }  })
     }
 
     pub fn get_ln() -> Lightning {

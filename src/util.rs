@@ -105,13 +105,13 @@ pub async fn publish_order(
         None,
         None,
         None,
-        Some(order.created_at),
+        order.created_at,
     );
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, order_string, order_id.to_string(), tags)?;
-    info!("Event to be published: {event:#?}");
+    info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order id with the new event_id
@@ -217,7 +217,7 @@ pub async fn update_order_event(
         None,
         None,
         None,
-        Some(order.created_at),
+        order.created_at,
     );
     let order_content = publish_order.as_json()?;
     let mut order = order.clone();

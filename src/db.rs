@@ -26,15 +26,17 @@ pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result
     let dispute = sqlx::query_as::<_, Dispute>(
         r#"
         INSERT INTO disputes (
+        id,
         order_id,
         status,
         solver_pubkey,
         created_at,
         taken_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         RETURNING *
       "#,
     )
+    .bind(dispute.id)
     .bind(dispute.order_id)
     .bind(&dispute.status.to_string())
     .bind(&dispute.solver_pubkey)

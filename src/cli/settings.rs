@@ -48,7 +48,6 @@ use std::io;
 
 
 #[derive(Debug)]
-#[non_exhaustive]
 pub struct MostroSettingsError {
 	pub path: Box<Path>,
 	pub kind: FromConfigErrorKind,
@@ -64,7 +63,8 @@ impl Error for MostroSettingsError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match &self.kind {
 			FromConfigErrorKind::Io(e) => Some(e),
-			FromConfigErrorKind::TomlFileError(e) => Some(e),
+			FromConfigErrorKind::TomlFileError{ source } => Some(source),
+            FromConfigErrorKind::Env{ source } => Some(source),
 		}
 	}
 }
@@ -73,7 +73,7 @@ impl Error for MostroSettingsError {
 pub enum FromConfigErrorKind {
 	Io(io::Error),
     TomlFileError{ source : ConfigError },
-    Env{ source : std::env::VarError },
+    Env{ source : env::VarError },
 
 	//Parse(ParseError),
 }
@@ -84,9 +84,9 @@ pub struct Database {
 }
 
 impl TryFrom<Settings> for Database {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().database.clone())
     }
 }
@@ -103,9 +103,9 @@ pub struct Lightning {
 }
 
 impl TryFrom<Settings> for Lightning {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().lightning.clone())
     }
 }
@@ -117,9 +117,9 @@ pub struct Nostr {
 }
 
 impl TryFrom<Settings> for Nostr {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().nostr.clone())
     }
 }
@@ -135,9 +135,9 @@ pub struct Mostro {
 }
 
 impl TryFrom<Settings> for Mostro {
-    type Error = Error;
+    type Error = MostroSettingsError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroSettingsError> {
         Ok(MOSTRO_CONFIG.get().unwrap().mostro.clone())
     }
 }
@@ -168,19 +168,22 @@ impl Settings {
             }
         };
 
-        let s = Config::builder()
-            .add_source(File::with_name(&file_name).required(true))
-            // Add in settings from the environment (with a prefix of APP)
-            // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
-            .add_source(Environment::with_prefix("app"))
-            .set_override(
-                "database.url",
-                format!("sqlite://{}", config_path.display()),
-            )?
-            .build().map_err(|source| FromConfigErrorKind::TomlFileError { source })?;
+        let s = || { 
+                Config::builder()
+                .add_source(File::with_name(&file_name).required(true))
+                // Add in settings from the environment (with a prefix of APP)
+                // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
+                .add_source(Environment::with_prefix("app"))
+                .set_override(
+                    "database.url",
+                    format!("sqlite://{}", config_path.display()),
+                ).map_err(|source| FromConfigErrorKind::TomlFileError { source })?
+                .build().map_err(|source| FromConfigErrorKind::TomlFileError { source })
+            }();//.map_err(|kind| MostroSettingsError{ path : config_path.into(), kind, })?;
+        
 
         // You can deserialize the entire configuration as
-        s.try_deserialize().map_err(|source| FromConfigErrorKind::TomlFileError { source })?
+        s.try_deserialize()//.map_err(|source| FromConfigErrorKind::TomlFileError { source })?
     }
 
     pub fn get_ln() -> Lightning {

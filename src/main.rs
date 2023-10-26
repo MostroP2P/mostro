@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_order_deserialize_serialize() {
-        let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","premium":1}"#;
+        let sample_order = r#"{"kind":"Sell","status":"Pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"belo","premium":1,"created_at":0}"#;
         let order = NewOrder::from_json(sample_order).unwrap();
         let json_order = order.as_json().unwrap();
         assert_eq!(sample_order, json_order);

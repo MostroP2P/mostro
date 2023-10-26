@@ -1,9 +1,11 @@
 use crate::db::{add_dispute, update_order_buyer_dispute, update_order_seller_dispute};
+use crate::nip33::new_event;
 use crate::util::send_dm;
 
 use anyhow::Result;
 use log::error;
-use mostro_core::dispute::{Dispute, Status};
+use log::info;
+use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
@@ -65,13 +67,7 @@ pub async fn dispute_action(
     if !update_buyer_dispute && !update_seller_dispute {
         return Ok(());
     };
-    let dispute = Dispute {
-        order_id,
-        status: Status::Pending,
-        solver_pubkey: None,
-        created_at: 0,
-        taken_at: 0,
-    };
+    let dispute = Dispute::new(order.id);
     add_dispute(&dispute, pool).await?;
 
     // We create a Message for the initiator
@@ -91,6 +87,15 @@ pub async fn dispute_action(
     let message = message.as_json()?;
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;
+    // nip33 kind with dispute id as identifier
+    let event = new_event(
+        my_keys,
+        "".to_string(),
+        dispute.id.to_string(),
+        ([]).to_vec(),
+    )?;
+    info!("Dispute event to be published: {event:#?}");
+    client.send_event(event).await?;
 
     Ok(())
 }

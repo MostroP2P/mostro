@@ -124,12 +124,10 @@ pub async fn update_user_reputation_action(
     let min_rate = 1;
     let max_rate = 5;
 
-    if rep.is_none() {
-        reputation = Rating::new(1, rating as f64, min_rate, max_rate, rating);
-    } else {
+    if let Some(r) = rep {
         // Update user reputation
         // Going on with calculation
-        reputation = rep.unwrap();
+        reputation = r;
         let old_rating = reputation.total_rating;
         let last_rating = reputation.last_rating;
         let new_rating =
@@ -142,6 +140,8 @@ pub async fn update_user_reputation_action(
 
         // Assing new total rating to review
         reputation.total_rating = new_rating;
+    } else {
+        reputation = Rating::new(1, rating as f64, min_rate, max_rate, rating);
     }
 
     if buyer_rating || seller_rating {

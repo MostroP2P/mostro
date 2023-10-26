@@ -15,6 +15,7 @@ use nostr_sdk::prelude::*;
 use sqlx::types::chrono::Utc;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
+use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
@@ -295,9 +296,8 @@ pub async fn show_hold_invoice(
     if let Some(invoice) = payment_request {
         db::edit_buyer_invoice_order(pool, order.id, &invoice).await?;
     };
-    let preimage: String = preimage.iter().map(|b| format!("{:02x}", b)).collect();
-    let hash_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-
+    let preimage = bytes_to_string(&preimage);
+    let hash_str = bytes_to_string(&hash);
     db::edit_order(
         pool,
         &Status::WaitingPayment,
@@ -345,7 +345,7 @@ pub async fn show_hold_invoice(
         async move {
             // Receiving msgs from the invoice subscription.
             while let Some(msg) = rx.recv().await {
-                let hash: String = msg.hash.iter().map(|b| format!("{:02x}", b)).collect();
+                let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
                     flow::hold_invoice_paid(&hash).await;
@@ -487,4 +487,11 @@ pub async fn settle_seller_hold_invoice(
     update_order_event(pool, client, my_keys, status, order, None).await?;
 
     Ok(())
+}
+
+pub fn bytes_to_string(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut output, b| {
+        let _ = write!(output, "{:02x}", b);
+        output
+    })
 }

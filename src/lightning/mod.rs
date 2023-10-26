@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
+use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
@@ -158,11 +159,7 @@ impl LndConnector {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
-        let hash: String = payment_hash
-            .clone()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
+        let hash = bytes_to_string(&payment_hash);
         let mostro_settings = Settings::get_mostro();
 
         // We need to set a max fee amount

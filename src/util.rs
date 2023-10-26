@@ -12,6 +12,7 @@ use log::{error, info};
 use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
 use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
+use sqlx::types::chrono::Utc;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
@@ -105,7 +106,7 @@ pub async fn publish_order(
         None,
         None,
         None,
-        order.created_at,
+        Utc::now().timestamp(),
     );
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");

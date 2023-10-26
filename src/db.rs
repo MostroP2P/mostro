@@ -1,5 +1,6 @@
 use mostro_core::dispute::Dispute;
 use mostro_core::order::{Kind, NewOrder, Order, Status};
+use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -19,6 +20,35 @@ pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let pool = SqlitePool::connect(&db_url).await?;
 
     Ok(pool)
+}
+
+pub async fn add_user(user: &User, pool: &SqlitePool) -> anyhow::Result<User> {
+    let mut conn = pool.acquire().await?;
+    let user = sqlx::query_as::<_, User>(
+        r#"
+        INSERT INTO users (
+        id,
+        pubkey,
+        is_admin,
+        is_solver,
+        is_banned,
+        category,
+        created_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        RETURNING *
+      "#,
+    )
+    .bind(user.id)
+    .bind(&user.pubkey)
+    .bind(user.is_admin)
+    .bind(user.is_solver)
+    .bind(user.is_banned)
+    .bind(user.category)
+    .bind(user.created_at)
+    .fetch_one(&mut conn)
+    .await?;
+
+    Ok(user)
 }
 
 pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result<Dispute> {

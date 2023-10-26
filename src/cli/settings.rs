@@ -178,14 +178,12 @@ impl Settings {
                 .set_override(
                     "database.url",
                     format!("sqlite://{}", config_path.display()),
-                )
-                .map_err(|source| FromConfigErrorKind::TomlFileError { source })?
+                )?
                 .build()
-                .map_err(|source| FromConfigErrorKind::TomlFileError { source })
         })()
-        .map_err(|kind| MostroSettingsError {
+        .map_err(|source| MostroSettingsError {
             path: Some(config_path.clone().into()),
-            kind,
+            kind: FromConfigErrorKind::TomlFileError { source },
         })?;
 
         // You can deserialize the entire configuration as

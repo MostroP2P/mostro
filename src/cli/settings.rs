@@ -195,6 +195,7 @@ impl Settings {
         })
     }
 
+    // Getter functions for struct MOSTRO unwrap here should be safe because we yet deserialized it.
     pub fn get_ln() -> Lightning {
         MOSTRO_CONFIG.get().unwrap().lightning.clone()
     }
@@ -226,7 +227,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroSe
         settings_dir_default.push(home_dir);
     } else {
         // Get $HOME from env
-        let tmp = std::env::var("HOMEX").map_err(|source| MostroSettingsError {
+        let tmp = std::env::var("HOME").map_err(|source| MostroSettingsError {
             path: None,
             kind: FromConfigErrorKind::Env { source },
         })?;

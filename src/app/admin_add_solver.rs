@@ -21,15 +21,12 @@ pub async fn admin_add_solver_action(
         error!("AdminAddSolver: No pubkey found!");
         return Ok(());
     };
-    println!("Content: {:#?}", content);
     let npubkey = if let Content::TextMessage(p) = content {
         p
     } else {
         error!("AdminAddSolver: No pubkey found!");
         return Ok(());
     };
-    let user = User::new(npubkey, 0, 1, 0, 0);
-    add_user(&user, pool).await?;
 
     let mostro_pubkey = my_keys.public_key().to_bech32()?;
     // Check if the pubkey is Mostro
@@ -41,15 +38,14 @@ pub async fn admin_add_solver_action(
 
         return Ok(());
     }
+    let user = User::new(npubkey, 0, 1, 0, 0);
+    add_user(&user, pool).await?;
 
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    // update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;
-    // We create a Message
-    // let message = Message::new(0, Some(order.id), None, Action::AdminCancel, None);
-    // let message = message.as_json()?;
-    // Message to admin
-    // send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+    // We create a Message for admin
+    let message = Message::new(0, None, None, Action::AdminAddSolver, None);
+    let message = message.as_json()?;
+    // Send the message
+    send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
 
     Ok(())
 }

@@ -76,7 +76,6 @@ pub enum FromConfigErrorKind {
     Io(io::Error),
     TomlFileError { source: ConfigError },
     Env { source: env::VarError },
-    //Parse(ParseError),
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

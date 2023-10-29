@@ -7,22 +7,63 @@ use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use std::error::Error;
+use std::fmt;
+use std::fmt::{Display, Formatter};
+
+#[derive(Debug)]
+pub struct MostroDatabaseError {
+    pub kind: FromDbErrorKind,
+}
+
+impl Display for MostroDatabaseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Error in database operations")
+    }
+}
+
+impl Error for MostroDatabaseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            FromDbErrorKind::Db { source } => Some(source),
+            FromDbErrorKind::Parse { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FromDbErrorKind {
+    Db { source: sqlx::Error },
+    Parse { source: nip19::Error },
+}
+
 use crate::cli::settings::Settings;
 
-pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
+pub async fn connect() -> Result<Pool<Sqlite>, MostroDatabaseError> {
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url;
     db_url.push_str("mostro.db");
-    if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-        panic!("Not database found, please create a new one first!");
-    }
-    let pool = SqlitePool::connect(&db_url).await?;
+    Sqlite::database_exists(&db_url)
+        .await
+        .map_err(|s| MostroDatabaseError {
+            kind: FromDbErrorKind::Db { source: s },
+        })?;
+    let pool = SqlitePool::connect(&db_url)
+        .await
+        .map_err(|s| MostroDatabaseError {
+            kind: FromDbErrorKind::Db { source: s },
+        })?;
 
     Ok(pool)
 }
 
-pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result<Dispute> {
-    let mut conn = pool.acquire().await?;
+pub async fn add_dispute(
+    dispute: &Dispute,
+    pool: &SqlitePool,
+) -> Result<Dispute, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let dispute = sqlx::query_as::<_, Dispute>(
         r#"
         INSERT INTO disputes (
@@ -43,7 +84,10 @@ pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result
     .bind(dispute.created_at)
     .bind(dispute.taken_at)
     .fetch_one(&mut conn)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(dispute)
 }
@@ -54,8 +98,10 @@ pub async fn add_order(
     event_id: &str,
     initiator_pubkey: &str,
     master_pubkey: &str,
-) -> anyhow::Result<Order> {
-    let mut conn = pool.acquire().await?;
+) -> Result<Order, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let uuid = Uuid::new_v4();
     let mut buyer_pubkey: Option<String> = None;
     let mut master_buyer_pubkey: Option<String> = None;
@@ -115,7 +161,10 @@ pub async fn add_order(
     .bind(order.buyer_invoice.as_ref())
     .bind(created_at.as_i64())
     .fetch_one(&mut conn)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
@@ -129,11 +178,17 @@ pub async fn edit_order(
     seller_pubkey: &XOnlyPublicKey,
     preimage: &str,
     hash: &str,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let status = status.to_string();
-    let buyer_pubkey = buyer_pubkey.to_bech32()?;
-    let seller_pubkey = seller_pubkey.to_bech32()?;
+    let buyer_pubkey = buyer_pubkey.to_bech32().map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Parse { source: s },
+    })?;
+    let seller_pubkey = seller_pubkey.to_bech32().map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Parse { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
     UPDATE orders
@@ -153,7 +208,10 @@ pub async fn edit_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -163,8 +221,10 @@ pub async fn edit_buyer_invoice_order(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_invoice: &str,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -176,7 +236,10 @@ pub async fn edit_buyer_invoice_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -186,8 +249,10 @@ pub async fn edit_buyer_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -199,7 +264,10 @@ pub async fn edit_buyer_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -209,8 +277,10 @@ pub async fn edit_seller_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     seller_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -222,7 +292,10 @@ pub async fn edit_seller_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -234,8 +307,10 @@ pub async fn update_order_event_id_status(
     status: &Status,
     event_id: &str,
     amount: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let mostro_settings = Settings::get_mostro();
     let status = status.to_string();
     // We calculate the bot fee
@@ -260,7 +335,10 @@ pub async fn update_order_event_id_status(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -270,8 +348,10 @@ pub async fn update_order_event_seller_rate(
     pool: &SqlitePool,
     order_id: Uuid,
     seller_sent_rate: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -283,7 +363,10 @@ pub async fn update_order_event_seller_rate(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -293,8 +376,10 @@ pub async fn update_order_event_buyer_rate(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_sent_rate: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -306,13 +391,19 @@ pub async fn update_order_event_buyer_rate(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn find_order_by_event_id(pool: &SqlitePool, event_id: &str) -> anyhow::Result<Order> {
+pub async fn find_order_by_event_id(
+    pool: &SqlitePool,
+    event_id: &str,
+) -> Result<Order, MostroDatabaseError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -322,12 +413,18 @@ pub async fn find_order_by_event_id(pool: &SqlitePool, event_id: &str) -> anyhow
     )
     .bind(event_id)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
 
-pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result<Order> {
+pub async fn find_order_by_hash(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<Order, MostroDatabaseError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -337,12 +434,15 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
     )
     .bind(hash)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
 
-pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroDatabaseError> {
     let mostro_settings = Settings::get_mostro();
     let exp_hours = mostro_settings.expiration_hours as u64;
     let expire_time = Timestamp::now() - (3600 * exp_hours);
@@ -355,12 +455,15 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     )
     .bind(expire_time.to_string())
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
 
-pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroDatabaseError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
     let expire_time = Timestamp::now() - exp_seconds;
@@ -373,7 +476,10 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
     )
     .bind(expire_time.to_string())
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
@@ -383,8 +489,10 @@ pub async fn update_order_to_initial_state(
     order_id: Uuid,
     amount: i64,
     fee: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let status = "Pending".to_string();
     let hash: Option<String> = None;
     let preimage: Option<String> = None;
@@ -411,14 +519,22 @@ pub async fn update_order_to_initial_state(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn init_cancel_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+pub async fn init_cancel_order(
+    pool: &SqlitePool,
+    order: &Order,
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -434,7 +550,10 @@ pub async fn init_cancel_order(pool: &SqlitePool, order: &Order) -> anyhow::Resu
         order.id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -444,8 +563,10 @@ pub async fn edit_master_buyer_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     master_buyer_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -457,7 +578,10 @@ pub async fn edit_master_buyer_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -467,8 +591,10 @@ pub async fn edit_master_seller_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     master_seller_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -480,13 +606,16 @@ pub async fn edit_master_seller_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Order> {
+pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> Result<Order, MostroDatabaseError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -496,7 +625,10 @@ pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Ord
     )
     .bind(id)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
 
     Ok(order)
 }
@@ -505,8 +637,10 @@ pub async fn update_order_buyer_dispute(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_dispute: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -519,7 +653,10 @@ pub async fn update_order_buyer_dispute(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -529,8 +666,10 @@ pub async fn update_order_seller_dispute(
     pool: &SqlitePool,
     order_id: Uuid,
     seller_dispute: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -543,7 +682,10 @@ pub async fn update_order_seller_dispute(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -553,8 +695,10 @@ pub async fn update_order_taken_at_time(
     pool: &SqlitePool,
     order_id: Uuid,
     taken_at: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -566,14 +710,22 @@ pub async fn update_order_taken_at_time(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+pub async fn reset_order_taken_at_time(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let taken_at = 0;
 
     let rows_affected = sqlx::query!(
@@ -587,7 +739,10 @@ pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> any
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)
@@ -597,8 +752,10 @@ pub async fn update_order_invoice_held_at_time(
     pool: &SqlitePool,
     order_id: Uuid,
     invoice_held_at: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroDatabaseError> {
+    let mut conn = pool.acquire().await.map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?;
     let rows_affected = sqlx::query!(
         r#"
             UPDATE orders
@@ -610,7 +767,10 @@ pub async fn update_order_invoice_held_at_time(
         order_id,
     )
     .execute(&mut conn)
-    .await?
+    .await
+    .map_err(|s| MostroDatabaseError {
+        kind: FromDbErrorKind::Db { source: s },
+    })?
     .rows_affected();
 
     Ok(rows_affected > 0)

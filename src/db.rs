@@ -1,4 +1,4 @@
-use mostro_core::dispute::Dispute;
+use mostro_core::dispute::{Dispute, Status as DisputeStatus};
 use mostro_core::order::{Kind, NewOrder, Order, Status};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
@@ -638,6 +638,38 @@ pub async fn update_order_invoice_held_at_time(
         "#,
         invoice_held_at,
         order_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn take_dispute(
+    pool: &SqlitePool,
+    status: &DisputeStatus,
+    dispute_id: Uuid,
+    solver_pubkey: &XOnlyPublicKey,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let status = status.to_string();
+    let solver_pubkey = solver_pubkey.to_bech32()?;
+    let taken_at = Timestamp::now();
+    let taken_at = taken_at.as_i64();
+    let rows_affected = sqlx::query!(
+        r#"
+    UPDATE disputes
+    SET
+    solver_pubkey = ?1,
+    status = ?2,
+    taken_at = ?3
+    WHERE id = ?4
+    "#,
+        solver_pubkey,
+        status,
+        taken_at,
+        dispute_id
     )
     .execute(&mut conn)
     .await?

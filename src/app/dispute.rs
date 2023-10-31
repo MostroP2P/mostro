@@ -88,7 +88,10 @@ pub async fn dispute_action(
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;
     // We create a tag to show status of the dispute
-    let tags = vec![("s".to_string(), dispute.status.to_string())];
+    let tags = vec![
+        ("s".to_string(), dispute.status.to_string()),
+        ("name".to_string(), "dispute".to_string()),
+    ];
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "".to_string(), dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");

@@ -29,6 +29,8 @@ min_payment_amount = 100
 expiration_hours = 24
 # Expiration of pending orders
 expiration_seconds = 900
+# User rate events scheduled time interval
+user_rates_sent_interval_seconds = 3600
 
 [database]
 url = "sqlite://mostro.db"

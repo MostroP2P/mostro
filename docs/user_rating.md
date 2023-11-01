@@ -2,7 +2,7 @@
 
 ## Overview
 
-All mostro messages are [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) and use `30078` as event `kind`, a list of standard event kinds can be found [here](https://github.com/nostr-protocol/nips#event-kinds)
+All Mostro messages are [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) and use `30078` as event `kind`, a list of standard event kinds can be found [here](https://github.com/nostr-protocol/nips#event-kinds)
 
 ## Communication between users and Mostro
 
@@ -37,5 +37,19 @@ After a Mostro client receive this message, the user can rate the other party, t
   "content": {
     "RatingUser": 5 // User input
   }
+}
+```
+
+## Confirmation message
+
+If Mostro received the message correct it will send back a last confirmation message to the user with `Action: Received`:
+
+```json
+{
+  "version": "0",
+  "order_id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
+  "pubkey": null,
+  "action": "Received",
+  "content": null
 }
 ```

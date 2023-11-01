@@ -23,6 +23,8 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client)
 async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>>) {
     // Clone for closure owning with Arc
     let inner_list = rate_list.clone();
+    let mostro_settings = Settings::get_mostro();
+    let user_rates_sent_seconds = mostro_settings.user_rates_sent_interval_seconds as u64;
 
     tokio::spawn(async move {
         loop {
@@ -44,13 +46,15 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
             inner_list.lock().await.clear();
 
             let now = Utc::now();
-            let next_tick = now.checked_add_signed(Duration::hours(1)).unwrap();
+            let next_tick = now
+                .checked_add_signed(Duration::seconds(user_rates_sent_seconds as i64))
+                .unwrap();
             info!(
                 "Next tick for update users rating is {}",
                 next_tick.format("%a %b %e %T %Y")
             );
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(user_rates_sent_seconds)).await;
         }
     });
 }

@@ -174,14 +174,14 @@ pub async fn update_user_rating_event(
     user: &String,
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
-    reputation: String,
+    tags: Vec<(String, String)>,
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // nip33 kind with user as identifier
-    let event = new_event(keys, reputation, user.to_string(), vec![])?;
+    let event = new_event(keys, "".to_string(), user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -494,4 +494,14 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
         let _ = write!(output, "{:02x}", b);
         output
     })
+}
+
+pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
+    let mut tags_tuple = Vec::new();
+    for tag in tags {
+        let t = tag.as_vec();
+        tags_tuple.push((t[0].to_string(), t[1].to_string()));
+    }
+
+    tags_tuple
 }

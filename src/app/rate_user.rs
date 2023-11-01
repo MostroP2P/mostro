@@ -1,9 +1,10 @@
-use crate::util::{send_dm, update_user_rating_event};
+use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use log::error;
 use mostro_core::order::Order;
-use mostro_core::{Action, Content, Message, Rating, NOSTR_REPLACEABLE_EVENT_KIND};
+use mostro_core::rating::Rating;
+use mostro_core::{Action, Content, Message, NOSTR_REPLACEABLE_EVENT_KIND};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -17,13 +18,11 @@ pub async fn get_counterpart_reputation(
     client: &Client,
 ) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
-
+    // TODO: filter by data_label=rating generic_tag
     let filters = Filter::new()
         .author(my_keys.public_key().to_string())
         .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
         .identifier(user.to_string());
-
-    println!("Filter : {:?}", filters);
 
     let mut user_reputation_event = client
         .get_events_of(vec![filters], Some(Duration::from_secs(10)))
@@ -34,10 +33,10 @@ pub async fn get_counterpart_reputation(
         return Ok(None);
     };
 
-    // Sore events by time
+    // Sort events by time
     user_reputation_event.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
-    let reputation = Rating::from_json(&user_reputation_event[0].content)?;
+    let tags = nostr_tags_to_tuple(user_reputation_event[0].tags.clone());
+    let reputation = Rating::from_tags(tags)?;
 
     Ok(Some(reputation))
 }
@@ -143,6 +142,7 @@ pub async fn update_user_reputation_action(
     } else {
         reputation = Rating::new(1, rating as f64, min_rate, max_rate, rating);
     }
+    let reputation = reputation.to_tags()?;
 
     if buyer_rating || seller_rating {
         // Update db with rate flags
@@ -150,7 +150,7 @@ pub async fn update_user_reputation_action(
             &counterpart,
             update_buyer_rate,
             update_seller_rate,
-            reputation.as_json().unwrap(),
+            reputation,
             order.id,
             my_keys,
             pool,

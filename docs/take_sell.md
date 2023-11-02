@@ -6,7 +6,7 @@ All Mostro messages are [Parameterized Replaceable Events](https://github.com/no
 
 ## Communication between users and Mostro
 
-All messages from/to Mostro should be a Nostr event kind 4, the content of the event should be a JSON-serialized string (with no white space or line breaks) of the following structure:
+All messages from/to Mostro should be a Nostr event [kind 4](https://github.com/nostr-protocol/nips/blob/master/04.md), the `content` field of the event should be a base64-encoded, aes-256-cbc encrypted JSON-serialized string (with no white space or line breaks) of the following structure:
 
 - `version`
 - `order_id` (optional)
@@ -16,13 +16,13 @@ All messages from/to Mostro should be a Nostr event kind 4, the content of the e
 
 ## Taking a sell order
 
-To take a new sell order the user should send a Nostr event kind 4 to Mostro with the following content:
+If the order amount is `0` the buyer don't know the exact amount to create the invoice, buyer will send a message in a Nostr event kind 4 to Mostro with the following content:
 
 ```json
 {
   "version": "0",
-  "pubkey": "npub1qqq...",
-  "order_id": "68e373ef-898b-4312-9f49-dfc50404e3b2",
+  "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
+  "order_id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
   "action": "TakeSell",
   "content": null
 }
@@ -30,17 +30,17 @@ To take a new sell order the user should send a Nostr event kind 4 to Mostro wit
 
 ## Mostro response
 
-In order to continue the buyer needs to send a lightning network invoice to Mostro, if the amount of the order is `0`, Mostro will need to calculate the amount of sats of this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have:
+In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have:
 
 ```json
 {
   "version": "0",
-  "order_id": "68e373ef-898b-4312-9f49-dfc50404e3b2",
+  "order_id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
   "pubkey": null,
   "action": "AddInvoice",
   "content": {
     "SmallOrder": {
-      "id": "68e373ef-898b-4312-9f49-dfc50404e3b2",
+      "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
       "amount": 7851,
       "fiat_code": "VES",
       "fiat_amount": 100,
@@ -54,6 +54,8 @@ In order to continue the buyer needs to send a lightning network invoice to Most
 ```
 
 ## Buyer sends LN invoice
+
+Here is how the buyer send the LN invoice to Mostro, in case the order has a fixed sats amount, the buyer can we skip the previous step:
 
 ```json
 {

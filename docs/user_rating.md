@@ -6,7 +6,7 @@ All Mostro messages are [Parameterized Replaceable Events](https://github.com/no
 
 ## Communication between users and Mostro
 
-All messages from/to Mostro should be a Nostr event kind 4, the content of the event should be a JSON-serialized string (with no white space or line breaks) of the following structure:
+All messages from/to Mostro should be a Nostr event [kind 4](https://github.com/nostr-protocol/nips/blob/master/04.md), the `content` field of the event should be a base64-encoded, aes-256-cbc encrypted JSON-serialized string (with no white space or line breaks) of the following structure:
 
 - `version`
 - `order_id` (optional)

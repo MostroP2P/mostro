@@ -6,7 +6,7 @@ All Mostro messages are [Parameterized Replaceable Events](https://github.com/no
 
 ## Communication between users and Mostro
 
-All messages from/to Mostro should be a Nostr event kind 4, the content of the event should be a JSON-serialized string (with no white space or line breaks) of the following structure:
+All messages from/to Mostro should be a Nostr event [kind 4](https://github.com/nostr-protocol/nips/blob/master/04.md), the `content` field of the event should be a base64-encoded, aes-256-cbc encrypted JSON-serialized string (with no white space or line breaks) of the following structure:
 
 - `version`
 - `order_id` (optional)
@@ -21,7 +21,7 @@ To create a new sell order the user should send a Nostr event kind 4 to Mostro w
 ```json
 {
   "version": "0",
-  "pubkey": "npub1qqq...",
+  "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2",
   "action": "Order",
   "content": {
     "Order": {
@@ -32,7 +32,6 @@ To create a new sell order the user should send a Nostr event kind 4 to Mostro w
       "fiat_amount": 100,
       "payment_method": "face to face",
       "premium": 1,
-      "master_seller_pubkey": "npub1qqq...",
       "created_at": 0
     }
   }
@@ -44,7 +43,7 @@ Let's explain some of the fields:
 - kind: `Sell` or `Buy`
 - status: Is always `Pending` when creating a new order
 - amount: 0 for when we want to sell with at market price, otherwise the amount in satoshis
-- master_seller_pubkey: Real user's pubkey, we use this when the message was sent from an ephemeral key
+- pubkey: Real user's pubkey, we use this when the message was sent from an ephemeral key
 - created_at: No need to send the correct unix timestamp, Mostro will replace it with the current time
 
 ## Confirmation message

@@ -74,6 +74,8 @@ Here is how the buyer send the LN invoice to Mostro, in case the order has a fix
 
 ## Mostro response
 
+Mostro send the following message to the buyer:
+
 ```json
 {
   "version": "0",

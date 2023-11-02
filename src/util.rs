@@ -310,7 +310,8 @@ pub async fn show_hold_invoice(
     .await?;
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
-    let new_order = order.as_new_order();
+    let mut new_order = order.as_new_order();
+    new_order.status = Status::WaitingPayment;
     // We create a Message to send the hold invoice to seller
     let message = Message::new(
         0,

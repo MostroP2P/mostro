@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Yadio {
     request: Request,
     pub result: f64,
@@ -8,7 +8,7 @@ pub struct Yadio {
     timestamp: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     amount: i64,
     from: String,

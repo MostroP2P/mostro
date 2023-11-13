@@ -22,7 +22,7 @@ pub async fn take_buy_action(
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("TakeBuy: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -37,21 +37,21 @@ pub async fn take_buy_action(
     }
 
     if order.kind != "Buy" {
-        error!("TakeBuy: Order Id {order_id} wrong kind");
+        error!("Order Id {order_id} wrong kind");
         return Ok(());
     }
 
     let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
-            error!("TakeBuy: Order Id {order_id} wrong status: {e:?}");
+            error!("Order Id {order_id} wrong status: {e:?}");
             return Ok(());
         }
     };
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
         None => {
-            error!("TakeBuy: Buyer pubkey not found for order {}!", order.id);
+            error!("Buyer pubkey not found for order {}!", order.id);
             return Ok(());
         }
     };
@@ -92,7 +92,13 @@ pub async fn take_buy_action(
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         order.amount =
-            get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
+            match get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await {
+                Ok(amount) => amount,
+                Err(e) => {
+                    error!("{:?}", e);
+                    return Ok(());
+                }
+            };
     }
 
     show_hold_invoice(

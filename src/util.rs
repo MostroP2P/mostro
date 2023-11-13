@@ -43,6 +43,7 @@ pub async fn get_market_quote(
         "https://api.yadio.io/convert/{}/{}/BTC",
         fiat_amount, fiat_code
     );
+    info!("Requesting API price: {}", req_string);
 
     let mut req = None;
     // Retry for 4 times
@@ -64,11 +65,14 @@ pub async fn get_market_quote(
 
     // Case no answers from Yadio
     if req.is_none() {
-        println!("Send dm to user to signal no API response");
         return Err(MostroError::NoAPIResponse);
     }
 
-    let quote = req.unwrap().json::<Yadio>().await?;
+    let quote = req.unwrap().json::<Yadio>().await;
+    if quote.is_err() {
+        return Err(MostroError::NoAPIResponse);
+    }
+    let quote = quote.unwrap();
 
     let mut sats = quote.result * 100_000_000_f64;
 

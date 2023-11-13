@@ -2,6 +2,7 @@ use crate::cli::settings::Settings;
 use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
+use log::error;
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::ToBech32;
 use nostr_sdk::{Client, Event, Keys};
@@ -16,7 +17,13 @@ pub async fn order_action(
 ) -> Result<()> {
     if let Some(order) = msg.get_order() {
         let mostro_settings = Settings::get_mostro();
-        let quote = get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await?;
+        let quote = match get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await {
+            Ok(amount) => amount,
+            Err(e) => {
+                error!("{:?}", e.to_string());
+                return Ok(());
+            }
+        };
         if quote > mostro_settings.max_order_amount as i64 {
             let message = Message::new(0, order.id, None, Action::CantDo, None);
             let message = message.as_json()?;

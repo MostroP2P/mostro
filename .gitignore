@@ -13,3 +13,5 @@ mostro.db*
 # settings file
 settings.dev.toml
 settings.prod.toml
+
+book/book/

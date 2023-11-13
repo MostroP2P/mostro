@@ -43,6 +43,7 @@ pub async fn get_market_quote(
         "https://api.yadio.io/convert/{}/{}/BTC",
         fiat_amount, fiat_code
     );
+    info!("Requesting API price: {}", req_string);
 
     let mut req = None;
     // Retry for 4 times
@@ -64,11 +65,14 @@ pub async fn get_market_quote(
 
     // Case no answers from Yadio
     if req.is_none() {
-        println!("Send dm to user to signal no API response");
         return Err(MostroError::NoAPIResponse);
     }
 
-    let quote = req.unwrap().json::<Yadio>().await?;
+    let quote = req.unwrap().json::<Yadio>().await;
+    if quote.is_err() {
+        return Err(MostroError::NoAPIResponse);
+    }
+    let quote = quote.unwrap();
 
     let mut sats = quote.result * 100_000_000_f64;
 
@@ -174,14 +178,14 @@ pub async fn update_user_rating_event(
     user: &String,
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
-    reputation: String,
+    tags: Vec<(String, String)>,
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // nip33 kind with user as identifier
-    let event = new_event(keys, reputation, user.to_string(), vec![])?;
+    let event = new_event(keys, "".to_string(), user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -310,7 +314,8 @@ pub async fn show_hold_invoice(
     .await?;
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
-    let new_order = order.as_new_order();
+    let mut new_order = order.as_new_order();
+    new_order.status = Status::WaitingPayment;
     // We create a Message to send the hold invoice to seller
     let message = Message::new(
         0,
@@ -494,4 +499,14 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
         let _ = write!(output, "{:02x}", b);
         output
     })
+}
+
+pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
+    let mut tags_tuple = Vec::new();
+    for tag in tags {
+        let t = tag.as_vec();
+        tags_tuple.push((t[0].to_string(), t[1].to_string()));
+    }
+
+    tags_tuple
 }

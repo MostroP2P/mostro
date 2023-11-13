@@ -97,6 +97,7 @@ pub struct Mostro {
     pub min_payment_amount: u32,
     pub expiration_hours: u32,
     pub expiration_seconds: u32,
+    pub user_rates_sent_interval_seconds: u32,
 }
 
 impl TryFrom<Settings> for Mostro {

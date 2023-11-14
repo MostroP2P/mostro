@@ -11,7 +11,7 @@
 - [Rate user](./user_rating.md)
 - [Cancel](./cancel.md)
 - [Dispute](./dispute.md)
-- [Actions](https://docs.rs/mostro-core/latest/mostro_core/enum.Action.html)
+- [Actions](./actions.md)
   - [Order](./new_order.md)
   - [TakeSell](./take_sell.md)
   - [AddInvoice](./take_sell.md)

@@ -3,12 +3,13 @@ use crate::util::send_dm;
 
 use anyhow::Result;
 use log::error;
+use mostro_core::dispute::Status;
 use mostro_core::user::User;
 use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-pub async fn admin_take_dispute(
+pub async fn admin_take_dispute_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
@@ -18,13 +19,13 @@ pub async fn admin_take_dispute(
     let content = if let Some(content) = msg.content {
         content
     } else {
-        error!("AdminTakeDispute: No dispute id found!");
+        error!("No dispute id found!");
         return Ok(());
     };
-    let dispute_id = if let Content::TextMessage(d) = content {
+    let dispute_id = if let Content::Dispute(d) = content {
         d
     } else {
-        error!("AdminTakeDispute: No dispute id found!");
+        error!("No dispute id found!");
         return Ok(());
     };
 
@@ -39,7 +40,8 @@ pub async fn admin_take_dispute(
 
         return Ok(());
     }
-    take_dispute(pool).await?;
+
+    take_dispute(pool, &Status::InProgress, dispute_id, &event.pubkey).await?;
 
     // We create a Message for admin
     let message = Message::new(0, None, None, Action::AdminAddSolver, None);

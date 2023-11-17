@@ -669,7 +669,7 @@ pub async fn take_dispute(
         solver_pubkey,
         status,
         taken_at,
-        dispute_id
+        dispute_id,
     )
     .execute(&mut conn)
     .await?

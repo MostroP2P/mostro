@@ -20,7 +20,7 @@ pub async fn get_counterpart_reputation(
     // Request NIP33 of the counterparts
     // TODO: filter by data_label=rating generic_tag
     let filters = Filter::new()
-        .author(my_keys.public_key().to_string())
+        .author(my_keys.public_key())
         .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
         .identifier(user.to_string());
 

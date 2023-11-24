@@ -18,13 +18,13 @@ pub async fn admin_add_solver_action(
     let content = if let Some(content) = msg.content {
         content
     } else {
-        error!("AdminAddSolver: No pubkey found!");
+        error!("No pubkey found!");
         return Ok(());
     };
     let npubkey = if let Content::TextMessage(p) = content {
         p
     } else {
-        error!("AdminAddSolver: No pubkey found!");
+        error!("No pubkey found!");
         return Ok(());
     };
 

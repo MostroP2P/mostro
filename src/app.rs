@@ -125,8 +125,6 @@ pub async fn run(
                                         .await?;
                                     }
                                     Action::AdminTakeDispute => {
-                                        // TODO: voy por aqui
-                                        println!("AdminTakeDispute: {:#?}", msg);
                                         admin_take_dispute_action(
                                             msg, &event, &my_keys, &client, &pool,
                                         )

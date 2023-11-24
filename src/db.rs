@@ -531,6 +531,24 @@ pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Ord
     Ok(order)
 }
 
+pub async fn find_dispute_by_order_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Dispute> {
+    let dispute = sqlx::query_as::<_, Dispute>(
+        r#"
+          SELECT *
+          FROM disputes
+          WHERE order_id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await;
+
+    match dispute {
+        Ok(dispute) => Ok(dispute),
+        Err(_) => Err(anyhow::anyhow!("Dispute not found!")),
+    }
+}
+
 pub async fn update_order_buyer_dispute(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -670,6 +688,30 @@ pub async fn take_dispute(
         status,
         taken_at,
         dispute_id,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn set_dispute_status(
+    pool: &SqlitePool,
+    dispute_id: Uuid,
+    status: &DisputeStatus,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    let status = status.to_string();
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE disputes
+            SET
+            status = ?1
+            WHERE id = ?2
+        "#,
+        status,
+        dispute_id
     )
     .execute(&mut conn)
     .await?

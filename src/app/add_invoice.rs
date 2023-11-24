@@ -24,7 +24,7 @@ pub async fn add_invoice_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("AddInvoice: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -63,21 +63,21 @@ pub async fn add_invoice_action(
         }
         pr = payment_request;
     } else {
-        error!("AddInvoice: Order Id {order_id} wrong get_payment_request");
+        error!("Order Id {order_id} wrong get_payment_request");
         return Ok(());
     }
 
     let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
-            error!("AddInvoice: Order Id {order_id} wrong status: {e:?}");
+            error!("Order Id {order_id} wrong status: {e:?}");
             return Ok(());
         }
     };
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
         None => {
-            error!("TakeBuy: Buyer pubkey not found for order {}!", order.id);
+            error!("Buyer pubkey not found for order {}!", order.id);
             return Ok(());
         }
     };

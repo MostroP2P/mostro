@@ -25,7 +25,7 @@ pub async fn fiat_sent_action(
     };
     // TODO: send to user a DM with the error
     if order.status != "Active" {
-        error!("FiatSent: Order Id {order_id} wrong status");
+        error!("Order Id {order_id} wrong status");
         return Ok(());
     }
     // Check if the pubkey is the buyer

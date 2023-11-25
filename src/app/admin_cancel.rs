@@ -1,8 +1,10 @@
+use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
 use log::{error, info};
+use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::order::{Order, Status};
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
@@ -21,7 +23,7 @@ pub async fn admin_cancel_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("AdminCancel: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -40,11 +42,18 @@ pub async fn admin_cancel_action(
         // We return funds to seller
         let hash = order.hash.as_ref().unwrap();
         ln_client.cancel_hold_invoice(hash).await?;
-        info!(
-            "AdminCancel: Order Id {}: Funds returned to seller",
-            &order.id
-        );
+        info!("Order Id {}: Funds returned to seller", &order.id);
     }
+
+    // we check if there is a dispute
+    let dispute = find_dispute_by_order_id(pool, order_id).await;
+
+    if let Ok(mut d) = dispute {
+        // we update the dispute
+        d.status = DisputeStatus::SellerRefunded;
+        d.update(pool).await?;
+    }
+
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;

@@ -27,6 +27,12 @@ sqlx migrate run
 echo "Preparing offline file for CI on github!"
 cargo sqlx prepare
 echo "Check json db file is ok!"
-cargo sqlx prepare --check
-
+if cargo sqlx prepare --check
+then
+  echo "Success: sqlx-json is correct"
+  exit 0
+else
+  echo "Failure: sqlx-json has issues" >&2
+  exit 1
+fi
 

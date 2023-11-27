@@ -10,6 +10,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
+  "17bd2b3471aa2ecf65bc3d23f768093d30ca1f8f51101f6443f36b3da45e225a": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE disputes\n            SET\n            status = ?1\n            WHERE id = ?2\n        "
+  },
   "301fbda63c61bf75d60bc330d5b1aacae80248c253a2fe9e97f5a74a7acafe75": {
     "describe": {
       "columns": [],
@@ -139,6 +149,16 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            seller_pubkey = ?1\n            WHERE id = ?2\n        "
+  },
+  "e3120e1c761fe28287be0ece61f39b5a6a994039fd7964410591d9cf0a682f62": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 4
+      }
+    },
+    "query": "\n    UPDATE disputes\n    SET\n    solver_pubkey = ?1,\n    status = ?2,\n    taken_at = ?3\n    WHERE id = ?4\n    "
   },
   "f7e4e95f502724efa0a7b67e3d69fb77c84c141ab9482a99ff254f0964b6eff2": {
     "describe": {

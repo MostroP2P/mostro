@@ -1,8 +1,10 @@
+use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, settle_seller_hold_invoice};
 
 use anyhow::Result;
 use log::error;
+use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::order::{Order, Status};
 use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
@@ -21,7 +23,7 @@ pub async fn admin_settle_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("AdminSettle: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -32,7 +34,14 @@ pub async fn admin_settle_action(
         event, my_keys, client, pool, ln_client, status, action, true, &order,
     )
     .await?;
+    // we check if there is a dispute
+    let dispute = find_dispute_by_order_id(pool, order_id).await;
 
+    if let Ok(mut d) = dispute {
+        // we update the dispute
+        d.status = DisputeStatus::Settled;
+        d.update(pool).await?;
+    }
     // We create a Message
     let message = Message::new(0, Some(order.id), None, Action::AdminSettle, None);
     let message = message.as_json()?;

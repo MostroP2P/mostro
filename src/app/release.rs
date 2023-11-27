@@ -25,7 +25,7 @@ pub async fn release_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("Release: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -80,7 +80,7 @@ pub async fn release_action(
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
                     if status == PaymentStatus::Succeeded {
                         info!(
-                            "Release: Order Id {}: Invoice with hash: {} paid!",
+                            "Order Id {}: Invoice with hash: {} paid!",
                             order.id, msg.payment.payment_hash
                         );
                         // Purchase completed message to buyer

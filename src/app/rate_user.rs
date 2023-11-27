@@ -53,7 +53,7 @@ pub async fn update_user_reputation_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("RateUser: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -67,7 +67,7 @@ pub async fn update_user_reputation_action(
         let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
-        error!("RateUser: Order Id {order_id} wrong status");
+        error!("Order Id {order_id} wrong status");
 
         return Ok(());
     }

@@ -25,12 +25,12 @@ pub async fn take_sell_action(
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("TakeSell: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
     if order.kind != "Sell" {
-        error!("TakeSell: Order Id {order_id} wrong kind");
+        error!("Order Id {order_id} wrong kind");
         return Ok(());
     }
     // We check if the message have a pubkey
@@ -87,7 +87,7 @@ pub async fn take_sell_action(
     let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
-            error!("TakeSell: Order Id {order_id} wrong status: {e:?}");
+            error!("Order Id {order_id} wrong status: {e:?}");
             return Ok(());
         }
     };
@@ -108,7 +108,7 @@ pub async fn take_sell_action(
     let seller_pubkey = match order.seller_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
         None => {
-            error!("TakeSell: Seller pubkey not found for order {}!", order.id);
+            error!("Seller pubkey not found for order {}!", order.id);
             return Ok(());
         }
     };

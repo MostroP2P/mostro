@@ -23,7 +23,7 @@ pub async fn dispute_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("Dispute: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
@@ -87,13 +87,13 @@ pub async fn dispute_action(
     let message = message.as_json()?;
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;
+    // We create a tag to show status of the dispute
+    let tags = vec![
+        ("s".to_string(), dispute.status.to_string()),
+        ("name".to_string(), "dispute".to_string()),
+    ];
     // nip33 kind with dispute id as identifier
-    let event = new_event(
-        my_keys,
-        "".to_string(),
-        dispute.id.to_string(),
-        ([]).to_vec(),
-    )?;
+    let event = new_event(my_keys, "".to_string(), dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
     client.send_event(event).await?;
 

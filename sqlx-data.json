@@ -10,6 +10,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
+  "17bd2b3471aa2ecf65bc3d23f768093d30ca1f8f51101f6443f36b3da45e225a": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 2
+      }
+    },
+    "query": "\n            UPDATE disputes\n            SET\n            status = ?1\n            WHERE id = ?2\n        "
+  },
   "301fbda63c61bf75d60bc330d5b1aacae80248c253a2fe9e97f5a74a7acafe75": {
     "describe": {
       "columns": [],

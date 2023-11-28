@@ -5,8 +5,9 @@ use crate::util::{send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
+use mostro_core::message::{Action, Content, Message};
+use mostro_core::order::SmallOrder;
 use mostro_core::order::{Order, Status};
-use mostro_core::{order::SmallOrder, Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -19,8 +20,15 @@ pub async fn add_invoice_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
+    let order_msg = match msg.get_order() {
+        Some(order) => order,
+        None => {
+            error!("Message without order!");
+            return Ok(());
+        }
+    };
     // Safe unwrap as we verified the message
-    let order_id = msg.order_id.unwrap();
+    let order_id = order_msg.id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -28,10 +36,9 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     };
-
     let pr: String;
     // If a buyer sent me a lightning invoice we get it
-    if let Some(payment_request) = msg.get_payment_request() {
+    if let Some(payment_request) = order_msg.get_payment_request() {
         // Verify if invoice is valid
         match is_valid_invoice(
             &payment_request,
@@ -46,7 +53,7 @@ pub async fn add_invoice_action(
                 | MostroError::WrongAmountError
                 | MostroError::MinAmountError => {
                     // We create a Message
-                    let message = Message::new(
+                    let message = Message::new_order(
                         0,
                         Some(order.id),
                         None,
@@ -84,7 +91,7 @@ pub async fn add_invoice_action(
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::new_order(0, Some(order.id), None, Action::CantDo, None);
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -95,7 +102,7 @@ pub async fn add_invoice_action(
         Status::WaitingBuyerInvoice => {}
         _ => {
             // We create a Message
-            let message = Message::new(
+            let message = Message::new_order(
                 0,
                 Some(order.id),
                 None,
@@ -126,7 +133,7 @@ pub async fn add_invoice_action(
             order.seller_pubkey.as_ref().cloned(),
         );
         // We send a confirmation message to seller
-        let message = Message::new(
+        let message = Message::new_order(
             0,
             Some(order.id),
             None,
@@ -137,7 +144,7 @@ pub async fn add_invoice_action(
 
         send_dm(client, my_keys, &seller_pubkey, message).await?;
         // We send a message to buyer saying seller paid
-        let message = Message::new(
+        let message = Message::new_order(
             0,
             Some(order.id),
             None,

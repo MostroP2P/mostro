@@ -64,8 +64,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use mostro_core::message::Message;
     use mostro_core::order::NewOrder;
-    use mostro_core::Message;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

@@ -20,13 +20,7 @@ pub async fn add_invoice_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let order_msg = match msg.get_order() {
-        Some(order) => order,
-        None => {
-            error!("Message without order!");
-            return Ok(());
-        }
-    };
+    let order_msg = msg.get_inner_message_kind();
     // Safe unwrap as we verified the message
     let order_id = order_msg.id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {

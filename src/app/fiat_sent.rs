@@ -2,8 +2,8 @@ use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::order::{Order, Status};
 use mostro_core::message::{Action, Content, Message, Peer};
+use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;

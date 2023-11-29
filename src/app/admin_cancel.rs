@@ -6,7 +6,7 @@ use anyhow::Result;
 use log::{error, info};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Message};
+use mostro_core::message::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;

@@ -10,7 +10,7 @@ use crate::{db, flow};
 use anyhow::{Context, Result};
 use log::{error, info};
 use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
-use mostro_core::{Action, Content, Message};
+use mostro_core::message::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::types::chrono::Utc;
 use sqlx::SqlitePool;

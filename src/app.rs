@@ -28,11 +28,12 @@ use crate::app::take_sell::take_sell_action;
 use crate::lightning::LndConnector;
 
 use anyhow::Result;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action,Message, MessageKind};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
 
 pub async fn run(
     my_keys: Keys,
@@ -57,41 +58,43 @@ pub async fn run(
                     if let Ok(m) = message {
                         let message = Message::from_json(&m);
                         if let Ok(msg) = message {
-                            if msg.verify() {
-                                match msg.get_action() {
-                                    Some(Action::NewOrder) => {
+                            if msg.get_inner_message_kind().verify(){
+                        
+                            if let Some(action) = msg.inner_action() {
+                                match action {
+                                    Action::NewOrder => {
                                         order_action(msg, &event, &my_keys, &client, &pool).await?;
                                     }
-                                    Some(Action::TakeSell) => {
+                                    Action::TakeSell => {
                                         take_sell_action(msg, &event, &my_keys, &client, &pool)
                                             .await?;
                                     }
-                                    Some(Action::TakeBuy) => {
+                                    Action::TakeBuy => {
                                         take_buy_action(msg, &event, &my_keys, &client, &pool)
                                             .await?;
                                     }
-                                    Some(Action::FiatSent) => {
+                                    Action::FiatSent => {
                                         fiat_sent_action(msg, &event, &my_keys, &client, &pool)
                                             .await?;
                                     }
-                                    Some(Action::Release) => {
+                                    Action::Release => {
                                         release_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
                                         .await?;
                                     }
-                                    Some(Action::Cancel) => {
+                                    Action::Cancel => {
                                         cancel_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
                                         .await?;
                                     }
-                                    Some(Action::AddInvoice) => {
+                                    Action::AddInvoice => {
                                         add_invoice_action(msg, &event, &my_keys, &client, &pool)
                                             .await?;
                                     }
-                                    Some(Action::PayInvoice) => todo!(),
-                                    Some(Action::RateUser) => {
+                                    Action::PayInvoice => todo!(),
+                                    Action::RateUser => {
                                         update_user_reputation_action(
                                             msg,
                                             &event,
@@ -102,29 +105,29 @@ pub async fn run(
                                         )
                                         .await?;
                                     }
-                                    Some(Action::Dispute) => {
+                                    Action::Dispute => {
                                         dispute_action(msg, &event, &my_keys, &client, &pool)
                                             .await?;
                                     }
-                                    Some(Action::AdminCancel) => {
+                                    Action::AdminCancel => {
                                         admin_cancel_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
                                         .await?;
                                     }
-                                    Some(Action::AdminSettle) => {
+                                    Action::AdminSettle => {
                                         admin_settle_action(
                                             msg, &event, &my_keys, &client, &pool, ln_client,
                                         )
                                         .await?;
                                     }
-                                    Some(Action::AdminAddSolver) => {
+                                    Action::AdminAddSolver => {
                                         admin_add_solver_action(
                                             msg, &event, &my_keys, &client, &pool,
                                         )
                                         .await?;
                                     }
-                                    Some(Action::AdminTakeDispute) => {
+                                    Action::AdminTakeDispute => {
                                         admin_take_dispute_action(
                                             msg, &event, &my_keys, &client, &pool,
                                         )
@@ -138,5 +141,6 @@ pub async fn run(
                 };
             }
         }
+    }
     }
 }

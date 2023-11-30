@@ -77,7 +77,7 @@ async fn job_cancel_orders(client: Client) {
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
                     if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
-                        // If hold invoice is payed return funds to seller
+                        // If hold invoice is paid return funds to seller
                         if order.hash.is_some() {
                             // We return funds to seller
                             let hash = order.hash.as_ref().unwrap();

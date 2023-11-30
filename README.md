@@ -18,7 +18,7 @@ Mostro works with a p2p communication on top of Nostr, Mostro will be the escrow
 
 Mostro will handle Bitcoin using a Lightning Network node, the node will create the hold invoices for sellers and pay the buyers lightning regular invoices.
 
-Mostro will need a private key to be able to create, sign and send events throught Nostr network.
+Mostro will need a private key to be able to create, sign and send events through Nostr network.
 
 In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](./FLOW.md):
 
@@ -29,7 +29,7 @@ sequenceDiagram
     Mostro-->>LN-Node: Give me a hold invoice
     LN-Node->>Mostro: Hold invoice
     Mostro->>Seller: Please pay this hold invoice
-    Seller->>LN-Node: Paying throught lightning
+    Seller->>LN-Node: Paying through lightning
     LN-Node-->>Mostro: Payment received
     Mostro-->>Seller: Thanks! talk to buyer now
 ```

@@ -15,7 +15,7 @@ pub async fn admin_take_dispute_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let content = if let Some(content) = msg.content {
+    let content = if let Some(content) = msg.get_inner_message_kind().content.to_owned() {
         content
     } else {
         error!("No dispute id found!");
@@ -43,7 +43,7 @@ pub async fn admin_take_dispute_action(
     take_dispute(pool, &Status::InProgress, dispute_id, &event.pubkey).await?;
 
     // We create a Message for admin
-    let message = Message::new(None, None, Action::AdminAddSolver, None);
+    let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

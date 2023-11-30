@@ -28,7 +28,7 @@ use crate::app::take_sell::take_sell_action;
 use crate::lightning::LndConnector;
 
 use anyhow::Result;
-use mostro_core::message::{Action, Message, MessageKind};
+use mostro_core::message::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;

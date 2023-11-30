@@ -83,7 +83,7 @@ pub async fn add_invoice_action(
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
         // We create a Message
-        let message = Message::cant_do(Some(order.id), None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

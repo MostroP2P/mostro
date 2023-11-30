@@ -20,7 +20,7 @@ pub async fn cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -41,7 +41,7 @@ pub async fn cancel_action(
             // and update on local database the status and new event id
             update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
             // We create a Message for cancel
-            let message = Message::new(Some(order.id), None, Action::Cancel, None);
+            let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
         }
@@ -184,7 +184,7 @@ pub async fn cancel_add_invoice(
         )
         .await?;
         // We create a Message for cancel
-        let message = Message::new(Some(order.id), None, Action::Cancel, None);
+        let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;
@@ -239,7 +239,7 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
         // We create a Message for cancel
-        let message = Message::new(Some(order.id), None, Action::Cancel, None);
+        let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;

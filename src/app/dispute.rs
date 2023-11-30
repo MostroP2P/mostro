@@ -71,14 +71,13 @@ pub async fn dispute_action(
     add_dispute(&dispute, pool).await?;
 
     // We create a Message for the initiator
-    let message = Message::new(Some(order.id), None, Action::DisputeInitiatedByYou, None);
+    let message = Message::new_dispute(Some(order.id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;
     let initiator_pubkey = XOnlyPublicKey::from_bech32(message_sender)?;
     send_dm(client, my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
-    let message = Message::new(
-        0,
+    let message = Message::new_dispute(
         Some(order.id),
         None,
         Action::DisputeInitiatedByPeer,

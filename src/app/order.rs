@@ -3,7 +3,7 @@ use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::Message;
 use nostr_sdk::prelude::ToBech32;
 use nostr_sdk::{Client, Event, Keys};
 use sqlx::{Pool, Sqlite};

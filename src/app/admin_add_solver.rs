@@ -43,7 +43,7 @@ pub async fn admin_add_solver_action(
     add_user(&user, pool).await?;
 
     // We create a Message for admin
-    let message = Message::new(None, None, Action::AdminAddSolver, None);
+    let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

@@ -5,7 +5,7 @@ use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};

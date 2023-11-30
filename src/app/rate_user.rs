@@ -2,7 +2,7 @@ use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Content, Message};
 use mostro_core::order::Order;
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -50,7 +50,7 @@ pub async fn update_user_reputation_action(
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -112,7 +112,7 @@ pub async fn update_user_reputation_action(
     // Check if content of Peer is the same of counterpart
     let mut rating = 0_u8;
 
-    if let Content::RatingUser(v) = msg.content.unwrap() {
+    if let Content::RatingUser(v) = msg.get_inner_message_kind().content.to_owned().unwrap() {
         rating = v;
     }
 

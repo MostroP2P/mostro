@@ -50,7 +50,7 @@ pub async fn release_action(
     let message = message.as_json()?;
     send_dm(client, my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer indicating seller released funds
-    let message = Message::new( Some(order.id), None, Action::Release, None);
+    let message = Message::new(Some(order.id), None, Action::Release, None);
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap())?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
@@ -85,7 +85,7 @@ pub async fn release_action(
                         );
                         // Purchase completed message to buyer
                         let message =
-                            Message::new( Some(order.id), None, Action::PurchaseCompleted, None);
+                            Message::new(Some(order.id), None, Action::PurchaseCompleted, None);
                         let message = message.as_json().unwrap();
                         send_dm(&client, &my_keys, &buyer_pubkey, message)
                             .await

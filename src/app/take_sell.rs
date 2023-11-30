@@ -119,7 +119,8 @@ pub async fn take_sell_action(
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_buyer_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone()).await?;
+    edit_master_buyer_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
+        .await?;
     let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
     // Add buyer pubkey to order
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;

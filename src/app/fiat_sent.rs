@@ -31,7 +31,7 @@ pub async fn fiat_sent_action(
     // Check if the pubkey is the buyer
     if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
         // We create a Message
-        let message = Message::cant_do( Some(order.id), None, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

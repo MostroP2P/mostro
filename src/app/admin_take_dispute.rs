@@ -33,7 +33,7 @@ pub async fn admin_take_dispute_action(
     // TODO: solvers also can take disputes
     if event.pubkey.to_bech32()? != mostro_pubkey {
         // We create a Message
-        let message = Message::cant_do( None, None, None);
+        let message = Message::cant_do(None, None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -43,7 +43,7 @@ pub async fn admin_take_dispute_action(
     take_dispute(pool, &Status::InProgress, dispute_id, &event.pubkey).await?;
 
     // We create a Message for admin
-    let message = Message::new( None, None, Action::AdminAddSolver, None);
+    let message = Message::new(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

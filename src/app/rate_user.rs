@@ -65,7 +65,7 @@ pub async fn update_user_reputation_action(
     let message_sender = event.pubkey.to_bech32()?;
 
     if order.status != "Success" {
-        let message = Message::cant_do( Some(order.id), None, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
         error!("Order Id {order_id} wrong status");
@@ -89,7 +89,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::cant_do( Some(order.id), None, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

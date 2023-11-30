@@ -33,7 +33,7 @@ pub async fn admin_add_solver_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_bech32()? != mostro_pubkey {
         // We create a Message
-        let message = Message::cant_do( None, None, None);
+        let message = Message::cant_do(None, None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

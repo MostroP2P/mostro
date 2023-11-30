@@ -331,7 +331,7 @@ pub async fn show_hold_invoice(
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
 
-    let message = Message::new_order( Some(order.id), None, Action::WaitingSellerToPay, None);
+    let message = Message::new_order(Some(order.id), None, Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -438,11 +438,11 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    let message_to_buyer = Message::new_rate_user( order.id, None, None);
+    let message_to_buyer = Message::new_rate_user(order.id, None, None);
     let message_to_buyer = message_to_buyer.as_json().unwrap();
     send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
     // to seller
-    let message_to_seller = Message::new_rate_user( order.id, None, None);
+    let message_to_seller = Message::new_rate_user(order.id, None, None);
     let message_to_seller = message_to_seller.as_json().unwrap();
     send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
 

@@ -37,7 +37,7 @@ pub async fn order_action(
             Some(ref pk) => pk,
             None => {
                 // We create a Message
-                let message = Message::cant_do( order.id, None, None);
+                let message = Message::cant_do(order.id, None, None);
                 let message = message.as_json()?;
                 send_dm(client, my_keys, &event.pubkey, message).await?;
 

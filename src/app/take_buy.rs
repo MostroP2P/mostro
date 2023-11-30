@@ -29,7 +29,7 @@ pub async fn take_buy_action(
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
         // We create a Message
-        let message = Message::cant_do( Some(order.id), None, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -64,7 +64,8 @@ pub async fn take_buy_action(
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_seller_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone()).await?;
+    edit_master_seller_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
+        .await?;
     let seller_pubkey = event.pubkey;
     // Seller can take pending orders only
     if order_status != Status::Pending {

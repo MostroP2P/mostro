@@ -48,7 +48,7 @@ pub async fn dispute_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::cant_do( Some(order.id), None, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -71,7 +71,7 @@ pub async fn dispute_action(
     add_dispute(&dispute, pool).await?;
 
     // We create a Message for the initiator
-    let message = Message::new( Some(order.id), None, Action::DisputeInitiatedByYou, None);
+    let message = Message::new(Some(order.id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;
     let initiator_pubkey = XOnlyPublicKey::from_bech32(message_sender)?;
     send_dm(client, my_keys, &initiator_pubkey, message).await?;

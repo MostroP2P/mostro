@@ -83,8 +83,12 @@ pub async fn release_action(
                             order.id, msg.payment.payment_hash
                         );
                         // Purchase completed message to buyer
-                        let message =
-                            Message::new_order(Some(order.id), None, Action::PurchaseCompleted, None);
+                        let message = Message::new_order(
+                            Some(order.id),
+                            None,
+                            Action::PurchaseCompleted,
+                            None,
+                        );
                         let message = message.as_json().unwrap();
                         send_dm(&client, &my_keys, &buyer_pubkey, message)
                             .await

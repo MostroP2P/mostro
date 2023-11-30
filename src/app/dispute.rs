@@ -77,12 +77,7 @@ pub async fn dispute_action(
     send_dm(client, my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
-    let message = Message::new_dispute(
-        Some(order.id),
-        None,
-        Action::DisputeInitiatedByPeer,
-        None,
-    );
+    let message = Message::new_dispute(Some(order.id), None, Action::DisputeInitiatedByPeer, None);
     let message = message.as_json()?;
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;

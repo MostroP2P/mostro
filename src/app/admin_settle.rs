@@ -43,7 +43,7 @@ pub async fn admin_settle_action(
         d.update(pool).await?;
     }
     // We create a Message
-    let message = Message::new(0, Some(order.id), None, Action::AdminSettle, None);
+    let message = Message::new( Some(order.id), None, Action::AdminSettle, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

@@ -132,7 +132,6 @@ pub async fn publish_order(
 
     // Send message as ack with small order
     let ack_message = Message::new_order(
-        0,
         order.id,
         None,
         Action::NewOrder,
@@ -319,7 +318,6 @@ pub async fn show_hold_invoice(
     new_order.status = Status::WaitingPayment;
     // We create a Message to send the hold invoice to seller
     let message = Message::new_order(
-        0,
         Some(order.id),
         None,
         Action::PayInvoice,
@@ -333,7 +331,7 @@ pub async fn show_hold_invoice(
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
 
-    let message = Message::new_order(0, Some(order.id), None, Action::WaitingSellerToPay, None);
+    let message = Message::new_order( Some(order.id), None, Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -406,7 +404,6 @@ pub async fn set_market_order_sats_amount(
     );
     // We create a Message
     let message = Message::new_order(
-        0,
         Some(order.id),
         None,
         Action::AddInvoice,
@@ -441,11 +438,11 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    let message_to_buyer = Message::new_order(0, order.id, None, Action::RateUser, None);
+    let message_to_buyer = Message::new_rate_user( order.id, None, None);
     let message_to_buyer = message_to_buyer.as_json().unwrap();
     send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
     // to seller
-    let message_to_seller = Message::new_order(0, order.id, None, Action::RateUser, None);
+    let message_to_seller = Message::new_rate_user( order.id, None, None);
     let message_to_seller = message_to_seller.as_json().unwrap();
     send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
 
@@ -474,7 +471,7 @@ pub async fn settle_seller_hold_invoice(
     // Check if the pubkey is right
     if event.pubkey.to_bech32()? != pubkey {
         // We create a Message
-        let message = Message::new_order(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

@@ -42,7 +42,6 @@ pub async fn hold_invoice_paid(hash: &str) {
     if order.buyer_invoice.is_some() {
         // We send a confirmation message to seller
         let message = Message::new_order(
-            0,
             Some(order.id),
             None,
             Action::BuyerTookOrder,
@@ -54,7 +53,6 @@ pub async fn hold_invoice_paid(hash: &str) {
             .unwrap();
         // We send a message to buyer saying seller paid
         let message = Message::new_order(
-            0,
             Some(order.id),
             None,
             Action::HoldInvoicePaymentAccepted,
@@ -74,7 +72,6 @@ pub async fn hold_invoice_paid(hash: &str) {
 
         // We ask to buyer for a new invoice
         let message = Message::new_order(
-            0,
             Some(order.id),
             None,
             Action::AddInvoice,
@@ -85,8 +82,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             .await
             .unwrap();
         // We send a message to seller we are waiting for buyer invoice
-        let message =
-            Message::new_order(0, Some(order.id), None, Action::WaitingBuyerInvoice, None);
+        let message = Message::new_order(Some(order.id), None, Action::WaitingBuyerInvoice, None);
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await

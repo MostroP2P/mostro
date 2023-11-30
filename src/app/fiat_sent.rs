@@ -15,7 +15,7 @@ pub async fn fiat_sent_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -31,7 +31,7 @@ pub async fn fiat_sent_action(
     // Check if the pubkey is the buyer
     if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do( Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -52,8 +52,7 @@ pub async fn fiat_sent_action(
     let peer = Peer::new(event.pubkey.to_bech32()?);
 
     // We create a Message
-    let message = Message::new(
-        0,
+    let message = Message::new_order(
         Some(order.id),
         None,
         Action::FiatSent,
@@ -65,8 +64,7 @@ pub async fn fiat_sent_action(
     let peer = Peer::new(seller_pubkey.to_bech32()?);
 
     // We create a Message
-    let message = Message::new(
-        0,
+    let message = Message::new_order(
         Some(order.id),
         None,
         Action::FiatSent,

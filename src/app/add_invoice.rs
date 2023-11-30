@@ -47,11 +47,9 @@ pub async fn add_invoice_action(
                 | MostroError::WrongAmountError
                 | MostroError::MinAmountError => {
                     // We create a Message
-                    let message = Message::new_order(
-                        0,
+                    let message = Message::cant_do(
                         Some(order.id),
                         None,
-                        Action::CantDo,
                         Some(Content::TextMessage(e.to_string())),
                     );
                     let message = message.as_json()?;
@@ -85,7 +83,7 @@ pub async fn add_invoice_action(
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
         // We create a Message
-        let message = Message::new_order(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None);
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -96,11 +94,9 @@ pub async fn add_invoice_action(
         Status::WaitingBuyerInvoice => {}
         _ => {
             // We create a Message
-            let message = Message::new_order(
-                0,
+            let message = Message::cant_do(
                 Some(order.id),
                 None,
-                Action::CantDo,
                 Some(Content::TextMessage(format!(
                     "Order Id {order_id} status must be WaitingBuyerInvoice!"
                 ))),
@@ -128,7 +124,6 @@ pub async fn add_invoice_action(
         );
         // We send a confirmation message to seller
         let message = Message::new_order(
-            0,
             Some(order.id),
             None,
             Action::BuyerTookOrder,
@@ -139,7 +134,6 @@ pub async fn add_invoice_action(
         send_dm(client, my_keys, &seller_pubkey, message).await?;
         // We send a message to buyer saying seller paid
         let message = Message::new_order(
-            0,
             Some(order.id),
             None,
             Action::HoldInvoicePaymentAccepted,

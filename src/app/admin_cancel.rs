@@ -31,7 +31,7 @@ pub async fn admin_cancel_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_bech32()? != mostro_pubkey {
         // We create a Message
-        let message = Message::new_order(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -58,7 +58,7 @@ pub async fn admin_cancel_action(
     // and update on local database the status and new event id
     update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;
     // We create a Message
-    let message = Message::new_order(0, Some(order.id), None, Action::AdminCancel, None);
+    let message = Message::new(Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

@@ -113,7 +113,9 @@ pub async fn add_invoice_action(
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
         let order_data = SmallOrder::new(
-            order.id,
+            Some(order.id),
+            None,
+            None,
             order.amount,
             order.fiat_code.clone(),
             order.fiat_amount,
@@ -121,13 +123,15 @@ pub async fn add_invoice_action(
             order.premium,
             order.buyer_pubkey.as_ref().cloned(),
             order.seller_pubkey.as_ref().cloned(),
+            None,
+            None,
         );
         // We send a confirmation message to seller
         let message = Message::new_order(
             Some(order.id),
             None,
             Action::BuyerTookOrder,
-            Some(Content::SmallOrder(order_data.clone())),
+            Some(Content::Order(order_data.clone())),
         );
         let message = message.as_json().unwrap();
 
@@ -137,7 +141,7 @@ pub async fn add_invoice_action(
             Some(order.id),
             None,
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::SmallOrder(order_data)),
+            Some(Content::Order(order_data)),
         );
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &buyer_pubkey, message)

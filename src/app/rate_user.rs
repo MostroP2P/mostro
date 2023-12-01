@@ -2,7 +2,7 @@ use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use log::error;
-use mostro_core::message::{Content, Message};
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::Order;
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -160,7 +160,7 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that rated
-        let message = Message::ack_rate_user(Some(order.id), None);
+        let message = Message::new_order(Some(order.id), None, Action::RateReceived, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
     }

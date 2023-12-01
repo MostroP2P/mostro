@@ -101,15 +101,9 @@ pub async fn release_action(
                             .unwrap();
 
                         // Adding here rate process
-                        rate_counterpart(
-                            &client,
-                            &buyer_pubkey,
-                            &seller_pubkey,
-                            &my_keys,
-                            order.as_new_order().clone(),
-                        )
-                        .await
-                        .unwrap();
+                        rate_counterpart(&client, &buyer_pubkey, &seller_pubkey, &my_keys, &order)
+                            .await
+                            .unwrap();
                     }
                 }
             }

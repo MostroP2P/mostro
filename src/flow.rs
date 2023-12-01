@@ -28,7 +28,9 @@ pub async fn hold_invoice_paid(hash: &str) {
 
     // We send this data related to the order to the parties
     let mut order_data = SmallOrder::new(
-        order.id,
+        Some(order.id),
+        None,
+        None,
         order.amount,
         order.fiat_code.clone(),
         order.fiat_amount,
@@ -36,6 +38,8 @@ pub async fn hold_invoice_paid(hash: &str) {
         order.premium,
         master_buyer_pubkey,
         master_seller_pubkey,
+        None,
+        None,
     );
     let status;
 
@@ -45,7 +49,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             Some(order.id),
             None,
             Action::BuyerTookOrder,
-            Some(Content::SmallOrder(order_data.clone())),
+            Some(Content::Order(order_data.clone())),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
@@ -56,7 +60,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             Some(order.id),
             None,
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::SmallOrder(order_data)),
+            Some(Content::Order(order_data)),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &buyer_pubkey, message)
@@ -75,7 +79,7 @@ pub async fn hold_invoice_paid(hash: &str) {
             Some(order.id),
             None,
             Action::AddInvoice,
-            Some(Content::SmallOrder(order_data.clone())),
+            Some(Content::Order(order_data.clone())),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &buyer_pubkey, message)

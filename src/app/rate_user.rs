@@ -2,9 +2,10 @@ use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use log::error;
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::Order;
 use mostro_core::rating::Rating;
-use mostro_core::{Action, Content, Message, NOSTR_REPLACEABLE_EVENT_KIND};
+use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -49,7 +50,7 @@ pub async fn update_user_reputation_action(
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -64,7 +65,7 @@ pub async fn update_user_reputation_action(
     let message_sender = event.pubkey.to_bech32()?;
 
     if order.status != "Success" {
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
         error!("Order Id {order_id} wrong status");
@@ -88,7 +89,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -111,7 +112,7 @@ pub async fn update_user_reputation_action(
     // Check if content of Peer is the same of counterpart
     let mut rating = 0_u8;
 
-    if let Content::RatingUser(v) = msg.content.unwrap() {
+    if let Content::RatingUser(v) = msg.get_inner_message_kind().content.to_owned().unwrap() {
         rating = v;
     }
 
@@ -159,7 +160,7 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that rated
-        let message = Message::new(0, Some(order.id), None, Action::Received, None);
+        let message = Message::new_order(Some(order.id), None, Action::RateReceived, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
     }

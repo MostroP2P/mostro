@@ -6,8 +6,8 @@ use anyhow::Result;
 use log::error;
 use log::info;
 use mostro_core::dispute::Dispute;
+use mostro_core::message::{Action, Message};
 use mostro_core::order::Order;
-use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -19,7 +19,7 @@ pub async fn dispute_action(
     client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -48,7 +48,7 @@ pub async fn dispute_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -71,19 +71,13 @@ pub async fn dispute_action(
     add_dispute(&dispute, pool).await?;
 
     // We create a Message for the initiator
-    let message = Message::new(0, Some(order.id), None, Action::DisputeInitiatedByYou, None);
+    let message = Message::new_dispute(Some(order.id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;
     let initiator_pubkey = XOnlyPublicKey::from_bech32(message_sender)?;
     send_dm(client, my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
-    let message = Message::new(
-        0,
-        Some(order.id),
-        None,
-        Action::DisputeInitiatedByPeer,
-        None,
-    );
+    let message = Message::new_dispute(Some(order.id), None, Action::DisputeInitiatedByPeer, None);
     let message = message.as_json()?;
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;

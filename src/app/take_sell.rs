@@ -5,8 +5,8 @@ use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
+use mostro_core::message::{Content, Message};
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -20,7 +20,7 @@ pub async fn take_sell_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
 
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
@@ -34,9 +34,9 @@ pub async fn take_sell_action(
         return Ok(());
     }
     // We check if the message have a pubkey
-    if msg.pubkey.is_none() {
+    if msg.get_inner_message_kind().pubkey.is_none() {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -47,7 +47,7 @@ pub async fn take_sell_action(
     let pr: Option<String>;
     // If a buyer sent me a lightning invoice we look on db an order with
     // that order id and save the buyer pubkey and invoice fields
-    if let Some(payment_request) = msg.get_payment_request() {
+    if let Some(payment_request) = msg.get_inner_message_kind().get_payment_request() {
         let order_amount = if order.amount == 0 {
             None
         } else {
@@ -64,11 +64,9 @@ pub async fn take_sell_action(
                 | MostroError::WrongAmountError
                 | MostroError::MinAmountError => {
                     // We create a Message
-                    let message = Message::new(
-                        0,
+                    let message = Message::cant_do(
                         Some(order.id),
                         None,
-                        Action::CantDo,
                         Some(Content::TextMessage(e.to_string())),
                     );
                     let message = message.as_json()?;
@@ -114,14 +112,15 @@ pub async fn take_sell_action(
     };
     if seller_pubkey == event.pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_buyer_pubkey_order(pool, order.id, msg.pubkey.clone()).await?;
+    edit_master_buyer_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
+        .await?;
     let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
     // Add buyer pubkey to order
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;

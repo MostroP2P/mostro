@@ -2,8 +2,8 @@ use crate::cli::settings::Settings;
 use crate::util::send_dm;
 
 use log::info;
-use mostro_core::order::Status;
-use mostro_core::{order::SmallOrder, Action, Content, Message};
+use mostro_core::message::{Action, Content, Message};
+use mostro_core::order::{SmallOrder, Status};
 use nostr_sdk::prelude::*;
 
 pub async fn hold_invoice_paid(hash: &str) {
@@ -28,7 +28,9 @@ pub async fn hold_invoice_paid(hash: &str) {
 
     // We send this data related to the order to the parties
     let mut order_data = SmallOrder::new(
-        order.id,
+        Some(order.id),
+        None,
+        None,
         order.amount,
         order.fiat_code.clone(),
         order.fiat_amount,
@@ -36,29 +38,29 @@ pub async fn hold_invoice_paid(hash: &str) {
         order.premium,
         master_buyer_pubkey,
         master_seller_pubkey,
+        None,
+        None,
     );
     let status;
 
     if order.buyer_invoice.is_some() {
         // We send a confirmation message to seller
-        let message = Message::new(
-            0,
+        let message = Message::new_order(
             Some(order.id),
             None,
             Action::BuyerTookOrder,
-            Some(Content::SmallOrder(order_data.clone())),
+            Some(Content::Order(order_data.clone())),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await
             .unwrap();
         // We send a message to buyer saying seller paid
-        let message = Message::new(
-            0,
+        let message = Message::new_order(
             Some(order.id),
             None,
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::SmallOrder(order_data)),
+            Some(Content::Order(order_data)),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &buyer_pubkey, message)
@@ -73,19 +75,18 @@ pub async fn hold_invoice_paid(hash: &str) {
         order_data.amount = new_amount;
 
         // We ask to buyer for a new invoice
-        let message = Message::new(
-            0,
+        let message = Message::new_order(
             Some(order.id),
             None,
             Action::AddInvoice,
-            Some(Content::SmallOrder(order_data.clone())),
+            Some(Content::Order(order_data.clone())),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &buyer_pubkey, message)
             .await
             .unwrap();
         // We send a message to seller we are waiting for buyer invoice
-        let message = Message::new(0, Some(order.id), None, Action::WaitingBuyerInvoice, None);
+        let message = Message::new_order(Some(order.id), None, Action::WaitingBuyerInvoice, None);
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await

@@ -3,8 +3,8 @@ use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use log::error;
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Content, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -18,7 +18,7 @@ pub async fn take_buy_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -27,9 +27,9 @@ pub async fn take_buy_action(
         }
     };
     // We check if the message have a pubkey
-    if msg.pubkey.is_none() {
+    if msg.get_inner_message_kind().pubkey.is_none() {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -57,20 +57,20 @@ pub async fn take_buy_action(
     };
     if buyer_pubkey == event.pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_seller_pubkey_order(pool, order.id, msg.pubkey).await?;
+    edit_master_seller_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
+        .await?;
     let seller_pubkey = event.pubkey;
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
-        let message = Message::new(
-            0,
+        let message = Message::new_order(
             Some(order.id),
             None,
             Action::FiatSent,

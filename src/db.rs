@@ -1,5 +1,5 @@
 use mostro_core::dispute::{Dispute, Status as DisputeStatus};
-use mostro_core::order::{Kind, NewOrder, Order, Status};
+use mostro_core::order::{Kind, Order, SmallOrder, Status};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
@@ -80,7 +80,7 @@ pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result
 
 pub async fn add_order(
     pool: &SqlitePool,
-    order: &NewOrder,
+    order: &SmallOrder,
     event_id: &str,
     initiator_pubkey: &str,
     master_pubkey: &str,
@@ -92,15 +92,20 @@ pub async fn add_order(
     let mut seller_pubkey: Option<String> = None;
     let mut master_seller_pubkey: Option<String> = None;
     let created_at = Timestamp::now();
-    if order.kind == Kind::Buy {
+    let mut kind = "Sell".to_string();
+    if order.kind == Some(Kind::Buy) {
+        kind = "Buy".to_string();
         buyer_pubkey = Some(initiator_pubkey.to_string());
         master_buyer_pubkey = Some(master_pubkey.to_string());
     } else {
         seller_pubkey = Some(initiator_pubkey.to_string());
         master_seller_pubkey = Some(master_pubkey.to_string());
     }
-    let kind = order.kind.to_string();
-    let status = order.status.to_string();
+    let status = if let Some(status) = order.status {
+        status.to_string()
+    } else {
+        "Pending".to_string()
+    };
     let price_from_api = order.amount == 0;
 
     let order = sqlx::query_as::<_, Order>(

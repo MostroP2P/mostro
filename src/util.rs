@@ -9,8 +9,8 @@ use crate::{db, flow};
 
 use anyhow::{Context, Result};
 use log::{error, info};
-use mostro_core::order::{Kind as OrderKind, NewOrder, Order, SmallOrder, Status};
-use mostro_core::{Action, Content, Message};
+use mostro_core::message::{Action, Content, Message};
+use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx::types::chrono::Utc;
 use sqlx::SqlitePool;
@@ -88,21 +88,22 @@ pub async fn publish_order(
     pool: &SqlitePool,
     client: &Client,
     keys: &Keys,
-    new_order: &NewOrder,
+    new_order: &SmallOrder,
     initiator_pubkey: &str,
     master_pubkey: &str,
     ack_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
     let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
     let order_id = order.id;
+    let kind = OrderKind::from_str(&order.kind).unwrap();
     info!("New order saved Id: {}", order_id);
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&order);
     // Now we have the order id, we can create a new event adding this id to the Order object
-    let order = NewOrder::new(
+    let order = SmallOrder::new(
         Some(order_id),
-        OrderKind::from_str(&order.kind).unwrap(),
-        Status::Pending,
+        Some(kind),
+        Some(Status::Pending),
         order.amount,
         order.fiat_code,
         order.fiat_amount,
@@ -111,7 +112,7 @@ pub async fn publish_order(
         None,
         None,
         None,
-        Utc::now().timestamp(),
+        Some(Utc::now().timestamp()),
     );
     let order_string = order.as_json().unwrap();
     info!("serialized order: {order_string}");
@@ -131,11 +132,10 @@ pub async fn publish_order(
     .await?;
 
     // Send message as ack with small order
-    let ack_message = Message::new(
-        0,
+    let ack_message = Message::new_order(
         order.id,
         None,
-        Action::Order,
+        Action::NewOrder,
         Some(Content::Order(order.clone())),
     );
     let ack_message = ack_message.as_json()?;
@@ -211,10 +211,10 @@ pub async fn update_order_event(
 ) -> Result<()> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let amount = amount.unwrap_or(order.amount);
-    let publish_order = NewOrder::new(
+    let publish_order = SmallOrder::new(
         Some(order.id),
-        kind,
-        status,
+        Some(kind),
+        Some(status),
         amount,
         order.fiat_code.to_owned(),
         order.fiat_amount,
@@ -223,7 +223,7 @@ pub async fn update_order_event(
         None,
         None,
         None,
-        order.created_at,
+        Some(order.created_at),
     );
     let order_content = publish_order.as_json()?;
     let mut order = order.clone();
@@ -316,10 +316,9 @@ pub async fn show_hold_invoice(
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
     let mut new_order = order.as_new_order();
-    new_order.status = Status::WaitingPayment;
+    new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
-    let message = Message::new(
-        0,
+    let message = Message::new_order(
         Some(order.id),
         None,
         Action::PayInvoice,
@@ -333,7 +332,7 @@ pub async fn show_hold_invoice(
     // We send the hold invoice to the seller
     send_dm(client, my_keys, seller_pubkey, message).await?;
 
-    let message = Message::new(0, Some(order.id), None, Action::WaitingSellerToPay, None);
+    let message = Message::new_order(Some(order.id), None, Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -395,7 +394,9 @@ pub async fn set_market_order_sats_amount(
 
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
-        order.id,
+        Some(order.id),
+        None,
+        None,
         buyer_final_amount,
         order.fiat_code.clone(),
         order.fiat_amount,
@@ -403,14 +404,15 @@ pub async fn set_market_order_sats_amount(
         order.premium,
         None,
         None,
+        None,
+        None,
     );
     // We create a Message
-    let message = Message::new(
-        0,
+    let message = Message::new_order(
         Some(order.id),
         None,
         Action::AddInvoice,
-        Some(Content::SmallOrder(order_data)),
+        Some(Content::Order(order_data)),
     );
     let message = message.as_json()?;
 
@@ -437,17 +439,15 @@ pub async fn rate_counterpart(
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
     my_keys: &Keys,
-    order: NewOrder,
+    order: &Order,
 ) -> Result<()> {
     // Send dm to counterparts
+    let message_to_parties = Message::new_order(Some(order.id), None, Action::RateUser, None);
+    let message_to_parties = message_to_parties.as_json().unwrap();
     // to buyer
-    let message_to_buyer = Message::new(0, order.id, None, Action::RateUser, None);
-    let message_to_buyer = message_to_buyer.as_json().unwrap();
-    send_dm(client, my_keys, buyer_pubkey, message_to_buyer).await?;
+    send_dm(client, my_keys, buyer_pubkey, message_to_parties.clone()).await?;
     // to seller
-    let message_to_seller = Message::new(0, order.id, None, Action::RateUser, None);
-    let message_to_seller = message_to_seller.as_json().unwrap();
-    send_dm(client, my_keys, seller_pubkey, message_to_seller).await?;
+    send_dm(client, my_keys, seller_pubkey, message_to_parties).await?;
 
     Ok(())
 }
@@ -474,7 +474,7 @@ pub async fn settle_seller_hold_invoice(
     // Check if the pubkey is right
     if event.pubkey.to_bech32()? != pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 

@@ -5,8 +5,8 @@ use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
 use log::{error, info};
 use mostro_core::dispute::Status as DisputeStatus;
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -19,7 +19,7 @@ pub async fn admin_cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -31,7 +31,7 @@ pub async fn admin_cancel_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_bech32()? != mostro_pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -58,7 +58,7 @@ pub async fn admin_cancel_action(
     // and update on local database the status and new event id
     update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;
     // We create a Message
-    let message = Message::new(0, Some(order.id), None, Action::AdminCancel, None);
+    let message = Message::new_dispute(Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;

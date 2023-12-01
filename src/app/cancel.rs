@@ -6,8 +6,8 @@ use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
 use log::{error, info};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -20,7 +20,7 @@ pub async fn cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -33,7 +33,7 @@ pub async fn cancel_action(
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
             // We create a Message
-            let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+            let message = Message::cant_do(Some(order.id), None, None);
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
         } else {
@@ -41,7 +41,7 @@ pub async fn cancel_action(
             // and update on local database the status and new event id
             update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
             // We create a Message for cancel
-            let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
+            let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
         }
@@ -74,7 +74,7 @@ pub async fn cancel_action(
             Some(ref initiator_pubkey) => {
                 if initiator_pubkey == &user_pubkey {
                     // We create a Message
-                    let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+                    let message = Message::cant_do(Some(order.id), None, None);
                     let message = message.as_json()?;
                     send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -103,8 +103,7 @@ pub async fn cancel_action(
                     )
                     .await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
-                    let message = Message::new(
-                        0,
+                    let message = Message::new_order(
                         Some(order.id),
                         None,
                         Action::CooperativeCancelAccepted,
@@ -122,8 +121,7 @@ pub async fn cancel_action(
                 // update db
                 init_cancel_order(pool, &order).await?;
                 // We create a Message to start a cooperative cancel and send it to both parties
-                let message = Message::new(
-                    0,
+                let message = Message::new_order(
                     Some(order.id),
                     None,
                     Action::CooperativeCancelInitiatedByYou,
@@ -131,8 +129,7 @@ pub async fn cancel_action(
                 );
                 let message = message.as_json()?;
                 send_dm(client, my_keys, &event.pubkey, message).await?;
-                let message = Message::new(
-                    0,
+                let message = Message::new_order(
                     Some(order.id),
                     None,
                     Action::CooperativeCancelInitiatedByPeer,
@@ -167,7 +164,7 @@ pub async fn cancel_add_invoice(
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
     if buyer_pubkey_bech32 != &user_pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -187,7 +184,7 @@ pub async fn cancel_add_invoice(
         )
         .await?;
         // We create a Message for cancel
-        let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
+        let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;
@@ -230,7 +227,7 @@ pub async fn cancel_pay_hold_invoice(
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey_bech32)?;
     if seller_pubkey_bech32 != &user_pubkey {
         // We create a Message
-        let message = Message::new(0, Some(order.id), None, Action::CantDo, None);
+        let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;
 
@@ -242,7 +239,7 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
         // We create a Message for cancel
-        let message = Message::new(0, Some(order.id), None, Action::Cancel, None);
+        let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
         send_dm(client, my_keys, &seller_pubkey, message).await?;

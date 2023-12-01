@@ -5,8 +5,8 @@ use crate::util::{rate_counterpart, send_dm, update_order_event};
 
 use anyhow::Result;
 use log::{error, info};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
-use mostro_core::{Action, Message};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -21,7 +21,7 @@ pub async fn release_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.order_id.unwrap();
+    let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -40,8 +40,7 @@ pub async fn release_action(
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
-    let message = Message::new(
-        0,
+    let message = Message::new_order(
         Some(order.id),
         None,
         Action::HoldInvoicePaymentSettled,
@@ -50,7 +49,7 @@ pub async fn release_action(
     let message = message.as_json()?;
     send_dm(client, my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer indicating seller released funds
-    let message = Message::new(0, Some(order.id), None, Action::Release, None);
+    let message = Message::new_order(Some(order.id), None, Action::Release, None);
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap())?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
@@ -84,8 +83,12 @@ pub async fn release_action(
                             order.id, msg.payment.payment_hash
                         );
                         // Purchase completed message to buyer
-                        let message =
-                            Message::new(0, Some(order.id), None, Action::PurchaseCompleted, None);
+                        let message = Message::new_order(
+                            Some(order.id),
+                            None,
+                            Action::PurchaseCompleted,
+                            None,
+                        );
                         let message = message.as_json().unwrap();
                         send_dm(&client, &my_keys, &buyer_pubkey, message)
                             .await
@@ -98,15 +101,9 @@ pub async fn release_action(
                             .unwrap();
 
                         // Adding here rate process
-                        rate_counterpart(
-                            &client,
-                            &buyer_pubkey,
-                            &seller_pubkey,
-                            &my_keys,
-                            order.as_new_order().clone(),
-                        )
-                        .await
-                        .unwrap();
+                        rate_counterpart(&client, &buyer_pubkey, &seller_pubkey, &my_keys, &order)
+                            .await
+                            .unwrap();
                     }
                 }
             }

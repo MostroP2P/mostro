@@ -12,7 +12,6 @@ use log::{error, info};
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
-use sqlx::types::chrono::Utc;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
 use std::fmt::Write;
@@ -377,12 +376,14 @@ pub async fn set_market_order_sats_amount(
     let rounded_fee = sub_fee.round();
 
     let buyer_final_amount = new_sats_amount - rounded_fee as i64;
+    let kind = OrderKind::from_str(&order.kind).unwrap();
+    let status = Status::from_str(&order.status).unwrap();
 
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),
-        None,
-        None,
+        Some(kind),
+        Some(status),
         buyer_final_amount,
         order.fiat_code.clone(),
         order.fiat_amount,

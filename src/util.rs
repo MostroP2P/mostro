@@ -95,29 +95,13 @@ pub async fn publish_order(
 ) -> Result<()> {
     let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
     let order_id = order.id;
-    let kind = OrderKind::from_str(&order.kind).unwrap();
     info!("New order saved Id: {}", order_id);
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&order);
-    // Now we have the order id, we can create a new event adding this id to the Order object
-    let order = SmallOrder::new(
-        Some(order_id),
-        Some(kind),
-        Some(Status::Pending),
-        order.amount,
-        order.fiat_code,
-        order.fiat_amount,
-        order.payment_method,
-        order.premium,
-        None,
-        None,
-        None,
-        Some(Utc::now().timestamp()),
-    );
-    let order_string = order.as_json().unwrap();
-    info!("serialized order: {order_string}");
+
+    info!("order tags to be published: {:#?}", tags);
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, order_string, order_id.to_string(), tags)?;
+    let event = new_event(keys, "".to_string(), order_id.to_string(), tags)?;
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
@@ -130,13 +114,15 @@ pub async fn publish_order(
         order.amount,
     )
     .await?;
+    let mut order = order.as_new_order();
+    order.id = Some(order_id);
 
     // Send message as ack with small order
     let ack_message = Message::new_order(
         order.id,
         None,
         Action::NewOrder,
-        Some(Content::Order(order.clone())),
+        Some(Content::Order(order)),
     );
     let ack_message = ack_message.as_json()?;
 

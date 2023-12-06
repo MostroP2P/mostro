@@ -4,11 +4,13 @@ After a successful trade Mostro send a nip04 event to both parties to let them k
 
 ```json
 {
-  "version": "0",
-  "order_id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
-  "pubkey": null,
-  "action": "RateUser",
-  "content": null
+  "Order": {
+    "version": "1",
+    "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
+    "pubkey": null,
+    "action": "RateUser",
+    "content": null
+  }
 }
 ```
 
@@ -16,26 +18,30 @@ After a Mostro client receive this message, the user can rate the other party, t
 
 ```json
 {
-  "version": "0",
-  "order_id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
-  "pubkey": null,
-  "action": "RateUser",
-  "content": {
-    "RatingUser": 5 // User input
+  "Order": {
+    "version": "1",
+    "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
+    "pubkey": null,
+    "action": "RateUser",
+    "content": {
+      "RatingUser": 5 // User input
+    }
   }
 }
 ```
 
 ## Confirmation message
 
-If Mostro received the message correct it will send back a last confirmation message to the user with `Action: Received`:
+If Mostro received the correct message, it will send back a confirmation message to the user with `Action: RateReceived`:
 
 ```json
 {
-  "version": "0",
-  "order_id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
-  "pubkey": null,
-  "action": "Received",
-  "content": null
+  "Order": {
+    "version": "1",
+    "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
+    "pubkey": null,
+    "action": "RateReceived",
+    "content": null
+  }
 }
 ```

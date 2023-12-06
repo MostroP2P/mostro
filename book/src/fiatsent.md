@@ -4,11 +4,13 @@ After the buyer sends the fiat money to the seller, the buyer should send a mess
 
 ```json
 {
-  "version": "0",
-  "order_id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-  "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
-  "action": "FiatSent",
-  "content": null
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": null,
+    "action": "FiatSent",
+    "content": null
+  }
 }
 ```
 
@@ -18,29 +20,33 @@ Mostro send a messages to both parties confirming `FiatSent` action and sending 
 
 ```json
 {
-  "version": "0",
-  "order_id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-  "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
-  "action": "FiatSent",
-  "content": {
-    "Peer": {
-      "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2"
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
+    "action": "FiatSent",
+    "content": {
+      "Peer": {
+        "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2"
+      }
     }
   }
 }
 ```
 
-And here an example of the message to the seller:
+And here an example of the message from Mostro to the seller:
 
 ```json
 {
-  "version": "0",
-  "order_id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-  "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2",
-  "action": "FiatSent",
-  "content": {
-    "Peer": {
-      "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj"
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2",
+    "action": "FiatSent",
+    "content": {
+      "Peer": {
+        "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj"
+      }
     }
   }
 }

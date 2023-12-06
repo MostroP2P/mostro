@@ -7,7 +7,7 @@ use anyhow::Result;
 use log::error;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::SmallOrder;
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -73,6 +73,15 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     };
+
+    let order_kind = match Kind::from_str(&order.kind) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Order Id {order_id} wrong kind: {e:?}");
+            return Ok(());
+        }
+    };
+
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
         None => {
@@ -114,8 +123,8 @@ pub async fn add_invoice_action(
         // We send this data related to the order to the parties
         let order_data = SmallOrder::new(
             Some(order.id),
-            None,
-            None,
+            Some(order_kind),
+            Some(order_status),
             order.amount,
             order.fiat_code.clone(),
             order.fiat_amount,

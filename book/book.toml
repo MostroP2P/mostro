@@ -3,4 +3,4 @@ authors = ["Francisco Calderón"]
 language = "en"
 multilingual = false
 src = "src"
-title = "Mostro"
+title = "Mostro messages specs"

@@ -1,10 +1,12 @@
 use crate::cli::settings::Settings;
 use crate::util::send_dm;
 
+use log::error;
 use log::info;
 use mostro_core::message::{Action, Content, Message};
-use mostro_core::order::{SmallOrder, Status};
+use mostro_core::order::{Kind, SmallOrder, Status};
 use nostr_sdk::prelude::*;
+use std::str::FromStr;
 
 pub async fn hold_invoice_paid(hash: &str) {
     let pool = crate::db::connect().await.unwrap();
@@ -25,11 +27,18 @@ pub async fn hold_invoice_paid(hash: &str) {
         master_buyer_pubkey = order.master_buyer_pubkey.clone();
         master_seller_pubkey = order.master_seller_pubkey.clone();
     }
+    let order_kind = match Kind::from_str(&order.kind) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Order Id {} wrong kind: {:?}", order.id, e);
+            return;
+        }
+    };
 
     // We send this data related to the order to the parties
     let mut order_data = SmallOrder::new(
         Some(order.id),
-        None,
+        Some(order_kind),
         None,
         order.amount,
         order.fiat_code.clone(),
@@ -51,6 +60,8 @@ pub async fn hold_invoice_paid(hash: &str) {
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
         );
+        status = Status::Active;
+        order_data.status = Some(status);
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await
@@ -66,14 +77,14 @@ pub async fn hold_invoice_paid(hash: &str) {
         send_dm(&client, &my_keys, &buyer_pubkey, message)
             .await
             .unwrap();
-        status = Status::Active;
     } else {
         let mostro_settings = Settings::get_mostro();
         let sub_fee = mostro_settings.fee * order_data.amount as f64;
         let rounded_fee = sub_fee.round();
         let new_amount = order_data.amount - rounded_fee as i64;
         order_data.amount = new_amount;
-
+        status = Status::WaitingBuyerInvoice;
+        order_data.status = Some(status);
         // We ask to buyer for a new invoice
         let message = Message::new_order(
             Some(order.id),
@@ -91,7 +102,6 @@ pub async fn hold_invoice_paid(hash: &str) {
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await
             .unwrap();
-        status = Status::WaitingBuyerInvoice;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id

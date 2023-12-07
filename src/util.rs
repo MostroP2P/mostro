@@ -100,7 +100,7 @@ pub async fn publish_order(
 
     info!("order tags to be published: {:#?}", tags);
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "".to_string(), order_id.to_string(), tags)?;
+    let event = new_event(keys, "", order_id.to_string(), tags)?;
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
@@ -170,7 +170,7 @@ pub async fn update_user_rating_event(
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // nip33 kind with user as identifier
-    let event = new_event(keys, "".to_string(), user.to_string(), tags)?;
+    let event = new_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -194,30 +194,14 @@ pub async fn update_order_event(
     order: &Order,
     amount: Option<i64>,
 ) -> Result<()> {
-    let kind = OrderKind::from_str(&order.kind).unwrap();
     let amount = amount.unwrap_or(order.amount);
-    let publish_order = SmallOrder::new(
-        Some(order.id),
-        Some(kind),
-        Some(status),
-        amount,
-        order.fiat_code.to_owned(),
-        order.fiat_amount,
-        order.payment_method.to_owned(),
-        order.premium,
-        None,
-        None,
-        None,
-        Some(order.created_at),
-    );
-    let order_content = publish_order.as_json()?;
     let mut order = order.clone();
     // update order.status with new status
     order.status = status.to_string();
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&order);
     // nip33 kind with order id as identifier and order fields as tags
-    let event = new_event(keys, order_content, order.id.to_string(), tags)?;
+    let event = new_event(keys, "", order.id.to_string(), tags)?;
     let event_id = event.id.to_string();
     let status_str = status.to_string();
     info!("Sending replaceable event: {event:#?}");
@@ -228,10 +212,9 @@ pub async fn update_order_event(
         order.id, status_str
     );
 
-    client.send_event(event).await.map(|_s| ()).map_err(|err| {
-        error!("{}", err);
-        err.into()
-    })
+    client.send_event(event).await?;
+
+    Ok(())
 }
 
 pub async fn connect_nostr() -> Result<Client> {

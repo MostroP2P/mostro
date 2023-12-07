@@ -17,7 +17,7 @@ use nostr_sdk::prelude::*;
 ///
 pub fn new_event(
     keys: &Keys,
-    content: String,
+    content: &str,
     identifier: String,
     extra_tags: Vec<(String, String)>,
 ) -> Result<Event, Error> {

@@ -87,7 +87,7 @@ pub async fn dispute_action(
         ("name".to_string(), "dispute".to_string()),
     ];
     // nip33 kind with dispute id as identifier
-    let event = new_event(my_keys, "".to_string(), dispute.id.to_string(), tags)?;
+    let event = new_event(my_keys, "", dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
     client.send_event(event).await?;
 

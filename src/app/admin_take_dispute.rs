@@ -42,8 +42,6 @@ pub async fn admin_take_dispute_action(
 
         return Ok(());
     }
-    // TODO: update dispute nostr event status
-
     take_dispute(pool, &Status::InProgress, dispute_id, &event.pubkey).await?;
 
     // We create a Message for admin

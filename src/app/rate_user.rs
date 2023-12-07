@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 pub async fn get_counterpart_reputation(
-    user: &String,
+    user: &str,
     my_keys: &Keys,
     client: &Client,
 ) -> Result<Option<Rating>> {

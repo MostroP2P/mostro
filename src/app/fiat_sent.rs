@@ -19,21 +19,27 @@ pub async fn fiat_sent_action(
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("FiatSent: Order Id {order_id} not found!");
+            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
-    // TODO: send to user a DM with the error
+    // Send to user a DM with the error
     if order.status != "Active" {
-        error!("Order Id {order_id} wrong status");
+        let error = "Order Id {order_id} wrong status";
+        error!("{}", error);
+        let message = Message::cant_do(
+            Some(order.id),
+            None,
+            Some(Content::TextMessage(error.to_string())),
+        );
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
+
         return Ok(());
     }
     // Check if the pubkey is the buyer
     if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
-        // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
         return Ok(());
     }
@@ -72,5 +78,6 @@ pub async fn fiat_sent_action(
     );
     let message = message.as_json()?;
     send_dm(client, my_keys, &event.pubkey, message).await?;
+
     Ok(())
 }

@@ -8,7 +8,7 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::{db, flow};
 
 use anyhow::{Context, Result};
-use log::{error, info};
+use log::info;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;

@@ -1,4 +1,3 @@
-use crate::db::add_user;
 use crate::util::send_dm;
 
 use anyhow::Result;
@@ -7,6 +6,7 @@ use mostro_core::message::{Action, Content, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
+use sqlx_crud::Crud;
 
 pub async fn admin_add_solver_action(
     msg: Message,
@@ -40,7 +40,8 @@ pub async fn admin_add_solver_action(
         return Ok(());
     }
     let user = User::new(npubkey.to_string(), 0, 1, 0, 0);
-    add_user(&user, pool).await?;
+    // Use CRUD to create user
+    user.create(pool).await?;
 
     // We create a Message for admin
     let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);

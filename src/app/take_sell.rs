@@ -139,7 +139,7 @@ pub async fn take_sell_action(
             pr,
             &buyer_pubkey,
             &seller_pubkey,
-            &order,
+            &mut order,
         )
         .await?;
     }

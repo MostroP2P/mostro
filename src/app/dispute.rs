@@ -1,4 +1,4 @@
-use crate::db::{add_dispute, update_order_buyer_dispute, update_order_seller_dispute};
+use crate::db::{update_order_buyer_dispute, update_order_seller_dispute};
 use crate::nip33::new_event;
 use crate::util::send_dm;
 
@@ -68,7 +68,8 @@ pub async fn dispute_action(
         return Ok(());
     };
     let dispute = Dispute::new(order.id);
-    add_dispute(&dispute, pool).await?;
+    // Use CRUD create method
+    dispute.create(pool).await?;
 
     // We create a Message for the initiator
     let message = Message::new_order(Some(order.id), None, Action::DisputeInitiatedByYou, None);

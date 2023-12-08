@@ -1,4 +1,3 @@
-use crate::db::edit_buyer_invoice_order;
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, show_hold_invoice};
@@ -23,7 +22,7 @@ pub async fn add_invoice_action(
     let order_msg = msg.get_inner_message_kind();
     // Safe unwrap as we verified the message
     let order_id = order_msg.id.unwrap();
-    let order = match Order::by_id(pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -118,7 +117,9 @@ pub async fn add_invoice_action(
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
     // We save the invoice on db
-    edit_buyer_invoice_order(pool, order.id, &pr).await?;
+    order.buyer_invoice = Some(pr.clone());
+    order.update(pool).await?;
+
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
         let order_data = SmallOrder::new(
@@ -170,7 +171,7 @@ pub async fn add_invoice_action(
             None,
             &buyer_pubkey,
             &seller_pubkey,
-            &order,
+            &mut order,
         )
         .await?;
     }

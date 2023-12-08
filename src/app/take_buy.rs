@@ -108,7 +108,7 @@ pub async fn take_buy_action(
         None,
         &buyer_pubkey,
         &seller_pubkey,
-        &order,
+        &mut order,
     )
     .await?;
     Ok(())

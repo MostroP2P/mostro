@@ -1,6 +1,4 @@
-use mostro_core::dispute::{Dispute, Status as DisputeStatus};
 use mostro_core::order::{Kind, Order, SmallOrder, Status};
-use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -20,62 +18,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let pool = SqlitePool::connect(&db_url).await?;
 
     Ok(pool)
-}
-
-pub async fn add_user(user: &User, pool: &SqlitePool) -> anyhow::Result<User> {
-    let mut conn = pool.acquire().await?;
-    let user = sqlx::query_as::<_, User>(
-        r#"
-        INSERT INTO users (
-        id,
-        pubkey,
-        is_admin,
-        is_solver,
-        is_banned,
-        category,
-        created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        RETURNING *
-      "#,
-    )
-    .bind(user.id)
-    .bind(&user.pubkey)
-    .bind(user.is_admin)
-    .bind(user.is_solver)
-    .bind(user.is_banned)
-    .bind(user.category)
-    .bind(user.created_at)
-    .fetch_one(&mut conn)
-    .await?;
-
-    Ok(user)
-}
-
-pub async fn add_dispute(dispute: &Dispute, pool: &SqlitePool) -> anyhow::Result<Dispute> {
-    let mut conn = pool.acquire().await?;
-    let dispute = sqlx::query_as::<_, Dispute>(
-        r#"
-        INSERT INTO disputes (
-        id,
-        order_id,
-        status,
-        solver_pubkey,
-        created_at,
-        taken_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        RETURNING *
-      "#,
-    )
-    .bind(dispute.id)
-    .bind(dispute.order_id)
-    .bind(&dispute.status.to_string())
-    .bind(&dispute.solver_pubkey)
-    .bind(dispute.created_at)
-    .bind(dispute.taken_at)
-    .fetch_one(&mut conn)
-    .await?;
-
-    Ok(dispute)
 }
 
 pub async fn add_order(
@@ -153,68 +95,6 @@ pub async fn add_order(
     .await?;
 
     Ok(order)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn edit_order(
-    pool: &SqlitePool,
-    status: &Status,
-    order_id: Uuid,
-    buyer_pubkey: &XOnlyPublicKey,
-    seller_pubkey: &XOnlyPublicKey,
-    preimage: &str,
-    hash: &str,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let status = status.to_string();
-    let buyer_pubkey = buyer_pubkey.to_bech32()?;
-    let seller_pubkey = seller_pubkey.to_bech32()?;
-    let rows_affected = sqlx::query!(
-        r#"
-    UPDATE orders
-    SET
-    buyer_pubkey = ?1,
-    seller_pubkey = ?2,
-    status = ?3,
-    preimage = ?4,
-    hash = ?5
-    WHERE id = ?6
-    "#,
-        buyer_pubkey,
-        seller_pubkey,
-        status,
-        preimage,
-        hash,
-        order_id
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn edit_buyer_invoice_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    buyer_invoice: &str,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            buyer_invoice = ?1
-            WHERE id = ?2
-        "#,
-        buyer_invoice,
-        order_id
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
 }
 
 pub async fn edit_buyer_pubkey_order(
@@ -299,67 +179,6 @@ pub async fn update_order_event_id_status(
     .rows_affected();
 
     Ok(rows_affected > 0)
-}
-
-pub async fn update_order_event_seller_rate(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    seller_sent_rate: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            seller_sent_rate = ?1
-            WHERE id = ?2
-        "#,
-        seller_sent_rate,
-        order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn update_order_event_buyer_rate(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    buyer_sent_rate: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            buyer_sent_rate = ?1
-            WHERE id = ?2
-        "#,
-        buyer_sent_rate,
-        order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn find_order_by_event_id(pool: &SqlitePool, event_id: &str) -> anyhow::Result<Order> {
-    let order = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE event_id = ?1
-        "#,
-    )
-    .bind(event_id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(order)
 }
 
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result<Order> {
@@ -452,29 +271,6 @@ pub async fn update_order_to_initial_state(
     Ok(rows_affected > 0)
 }
 
-pub async fn init_cancel_order(pool: &SqlitePool, order: &Order) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            cancel_initiator_pubkey = ?1,
-            buyer_cooperativecancel = ?2,
-            seller_cooperativecancel = ?3
-            WHERE id = ?4
-        "#,
-        order.cancel_initiator_pubkey,
-        order.buyer_cooperativecancel,
-        order.seller_cooperativecancel,
-        order.id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
 pub async fn edit_master_buyer_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -521,110 +317,6 @@ pub async fn edit_master_seller_pubkey_order(
     Ok(rows_affected > 0)
 }
 
-pub async fn find_order_by_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Order> {
-    let order = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE id = ?1
-        "#,
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(order)
-}
-
-pub async fn find_dispute_by_order_id(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Dispute> {
-    let dispute = sqlx::query_as::<_, Dispute>(
-        r#"
-          SELECT *
-          FROM disputes
-          WHERE order_id = ?1
-        "#,
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await;
-
-    match dispute {
-        Ok(dispute) => Ok(dispute),
-        Err(_) => Err(anyhow::anyhow!("Dispute not found!")),
-    }
-}
-
-pub async fn update_order_buyer_dispute(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    buyer_dispute: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            buyer_dispute = ?1,
-            status = 'Dispute'
-            WHERE id = ?2
-        "#,
-        buyer_dispute,
-        order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn update_order_seller_dispute(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    seller_dispute: bool,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            seller_dispute = ?1,
-            status = 'Dispute'
-            WHERE id = ?2
-        "#,
-        seller_dispute,
-        order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn update_order_taken_at_time(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    taken_at: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            taken_at = ?1
-            WHERE id = ?2
-        "#,
-        taken_at,
-        order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
 pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
     let taken_at = 0;
@@ -661,62 +353,6 @@ pub async fn update_order_invoice_held_at_time(
         "#,
         invoice_held_at,
         order_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn take_dispute(
-    pool: &SqlitePool,
-    status: &DisputeStatus,
-    dispute_id: Uuid,
-    solver_pubkey: &XOnlyPublicKey,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let status = status.to_string();
-    let solver_pubkey = solver_pubkey.to_bech32()?;
-    let taken_at = Timestamp::now();
-    let taken_at = taken_at.as_i64();
-    let rows_affected = sqlx::query!(
-        r#"
-    UPDATE disputes
-    SET
-    solver_pubkey = ?1,
-    status = ?2,
-    taken_at = ?3
-    WHERE id = ?4
-    "#,
-        solver_pubkey,
-        status,
-        taken_at,
-        dispute_id,
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn set_dispute_status(
-    pool: &SqlitePool,
-    dispute_id: Uuid,
-    status: &DisputeStatus,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let status = status.to_string();
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE disputes
-            SET
-            status = ?1
-            WHERE id = ?2
-        "#,
-        status,
-        dispute_id
     )
     .execute(&mut conn)
     .await?

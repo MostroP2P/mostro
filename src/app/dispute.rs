@@ -1,16 +1,14 @@
-use crate::db::{add_dispute, update_order_buyer_dispute, update_order_seller_dispute};
 use crate::nip33::new_event;
 use crate::util::send_dm;
 
 use anyhow::Result;
-use log::error;
-use log::info;
 use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use tracing::{error, info};
 
 pub async fn dispute_action(
     msg: Message,
@@ -20,7 +18,7 @@ pub async fn dispute_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
-    let order = match Order::by_id(pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -28,8 +26,8 @@ pub async fn dispute_action(
         }
     };
 
-    let buyer = order.buyer_pubkey.unwrap();
-    let seller = order.seller_pubkey.unwrap();
+    let buyer = order.buyer_pubkey.clone().unwrap();
+    let seller = order.seller_pubkey.clone().unwrap();
     let message_sender = event.pubkey.to_bech32()?;
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
@@ -59,16 +57,23 @@ pub async fn dispute_action(
     let mut update_buyer_dispute = false;
     if seller_dispute && !order.seller_dispute {
         update_seller_dispute = true;
-        update_order_seller_dispute(pool, order_id, update_seller_dispute).await?;
+        order.seller_dispute = update_seller_dispute;
     } else if buyer_dispute && !order.buyer_dispute {
         update_buyer_dispute = true;
-        update_order_buyer_dispute(pool, order_id, update_buyer_dispute).await?;
+        order.buyer_dispute = update_buyer_dispute;
     };
+
+    // Update the database with dispute information
+    // Save the dispute to DB
     if !update_buyer_dispute && !update_seller_dispute {
         return Ok(());
-    };
+    } else {
+        // Need to update dispute status
+        order.update(pool).await?;
+    }
     let dispute = Dispute::new(order.id);
-    add_dispute(&dispute, pool).await?;
+    // Use CRUD create method
+    dispute.create(pool).await?;
 
     // We create a Message for the initiator
     let message = Message::new_order(Some(order.id), None, Action::DisputeInitiatedByYou, None);

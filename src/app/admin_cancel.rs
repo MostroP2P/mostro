@@ -1,15 +1,15 @@
-use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
-use log::{error, info};
+use mostro_core::dispute::Dispute;
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use tracing::{error, info};
 
 pub async fn admin_cancel_action(
     msg: Message,
@@ -46,9 +46,9 @@ pub async fn admin_cancel_action(
     }
 
     // we check if there is a dispute
-    let dispute = find_dispute_by_order_id(pool, order_id).await;
+    let dispute = Dispute::by_id(pool, order_id).await?;
 
-    if let Ok(mut d) = dispute {
+    if let Some(mut d) = dispute {
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded;
         d.update(pool).await?;

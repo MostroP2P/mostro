@@ -4,7 +4,6 @@ use crate::util::{connect_nostr, get_keys, settle_seller_hold_invoice};
 use crate::util::{rate_counterpart, send_dm, update_order_event};
 
 use anyhow::Result;
-use log::{error, info};
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
@@ -12,6 +11,7 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
+use tracing::{error, info};
 
 pub async fn release_action(
     msg: Message,

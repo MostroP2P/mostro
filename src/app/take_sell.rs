@@ -4,13 +4,13 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
-use log::error;
 use mostro_core::message::{Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use tracing::error;
 
 pub async fn take_sell_action(
     msg: Message,
@@ -126,7 +126,8 @@ pub async fn take_sell_action(
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;
     // Timestamp take order time
     if order.taken_at == 0 {
-        crate::db::update_order_taken_at_time(pool, order.id, Timestamp::now().as_i64()).await?;
+        order.taken_at = Timestamp::now().as_i64();
+        order.update(pool).await?;
     }
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
@@ -139,7 +140,7 @@ pub async fn take_sell_action(
             pr,
             &buyer_pubkey,
             &seller_pubkey,
-            &order,
+            &mut order,
         )
         .await?;
     }

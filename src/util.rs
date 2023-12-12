@@ -1,19 +1,19 @@
 use crate::cli::settings::Settings;
 use crate::error::MostroError;
+use crate::flow;
 use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
-use crate::{db, flow};
 
 use anyhow::{Context, Result};
-use log::info;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx::{Pool, Sqlite};
+use sqlx_crud::Crud;
 use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,6 +21,8 @@ use std::thread;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tracing::error;
+use tracing::info;
 use uuid::Uuid;
 
 pub async fn retries_yadio_request(req_string: &String) -> Result<reqwest::Response> {
@@ -169,15 +171,24 @@ pub async fn update_user_rating_event(
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    // nip33 kind with user as identifier
+    // Get order from id
+    let mut order = match Order::by_id(pool, order_id).await? {
+        Some(order) => order,
+        None => {
+            error!("Order Id {order_id} not found!");
+            return Ok(());
+        }
+    }; // nip33 kind with user as identifier
     let event = new_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
-        crate::db::update_order_event_buyer_rate(pool, order_id, buyer_sent_rate).await?;
+        order.buyer_sent_rate = buyer_sent_rate;
+        order.update(pool).await?;
     }
     if seller_sent_rate {
-        crate::db::update_order_event_seller_rate(pool, order_id, seller_sent_rate).await?;
+        order.seller_sent_rate = seller_sent_rate;
+        order.update(pool).await?;
     }
 
     // Add event message to global list
@@ -243,7 +254,7 @@ pub async fn show_hold_invoice(
     payment_request: Option<String>,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
-    order: &Order,
+    order: &mut Order,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
     let mostro_settings = Settings::get_mostro();
@@ -267,20 +278,18 @@ pub async fn show_hold_invoice(
         )
         .await?;
     if let Some(invoice) = payment_request {
-        db::edit_buyer_invoice_order(pool, order.id, &invoice).await?;
+        order.buyer_invoice = Some(invoice);
+        order.update(pool).await?;
     };
-    let preimage = bytes_to_string(&preimage);
-    let hash_str = bytes_to_string(&hash);
-    db::edit_order(
-        pool,
-        &Status::WaitingPayment,
-        order.id,
-        buyer_pubkey,
-        seller_pubkey,
-        &preimage,
-        &hash_str,
-    )
-    .await?;
+
+    // Using CRUD to update all fiels
+    order.preimage = Some(bytes_to_string(&preimage));
+    order.hash = Some(bytes_to_string(&hash));
+    order.status = Status::WaitingPayment.to_string();
+    order.buyer_pubkey = Some(buyer_pubkey.to_bech32()?);
+    order.seller_pubkey = Some(seller_pubkey.to_bech32()?);
+    order.update(pool).await?;
+
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
     let mut new_order = order.as_new_order();

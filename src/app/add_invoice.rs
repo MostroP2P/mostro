@@ -3,7 +3,6 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, show_hold_invoice};
 
 use anyhow::Result;
-use log::error;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
@@ -11,6 +10,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use tracing::error;
 
 pub async fn add_invoice_action(
     msg: Message,

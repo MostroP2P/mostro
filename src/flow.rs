@@ -1,12 +1,10 @@
 use crate::cli::settings::Settings;
 use crate::util::send_dm;
-
-use log::error;
-use log::info;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use std::str::FromStr;
+use tracing::{error, info};
 
 pub async fn hold_invoice_paid(hash: &str) {
     let pool = crate::db::connect().await.unwrap();

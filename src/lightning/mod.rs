@@ -7,7 +7,6 @@ use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
-use log::info;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
@@ -18,6 +17,7 @@ use tonic_openssl_lnd::invoicesrpc::{
 use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, Payment};
 use tonic_openssl_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use tonic_openssl_lnd::{LndClient, LndClientError};
+use tracing::info;
 
 pub struct LndConnector {
     client: LndClient,

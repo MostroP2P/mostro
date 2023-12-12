@@ -1,4 +1,3 @@
-use crate::db::take_dispute;
 use crate::util::send_dm;
 
 use anyhow::Result;
@@ -17,7 +16,7 @@ pub async fn admin_take_dispute_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let dispute_id = msg.get_inner_message_kind().id.unwrap();
-    let dispute = match Dispute::by_id(pool, dispute_id).await? {
+    let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
         None => {
             // We create a Message
@@ -42,7 +41,13 @@ pub async fn admin_take_dispute_action(
 
         return Ok(());
     }
-    take_dispute(pool, &Status::InProgress, dispute_id, &event.pubkey).await?;
+
+    // Update dispute fields
+    dispute.status = Status::InProgress;
+    dispute.solver_pubkey = Some(event.pubkey.to_bech32()?);
+    dispute.taken_at = Timestamp::now().as_i64();
+    // Save it to DB
+    dispute.update(pool).await?;
 
     // We create a Message for admin
     let message = Message::new_dispute(

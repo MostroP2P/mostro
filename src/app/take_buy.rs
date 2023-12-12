@@ -2,13 +2,13 @@ use crate::db::edit_master_seller_pubkey_order;
 use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
-use log::error;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use tracing::error;
 
 pub async fn take_buy_action(
     msg: Message,
@@ -86,7 +86,8 @@ pub async fn take_buy_action(
 
     // Timestamp order take time
     if order.taken_at == 0 {
-        crate::db::update_order_taken_at_time(pool, order.id, Timestamp::now().as_i64()).await?;
+        order.taken_at = Timestamp::now().as_i64();
+        order.update(pool).await?;
     }
 
     // Check market price value in sats - if order was with market price then calculate

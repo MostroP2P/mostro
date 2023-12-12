@@ -15,7 +15,6 @@ anyhow = "1.0.66"
 chrono = "0.4.23"
 easy-hasher = "2.2.1"
 lightning-invoice = "0.25.0"
-log = "0.4.17"
 nostr-sdk = "0.25.0"
 serde = { version = "1.0.149" }
 serde_json = "1.0.89"

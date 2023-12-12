@@ -1,12 +1,12 @@
 use crate::util::send_dm;
 
 use anyhow::Result;
-use log::error;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use tracing::error;
 
 pub async fn admin_add_solver_action(
     msg: Message,

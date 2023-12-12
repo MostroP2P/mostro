@@ -1,16 +1,13 @@
-use crate::db::{
-    edit_buyer_pubkey_order, edit_seller_pubkey_order, init_cancel_order,
-    update_order_to_initial_state,
-};
+use crate::db::{edit_buyer_pubkey_order, edit_seller_pubkey_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
-use log::{error, info};
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use tracing::{error, info};
 
 pub async fn cancel_action(
     msg: Message,
@@ -89,7 +86,8 @@ pub async fn cancel_action(
                             &order.id
                         );
                     }
-                    init_cancel_order(pool, &order).await?;
+                    // Update db
+                    order.update(pool).await?;
                     order.status = "CooperativelyCanceled".to_string();
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
@@ -119,7 +117,7 @@ pub async fn cancel_action(
             None => {
                 order.cancel_initiator_pubkey = Some(user_pubkey.clone());
                 // update db
-                init_cancel_order(pool, &order).await?;
+                order.update(pool).await?;
                 // We create a Message to start a cooperative cancel and send it to both parties
                 let message = Message::new_order(
                     Some(order.id),

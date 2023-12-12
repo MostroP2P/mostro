@@ -8,7 +8,6 @@ use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
 
 use anyhow::{Context, Result};
-use log::info;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
@@ -22,6 +21,8 @@ use std::thread;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tracing::error;
+use tracing::info;
 use uuid::Uuid;
 
 pub async fn retries_yadio_request(req_string: &String) -> Result<reqwest::Response> {
@@ -170,15 +171,24 @@ pub async fn update_user_rating_event(
     pool: &SqlitePool,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    // nip33 kind with user as identifier
+    // Get order from id
+    let mut order = match Order::by_id(pool, order_id).await? {
+        Some(order) => order,
+        None => {
+            error!("Order Id {order_id} not found!");
+            return Ok(());
+        }
+    }; // nip33 kind with user as identifier
     let event = new_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
-        crate::db::update_order_event_buyer_rate(pool, order_id, buyer_sent_rate).await?;
+        order.buyer_sent_rate = buyer_sent_rate;
+        order.update(pool).await?;
     }
     if seller_sent_rate {
-        crate::db::update_order_event_seller_rate(pool, order_id, seller_sent_rate).await?;
+        order.seller_sent_rate = seller_sent_rate;
+        order.update(pool).await?;
     }
 
     // Add event message to global list

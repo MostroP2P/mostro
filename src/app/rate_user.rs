@@ -1,7 +1,6 @@
 use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
-use log::error;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::Order;
 use mostro_core::rating::Rating;
@@ -12,6 +11,7 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::error;
 
 pub async fn get_counterpart_reputation(
     user: &str,

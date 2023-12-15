@@ -87,7 +87,7 @@ pub async fn cancel_action(
                         );
                     }
                     // Update db
-                    order.update(pool).await?;
+                    let mut order = order.update(pool).await?;
                     order.status = "CooperativelyCanceled".to_string();
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
@@ -117,7 +117,7 @@ pub async fn cancel_action(
             None => {
                 order.cancel_initiator_pubkey = Some(user_pubkey.clone());
                 // update db
-                order.update(pool).await?;
+                let order = order.update(pool).await?;
                 // We create a Message to start a cooperative cancel and send it to both parties
                 let message = Message::new_order(
                     Some(order.id),

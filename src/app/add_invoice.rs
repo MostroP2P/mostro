@@ -118,7 +118,7 @@ pub async fn add_invoice_action(
     let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
     // We save the invoice on db
     order.buyer_invoice = Some(pr.clone());
-    order.update(pool).await?;
+    let order = order.update(pool).await?;
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
@@ -171,7 +171,7 @@ pub async fn add_invoice_action(
             None,
             &buyer_pubkey,
             &seller_pubkey,
-            &mut order,
+            order.id,
         )
         .await?;
     }

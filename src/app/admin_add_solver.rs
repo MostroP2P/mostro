@@ -6,7 +6,7 @@ use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use tracing::error;
+use tracing::{error, info};
 
 pub async fn admin_add_solver_action(
     msg: Message,
@@ -41,13 +41,15 @@ pub async fn admin_add_solver_action(
     }
     let user = User::new(npubkey.to_string(), 0, 1, 0, 0);
     // Use CRUD to create user
-    user.create(pool).await?;
-
+    match user.create(pool).await {
+        Ok(r) => info!("Solver added: {:#?}", r),
+        Err(ee) => error!("Error creating solver: {:#?}", ee),
+    }
     // We create a Message for admin
     let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
-    send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(client, my_keys, &event.pubkey, message).await?;
 
     Ok(())
 }

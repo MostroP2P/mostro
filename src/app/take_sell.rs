@@ -125,10 +125,9 @@ pub async fn take_sell_action(
     // Add buyer pubkey to order
     edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;
     // Timestamp take order time
-    if order.taken_at == 0 {
-        order.taken_at = Timestamp::now().as_i64();
-        order.update(pool).await?;
-    }
+    order.taken_at = Timestamp::now().as_i64();
+    let order_id = order.id;
+    let mut order = order.update(pool).await?;
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
         set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
@@ -140,7 +139,7 @@ pub async fn take_sell_action(
             pr,
             &buyer_pubkey,
             &seller_pubkey,
-            &mut order,
+            order_id,
         )
         .await?;
     }

@@ -84,12 +84,6 @@ pub async fn take_buy_action(
         return Ok(());
     }
 
-    // Timestamp order take time
-    if order.taken_at == 0 {
-        order.taken_at = Timestamp::now().as_i64();
-        order.update(pool).await?;
-    }
-
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         order.amount =
@@ -102,6 +96,11 @@ pub async fn take_buy_action(
             };
     }
 
+    // Timestamp order take time
+    order.taken_at = Timestamp::now().as_i64();
+    let order_id = order.id;
+    order.update(pool).await?;
+
     show_hold_invoice(
         pool,
         client,
@@ -109,7 +108,7 @@ pub async fn take_buy_action(
         None,
         &buyer_pubkey,
         &seller_pubkey,
-        &mut order,
+        order_id,
     )
     .await?;
     Ok(())

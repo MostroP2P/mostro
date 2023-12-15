@@ -184,12 +184,11 @@ pub async fn update_user_rating_event(
     // We update the order vote status
     if buyer_sent_rate {
         order.buyer_sent_rate = buyer_sent_rate;
-        order.update(pool).await?;
     }
     if seller_sent_rate {
         order.seller_sent_rate = seller_sent_rate;
-        order.update(pool).await?;
     }
+    order.update(pool).await?;
 
     // Add event message to global list
     rate_list.lock().await.push(event);
@@ -254,8 +253,15 @@ pub async fn show_hold_invoice(
     payment_request: Option<String>,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
-    order: &mut Order,
+    order_id: Uuid,
 ) -> anyhow::Result<()> {
+    let mut order = match Order::by_id(pool, order_id).await? {
+        Some(order) => order,
+        None => {
+            error!("Order Id {order_id} not found!");
+            return Ok(());
+        }
+    };
     let mut ln_client = lightning::LndConnector::new().await;
     let mostro_settings = Settings::get_mostro();
     // Add fee of seller to hold invoice
@@ -279,7 +285,6 @@ pub async fn show_hold_invoice(
         .await?;
     if let Some(invoice) = payment_request {
         order.buyer_invoice = Some(invoice);
-        order.update(pool).await?;
     };
 
     // Using CRUD to update all fiels
@@ -288,10 +293,10 @@ pub async fn show_hold_invoice(
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_bech32()?);
     order.seller_pubkey = Some(seller_pubkey.to_bech32()?);
-    order.update(pool).await?;
+    let order = order.update(pool).await?;
 
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, order, None).await?;
+    update_order_event(pool, client, my_keys, Status::WaitingPayment, &order, None).await?;
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller

@@ -7,7 +7,7 @@ use mostro_core::message::{Action, Message};
 use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
+use sqlx_crud::traits::Crud;
 use tracing::{error, info};
 
 pub async fn dispute_action(
@@ -71,18 +71,18 @@ pub async fn dispute_action(
         // Need to update dispute status
         order.update(pool).await?;
     }
-    let dispute = Dispute::new(order.id);
+    let dispute = Dispute::new(order_id);
     // Use CRUD create method
-    dispute.create(pool).await?;
+    let dispute = dispute.create(pool).await?;
 
     // We create a Message for the initiator
-    let message = Message::new_order(Some(order.id), None, Action::DisputeInitiatedByYou, None);
+    let message = Message::new_order(Some(order_id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;
     let initiator_pubkey = XOnlyPublicKey::from_bech32(message_sender)?;
     send_dm(client, my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
-    let message = Message::new_order(Some(order.id), None, Action::DisputeInitiatedByPeer, None);
+    let message = Message::new_order(Some(order_id), None, Action::DisputeInitiatedByPeer, None);
     let message = message.as_json()?;
     let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;

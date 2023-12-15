@@ -45,3 +45,29 @@ If Mostro received the correct message, it will send back a confirmation message
   }
 }
 ```
+
+Mostro updates the nip 33 rating event, in this event the `d` tag will be the user pubkey `npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj` and looks like this:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "80909a120d17632f99995f92caff4801f25e9e523d7643bf8acb0166bd0932a6",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702637077,
+    "kind": 38383,
+    "tags": [
+      ["d", "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj"],
+      ["total_reviews", "1"],
+      ["total_rating", "2"],
+      ["last_rating", "1"],
+      ["max_rate", "2"],
+      ["min_rate", "5"],
+      ["data_label", "rating"]
+    ],
+    "content": "",
+    "sig": "456fdc0589a5ffe1b55d5474cef2826bf01f458d63cf409490def9c5af31052e0461d38aed4f386f5dcea999e9fe6001d27d592dbba54a0420687dce0652322f"
+  }
+]
+```

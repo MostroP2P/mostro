@@ -59,3 +59,61 @@ Right after seller release sats Mostro will try to pay the buyer's lightning inv
   }
 }
 ```
+
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `SettledHoldInvoice`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "SettledHoldInvoice"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
+```
+
+Seconds later Mostro will try to pay the buyer's invoice, if the payment is successful Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Success`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "Success"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
+```

@@ -1,6 +1,6 @@
 # Seller pays hold invoice
 
-When the seller is the maker and the order was taken by a buyer, Mostro will send to the seller a message asking to pay the hold invoice, the message will look like this:
+When the seller is the maker and the order was taken by a buyer, Mostro will send to the seller a message asking to pay the hold invoice, the content of the message will look like this:
 
 ```json
 {
@@ -77,6 +77,35 @@ Mostro also send a message to the buyer, this way they can both write to each ot
     }
   }
 }
+```
+
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Active`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "Active"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
 ```
 
 ## Ephemeral keys

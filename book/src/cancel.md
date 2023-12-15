@@ -1,6 +1,6 @@
 # Cancel Order
 
-A user can cancel an Order created by himself and with status `Pending` sending action `Cancel`, the message will look like this:
+A user can cancel an Order created by himself and with status `Pending` sending action `Cancel`, the message content will look like this:
 
 ```json
 {
@@ -28,6 +28,35 @@ Mostro will send a message with action `Cancel` confirming the order was cancele
     "content": null
   }
 }
+```
+
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Canceled`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "Canceled"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
 ```
 
 ## Cancel cooperatively
@@ -72,6 +101,35 @@ And this message to the buyer:
     "content": null
   }
 }
+```
+
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `CooperativelyCanceled`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "CooperativelyCanceled"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
 ```
 
 The buyer can accept the cooperative cancellation sending this message:

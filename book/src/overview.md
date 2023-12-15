@@ -2,7 +2,7 @@
 
 ## Overview
 
-All messages broadcasted by Mostro daemon are [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) and use `30078` as event `kind`, a list of standard event kinds can be found [here](https://github.com/nostr-protocol/nips#event-kinds)
+All messages broadcasted by Mostro daemon are [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) and use `38383` as event `kind`, a list of standard event kinds can be found [here](https://github.com/nostr-protocol/nips#event-kinds)
 
 ## Communication between users and Mostro
 

@@ -14,9 +14,27 @@ If the order amount is `0` the buyer don't know the exact amount to create the i
 }
 ```
 
+This event would look like this:
+
+The event to send to Mostro would look like this:
+
+```json
+{
+  "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
+  "kind": 4,
+  "pubkey": "1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d",
+  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "tags": [
+    ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"] // Mostro's pubkey
+  ],
+  "created_at": 1234567890,
+  "sig": "a21eb195fe418613aa9a3a8a78039b090e50dc3f9fb06b0f3fe41c63221adc073a9317a1f28d9db843a43c28d860ba173b70132ca85b0e706f6487d43a57ee82"
+}
+```
+
 ## Mostro response
 
-In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have:
+In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have, here the unencrypted content of the message:
 
 ```json
 {
@@ -41,9 +59,38 @@ In order to continue the buyer needs to send a lightning network invoice to Most
 }
 ```
 
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingBuyerInvoice`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "WaitingBuyerInvoice"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
+```
+
 ## Buyer sends LN invoice
 
-Here is how the buyer send the LN invoice to Mostro, in case the order has a fixed sats amount, the buyer can we skip the previous step:
+The buyer sends a nip 04 evento to Mostro with the LN invoice, in case the order has a fixed sats amount, the buyer can we skip the previous step, here the unencrypted content of the event:
 
 ```json
 {
@@ -64,7 +111,7 @@ Here is how the buyer send the LN invoice to Mostro, in case the order has a fix
 
 ## Mostro response
 
-Mostro send the following message to the buyer:
+Mostro send a nip 04 event to the buyer with a wrapped `Order` in the content, it would look like this:
 
 ```json
 {
@@ -76,4 +123,33 @@ Mostro send the following message to the buyer:
     "content": null
   }
 }
+```
+
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingPayment`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "WaitingPayment"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["l", "MostroP2P"],
+      ["data_label", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
 ```

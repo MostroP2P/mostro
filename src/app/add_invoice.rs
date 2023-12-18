@@ -82,7 +82,7 @@ pub async fn add_invoice_action(
     };
 
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+        Some(pk) => XOnlyPublicKey::from_str(pk)?,
         None => {
             error!("Buyer pubkey not found for order {}!", order.id);
             return Ok(());
@@ -115,7 +115,7 @@ pub async fn add_invoice_action(
         }
     }
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
+    let seller_pubkey = XOnlyPublicKey::from_str(&seller_pubkey)?;
     // We save the invoice on db
     order.buyer_invoice = Some(pr.clone());
     let order = order.update(pool).await?;

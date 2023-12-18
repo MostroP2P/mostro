@@ -62,7 +62,7 @@ pub async fn update_user_reputation_action(
     // Get needed info about users
     let buyer = order.buyer_pubkey.unwrap();
     let seller = order.seller_pubkey.unwrap();
-    let message_sender = event.pubkey.to_bech32()?;
+    let message_sender = event.pubkey.to_string();
 
     if order.status != "Success" {
         let message = Message::cant_do(Some(order.id), None, None);

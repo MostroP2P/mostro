@@ -11,8 +11,20 @@ pub async fn hold_invoice_paid(hash: &str) {
     let client = crate::util::connect_nostr().await.unwrap();
     let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
     let my_keys = crate::util::get_keys().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(order.seller_pubkey.as_ref().unwrap()).unwrap();
-    let buyer_pubkey = XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+    let seller_pubkey = match XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Order Id {} wrong seller pubkey: {:?}", order.id, e);
+            return;
+        }
+    };
+    let buyer_pubkey = match XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Order Id {} wrong buyer pubkey: {:?}", order.id, e);
+            return;
+        }
+    };
 
     info!(
         "Order Id: {} - Seller paid invoice with hash: {hash}",

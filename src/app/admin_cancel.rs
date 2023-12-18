@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 
@@ -27,9 +29,9 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    let mostro_pubkey = my_keys.public_key().to_bech32()?;
+
     // Check if the pubkey is Mostro
-    if event.pubkey.to_bech32()? != mostro_pubkey {
+    if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
@@ -62,11 +64,21 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
-    let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey).unwrap();
+    let seller_pubkey = match XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing seller pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
     send_dm(client, my_keys, &seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let buyer_pubkey = XOnlyPublicKey::from_bech32(buyer_pubkey).unwrap();
+    let buyer_pubkey = match XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing buyer pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
     send_dm(client, my_keys, &buyer_pubkey, message.clone()).await?;
 
     Ok(())

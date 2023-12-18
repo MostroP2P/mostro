@@ -291,8 +291,8 @@ pub async fn show_hold_invoice(
     order.preimage = Some(bytes_to_string(&preimage));
     order.hash = Some(bytes_to_string(&hash));
     order.status = Status::WaitingPayment.to_string();
-    order.buyer_pubkey = Some(buyer_pubkey.to_bech32()?);
-    order.seller_pubkey = Some(seller_pubkey.to_bech32()?);
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.seller_pubkey = Some(seller_pubkey.to_string());
     let order = order.update(pool).await?;
 
     // We need to publish a new event with the new status
@@ -451,12 +451,12 @@ pub async fn settle_seller_hold_invoice(
 ) -> Result<()> {
     // It can be settle only by a seller or by admin
     let pubkey = if is_admin {
-        my_keys.public_key().to_bech32()?
+        my_keys.public_key().to_string()
     } else {
         order.seller_pubkey.as_ref().unwrap().to_string()
     };
     // Check if the pubkey is right
-    if event.pubkey.to_bech32()? != pubkey {
+    if event.pubkey.to_string() != pubkey {
         // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;

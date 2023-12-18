@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use crate::nip33::new_event;
 use crate::util::send_dm;
 
@@ -28,7 +30,7 @@ pub async fn dispute_action(
 
     let buyer = order.buyer_pubkey.clone().unwrap();
     let seller = order.seller_pubkey.clone().unwrap();
-    let message_sender = event.pubkey.to_bech32()?;
+    let message_sender = event.pubkey.to_string();
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
     let mut buyer_dispute: bool = false;
@@ -78,13 +80,25 @@ pub async fn dispute_action(
     // We create a Message for the initiator
     let message = Message::new_order(Some(order_id), None, Action::DisputeInitiatedByYou, None);
     let message = message.as_json()?;
-    let initiator_pubkey = XOnlyPublicKey::from_bech32(message_sender)?;
+    let initiator_pubkey = match XOnlyPublicKey::from_str(&message_sender) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing initiator pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
     send_dm(client, my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
     let message = Message::new_order(Some(order_id), None, Action::DisputeInitiatedByPeer, None);
     let message = message.as_json()?;
-    let counterpart_pubkey = XOnlyPublicKey::from_bech32(counterpart)?;
+    let counterpart_pubkey = match XOnlyPublicKey::from_str(&counterpart) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing counterpart pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
     send_dm(client, my_keys, &counterpart_pubkey, message).await?;
     // We create a tag to show status of the dispute
     let tags = vec![

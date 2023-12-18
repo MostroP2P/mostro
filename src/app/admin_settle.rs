@@ -9,6 +9,7 @@ use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tracing::error;
 
 pub async fn admin_settle_action(
@@ -48,10 +49,10 @@ pub async fn admin_settle_action(
     // Message to admin
     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
     let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey).unwrap();
+    let seller_pubkey = XOnlyPublicKey::from_str(seller_pubkey).unwrap();
     send_dm(client, my_keys, &seller_pubkey, message.clone()).await?;
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let buyer_pubkey = XOnlyPublicKey::from_bech32(buyer_pubkey).unwrap();
+    let buyer_pubkey = XOnlyPublicKey::from_str(buyer_pubkey).unwrap();
     send_dm(client, my_keys, &buyer_pubkey, message.clone()).await?;
 
     Ok(())

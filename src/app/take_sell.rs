@@ -1,4 +1,3 @@
-use crate::db::{edit_buyer_pubkey_order, edit_master_buyer_pubkey_order};
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
@@ -104,7 +103,7 @@ pub async fn take_sell_action(
         }
     }
     let seller_pubkey = match order.seller_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+        Some(pk) => XOnlyPublicKey::from_str(pk)?,
         None => {
             error!("Seller pubkey not found for order {}!", order.id);
             return Ok(());
@@ -119,11 +118,9 @@ pub async fn take_sell_action(
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_buyer_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
-        .await?;
-    let buyer_pubkey_bech32 = buyer_pubkey.to_bech32().ok();
+    order.master_buyer_pubkey = msg.get_inner_message_kind().pubkey.clone();
     // Add buyer pubkey to order
-    edit_buyer_pubkey_order(pool, order_id, buyer_pubkey_bech32).await?;
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_i64();
     let order_id = order.id;

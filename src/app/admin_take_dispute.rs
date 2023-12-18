@@ -30,10 +30,9 @@ pub async fn admin_take_dispute_action(
     let order = Order::by_id(pool, dispute.order_id).await?.unwrap();
     let order = order.as_new_order();
 
-    let mostro_pubkey = my_keys.public_key().to_bech32()?;
     // Check if the pubkey is Mostro
     // TODO: solvers also can take disputes
-    if event.pubkey.to_bech32()? != mostro_pubkey {
+    if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         let message = Message::cant_do(None, None, None);
         let message = message.as_json()?;
@@ -44,7 +43,7 @@ pub async fn admin_take_dispute_action(
 
     // Update dispute fields
     dispute.status = Status::InProgress;
-    dispute.solver_pubkey = Some(event.pubkey.to_bech32()?);
+    dispute.solver_pubkey = Some(event.pubkey.to_string());
     dispute.taken_at = Timestamp::now().as_i64();
     // Save it to DB
     dispute.update(pool).await?;

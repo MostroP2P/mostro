@@ -9,6 +9,7 @@ use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
@@ -51,7 +52,7 @@ pub async fn release_action(
     // We send a message to buyer indicating seller released funds
     let message = Message::new_order(Some(order.id), None, Action::Release, None);
     let message = message.as_json()?;
-    let buyer_pubkey = XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap())?;
+    let buyer_pubkey = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap())?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
     // Finally we try to pay buyer's invoice
@@ -72,7 +73,7 @@ pub async fn release_action(
             let client = connect_nostr().await.unwrap();
             let my_keys = get_keys().unwrap();
             let buyer_pubkey =
-                XOnlyPublicKey::from_bech32(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+                XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
             let pool = db::connect().await.unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {

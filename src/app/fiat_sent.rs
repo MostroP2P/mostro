@@ -6,6 +6,7 @@ use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tracing::error;
 
 pub async fn fiat_sent_action(
@@ -37,7 +38,7 @@ pub async fn fiat_sent_action(
         return Ok(());
     }
     // Check if the pubkey is the buyer
-    if Some(event.pubkey.to_bech32()?) != order.buyer_pubkey {
+    if Some(event.pubkey.to_string()) != order.buyer_pubkey {
         let message = Message::cant_do(Some(order.id), None, None);
         send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
@@ -49,7 +50,7 @@ pub async fn fiat_sent_action(
     update_order_event(pool, client, my_keys, Status::FiatSent, &order, None).await?;
 
     let seller_pubkey = match order.seller_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_bech32(pk)?,
+        Some(pk) => XOnlyPublicKey::from_str(pk)?,
         None => {
             error!("Seller pubkey not found for order {}!", order.id);
             return Ok(());

@@ -3,7 +3,6 @@ use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
 use mostro_core::message::Message;
-use nostr_sdk::prelude::ToBech32;
 use nostr_sdk::{Client, Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
@@ -32,7 +31,7 @@ pub async fn order_action(
             return Ok(());
         }
 
-        let initiator_ephemeral_pubkey = event.pubkey.to_bech32()?;
+        let initiator_ephemeral_pubkey = event.pubkey.to_string();
         let master_pubkey = match msg.get_inner_message_kind().pubkey {
             Some(ref pk) => pk,
             None => {

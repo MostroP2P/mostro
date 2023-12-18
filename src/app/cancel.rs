@@ -7,6 +7,7 @@ use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tracing::{error, info};
 
 pub async fn cancel_action(
@@ -26,7 +27,7 @@ pub async fn cancel_action(
         }
     };
     if order.status == "Pending" {
-        let user_pubkey = event.pubkey.to_bech32()?;
+        let user_pubkey = event.pubkey.to_string();
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
             // We create a Message
@@ -55,16 +56,16 @@ pub async fn cancel_action(
     }
 
     if order.status == "Active" || order.status == "FiatSent" || order.status == "Dispute" {
-        let user_pubkey = event.pubkey.to_bech32()?;
-        let buyer_pubkey_bech32 = order.buyer_pubkey.as_ref().unwrap();
-        let seller_pubkey_bech32 = order.seller_pubkey.as_ref().unwrap();
+        let user_pubkey = event.pubkey.to_string();
+        let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
+        let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
         let counterparty_pubkey: String;
-        if buyer_pubkey_bech32 == &user_pubkey {
+        if buyer_pubkey == &user_pubkey {
             order.buyer_cooperativecancel = true;
-            counterparty_pubkey = seller_pubkey_bech32.to_string();
+            counterparty_pubkey = seller_pubkey.to_string();
         } else {
             order.seller_cooperativecancel = true;
-            counterparty_pubkey = buyer_pubkey_bech32.to_string();
+            counterparty_pubkey = buyer_pubkey.to_string();
         }
 
         match order.cancel_initiator_pubkey {
@@ -109,7 +110,7 @@ pub async fn cancel_action(
                     );
                     let message = message.as_json()?;
                     send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
-                    let counterparty_pubkey = XOnlyPublicKey::from_bech32(counterparty_pubkey)?;
+                    let counterparty_pubkey = XOnlyPublicKey::from_str(&counterparty_pubkey)?;
                     send_dm(client, my_keys, &counterparty_pubkey, message).await?;
                     info!("Cancel: Order Id {order_id} canceled cooperatively!");
                 }
@@ -134,7 +135,7 @@ pub async fn cancel_action(
                     None,
                 );
                 let message = message.as_json()?;
-                let counterparty_pubkey = XOnlyPublicKey::from_bech32(counterparty_pubkey)?;
+                let counterparty_pubkey = XOnlyPublicKey::from_str(&counterparty_pubkey)?;
                 send_dm(client, my_keys, &counterparty_pubkey, message).await?;
             }
         }
@@ -156,11 +157,17 @@ pub async fn cancel_add_invoice(
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
-    let user_pubkey = event.pubkey.to_bech32()?;
-    let buyer_pubkey_bech32 = order.buyer_pubkey.as_ref().unwrap();
+    let user_pubkey = event.pubkey.to_string();
+    let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey)?;
-    if buyer_pubkey_bech32 != &user_pubkey {
+    let seller_pubkey = match XOnlyPublicKey::from_str(&seller_pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing seller pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
+    if buyer_pubkey != &user_pubkey {
         // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
@@ -169,7 +176,7 @@ pub async fn cancel_add_invoice(
         return Ok(());
     }
 
-    if &order.creator_pubkey == buyer_pubkey_bech32 {
+    if &order.creator_pubkey == buyer_pubkey {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
         update_order_event(
@@ -199,7 +206,7 @@ pub async fn cancel_add_invoice(
         update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
-            buyer_pubkey_bech32, order.id
+            buyer_pubkey, order.id
         );
         Ok(())
     }
@@ -219,11 +226,17 @@ pub async fn cancel_pay_hold_invoice(
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
-    let user_pubkey = event.pubkey.to_bech32()?;
-    let buyer_pubkey_bech32 = order.buyer_pubkey.as_ref().unwrap();
-    let seller_pubkey_bech32 = order.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_bech32(seller_pubkey_bech32)?;
-    if seller_pubkey_bech32 != &user_pubkey {
+    let user_pubkey = event.pubkey.to_string();
+    let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
+    let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
+    let seller_pubkey = match XOnlyPublicKey::from_str(seller_pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            error!("Error parsing seller pubkey: {:#?}", e);
+            return Ok(());
+        }
+    };
+    if seller_pubkey.to_string() != user_pubkey {
         // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
@@ -232,7 +245,7 @@ pub async fn cancel_pay_hold_invoice(
         return Ok(());
     }
 
-    if &order.creator_pubkey == seller_pubkey_bech32 {
+    if order.creator_pubkey == seller_pubkey.to_string() {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
         update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
@@ -254,7 +267,7 @@ pub async fn cancel_pay_hold_invoice(
         update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
-            buyer_pubkey_bech32, order.id
+            buyer_pubkey, order.id
         );
         Ok(())
     }

@@ -162,7 +162,7 @@ pub fn get_keys() -> Result<Keys> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn update_user_rating_event(
-    user: &String,
+    user: &str,
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
     tags: Vec<(String, String)>,

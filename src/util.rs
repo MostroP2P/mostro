@@ -94,11 +94,39 @@ pub async fn publish_order(
     master_pubkey: &str,
     ack_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
-    let order = crate::db::add_order(pool, new_order, "", initiator_pubkey, master_pubkey).await?;
-    let order_id = order.id;
+    // Prepare a new default order
+    let mut new_order_db = Order {
+        ..Default::default()
+    };
+    // Create new order values to store
+    new_order_db.id = Uuid::new_v4();
+    new_order_db.buyer_pubkey = None;
+    new_order_db.master_buyer_pubkey = None;
+    new_order_db.seller_pubkey = None;
+    new_order_db.master_seller_pubkey = None;
+    new_order_db.created_at = Timestamp::now().as_i64();
+    new_order_db.kind = "Sell".to_string();
+    if new_order.kind == Some(OrderKind::Buy) {
+        new_order_db.kind = "Buy".to_string();
+        new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.master_buyer_pubkey = Some(master_pubkey.to_string());
+    } else {
+        new_order_db.seller_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.master_seller_pubkey = Some(master_pubkey.to_string());
+    }
+    new_order_db.status = if let Some(status) = new_order.status {
+        status.to_string()
+    } else {
+        "Pending".to_string()
+    };
+    // Request price from API in case amount is 0
+    new_order_db.price_from_api = new_order.amount == 0;
+    // CRUD order creation
+    new_order_db.clone().create(pool).await?;
+    let order_id = new_order_db.id;
     info!("New order saved Id: {}", order_id);
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order);
+    let tags = order_to_tags(&new_order_db);
 
     info!("order tags to be published: {:#?}", tags);
     // nip33 kind with order fields as tags and order id as identifier
@@ -112,10 +140,10 @@ pub async fn publish_order(
         order_id,
         &Status::Pending,
         &event_id,
-        order.amount,
+        new_order_db.amount,
     )
     .await?;
-    let mut order = order.as_new_order();
+    let mut order = new_order_db.as_new_order();
     order.id = Some(order_id);
 
     // Send message as ack with small order

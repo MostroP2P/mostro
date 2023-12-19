@@ -7,7 +7,7 @@ A user can cancel an Order created by himself and with status `Pending` sending 
   "Order": {
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
+    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "Cancel",
     "content": null
   }

@@ -7,7 +7,7 @@ After confirming the buyer sent the fiat money, the seller should send a message
   "Order": {
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2",
+    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "Release",
     "content": null
   }

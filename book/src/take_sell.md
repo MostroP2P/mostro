@@ -7,14 +7,12 @@ If the order amount is `0` the buyer don't know the exact amount to create the i
   "Order": {
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "npub1qqq...",
+    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "TakeSell",
     "content": null
   }
 }
 ```
-
-This event would look like this:
 
 The event to send to Mostro would look like this:
 
@@ -22,10 +20,10 @@ The event to send to Mostro would look like this:
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
   "kind": 4,
-  "pubkey": "1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d",
+  "pubkey": "9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b",
   "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
   "tags": [
-    ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"] // Mostro's pubkey
+    ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"]
   ],
   "created_at": 1234567890,
   "sig": "a21eb195fe418613aa9a3a8a78039b090e50dc3f9fb06b0f3fe41c63221adc073a9317a1f28d9db843a43c28d860ba173b70132ca85b0e706f6487d43a57ee82"

@@ -20,9 +20,19 @@ These fields are relative to the wrapper, here an example of a `FiatSent` Order 
   "Order": {
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "npub1qqq...",
+    "pubkey": "0001be6bd50247846a28cce439a10470a39b1b6c81d5c3be2475156a413e1e3a",
     "action": "FiatSent",
     "content": null
   }
 }
 ```
+
+## Keys
+
+For all examples the participants will use this keys:
+
+- Mostro's pubkey `dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a`
+- Seller's real pubkey `00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78`
+- Seller's ephemeral pubkey `1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d`
+- Buyer's real pubkey `0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427`
+- Buyer's ephemeral pubkey `9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b`

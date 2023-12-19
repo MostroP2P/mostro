@@ -6,7 +6,7 @@ To create a new sell order the user should send a Nostr event kind 4 (an encrypt
 {
   "Order": {
     "version": "1",
-    "pubkey": "npub1qqq...",
+    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78", // Seller's real pubkey
     "action": "NewOrder",
     "content": {
       "Order": {
@@ -38,7 +38,7 @@ The event to send to Mostro would look like this:
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
   "kind": 4,
-  "pubkey": "1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d",
+  "pubkey": "1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d", // Seller's ephemeral pubkey
   "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"] // Mostro's pubkey
@@ -57,8 +57,7 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
   "Order": {
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "npub1qqq...",
-    "action": "NewOrder",
+    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "content": {
       "Order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",

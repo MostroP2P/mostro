@@ -55,9 +55,9 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         // premium (premium) - The premium
         ("premium".to_string(), order.premium.to_string()),
         // Label to identify this is a Mostro's order
-        ("l".to_string(), "MostroP2P".to_string()),
+        ("y".to_string(), "mostrop2p".to_string()),
         // Table name
-        ("data_label".to_string(), "order".to_string()),
+        ("z".to_string(), "order".to_string()),
     ];
 
     tags

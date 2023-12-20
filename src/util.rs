@@ -96,16 +96,12 @@ pub async fn publish_order(
 ) -> Result<()> {
     // Prepare a new default order
     let mut new_order_db = Order {
+        id: Uuid::new_v4(),
+        kind: "Sell".to_string(),
+        created_at: Timestamp::now().as_i64(),
         ..Default::default()
     };
-    // Create new order values to store
-    new_order_db.id = Uuid::new_v4();
-    new_order_db.buyer_pubkey = None;
-    new_order_db.master_buyer_pubkey = None;
-    new_order_db.seller_pubkey = None;
-    new_order_db.master_seller_pubkey = None;
-    new_order_db.created_at = Timestamp::now().as_i64();
-    new_order_db.kind = "Sell".to_string();
+
     if new_order.kind == Some(OrderKind::Buy) {
         new_order_db.kind = "Buy".to_string();
         new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());

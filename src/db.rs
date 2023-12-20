@@ -1,4 +1,4 @@
-use mostro_core::order::{Kind, Order, SmallOrder, Status};
+use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -18,83 +18,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
     let pool = SqlitePool::connect(&db_url).await?;
 
     Ok(pool)
-}
-
-pub async fn add_order(
-    pool: &SqlitePool,
-    order: &SmallOrder,
-    event_id: &str,
-    initiator_pubkey: &str,
-    master_pubkey: &str,
-) -> anyhow::Result<Order> {
-    let mut conn = pool.acquire().await?;
-    let uuid = Uuid::new_v4();
-    let mut buyer_pubkey: Option<String> = None;
-    let mut master_buyer_pubkey: Option<String> = None;
-    let mut seller_pubkey: Option<String> = None;
-    let mut master_seller_pubkey: Option<String> = None;
-    let created_at = Timestamp::now();
-    let mut kind = "Sell".to_string();
-    if order.kind == Some(Kind::Buy) {
-        kind = "Buy".to_string();
-        buyer_pubkey = Some(initiator_pubkey.to_string());
-        master_buyer_pubkey = Some(master_pubkey.to_string());
-    } else {
-        seller_pubkey = Some(initiator_pubkey.to_string());
-        master_seller_pubkey = Some(master_pubkey.to_string());
-    }
-    let status = if let Some(status) = order.status {
-        status.to_string()
-    } else {
-        "Pending".to_string()
-    };
-    let price_from_api = order.amount == 0;
-
-    let order = sqlx::query_as::<_, Order>(
-        r#"
-        INSERT INTO orders (
-        id,
-        kind,
-        event_id,
-        creator_pubkey,
-        buyer_pubkey,
-        master_buyer_pubkey,
-        seller_pubkey,
-        master_seller_pubkey,
-        status,
-        premium,
-        payment_method,
-        amount,
-        price_from_api,
-        fiat_code,
-        fiat_amount,
-        buyer_invoice,
-        created_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-        RETURNING *
-      "#,
-    )
-    .bind(uuid)
-    .bind(kind)
-    .bind(event_id)
-    .bind(initiator_pubkey)
-    .bind(buyer_pubkey)
-    .bind(master_buyer_pubkey)
-    .bind(seller_pubkey)
-    .bind(master_seller_pubkey)
-    .bind(status)
-    .bind(order.premium)
-    .bind(&order.payment_method)
-    .bind(order.amount)
-    .bind(price_from_api)
-    .bind(&order.fiat_code)
-    .bind(order.fiat_amount)
-    .bind(order.buyer_invoice.as_ref())
-    .bind(created_at.as_i64())
-    .fetch_one(&mut conn)
-    .await?;
-
-    Ok(order)
 }
 
 pub async fn edit_buyer_pubkey_order(

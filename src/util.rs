@@ -98,6 +98,7 @@ pub async fn publish_order(
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
         kind: "Sell".to_string(),
+        status: "Pending".to_string(),
         created_at: Timestamp::now().as_i64(),
         ..Default::default()
     };
@@ -110,11 +111,7 @@ pub async fn publish_order(
         new_order_db.seller_pubkey = Some(initiator_pubkey.to_string());
         new_order_db.master_seller_pubkey = Some(master_pubkey.to_string());
     }
-    new_order_db.status = if let Some(status) = new_order.status {
-        status.to_string()
-    } else {
-        "Pending".to_string()
-    };
+
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
     // CRUD order creation

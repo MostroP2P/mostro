@@ -25,7 +25,7 @@ use tracing::error;
 use tracing::info;
 use uuid::Uuid;
 
-pub async fn retries_yadio_request(req_string: &String) -> Result<reqwest::Response> {
+pub async fn retries_yadio_request(req_string: &str) -> Result<reqwest::Response> {
     let res = reqwest::get(req_string)
         .await
         .context("Something went wrong with API request, try again!")?;
@@ -99,6 +99,7 @@ pub async fn publish_order(
         id: Uuid::new_v4(),
         kind: "Sell".to_string(),
         status: "Pending".to_string(),
+        creator_pubkey: initiator_pubkey.to_string(),
         created_at: Timestamp::now().as_i64(),
         ..Default::default()
     };

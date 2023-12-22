@@ -2,7 +2,7 @@ use crate::db::{edit_buyer_pubkey_order, edit_seller_pubkey_order, update_order_
 use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -31,7 +31,11 @@ pub async fn cancel_action(
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
             // We create a Message
-            let message = Message::cant_do(Some(order.id), None, None);
+            let message = Message::cant_do(
+                Some(order.id),
+                None,
+                Some(Content::TextMessage("Not allowed!".to_string())),
+            );
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
         } else {

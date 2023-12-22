@@ -2,7 +2,7 @@ use crate::cli::settings::Settings;
 use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
-use mostro_core::message::Message;
+use mostro_core::message::{Content, Message};
 use nostr_sdk::{Client, Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
@@ -24,7 +24,14 @@ pub async fn order_action(
             }
         };
         if quote > mostro_settings.max_order_amount as i64 {
-            let message = Message::cant_do(order.id, None, None);
+            let message = Message::cant_do(
+                order.id,
+                None,
+                Some(Content::TextMessage(format!(
+                    "Quote too high, max is {}",
+                    mostro_settings.max_order_amount
+                ))),
+            );
             let message = message.as_json()?;
             send_dm(client, my_keys, &event.pubkey, message).await?;
 

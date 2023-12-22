@@ -127,7 +127,13 @@ pub async fn take_sell_action(
     let mut order = order.update(pool).await?;
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
-        set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await?;
+        match set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Error setting market order sats amount: {:#?}", e);
+                return Ok(());
+            }
+        }
     } else {
         show_hold_invoice(
             pool,

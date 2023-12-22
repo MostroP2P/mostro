@@ -100,6 +100,12 @@ pub async fn publish_order(
         kind: "Sell".to_string(),
         status: "Pending".to_string(),
         creator_pubkey: initiator_pubkey.to_string(),
+        payment_method: new_order.payment_method.clone(),
+        amount: new_order.amount,
+        fiat_code: new_order.fiat_code.clone(),
+        fiat_amount: new_order.fiat_amount,
+        premium: new_order.premium,
+        buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_i64(),
         ..Default::default()
     };

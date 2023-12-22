@@ -19,10 +19,10 @@ pub async fn get_counterpart_reputation(
     client: &Client,
 ) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
-    // TODO: filter by data_label=rating generic_tag
     let filters = Filter::new()
         .author(my_keys.public_key())
         .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
+        .custom_tag(Alphabet::Z, vec!["rating"])
         .identifier(user.to_string());
 
     let mut user_reputation_event = client

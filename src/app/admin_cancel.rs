@@ -1,11 +1,11 @@
 use std::str::FromStr;
 
+use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
-use mostro_core::dispute::Dispute;
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -49,9 +49,9 @@ pub async fn admin_cancel_action(
     }
 
     // we check if there is a dispute
-    let dispute = Dispute::by_id(pool, order_id).await?;
+    let dispute = find_dispute_by_order_id(pool, order_id).await;
 
-    if let Some(mut d) = dispute {
+    if let Ok(mut d) = dispute {
         let dispute_id = d.id;
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded;
@@ -64,7 +64,7 @@ pub async fn admin_cancel_action(
         ];
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
-        info!("Dispute event to be published: {event:#?}");
+
         client.send_event(event).await?;
     }
 

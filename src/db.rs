@@ -1,3 +1,4 @@
+use mostro_core::dispute::Dispute;
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
@@ -153,6 +154,24 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
     .await?;
 
     Ok(order)
+}
+
+pub async fn find_dispute_by_order_id(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> anyhow::Result<Dispute> {
+    let dispute = sqlx::query_as::<_, Dispute>(
+        r#"
+          SELECT *
+          FROM disputes
+          WHERE order_id == ?1
+        "#,
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(dispute)
 }
 
 pub async fn update_order_to_initial_state(

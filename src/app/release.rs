@@ -1,7 +1,9 @@
-use crate::db::{self};
+use crate::db;
 use crate::lightning::LndConnector;
-use crate::util::{connect_nostr, get_keys, settle_seller_hold_invoice};
-use crate::util::{rate_counterpart, send_dm, update_order_event};
+use crate::util::{
+    connect_nostr, get_keys, rate_counterpart, send_dm, settle_seller_hold_invoice,
+    update_order_event,
+};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Message};

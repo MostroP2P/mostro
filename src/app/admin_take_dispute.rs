@@ -34,7 +34,9 @@ pub async fn admin_take_dispute_action(
         }
     };
     let order = Order::by_id(pool, dispute.order_id).await?.unwrap();
-    let order = order.as_new_order();
+    let mut new_order = order.as_new_order();
+    new_order.master_buyer_pubkey = order.master_buyer_pubkey.clone();
+    new_order.master_seller_pubkey = order.master_seller_pubkey.clone();
 
     // Check if the pubkey is Mostro
     // TODO: solvers also can take disputes
@@ -63,7 +65,7 @@ pub async fn admin_take_dispute_action(
         Some(dispute_id),
         None,
         Action::AdminTakeDispute,
-        Some(Content::Order(order)),
+        Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;
     // Send the message

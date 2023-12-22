@@ -62,7 +62,8 @@ Here is an example of the nip 33 event sent by Mostro:
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
       ["s", "Pending"],
-      ["data_label", "dispute"]
+      ["y", "mostrop2p"],
+      ["z", "dispute"]
     ],
     "content": "",
     "sig": "00a1da45c00684c5af18cf292ca11697c9e70f2a691e6cd397211e717d2f54362dd401d7567da8184a5c596f48a09693479e67214c23e773523a63d0b1c3f537"
@@ -97,7 +98,7 @@ Mostro will send a confirmation message to the admin with the Order details:
       "Order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
         "kind": "Sell",
-        "status": "Pending",
+        "status": "Active",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -127,7 +128,8 @@ Also Mostro will broadcast a new nip33 dispute event to update the Dispute `stat
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
       ["s", "InProgress"],
-      ["data_label", "dispute"]
+      ["y", "mostrop2p"],
+      ["z", "dispute"]
     ],
     "content": "",
     "sig": "20d454a0704cfac1d4a6660d234ce407deb56db8f08598741af5d38c0698a96234fd326a34e7efb2ac20c1c0ed0a921fd50513aab8f5c4b83e2509f2d32794d2"

@@ -95,8 +95,8 @@ Mostro publishes this order as an event kind `38383` with status `Pending`:
       ["fa", "100"],
       ["pm", "face to face"],
       ["premium", "1"],
-      ["l", "MostroP2P"],
-      ["data_label", "order"]
+      ["y", "mostrop2p"],
+      ["z", "order"]
     ],
     "content": "",
     "sig": "7e8fe1eb644f33ff51d8805c02a0e1a6d034e6234eac50ef7a7e0dac68a0414f7910366204fa8217086f90eddaa37ded71e61f736d1838e37c0b73f6a16c4af2"

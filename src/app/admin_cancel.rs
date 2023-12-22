@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use crate::lightning::LndConnector;
+use crate::nip33::new_event;
 use crate::util::{send_dm, update_order_event};
 
 use anyhow::Result;
@@ -51,9 +52,20 @@ pub async fn admin_cancel_action(
     let dispute = Dispute::by_id(pool, order_id).await?;
 
     if let Some(mut d) = dispute {
+        let dispute_id = d.id;
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded;
         d.update(pool).await?;
+        // We create a tag to show status of the dispute
+        let tags = vec![
+            ("s".to_string(), "SellerRefunded".to_string()),
+            ("y".to_string(), "mostrop2p".to_string()),
+            ("z".to_string(), "dispute".to_string()),
+        ];
+        // nip33 kind with dispute id as identifier
+        let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
+        info!("Dispute event to be published: {event:#?}");
+        client.send_event(event).await?;
     }
 
     // We publish a new replaceable kind nostr event with the status updated

@@ -30,13 +30,7 @@ pub async fn hold_invoice_paid(hash: &str) {
         "Order Id: {} - Seller paid invoice with hash: {hash}",
         order.id
     );
-    let mut master_buyer_pubkey: Option<String> = None;
-    let mut master_seller_pubkey: Option<String> = None;
-    // If this is a sell order we show the master identities
-    if order.kind == "Sell" {
-        master_buyer_pubkey = order.master_buyer_pubkey.clone();
-        master_seller_pubkey = order.master_seller_pubkey.clone();
-    }
+
     let order_kind = match Kind::from_str(&order.kind) {
         Ok(k) => k,
         Err(e) => {

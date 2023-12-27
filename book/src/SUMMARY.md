@@ -12,4 +12,5 @@
 - [Cancel](./cancel.md)
 - [Dispute](./dispute.md)
 - [Settle order](./settle_order.md)
+- [Cancel order](./cancel_order.md)
 - [Actions](./actions.md)

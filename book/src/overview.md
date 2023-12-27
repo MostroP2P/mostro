@@ -10,8 +10,8 @@ All messages from/to Mostro should be a Nostr event [kind 4](https://github.com/
 
 - `version`: Version of the protocol, currently `1`
 - `pubkey` (optional): Real pubkey of the user, if present the message is signed with the real pubkey, this is used when users are sending messages from ephemeral keys
-- [action](https://docs.rs/mostro-core/latest/mostro_core/enum.Action.html): Action to be performed by Mostro daemon
-- [content](https://docs.rs/mostro-core/latest/mostro_core/enum.Content.html) (optional): Content of the message, this field is optional and depends on the action
+- [action](https://docs.rs/mostro-core/latest/mostro_core/message/enum.Action.html): Action to be performed by Mostro daemon
+- [content](https://docs.rs/mostro-core/latest/mostro_core/message/enum.Content.html) (optional): Content of the message, this field is optional and depends on the action
 
 These fields are relative to the wrapper, here an example of a `FiatSent` Order message, in this case `id` is the Order Id:
 

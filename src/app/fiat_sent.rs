@@ -56,7 +56,7 @@ pub async fn fiat_sent_action(
             return Ok(());
         }
     };
-    let peer = Peer::new(event.pubkey.to_bech32()?);
+    let peer = Peer::new(event.pubkey.to_string());
 
     // We create a Message
     let message = Message::new_order(
@@ -68,7 +68,7 @@ pub async fn fiat_sent_action(
     let message = message.as_json().unwrap();
     send_dm(client, my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer to wait
-    let peer = Peer::new(seller_pubkey.to_bech32()?);
+    let peer = Peer::new(seller_pubkey.to_string());
 
     // We create a Message
     let message = Message::new_order(

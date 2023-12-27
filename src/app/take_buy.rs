@@ -1,4 +1,3 @@
-use crate::db::edit_master_seller_pubkey_order;
 use crate::util::{get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
@@ -8,6 +7,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use std::thread;
 use tracing::error;
 
 pub async fn take_buy_action(
@@ -30,14 +30,16 @@ pub async fn take_buy_action(
     if msg.get_inner_message_kind().pubkey.is_none() {
         // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
         return Ok(());
     }
 
     if order.kind != "Buy" {
         error!("Order Id {order_id} wrong kind");
+        let message = Message::cant_do(Some(order.id), None, None);
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
+
         return Ok(());
     }
 
@@ -56,16 +58,14 @@ pub async fn take_buy_action(
         }
     };
     if buyer_pubkey == event.pubkey {
-        // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json().unwrap();
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
         return Ok(());
     }
     // We update the master pubkey
-    edit_master_seller_pubkey_order(pool, order.id, msg.get_inner_message_kind().pubkey.clone())
-        .await?;
+    order.master_seller_pubkey = msg.get_inner_message_kind().pubkey.clone();
+
     let seller_pubkey = event.pubkey;
     // Seller can take pending orders only
     if order_status != Status::Pending {
@@ -78,8 +78,7 @@ pub async fn take_buy_action(
                 "Order Id {order_id} was already taken!"
             ))),
         );
-        let message = message.as_json().unwrap();
-        send_dm(client, my_keys, &seller_pubkey, message).await?;
+        send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
 
         return Ok(());
     }
@@ -100,6 +99,8 @@ pub async fn take_buy_action(
     order.taken_at = Timestamp::now().as_i64();
     let order_id = order.id;
     order.update(pool).await?;
+    // We need to wait a second to be sure that the order is in the db
+    thread::sleep(std::time::Duration::from_secs(1));
 
     show_hold_invoice(
         pool,

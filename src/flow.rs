@@ -55,8 +55,8 @@ pub async fn hold_invoice_paid(hash: &str) {
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
-        master_buyer_pubkey,
-        master_seller_pubkey,
+        None,
+        None,
         None,
         None,
     );

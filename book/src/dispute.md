@@ -77,7 +77,7 @@ Mostro admin will see the dispute and can take it using the dispute `Id` from `d
 {
   "Dispute": {
     "version": "1",
-    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
     "pubkey": null,
     "action": "AdminTakeDispute",
     "content": null

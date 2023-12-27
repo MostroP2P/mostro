@@ -129,7 +129,7 @@ pub async fn add_invoice_action(
             order.amount,
             order.fiat_code.clone(),
             order.fiat_amount,
-            pr.clone(),
+            order.payment_method.clone(),
             order.premium,
             order.buyer_pubkey.as_ref().cloned(),
             order.seller_pubkey.as_ref().cloned(),

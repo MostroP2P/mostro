@@ -10,7 +10,6 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
-use std::thread;
 use tracing::error;
 
 pub async fn add_invoice_action(

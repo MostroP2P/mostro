@@ -10,6 +10,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use std::thread;
 use tracing::error;
 
 pub async fn add_invoice_action(
@@ -125,7 +126,7 @@ pub async fn add_invoice_action(
         let order_data = SmallOrder::new(
             Some(order.id),
             Some(order_kind),
-            Some(order_status),
+            Some(Status::Active),
             order.amount,
             order.fiat_code.clone(),
             order.fiat_amount,
@@ -136,6 +137,12 @@ pub async fn add_invoice_action(
             None,
             None,
         );
+        // We publish a new replaceable kind nostr event with the status updated
+        // and update on local database the status and new event id
+        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
+            .await
+            .unwrap();
+
         // We send a confirmation message to seller
         let message = Message::new_order(
             Some(order.id),
@@ -143,9 +150,8 @@ pub async fn add_invoice_action(
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
         );
-        let message = message.as_json().unwrap();
 
-        send_dm(client, my_keys, &seller_pubkey, message).await?;
+        send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
         // We send a message to buyer saying seller paid
         let message = Message::new_order(
             Some(order.id),
@@ -153,14 +159,8 @@ pub async fn add_invoice_action(
             Action::HoldInvoicePaymentAccepted,
             Some(Content::Order(order_data)),
         );
-        let message = message.as_json().unwrap();
-        send_dm(client, my_keys, &buyer_pubkey, message)
-            .await
-            .unwrap();
 
-        // We publish a new replaceable kind nostr event with the status updated
-        // and update on local database the status and new event id
-        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
+        send_dm(client, my_keys, &buyer_pubkey, message.as_json()?)
             .await
             .unwrap();
     } else {

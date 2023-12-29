@@ -41,13 +41,17 @@ After the hold invoice is paid Mostro will send a new message to seller with the
     "content": {
       "Order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+        "kind": "Sell",
+        "status": "Active",
         "amount": 7851,
         "fiat_code": "VES",
         "fiat_amount": 100,
         "payment_method": "face to face",
         "premium": 1,
-        "buyer_pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
-        "seller_pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2"
+        "master_buyer_pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
+        "master_seller_pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
+        "buyer_invoice": null,
+        "created_at": 1698937797
       }
     }
   }
@@ -66,13 +70,17 @@ Mostro also send a message to the buyer, this way they can both write to each ot
     "content": {
       "Order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+        "kind": "Sell",
+        "status": "Active",
         "amount": 7851,
         "fiat_code": "VES",
         "fiat_amount": 100,
         "payment_method": "face to face",
         "premium": 1,
-        "buyer_pubkey": "npub1qqqt938cer4dvlslg04zwwf66ts8r3txp6mv79cx2498pyuqx8uq0c7qkj",
-        "seller_pubkey": "npub1qqqxssz4k6swex94zdg5s4pqx3uqlhwsc2vdzvhjvzk33pcypkhqe9aeq2"
+        "master_buyer_pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
+        "master_seller_pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
+        "buyer_invoice": null,
+        "created_at": 1698937797
       }
     }
   }
@@ -107,7 +115,3 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
   }
 ]
 ```
-
-## Ephemeral keys
-
-Mostro clients should use ephemeral keys to communicate with Mostro, indicating the pubkey where they want to be contacted in the `pubkey` field of the message, this way orders and users can't be easily linked, `buyer_pubkey` and `seller_pubkey` fields are each party real pubkeys.

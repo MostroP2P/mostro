@@ -52,11 +52,13 @@ pub async fn hold_invoice_paid(hash: &str) {
         order.buyer_pubkey.as_ref().cloned(),
         order.seller_pubkey.as_ref().cloned(),
         None,
-        None,
+        Some(order.created_at),
     );
     let status;
 
     if order.buyer_invoice.is_some() {
+        status = Status::Active;
+        order_data.status = Some(status);
         // We send a confirmation message to seller
         let message = Message::new_order(
             Some(order.id),
@@ -64,8 +66,6 @@ pub async fn hold_invoice_paid(hash: &str) {
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
         );
-        status = Status::Active;
-        order_data.status = Some(status);
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &seller_pubkey, message)
             .await

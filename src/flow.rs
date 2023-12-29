@@ -52,7 +52,9 @@ pub async fn hold_invoice_paid(hash: &str) {
         None,
         None,
         None,
-        None,
+        Some(order.created_at),
+        order.buyer_pubkey.clone(),
+        order.seller_pubkey.clone(),
     );
     let status;
 

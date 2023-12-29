@@ -417,7 +417,9 @@ pub async fn set_market_order_sats_amount(
         None,
         None,
         None,
+        Some(order.created_at),
         None,
+        None
     );
     // We create a Message
     let message = Message::new_order(

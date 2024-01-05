@@ -14,7 +14,7 @@ When the seller is the maker and the order was taken by a buyer, Mostro will sen
         {
           "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
           "kind": "Sell",
-          "status": "WaitingBuyerInvoice",
+          "status": "WaitingPayment",
           "amount": 7851,
           "fiat_code": "VES",
           "fiat_amount": 100,
@@ -29,7 +29,7 @@ When the seller is the maker and the order was taken by a buyer, Mostro will sen
 }
 ```
 
-After the hold invoice is paid Mostro will send a new message to seller with the following content:
+After the hold invoice is paid and the buyer already sent the invoice to receive the sats, Mostro will send a new message to seller with the following content:
 
 ```json
 {
@@ -115,3 +115,95 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
   }
 ]
 ```
+
+## If the buyer didn't sent the invoice yet
+
+Mostro send this message to the seller:
+
+```json
+{
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
+    "action": "WaitingBuyerInvoice",
+    "content": null
+  }
+}
+```
+
+And this message to the buyer:
+
+```json
+{
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": null,
+    "action": "AddInvoice",
+    "content": {
+      "Order": {
+        "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+        "kind": "Sell",
+        "status": "WaitingBuyerInvoice",
+        "amount": 7851,
+        "fiat_code": "VES",
+        "fiat_amount": 100,
+        "payment_method": "face to face",
+        "premium": 1,
+        "created_at": 1698937797
+      }
+    }
+  }
+}
+```
+
+And updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingBuyerInvoice`:
+
+```json
+[
+  "EVENT",
+  "RAND",
+  {
+    "id": "eb0582360ebd3836c90711f774fbecb27e600f4a5fedf4fc2d16fc852f8380b1",
+    "pubkey": "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a",
+    "created_at": 1702549437,
+    "kind": 38383,
+    "tags": [
+      ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
+      ["k", "Sell"],
+      ["f", "VES"],
+      ["s", "WaitingBuyerInvoice"],
+      ["amt", "7851"],
+      ["fa", "100"],
+      ["pm", "face to face"],
+      ["premium", "1"],
+      ["y", "mostrop2p"],
+      ["z", "order"]
+    ],
+    "content": "",
+    "sig": "a835f8620db3ebdd9fa142ae99c599a61da86321c60f7c9fed0cc57169950f4121757ff64a5e998baccf6b68272aa51819c3e688d8ad586c0177b3cd1ab09c0f"
+  }
+]
+```
+
+Now buyer sends the invoice to Mostro:
+
+```json
+{
+  "Order": {
+    "version": "1",
+    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "pubkey": null,
+    "action": "AddInvoice",
+    "content": {
+      "PaymentRequest": [
+        null,
+        "lnbcrt78510n1pj59wmepp50677g8tffdqa2p8882y0x6newny5vtz0hjuyngdwv226nanv4uzsdqqcqzzsxqyz5vqsp5skn973360gp4yhlpmefwvul5hs58lkkl3u3ujvt57elmp4zugp4q9qyyssqw4nzlr72w28k4waycf27qvgzc9sp79sqlw83j56txltz4va44j7jda23ydcujj9y5k6k0rn5ms84w8wmcmcyk5g3mhpqepf7envhdccp72nz6e"
+      ]
+    }
+  }
+}
+```
+
+And both parties receives each other pubkeys to start a direct conversation

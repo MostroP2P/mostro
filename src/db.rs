@@ -1,5 +1,5 @@
 use mostro_core::dispute::Dispute;
-use mostro_core::order::{Order, Status};
+use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -59,44 +59,6 @@ pub async fn edit_seller_pubkey_order(
         "#,
         seller_pubkey,
         order_id
-    )
-    .execute(&mut conn)
-    .await?
-    .rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn update_order_event_id_status(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    status: &Status,
-    event_id: &str,
-    amount: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let mostro_settings = Settings::get_mostro();
-    let status = status.to_string();
-    // We calculate the bot fee
-    let fee = mostro_settings.fee;
-    let fee = fee * amount as f64;
-    let fee = fee.round() as i64;
-
-    let rows_affected = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            status = ?1,
-            amount = ?2,
-            fee = ?3,
-            event_id = ?4
-            WHERE id = ?5
-        "#,
-        status,
-        amount,
-        fee,
-        event_id,
-        order_id,
     )
     .execute(&mut conn)
     .await?

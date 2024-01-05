@@ -1,4 +1,3 @@
-use crate::cli::settings::Settings;
 use crate::util::send_dm;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind, SmallOrder, Status};
@@ -82,19 +81,18 @@ pub async fn hold_invoice_paid(hash: &str) {
             .await
             .unwrap();
     } else {
-        let mostro_settings = Settings::get_mostro();
-        let sub_fee = mostro_settings.fee * order_data.amount as f64;
-        let rounded_fee = sub_fee.round();
-        let new_amount = order_data.amount - rounded_fee as i64;
+        let new_amount = order_data.amount - order.fee;
         order_data.amount = new_amount;
         status = Status::WaitingBuyerInvoice;
         order_data.status = Some(status);
+        order_data.master_buyer_pubkey = None;
+        order_data.master_seller_pubkey = None;
         // We ask to buyer for a new invoice
         let message = Message::new_order(
             Some(order.id),
             None,
             Action::AddInvoice,
-            Some(Content::Order(order_data.clone())),
+            Some(Content::Order(order_data)),
         );
         let message = message.as_json().unwrap();
         send_dm(&client, &my_keys, &buyer_pubkey, message)

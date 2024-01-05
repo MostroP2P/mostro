@@ -94,6 +94,11 @@ pub async fn publish_order(
     master_pubkey: &str,
     ack_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
+    let mostro_settings = Settings::get_mostro();
+    // We calculate the bot fee
+    let fee = mostro_settings.fee;
+    let fee = (fee * new_order.amount as f64) / 2.0;
+    let fee = fee.round() as i64;
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -102,6 +107,7 @@ pub async fn publish_order(
         creator_pubkey: initiator_pubkey.to_string(),
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
+        fee,
         fiat_code: new_order.fiat_code.clone(),
         fiat_amount: new_order.fiat_amount,
         premium: new_order.premium,
@@ -121,9 +127,10 @@ pub async fn publish_order(
 
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
+
     // CRUD order creation
-    new_order_db.clone().create(pool).await?;
-    let order_id = new_order_db.id;
+    let mut order = new_order_db.clone().create(pool).await?;
+    let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db);
@@ -134,15 +141,9 @@ pub async fn publish_order(
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
-    // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(
-        pool,
-        order_id,
-        &Status::Pending,
-        &event_id,
-        new_order_db.amount,
-    )
-    .await?;
+    // We update the order with the new event_id
+    order.event_id = event_id;
+    order.update(pool).await?;
     let mut order = new_order_db.as_new_order();
     order.id = Some(order_id);
 
@@ -240,14 +241,16 @@ pub async fn update_order_event(
     let tags = order_to_tags(&order);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, "", order.id.to_string(), tags)?;
-    let event_id = event.id.to_string();
-    let status_str = status.to_string();
+    let order_id = order.id.to_string();
     info!("Sending replaceable event: {event:#?}");
-    // We update the order id with the new event_id
-    crate::db::update_order_event_id_status(pool, order.id, &status, &event_id, amount).await?;
+    // We update the order with the new event_id
+    order.event_id = event.id.to_string();
+    order.amount = amount;
+    order.update(pool).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
-        order.id, status_str
+        order_id,
+        status.to_string()
     );
 
     client.send_event(event).await?;

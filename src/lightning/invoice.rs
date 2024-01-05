@@ -26,9 +26,6 @@ pub fn is_valid_invoice(
 
     let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);
-    // We receive the total order fee, we divide by 2 because we split the fee
-    let fee = fee as f64 / 2.0;
-    let fee = fee.round() as u64;
 
     if let Some(amt) = amount {
         if amount_sat > 0 && amount_sat != (amt - fee) {

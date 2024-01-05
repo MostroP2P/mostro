@@ -10,6 +10,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use std::thread;
 use tracing::error;
 
 pub async fn add_invoice_action(
@@ -119,6 +120,7 @@ pub async fn add_invoice_action(
     // We save the invoice on db
     order.buyer_invoice = Some(pr.clone());
     let order = order.update(pool).await?;
+    thread::sleep(std::time::Duration::from_secs(1));
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
@@ -138,7 +140,7 @@ pub async fn add_invoice_action(
         );
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order, None)
+        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order)
             .await
             .unwrap();
 

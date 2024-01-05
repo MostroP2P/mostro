@@ -107,7 +107,7 @@ pub async fn hold_invoice_paid(hash: &str) {
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, status, &order, None)
+    crate::util::update_order_event(&pool, &client, &my_keys, status, &order)
         .await
         .unwrap();
     // Update the invoice_held_at field

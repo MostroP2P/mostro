@@ -41,7 +41,7 @@ pub async fn cancel_action(
         } else {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
-            update_order_event(pool, client, my_keys, Status::Canceled, &order, None).await?;
+            update_order_event(pool, client, my_keys, Status::Canceled, &order).await?;
             // We create a Message for cancel
             let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
             let message = message.as_json()?;
@@ -102,7 +102,6 @@ pub async fn cancel_action(
                         my_keys,
                         Status::CooperativelyCanceled,
                         &order,
-                        None,
                     )
                     .await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
@@ -183,15 +182,7 @@ pub async fn cancel_add_invoice(
     if &order.creator_pubkey == buyer_pubkey {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(
-            pool,
-            client,
-            my_keys,
-            Status::CooperativelyCanceled,
-            order,
-            None,
-        )
-        .await?;
+        update_order_event(pool, client, my_keys, Status::CooperativelyCanceled, order).await?;
         // We create a Message for cancel
         let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
@@ -207,7 +198,7 @@ pub async fn cancel_add_invoice(
         }
         edit_buyer_pubkey_order(pool, order.id, None).await?;
         update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
+        update_order_event(pool, client, my_keys, Status::Pending, order).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id
@@ -252,7 +243,7 @@ pub async fn cancel_pay_hold_invoice(
     if order.creator_pubkey == seller_pubkey.to_string() {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(pool, client, my_keys, Status::Canceled, order, None).await?;
+        update_order_event(pool, client, my_keys, Status::Canceled, order).await?;
         // We create a Message for cancel
         let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
@@ -268,7 +259,7 @@ pub async fn cancel_pay_hold_invoice(
         }
         edit_seller_pubkey_order(pool, order.id, None).await?;
         update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(pool, client, my_keys, Status::Pending, order, None).await?;
+        update_order_event(pool, client, my_keys, Status::Pending, order).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id

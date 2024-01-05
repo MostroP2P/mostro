@@ -70,7 +70,7 @@ pub async fn admin_cancel_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order, None).await?;
+    update_order_event(pool, client, my_keys, Status::CanceledByAdmin, &order).await?;
     // We create a Message
     let message = Message::new_dispute(Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;

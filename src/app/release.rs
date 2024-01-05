@@ -101,7 +101,7 @@ pub async fn release_action(
                         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                         // We publish a new replaceable kind nostr event with the status updated
                         // and update on local database the status and new event id
-                        update_order_event(&pool, &client, &my_keys, status, &order, None)
+                        update_order_event(&pool, &client, &my_keys, status, &order)
                             .await
                             .unwrap();
 

@@ -84,14 +84,12 @@ async fn job_cancel_orders(client: Client) {
                             let _ = ln_client.cancel_hold_invoice(hash).await;
                             info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
                         };
+                        let mut order = order.clone();
                         // We re-publish the event with Pending status
                         // and update on local database
-                        let mut updated_order_amount = order.amount;
-                        let mut updated_order_fee = order.fee;
-
                         if order.price_from_api {
-                            updated_order_amount = 0;
-                            updated_order_fee = 0;
+                            order.amount = 0;
+                            order.fee = 0;
                         }
 
                         // Initialize reset status to pending, change in case of specifici needs of order
@@ -137,8 +135,8 @@ async fn job_cancel_orders(client: Client) {
                             let _ = update_order_to_initial_state(
                                 &pool,
                                 order.id,
-                                updated_order_amount,
-                                updated_order_fee,
+                                order.amount,
+                                order.fee,
                             )
                             .await;
                             info!(
@@ -151,15 +149,7 @@ async fn job_cancel_orders(client: Client) {
                                 order.id
                             );
                         }
-                        let _ = update_order_event(
-                            &pool,
-                            &client,
-                            &keys,
-                            new_status,
-                            &order,
-                            Some(updated_order_amount),
-                        )
-                        .await;
+                        let _ = update_order_event(&pool, &client, &keys, new_status, &order).await;
                     }
                 }
             }
@@ -193,7 +183,6 @@ async fn job_expire_pending_older_orders(client: Client) {
                         &keys,
                         Status::Expired,
                         order,
-                        None,
                     )
                     .await;
                 }

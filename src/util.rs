@@ -94,11 +94,13 @@ pub async fn publish_order(
     master_pubkey: &str,
     ack_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
-    let mostro_settings = Settings::get_mostro();
-    // We calculate the bot fee
-    let fee = mostro_settings.fee;
-    let fee = (fee * new_order.amount as f64) / 2.0;
-    let fee = fee.round() as i64;
+    let mut fee = 0;
+    if new_order.amount > 0 {
+        let mostro_settings = Settings::get_mostro();
+        // We calculate the bot fee
+        let split_fee = (mostro_settings.fee * new_order.amount as f64) / 2.0;
+        fee = split_fee.round() as i64;
+    }
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -231,9 +233,7 @@ pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
-    amount: Option<i64>,
 ) -> Result<()> {
-    let amount = amount.unwrap_or(order.amount);
     let mut order = order.clone();
     // update order.status with new status
     order.status = status.to_string();
@@ -245,7 +245,6 @@ pub async fn update_order_event(
     info!("Sending replaceable event: {event:#?}");
     // We update the order with the new event_id
     order.event_id = event.id.to_string();
-    order.amount = amount;
     order.update(pool).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
@@ -294,13 +293,8 @@ pub async fn show_hold_invoice(
         }
     };
     let mut ln_client = lightning::LndConnector::new().await;
-    let mostro_settings = Settings::get_mostro();
     // Add fee of seller to hold invoice
-    let seller_fee = mostro_settings.fee / 2.0;
-    let add_fee = seller_fee * order.amount as f64;
-    let rounded_fee = add_fee.round();
-    let new_amount = order.amount + rounded_fee as i64;
-    let seller_total_amount = new_amount;
+    let new_amount = order.amount + order.fee;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -311,7 +305,7 @@ pub async fn show_hold_invoice(
                 &order.fiat_code,
                 &order.fiat_amount.to_string(),
             )?,
-            seller_total_amount,
+            new_amount,
         )
         .await?;
     if let Some(invoice) = payment_request {
@@ -327,7 +321,7 @@ pub async fn show_hold_invoice(
     let order = order.update(pool).await?;
 
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, &order, None).await?;
+    update_order_event(pool, client, my_keys, Status::WaitingPayment, &order).await?;
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
@@ -399,13 +393,12 @@ pub async fn set_market_order_sats_amount(
         get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
 
     // We calculate the bot fee
-    let fee = mostro_settings.fee / 2.0;
-    let sub_fee = fee * new_sats_amount as f64;
-    let rounded_fee = sub_fee.round();
+    let sub_fee = (mostro_settings.fee * new_sats_amount as f64) / 2.0;
+    let rounded_fee = sub_fee.round() as i64;
 
-    let buyer_final_amount = new_sats_amount - rounded_fee as i64;
+    let buyer_final_amount = new_sats_amount - rounded_fee;
     let kind = OrderKind::from_str(&order.kind).unwrap();
-    let status = Status::from_str(&order.status).unwrap();
+    let status = Status::WaitingBuyerInvoice;
 
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
@@ -435,15 +428,8 @@ pub async fn set_market_order_sats_amount(
 
     // Update order with new sats value
     order.amount = new_sats_amount;
-    update_order_event(
-        pool,
-        client,
-        my_keys,
-        Status::WaitingBuyerInvoice,
-        order,
-        None,
-    )
-    .await?;
+    order.fee = rounded_fee;
+    update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(order.amount)
 }
@@ -505,7 +491,7 @@ pub async fn settle_seller_hold_invoice(
     info!("{action}: Order Id {}: hold invoice settled", order.id);
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, status, order, None).await?;
+    update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(())
 }

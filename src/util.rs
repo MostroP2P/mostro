@@ -27,8 +27,11 @@ use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 
-pub async fn check_fiat_currency(fiat_code: &str) -> Result<bool> {
-    // Get Fiat list
+pub async fn retries_yadio_request(
+    req_string: &str,
+    fiat_code: &str,
+) -> Result<(Option<reqwest::Response>, bool)> {
+    // Get Fiat list and check if currency exchange is available
     let api_req_string = "https://api.yadio.io/currencies".to_string();
     let fiat_list_check = reqwest::get(api_req_string)
         .await?
@@ -36,15 +39,16 @@ pub async fn check_fiat_currency(fiat_code: &str) -> Result<bool> {
         .await?
         .contains_key(fiat_code);
 
-    Ok(fiat_list_check)
-}
+    // Exit with error - no currency
+    if !fiat_list_check {
+        return Ok((None, fiat_list_check));
+    }
 
-pub async fn retries_yadio_request(req_string: &str) -> Result<reqwest::Response> {
     let res = reqwest::get(req_string)
         .await
         .context("Something went wrong with API request, try again!")?;
 
-    Ok(res)
+    Ok((Some(res), fiat_list_check))
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price
@@ -53,25 +57,6 @@ pub async fn get_market_quote(
     fiat_code: &str,
     premium: &i64,
 ) -> Result<i64, MostroError> {
-    // Check if requested currency is supported from Yadio
-    // Retry for 4 times
-    for retries_num in 1..=4 {
-        match check_fiat_currency(fiat_code).await {
-            Ok(fiat_is_present) => {
-                if !fiat_is_present {
-                    return Err(MostroError::NoCurrency);
-                }
-            }
-            Err(_e) => {
-                println!(
-                    "API price request failed retrying - {} tentatives left.",
-                    (4 - retries_num)
-                );
-                thread::sleep(std::time::Duration::from_secs(2));
-            }
-        };
-    }
-
     // Add here check for market price
     let req_string = format!(
         "https://api.yadio.io/convert/{}/{}/BTC",
@@ -79,15 +64,20 @@ pub async fn get_market_quote(
     );
     info!("Requesting API price: {}", req_string);
 
-    let mut req = None;
+    let mut req = (None, false);
+    let mut no_answer_api = false;
+
     // Retry for 4 times
     for retries_num in 1..=4 {
-        match retries_yadio_request(&req_string).await {
+        match retries_yadio_request(&req_string, fiat_code).await {
             Ok(response) => {
-                req = Some(response);
+                req = response;
                 break;
             }
             Err(_e) => {
+                if retries_num == 4 {
+                    no_answer_api = true;
+                }
                 println!(
                     "API price request failed retrying - {} tentatives left.",
                     (4 - retries_num)
@@ -98,13 +88,18 @@ pub async fn get_market_quote(
     }
 
     // Case no answers from Yadio
-    if req.is_none() {
+    if no_answer_api {
         return Err(MostroError::NoAPIResponse);
     }
 
-    let quote = req.unwrap().json::<Yadio>().await;
+    // No currency present
+    if !req.1 {
+        return Err(MostroError::NoCurrency);
+    }
+
+    let quote = req.0.unwrap().json::<Yadio>().await;
     if quote.is_err() {
-        return Err(MostroError::NoAPIResponse);
+        return Err(MostroError::MalformedAPIRes);
     }
     let quote = quote.unwrap();
 

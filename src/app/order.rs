@@ -16,13 +16,18 @@ pub async fn order_action(
 ) -> Result<()> {
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
-        let quote = match get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await {
-            Ok(amount) => amount,
-            Err(e) => {
-                error!("{:?}", e.to_string());
-                return Ok(());
-            }
+
+        let quote = match order.amount {
+            0 => match get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await {
+                Ok(amount) => amount,
+                Err(e) => {
+                    error!("{:?}", e.to_string());
+                    return Ok(());
+                }
+            },
+            _ => order.amount,
         };
+
         if quote > mostro_settings.max_order_amount as i64 {
             let message = Message::cant_do(
                 order.id,

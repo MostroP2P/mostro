@@ -25,6 +25,20 @@ use tracing::error;
 use tracing::info;
 use uuid::Uuid;
 
+pub type FiatNames = std::collections::HashMap<String, String>;
+
+pub async fn check_fiat_currency(fiat_code: &str) -> Result<bool> {
+    // Get Fiat list
+    let api_req_string = "https://api.yadio.io/currencies".to_string();
+    let fiat_list_check = reqwest::get(api_req_string)
+        .await?
+        .json::<FiatNames>()
+        .await?
+        .contains_key(fiat_code);
+
+    Ok(fiat_list_check)
+}
+
 pub async fn retries_yadio_request(req_string: &str) -> Result<reqwest::Response> {
     let res = reqwest::get(req_string)
         .await
@@ -39,6 +53,25 @@ pub async fn get_market_quote(
     fiat_code: &str,
     premium: &i64,
 ) -> Result<i64, MostroError> {
+    // Check if requested currency is supported from Yadio
+    // Retry for 4 times
+    for retries_num in 1..=4 {
+        match check_fiat_currency(fiat_code).await {
+            Ok(fiat_is_present) => {
+                if !fiat_is_present {
+                    return Err(MostroError::NoCurrency);
+                }
+            }
+            Err(_e) => {
+                println!(
+                    "API price request failed retrying - {} tentatives left.",
+                    (4 - retries_num)
+                );
+                thread::sleep(std::time::Duration::from_secs(2));
+            }
+        };
+    }
+
     // Add here check for market price
     let req_string = format!(
         "https://api.yadio.io/convert/{}/{}/BTC",

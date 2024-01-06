@@ -26,6 +26,7 @@ use tracing::info;
 use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
+const MAX_RETRY: u16 = 4;
 
 pub async fn retries_yadio_request(
     req_string: &str,
@@ -68,19 +69,19 @@ pub async fn get_market_quote(
     let mut no_answer_api = false;
 
     // Retry for 4 times
-    for retries_num in 1..=4 {
+    for retries_num in 1..=MAX_RETRY {
         match retries_yadio_request(&req_string, fiat_code).await {
             Ok(response) => {
                 req = response;
                 break;
             }
             Err(_e) => {
-                if retries_num == 4 {
+                if retries_num == MAX_RETRY {
                     no_answer_api = true;
                 }
                 println!(
                     "API price request failed retrying - {} tentatives left.",
-                    (4 - retries_num)
+                    (MAX_RETRY - retries_num)
                 );
                 thread::sleep(std::time::Duration::from_secs(2));
             }

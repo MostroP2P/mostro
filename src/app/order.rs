@@ -28,6 +28,22 @@ pub async fn order_action(
             _ => order.amount,
         };
 
+        // Check amount is positive - extra safety check
+        if quote < 0 {
+            let message = Message::cant_do(
+                order.id,
+                None,
+                Some(Content::TextMessage(format!(
+                    "Amount must be positive {} is not valid",
+                    order.amount
+                ))),
+            );
+            let message = message.as_json()?;
+            send_dm(client, my_keys, &event.pubkey, message).await?;
+
+            return Ok(());
+        }
+
         if quote > mostro_settings.max_order_amount as i64 {
             let message = Message::cant_do(
                 order.id,

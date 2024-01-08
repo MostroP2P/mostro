@@ -9,6 +9,9 @@ pub enum MostroError {
     MinAmountError,
     WrongAmountError,
     NoAPIResponse,
+    NoCurrency,
+    MalformedAPIRes,
+    NegativeAmount,
 }
 
 impl std::error::Error for MostroError {}
@@ -23,6 +26,9 @@ impl fmt::Display for MostroError {
             MostroError::MinAmountError => write!(f, "Minimal payment amount"),
             MostroError::WrongAmountError => write!(f, "The amount on this invoice is wrong"),
             MostroError::NoAPIResponse => write!(f, "Price API not answered - retry"),
+            MostroError::NoCurrency => write!(f, "Currency requested is not present in the exchange list, please specify a fixed rate"),
+            MostroError::MalformedAPIRes => write!(f, "Malformed answer from exchange quoting request"),
+            MostroError::NegativeAmount => write!(f, "Negative amount is not valid"),
         }
     }
 }

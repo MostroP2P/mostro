@@ -6,7 +6,7 @@ use crate::util::{
 };
 
 use anyhow::Result;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -32,7 +32,28 @@ pub async fn release_action(
             return Ok(());
         }
     };
-    let seller_pubkey = event.pubkey;
+    let seller_pubkey_hex = match order.seller_pubkey {
+        Some(ref pk) => pk,
+        None => {
+            error!("Order Id {}: Seller pubkey not found!", order.id);
+            return Ok(());
+        }
+    };
+    let seller_pubkey = event.pubkey.clone();
+
+    if &seller_pubkey.to_string() != seller_pubkey_hex {
+        let message = Message::cant_do(
+            Some(order.id),
+            None,
+            Some(Content::TextMessage(
+                "You are not allowed to release funds for this order!".to_string(),
+            )),
+        );
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
+
+        return Ok(());
+    }
+
     let status = Status::SettledHoldInvoice;
     let action = Action::Release;
 
@@ -49,8 +70,8 @@ pub async fn release_action(
         Action::HoldInvoicePaymentSettled,
         None,
     );
-    let message = message.as_json()?;
-    send_dm(client, my_keys, &seller_pubkey, message).await?;
+
+    send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
     // We send a message to buyer indicating seller released funds
     let message = Message::new_order(Some(order.id), None, Action::Release, None);
     let message = message.as_json()?;
@@ -97,8 +118,8 @@ pub async fn release_action(
                             .await
                             .unwrap();
                         let status = Status::Success;
-                        // Let's wait 10 secs before publish this new event
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        // Let's wait 5 secs before publish this new event
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                         // We publish a new replaceable kind nostr event with the status updated
                         // and update on local database the status and new event id
                         update_order_event(&pool, &client, &my_keys, status, &order)

@@ -114,6 +114,13 @@ pub async fn get_market_quote(
     Ok(sats as i64)
 }
 
+pub fn get_fee(amount: i64) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    // We calculate the bot fee
+    let split_fee = (mostro_settings.fee * amount as f64) / 2.0;
+    split_fee.round() as i64
+}
+
 pub async fn publish_order(
     pool: &SqlitePool,
     client: &Client,
@@ -125,10 +132,7 @@ pub async fn publish_order(
 ) -> Result<()> {
     let mut fee = 0;
     if new_order.amount > 0 {
-        let mostro_settings = Settings::get_mostro();
-        // We calculate the bot fee
-        let split_fee = (mostro_settings.fee * new_order.amount as f64) / 2.0;
-        fee = split_fee.round() as i64;
+        fee = get_fee(new_order.amount);
     }
     // Prepare a new default order
     let mut new_order_db = Order {

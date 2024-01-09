@@ -39,7 +39,7 @@ pub async fn release_action(
             return Ok(());
         }
     };
-    let seller_pubkey = event.pubkey.clone();
+    let seller_pubkey = event.pubkey;
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
         let message = Message::cant_do(

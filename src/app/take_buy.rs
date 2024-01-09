@@ -1,4 +1,4 @@
-use crate::util::{get_market_quote, send_dm, show_hold_invoice};
+use crate::util::{get_fee, get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -93,6 +93,7 @@ pub async fn take_buy_action(
                     return Ok(());
                 }
             };
+        order.fee = get_fee(order.amount);
     }
 
     // Timestamp order take time

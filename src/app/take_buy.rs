@@ -86,7 +86,7 @@ pub async fn take_buy_action(
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         order.amount =
-            match get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await {
+            match get_market_quote(&order.fiat_amount, &order.fiat_code, order.premium).await {
                 Ok(amount) => amount,
                 Err(e) => {
                     error!("{:?}", e);

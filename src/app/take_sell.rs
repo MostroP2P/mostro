@@ -1,6 +1,6 @@
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{send_dm, set_market_order_sats_amount, show_hold_invoice};
+use crate::util::{get_market_amount_and_fee, send_dm, set_order_sats_amount, show_hold_invoice};
 
 use anyhow::Result;
 use mostro_core::message::{Content, Message};
@@ -24,25 +24,27 @@ pub async fn take_sell_action(
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("Order Id {order_id} not found!");
             return Ok(());
         }
     };
     if order.kind != "Sell" {
-        error!("Order Id {order_id} wrong kind");
         return Ok(());
     }
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
-        // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
         return Ok(());
     }
-
     let buyer_pubkey = event.pubkey;
+    let seller_pubkey = match order.seller_pubkey.as_ref() {
+        Some(pk) => XOnlyPublicKey::from_str(pk)?,
+        None => {
+            error!("Seller pubkey not found for order {}!", order.id);
+            return Ok(());
+        }
+    };
     let pr: Option<String>;
     // If a buyer sent me a lightning invoice we look on db an order with
     // that order id and save the buyer pubkey and invoice fields
@@ -68,8 +70,7 @@ pub async fn take_sell_action(
                         None,
                         Some(Content::TextMessage(e.to_string())),
                     );
-                    let message = message.as_json()?;
-                    send_dm(client, my_keys, &buyer_pubkey, message).await?;
+                    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
                     error!("{e}");
                     return Ok(());
                 }
@@ -102,21 +103,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     }
-    let seller_pubkey = match order.seller_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_str(pk)?,
-        None => {
-            error!("Seller pubkey not found for order {}!", order.id);
-            return Ok(());
-        }
-    };
-    if seller_pubkey == event.pubkey {
-        // We create a Message
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
 
-        return Ok(());
-    }
     // We update the master pubkey
     order.master_buyer_pubkey = msg.get_inner_message_kind().pubkey.clone();
     // Add buyer pubkey to order
@@ -125,16 +112,32 @@ pub async fn take_sell_action(
     order.taken_at = Timestamp::now().as_i64();
     let order_id = order.id;
     let mut order = order.update(pool).await?;
+
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
-        match set_market_order_sats_amount(&mut order, buyer_pubkey, my_keys, pool, client).await {
+        let (new_sats_amount, fee) =
+            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
+
+        // let buyer_final_amount = new_sats_amount - fee;
+
+        match set_order_sats_amount(
+            &mut order,
+            Some(new_sats_amount),
+            Some(fee),
+            buyer_pubkey,
+            my_keys,
+            pool,
+            client,
+        )
+        .await
+        {
             Ok(_) => {}
             Err(e) => {
                 error!("Error setting market order sats amount: {:#?}", e);
                 return Ok(());
             }
         }
-    } else {
+    } else if pr.is_some() {
         show_hold_invoice(
             pool,
             client,
@@ -145,6 +148,16 @@ pub async fn take_sell_action(
             order_id,
         )
         .await?;
+    } else {
+        match set_order_sats_amount(&mut order, None, None, buyer_pubkey, my_keys, pool, client)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Error setting market order sats amount: {:#?}", e);
+                return Ok(());
+            }
+        }
     }
 
     Ok(())

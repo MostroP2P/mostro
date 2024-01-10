@@ -18,7 +18,7 @@ pub async fn order_action(
         let mostro_settings = Settings::get_mostro();
 
         let quote = match order.amount {
-            0 => match get_market_quote(&order.fiat_amount, &order.fiat_code, &0).await {
+            0 => match get_market_quote(&order.fiat_amount, &order.fiat_code, 0).await {
                 Ok(amount) => amount,
                 Err(e) => {
                     error!("{:?}", e.to_string());

@@ -56,7 +56,7 @@ pub async fn retries_yadio_request(
 pub async fn get_market_quote(
     fiat_amount: &i64,
     fiat_code: &str,
-    premium: &i64,
+    premium: i64,
 ) -> Result<i64, MostroError> {
     // Add here check for market price
     let req_string = format!(
@@ -107,8 +107,8 @@ pub async fn get_market_quote(
     let mut sats = quote.result * 100_000_000_f64;
 
     // Added premium value to have correct sats value
-    if *premium != 0 {
-        sats += (*premium as f64) / 100_f64 * sats;
+    if premium != 0 {
+        sats += (premium as f64) / 100_f64 * sats;
     }
 
     Ok(sats as i64)
@@ -412,27 +412,40 @@ pub async fn show_hold_invoice(
     Ok(())
 }
 
-/// Set market order sats amount, this used when a buyer take a sell order
-pub async fn set_market_order_sats_amount(
+pub async fn get_market_amount_and_fee(
+    fiat_amount: i64,
+    fiat_code: &str,
+    premium: i64,
+) -> Result<(i64, i64)> {
+    // Update amount order
+    let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
+    let fee = get_fee(new_sats_amount);
+
+    Ok((new_sats_amount, fee))
+}
+
+/// Set order sats amount, this used when a buyer take a sell order
+pub async fn set_order_sats_amount(
     order: &mut Order,
+    amount: Option<i64>,
+    fee: Option<i64>,
     buyer_pubkey: XOnlyPublicKey,
     my_keys: &Keys,
     pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
-    let mostro_settings = Settings::get_mostro();
-    // Update amount order
-    let new_sats_amount =
-        get_market_quote(&order.fiat_amount, &order.fiat_code, &order.premium).await?;
-
-    // We calculate the bot fee
-    let sub_fee = (mostro_settings.fee * new_sats_amount as f64) / 2.0;
-    let rounded_fee = sub_fee.round() as i64;
-
-    let buyer_final_amount = new_sats_amount - rounded_fee;
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
+    let amount = match amount {
+        Some(amount) => amount,
+        None => order.amount,
+    };
+    let fee = match fee {
+        Some(fee) => fee,
+        None => order.fee,
+    };
 
+    let buyer_final_amount = amount - fee;
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),
@@ -460,8 +473,8 @@ pub async fn set_market_order_sats_amount(
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
 
     // Update order with new sats value
-    order.amount = new_sats_amount;
-    order.fee = rounded_fee;
+    order.amount = amount;
+    order.fee = fee;
     update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(order.amount)

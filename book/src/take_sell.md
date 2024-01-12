@@ -88,7 +88,7 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
 
 ## Buyer sends LN invoice
 
-The buyer sends a nip 04 evento to Mostro with the LN invoice, in case the order has a fixed sats amount, the buyer can we skip the previous step, here the unencrypted content of the event:
+The buyer sends a nip 04 event to Mostro with the lightning invoice, the action should be the same the buyer just received in the last message from Mostro (`AddInvoice`), here the unencrypted content of the event:
 
 ```json
 {
@@ -96,7 +96,7 @@ The buyer sends a nip 04 evento to Mostro with the LN invoice, in case the order
     "version": "1",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "TakeSell",
+    "action": "AddInvoice",
     "content": {
       "PaymentRequest": [
         null,

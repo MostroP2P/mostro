@@ -1,11 +1,13 @@
 use crate::db;
 use crate::lightning::LndConnector;
+use crate::lnurl::resolv_ln_address;
 use crate::util::{
     connect_nostr, get_keys, rate_counterpart, send_dm, settle_seller_hold_invoice,
     update_order_event,
 };
 
 use anyhow::Result;
+use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
@@ -40,6 +42,17 @@ pub async fn release_action(
         }
     };
     let seller_pubkey = event.pubkey;
+
+    let current_status = Status::from_str(&order.status).unwrap();
+    if current_status != Status::Active
+        && current_status != Status::FiatSent
+        && current_status != Status::Dispute
+    {
+        let message = Message::cant_do(Some(order.id), None, None);
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
+
+        return Ok(());
+    }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
         let message = Message::cant_do(
@@ -80,6 +93,13 @@ pub async fn release_action(
 
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
+    let ln_addr = LightningAddress::from_str(&payment_request);
+    let payment_request = if let Ok(addr) = ln_addr {
+        let amount = order.amount as u64 - order.fee as u64;
+        resolv_ln_address(&addr.to_string(), amount).await?
+    } else {
+        payment_request
+    };
     let mut ln_client_payment = LndConnector::new().await;
     let (tx, mut rx) = channel(100);
     let payment_task = {

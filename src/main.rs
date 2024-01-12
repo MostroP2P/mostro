@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod flow;
 pub mod lightning;
+pub mod lnurl;
 pub mod messages;
 pub mod models;
 pub mod nip33;

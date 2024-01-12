@@ -425,10 +425,8 @@ pub async fn get_market_amount_and_fee(
 }
 
 /// Set order sats amount, this used when a buyer take a sell order
-pub async fn set_order_sats_amount(
+pub async fn set_waiting_invoice_status(
     order: &mut Order,
-    amount: Option<i64>,
-    fee: Option<i64>,
     buyer_pubkey: XOnlyPublicKey,
     my_keys: &Keys,
     pool: &SqlitePool,
@@ -436,16 +434,8 @@ pub async fn set_order_sats_amount(
 ) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
-    let amount = match amount {
-        Some(amount) => amount,
-        None => order.amount,
-    };
-    let fee = match fee {
-        Some(fee) => fee,
-        None => order.fee,
-    };
 
-    let buyer_final_amount = amount - fee;
+    let buyer_final_amount = order.amount - order.fee;
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),
@@ -468,13 +458,9 @@ pub async fn set_order_sats_amount(
         Action::AddInvoice,
         Some(Content::Order(order_data)),
     );
-    let message = message.as_json()?;
+    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
 
-    send_dm(client, my_keys, &buyer_pubkey, message).await?;
-
-    // Update order with new sats value
-    order.amount = amount;
-    order.fee = fee;
+    // Update order status
     update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(order.amount)
@@ -520,10 +506,8 @@ pub async fn settle_seller_hold_invoice(
     };
     // Check if the pubkey is right
     if event.pubkey.to_string() != pubkey {
-        // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
 
         return Ok(());
     }

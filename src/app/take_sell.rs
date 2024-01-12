@@ -1,14 +1,19 @@
 use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{get_market_amount_and_fee, send_dm, set_order_sats_amount, show_hold_invoice};
+use crate::lnurl::ln_exists;
+use crate::util::{
+    get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice,
+};
 
 use anyhow::Result;
+use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
+use std::thread;
 use tracing::error;
 
 pub async fn take_sell_action(
@@ -54,29 +59,39 @@ pub async fn take_sell_action(
         } else {
             Some(order.amount as u64)
         };
-
-        // Verify if invoice is valid
-        match is_valid_invoice(&payment_request, order_amount, Some(order.fee as u64)) {
-            Ok(_) => {}
-            Err(e) => match e {
-                MostroError::ParsingInvoiceError
-                | MostroError::InvoiceExpiredError
-                | MostroError::MinExpirationTimeError
-                | MostroError::WrongAmountError
-                | MostroError::MinAmountError => {
-                    // We create a Message
-                    let message = Message::cant_do(
-                        Some(order.id),
-                        None,
-                        Some(Content::TextMessage(e.to_string())),
-                    );
-                    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
-                    error!("{e}");
-                    return Ok(());
+        let payment_request = {
+            let ln_addr = LightningAddress::from_str(&payment_request);
+            if ln_addr.is_ok() && ln_exists(&payment_request).await? {
+                payment_request
+            } else {
+                // Verify if invoice is valid
+                match is_valid_invoice(&payment_request, order_amount, Some(order.fee as u64)) {
+                    Ok(_) => payment_request,
+                    Err(e) => match e {
+                        MostroError::ParsingInvoiceError
+                        | MostroError::InvoiceExpiredError
+                        | MostroError::MinExpirationTimeError
+                        | MostroError::WrongAmountError
+                        | MostroError::MinAmountError => {
+                            let message = Message::cant_do(
+                                Some(order.id),
+                                None,
+                                Some(Content::TextMessage(e.to_string())),
+                            );
+                            send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
+                            error!("{e}");
+                            return Ok(());
+                        }
+                        _ => {
+                            let message = Message::cant_do(Some(order.id), None, None);
+                            send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
+                            error!("{e}");
+                            return Ok(());
+                        }
+                    },
                 }
-                _ => {}
-            },
-        }
+            }
+        };
         pr = Some(payment_request);
     } else {
         pr = None;
@@ -117,27 +132,41 @@ pub async fn take_sell_action(
     if order.amount == 0 {
         let (new_sats_amount, fee) =
             get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
-
-        // let buyer_final_amount = new_sats_amount - fee;
-
-        match set_order_sats_amount(
-            &mut order,
-            Some(new_sats_amount),
-            Some(fee),
-            buyer_pubkey,
-            my_keys,
-            pool,
-            client,
-        )
-        .await
-        {
+        // Update order with new sats value
+        order.amount = new_sats_amount;
+        order.fee = fee;
+        let mut order = order.update(pool).await?;
+        thread::sleep(std::time::Duration::from_secs(1));
+        if pr.is_none() {
+            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Error setting market order sats amount: {:#?}", e);
+                    return Ok(());
+                }
+            }
+        } else {
+            show_hold_invoice(
+                pool,
+                client,
+                my_keys,
+                pr,
+                &buyer_pubkey,
+                &seller_pubkey,
+                order_id,
+            )
+            .await?;
+        }
+    } else if pr.is_none() {
+        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await {
             Ok(_) => {}
             Err(e) => {
                 error!("Error setting market order sats amount: {:#?}", e);
                 return Ok(());
             }
         }
-    } else if pr.is_some() {
+    } else {
         show_hold_invoice(
             pool,
             client,
@@ -148,16 +177,6 @@ pub async fn take_sell_action(
             order_id,
         )
         .await?;
-    } else {
-        match set_order_sats_amount(&mut order, None, None, buyer_pubkey, my_keys, pool, client)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Error setting market order sats amount: {:#?}", e);
-                return Ok(());
-            }
-        }
     }
 
     Ok(())

@@ -1,5 +1,6 @@
 use crate::db::{connect, find_dispute_by_order_id};
 use crate::lightning::LndConnector;
+use crate::lnurl::resolv_ln_address;
 use crate::nip33::new_event;
 use crate::util::{
     connect_nostr, get_keys, rate_counterpart, send_dm, settle_seller_hold_invoice,
@@ -7,6 +8,7 @@ use crate::util::{
 };
 
 use anyhow::Result;
+use lnurl::lightning_address::LightningAddress;
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -74,6 +76,14 @@ pub async fn admin_settle_action(
 
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
+    let ln_addr = LightningAddress::from_str(&payment_request);
+    let payment_request = if let Ok(addr) = ln_addr {
+        let amount = order.amount as u64 - order.fee as u64;
+        resolv_ln_address(&addr.to_string(), amount).await?
+    } else {
+        payment_request
+    };
+
     let mut ln_client_payment = LndConnector::new().await;
     let (tx, mut rx) = channel(100);
     let payment_task = {

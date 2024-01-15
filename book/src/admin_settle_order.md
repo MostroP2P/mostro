@@ -5,7 +5,7 @@ An admin can settle an order, most of the time this is done when admin is solvin
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AdminSettle",
@@ -21,7 +21,7 @@ Mostro will send this message to the both parties buyer/seller and to the admin:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AdminSettle",

@@ -5,7 +5,7 @@ If the order amount is `0` the buyer don't know the exact amount to create the i
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "TakeSell",
@@ -37,7 +37,7 @@ In order to continue the buyer needs to send a lightning network invoice to Most
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",
@@ -93,7 +93,7 @@ The buyer sends a nip 04 event to Mostro with the lightning invoice, the action 
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",
@@ -114,7 +114,7 @@ Mostro send a nip 04 event to the buyer with a wrapped `Order` in the content, i
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "WaitingSellerToPay",

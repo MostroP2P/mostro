@@ -5,7 +5,7 @@ A user can cancel an Order created by himself and with status `Pending` sending 
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "Cancel",
@@ -21,7 +21,7 @@ Mostro will send a message with action `Cancel` confirming the order was cancele
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "Cancel",
@@ -66,7 +66,7 @@ A user can cancel an `Active` order, but will need the counterparty to agree, le
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "Cancel",
@@ -80,7 +80,7 @@ Mostro will send this message to the seller:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "CooperativeCancelInitiatedByYou",
@@ -94,7 +94,7 @@ And this message to the buyer:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "CooperativeCancelInitiatedByPeer",
@@ -137,7 +137,7 @@ The buyer can accept the cooperative cancellation sending this message:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "Cancel",
@@ -151,7 +151,7 @@ And Mostro will send this message to both parties:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "CooperativeCancelAccepted",

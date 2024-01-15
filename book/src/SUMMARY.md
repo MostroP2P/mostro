@@ -13,6 +13,6 @@
 - [Rate user](./user_rating.md)
 - [Cancel](./cancel.md)
 - [Dispute](./dispute.md)
-- [Settle order](./settle_order.md)
-- [Cancel order](./cancel_order.md)
+- [Admin Settle order](./admin_settle_order.md)
+- [Admin Cancel order](./admin_cancel_order.md)
 - [Actions](./actions.md)

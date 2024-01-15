@@ -5,7 +5,7 @@ When the seller is the maker and the order was taken by a buyer, Mostro will sen
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "PayInvoice",
@@ -34,7 +34,7 @@ After the hold invoice is paid and the buyer already sent the invoice to receive
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "BuyerTookOrder",
@@ -63,7 +63,7 @@ Mostro also send a message to the buyer, this way they can both write to each ot
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "HoldInvoicePaymentAccepted",
@@ -123,7 +123,7 @@ Mostro send this message to the seller:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "WaitingBuyerInvoice",
@@ -137,7 +137,7 @@ And this message to the buyer:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",
@@ -192,7 +192,7 @@ Now buyer sends the invoice to Mostro:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",

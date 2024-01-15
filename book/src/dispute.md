@@ -5,7 +5,7 @@ A use can start a dispute in an order with status `Pending` or `FiatSent` sendin
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "Dispute",
@@ -21,7 +21,7 @@ Mostro will send this message to the seller:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "DisputeInitiatedByYou,",
@@ -35,7 +35,7 @@ And here is the message to the buyer:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "DisputeInitiatedByPeer",
@@ -76,7 +76,7 @@ Mostro admin will see the dispute and can take it using the dispute `Id` from `d
 ```json
 {
   "Dispute": {
-    "version": "1",
+    "version": 1,
     "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
     "pubkey": null,
     "action": "AdminTakeDispute",
@@ -90,7 +90,7 @@ Mostro will send a confirmation message to the admin with the Order details:
 ```json
 {
   "Dispute": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AdminTakeDispute",

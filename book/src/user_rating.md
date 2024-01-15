@@ -5,7 +5,7 @@ After a successful trade Mostro send a nip04 event to both parties to let them k
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
     "pubkey": null,
     "action": "RateUser",
@@ -19,7 +19,7 @@ After a Mostro client receive this message, the user can rate the other party, t
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
     "pubkey": null,
     "action": "RateUser",
@@ -37,7 +37,7 @@ If Mostro received the correct message, it will send back a confirmation message
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
     "pubkey": null,
     "action": "RateReceived",

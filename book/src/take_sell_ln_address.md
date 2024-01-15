@@ -5,7 +5,7 @@ The buyer can use a [lightning address](https://github.com/andrerfneves/lightnin
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "TakeSell",
@@ -39,7 +39,7 @@ Mostro send a nip 04 event to the buyer with a wrapped `Order` in the content, i
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "WaitingSellerToPay",

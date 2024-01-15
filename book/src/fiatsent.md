@@ -5,7 +5,7 @@ After the buyer sends the fiat money to the seller, the buyer should send a mess
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "FiatSent",
@@ -37,7 +37,7 @@ Mostro send a messages to both parties confirming `FiatSent` action and sending 
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "FiatSent",
@@ -55,7 +55,7 @@ And here an example of the message from Mostro to the seller:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "FiatSent",

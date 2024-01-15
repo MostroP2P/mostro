@@ -5,7 +5,7 @@ Creating buy order with a [lightning address](https://github.com/andrerfneves/li
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427", // Buyer's real pubkey
     "action": "NewOrder",
     "content": {
@@ -48,7 +48,7 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "content": {

@@ -5,7 +5,7 @@ To take an order the seller will send to Mostro a message with the following con
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "action": "TakeBuy",
@@ -37,7 +37,7 @@ Mostro respond to the seller with a message with the following content:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "PayInvoice",
@@ -95,7 +95,7 @@ And send a message to the buyer with the following content:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "WaitingSellerToPay",
@@ -111,7 +111,7 @@ After seller pays the hold invoice Mostro send a message to the seller with the 
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "WaitingBuyerInvoice",
@@ -154,7 +154,7 @@ And sends a message to the buyer with the following content:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",
@@ -181,7 +181,7 @@ Buyer sends the LN invoice to Mostro.
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "AddInvoice",

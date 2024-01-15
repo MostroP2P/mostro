@@ -5,7 +5,7 @@ After confirming the buyer sent the fiat money, the seller should send a message
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "Release",
@@ -21,7 +21,7 @@ Here an example of the Mostro response to the seller:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "HoldInvoicePaymentSettled",
@@ -35,7 +35,7 @@ And a message to the buyer to let him know that the sats were released:
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "Release",
@@ -51,7 +51,7 @@ Right after seller release sats Mostro will try to pay the buyer's lightning inv
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "PurchaseCompleted",

@@ -5,7 +5,7 @@ To create a new sell order the user should send a Nostr event kind 4 (an encrypt
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78", // Seller's real pubkey
     "action": "NewOrder",
     "content": {
@@ -55,7 +55,7 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 ```json
 {
   "Order": {
-    "version": "1",
+    "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "content": {

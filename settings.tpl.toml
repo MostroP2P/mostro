@@ -5,11 +5,13 @@ lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
 lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
 lnd_grpc_port = 10001
 lnd_grpc_host = '127.0.0.1'
-# lightning invoice expiration time in seconds
+# lightning invoices sent by the buyer to Mostro should have at least
+# this expiration time in seconds
 invoice_expiration_window = 3600
 # Hold invoice cltv delta (expiration time in blocks)
 hold_invoice_cltv_delta = 144
-# lightning hold invoice expiration time in seconds
+# This is the time that a taker has to pay the invoice (seller) or 
+# to add a new invoice (buyer), in seconds
 hold_invoice_expiration_window = 300
 
 [nostr]

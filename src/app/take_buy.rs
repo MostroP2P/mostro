@@ -7,7 +7,6 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
-use std::thread;
 use tracing::error;
 
 pub async fn take_buy_action(
@@ -98,10 +97,6 @@ pub async fn take_buy_action(
 
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_i64();
-    let order_id = order.id;
-    order.update(pool).await?;
-    // We need to wait a second to be sure that the order is in the db
-    thread::sleep(std::time::Duration::from_secs(1));
 
     show_hold_invoice(
         pool,
@@ -110,7 +105,7 @@ pub async fn take_buy_action(
         None,
         &buyer_pubkey,
         &seller_pubkey,
-        order_id,
+        order,
     )
     .await?;
     Ok(())

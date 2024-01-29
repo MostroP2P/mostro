@@ -13,7 +13,6 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
-use std::thread;
 use tracing::error;
 
 pub async fn take_sell_action(
@@ -125,7 +124,7 @@ pub async fn take_sell_action(
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_i64();
-    let order_id = order.id;
+    // let order_id = order.id;
     let mut order = order.update(pool).await?;
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
@@ -135,8 +134,7 @@ pub async fn take_sell_action(
         // Update order with new sats value
         order.amount = new_sats_amount;
         order.fee = fee;
-        let mut order = order.update(pool).await?;
-        thread::sleep(std::time::Duration::from_secs(1));
+
         if pr.is_none() {
             match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await
             {
@@ -154,7 +152,7 @@ pub async fn take_sell_action(
                 pr,
                 &buyer_pubkey,
                 &seller_pubkey,
-                order_id,
+                order,
             )
             .await?;
         }
@@ -174,7 +172,7 @@ pub async fn take_sell_action(
             pr,
             &buyer_pubkey,
             &seller_pubkey,
-            order_id,
+            order,
         )
         .await?;
     }

@@ -124,8 +124,6 @@ pub async fn take_sell_action(
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_i64();
-    // let order_id = order.id;
-    let mut order = order.update(pool).await?;
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {

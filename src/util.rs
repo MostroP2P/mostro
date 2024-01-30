@@ -344,7 +344,6 @@ pub async fn show_hold_invoice(
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
-    let order = order.update(pool).await?;
 
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, &order).await?;

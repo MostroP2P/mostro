@@ -316,15 +316,8 @@ pub async fn show_hold_invoice(
     payment_request: Option<String>,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
-    order_id: Uuid,
+    mut order: Order,
 ) -> anyhow::Result<()> {
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
-        }
-    };
     let mut ln_client = lightning::LndConnector::new().await;
     // Add fee of seller to hold invoice
     let new_amount = order.amount + order.fee;
@@ -351,7 +344,6 @@ pub async fn show_hold_invoice(
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
-    let order = order.update(pool).await?;
 
     // We need to publish a new event with the new status
     update_order_event(pool, client, my_keys, Status::WaitingPayment, &order).await?;

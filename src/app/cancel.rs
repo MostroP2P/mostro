@@ -91,8 +91,6 @@ pub async fn cancel_action(
                             &order.id
                         );
                     }
-                    // Update db
-                    let mut order = order.update(pool).await?;
                     order.status = "CooperativelyCanceled".to_string();
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id

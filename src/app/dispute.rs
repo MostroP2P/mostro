@@ -23,7 +23,7 @@ pub async fn dispute_action(
     let order_id = msg.get_inner_message_kind().id.unwrap();
 
     // Check dispute for this order id is yet present.
-    if find_dispute_by_order_id(pool, order_id).await.is_err() {
+    if find_dispute_by_order_id(pool, order_id).await.is_ok() {
         error!("Dispute yet opened for this order id: {order_id}");
         return Ok(());
     }

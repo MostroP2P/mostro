@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
 use crate::util::send_dm;
 
@@ -20,6 +21,13 @@ pub async fn dispute_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
+
+    // Check dispute for this order id is yet present.
+    if find_dispute_by_order_id(pool, order_id).await.is_ok() {
+        error!("Dispute yet opened for this order id: {order_id}");
+        return Ok(());
+    }
+
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {

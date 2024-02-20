@@ -186,20 +186,30 @@ impl LndConnector {
             return;
         }
 
-        let invoice_amount_milli = invoice.amount_milli_satoshis();
         let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
             timeout_seconds: 60,
             fee_limit_sat: max_fee as i64,
             ..Default::default()
         };
-
-        // We add amount to the request only if the invoice doesn't have amount
-        if invoice_amount_milli.is_none() {
-            request = SendPaymentRequest {
-                amt: amount,
-                ..request
-            };
+        let invoice_amount_milli = invoice.amount_milli_satoshis();
+        match invoice_amount_milli {
+            Some(amt) => {
+                if amount != amt as i64 * 1000 {
+                    info!(
+                        "Aborting paying invoice with wrong amount to buyer, hash: {}",
+                        hash
+                    );
+                    return;
+                }
+            }
+            None => {
+                // We add amount to the request only if the invoice doesn't have amount
+                request = SendPaymentRequest {
+                    amt: amount,
+                    ..request
+                };
+            }
         }
 
         let mut stream = self

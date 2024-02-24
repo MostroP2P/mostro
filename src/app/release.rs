@@ -90,7 +90,12 @@ pub async fn release_action(
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap())?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
+    let _ = do_payment(order).await;
 
+    Ok(())
+}
+
+pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
@@ -117,39 +122,48 @@ pub async fn release_action(
             let my_keys = get_keys().unwrap();
             let buyer_pubkey =
                 XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+            let seller_pubkey =
+                XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
             let pool = db::connect().await.unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
-                    if status == PaymentStatus::Succeeded {
-                        info!(
-                            "Order Id {}: Invoice with hash: {} paid!",
-                            order.id, msg.payment.payment_hash
-                        );
-                        // Purchase completed message to buyer
-                        let message = Message::new_order(
-                            Some(order.id),
-                            None,
-                            Action::PurchaseCompleted,
-                            None,
-                        );
-                        let message = message.as_json().unwrap();
-                        send_dm(&client, &my_keys, &buyer_pubkey, message)
-                            .await
-                            .unwrap();
-                        let status = Status::Success;
-                        // Let's wait 5 secs before publish this new event
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        // We publish a new replaceable kind nostr event with the status updated
-                        // and update on local database the status and new event id
-                        update_order_event(&pool, &client, &my_keys, status, &order)
-                            .await
-                            .unwrap();
+                    match status {
+                        PaymentStatus::Succeeded => {
+                            info!(
+                                "Order Id {}: Invoice with hash: {} paid!",
+                                order.id, msg.payment.payment_hash
+                            );
+                            payment_success(
+                                &order,
+                                &buyer_pubkey,
+                                &seller_pubkey,
+                                &my_keys,
+                                &client,
+                                &pool,
+                            )
+                            .await;
+                        }
+                        PaymentStatus::Failed => {
+                            info!(
+                                "Order Id {}: Invoice with hash: {} has failed!",
+                                order.id, msg.payment.payment_hash
+                            );
+                            let mut order = order.clone();
 
-                        // Adding here rate process
-                        rate_counterpart(&client, &buyer_pubkey, &seller_pubkey, &my_keys, &order)
-                            .await
-                            .unwrap();
+                            // Mark payment as failed
+                            if !order.failed_payment {
+                                order.failed_payment = true;
+                                order.payment_attempts = 0;
+                            } else if order.payment_attempts < 3 {
+                                order.payment_attempts += 1;
+                            } else {
+                                order.status = Status::PaidHoldInvoice.to_string();
+                            }
+                            // Update order
+                            let _ = order.update(&pool).await;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -157,4 +171,33 @@ pub async fn release_action(
     };
     tokio::spawn(payment);
     Ok(())
+}
+
+async fn payment_success(
+    order: &Order,
+    buyer_pubkey: &XOnlyPublicKey,
+    seller_pubkey: &XOnlyPublicKey,
+    my_keys: &Keys,
+    client: &Client,
+    pool: &Pool<Sqlite>,
+) {
+    // Purchase completed message to buyer
+    let message = Message::new_order(Some(order.id), None, Action::PurchaseCompleted, None);
+    let message = message.as_json().unwrap();
+    send_dm(client, my_keys, buyer_pubkey, message)
+        .await
+        .unwrap();
+    let status = Status::Success;
+    // Let's wait 5 secs before publish this new event
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    update_order_event(pool, client, my_keys, status, order)
+        .await
+        .unwrap();
+
+    // Adding here rate process
+    rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, order)
+        .await
+        .unwrap();
 }

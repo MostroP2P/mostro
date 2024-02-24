@@ -65,6 +65,8 @@ pub struct Lightning {
     pub invoice_expiration_window: u32,
     pub hold_invoice_cltv_delta: u32,
     pub hold_invoice_expiration_window: u32,
+    pub payment_retries: u32,
+    pub payment_retries_interval: u32,
 }
 
 impl TryFrom<Settings> for Lightning {

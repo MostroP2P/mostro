@@ -32,5 +32,7 @@ CREATE TABLE IF NOT EXISTS orders (
   taken_at integer default 0,
   created_at integer not null,
   buyer_sent_rate integer default 0,
-  seller_sent_rate integer default 0
+  seller_sent_rate integer default 0,
+  payment_attempts integer default 0,
+  failed_payment integer default 0
 );

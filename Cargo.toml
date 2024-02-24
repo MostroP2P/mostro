@@ -44,4 +44,4 @@ clap = { version = "4.4.4", features = ["derive"] }
 lnurl-rs = "0.4.0"
 
 [patch.crates-io]
-mostro-core = { git = 'https://github.com/arkanoider/mostro-core/tree/AddStatus' }
+mostro-core = { git = "https://github.com/arkanoider/mostro-core.git", branch = "AddStatus"  }

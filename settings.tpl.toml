@@ -14,7 +14,7 @@ hold_invoice_cltv_delta = 144
 # to add a new invoice (buyer), in seconds
 hold_invoice_expiration_window = 300
 # Retries for failed payments
-payment_retries = 3
+payment_attempts = 3
 # Retries interval for failed payments
 payment_retries_interval = 60
 

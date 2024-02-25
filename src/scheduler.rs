@@ -24,7 +24,7 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client)
 
 async fn job_retry_failed_payments() {
     let ln_settings = Settings::get_ln();
-    let retries_number = ln_settings.payment_retries as i64;
+    let retries_number = ln_settings.payment_attempts as i64;
     let interval = ln_settings.payment_retries_interval as u64;
 
     let pool = crate::db::connect().await.unwrap();

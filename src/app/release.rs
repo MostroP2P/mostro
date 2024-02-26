@@ -1,3 +1,4 @@
+use crate::cli::settings::Settings;
 use crate::db;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -151,11 +152,15 @@ pub async fn do_payment(order: Order) -> Result<()> {
                             );
                             let mut order = order.clone();
 
+                            // Get max number of retries
+                            let ln_settings = Settings::get_ln();
+                            let retries_number = ln_settings.payment_attempts as i64;
+
                             // Mark payment as failed
                             if !order.failed_payment {
                                 order.failed_payment = true;
                                 order.payment_attempts = 0;
-                            } else if order.payment_attempts < 3 {
+                            } else if order.payment_attempts < retries_number {
                                 order.payment_attempts += 1;
                             } else {
                                 order.status = Status::PaidHoldInvoice.to_string();

@@ -57,7 +57,6 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
-        // We create a Message
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json().unwrap();
         send_dm(client, my_keys, &event.pubkey, message).await?;
@@ -85,7 +84,6 @@ pub async fn add_invoice_action(
                         | MostroError::MinExpirationTimeError
                         | MostroError::WrongAmountError
                         | MostroError::MinAmountError => {
-                            // We create a Message
                             let message = Message::cant_do(
                                 Some(order.id),
                                 None,
@@ -108,12 +106,26 @@ pub async fn add_invoice_action(
         error!("Order Id {order_id} wrong get_payment_request");
         return Ok(());
     }
-
+    // We save the invoice on db
+    order.buyer_invoice = Some(pr.clone());
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     match order_status {
         Status::WaitingBuyerInvoice => {}
+        Status::SettledHoldInvoice => {
+            order.update(pool).await?;
+            let message = Message::new_order(
+                Some(order_id),
+                None,
+                Action::AddInvoice,
+                Some(Content::TextMessage(format!(
+                    "Order Id {order_id}: Invoice updated!"
+                ))),
+            );
+            let message = message.as_json()?;
+            send_dm(client, my_keys, &buyer_pubkey, message).await?;
+            return Ok(());
+        }
         _ => {
-            // We create a Message
             let message = Message::cant_do(
                 Some(order.id),
                 None,
@@ -128,8 +140,6 @@ pub async fn add_invoice_action(
     }
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_str(&seller_pubkey)?;
-    // We save the invoice on db
-    order.buyer_invoice = Some(pr.clone());
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

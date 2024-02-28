@@ -1,9 +1,11 @@
 use crate::cli::settings::Settings;
 use crate::error::MostroError;
+use crate::lnurl::ln_exists;
 
 use chrono::prelude::*;
 use chrono::Duration;
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
+use lnurl::lightning_address::LightningAddress;
 use std::str::FromStr;
 
 /// Decode a lightning invoice (bolt11)
@@ -15,47 +17,54 @@ pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroErro
 
 /// Verify if a buyer invoice is valid,
 /// if the invoice have amount we check if the amount minus fee is the same
-pub fn is_valid_invoice(
-    payment_request: &str,
-    amount: Option<u64>,
-    fee: Option<u64>,
-) -> Result<Bolt11Invoice, MostroError> {
-    let invoice = decode_invoice(payment_request)?;
-    let mostro_settings = Settings::get_mostro();
-    let ln_settings = Settings::get_ln();
+pub async fn is_valid_invoice(
+    payment_request: String,
+    amount: u64,
+    fee: u64,
+) -> Result<(), MostroError> {
+    // Check if it's a lightning address
+    let ln_addr = LightningAddress::from_str(&payment_request);
+    // Is it a ln address
+    if ln_addr.is_ok() {
+        if amount != 0 || ln_exists(&payment_request).await.is_err() {
+            return Err(MostroError::ParsingInvoiceError);
+        }
+    } else {
+        let invoice = decode_invoice(&payment_request)?;
+        let mostro_settings = Settings::get_mostro();
+        let ln_settings = Settings::get_ln();
 
-    let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
-    let fee = fee.unwrap_or(0);
+        let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
+        // let fee = fee.unwrap_or(0);
 
-    if let Some(amt) = amount {
-        if amount_sat > 0 && amount_sat != (amt - fee) {
+        if amount_sat > 0 && amount_sat != (amount - fee) {
             return Err(MostroError::WrongAmountError);
+        }
+
+        if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
+            return Err(MostroError::MinAmountError);
+        }
+
+        if invoice.is_expired() {
+            return Err(MostroError::InvoiceExpiredError);
+        }
+
+        let parsed = payment_request.parse::<SignedRawBolt11Invoice>()?;
+
+        let (parsed_invoice, _, _) = parsed.into_parts();
+
+        let expiration_window = ln_settings.invoice_expiration_window as i64;
+        let latest_date = Utc::now() + Duration::seconds(expiration_window);
+        let latest_date = latest_date.timestamp() as u64;
+        let expires_at =
+            invoice.expiry_time().as_secs() + parsed_invoice.data.timestamp.as_unix_timestamp();
+
+        if expires_at < latest_date {
+            return Err(MostroError::MinExpirationTimeError);
         }
     }
 
-    if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
-        return Err(MostroError::MinAmountError);
-    }
-
-    if invoice.is_expired() {
-        return Err(MostroError::InvoiceExpiredError);
-    }
-
-    let parsed = payment_request.parse::<SignedRawBolt11Invoice>()?;
-
-    let (parsed_invoice, _, _) = parsed.into_parts();
-
-    let expiration_window = ln_settings.invoice_expiration_window as i64;
-    let latest_date = Utc::now() + Duration::seconds(expiration_window);
-    let latest_date = latest_date.timestamp() as u64;
-    let expires_at =
-        invoice.expiry_time().as_secs() + parsed_invoice.data.timestamp.as_unix_timestamp();
-
-    if expires_at < latest_date {
-        return Err(MostroError::MinExpirationTimeError);
-    }
-
-    Ok(invoice)
+    Ok(())
 }
 
 #[cfg(test)]

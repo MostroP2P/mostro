@@ -12,6 +12,8 @@ pub enum MostroError {
     NoCurrency,
     MalformedAPIRes,
     NegativeAmount,
+    LnAddressParseError,
+    LnAddressWrongAmount,
 }
 
 impl std::error::Error for MostroError {}
@@ -29,6 +31,8 @@ impl fmt::Display for MostroError {
             MostroError::NoCurrency => write!(f, "Currency requested is not present in the exchange list, please specify a fixed rate"),
             MostroError::MalformedAPIRes => write!(f, "Malformed answer from exchange quoting request"),
             MostroError::NegativeAmount => write!(f, "Negative amount is not valid"),
+            MostroError::LnAddressWrongAmount => write!(f, "Ln address need amount of 0 sats - please check your order"),
+            MostroError::LnAddressParseError  => write!(f, "Ln address parsing error - please check your address"),
         }
     }
 }

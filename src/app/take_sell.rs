@@ -1,12 +1,9 @@
-use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::lnurl::ln_exists;
 use crate::util::{
     get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice,
 };
 
 use anyhow::Result;
-use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
@@ -49,51 +46,32 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
-    let pr: Option<String>;
+    let mut pr: Option<String> = None;
     // If a buyer sent me a lightning invoice we look on db an order with
     // that order id and save the buyer pubkey and invoice fields
     if let Some(payment_request) = msg.get_inner_message_kind().get_payment_request() {
-        let order_amount = if order.amount == 0 {
-            None
-        } else {
-            Some(order.amount as u64)
-        };
-        let payment_request = {
-            let ln_addr = LightningAddress::from_str(&payment_request);
-            if ln_addr.is_ok() && ln_exists(&payment_request).await? {
-                payment_request
-            } else {
-                // Verify if invoice is valid
-                match is_valid_invoice(&payment_request, order_amount, Some(order.fee as u64)) {
-                    Ok(_) => payment_request,
-                    Err(e) => match e {
-                        MostroError::ParsingInvoiceError
-                        | MostroError::InvoiceExpiredError
-                        | MostroError::MinExpirationTimeError
-                        | MostroError::WrongAmountError
-                        | MostroError::MinAmountError => {
-                            let message = Message::cant_do(
-                                Some(order.id),
-                                None,
-                                Some(Content::TextMessage(e.to_string())),
-                            );
-                            send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
-                            error!("{e}");
-                            return Ok(());
-                        }
-                        _ => {
-                            let message = Message::cant_do(Some(order.id), None, None);
-                            send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
-                            error!("{e}");
-                            return Ok(());
-                        }
-                    },
+        pr = {
+            // Verify if invoice is valid
+            match is_valid_invoice(
+                payment_request.clone(),
+                order.amount as u64,
+                order.fee as u64,
+            )
+            .await
+            {
+                Ok(_) => Some(payment_request),
+                Err(e) => {
+                    let message = Message::cant_do(
+                        Some(order.id),
+                        None,
+                        Some(Content::TextMessage(e.to_string())),
+                    );
+                    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
+                    error!("{e}");
+                    return Ok(());
                 }
             }
         };
-        pr = Some(payment_request);
-    } else {
-        pr = None;
     }
 
     let order_status = match Status::from_str(&order.status) {

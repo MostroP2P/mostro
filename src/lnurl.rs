@@ -1,27 +1,28 @@
+use crate::error::MostroError;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-pub async fn ln_exists(address: &str) -> Result<bool> {
+pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let (user, domain) = match address.split_once('@') {
         Some((user, domain)) => (user, domain),
-        None => return Ok(false),
+        None => return Err(MostroError::LnAddressParseError),
     };
 
     let url = format!("https://{domain}/.well-known/lnurlp/{user}");
     let res = reqwest::get(url)
         .await
-        .context("Something went wrong with API request, try again!")?;
+        .map_err(|_| MostroError::NoAPIResponse)?;
     let status = res.status();
     if status.is_success() {
         let body = res.text().await?;
-        let body: Value = serde_json::from_str(&body)?;
+        let body: Value = serde_json::from_str(&body).map_err(|_| MostroError::MalformedAPIRes)?;
         let tag = body["tag"].as_str().unwrap_or("");
         if tag == "payRequest" {
-            return Ok(true);
+            return Ok(());
         }
-        Ok(false)
+        Err(MostroError::LnAddressParseError)
     } else {
-        Ok(false)
+        Err(MostroError::LnAddressParseError)
     }
 }
 

@@ -100,8 +100,9 @@ pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
+    let amount = order.amount as u64 - order.fee as u64;
+    println!("Amount: {}", amount);
     let payment_request = if let Ok(addr) = ln_addr {
-        let amount = order.amount as u64 - order.fee as u64;
         resolv_ln_address(&addr.to_string(), amount).await?
     } else {
         payment_request
@@ -111,7 +112,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
     let payment_task = {
         async move {
             ln_client_payment
-                .send_payment(&payment_request, order.amount, tx)
+                .send_payment(&payment_request, amount as i64, tx)
                 .await;
         }
     };
@@ -163,7 +164,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
                             } else if order.payment_attempts < retries_number {
                                 order.payment_attempts += 1;
                             } else {
-                                order.status = Status::PaidHoldInvoice.to_string();
+                                order.status = Status::SettledHoldInvoice.to_string();
                             }
                             // Update order
                             let _ = order.update(&pool).await;

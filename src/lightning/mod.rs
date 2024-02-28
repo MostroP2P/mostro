@@ -195,7 +195,7 @@ impl LndConnector {
         let invoice_amount_milli = invoice.amount_milli_satoshis();
         match invoice_amount_milli {
             Some(amt) => {
-                if amount != amt as i64 * 1000 {
+                if amt != amount as u64 * 1000 {
                     info!(
                         "Aborting paying invoice with wrong amount to buyer, hash: {}",
                         hash

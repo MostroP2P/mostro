@@ -54,8 +54,8 @@ pub async fn take_sell_action(
             // Verify if invoice is valid
             match is_valid_invoice(
                 payment_request.clone(),
-                order.amount as u64,
-                order.fee as u64,
+                Some(order.amount as u64),
+                Some(order.fee as u64),
             )
             .await
             {

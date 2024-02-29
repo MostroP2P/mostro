@@ -95,7 +95,7 @@ pub async fn add_invoice_action(
         return Ok(());
     }
     // We save the invoice on db
-    order.buyer_invoice = Some(pr.clone());
+    order.buyer_invoice = Some(invoice);
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     match order_status {
         Status::WaitingBuyerInvoice => {}

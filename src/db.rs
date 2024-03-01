@@ -264,3 +264,17 @@ pub async fn update_order_invoice_held_at_time(
 
     Ok(rows_affected > 0)
 }
+
+pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE failed_payment == true AND  status == 'SettledHoldInvoice'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
+}

@@ -13,6 +13,10 @@ hold_invoice_cltv_delta = 144
 # This is the time that a taker has to pay the invoice (seller) or 
 # to add a new invoice (buyer), in seconds
 hold_invoice_expiration_window = 300
+# Retries for failed payments
+payment_attempts = 3
+# Retries interval for failed payments
+payment_retries_interval = 60
 
 [nostr]
 nsec_privkey = 'nsec1...'
@@ -33,6 +37,8 @@ expiration_hours = 24
 expiration_seconds = 900
 # User rate events scheduled time interval
 user_rates_sent_interval_seconds = 3600
+
+
 
 [database]
 url = "sqlite://mostro.db"

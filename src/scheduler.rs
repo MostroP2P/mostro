@@ -1,3 +1,4 @@
+use crate::app::release::do_payment;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
@@ -16,19 +17,49 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client)
     job_expire_pending_older_orders(client.clone()).await;
     job_update_rate_events(client.clone(), rate_list).await;
     job_cancel_orders(client.clone()).await;
+    job_retry_failed_payments().await;
 
     info!("Scheduler Started");
+}
+
+async fn job_retry_failed_payments() {
+    let ln_settings = Settings::get_ln();
+    let retries_number = ln_settings.payment_attempts as i64;
+    let interval = ln_settings.payment_retries_interval as u64;
+
+    let pool = crate::db::connect().await.unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            info!(
+                "I run async every {} minutes - checking for failed lighting payment",
+                interval
+            );
+
+            if let Ok(payment_failed_list) = crate::db::find_failed_payment(&pool).await {
+                for payment_failed in payment_failed_list.into_iter() {
+                    if payment_failed.payment_attempts < retries_number {
+                        let _ = do_payment(payment_failed.clone()).await;
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
 }
 
 async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>>) {
     // Clone for closure owning with Arc
     let inner_list = rate_list.clone();
     let mostro_settings = Settings::get_mostro();
-    let user_rates_sent_seconds = mostro_settings.user_rates_sent_interval_seconds as u64;
+    let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
 
     tokio::spawn(async move {
         loop {
-            info!("I run async every hour - update rate event of users");
+            info!(
+                "I run async every {} minutes - update rate event of users",
+                interval
+            );
 
             for ev in inner_list.lock().await.iter() {
                 // Send event to relay
@@ -47,14 +78,14 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
 
             let now = Utc::now();
             let next_tick = now
-                .checked_add_signed(Duration::seconds(user_rates_sent_seconds as i64))
+                .checked_add_signed(Duration::seconds(interval as i64))
                 .unwrap();
             info!(
                 "Next tick for update users rating is {}",
                 next_tick.format("%a %b %e %T %Y")
             );
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(user_rates_sent_seconds)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
 }

@@ -47,7 +47,13 @@ pub async fn is_valid_invoice(
         if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
             return Err(MostroError::MinAmountError);
         }
+        if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
+            return Err(MostroError::MinAmountError);
+        }
 
+        if invoice.is_expired() {
+            return Err(MostroError::InvoiceExpiredError);
+        }
         if invoice.is_expired() {
             return Err(MostroError::InvoiceExpiredError);
         }

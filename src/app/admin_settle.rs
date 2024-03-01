@@ -88,7 +88,7 @@ pub async fn admin_settle_action(
     let (tx, mut rx) = channel(100);
     let payment_task = {
         async move {
-            ln_client_payment
+            let _ = ln_client_payment
                 .send_payment(&payment_request, order.amount, tx)
                 .await;
         }

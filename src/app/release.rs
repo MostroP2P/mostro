@@ -19,6 +19,28 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
 
+pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<()> {
+    let mut order = order.clone();
+
+    // Get max number of retries
+    let ln_settings = Settings::get_ln();
+    let retries_number = ln_settings.payment_attempts as i64;
+
+    // Mark payment as failed
+    if !order.failed_payment {
+        order.failed_payment = true;
+        order.payment_attempts = 0;
+    } else if order.payment_attempts < retries_number {
+        order.payment_attempts += 1;
+    } else {
+        order.status = Status::SettledHoldInvoice.to_string();
+    }
+    // Update order
+    let _ = order.update(pool).await;
+
+    Ok(())
+}
+
 pub async fn release_action(
     msg: Message,
     event: &Event,
@@ -101,7 +123,6 @@ pub async fn do_payment(order: Order) -> Result<()> {
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
-    println!("Amount: {}", amount);
     let payment_request = if let Ok(addr) = ln_addr {
         resolv_ln_address(&addr.to_string(), amount).await?
     } else {
@@ -109,14 +130,14 @@ pub async fn do_payment(order: Order) -> Result<()> {
     };
     let mut ln_client_payment = LndConnector::new().await;
     let (tx, mut rx) = channel(100);
-    let payment_task = {
-        async move {
-            ln_client_payment
-                .send_payment(&payment_request, amount as i64, tx)
-                .await;
-        }
-    };
-    tokio::spawn(payment_task);
+
+    let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
+    if let Err(paymement_result) = payment_task.await {
+        info!("Error during ln paymenet : {}", paymement_result);
+        let pool = db::connect().await.unwrap();
+        check_failure_retries(&order, &pool).await?;
+    }
+
     let payment = {
         async move {
             // We redeclare vars to use inside this block
@@ -151,23 +172,9 @@ pub async fn do_payment(order: Order) -> Result<()> {
                                 "Order Id {}: Invoice with hash: {} has failed!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let mut order = order.clone();
-
-                            // Get max number of retries
-                            let ln_settings = Settings::get_ln();
-                            let retries_number = ln_settings.payment_attempts as i64;
 
                             // Mark payment as failed
-                            if !order.failed_payment {
-                                order.failed_payment = true;
-                                order.payment_attempts = 0;
-                            } else if order.payment_attempts < retries_number {
-                                order.payment_attempts += 1;
-                            } else {
-                                order.status = Status::SettledHoldInvoice.to_string();
-                            }
-                            // Update order
-                            let _ = order.update(&pool).await;
+                            let _ = check_failure_retries(&order, &pool).await;
                         }
                         _ => {}
                     }

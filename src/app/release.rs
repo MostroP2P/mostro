@@ -35,7 +35,7 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
     } else if order.payment_attempts < retries_number {
         order.payment_attempts += 1;
     }
-    
+
     // Update order
     let _ = order.update(pool).await;
 
@@ -114,12 +114,20 @@ pub async fn release_action(
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap())?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
-    let _ = do_payment(order).await;
+    let _ = do_payment(order, pool).await;
 
     Ok(())
 }
 
-pub async fn do_payment(order: Order) -> Result<()> {
+pub async fn do_payment(order: Order, pool: &Pool<Sqlite>) -> Result<()> {
+    // Get updated order to get correct status ( SettledHoldInvoice )
+    let order = match Order::by_id(pool, order.id).await? {
+        Some(order) => order,
+        None => {
+            error!("Order Id {} not found!", order.id);
+            return Ok(());
+        }
+    };
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);

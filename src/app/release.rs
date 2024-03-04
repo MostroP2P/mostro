@@ -140,7 +140,7 @@ pub async fn do_payment(order: Order, pool: &Pool<Sqlite>) -> Result<()> {
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
-        info!("Error during ln paymenet : {}", paymement_result);
+        info!("Error during ln payment : {}", paymement_result);
         let pool = db::connect().await.unwrap();
         check_failure_retries(&order, &pool).await?;
     }

@@ -26,8 +26,6 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
 
-    order.status = Status::SettledHoldInvoice.to_string();
-
     // Mark payment as failed
     if !order.failed_payment {
         order.failed_payment = true;

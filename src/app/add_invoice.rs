@@ -100,6 +100,7 @@ pub async fn add_invoice_action(
     match order_status {
         Status::WaitingBuyerInvoice => {}
         Status::SettledHoldInvoice => {
+            order.payment_attempts = 0;
             order.update(pool).await?;
             let message = Message::new_order(
                 Some(order_id),

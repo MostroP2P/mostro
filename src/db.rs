@@ -270,7 +270,7 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>
         r#"
           SELECT *
           FROM orders
-          WHERE failed_payment == true AND  status == 'SettledHoldInvoice'
+          WHERE failed_payment == true AND  status == 'settledholdinvoice'
         "#,
     )
     .fetch_all(pool)

@@ -12,7 +12,6 @@ use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -266,7 +265,7 @@ pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
-) -> Result<()> {
+) -> Result<String> {
     let mut order = order.clone();
     // update order.status with new status
     order.status = status.to_string();
@@ -278,6 +277,7 @@ pub async fn update_order_event(
     info!("Sending replaceable event: {event:#?}");
     // We update the order with the new event_id
     order.event_id = event.id.to_string();
+    let event_id = event.id.to_string();
     order.update(pool).await?;
     info!(
         "Order Id: {} updated Nostr new Status: {}",
@@ -287,7 +287,7 @@ pub async fn update_order_event(
 
     client.send_event(event).await?;
 
-    Ok(())
+    Ok(event_id)
 }
 
 pub async fn connect_nostr() -> Result<Client> {
@@ -483,9 +483,7 @@ pub async fn settle_seller_hold_invoice(
     event: &Event,
     my_keys: &Keys,
     client: &Client,
-    pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    status: Status,
     action: Action,
     is_admin: bool,
     order: &Order,
@@ -511,9 +509,6 @@ pub async fn settle_seller_hold_invoice(
     let preimage = order.preimage.as_ref().unwrap();
     ln_client.settle_hold_invoice(preimage).await?;
     info!("{action}: Order Id {}: hold invoice settled", order.id);
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(())
 }

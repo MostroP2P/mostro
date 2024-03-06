@@ -18,6 +18,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
+use uuid::Uuid;
 
 pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<()> {
     let mut order = order.clone();
@@ -49,7 +50,7 @@ pub async fn release_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
-    let order = match Order::by_id(pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -92,15 +93,17 @@ pub async fn release_action(
     let status = Status::SettledHoldInvoice;
     let action = Action::Release;
 
-    settle_seller_hold_invoice(
-        event, my_keys, client, pool, ln_client, status, action, false, &order,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, my_keys, client, ln_client, action, false, &order).await?;
+    let event_id = update_order_event(pool, client, my_keys, status, &order).await?;
+    let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
+    order.event_id = event_id;
+    order.status = status.to_string();
+    order.update(pool).await?;
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
     let message = Message::new_order(
-        Some(order.id),
+        Some(order_id),
         None,
         Action::HoldInvoicePaymentSettled,
         None,
@@ -108,21 +111,21 @@ pub async fn release_action(
 
     send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
     // We send a message to buyer indicating seller released funds
-    let message = Message::new_order(Some(order.id), None, Action::Release, None);
+    let message = Message::new_order(Some(order_id), None, Action::Release, None);
     let message = message.as_json()?;
-    let buyer_pubkey = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap())?;
+    let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
-    let _ = do_payment(order, pool).await;
+    let _ = do_payment(order_id, pool).await;
 
     Ok(())
 }
 
-pub async fn do_payment(order: Order, pool: &Pool<Sqlite>) -> Result<()> {
+pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
     // Get updated order to get correct status ( SettledHoldInvoice )
-    let order = match Order::by_id(pool, order.id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
-            error!("Order Id {} not found!", order.id);
+            error!("Order Id {} not found!", order_id);
             return Ok(());
         }
     };

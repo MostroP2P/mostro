@@ -222,7 +222,9 @@ impl LndConnector {
             .map_err(|e| MostroError::LnPaymentError(e.to_string()));
 
         // We can safely unwrap here cause await was successful
-        let mut stream = outer_stream.map_err(|e| MostroError::LnPaymentError(e.to_string()))?.into_inner();
+        let mut stream = outer_stream
+            .map_err(|e| MostroError::LnPaymentError(e.to_string()))?
+            .into_inner();
 
         while let Some(payment) = stream.message().await.expect("Failed paying invoice") {
             let msg = PaymentMessage { payment };

@@ -36,13 +36,10 @@ pub async fn admin_settle_action(
             return Ok(());
         }
     };
-    let status = Status::SettledByAdmin;
+
     let action = Action::AdminSettle;
 
-    settle_seller_hold_invoice(
-        event, my_keys, client, pool, ln_client, status, action, true, &order,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, my_keys, client, ln_client, action, true, &order).await?;
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order_id).await;
 

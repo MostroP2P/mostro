@@ -7,10 +7,10 @@ use crate::util::update_order_event;
 use chrono::{Duration, Utc};
 use mostro_core::order::Status;
 use nostr_sdk::{Client, Event};
+use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
-use sqlx_crud::Crud;
 
 pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client) {
     info!("Creating scheduler");
@@ -181,8 +181,10 @@ async fn job_cancel_orders(client: Client) {
                                 order.id
                             );
                         }
-                        if let Ok(order_updated) = update_order_event(&client, &keys, new_status, &order).await{
-                            order_updated.update(&pool).await;
+                        if let Ok(order_updated) =
+                            update_order_event(&client, &keys, new_status, &order).await
+                        {
+                            let _ = order_updated.update(&pool).await;
                         }
                     }
                 }
@@ -211,14 +213,11 @@ async fn job_expire_pending_older_orders(client: Client) {
                 for order in older_orders_list.iter() {
                     println!("Uid {} - created at {}", order.id, order.created_at);
                     // We update the order id with the new event_id
-                    if let Ok(order_updated) = crate::util::update_order_event(
-                        &client,
-                        &keys,
-                        Status::Expired,
-                        order,
-                    )
-                    .await{
-                        order_updated.update(&pool).await;
+                    if let Ok(order_updated) =
+                        crate::util::update_order_event(&client, &keys, Status::Expired, order)
+                            .await
+                    {
+                        let _ = order_updated.update(&pool).await;
                     }
                 }
             }

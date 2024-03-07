@@ -90,10 +90,20 @@ pub async fn release_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, my_keys, client, ln_client, Action::Release, false, &order).await?;
+    settle_seller_hold_invoice(
+        event,
+        my_keys,
+        client,
+        ln_client,
+        Action::Release,
+        false,
+        &order,
+    )
+    .await?;
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
-    let order_updated = update_order_event( client, my_keys, Status::SettledHoldInvoice, &order).await?;
+    let order_updated =
+        update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
     order_updated.update(pool).await?;
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
@@ -169,7 +179,6 @@ pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
                                 &seller_pubkey,
                                 &my_keys,
                                 &client,
-                                &pool,
                             )
                             .await;
                         }
@@ -198,7 +207,6 @@ async fn payment_success(
     seller_pubkey: &XOnlyPublicKey,
     my_keys: &Keys,
     client: &Client,
-    pool: &Pool<Sqlite>,
 ) {
     // Purchase completed message to buyer
     let message = Message::new_order(Some(order.id), None, Action::PurchaseCompleted, None);
@@ -211,7 +219,7 @@ async fn payment_success(
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, status, order)
+    update_order_event(client, my_keys, status, order)
         .await
         .unwrap();
 

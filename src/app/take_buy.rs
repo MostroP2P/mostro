@@ -98,15 +98,6 @@ pub async fn take_buy_action(
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_i64();
 
-    show_hold_invoice(
-        pool,
-        client,
-        my_keys,
-        None,
-        &buyer_pubkey,
-        &seller_pubkey,
-        order,
-    )
-    .await?;
+    show_hold_invoice(client, my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     Ok(())
 }

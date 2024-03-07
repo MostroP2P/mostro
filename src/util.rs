@@ -138,7 +138,7 @@ pub async fn publish_order(
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
         kind: "Sell".to_string(),
-        status: "Pending".to_string(),
+        status: Status::Pending.to_string(),
         creator_pubkey: initiator_pubkey.to_string(),
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,

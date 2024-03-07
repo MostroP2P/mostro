@@ -1,6 +1,6 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice,
+    get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice, update_order_event
 };
 
 use anyhow::Result;
@@ -112,9 +112,13 @@ pub async fn take_sell_action(
         order.fee = fee;
 
         if pr.is_none() {
-            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await
+            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await
             {
-                Ok(_) => {}
+                Ok(_) => { // Update order status
+                    if let Ok(order_updated) = update_order_event(client, my_keys, Status::from_str(&order.status).unwrap(), &order).await{
+                        order_updated.update(pool).await
+                    }
+                }
                 Err(e) => {
                     error!("Error setting market order sats amount: {:#?}", e);
                     return Ok(());
@@ -122,7 +126,6 @@ pub async fn take_sell_action(
             }
         } else {
             show_hold_invoice(
-                pool,
                 client,
                 my_keys,
                 pr,
@@ -133,16 +136,19 @@ pub async fn take_sell_action(
             .await?;
         }
     } else if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await {
-            Ok(_) => {}
-            Err(e) => {
+        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
+            Ok(_) => { // Update order status
+                if let Ok(order_updated) = update_order_event(client, my_keys, Status::from_str(&order.status).unwrap(), &order).await{
+                    order_updated.update(pool).await;
+                }
+            }
+        Err(e) => {
                 error!("Error setting market order sats amount: {:#?}", e);
                 return Ok(());
             }
         }
     } else {
         show_hold_invoice(
-            pool,
             client,
             my_keys,
             pr,

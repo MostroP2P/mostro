@@ -29,7 +29,7 @@ pub async fn admin_settle_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
-    let order = match Order::by_id(pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -37,9 +37,11 @@ pub async fn admin_settle_action(
         }
     };
 
-    let action = Action::AdminSettle;
+    settle_seller_hold_invoice(event, my_keys, client, ln_client, Action::AdminSettle, true, &order).await?;
+    // Update order event
+    let order = update_order_event(client, my_keys, Status::SettledByAdmin, &order).await?;
+    order.update(pool).await?;
 
-    settle_seller_hold_invoice(event, my_keys, client, ln_client, action, true, &order).await?;
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order_id).await;
 

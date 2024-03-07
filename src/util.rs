@@ -260,25 +260,23 @@ pub async fn update_user_rating_event(
 }
 
 pub async fn update_order_event(
-    pool: &SqlitePool,
     client: &Client,
     keys: &Keys,
     status: Status,
     order: &Order,
-) -> Result<String> {
-    let mut order = order.clone();
+) -> Result<Order> {
+    let mut order_updated = order.clone();
     // update order.status with new status
-    order.status = status.to_string();
+    order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order);
+    let tags = order_to_tags(&order_updated);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, "", order.id.to_string(), tags)?;
     let order_id = order.id.to_string();
     info!("Sending replaceable event: {event:#?}");
     // We update the order with the new event_id
-    order.event_id = event.id.to_string();
-    let event_id = event.id.to_string();
-    order.update(pool).await?;
+    order_updated.event_id = event.id.to_string();
+
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order_id,
@@ -287,7 +285,7 @@ pub async fn update_order_event(
 
     client.send_event(event).await?;
 
-    Ok(event_id)
+    Ok(order_updated)
 }
 
 pub async fn connect_nostr() -> Result<Client> {
@@ -310,7 +308,6 @@ pub async fn connect_nostr() -> Result<Client> {
 }
 
 pub async fn show_hold_invoice(
-    pool: &SqlitePool,
     client: &Client,
     my_keys: &Keys,
     payment_request: Option<String>,
@@ -346,7 +343,10 @@ pub async fn show_hold_invoice(
     order.seller_pubkey = Some(seller_pubkey.to_string());
 
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, &order).await?;
+    let pool = db::connect().await?;
+    let order_updated = update_order_event(client, my_keys, Status::WaitingPayment, &order).await?;
+    order_updated.update(pool).await?;
+
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
@@ -421,7 +421,6 @@ pub async fn set_waiting_invoice_status(
     order: &mut Order,
     buyer_pubkey: XOnlyPublicKey,
     my_keys: &Keys,
-    pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
@@ -451,9 +450,6 @@ pub async fn set_waiting_invoice_status(
         Some(Content::Order(order_data)),
     );
     send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
-
-    // Update order status
-    update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(order.amount)
 }

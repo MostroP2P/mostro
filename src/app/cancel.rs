@@ -41,7 +41,9 @@ pub async fn cancel_action(
         } else {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
-            update_order_event(pool, client, my_keys, Status::Canceled, &order).await?;
+            if let Ok(order_updated) = update_order_event(client, my_keys, Status::Canceled, &order).await{
+                order_updated.update(pool).await;
+            }
             // We create a Message for cancel
             let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
             let message = message.as_json()?;

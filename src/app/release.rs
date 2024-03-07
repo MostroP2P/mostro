@@ -50,7 +50,7 @@ pub async fn release_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
-    let mut order = match Order::by_id(pool, order_id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -90,15 +90,11 @@ pub async fn release_action(
         return Ok(());
     }
 
-    let status = Status::SettledHoldInvoice;
-    let action = Action::Release;
-
-    settle_seller_hold_invoice(event, my_keys, client, ln_client, action, false, &order).await?;
-    let event_id = update_order_event(pool, client, my_keys, status, &order).await?;
+    settle_seller_hold_invoice(event, my_keys, client, ln_client, Action::Release, false, &order).await?;
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
-    order.event_id = event_id;
-    order.status = status.to_string();
-    order.update(pool).await?;
+
+    let order_updated = update_order_event( client, my_keys, Status::SettledHoldInvoice, &order).await?;
+    order_updated.update(pool).await?;
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller

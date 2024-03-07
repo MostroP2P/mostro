@@ -219,9 +219,10 @@ async fn payment_success(
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(client, my_keys, status, order)
-        .await
-        .unwrap();
+    if let Ok(order_updated) = update_order_event(client, my_keys, status, order).await {
+        let pool = db::connect().await.unwrap();
+        let _ = order_updated.update(&pool).await;
+    }
 
     // Adding here rate process
     rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, order)

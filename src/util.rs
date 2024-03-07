@@ -1,4 +1,5 @@
 use crate::cli::settings::Settings;
+use crate::db;
 use crate::error::MostroError;
 use crate::flow;
 use crate::lightning;
@@ -345,7 +346,7 @@ pub async fn show_hold_invoice(
     // We need to publish a new event with the new status
     let pool = db::connect().await?;
     let order_updated = update_order_event(client, my_keys, Status::WaitingPayment, &order).await?;
-    order_updated.update(pool).await?;
+    order_updated.update(&pool).await?;
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);

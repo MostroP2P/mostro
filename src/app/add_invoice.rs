@@ -148,7 +148,7 @@ pub async fn add_invoice_action(
         );
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order)
+        let _ = crate::util::update_order_event(client, my_keys, Status::Active, &order)
             .await
             .unwrap();
 
@@ -173,16 +173,7 @@ pub async fn add_invoice_action(
             .await
             .unwrap();
     } else {
-        show_hold_invoice(
-            pool,
-            client,
-            my_keys,
-            None,
-            &buyer_pubkey,
-            &seller_pubkey,
-            order,
-        )
-        .await?;
+        show_hold_invoice(client, my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     }
 
     Ok(())

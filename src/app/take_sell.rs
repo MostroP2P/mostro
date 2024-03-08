@@ -82,6 +82,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
+
     // Buyer can take Pending or WaitingBuyerInvoice orders only
     match order_status {
         Status::Pending | Status::WaitingBuyerInvoice => {}
@@ -116,13 +117,9 @@ pub async fn take_sell_action(
             match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
                 Ok(_) => {
                     // Update order status
-                    if let Ok(order_updated) = update_order_event(
-                        client,
-                        my_keys,
-                        Status::from_str(&order.status).unwrap(),
-                        &order,
-                    )
-                    .await
+                    if let Ok(order_updated) =
+                        update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order)
+                            .await
                     {
                         let _ = order_updated.update(pool).await;
                         return Ok(());
@@ -140,13 +137,8 @@ pub async fn take_sell_action(
         match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
             Ok(_) => {
                 // Update order status
-                if let Ok(order_updated) = update_order_event(
-                    client,
-                    my_keys,
-                    Status::from_str(&order.status).unwrap(),
-                    &order,
-                )
-                .await
+                if let Ok(order_updated) =
+                    update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order).await
                 {
                     let _ = order_updated.update(pool).await;
                 }

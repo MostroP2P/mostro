@@ -26,7 +26,7 @@ pub async fn cancel_action(
             return Ok(());
         }
     };
-    if order.status == "Pending" {
+    if order.status == Status::Pending.to_string() {
         let user_pubkey = event.pubkey.to_string();
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
@@ -55,15 +55,18 @@ pub async fn cancel_action(
         return Ok(());
     }
 
-    if order.kind == "Sell" && order.status == "WaitingBuyerInvoice" {
+    if order.kind == "Sell" && order.status == Status::WaitingBuyerInvoice.to_string() {
         cancel_add_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.kind == "Buy" && order.status == "WaitingPayment" {
+    if order.kind == "Buy" && order.status == Status::WaitingPayment.to_string() {
         cancel_pay_hold_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.status == "Active" || order.status == "FiatSent" || order.status == "Dispute" {
+    if order.status == Status::Active.to_string()
+        || order.status == Status::FiatSent.to_string()
+        || order.status == Status::Dispute.to_string()
+    {
         let user_pubkey = event.pubkey.to_string();
         let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
         let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
@@ -95,7 +98,7 @@ pub async fn cancel_action(
                             &order.id
                         );
                     }
-                    order.status = "CooperativelyCanceled".to_string();
+                    order.status = Status::CooperativelyCanceled.to_string();
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
                     update_order_event(client, my_keys, Status::CooperativelyCanceled, &order)

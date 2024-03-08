@@ -25,7 +25,7 @@ pub async fn fiat_sent_action(
         }
     };
     // Send to user a DM with the error
-    if order.status != "Active" {
+    if order.status != Status::Active.to_string() {
         let error = format!("Order Id {order_id} wrong status");
         let message = Message::cant_do(Some(order.id), None, Some(Content::TextMessage(error)));
         send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;

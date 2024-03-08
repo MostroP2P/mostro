@@ -90,6 +90,10 @@ pub async fn release_action(
         return Ok(());
     }
 
+    println!(
+        "Entering settle_seller_hold_invoice, order status {:?}",
+        order.status
+    );
     settle_seller_hold_invoice(
         event,
         my_keys,
@@ -100,11 +104,27 @@ pub async fn release_action(
         &order,
     )
     .await?;
+    println!(
+        "Exiting settle_seller_hold_invoice, order status {:?}",
+        order.status
+    );
+
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
     let order_updated =
         update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
-    order_updated.update(pool).await?;
+
+    println!(
+        "update_order_event done, order_updated status {:?}, old order status {:?}",
+        order_updated.status, order.status
+    );
+
+    let new_order_afted_crud = order_updated.update(pool).await?;
+
+    println!(
+        "CRUD done, order_updated status {:?}",
+        new_order_afted_crud.status
+    );
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller

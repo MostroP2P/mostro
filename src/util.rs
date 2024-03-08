@@ -287,8 +287,9 @@ pub async fn update_order_event(
     client.send_event(event).await?;
 
     println!(
-        "Inside update_order_event order_updated status {:?}",
-        order_updated.status
+        "Inside update_order_event order_updated status {:?} - order id {:?}",
+        order_updated.status,
+        order_updated.id,
     );
 
     Ok(order_updated)

@@ -91,8 +91,9 @@ pub async fn release_action(
     }
 
     println!(
-        "Entering settle_seller_hold_invoice, order status {:?}",
-        order.status
+        "Entering settle_seller_hold_invoice, order status {:?} - order id {:?}",
+        order.status,
+        order.id,
     );
     settle_seller_hold_invoice(
         event,
@@ -105,8 +106,9 @@ pub async fn release_action(
     )
     .await?;
     println!(
-        "Exiting settle_seller_hold_invoice, order status {:?}",
-        order.status
+        "Exiting settle_seller_hold_invoice, order status {:?} - order id {:?}",
+        order.status,
+        order.id,
     );
 
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
@@ -115,8 +117,8 @@ pub async fn release_action(
         update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
 
     println!(
-        "update_order_event done, order_updated status {:?}, old order status {:?}",
-        order_updated.status, order.status
+        "update_order_event done, order_updated status {:?}, old order status {:?} - order updated id {:?}",
+        order_updated.status, order.status,order_updated.id,
     );
 
     let new_order_afted_crud = order_updated.update(pool).await?;

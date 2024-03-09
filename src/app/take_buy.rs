@@ -2,7 +2,7 @@ use crate::util::{get_fee, get_market_quote, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -34,7 +34,7 @@ pub async fn take_buy_action(
         return Ok(());
     }
 
-    if order.kind != "Buy" {
+    if order.kind != Kind::Buy.to_string() {
         error!("Order Id {order_id} wrong kind");
         let message = Message::cant_do(Some(order.id), None, None);
         send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;

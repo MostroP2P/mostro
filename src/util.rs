@@ -137,7 +137,7 @@ pub async fn publish_order(
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
-        kind: "Sell".to_string(),
+        kind: OrderKind::Sell.to_string(),
         status: Status::Pending.to_string(),
         creator_pubkey: initiator_pubkey.to_string(),
         payment_method: new_order.payment_method.clone(),
@@ -152,7 +152,7 @@ pub async fn publish_order(
     };
 
     if new_order.kind == Some(OrderKind::Buy) {
-        new_order_db.kind = "Buy".to_string();
+        new_order_db.kind = OrderKind::Buy.to_string();
         new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
         new_order_db.master_buyer_pubkey = Some(master_pubkey.to_string());
     } else {
@@ -288,8 +288,7 @@ pub async fn update_order_event(
 
     println!(
         "Inside update_order_event order_updated status {:?} - order id {:?}",
-        order_updated.status,
-        order_updated.id,
+        order_updated.status, order_updated.id,
     );
 
     Ok(order_updated)

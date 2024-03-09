@@ -6,7 +6,7 @@ use crate::util::{
 
 use anyhow::Result;
 use mostro_core::message::{Content, Message};
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -29,7 +29,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
-    if order.kind != "Sell" {
+    if order.kind != Kind::Sell.to_string() {
         return Ok(());
     }
     // We check if the message have a pubkey

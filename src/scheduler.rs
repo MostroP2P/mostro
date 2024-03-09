@@ -5,7 +5,7 @@ use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 
 use chrono::{Duration, Utc};
-use mostro_core::order::Status;
+use mostro_core::order::{Kind, Status};
 use nostr_sdk::{Client, Event};
 use sqlx_crud::Crud;
 use std::sync::Arc;
@@ -108,7 +108,9 @@ async fn job_cancel_orders(client: Client) {
                 for order in older_orders_list.into_iter() {
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
-                    if order.status == "WaitingBuyerInvoice" || order.status == "WaitingPayment" {
+                    if order.status == Status::WaitingBuyerInvoice.to_string()
+                        || order.status == Status::WaitingPayment.to_string()
+                    {
                         // If hold invoice is paid return funds to seller
                         if order.hash.is_some() {
                             // We return funds to seller
@@ -127,15 +129,15 @@ async fn job_cancel_orders(client: Client) {
                         // Initialize reset status to pending, change in case of specifici needs of order
                         let mut new_status = Status::Pending;
 
-                        if order.status == "WaitingBuyerInvoice" {
-                            if order.kind == "Sell" {
+                        if order.status == Status::WaitingBuyerInvoice.to_string() {
+                            if order.kind == Kind::Sell.to_string() {
                                 // Reset buyer pubkey to none
                                 edit_buyer_pubkey_order(&pool, order.id, None)
                                     .await
                                     .unwrap();
                                 let _ = edit_master_buyer_pubkey_order(&pool, order.id, None).await;
                             }
-                            if order.kind == "Buy" {
+                            if order.kind == Kind::Buy.to_string() {
                                 let _ = edit_seller_pubkey_order(&pool, order.id, None).await;
                                 let _ =
                                     edit_master_seller_pubkey_order(&pool, order.id, None).await;
@@ -144,8 +146,8 @@ async fn job_cancel_orders(client: Client) {
                             info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                         };
 
-                        if order.status == "WaitingPayment" {
-                            if order.kind == "Sell" {
+                        if order.status == Status::WaitingPayment.to_string() {
+                            if order.kind == Kind::Sell.to_string() {
                                 edit_buyer_pubkey_order(&pool, order.id, None)
                                     .await
                                     .unwrap();
@@ -153,7 +155,7 @@ async fn job_cancel_orders(client: Client) {
                                 new_status = Status::Canceled;
                             };
 
-                            if order.kind == "Buy" {
+                            if order.kind == Kind::Buy.to_string() {
                                 edit_seller_pubkey_order(&pool, order.id, None)
                                     .await
                                     .unwrap();

@@ -4,13 +4,13 @@ The buyer can use a [lightning address](https://github.com/andrerfneves/lightnin
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
-    "action": "TakeSell",
+    "action": "take-sell",
     "content": {
-      "PaymentRequest": [null, "mostro_p2p@ln.tips"]
+      "payment_request": [null, "mostro_p2p@ln.tips"]
     }
   }
 }
@@ -34,15 +34,15 @@ The event to send to Mostro would look like this:
 
 ## Mostro response
 
-Mostro send a nip 04 event to the buyer with a wrapped `Order` in the content, it would look like this:
+Mostro send a nip 04 event to the buyer with a wrapped `order` in the content, it would look like this:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "WaitingSellerToPay",
+    "action": "waiting-seller-to-pay",
     "content": null
   }
 }
@@ -61,9 +61,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "WaitingPayment"],
+      ["s", "waiting-payment"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],

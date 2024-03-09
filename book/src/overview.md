@@ -13,15 +13,15 @@ All messages from/to Mostro should be a Nostr event [kind 4](https://github.com/
 - [action](https://docs.rs/mostro-core/latest/mostro_core/message/enum.Action.html): Action to be performed by Mostro daemon
 - [content](https://docs.rs/mostro-core/latest/mostro_core/message/enum.Content.html) (optional): Content of the message, this field is optional and depends on the action
 
-These fields are relative to the wrapper, here an example of a `FiatSent` Order message, in this case `id` is the Order Id:
+These fields are relative to the wrapper, here an example of a `fiat-sent` Order message, in this case `id` is the Order Id:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0001be6bd50247846a28cce439a10470a39b1b6c81d5c3be2475156a413e1e3a",
-    "action": "FiatSent",
+    "action": "fiat-sent",
     "content": null
   }
 }

@@ -1,14 +1,14 @@
 # Dispute
 
-A use can start a dispute in an order with status `Pending` or `FiatSent` sending action `Dispute`, here is an example where the seller initiates a dispute:
+A use can start a dispute in an order with status `pending` or `fiat-sent` sending action `dispute`, here is an example where the seller initiates a dispute:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
-    "action": "Dispute",
+    "action": "dispute",
     "content": null
   }
 }
@@ -20,11 +20,11 @@ Mostro will send this message to the seller:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "DisputeInitiatedByYou,",
+    "action": "dispute-initiated-by-you",
     "content": null
   }
 }
@@ -34,17 +34,17 @@ And here is the message to the buyer:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "DisputeInitiatedByPeer",
+    "action": "dispute-initiated-by-peer",
     "content": null
   }
 }
 ```
 
-Mostro will not update the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Dispute`, this is because the order is still active, the dispute is just a way to let the admins and the other party know that there is a problem with the order.
+Mostro will not update the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `dispute`, this is because the order is still active, the dispute is just a way to let the admins and the other party know that there is a problem with the order.
 
 ## Mostro send a nip 33 event to show the dispute
 
@@ -61,7 +61,7 @@ Here is an example of the nip 33 event sent by Mostro:
     "kind": 38383,
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
-      ["s", "Pending"],
+      ["s", "pending"],
       ["y", "mostrop2p"],
       ["z", "dispute"]
     ],
@@ -75,11 +75,11 @@ Mostro admin will see the dispute and can take it using the dispute `Id` from `d
 
 ```json
 {
-  "Dispute": {
+  "dispute": {
     "version": 1,
     "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
     "pubkey": null,
-    "action": "AdminTakeDispute",
+    "action": "admin-take-dispute",
     "content": null
   }
 }
@@ -89,16 +89,16 @@ Mostro will send a confirmation message to the admin with the Order details:
 
 ```json
 {
-  "Dispute": {
+  "dispute": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "AdminTakeDispute",
+    "action": "admin-take-dispute",
     "content": {
-      "Order": {
+      "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-        "kind": "Sell",
-        "status": "Active",
+        "kind": "sell",
+        "status": "active",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -114,7 +114,7 @@ Mostro will send a confirmation message to the admin with the Order details:
 }
 ```
 
-Also Mostro will broadcast a new nip33 dispute event to update the Dispute `status` to `InProgress`:
+Also Mostro will broadcast a new nip33 dispute event to update the Dispute `status` to `in-progress`:
 
 ```json
 [
@@ -127,7 +127,7 @@ Also Mostro will broadcast a new nip33 dispute event to update the Dispute `stat
     "kind": 38383,
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
-      ["s", "InProgress"],
+      ["s", "in-progress"],
       ["y", "mostrop2p"],
       ["z", "dispute"]
     ],

@@ -1,14 +1,14 @@
 # Cancel order
 
-An admin can cancel an order, most of the time this is done when admin is solving a dispute, for this the admin will need to send an `Order` message to Mostro with action `AdminCancel` with the `Id` of the order like this:
+An admin can cancel an order, most of the time this is done when admin is solving a dispute, for this the admin will need to send an `order` message to Mostro with action `admin-cancel` with the `Id` of the order like this:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "AdminCancel",
+    "action": "admin-cancel",
     "content": null
   }
 }
@@ -20,11 +20,11 @@ Mostro will send this message to the both parties buyer/seller and to the admin:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "AdminCancel",
+    "action": "admin-cancel",
     "content": null
   }
 }
@@ -32,7 +32,7 @@ Mostro will send this message to the both parties buyer/seller and to the admin:
 
 ## Mostro updates nip 33 events
 
-Mostro will publish two nip33 messages, one for the order to update the status to `CanceledByAdmin`, this means that the hold invoice was canceled and the seller's funds were returned:
+Mostro will publish two nip33 messages, one for the order to update the status to `canceled-by-admin`, this means that the hold invoice was canceled and the seller's funds were returned:
 
 ```json
 [
@@ -45,9 +45,9 @@ Mostro will publish two nip33 messages, one for the order to update the status t
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "CanceledByAdmin"],
+      ["s", "canceled-by-admin"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],
@@ -61,7 +61,7 @@ Mostro will publish two nip33 messages, one for the order to update the status t
 ]
 ```
 
-And updates nip33 dispute event with status `SellerRefunded`:
+And updates nip33 dispute event with status `seller-refunded`:
 
 ```json
 [
@@ -74,7 +74,7 @@ And updates nip33 dispute event with status `SellerRefunded`:
     "kind": 38383,
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
-      ["s", "SellerRefunded"],
+      ["s", "seller-refunded"],
       ["y", "mostrop2p"],
       ["z", "dispute"]
     ],

@@ -4,11 +4,11 @@ After the buyer sends the fiat money to the seller, the buyer should send a mess
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
-    "action": "FiatSent",
+    "action": "fiat-sent",
     "content": null
   }
 }
@@ -32,15 +32,15 @@ The event to send to Mostro would look like this:
 
 ## Mostro response
 
-Mostro send a messages to both parties confirming `FiatSent` action and sending again the counterpart pubkey, here an example of the message to the buyer:
+Mostro send a messages to both parties confirming `fiat-sent` action and sending again the counterpart pubkey, here an example of the message to the buyer:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
-    "action": "FiatSent",
+    "action": "fiat-sent",
     "content": {
       "Peer": {
         "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78"
@@ -54,11 +54,11 @@ And here an example of the message from Mostro to the seller:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
-    "action": "FiatSent",
+    "action": "fiat-sent",
     "content": {
       "Peer": {
         "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427"
@@ -68,7 +68,7 @@ And here an example of the message from Mostro to the seller:
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `FiatSent`:
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `fiat-sent`:
 
 ```json
 [
@@ -81,9 +81,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "FiatSent"],
+      ["s", "fiat-sent"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],

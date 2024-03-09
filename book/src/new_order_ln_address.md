@@ -4,14 +4,14 @@ Creating buy order with a [lightning address](https://github.com/andrerfneves/li
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427", // Buyer's real pubkey
-    "action": "NewOrder",
+    "action": "new-order",
     "content": {
-      "Order": {
-        "kind": "Buy",
-        "status": "Pending",
+      "order": {
+        "kind": "buy",
+        "status": "pending",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -47,15 +47,15 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "content": {
-      "Order": {
+      "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-        "kind": "Sell",
-        "status": "Pending",
+        "kind": "sell",
+        "status": "pending",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -71,7 +71,7 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 }
 ```
 
-Mostro publishes this order as an event kind `38383` with status `Pending`:
+Mostro publishes this order as an event kind `38383` with status `pending`:
 
 ```json
 [
@@ -84,9 +84,9 @@ Mostro publishes this order as an event kind `38383` with status `Pending`:
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "Pending"],
+      ["s", "pending"],
       ["amt", "0"],
       ["fa", "100"],
       ["pm", "face to face"],

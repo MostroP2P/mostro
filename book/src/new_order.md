@@ -4,14 +4,14 @@ To create a new sell order the user should send a Nostr event kind 4 (an encrypt
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78", // Seller's real pubkey
-    "action": "NewOrder",
+    "action": "new-order",
     "content": {
-      "Order": {
-        "kind": "Sell",
-        "status": "Pending",
+      "order": {
+        "kind": "sell",
+        "status": "pending",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -26,8 +26,8 @@ To create a new sell order the user should send a Nostr event kind 4 (an encrypt
 
 Let's explain some of the fields:
 
-- kind: `Sell` or `Buy`
-- status: Is always `Pending` when creating a new order
+- kind: `sell` or `buy`
+- status: Is always `pending` when creating a new order
 - amount: 0 for when we want to sell with at market price, otherwise the amount in satoshis
 - pubkey: Real user's npub, we use this when the message was sent from an ephemeral key
 - created_at: No need to send the correct unix timestamp, Mostro will replace it with the current time
@@ -54,15 +54,15 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "content": {
-      "Order": {
+      "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-        "kind": "Sell",
-        "status": "Pending",
+        "kind": "sell",
+        "status": "pending",
         "amount": 0,
         "fiat_code": "VES",
         "fiat_amount": 100,
@@ -75,7 +75,7 @@ Mostro will send back a nip04 event as a confirmation message to the user like t
 }
 ```
 
-Mostro publishes this order as an event kind `38383` with status `Pending`:
+Mostro publishes this order as an event kind `38383` with status `pending`:
 
 ```json
 [
@@ -88,9 +88,9 @@ Mostro publishes this order as an event kind `38383` with status `Pending`:
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "Pending"],
+      ["s", "pending"],
       ["amt", "0"],
       ["fa", "100"],
       ["pm", "face to face"],

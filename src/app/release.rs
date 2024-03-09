@@ -118,11 +118,11 @@ pub async fn release_action(
         "update_order_event done, order_updated status {:?}, old order status {:?} - order updated id {:?}",
         order_updated.status, order.status,order_updated.id,
     );
+    let new_order_afted_crud = order_updated.update(pool).await?;
     // FIXME: Ugly hack to wait for the update to be persisted
     use std::thread::sleep;
     use std::time::Duration;
-    sleep(Duration::from_millis(1));
-    let new_order_afted_crud = order_updated.update(pool).await?;
+    sleep(Duration::from_millis(300));
 
     println!(
         "CRUD done, order_updated status {:?}",

@@ -3,7 +3,7 @@ use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind as OrderKind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -55,11 +55,15 @@ pub async fn cancel_action(
         return Ok(());
     }
 
-    if order.kind == "Sell" && order.status == Status::WaitingBuyerInvoice.to_string() {
+    if order.kind == OrderKind::Sell.to_string()
+        && order.status == Status::WaitingBuyerInvoice.to_string()
+    {
         cancel_add_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.kind == "Buy" && order.status == Status::WaitingPayment.to_string() {
+    if order.kind == OrderKind::Buy.to_string()
+        && order.status == Status::WaitingPayment.to_string()
+    {
         cancel_pay_hold_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 

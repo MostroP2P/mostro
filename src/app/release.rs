@@ -235,12 +235,12 @@ async fn payment_success(
     send_dm(client, my_keys, buyer_pubkey, message)
         .await
         .unwrap();
-    let status = Status::Success;
+
     // Let's wait 5 secs before publish this new event
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(client, my_keys, status, order).await {
+    if let Ok(order_updated) = update_order_event(client, my_keys, Status::Success, order).await {
         let pool = db::connect().await.unwrap();
         let _ = order_updated.update(&pool).await;
     }

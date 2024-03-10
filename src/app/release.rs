@@ -19,8 +19,11 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<Order> {
+pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     let mut order = order.clone();
+
+    // Handle to db here
+    let pool = db::connect().await.unwrap();
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -40,7 +43,7 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
     );
 
     // Update order
-    let result = order.update(pool).await?;
+    let result = order.update(&pool).await?;
     Ok(result)
 }
 
@@ -161,8 +164,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        let pool = db::connect().await.unwrap();
-        if let Ok(failed_payment) = check_failure_retries(&order, &pool).await {
+        if let Ok(failed_payment) = check_failure_retries(&order).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -179,7 +181,6 @@ pub async fn do_payment(order: Order) -> Result<()> {
                 XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
             let seller_pubkey =
                 XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
-            let pool = db::connect().await.unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
@@ -205,7 +206,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
                             );
 
                             // Mark payment as failed
-                            if let Ok(failed_payment) = check_failure_retries(&order, &pool).await {
+                            if let Ok(failed_payment) = check_failure_retries(&order).await {
                                 info!(
                                     "Order id {} has {} failed payments retries",
                                     failed_payment.id, failed_payment.payment_attempts

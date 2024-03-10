@@ -1,14 +1,14 @@
-# Release
+# release
 
 After confirming the buyer sent the fiat money, the seller should send a message to Mostro indicating that sats should be delivered to the buyer, the message will look like this:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
-    "action": "Release",
+    "action": "release",
     "content": null
   }
 }
@@ -20,11 +20,11 @@ Here an example of the Mostro response to the seller:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "HoldInvoicePaymentSettled",
+    "action": "hold-invoice-payment-settled",
     "content": null
   }
 }
@@ -34,11 +34,11 @@ And a message to the buyer to let him know that the sats were released:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "Release",
+    "action": "release",
     "content": null
   }
 }
@@ -50,17 +50,17 @@ Right after seller release sats Mostro will try to pay the buyer's lightning inv
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "PurchaseCompleted",
+    "action": "purchase-completed",
     "content": null
   }
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `SettledHoldInvoice`:
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `settled-hold-invoice`:
 
 ```json
 [
@@ -73,9 +73,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "SettledHoldInvoice"],
+      ["s", "settled-hold-invoice"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],
@@ -89,7 +89,7 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
 ]
 ```
 
-Seconds later Mostro will try to pay the buyer's invoice, if the payment is successful Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Success`:
+Seconds later Mostro will try to pay the buyer's invoice, if the payment is successful Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `success`:
 
 ```json
 [
@@ -102,9 +102,9 @@ Seconds later Mostro will try to pay the buyer's invoice, if the payment is succ
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "Success"],
+      ["s", "success"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],

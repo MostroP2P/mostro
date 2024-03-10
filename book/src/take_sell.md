@@ -4,11 +4,11 @@ If the order amount is `0` the buyer don't know the exact amount to create the i
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
-    "action": "TakeSell",
+    "action": "take-sell",
     "content": null
   }
 }
@@ -36,13 +36,13 @@ In order to continue the buyer needs to send a lightning network invoice to Most
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "AddInvoice",
+    "action": "add-invoice",
     "content": {
-      "Order": {
+      "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
         "amount": 7851,
         "fiat_code": "VES",
@@ -57,7 +57,7 @@ In order to continue the buyer needs to send a lightning network invoice to Most
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingBuyerInvoice`:
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `waiting-buyer-invoice`:
 
 ```json
 [
@@ -70,9 +70,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "WaitingBuyerInvoice"],
+      ["s", "waiting-buyer-invoice"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],
@@ -88,17 +88,17 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
 
 ## Buyer sends LN invoice
 
-The buyer sends a nip 04 event to Mostro with the lightning invoice, the action should be the same the buyer just received in the last message from Mostro (`AddInvoice`), here the unencrypted content of the event:
+The buyer sends a nip 04 event to Mostro with the lightning invoice, the action should be the same the buyer just received in the last message from Mostro (`add-invoice`), here the unencrypted content of the event:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "AddInvoice",
+    "action": "add-invoice",
     "content": {
-      "PaymentRequest": [
+      "payment_request": [
         null,
         "lnbcrt78510n1pj59wmepp50677g8tffdqa2p8882y0x6newny5vtz0hjuyngdwv226nanv4uzsdqqcqzzsxqyz5vqsp5skn973360gp4yhlpmefwvul5hs58lkkl3u3ujvt57elmp4zugp4q9qyyssqw4nzlr72w28k4waycf27qvgzc9sp79sqlw83j56txltz4va44j7jda23ydcujj9y5k6k0rn5ms84w8wmcmcyk5g3mhpqepf7envhdccp72nz6e"
       ]
@@ -109,15 +109,15 @@ The buyer sends a nip 04 event to Mostro with the lightning invoice, the action 
 
 ## Mostro response
 
-Mostro send a nip 04 event to the buyer with a wrapped `Order` in the content, it would look like this:
+Mostro send a nip 04 event to the buyer with a wrapped `order` in the content, it would look like this:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "WaitingSellerToPay",
+    "action": "waiting-seller-to-pay",
     "content": null
   }
 }
@@ -136,9 +136,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "WaitingPayment"],
+      ["s", "waiting-payment"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],

@@ -1,14 +1,14 @@
 # Cancel Order
 
-A user can cancel an Order created by himself and with status `Pending` sending action `Cancel`, the message content will look like this:
+A user can cancel an Order created by himself and with status `pending` sending action `cancel`, the message content will look like this:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
-    "action": "Cancel",
+    "action": "cancel",
     "content": null
   }
 }
@@ -16,21 +16,21 @@ A user can cancel an Order created by himself and with status `Pending` sending 
 
 ## Mostro response
 
-Mostro will send a message with action `Cancel` confirming the order was canceled, here an example of the message:
+Mostro will send a message with action `cancel` confirming the order was canceled, here an example of the message:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "Cancel",
+    "action": "cancel",
     "content": null
   }
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `Canceled`:
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `canceled`:
 
 ```json
 [
@@ -43,9 +43,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "Canceled"],
+      ["s", "canceled"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],
@@ -61,15 +61,15 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
 
 ## Cancel cooperatively
 
-A user can cancel an `Active` order, but will need the counterparty to agree, let's look at an example where the seller initiates a cooperative cancellation:
+A user can cancel an `active` order, but will need the counterparty to agree, let's look at an example where the seller initiates a cooperative cancellation:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "Cancel",
+    "action": "cancel",
     "content": null
   }
 }
@@ -79,11 +79,11 @@ Mostro will send this message to the seller:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "CooperativeCancelInitiatedByYou",
+    "action": "cooperative-cancel-initiated-by-you",
     "content": null
   }
 }
@@ -93,17 +93,17 @@ And this message to the buyer:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "CooperativeCancelInitiatedByPeer",
+    "action": "cooperative-cancel-initiated-by-peer",
     "content": null
   }
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `CooperativelyCanceled`:
+Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `cooperatively-canceled`:
 
 ```json
 [
@@ -116,9 +116,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "Sell"],
+      ["k", "sell"],
       ["f", "VES"],
-      ["s", "CooperativelyCanceled"],
+      ["s", "cooperatively-canceled"],
       ["amt", "7851"],
       ["fa", "100"],
       ["pm", "face to face"],
@@ -136,11 +136,11 @@ The buyer can accept the cooperative cancellation sending this message:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "Cancel",
+    "action": "cancel",
     "content": null
   }
 }
@@ -150,11 +150,11 @@ And Mostro will send this message to both parties:
 
 ```json
 {
-  "Order": {
+  "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "CooperativeCancelAccepted",
+    "action": "cooperative-cancel-accepted",
     "content": null
   }
 }

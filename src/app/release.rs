@@ -37,11 +37,6 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts += 1;
     }
 
-    println!(
-        "(check_failure_retries) -  before order status {}",
-        order.status.clone()
-    );
-
     // Update order
     let result = order.update(&pool).await?;
     Ok(result)
@@ -96,10 +91,6 @@ pub async fn release_action(
         return Ok(());
     }
 
-    println!(
-        "Entering settle_seller_hold_invoice, order status {:?} - order id {:?}",
-        order.status, order.id,
-    );
     settle_seller_hold_invoice(
         event,
         my_keys,
@@ -110,22 +101,11 @@ pub async fn release_action(
         &order,
     )
     .await?;
-    println!(
-        "Exiting settle_seller_hold_invoice, order status {:?} - order id {:?}",
-        order.status, order.id,
-    );
 
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
     let order_updated =
         update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
-
-    println!(
-        "update_order_event done, order_updated status {:?}, old order status {:?} - order updated id {:?}",
-        order_updated.status, order.status,order_updated.id,
-    );
-
-    println!("CRUD done, order_updated status {:?}", order_updated.status);
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
@@ -148,7 +128,6 @@ pub async fn release_action(
 }
 
 pub async fn do_payment(order: Order) -> Result<()> {
-    println!("(do_payment) -  order status {}", order.status);
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
@@ -243,11 +222,11 @@ async fn payment_success(
     // and update on local database the status and new event id
     if let Ok(order_updated) = update_order_event(client, my_keys, Status::Success, order).await {
         let pool = db::connect().await.unwrap();
-        let _ = order_updated.update(&pool).await;
+        if let Ok(order_success) = order_updated.update(&pool).await {
+            // Adding here rate process
+            rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, &order_success)
+                .await
+                .unwrap();
+        }
     }
-
-    // Adding here rate process
-    rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, order)
-        .await
-        .unwrap();
 }

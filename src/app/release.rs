@@ -19,7 +19,7 @@ use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<()> {
+pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<Order> {
     let mut order = order.clone();
 
     // Get max number of retries
@@ -40,14 +40,8 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
     );
 
     // Update order
-    if let Ok(res) = order.update(pool).await {
-        println!(
-            "(check_failure_retries) -  after order status {}",
-            res.status.clone()
-        );
-    }
-
-    Ok(())
+    let result = order.update(pool).await?;
+    Ok(result)
 }
 
 pub async fn release_action(
@@ -127,12 +121,8 @@ pub async fn release_action(
         "update_order_event done, order_updated status {:?}, old order status {:?} - order updated id {:?}",
         order_updated.status, order.status,order_updated.id,
     );
-    let new_order_afted_crud = order_updated.update(pool).await?;
 
-    println!(
-        "CRUD done, order_updated status {:?}",
-        new_order_afted_crud.status
-    );
+    println!("CRUD done, order_updated status {:?}", order_updated.status);
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
@@ -149,7 +139,7 @@ pub async fn release_action(
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
-    let _ = do_payment(new_order_afted_crud).await;
+    let _ = do_payment(order_updated).await;
 
     Ok(())
 }
@@ -172,7 +162,12 @@ pub async fn do_payment(order: Order) -> Result<()> {
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
         let pool = db::connect().await.unwrap();
-        check_failure_retries(&order, &pool).await?;
+        if let Ok(failed_payment) = check_failure_retries(&order, &pool).await {
+            info!(
+                "Order id {} has {} failed payments retries",
+                failed_payment.id, failed_payment.payment_attempts
+            );
+        }
     }
 
     let payment = {
@@ -210,7 +205,12 @@ pub async fn do_payment(order: Order) -> Result<()> {
                             );
 
                             // Mark payment as failed
-                            let _ = check_failure_retries(&order, &pool).await;
+                            if let Ok(failed_payment) = check_failure_retries(&order, &pool).await {
+                                info!(
+                                    "Order id {} has {} failed payments retries",
+                                    failed_payment.id, failed_payment.payment_attempts
+                                );
+                            }
                         }
                         _ => {}
                     }

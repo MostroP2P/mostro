@@ -18,10 +18,12 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
-use uuid::Uuid;
 
-pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<()> {
+pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     let mut order = order.clone();
+
+    // Handle to db here
+    let pool = db::connect().await.unwrap();
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -36,9 +38,8 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
     }
 
     // Update order
-    let _ = order.update(pool).await;
-
-    Ok(())
+    let result = order.update(&pool).await?;
+    Ok(result)
 }
 
 pub async fn release_action(
@@ -90,10 +91,6 @@ pub async fn release_action(
         return Ok(());
     }
 
-    println!(
-        "Entering settle_seller_hold_invoice, order status {:?} - order id {:?}",
-        order.status, order.id,
-    );
     settle_seller_hold_invoice(
         event,
         my_keys,
@@ -104,30 +101,11 @@ pub async fn release_action(
         &order,
     )
     .await?;
-    println!(
-        "Exiting settle_seller_hold_invoice, order status {:?} - order id {:?}",
-        order.status, order.id,
-    );
 
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
     let order_updated =
         update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
-
-    println!(
-        "update_order_event done, order_updated status {:?}, old order status {:?} - order updated id {:?}",
-        order_updated.status, order.status,order_updated.id,
-    );
-    let new_order_afted_crud = order_updated.update(pool).await?;
-    // FIXME: Ugly hack to wait for the update to be persisted
-    use std::thread::sleep;
-    use std::time::Duration;
-    sleep(Duration::from_millis(300));
-
-    println!(
-        "CRUD done, order_updated status {:?}",
-        new_order_afted_crud.status
-    );
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
@@ -144,20 +122,12 @@ pub async fn release_action(
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
-    let _ = do_payment(order_id, pool).await;
+    let _ = do_payment(order_updated).await;
 
     Ok(())
 }
 
-pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
-    // Get updated order to get correct status ( SettledHoldInvoice )
-    let order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {} not found!", order_id);
-            return Ok(());
-        }
-    };
+pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
@@ -173,8 +143,12 @@ pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        let pool = db::connect().await.unwrap();
-        check_failure_retries(&order, &pool).await?;
+        if let Ok(failed_payment) = check_failure_retries(&order).await {
+            info!(
+                "Order id {} has {} failed payments retries",
+                failed_payment.id, failed_payment.payment_attempts
+            );
+        }
     }
 
     let payment = {
@@ -186,7 +160,6 @@ pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
                 XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
             let seller_pubkey =
                 XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
-            let pool = db::connect().await.unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
@@ -212,7 +185,12 @@ pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
                             );
 
                             // Mark payment as failed
-                            let _ = check_failure_retries(&order, &pool).await;
+                            if let Ok(failed_payment) = check_failure_retries(&order).await {
+                                info!(
+                                    "Order id {} has {} failed payments retries",
+                                    failed_payment.id, failed_payment.payment_attempts
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -237,18 +215,18 @@ async fn payment_success(
     send_dm(client, my_keys, buyer_pubkey, message)
         .await
         .unwrap();
-    let status = Status::Success;
+
     // Let's wait 5 secs before publish this new event
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(client, my_keys, status, order).await {
+    if let Ok(order_updated) = update_order_event(client, my_keys, Status::Success, order).await {
         let pool = db::connect().await.unwrap();
-        let _ = order_updated.update(&pool).await;
+        if let Ok(order_success) = order_updated.update(&pool).await {
+            // Adding here rate process
+            rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, &order_success)
+                .await
+                .unwrap();
+        }
     }
-
-    // Adding here rate process
-    rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, order)
-        .await
-        .unwrap();
 }

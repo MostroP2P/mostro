@@ -42,7 +42,9 @@ pub async fn fiat_sent_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(client, my_keys, Status::FiatSent, &order).await?;
+    if let Ok(order_updated) = update_order_event(client, my_keys, Status::FiatSent, &order).await {
+        let _ = order_updated.update(pool).await;
+    }
 
     let seller_pubkey = match order.seller_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_str(pk)?,

@@ -18,7 +18,6 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
-use uuid::Uuid;
 
 pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result<()> {
     let mut order = order.clone();
@@ -35,8 +34,18 @@ pub async fn check_failure_retries(order: &Order, pool: &Pool<Sqlite>) -> Result
         order.payment_attempts += 1;
     }
 
+    println!(
+        "(check_failure_retries) -  before order status {}",
+        order.status.clone()
+    );
+
     // Update order
-    let _ = order.update(pool).await;
+    if let Ok(res) = order.update(pool).await {
+        println!(
+            "(check_failure_retries) -  after order status {}",
+            res.status.clone()
+        );
+    }
 
     Ok(())
 }
@@ -119,10 +128,6 @@ pub async fn release_action(
         order_updated.status, order.status,order_updated.id,
     );
     let new_order_afted_crud = order_updated.update(pool).await?;
-    // FIXME: Ugly hack to wait for the update to be persisted
-    use std::thread::sleep;
-    use std::time::Duration;
-    sleep(Duration::from_millis(300));
 
     println!(
         "CRUD done, order_updated status {:?}",
@@ -144,20 +149,13 @@ pub async fn release_action(
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
     send_dm(client, my_keys, &buyer_pubkey, message).await?;
-    let _ = do_payment(order_id, pool).await;
+    let _ = do_payment(new_order_afted_crud).await;
 
     Ok(())
 }
 
-pub async fn do_payment(order_id: Uuid, pool: &Pool<Sqlite>) -> Result<()> {
-    // Get updated order to get correct status ( SettledHoldInvoice )
-    let order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {} not found!", order_id);
-            return Ok(());
-        }
-    };
+pub async fn do_payment(order: Order) -> Result<()> {
+    println!("(do_payment) -  order status {}", order.status);
     // Finally we try to pay buyer's invoice
     let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);

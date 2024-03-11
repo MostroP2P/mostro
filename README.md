@@ -71,7 +71,7 @@ Clone the repository and then create a new `settings.dev.toml` file based on `se
 ```
 $ git clone https://github.com/MostroP2P/mostro.git
 $ cd mostro
-$ cp settings.toml settings.dev.toml
+$ cp settings.tpl.toml settings.dev.toml
 ```
 
 To connect with a lnd node we need to set 4 variables in the `[lightning]` section in `settings.dev.toml` file.

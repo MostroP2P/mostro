@@ -2,7 +2,7 @@ use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
-use mostro_core::order::Order;
+use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr_sdk::prelude::*;
@@ -64,7 +64,7 @@ pub async fn update_user_reputation_action(
     let seller = order.seller_pubkey.unwrap();
     let message_sender = event.pubkey.to_string();
 
-    if order.status != "Success" {
+    if order.status != Status::Success.to_string() {
         let message = Message::cant_do(Some(order.id), None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;

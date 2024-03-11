@@ -2,6 +2,7 @@ pub mod invoice;
 use std::cmp::Ordering;
 
 use crate::cli::settings::Settings;
+use crate::error::MostroError;
 use crate::lightning::invoice::decode_invoice;
 use crate::util::bytes_to_string;
 
@@ -155,7 +156,7 @@ impl LndConnector {
         payment_request: &str,
         amount: i64,
         listener: Sender<PaymentMessage>,
-    ) {
+    ) -> Result<(), MostroError> {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_vec();
@@ -178,12 +179,13 @@ impl LndConnector {
             .client
             .router()
             .track_payment_v2(track_payment_req)
-            .await;
+            .await
+            .map_err(|e| MostroError::LnPaymentError(e.to_string()));
 
         // We only send the payment if it wasn't attempted before
         if track.is_ok() {
             info!("Aborting paying invoice with hash {} to buyer", hash);
-            return;
+            return Err(MostroError::LnPaymentError("Track error".to_string()));
         }
 
         let mut request = SendPaymentRequest {
@@ -195,12 +197,12 @@ impl LndConnector {
         let invoice_amount_milli = invoice.amount_milli_satoshis();
         match invoice_amount_milli {
             Some(amt) => {
-                if amount != amt as i64 * 1000 {
+                if amt != amount as u64 * 1000 {
                     info!(
                         "Aborting paying invoice with wrong amount to buyer, hash: {}",
                         hash
                     );
-                    return;
+                    return Err(MostroError::LnPaymentError("Wrong amount".to_string()));
                 }
             }
             None => {
@@ -212,12 +214,16 @@ impl LndConnector {
             }
         }
 
-        let mut stream = self
+        let outer_stream = self
             .client
             .router()
             .send_payment_v2(request)
             .await
-            .expect("Failed sending payment")
+            .map_err(|e| MostroError::LnPaymentError(e.to_string()));
+
+        // We can safely unwrap here cause await was successful
+        let mut stream = outer_stream
+            .map_err(|e| MostroError::LnPaymentError(e.to_string()))?
             .into_inner();
 
         while let Some(payment) = stream.message().await.expect("Failed paying invoice") {
@@ -228,5 +234,7 @@ impl LndConnector {
                 .await
                 .expect("Failed to send a message");
         }
+
+        Ok(())
     }
 }

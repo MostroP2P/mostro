@@ -1,11 +1,12 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
     get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice,
+    update_order_event,
 };
 
 use anyhow::Result;
 use mostro_core::message::{Content, Message};
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -28,7 +29,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
-    if order.kind != "Sell" {
+    if order.kind != Kind::Sell.to_string() {
         return Ok(());
     }
     // We check if the message have a pubkey
@@ -81,6 +82,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
+
     // Buyer can take Pending or WaitingBuyerInvoice orders only
     match order_status {
         Status::Pending | Status::WaitingBuyerInvoice => {}
@@ -112,45 +114,42 @@ pub async fn take_sell_action(
         order.fee = fee;
 
         if pr.is_none() {
-            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await
-            {
-                Ok(_) => {}
+            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
+                Ok(_) => {
+                    // Update order status
+                    if let Ok(order_updated) =
+                        update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order)
+                            .await
+                    {
+                        let _ = order_updated.update(pool).await;
+                        return Ok(());
+                    }
+                }
                 Err(e) => {
                     error!("Error setting market order sats amount: {:#?}", e);
                     return Ok(());
                 }
             }
         } else {
-            show_hold_invoice(
-                pool,
-                client,
-                my_keys,
-                pr,
-                &buyer_pubkey,
-                &seller_pubkey,
-                order,
-            )
-            .await?;
+            show_hold_invoice(client, my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
         }
     } else if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, pool, client).await {
-            Ok(_) => {}
+        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
+            Ok(_) => {
+                // Update order status
+                if let Ok(order_updated) =
+                    update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order).await
+                {
+                    let _ = order_updated.update(pool).await;
+                }
+            }
             Err(e) => {
                 error!("Error setting market order sats amount: {:#?}", e);
                 return Ok(());
             }
         }
     } else {
-        show_hold_invoice(
-            pool,
-            client,
-            my_keys,
-            pr,
-            &buyer_pubkey,
-            &seller_pubkey,
-            order,
-        )
-        .await?;
+        show_hold_invoice(client, my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
     }
 
     Ok(())

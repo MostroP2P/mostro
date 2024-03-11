@@ -2,6 +2,7 @@ use crate::util::send_dm;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind, SmallOrder, Status};
 use nostr_sdk::prelude::*;
+use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::{error, info};
 
@@ -107,9 +108,13 @@ pub async fn hold_invoice_paid(hash: &str) {
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    crate::util::update_order_event(&pool, &client, &my_keys, status, &order)
-        .await
-        .unwrap();
+    if let Ok(updated_order) =
+        crate::util::update_order_event(&client, &my_keys, status, &order).await
+    {
+        // Update order on db
+        let _ = updated_order.update(&pool).await;
+    }
+
     // Update the invoice_held_at field
     crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_i64())
         .await

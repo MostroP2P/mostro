@@ -14,6 +14,7 @@ pub enum MostroError {
     NegativeAmount,
     LnAddressParseError,
     LnAddressWrongAmount,
+    LnPaymentError(String),
 }
 
 impl std::error::Error for MostroError {}
@@ -33,6 +34,7 @@ impl fmt::Display for MostroError {
             MostroError::NegativeAmount => write!(f, "Negative amount is not valid"),
             MostroError::LnAddressWrongAmount => write!(f, "Ln address need amount of 0 sats - please check your order"),
             MostroError::LnAddressParseError  => write!(f, "Ln address parsing error - please check your address"),
+            MostroError::LnPaymentError(e) => write!(f, "Lightning payment failure cause: {}",e),
         }
     }
 }

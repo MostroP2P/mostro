@@ -3,7 +3,7 @@ use crate::lightning::LndConnector;
 use crate::util::{send_dm, update_order_event};
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{Kind as OrderKind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -26,7 +26,7 @@ pub async fn cancel_action(
             return Ok(());
         }
     };
-    if order.status == "Pending" {
+    if order.status == Status::Pending.to_string() {
         let user_pubkey = event.pubkey.to_string();
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
@@ -41,7 +41,11 @@ pub async fn cancel_action(
         } else {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
-            update_order_event(pool, client, my_keys, Status::Canceled, &order).await?;
+            if let Ok(order_updated) =
+                update_order_event(client, my_keys, Status::Canceled, &order).await
+            {
+                let _ = order_updated.update(pool).await;
+            }
             // We create a Message for cancel
             let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
             let message = message.as_json()?;
@@ -51,15 +55,22 @@ pub async fn cancel_action(
         return Ok(());
     }
 
-    if order.kind == "Sell" && order.status == "WaitingBuyerInvoice" {
+    if order.kind == OrderKind::Sell.to_string()
+        && order.status == Status::WaitingBuyerInvoice.to_string()
+    {
         cancel_add_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.kind == "Buy" && order.status == "WaitingPayment" {
+    if order.kind == OrderKind::Buy.to_string()
+        && order.status == Status::WaitingPayment.to_string()
+    {
         cancel_pay_hold_invoice(ln_client, &mut order, event, pool, client, my_keys).await?;
     }
 
-    if order.status == "Active" || order.status == "FiatSent" || order.status == "Dispute" {
+    if order.status == Status::Active.to_string()
+        || order.status == Status::FiatSent.to_string()
+        || order.status == Status::Dispute.to_string()
+    {
         let user_pubkey = event.pubkey.to_string();
         let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
         let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
@@ -91,17 +102,11 @@ pub async fn cancel_action(
                             &order.id
                         );
                     }
-                    order.status = "CooperativelyCanceled".to_string();
+                    order.status = Status::CooperativelyCanceled.to_string();
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
-                    update_order_event(
-                        pool,
-                        client,
-                        my_keys,
-                        Status::CooperativelyCanceled,
-                        &order,
-                    )
-                    .await?;
+                    update_order_event(client, my_keys, Status::CooperativelyCanceled, &order)
+                        .await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
                     let message = Message::new_order(
                         Some(order.id),
@@ -180,7 +185,7 @@ pub async fn cancel_add_invoice(
     if &order.creator_pubkey == buyer_pubkey {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(pool, client, my_keys, Status::CooperativelyCanceled, order).await?;
+        update_order_event(client, my_keys, Status::CooperativelyCanceled, order).await?;
         // We create a Message for cancel
         let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
@@ -196,7 +201,7 @@ pub async fn cancel_add_invoice(
         }
         edit_buyer_pubkey_order(pool, order.id, None).await?;
         update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(pool, client, my_keys, Status::Pending, order).await?;
+        update_order_event(client, my_keys, Status::Pending, order).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id
@@ -241,7 +246,7 @@ pub async fn cancel_pay_hold_invoice(
     if order.creator_pubkey == seller_pubkey.to_string() {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(pool, client, my_keys, Status::Canceled, order).await?;
+        update_order_event(client, my_keys, Status::Canceled, order).await?;
         // We create a Message for cancel
         let message = Message::new_order(Some(order.id), None, Action::Cancel, None);
         let message = message.as_json()?;
@@ -257,7 +262,7 @@ pub async fn cancel_pay_hold_invoice(
         }
         edit_seller_pubkey_order(pool, order.id, None).await?;
         update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(pool, client, my_keys, Status::Pending, order).await?;
+        update_order_event(client, my_keys, Status::Pending, order).await?;
         info!(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id

@@ -25,7 +25,7 @@ pub async fn fiat_sent_action(
         }
     };
     // Send to user a DM with the error
-    if order.status != "Active" {
+    if order.status != Status::Active.to_string() {
         let error = format!("Order Id {order_id} wrong status");
         let message = Message::cant_do(Some(order.id), None, Some(Content::TextMessage(error)));
         send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
@@ -42,7 +42,9 @@ pub async fn fiat_sent_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, Status::FiatSent, &order).await?;
+    if let Ok(order_updated) = update_order_event(client, my_keys, Status::FiatSent, &order).await {
+        let _ = order_updated.update(pool).await;
+    }
 
     let seller_pubkey = match order.seller_pubkey.as_ref() {
         Some(pk) => XOnlyPublicKey::from_str(pk)?,

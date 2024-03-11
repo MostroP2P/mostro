@@ -1,5 +1,5 @@
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{send_dm, show_hold_invoice};
+use crate::util::{send_dm, show_hold_invoice, update_order_event};
 
 use anyhow::Result;
 
@@ -100,6 +100,7 @@ pub async fn add_invoice_action(
     match order_status {
         Status::WaitingBuyerInvoice => {}
         Status::SettledHoldInvoice => {
+            order.payment_attempts = 0;
             order.update(pool).await?;
             let message = Message::new_order(
                 Some(order_id),
@@ -147,9 +148,10 @@ pub async fn add_invoice_action(
         );
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        crate::util::update_order_event(pool, client, my_keys, Status::Active, &order)
-            .await
-            .unwrap();
+        if let Ok(order_updated) = update_order_event(client, my_keys, Status::Active, &order).await
+        {
+            let _ = order_updated.update(pool).await;
+        }
 
         // We send a confirmation message to seller
         let message = Message::new_order(
@@ -172,16 +174,7 @@ pub async fn add_invoice_action(
             .await
             .unwrap();
     } else {
-        show_hold_invoice(
-            pool,
-            client,
-            my_keys,
-            None,
-            &buyer_pubkey,
-            &seller_pubkey,
-            order,
-        )
-        .await?;
+        show_hold_invoice(client, my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     }
 
     Ok(())

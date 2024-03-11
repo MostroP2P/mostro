@@ -1,5 +1,6 @@
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
+use mostro_core::order::Status;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -90,7 +91,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
         r#"
           SELECT *
           FROM orders
-          WHERE created_at < ?1 AND status == 'Pending'
+          WHERE created_at < ?1 AND status == 'pending'
         "#,
     )
     .bind(expire_time.to_string())
@@ -108,7 +109,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
         r#"
           SELECT *
           FROM orders
-          WHERE taken_at < ?1 AND ( status == 'WaitingBuyerInvoice' OR status == 'WaitingPayment' )
+          WHERE taken_at < ?1 AND ( status == 'waiting-buyer-invoice' OR status == 'waiting-payment' )
         "#,
     )
     .bind(expire_time.to_string())
@@ -143,7 +144,7 @@ pub async fn update_order_to_initial_state(
     fee: i64,
 ) -> anyhow::Result<bool> {
     let mut conn = pool.acquire().await?;
-    let status = "Pending".to_string();
+    let status = Status::Pending.to_string();
     let hash: Option<String> = None;
     let preimage: Option<String> = None;
     let rows_affected = sqlx::query!(
@@ -263,4 +264,18 @@ pub async fn update_order_invoice_held_at_time(
     .rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE failed_payment == true AND  status == 'settled-hold-invoice'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(order)
 }

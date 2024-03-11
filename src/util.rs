@@ -1,4 +1,5 @@
 use crate::cli::settings::Settings;
+use crate::db;
 use crate::error::MostroError;
 use crate::flow;
 use crate::lightning;
@@ -12,7 +13,6 @@ use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -137,8 +137,8 @@ pub async fn publish_order(
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
-        kind: "Sell".to_string(),
-        status: "Pending".to_string(),
+        kind: OrderKind::Sell.to_string(),
+        status: Status::Pending.to_string(),
         creator_pubkey: initiator_pubkey.to_string(),
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
@@ -152,7 +152,7 @@ pub async fn publish_order(
     };
 
     if new_order.kind == Some(OrderKind::Buy) {
-        new_order_db.kind = "Buy".to_string();
+        new_order_db.kind = OrderKind::Buy.to_string();
         new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
         new_order_db.master_buyer_pubkey = Some(master_pubkey.to_string());
     } else {
@@ -261,24 +261,23 @@ pub async fn update_user_rating_event(
 }
 
 pub async fn update_order_event(
-    pool: &SqlitePool,
     client: &Client,
     keys: &Keys,
     status: Status,
     order: &Order,
-) -> Result<()> {
-    let mut order = order.clone();
+) -> Result<Order> {
+    let mut order_updated = order.clone();
     // update order.status with new status
-    order.status = status.to_string();
+    order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order);
+    let tags = order_to_tags(&order_updated);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, "", order.id.to_string(), tags)?;
     let order_id = order.id.to_string();
     info!("Sending replaceable event: {event:#?}");
     // We update the order with the new event_id
-    order.event_id = event.id.to_string();
-    order.update(pool).await?;
+    order_updated.event_id = event.id.to_string();
+
     info!(
         "Order Id: {} updated Nostr new Status: {}",
         order_id,
@@ -287,7 +286,12 @@ pub async fn update_order_event(
 
     client.send_event(event).await?;
 
-    Ok(())
+    println!(
+        "Inside update_order_event order_updated status {:?} - order id {:?}",
+        order_updated.status, order_updated.id,
+    );
+
+    Ok(order_updated)
 }
 
 pub async fn connect_nostr() -> Result<Client> {
@@ -310,7 +314,6 @@ pub async fn connect_nostr() -> Result<Client> {
 }
 
 pub async fn show_hold_invoice(
-    pool: &SqlitePool,
     client: &Client,
     my_keys: &Keys,
     payment_request: Option<String>,
@@ -346,7 +349,10 @@ pub async fn show_hold_invoice(
     order.seller_pubkey = Some(seller_pubkey.to_string());
 
     // We need to publish a new event with the new status
-    update_order_event(pool, client, my_keys, Status::WaitingPayment, &order).await?;
+    let pool = db::connect().await?;
+    let order_updated = update_order_event(client, my_keys, Status::WaitingPayment, &order).await?;
+    order_updated.update(&pool).await?;
+
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
@@ -421,7 +427,6 @@ pub async fn set_waiting_invoice_status(
     order: &mut Order,
     buyer_pubkey: XOnlyPublicKey,
     my_keys: &Keys,
-    pool: &SqlitePool,
     client: &Client,
 ) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
@@ -452,9 +457,6 @@ pub async fn set_waiting_invoice_status(
     );
     send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
 
-    // Update order status
-    update_order_event(pool, client, my_keys, status, order).await?;
-
     Ok(order.amount)
 }
 
@@ -483,9 +485,7 @@ pub async fn settle_seller_hold_invoice(
     event: &Event,
     my_keys: &Keys,
     client: &Client,
-    pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    status: Status,
     action: Action,
     is_admin: bool,
     order: &Order,
@@ -511,9 +511,6 @@ pub async fn settle_seller_hold_invoice(
     let preimage = order.preimage.as_ref().unwrap();
     ln_client.settle_hold_invoice(preimage).await?;
     info!("{action}: Order Id {}: hold invoice settled", order.id);
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    update_order_event(pool, client, my_keys, status, order).await?;
 
     Ok(())
 }

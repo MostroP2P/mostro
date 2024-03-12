@@ -58,7 +58,7 @@ pub async fn admin_cancel_action(
         d.update(pool).await?;
         // We create a tag to show status of the dispute
         let tags = vec![
-            ("s".to_string(), "SellerRefunded".to_string()),
+            ("s".to_string(), DisputeStatus::SellerRefunded.to_string()),
             ("y".to_string(), "mostrop2p".to_string()),
             ("z".to_string(), "dispute".to_string()),
         ];

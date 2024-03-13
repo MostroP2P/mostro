@@ -1,5 +1,6 @@
 use crate::cli::settings::Settings;
-use crate::util::{get_market_quote, publish_order, send_dm};
+use crate::lightning::invoice::is_valid_invoice;
+use crate::util::{get_fee, get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
 use mostro_core::message::{Content, Message};
@@ -27,6 +28,13 @@ pub async fn order_action(
             },
             _ => order.amount,
         };
+
+        if let Some(pay) = msg.get_inner_message_kind().get_payment_request(){
+            if is_valid_invoice(pay, Some(quote as u64), Some(get_fee(quote) as u64) ).await.is_ok()
+            {
+
+            }
+        }
 
         // Check amount is positive - extra safety check
         if quote < 0 {

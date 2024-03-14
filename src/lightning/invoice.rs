@@ -43,6 +43,9 @@ pub async fn is_valid_invoice(
                 if amount_sat != res {
                     return Err(MostroError::WrongAmountError);
                 }
+            } else {
+                //case overflow in subtraction
+                return Err(MostroError::WrongAmountError);
             }
         }
 

@@ -53,7 +53,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 ## Requirements:
 
 0. You need Rust version 1.70 or higher to compile.
-1. You will need a lightning network node
+1. You will need a lightning network node.
 
 ## Install dependencies:
 
@@ -74,7 +74,7 @@ $ cd mostro
 $ cp settings.tpl.toml settings.dev.toml
 ```
 
-To connect with a lnd node we need to set 4 variables in the `[lightning]` section in `settings.dev.toml` file.
+To connect to an LND node, you must define 4 variables within the [lightning] section of the settings.dev.toml file.
 
 _lnd_cert_file:_ LND node TLS certificate file path.
 
@@ -91,19 +91,29 @@ The data is saved in a sqlite db file named by default `mostro.db`, this file is
 Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
 ```bash
-$ cargo install sqlx-cli
+$ cargo install sqlx-cli --version 0.6.2
 $ ./init_db.sh
 ```
 
-Running it:
+### Running it:
 
-Before run it you to set `nsec_privkey` with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one, then run it:
+Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.dev.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
+
+You must create a .mostro directory in /home/user/ and copy the settings.dev.toml and mostro.db files inside.
+
+```bash
+$ mkdir $HOME/.mostro/ && cp settings.dev.toml mostro.db $HOME/.mostro/ 
+```
+
+Finnaly run it:
 
 ```bash
 $ cargo run
 ```
 
-If you want to run with with a private dockerized relay, you must:
+## Connecting to relay
+
+### Option 1: Run Mostro with a private dockerized relay
 
 ```bash
 cd relay
@@ -113,3 +123,29 @@ docker compose up -d
 This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
 
 So the relay URL you want to connect to is: `ws://localhost:7000`.
+
+You need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file:  
+relays = ['ws://localhost:7000']
+
+#### Tip: 
+If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the docker-compose.yml file in the relay directory with:
+
+```bash
+version: '3.8'
+
+services:
+  nostr-relay:
+    image: scsibug/nostr-rs-relay
+    container_name: nostr-relay
+    ports:
+      - '${MOSTRO_RELAY_LOCAL_PORT:-7000}:8080'
+    volumes:
+      - 'mostro_data:/usr/src/app/db:Z'
+      - './config.toml:/usr/src/app/config.toml:ro,Z'
+volumes:
+  mostro_data:
+```
+### Option 2: Connect to any other relay
+
+You just need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file with the relays you will use.
+

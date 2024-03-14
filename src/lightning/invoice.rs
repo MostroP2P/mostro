@@ -39,8 +39,10 @@ pub async fn is_valid_invoice(
         let fee = fee.unwrap_or(0);
 
         if let Some(amt) = amount {
-            if amount_sat > 0 && amount_sat != (amt - fee) {
-                return Err(MostroError::WrongAmountError);
+            if let Some(res) = amt.checked_sub(fee) {
+                if amount_sat != res {
+                    return Err(MostroError::WrongAmountError);
+                }
             }
         }
 

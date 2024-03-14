@@ -1,6 +1,6 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{get_fee, get_market_quote, publish_order, send_dm};
+use crate::util::{get_market_quote, publish_order, send_dm};
 
 use anyhow::Result;
 use mostro_core::message::{Content, Message};
@@ -18,6 +18,13 @@ pub async fn order_action(
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 
+        // We get the invoice inside the order if present and we check if it's correct:
+        // -- Ln address invoice with amount 0 is ok
+        // -- Bolt invoice with amount 0 must have also order amount to 0
+        if let Some(pay) = msg.get_inner_message_kind().get_payment_request() {
+            is_valid_invoice(pay, Some(order.amount as u64), None).await?;
+        }
+
         let quote = match order.amount {
             0 => match get_market_quote(&order.fiat_amount, &order.fiat_code, 0).await {
                 Ok(amount) => amount,
@@ -28,13 +35,6 @@ pub async fn order_action(
             },
             _ => order.amount,
         };
-
-        if let Some(pay) = msg.get_inner_message_kind().get_payment_request(){
-            if is_valid_invoice(pay, Some(quote as u64), Some(get_fee(quote) as u64) ).await.is_ok()
-            {
-
-            }
-        }
 
         // Check amount is positive - extra safety check
         if quote < 0 {

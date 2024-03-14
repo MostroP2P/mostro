@@ -22,7 +22,20 @@ pub async fn order_action(
         // -- Ln address invoice with amount 0 is ok
         // -- Bolt invoice with amount 0 must have also order amount to 0
         if let Some(pay) = msg.get_inner_message_kind().get_payment_request() {
-            is_valid_invoice(pay, Some(order.amount as u64), None).await?;
+            match is_valid_invoice(pay, Some(order.amount as u64), None).await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("{:?}", e);
+                    let message = Message::cant_do(
+                        order.id,
+                        None,
+                        Some(Content::TextMessage(format!("{:?}", e.to_string()))),
+                    );
+                    let message = message.as_json()?;
+                    send_dm(client, my_keys, &event.pubkey, message).await?;
+                    return Ok(());
+                }
+            }
         }
 
         let quote = match order.amount {

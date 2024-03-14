@@ -40,7 +40,7 @@ pub async fn is_valid_invoice(
 
         if let Some(amt) = amount {
             if let Some(res) = amt.checked_sub(fee) {
-                if amount_sat != res {
+                if amount_sat != res && amount_sat != 0 {
                     return Err(MostroError::WrongAmountError);
                 }
             } else {

@@ -52,7 +52,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 
 ## Requirements:
 
-0. You need Rust version 1.74 or higher to compile.
+0. You need Rust version 1.70 or higher to compile.
 1. You will need a lightning network node.
 
 ## Install dependencies:
@@ -74,7 +74,7 @@ $ cd mostro
 $ cp settings.tpl.toml settings.dev.toml
 ```
 
-To connect with a lnd node you need to set 4 variables in the `[lightning]` section in `settings.dev.toml` file.
+To connect to an LND node, you must define 4 variables within the [lightning] section of the settings.dev.toml file.
 
 _lnd_cert_file:_ LND node TLS certificate file path.
 
@@ -97,12 +97,12 @@ $ ./init_db.sh
 
 ### Running it:
 
-Before run it you need to set `nsec_privkey` on the `[nostr]` section in `settings.dev.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
+Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.dev.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
 
 You must create a .mostro directory in /home/user/ and copy the settings.dev.toml and mostro.db files inside.
 
 ```bash
-$ mkdir /home/user/.mostro/ && cp settings.dev.toml mostro.db /home/user/.mostro/ 
+$ mkdir $HOME/.mostro/ && cp settings.dev.toml mostro.db $HOME/.mostro/ 
 ```
 
 Finnaly run it:
@@ -124,7 +124,7 @@ This will spin a new docker container with an instance of [nostr-rs-relay](https
 
 So the relay URL you want to connect to is: `ws://localhost:7000`.
 
-You need to set `relays` on the `[nostr]` section in `settings.dev.toml` file:  
+You need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file:  
 relays = ['ws://localhost:7000']
 
 #### Tip: 
@@ -147,5 +147,5 @@ volumes:
 ```
 ### Option 2: Connect to any other relay
 
-You just need to set `relays` on the `[nostr]` section in `settings.dev.toml` file with the relays you will use.
+You just need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file with the relays you will use.
 

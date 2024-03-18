@@ -22,7 +22,7 @@ pub async fn order_action(
         if let Some(invoice) = msg.get_inner_message_kind().get_payment_request() {
             let invoice = decode_invoice(&invoice)?;
             if let Some(invoice_sats) = invoice.amount_milli_satoshis().map(|sats| sats / 1000) {
-                if invoice_sats == 0 {
+                if invoice_sats !=0 {
                     let message = Message::cant_do(
                         order.id,
                         None,

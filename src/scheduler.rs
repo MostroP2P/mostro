@@ -4,7 +4,7 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
 
-use chrono::{Duration, Utc};
+use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::{Client, Event};
 use sqlx_crud::Crud;
@@ -79,7 +79,9 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
 
             let now = Utc::now();
             let next_tick = now
-                .checked_add_signed(Duration::seconds(interval as i64))
+                .checked_add_signed(
+                    TimeDelta::try_seconds(interval as i64).expect("Wrong seconds value"),
+                )
                 .unwrap();
             info!(
                 "Next tick for update users rating is {}",
@@ -193,7 +195,9 @@ async fn job_cancel_orders(client: Client) {
             }
             let now = Utc::now();
             let next_tick = now
-                .checked_add_signed(Duration::seconds(exp_seconds as i64))
+                .checked_add_signed(
+                    TimeDelta::try_seconds(exp_seconds as i64).expect("Wrong seconds value"),
+                )
                 .unwrap();
             info!(
                 "Next tick for late action users check is {}",
@@ -224,7 +228,9 @@ async fn job_expire_pending_older_orders(client: Client) {
                 }
             }
             let now = Utc::now();
-            let next_tick = now.checked_add_signed(Duration::minutes(1)).unwrap();
+            let next_tick = now
+                .checked_add_signed(TimeDelta::try_minutes(1).expect("Wrong minutes value"))
+                .unwrap();
             info!(
                 "Next tick for removal of older orders is {}",
                 next_tick.format("%a %b %e %T %Y")

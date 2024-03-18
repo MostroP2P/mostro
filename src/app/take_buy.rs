@@ -1,4 +1,4 @@
-use crate::util::{get_fee, get_market_quote, send_dm, show_hold_invoice};
+use crate::util::{get_market_amount_and_fee, send_dm, show_hold_invoice};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -84,15 +84,11 @@ pub async fn take_buy_action(
 
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
-        order.amount =
-            match get_market_quote(&order.fiat_amount, &order.fiat_code, order.premium).await {
-                Ok(amount) => amount,
-                Err(e) => {
-                    error!("{:?}", e);
-                    return Ok(());
-                }
-            };
-        order.fee = get_fee(order.amount);
+        let (new_sats_amount, fee) =
+            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
+        // Update order with new sats value
+        order.amount = new_sats_amount;
+        order.fee = fee;
     }
 
     // Timestamp order take time

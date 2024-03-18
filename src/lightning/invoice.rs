@@ -3,7 +3,7 @@ use crate::error::MostroError;
 use crate::lnurl::ln_exists;
 
 use chrono::prelude::*;
-use chrono::Duration;
+use chrono::TimeDelta;
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 use lnurl::lightning_address::LightningAddress;
 use std::str::FromStr;
@@ -39,7 +39,12 @@ pub async fn is_valid_invoice(
         let fee = fee.unwrap_or(0);
 
         if let Some(amt) = amount {
-            if amount_sat > 0 && amount_sat != (amt - fee) {
+            if let Some(res) = amt.checked_sub(fee) {
+                if amount_sat != res && amount_sat != 0 {
+                    return Err(MostroError::WrongAmountError);
+                }
+            } else {
+                //case overflow in subtraction
                 return Err(MostroError::WrongAmountError);
             }
         }
@@ -57,7 +62,8 @@ pub async fn is_valid_invoice(
         let (parsed_invoice, _, _) = parsed.into_parts();
 
         let expiration_window = ln_settings.invoice_expiration_window as i64;
-        let latest_date = Utc::now() + Duration::seconds(expiration_window);
+        let latest_date = Utc::now()
+            + TimeDelta::try_seconds(expiration_window).expect("wrong seconds timeout value");
         let latest_date = latest_date.timestamp() as u64;
         let expires_at =
             invoice.expiry_time().as_secs() + parsed_invoice.data.timestamp.as_unix_timestamp();

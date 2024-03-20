@@ -6,7 +6,7 @@
 
 Due to the growing need to be able to operate with Bitcoin without giving up personal data, in 2021 I started a project to allows people to buy and sell Bitcoin through Lightning Network without funds custody and without KYC, this project is a telegram bot called @lnp2pbot.
 
-[@lnp2pBot](https://github.com/lnp2pBot) is growing steadily and organically, it's being use in the whole world and is having a bigger impact in Latin-America, a place where there is no need to explain to people that money is broken, it's being used more and more in dictatorial regimes like Cuba and Venezuela, where people keep resisting tyranny and protesting using less the local currency and more Bitcoin.
+[@lnp2pBot](https://github.com/lnp2pBot/bot) is growing steadily and organically, it's being use in the whole world and is having a bigger impact in Latin-America, a place where there is no need to explain to people that money is broken, it's being used more and more in dictatorial regimes like Cuba and Venezuela, where people keep resisting tyranny and protesting using less the local currency and more Bitcoin.
 
 Although the bot works excellent, it's running on top of Telegram, a great platform but we do not know if one day it will be reached by the tentacles of a powerful government asking for political dissidents or simply awkward public person.
 
@@ -16,11 +16,11 @@ At this point Nostr appears as a platform where a system like this can live with
 
 Mostro works with a p2p communication on top of Nostr, Mostro will be the escrow that will allow buyer and seller operate reducing the risk for both parties.
 
-Mostro will handle Bitcoin using a Lightning Network node, the node will create the hold invoices for sellers and pay the buyers lightning regular invoices.
+Mostro will handle Bitcoin using a Lightning Network node, the node will create the hold invoices for sellers to pay and pays to the buyers lightning regular invoices.
 
 Mostro will need a private key to be able to create, sign and send events through Nostr network.
 
-In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](./FLOW.md):
+In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](https://mostro.network/messages):
 
 ```mermaid
 sequenceDiagram
@@ -34,7 +34,7 @@ sequenceDiagram
     Mostro-->>Seller: Thanks! talk to buyer now
 ```
 
-In this repository we are building a Mostro on Rust.
+In this repository we are building a Mostro daemon on Rust.
 
 ## Client
 
@@ -102,7 +102,7 @@ Before running it you need to set `nsec_privkey` in the `[nostr]` section of the
 You must create a .mostro directory in /home/user/ and copy the settings.dev.toml and mostro.db files inside.
 
 ```bash
-$ mkdir $HOME/.mostro/ && cp settings.dev.toml mostro.db $HOME/.mostro/ 
+$ mkdir $HOME/.mostro/ && cp settings.dev.toml mostro.db $HOME/.mostro/
 ```
 
 Finnaly run it:
@@ -127,7 +127,8 @@ So the relay URL you want to connect to is: `ws://localhost:7000`.
 You need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file:  
 relays = ['ws://localhost:7000']
 
-#### Tip: 
+#### Troubleshots:
+
 If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the docker-compose.yml file in the relay directory with:
 
 ```bash
@@ -145,7 +146,7 @@ services:
 volumes:
   mostro_data:
 ```
+
 ### Option 2: Connect to any other relay
 
 You just need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file with the relays you will use.
-

@@ -5,7 +5,7 @@ use crate::util::{send_dm, settle_seller_hold_invoice, update_order_event};
 
 use anyhow::Result;
 use mostro_core::dispute::Status as DisputeStatus;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -31,6 +31,20 @@ pub async fn admin_settle_action(
             return Ok(());
         }
     };
+
+    // Check if the pubkey is Mostro
+    if event.pubkey.to_string() != my_keys.public_key().to_string() {
+        // We create a Message
+        let message = Message::cant_do(
+            Some(order.id),
+            None,
+            Some(Content::TextMessage("Not allowed".to_string())),
+        );
+        let message = message.as_json()?;
+        send_dm(client, my_keys, &event.pubkey, message).await?;
+
+        return Ok(());
+    }
 
     settle_seller_hold_invoice(
         event,

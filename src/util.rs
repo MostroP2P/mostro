@@ -498,9 +498,7 @@ pub async fn settle_seller_hold_invoice(
     };
     // Check if the pubkey is right
     if event.pubkey.to_string() != pubkey {
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        cant_do(order.id, None, &event.pubkey, client).await;
         return Ok(());
     }
     if order.preimage.is_none() {
@@ -530,4 +528,27 @@ pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
     }
 
     tags_tuple
+}
+
+pub async fn cant_do (order_id: Uuid, message: Option<String>, destination_key : &XOnlyPublicKey, client: &Client){
+    // Get mostro keys
+    let my_keys = crate::util::get_keys().unwrap();
+    // Prepare content in case
+    let content = if let Some( m ) = message {
+        Some(Content::TextMessage(m))
+    }
+    else{
+        None
+    };
+    
+    // Send message to event creator
+    let message = Message::cant_do(
+        Some(order_id),
+        None,
+        content,
+    );
+    if let Ok(message) = message.as_json(){
+        let _ = send_dm(client, &my_keys, destination_key, message).await;
+    }   
+
 }

@@ -1,5 +1,5 @@
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{send_dm, show_hold_invoice, update_order_event};
+use crate::util::{cant_do, send_dm, show_hold_invoice, update_order_event};
 
 use anyhow::Result;
 
@@ -55,10 +55,7 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json().unwrap();
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        cant_do(order.id, Some("Not allowed".to_string()), &event.pubkey, client).await;
         return Ok(());
     }
 
@@ -77,15 +74,7 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(e) => {
-                    // We create a Message
-                    let message = Message::cant_do(
-                        Some(order.id),
-                        None,
-                        Some(Content::TextMessage(e.to_string())),
-                    );
-                    let message = message.as_json()?;
-                    send_dm(client, my_keys, &event.pubkey, message).await?;
-                    error!("{e}");
+                    cant_do(order_id, Some(e.to_string()), &event.pubkey, client).await;
                     return Ok(());
                 }
             }
@@ -115,15 +104,7 @@ pub async fn add_invoice_action(
             return Ok(());
         }
         _ => {
-            let message = Message::cant_do(
-                Some(order.id),
-                None,
-                Some(Content::TextMessage(format!(
-                    "Order Id {order_id} status must be WaitingBuyerInvoice!"
-                ))),
-            );
-            let message = message.as_json()?;
-            send_dm(client, my_keys, &buyer_pubkey, message).await?;
+            cant_do(order_id, Some(format!("Order Id {order_id} status must be WaitingBuyerInvoice!")), &buyer_pubkey, client).await;
             return Ok(());
         }
     }

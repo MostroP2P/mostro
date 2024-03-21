@@ -127,7 +127,7 @@ So the relay URL you want to connect to is: `ws://localhost:7000`.
 You need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file:  
 relays = ['ws://localhost:7000']
 
-#### Troubleshots:
+#### Troubleshooting:
 
 If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the docker-compose.yml file in the relay directory with:
 

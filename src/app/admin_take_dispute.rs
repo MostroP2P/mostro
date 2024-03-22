@@ -1,5 +1,6 @@
 use crate::nip33::new_event;
-use crate::util::send_dm;
+use crate::util::{send_cant_do_msg, send_dm};
+use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
 use mostro_core::dispute::{Dispute, Status};
@@ -14,7 +15,6 @@ pub async fn admin_take_dispute_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let dispute_id = msg.get_inner_message_kind().id.unwrap();
@@ -22,14 +22,12 @@ pub async fn admin_take_dispute_action(
         Some(dispute) => dispute,
         None => {
             // We create a Message
-            let message = Message::cant_do(
-                None,
-                None,
-                Some(Content::TextMessage("Dispute not found".to_string())),
-            );
-            let message = message.as_json()?;
-            send_dm(client, my_keys, &event.pubkey, message).await?;
-
+            send_cant_do_msg(
+                Some(dispute_id),
+                Some("Dispute not found".to_string()),
+                &event.pubkey,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -42,14 +40,7 @@ pub async fn admin_take_dispute_action(
     // TODO: solvers also can take disputes
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        let message = Message::cant_do(
-            None,
-            None,
-            Some(Content::TextMessage("Not allowed".to_string())),
-        );
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
 
@@ -69,7 +60,7 @@ pub async fn admin_take_dispute_action(
     );
     let message = message.as_json()?;
     // Send the message
-    send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(my_keys, &event.pubkey, message.clone()).await?;
 
     // We create a tag to show status of the dispute
     let tags = vec![
@@ -80,7 +71,7 @@ pub async fn admin_take_dispute_action(
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
-    client.send_event(event).await?;
+    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     Ok(())
 }

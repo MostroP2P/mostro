@@ -61,38 +61,28 @@ pub async fn run(
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
-                                            order_action(msg, &event, &my_keys, &pool)
-                                                .await?;
+                                            order_action(msg, &event, &my_keys, &pool).await?;
                                         }
                                         Action::TakeSell => {
-                                            take_sell_action(msg, &event, &my_keys, &client, &pool)
-                                                .await?;
+                                            take_sell_action(msg, &event, &my_keys, &pool).await?;
                                         }
                                         Action::TakeBuy => {
-                                            take_buy_action(msg, &event, &my_keys, &client, &pool)
-                                                .await?;
+                                            take_buy_action(msg, &event, &my_keys, &pool).await?;
                                         }
                                         Action::FiatSent => {
-                                            fiat_sent_action(msg, &event, &my_keys, &client, &pool)
-                                                .await?;
+                                            fiat_sent_action(msg, &event, &my_keys, &pool).await?;
                                         }
                                         Action::Release => {
-                                            release_action(
-                                                msg, &event, &my_keys, &client, &pool, ln_client,
-                                            )
-                                            .await?;
+                                            release_action(msg, &event, &my_keys, &pool, ln_client)
+                                                .await?;
                                         }
                                         Action::Cancel => {
-                                            cancel_action(
-                                                msg, &event, &my_keys, &client, &pool, ln_client,
-                                            )
-                                            .await?;
+                                            cancel_action(msg, &event, &my_keys, &pool, ln_client)
+                                                .await?;
                                         }
                                         Action::AddInvoice => {
-                                            add_invoice_action(
-                                                msg, &event, &my_keys, &client, &pool,
-                                            )
-                                            .await?;
+                                            add_invoice_action(msg, &event, &my_keys, &pool)
+                                                .await?;
                                         }
                                         Action::PayInvoice => todo!(),
                                         Action::RateUser => {
@@ -100,39 +90,33 @@ pub async fn run(
                                                 msg,
                                                 &event,
                                                 &my_keys,
-                                                &client,
                                                 &pool,
                                                 rate_list.clone(),
                                             )
                                             .await?;
                                         }
                                         Action::Dispute => {
-                                            dispute_action(msg, &event, &my_keys, &client, &pool)
-                                                .await?;
+                                            dispute_action(msg, &event, &my_keys, &pool).await?;
                                         }
                                         Action::AdminCancel => {
                                             admin_cancel_action(
-                                                msg, &event, &my_keys, &client, &pool, ln_client,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await?;
                                         }
                                         Action::AdminSettle => {
                                             admin_settle_action(
-                                                msg, &event, &my_keys, &client, &pool, ln_client,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await?;
                                         }
                                         Action::AdminAddSolver => {
-                                            admin_add_solver_action(
-                                                msg, &event, &my_keys, &client, &pool,
-                                            )
-                                            .await?;
+                                            admin_add_solver_action(msg, &event, &my_keys, &pool)
+                                                .await?;
                                         }
                                         Action::AdminTakeDispute => {
-                                            admin_take_dispute_action(
-                                                msg, &event, &my_keys, &client, &pool,
-                                            )
-                                            .await?;
+                                            admin_take_dispute_action(msg, &event, &my_keys, &pool)
+                                                .await?;
                                         }
                                         _ => todo!(),
                                     }

@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
-use crate::util::send_dm;
+use crate::util::{send_cant_do_msg, send_dm};
+use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
 use mostro_core::dispute::Dispute;
@@ -17,7 +18,6 @@ pub async fn dispute_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
@@ -56,10 +56,7 @@ pub async fn dispute_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     };
 
@@ -95,7 +92,7 @@ pub async fn dispute_action(
             return Ok(());
         }
     };
-    send_dm(client, my_keys, &initiator_pubkey, message).await?;
+    send_dm(my_keys, &initiator_pubkey, message).await?;
 
     // We create a Message for the counterpart
     let message = Message::new_order(Some(order_id), None, Action::DisputeInitiatedByPeer, None);
@@ -107,7 +104,7 @@ pub async fn dispute_action(
             return Ok(());
         }
     };
-    send_dm(client, my_keys, &counterpart_pubkey, message).await?;
+    send_dm(my_keys, &counterpart_pubkey, message).await?;
     // We create a tag to show status of the dispute
     let tags = vec![
         ("s".to_string(), dispute.status.to_string()),
@@ -117,7 +114,7 @@ pub async fn dispute_action(
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "", dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
-    client.send_event(event).await?;
+    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     Ok(())
 }

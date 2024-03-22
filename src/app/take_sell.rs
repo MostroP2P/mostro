@@ -1,11 +1,11 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_market_amount_and_fee, send_dm, set_waiting_invoice_status, show_hold_invoice,
-    update_order_event,
+    get_market_amount_and_fee, send_cant_do_msg, send_dm, set_waiting_invoice_status,
+    show_hold_invoice, update_order_event,
 };
 
 use anyhow::Result;
-use mostro_core::message::{Content, Message};
+use mostro_core::message::Message;
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -17,7 +17,6 @@ pub async fn take_sell_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
@@ -34,9 +33,7 @@ pub async fn take_sell_action(
     }
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
     let buyer_pubkey = event.pubkey;
@@ -62,12 +59,7 @@ pub async fn take_sell_action(
             {
                 Ok(_) => Some(payment_request),
                 Err(e) => {
-                    let message = Message::cant_do(
-                        Some(order.id),
-                        None,
-                        Some(Content::TextMessage(e.to_string())),
-                    );
-                    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
+                    send_cant_do_msg(Some(order.id), Some(e.to_string()), &event.pubkey).await;
                     error!("{e}");
                     return Ok(());
                 }
@@ -88,7 +80,6 @@ pub async fn take_sell_action(
         Status::Pending | Status::WaitingBuyerInvoice => {}
         _ => {
             send_dm(
-                client,
                 my_keys,
                 &buyer_pubkey,
                 format!("Order Id {order_id} was already taken!"),
@@ -114,12 +105,11 @@ pub async fn take_sell_action(
         order.fee = fee;
 
         if pr.is_none() {
-            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
+            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys).await {
                 Ok(_) => {
                     // Update order status
                     if let Ok(order_updated) =
-                        update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order)
-                            .await
+                        update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await
                     {
                         let _ = order_updated.update(pool).await;
                         return Ok(());
@@ -131,14 +121,14 @@ pub async fn take_sell_action(
                 }
             }
         } else {
-            show_hold_invoice(client, my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
+            show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
         }
     } else if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys, client).await {
+        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys).await {
             Ok(_) => {
                 // Update order status
                 if let Ok(order_updated) =
-                    update_order_event(client, my_keys, Status::WaitingBuyerInvoice, &order).await
+                    update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await
                 {
                     let _ = order_updated.update(pool).await;
                 }
@@ -149,7 +139,7 @@ pub async fn take_sell_action(
             }
         }
     } else {
-        show_hold_invoice(client, my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
+        show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
     }
 
     Ok(())

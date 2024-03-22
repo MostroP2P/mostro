@@ -1,4 +1,4 @@
-use crate::util::{send_dm, update_order_event};
+use crate::util::{send_cant_do_msg, send_dm, update_order_event};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message, Peer};
@@ -13,7 +13,6 @@ pub async fn fiat_sent_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_id = msg.get_inner_message_kind().id.unwrap();
@@ -27,22 +26,18 @@ pub async fn fiat_sent_action(
     // Send to user a DM with the error
     if order.status != Status::Active.to_string() {
         let error = format!("Order Id {order_id} wrong status");
-        let message = Message::cant_do(Some(order.id), None, Some(Content::TextMessage(error)));
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
         return Ok(());
     }
     // Check if the pubkey is the buyer
     if Some(event.pubkey.to_string()) != order.buyer_pubkey {
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(client, my_keys, Status::FiatSent, &order).await {
+    if let Ok(order_updated) = update_order_event(my_keys, Status::FiatSent, &order).await {
         let _ = order_updated.update(pool).await;
     }
 
@@ -63,7 +58,7 @@ pub async fn fiat_sent_action(
         Some(Content::Peer(peer)),
     );
     let message = message.as_json().unwrap();
-    send_dm(client, my_keys, &seller_pubkey, message).await?;
+    send_dm(my_keys, &seller_pubkey, message).await?;
     // We send a message to buyer to wait
     let peer = Peer::new(seller_pubkey.to_string());
 
@@ -75,7 +70,7 @@ pub async fn fiat_sent_action(
         Some(Content::Peer(peer)),
     );
     let message = message.as_json()?;
-    send_dm(client, my_keys, &event.pubkey, message).await?;
+    send_dm(my_keys, &event.pubkey, message).await?;
 
     Ok(())
 }

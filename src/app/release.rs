@@ -3,13 +3,13 @@ use crate::db;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    connect_nostr, get_keys, rate_counterpart, send_dm, settle_seller_hold_invoice,
+    get_keys, rate_counterpart, send_cant_do_msg, send_dm, settle_seller_hold_invoice,
     update_order_event,
 };
 
 use anyhow::Result;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -46,7 +46,6 @@ pub async fn release_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
@@ -72,40 +71,25 @@ pub async fn release_action(
         && current_status != Status::FiatSent
         && current_status != Status::Dispute
     {
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        let message = Message::cant_do(
+        send_cant_do_msg(
             Some(order.id),
-            None,
-            Some(Content::TextMessage(
-                "You are not allowed to release funds for this order!".to_string(),
-            )),
-        );
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+            Some("You are not allowed to release funds for this order!".to_string()),
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
-    settle_seller_hold_invoice(
-        event,
-        my_keys,
-        client,
-        ln_client,
-        Action::Release,
-        false,
-        &order,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, my_keys, ln_client, Action::Release, false, &order).await?;
 
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
-    let order_updated =
-        update_order_event(client, my_keys, Status::SettledHoldInvoice, &order).await?;
+    let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
@@ -116,12 +100,12 @@ pub async fn release_action(
         None,
     );
 
-    send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
+    send_dm(my_keys, &seller_pubkey, message.as_json()?).await?;
     // We send a message to buyer indicating seller released funds
     let message = Message::new_order(Some(order_id), None, Action::Release, None);
     let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
-    send_dm(client, my_keys, &buyer_pubkey, message).await?;
+    send_dm(my_keys, &buyer_pubkey, message).await?;
     let _ = do_payment(order_updated).await;
 
     Ok(())
@@ -154,7 +138,6 @@ pub async fn do_payment(order: Order) -> Result<()> {
     let payment = {
         async move {
             // We redeclare vars to use inside this block
-            let client = connect_nostr().await.unwrap();
             let my_keys = get_keys().unwrap();
             let buyer_pubkey =
                 XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
@@ -169,14 +152,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            payment_success(
-                                &order,
-                                &buyer_pubkey,
-                                &seller_pubkey,
-                                &my_keys,
-                                &client,
-                            )
-                            .await;
+                            payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys).await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -207,24 +183,21 @@ async fn payment_success(
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
     my_keys: &Keys,
-    client: &Client,
 ) {
     // Purchase completed message to buyer
     let message = Message::new_order(Some(order.id), None, Action::PurchaseCompleted, None);
     let message = message.as_json().unwrap();
-    send_dm(client, my_keys, buyer_pubkey, message)
-        .await
-        .unwrap();
+    send_dm(my_keys, buyer_pubkey, message).await.unwrap();
 
     // Let's wait 5 secs before publish this new event
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(client, my_keys, Status::Success, order).await {
+    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let pool = db::connect().await.unwrap();
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process
-            rate_counterpart(client, buyer_pubkey, seller_pubkey, my_keys, &order_success)
+            rate_counterpart(buyer_pubkey, seller_pubkey, my_keys, &order_success)
                 .await
                 .unwrap();
         }

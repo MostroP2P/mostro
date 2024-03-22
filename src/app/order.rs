@@ -1,10 +1,10 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_market_quote, publish_order, send_dm};
+use crate::util::{get_market_quote, publish_order, send_cant_do_msg};
 
 use anyhow::Result;
-use mostro_core::message::{Content, Message};
-use nostr_sdk::{Client, Event, Keys};
+use mostro_core::message::Message;
+use nostr_sdk::{Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
 
@@ -21,16 +21,9 @@ pub async fn order_action(
         if let Some(invoice) = msg.get_inner_message_kind().get_payment_request() {
             let invoice = decode_invoice(&invoice)?;
             if let Some(invoice_sats) = invoice.amount_milli_satoshis().map(|sats| sats / 1000) {
-                if invoice_sats !=0 {
-                    let message = Message::cant_do(
-                        order.id,
-                        None,
-                        Some(Content::TextMessage(
-                            String::from("Invoice with an amount different from zero receive on new order, please send 0 amount invoice or no invoice at all!"                  
-                        ))),
-                    );
-                    let message = message.as_json()?;
-                    send_dm(my_keys, &event.pubkey, message).await?;
+                if invoice_sats != 0 {
+                    let error = String::from("Invoice with an amount different from zero receive on new order, please send 0 amount invoice or no invoice at all!");
+                    send_cant_do_msg(order.id, Some(error), &event.pubkey).await;
                     return Ok(());
                 }
             }
@@ -49,32 +42,17 @@ pub async fn order_action(
 
         // Check amount is positive - extra safety check
         if quote < 0 {
-            let message = Message::cant_do(
-                order.id,
-                None,
-                Some(Content::TextMessage(format!(
-                    "Amount must be positive {} is not valid",
-                    order.amount
-                ))),
-            );
-            let message = message.as_json()?;
-            send_dm(my_keys, &event.pubkey, message).await?;
-
+            let msg = format!("Amount must be positive {} is not valid", order.amount);
+            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
             return Ok(());
         }
 
         if quote > mostro_settings.max_order_amount as i64 {
-            let message = Message::cant_do(
-                order.id,
-                None,
-                Some(Content::TextMessage(format!(
-                    "Quote too high, max is {}",
-                    mostro_settings.max_order_amount
-                ))),
+            let msg = format!(
+                "Quote too high, max is {}",
+                mostro_settings.max_order_amount
             );
-            let message = message.as_json()?;
-            send_dm(my_keys, &event.pubkey, message).await?;
-
+            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
             return Ok(());
         }
 
@@ -83,10 +61,7 @@ pub async fn order_action(
             Some(ref pk) => pk,
             None => {
                 // We create a Message
-                let message = Message::cant_do(order.id, None, None);
-                let message = message.as_json()?;
-                send_dm(my_keys, &event.pubkey, message).await?;
-
+                send_cant_do_msg(order.id, None, &event.pubkey).await;
                 return Ok(());
             }
         };

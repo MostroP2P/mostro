@@ -1,5 +1,5 @@
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{cant_do, send_dm, show_hold_invoice, update_order_event};
+use crate::util::{send_cant_do_msg, send_dm, show_hold_invoice, update_order_event};
 
 use anyhow::Result;
 
@@ -16,7 +16,6 @@ pub async fn add_invoice_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
@@ -55,7 +54,12 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
-        cant_do(order.id, Some("Not allowed".to_string()), &event.pubkey, client).await;
+        send_cant_do_msg(
+            Some(order_id),
+            Some("Not allowed".to_string()),
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -74,7 +78,7 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(e) => {
-                    cant_do(order_id, Some(e.to_string()), &event.pubkey, client).await;
+                    send_cant_do_msg(Some(order_id), Some(e.to_string()), &event.pubkey).await;
                     return Ok(());
                 }
             }
@@ -100,11 +104,18 @@ pub async fn add_invoice_action(
                 ))),
             );
             let message = message.as_json()?;
-            send_dm(client, my_keys, &buyer_pubkey, message).await?;
+            send_dm(my_keys, &buyer_pubkey, message).await?;
             return Ok(());
         }
         _ => {
-            cant_do(order_id, Some(format!("Order Id {order_id} status must be WaitingBuyerInvoice!")), &buyer_pubkey, client).await;
+            send_cant_do_msg(
+                Some(order_id),
+                Some(format!(
+                    "Order Id {order_id} status must be WaitingBuyerInvoice!"
+                )),
+                &buyer_pubkey,
+            )
+            .await;
             return Ok(());
         }
     }
@@ -129,8 +140,7 @@ pub async fn add_invoice_action(
         );
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        if let Ok(order_updated) = update_order_event(client, my_keys, Status::Active, &order).await
-        {
+        if let Ok(order_updated) = update_order_event(my_keys, Status::Active, &order).await {
             let _ = order_updated.update(pool).await;
         }
 
@@ -142,7 +152,7 @@ pub async fn add_invoice_action(
             Some(Content::Order(order_data.clone())),
         );
 
-        send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
+        send_dm(my_keys, &seller_pubkey, message.as_json()?).await?;
         // We send a message to buyer saying seller paid
         let message = Message::new_order(
             Some(order.id),
@@ -151,11 +161,11 @@ pub async fn add_invoice_action(
             Some(Content::Order(order_data)),
         );
 
-        send_dm(client, my_keys, &buyer_pubkey, message.as_json()?)
+        send_dm(my_keys, &buyer_pubkey, message.as_json()?)
             .await
             .unwrap();
     } else {
-        show_hold_invoice(client, my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
+        show_hold_invoice(my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     }
 
     Ok(())

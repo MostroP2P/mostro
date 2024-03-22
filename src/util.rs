@@ -193,7 +193,9 @@ pub async fn publish_order(
 
     send_dm(keys, &ack_pubkey, ack_message).await?;
 
-    NOSTR_CLIENT.get().unwrap()
+    NOSTR_CLIENT
+        .get()
+        .unwrap()
         .send_event(event)
         .await
         .map(|_s| ())
@@ -259,12 +261,7 @@ pub async fn update_user_rating_event(
     Ok(())
 }
 
-pub async fn update_order_event(
-    client: &Client,
-    keys: &Keys,
-    status: Status,
-    order: &Order,
-) -> Result<Order> {
+pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> Result<Order> {
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
@@ -283,7 +280,7 @@ pub async fn update_order_event(
         status.to_string()
     );
 
-    client.send_event(event).await?;
+    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     println!(
         "Inside update_order_event order_updated status {:?} - order id {:?}",
@@ -313,7 +310,6 @@ pub async fn connect_nostr() -> Result<Client> {
 }
 
 pub async fn show_hold_invoice(
-    client: &Client,
     my_keys: &Keys,
     payment_request: Option<String>,
     buyer_pubkey: &XOnlyPublicKey,
@@ -349,7 +345,7 @@ pub async fn show_hold_invoice(
 
     // We need to publish a new event with the new status
     let pool = db::connect().await?;
-    let order_updated = update_order_event(client, my_keys, Status::WaitingPayment, &order).await?;
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order).await?;
     order_updated.update(&pool).await?;
 
     let mut new_order = order.as_new_order();
@@ -367,13 +363,13 @@ pub async fn show_hold_invoice(
     let message = message.as_json()?;
 
     // We send the hold invoice to the seller
-    send_dm(client, my_keys, seller_pubkey, message).await?;
+    send_dm(my_keys, seller_pubkey, message).await?;
 
     let message = Message::new_order(Some(order.id), None, Action::WaitingSellerToPay, None);
     let message = message.as_json()?;
 
     // We send a message to buyer to know that seller was requested to pay the invoice
-    send_dm(client, my_keys, buyer_pubkey, message).await?;
+    send_dm(my_keys, buyer_pubkey, message).await?;
     let mut ln_client_invoices = lightning::LndConnector::new().await;
     let (tx, mut rx) = channel(100);
 
@@ -426,7 +422,6 @@ pub async fn set_waiting_invoice_status(
     order: &mut Order,
     buyer_pubkey: XOnlyPublicKey,
     my_keys: &Keys,
-    client: &Client,
 ) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
@@ -454,14 +449,13 @@ pub async fn set_waiting_invoice_status(
         Action::AddInvoice,
         Some(Content::Order(order_data)),
     );
-    send_dm(client, my_keys, &buyer_pubkey, message.as_json()?).await?;
+    send_dm(my_keys, &buyer_pubkey, message.as_json()?).await?;
 
     Ok(order.amount)
 }
 
 /// Send message to buyer and seller to vote for counterpart
 pub async fn rate_counterpart(
-    client: &Client,
     buyer_pubkey: &XOnlyPublicKey,
     seller_pubkey: &XOnlyPublicKey,
     my_keys: &Keys,
@@ -471,9 +465,9 @@ pub async fn rate_counterpart(
     let message_to_parties = Message::new_order(Some(order.id), None, Action::RateUser, None);
     let message_to_parties = message_to_parties.as_json().unwrap();
     // to buyer
-    send_dm(client, my_keys, buyer_pubkey, message_to_parties.clone()).await?;
+    send_dm(my_keys, buyer_pubkey, message_to_parties.clone()).await?;
     // to seller
-    send_dm(client, my_keys, seller_pubkey, message_to_parties).await?;
+    send_dm(my_keys, seller_pubkey, message_to_parties).await?;
 
     Ok(())
 }
@@ -483,7 +477,6 @@ pub async fn rate_counterpart(
 pub async fn settle_seller_hold_invoice(
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
@@ -497,7 +490,7 @@ pub async fn settle_seller_hold_invoice(
     };
     // Check if the pubkey is right
     if event.pubkey.to_string() != pubkey {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey, client).await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
     if order.preimage.is_none() {
@@ -529,25 +522,20 @@ pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
     tags_tuple
 }
 
-pub async fn send_cant_do_msg(order_id: Option<Uuid>, message: Option<String>, destination_key : &XOnlyPublicKey, client: &Client){
+pub async fn send_cant_do_msg(
+    order_id: Option<Uuid>,
+    message: Option<String>,
+    destination_key: &XOnlyPublicKey,
+) {
     // Get mostro keys
     let my_keys = crate::util::get_keys().unwrap();
-    // Prepare content in case
-    let content = if let Some( m ) = message {
-        Some(Content::TextMessage(m))
-    }
-    else{
-        None
-    };
-    
-    // Send message to event creator
-    let message = Message::cant_do(
-        Some(order_id),
-        None,
-        content,
-    );
-    if let Ok(message) = message.as_json(){
-        let _ = send_dm(client, &my_keys, destination_key, message).await;
-    }   
 
+    // Prepare content in case
+    let content = message.map(Content::TextMessage);
+
+    // Send message to event creator
+    let message = Message::cant_do(order_id, None, content);
+    if let Ok(message) = message.as_json() {
+        let _ = send_dm(&my_keys, destination_key, message).await;
+    }
 }

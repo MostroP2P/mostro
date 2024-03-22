@@ -3,7 +3,8 @@ use std::str::FromStr;
 use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_dm, update_order_event};
+use crate::util::{send_cant_do_msg, send_dm, update_order_event};
+use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
 use mostro_core::dispute::Status as DisputeStatus;
@@ -18,7 +19,6 @@ pub async fn admin_cancel_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
@@ -34,10 +34,7 @@ pub async fn admin_cancel_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        send_cant_do_msg(Some(order_id), None, &event.pubkey).await;
         return Ok(());
     }
 
@@ -65,19 +62,18 @@ pub async fn admin_cancel_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
 
-        client.send_event(event).await?;
+        NOSTR_CLIENT.get().unwrap().send_event(event).await?;
     }
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    let order_updated =
-        update_order_event(client, my_keys, Status::CanceledByAdmin, &order).await?;
+    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order).await?;
     order_updated.update(pool).await?;
     // We create a Message
     let message = Message::new_dispute(Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(client, my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(my_keys, &event.pubkey, message.clone()).await?;
     let seller_pubkey = match XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
@@ -85,7 +81,7 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    send_dm(client, my_keys, &seller_pubkey, message.clone()).await?;
+    send_dm(my_keys, &seller_pubkey, message.clone()).await?;
     let buyer_pubkey = match XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
@@ -93,7 +89,7 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    send_dm(client, my_keys, &buyer_pubkey, message.clone()).await?;
+    send_dm(my_keys, &buyer_pubkey, message.clone()).await?;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
-use crate::util::{nostr_tags_to_tuple, send_dm, update_user_rating_event};
+use crate::util::{nostr_tags_to_tuple, send_cant_do_msg, send_dm, update_user_rating_event};
+use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -13,11 +14,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::error;
 
-pub async fn get_counterpart_reputation(
-    user: &str,
-    my_keys: &Keys,
-    client: &Client,
-) -> Result<Option<Rating>> {
+pub async fn get_counterpart_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
     let filters = Filter::new()
         .author(my_keys.public_key())
@@ -25,7 +22,9 @@ pub async fn get_counterpart_reputation(
         .custom_tag(Alphabet::Z, vec!["rating"])
         .identifier(user.to_string());
 
-    let mut user_reputation_event = client
+    let mut user_reputation_event = NOSTR_CLIENT
+        .get()
+        .unwrap()
         .get_events_of(vec![filters], Some(Duration::from_secs(10)))
         .await?;
 
@@ -46,7 +45,6 @@ pub async fn update_user_reputation_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
@@ -65,11 +63,8 @@ pub async fn update_user_reputation_action(
     let message_sender = event.pubkey.to_string();
 
     if order.status != Status::Success.to_string() {
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         error!("Order Id {order_id} wrong status");
-
         return Ok(());
     }
     // Get counterpart pubkey
@@ -89,10 +84,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        let message = Message::cant_do(Some(order.id), None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     };
 
@@ -117,7 +109,7 @@ pub async fn update_user_reputation_action(
     }
 
     // Ask counterpart reputation
-    let rep = get_counterpart_reputation(&counterpart, my_keys, client).await?;
+    let rep = get_counterpart_reputation(&counterpart, my_keys).await?;
     // Here we have to update values of the review of the counterpart
     let mut reputation;
     // min_rate is 1 and max_rate is 5
@@ -162,7 +154,7 @@ pub async fn update_user_reputation_action(
         // Send confirmation message to user that rated
         let message = Message::new_order(Some(order.id), None, Action::RateReceived, None);
         let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
+        send_dm(my_keys, &event.pubkey, message).await?;
     }
 
     Ok(())

@@ -7,6 +7,7 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
+use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Result};
 use mostro_core::message::{Action, Content, Message};
@@ -123,7 +124,6 @@ pub fn get_fee(amount: i64) -> i64 {
 
 pub async fn publish_order(
     pool: &SqlitePool,
-    client: &Client,
     keys: &Keys,
     new_order: &SmallOrder,
     initiator_pubkey: &str,
@@ -191,9 +191,9 @@ pub async fn publish_order(
     );
     let ack_message = ack_message.as_json()?;
 
-    send_dm(client, keys, &ack_pubkey, ack_message).await?;
+    send_dm(keys, &ack_pubkey, ack_message).await?;
 
-    client
+    NOSTR_CLIENT.get().unwrap()
         .send_event(event)
         .await
         .map(|_s| ())
@@ -201,7 +201,6 @@ pub async fn publish_order(
 }
 
 pub async fn send_dm(
-    client: &Client,
     sender_keys: &Keys,
     receiver_pubkey: &XOnlyPublicKey,
     content: String,
@@ -211,7 +210,7 @@ pub async fn send_dm(
         EventBuilder::new_encrypted_direct_msg(sender_keys, *receiver_pubkey, content, None)?
             .to_event(sender_keys)?;
     info!("Sending event: {event:#?}");
-    client.send_event(event).await?;
+    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     Ok(())
 }
@@ -498,7 +497,7 @@ pub async fn settle_seller_hold_invoice(
     };
     // Check if the pubkey is right
     if event.pubkey.to_string() != pubkey {
-        cant_do(order.id, None, &event.pubkey, client).await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey, client).await;
         return Ok(());
     }
     if order.preimage.is_none() {
@@ -530,7 +529,7 @@ pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
     tags_tuple
 }
 
-pub async fn cant_do (order_id: Uuid, message: Option<String>, destination_key : &XOnlyPublicKey, client: &Client){
+pub async fn send_cant_do_msg(order_id: Option<Uuid>, message: Option<String>, destination_key : &XOnlyPublicKey, client: &Client){
     // Get mostro keys
     let my_keys = crate::util::get_keys().unwrap();
     // Prepare content in case

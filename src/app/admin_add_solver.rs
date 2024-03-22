@@ -33,6 +33,8 @@ pub async fn admin_add_solver_action(
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         cant_do(order_id, message, destination_key, client)
+
+        
         let message = Message::cant_do(None, None, None);
         let message = message.as_json()?;
         send_dm(client, my_keys, &event.pubkey, message).await?;

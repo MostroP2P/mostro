@@ -25,6 +25,8 @@ use tokio::sync::Mutex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
+static NOSTR_CLIENT:        OnceLock<Client> = OnceLock::new();
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,7 +49,8 @@ async fn main() -> Result<()> {
     // Connect to database
     let pool = db::connect().await?;
     // // Connect to relays
-    let client = util::connect_nostr().await?;
+    NOSTR_CLIENT.set(util::connect_nostr().await?);
+
     let my_keys = util::get_keys()?;
 
     let subscription = Filter::new()
@@ -58,9 +61,9 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await;
 
     // Start scheduler for tasks
-    start_scheduler(rate_list.clone(), &client).await;
+    start_scheduler(rate_list.clone(), NOSTR_CLIENT.get().unwrap()).await;
 
-    run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
+    run(my_keys, NOSTR_CLIENT.get().unwrap(), &mut ln_client, pool, rate_list.clone()).await
 }
 
 #[cfg(test)]

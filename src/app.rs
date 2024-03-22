@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 
 pub async fn run(
     my_keys: Keys,
-    client: Client,
+    client: &Client,
     ln_client: &mut LndConnector,
     pool: Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
@@ -61,7 +61,7 @@ pub async fn run(
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
-                                            order_action(msg, &event, &my_keys, &client, &pool)
+                                            order_action(msg, &event, &my_keys, &pool)
                                                 .await?;
                                         }
                                         Action::TakeSell => {

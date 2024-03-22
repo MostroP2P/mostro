@@ -12,7 +12,6 @@ pub async fn order_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     if let Some(order) = msg.get_inner_message_kind().get_order() {
@@ -31,7 +30,7 @@ pub async fn order_action(
                         ))),
                     );
                     let message = message.as_json()?;
-                    send_dm(client, my_keys, &event.pubkey, message).await?;
+                    send_dm(my_keys, &event.pubkey, message).await?;
                     return Ok(());
                 }
             }
@@ -59,7 +58,7 @@ pub async fn order_action(
                 ))),
             );
             let message = message.as_json()?;
-            send_dm(client, my_keys, &event.pubkey, message).await?;
+            send_dm(my_keys, &event.pubkey, message).await?;
 
             return Ok(());
         }
@@ -74,7 +73,7 @@ pub async fn order_action(
                 ))),
             );
             let message = message.as_json()?;
-            send_dm(client, my_keys, &event.pubkey, message).await?;
+            send_dm(my_keys, &event.pubkey, message).await?;
 
             return Ok(());
         }
@@ -86,7 +85,7 @@ pub async fn order_action(
                 // We create a Message
                 let message = Message::cant_do(order.id, None, None);
                 let message = message.as_json()?;
-                send_dm(client, my_keys, &event.pubkey, message).await?;
+                send_dm(my_keys, &event.pubkey, message).await?;
 
                 return Ok(());
             }
@@ -94,7 +93,6 @@ pub async fn order_action(
 
         publish_order(
             pool,
-            client,
             my_keys,
             order,
             &initiator_ephemeral_pubkey,

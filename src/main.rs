@@ -22,9 +22,11 @@ use std::env;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
+use tracing::error;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
+static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,21 +48,37 @@ async fn main() -> Result<()> {
 
     // Connect to database
     let pool = db::connect().await?;
-    // // Connect to relays
-    let client = util::connect_nostr().await?;
+
+    // Connect to relays
+    // from now unwrap is safe - oncelock inited
+    if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
+        error!("No connection to nostr relay - closing Mostro!");
+    };
+
     let my_keys = util::get_keys()?;
 
     let subscription = Filter::new()
         .pubkey(my_keys.public_key())
         .since(Timestamp::now());
 
-    client.subscribe(vec![subscription]).await;
+    NOSTR_CLIENT
+        .get()
+        .unwrap()
+        .subscribe(vec![subscription])
+        .await;
     let mut ln_client = LndConnector::new().await;
 
     // Start scheduler for tasks
-    start_scheduler(rate_list.clone(), &client).await;
+    start_scheduler(rate_list.clone()).await;
 
-    run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
+    run(
+        my_keys,
+        NOSTR_CLIENT.get().unwrap(),
+        &mut ln_client,
+        pool,
+        rate_list.clone(),
+    )
+    .await
 }
 
 #[cfg(test)]

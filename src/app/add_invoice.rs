@@ -119,9 +119,8 @@ pub async fn add_invoice_action(
                 Some(order.id),
                 None,
                 Some(Content::TextMessage(format!(
-                    "Order Id {order_id} status must be WaitingBuyerInvoice!"
-                ))),
-            );
+                    "You are not allowed to add an invoice because order Id {order_id} status is {}",order_status.to_string()))
+            ));
             let message = message.as_json()?;
             send_dm(client, my_keys, &buyer_pubkey, message).await?;
             return Ok(());

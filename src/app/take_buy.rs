@@ -1,4 +1,6 @@
-use crate::util::{get_market_amount_and_fee, send_dm, show_hold_invoice};
+use crate::util::{
+    get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg, show_hold_invoice,
+};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -13,7 +15,6 @@ pub async fn take_buy_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
@@ -28,17 +29,13 @@ pub async fn take_buy_action(
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
         // We create a Message
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 
     if order.kind != Kind::Buy.to_string() {
         error!("Order Id {order_id} wrong kind");
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 
@@ -57,9 +54,7 @@ pub async fn take_buy_action(
         }
     };
     if buyer_pubkey == event.pubkey {
-        let message = Message::cant_do(Some(order.id), None, None);
-        send_dm(client, my_keys, &event.pubkey, message.as_json()?).await?;
-
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
     // We update the master pubkey
@@ -69,16 +64,15 @@ pub async fn take_buy_action(
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
-        let message = Message::new_order(
+        send_new_order_msg(
             Some(order.id),
-            None,
             Action::FiatSent,
             Some(Content::TextMessage(format!(
                 "Order Id {order_id} was already taken!"
             ))),
-        );
-        send_dm(client, my_keys, &seller_pubkey, message.as_json()?).await?;
-
+            &seller_pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -94,6 +88,6 @@ pub async fn take_buy_action(
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_i64();
 
-    show_hold_invoice(client, my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
+    show_hold_invoice(my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::util::send_dm;
+use crate::util::{send_cant_do_msg, send_dm};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -12,7 +12,6 @@ pub async fn admin_add_solver_action(
     msg: Message,
     event: &Event,
     my_keys: &Keys,
-    client: &Client,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let inner_message = msg.get_inner_message_kind();
@@ -32,10 +31,7 @@ pub async fn admin_add_solver_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        let message = Message::cant_do(None, None, None);
-        let message = message.as_json()?;
-        send_dm(client, my_keys, &event.pubkey, message).await?;
-
+        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
     let user = User::new(npubkey.to_string(), 0, 1, 0, 0);
@@ -48,7 +44,7 @@ pub async fn admin_add_solver_action(
     let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
-    send_dm(client, my_keys, &event.pubkey, message).await?;
+    send_dm(&event.pubkey, message).await?;
 
     Ok(())
 }

@@ -110,7 +110,7 @@ pub async fn add_invoice_action(
             send_cant_do_msg(
                 Some(order_id),
                 Some(format!(
-                    "Order Id {order_id} status must be WaitingBuyerInvoice!"
+                    "You are not allowed to add an invoice because order Id {order_id} status is {}", order_status.to_string()
                 )),
                 &buyer_pubkey,
             )

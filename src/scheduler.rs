@@ -3,21 +3,22 @@ use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util::update_order_event;
+use crate::NOSTR_CLIENT;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
-use nostr_sdk::{Client, Event};
+use nostr_sdk::Event;
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, client: &Client) {
+pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     info!("Creating scheduler");
 
-    job_expire_pending_older_orders(client.clone()).await;
-    job_update_rate_events(client.clone(), rate_list).await;
-    job_cancel_orders(client.clone()).await;
+    job_expire_pending_older_orders().await;
+    job_update_rate_events(rate_list).await;
+    job_cancel_orders().await;
     job_retry_failed_payments().await;
 
     info!("Scheduler Started");
@@ -49,7 +50,7 @@ async fn job_retry_failed_payments() {
     });
 }
 
-async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>>) {
+async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
     // Clone for closure owning with Arc
     let inner_list = rate_list.clone();
     let mostro_settings = Settings::get_mostro();
@@ -64,7 +65,7 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
 
             for ev in inner_list.lock().await.iter() {
                 // Send event to relay
-                match client.send_event(ev.clone()).await {
+                match NOSTR_CLIENT.get().unwrap().send_event(ev.clone()).await {
                     Ok(id) => {
                         info!("Updated rate event with id {:?}", id)
                     }
@@ -93,7 +94,7 @@ async fn job_update_rate_events(client: Client, rate_list: Arc<Mutex<Vec<Event>>
     });
 }
 
-async fn job_cancel_orders(client: Client) {
+async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
 
     let pool = crate::db::connect().await.unwrap();
@@ -186,7 +187,7 @@ async fn job_cancel_orders(client: Client) {
                             );
                         }
                         if let Ok(order_updated) =
-                            update_order_event(&client, &keys, new_status, &order).await
+                            update_order_event(&keys, new_status, &order).await
                         {
                             let _ = order_updated.update(&pool).await;
                         }
@@ -208,7 +209,7 @@ async fn job_cancel_orders(client: Client) {
     });
 }
 
-async fn job_expire_pending_older_orders(client: Client) {
+async fn job_expire_pending_older_orders() {
     let pool = crate::db::connect().await.unwrap();
     let keys = crate::util::get_keys().unwrap();
 
@@ -220,8 +221,7 @@ async fn job_expire_pending_older_orders(client: Client) {
                     println!("Uid {} - created at {}", order.id, order.created_at);
                     // We update the order id with the new event_id
                     if let Ok(order_updated) =
-                        crate::util::update_order_event(&client, &keys, Status::Expired, order)
-                            .await
+                        crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
                         let _ = order_updated.update(&pool).await;
                     }

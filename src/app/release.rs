@@ -3,7 +3,7 @@ use crate::db;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, rate_counterpart, send_cant_do_msg, send_dm, settle_seller_hold_invoice,
+    get_keys, rate_counterpart, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
     update_order_event,
 };
 
@@ -28,6 +28,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
+    let time_window = ln_settings.payment_retries_interval * retries_number as u32;
 
     // Mark payment as failed
     if !order.failed_payment {
@@ -36,6 +37,10 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     } else if order.payment_attempts < retries_number {
         order.payment_attempts += 1;
     }
+    let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
+    let buyer_key = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+
+    send_cant_do_msg(Some(order.id), Some(msg), &buyer_key).await;
 
     // Update order
     let result = order.update(&pool).await?;
@@ -93,19 +98,16 @@ pub async fn release_action(
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
-    let message = Message::new_order(
+    send_new_order_msg(
         Some(order_id),
-        None,
         Action::HoldInvoicePaymentSettled,
         None,
-    );
-
-    send_dm(my_keys, &seller_pubkey, message.as_json()?).await?;
+        &seller_pubkey,
+    )
+    .await;
     // We send a message to buyer indicating seller released funds
-    let message = Message::new_order(Some(order_id), None, Action::Release, None);
-    let message = message.as_json()?;
     let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
-    send_dm(my_keys, &buyer_pubkey, message).await?;
+    send_new_order_msg(Some(order_id), Action::Release, None, &buyer_pubkey).await;
     let _ = do_payment(order_updated).await;
 
     Ok(())
@@ -185,9 +187,13 @@ async fn payment_success(
     my_keys: &Keys,
 ) {
     // Purchase completed message to buyer
-    let message = Message::new_order(Some(order.id), None, Action::PurchaseCompleted, None);
-    let message = message.as_json().unwrap();
-    send_dm(my_keys, buyer_pubkey, message).await.unwrap();
+    send_new_order_msg(
+        Some(order.id),
+        Action::PurchaseCompleted,
+        None,
+        buyer_pubkey,
+    )
+    .await;
 
     // Let's wait 5 secs before publish this new event
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -197,7 +203,7 @@ async fn payment_success(
         let pool = db::connect().await.unwrap();
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process
-            rate_counterpart(buyer_pubkey, seller_pubkey, my_keys, &order_success)
+            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success)
                 .await
                 .unwrap();
         }

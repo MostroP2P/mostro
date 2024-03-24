@@ -60,7 +60,7 @@ pub async fn admin_take_dispute_action(
     );
     let message = message.as_json()?;
     // Send the message
-    send_dm(my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(&event.pubkey, message.clone()).await?;
 
     // We create a tag to show status of the dispute
     let tags = vec![

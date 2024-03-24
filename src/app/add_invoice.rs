@@ -1,5 +1,5 @@
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{send_cant_do_msg, send_dm, show_hold_invoice, update_order_event};
+use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, update_order_event};
 
 use anyhow::Result;
 
@@ -95,16 +95,15 @@ pub async fn add_invoice_action(
         Status::SettledHoldInvoice => {
             order.payment_attempts = 0;
             order.update(pool).await?;
-            let message = Message::new_order(
+            send_new_order_msg(
                 Some(order_id),
-                None,
                 Action::AddInvoice,
                 Some(Content::TextMessage(format!(
                     "Order Id {order_id}: Invoice updated!"
                 ))),
-            );
-            let message = message.as_json()?;
-            send_dm(my_keys, &buyer_pubkey, message).await?;
+                &buyer_pubkey,
+            )
+            .await;
             return Ok(());
         }
         _ => {
@@ -145,25 +144,21 @@ pub async fn add_invoice_action(
         }
 
         // We send a confirmation message to seller
-        let message = Message::new_order(
+        send_new_order_msg(
             Some(order.id),
-            None,
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
-        );
-
-        send_dm(my_keys, &seller_pubkey, message.as_json()?).await?;
+            &seller_pubkey,
+        )
+        .await;
         // We send a message to buyer saying seller paid
-        let message = Message::new_order(
+        send_new_order_msg(
             Some(order.id),
-            None,
             Action::HoldInvoicePaymentAccepted,
             Some(Content::Order(order_data)),
-        );
-
-        send_dm(my_keys, &buyer_pubkey, message.as_json()?)
-            .await
-            .unwrap();
+            &buyer_pubkey,
+        )
+        .await;
     } else {
         show_hold_invoice(my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
     }

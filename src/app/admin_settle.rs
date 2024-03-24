@@ -60,13 +60,13 @@ pub async fn admin_settle_action(
     let message = Message::new_dispute(Some(order_updated.id), None, Action::AdminSettle, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(&event.pubkey, message.clone()).await?;
     let seller_pubkey = order_updated.seller_pubkey.as_ref().unwrap();
     let seller_pubkey = XOnlyPublicKey::from_str(seller_pubkey).unwrap();
-    send_dm(my_keys, &seller_pubkey, message.clone()).await?;
+    send_dm(&seller_pubkey, message.clone()).await?;
     let buyer_pubkey = order_updated.buyer_pubkey.as_ref().unwrap();
     let buyer_pubkey = XOnlyPublicKey::from_str(buyer_pubkey).unwrap();
-    send_dm(my_keys, &buyer_pubkey, message.clone()).await?;
+    send_dm(&buyer_pubkey, message.clone()).await?;
 
     let _ = do_payment(order_updated).await;
 

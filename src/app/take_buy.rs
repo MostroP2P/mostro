@@ -1,4 +1,6 @@
-use crate::util::{get_market_amount_and_fee, send_cant_do_msg, send_dm, show_hold_invoice};
+use crate::util::{
+    get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg, show_hold_invoice,
+};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
@@ -62,16 +64,15 @@ pub async fn take_buy_action(
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
-        let message = Message::new_order(
+        send_new_order_msg(
             Some(order.id),
-            None,
             Action::FiatSent,
             Some(Content::TextMessage(format!(
                 "Order Id {order_id} was already taken!"
             ))),
-        );
-        send_dm(my_keys, &seller_pubkey, message.as_json()?).await?;
-
+            &seller_pubkey,
+        )
+        .await;
         return Ok(());
     }
 

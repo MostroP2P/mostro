@@ -1,4 +1,6 @@
-use crate::util::{nostr_tags_to_tuple, send_cant_do_msg, send_dm, update_user_rating_event};
+use crate::util::{
+    nostr_tags_to_tuple, send_cant_do_msg, send_new_order_msg, update_user_rating_event,
+};
 use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
@@ -152,9 +154,7 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that rated
-        let message = Message::new_order(Some(order.id), None, Action::RateReceived, None);
-        let message = message.as_json()?;
-        send_dm(my_keys, &event.pubkey, message).await?;
+        send_new_order_msg(Some(order.id), Action::RateReceived, None, &event.pubkey).await;
     }
 
     Ok(())

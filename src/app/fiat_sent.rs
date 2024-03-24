@@ -1,4 +1,4 @@
-use crate::util::{send_cant_do_msg, send_dm, update_order_event};
+use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message, Peer};
@@ -51,26 +51,24 @@ pub async fn fiat_sent_action(
     let peer = Peer::new(event.pubkey.to_string());
 
     // We create a Message
-    let message = Message::new_order(
+    send_new_order_msg(
         Some(order.id),
-        None,
         Action::FiatSent,
         Some(Content::Peer(peer)),
-    );
-    let message = message.as_json().unwrap();
-    send_dm(my_keys, &seller_pubkey, message).await?;
+        &seller_pubkey,
+    )
+    .await;
     // We send a message to buyer to wait
     let peer = Peer::new(seller_pubkey.to_string());
 
     // We create a Message
-    let message = Message::new_order(
+    send_new_order_msg(
         Some(order.id),
-        None,
         Action::FiatSent,
         Some(Content::Peer(peer)),
-    );
-    let message = message.as_json()?;
-    send_dm(my_keys, &event.pubkey, message).await?;
+        &event.pubkey,
+    )
+    .await;
 
     Ok(())
 }

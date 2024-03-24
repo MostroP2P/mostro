@@ -44,7 +44,7 @@ pub async fn admin_add_solver_action(
     let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
-    send_dm(my_keys, &event.pubkey, message).await?;
+    send_dm(&event.pubkey, message).await?;
 
     Ok(())
 }

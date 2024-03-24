@@ -80,7 +80,6 @@ pub async fn take_sell_action(
         Status::Pending | Status::WaitingBuyerInvoice => {}
         _ => {
             send_dm(
-                my_keys,
                 &buyer_pubkey,
                 format!("Order Id {order_id} was already taken!"),
             )
@@ -105,7 +104,7 @@ pub async fn take_sell_action(
         order.fee = fee;
 
         if pr.is_none() {
-            match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys).await {
+            match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
                 Ok(_) => {
                     // Update order status
                     if let Ok(order_updated) =
@@ -124,7 +123,7 @@ pub async fn take_sell_action(
             show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
         }
     } else if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, my_keys).await {
+        match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
             Ok(_) => {
                 // Update order status
                 if let Ok(order_updated) =

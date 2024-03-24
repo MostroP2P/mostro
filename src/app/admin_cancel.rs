@@ -73,7 +73,7 @@ pub async fn admin_cancel_action(
     let message = Message::new_dispute(Some(order.id), None, Action::AdminCancel, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(my_keys, &event.pubkey, message.clone()).await?;
+    send_dm(&event.pubkey, message.clone()).await?;
     let seller_pubkey = match XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
@@ -81,7 +81,7 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    send_dm(my_keys, &seller_pubkey, message.clone()).await?;
+    send_dm(&seller_pubkey, message.clone()).await?;
     let buyer_pubkey = match XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
@@ -89,7 +89,7 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    send_dm(my_keys, &buyer_pubkey, message.clone()).await?;
+    send_dm(&buyer_pubkey, message.clone()).await?;
 
     Ok(())
 }

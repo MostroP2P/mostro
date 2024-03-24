@@ -8,6 +8,7 @@ use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
+use nostr_sdk::hashes::Hash;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
@@ -159,7 +160,7 @@ impl LndConnector {
     ) -> Result<(), MostroError> {
         let invoice = decode_invoice(payment_request).unwrap();
         let payment_hash = invoice.payment_hash();
-        let payment_hash = payment_hash.to_vec();
+        let payment_hash = payment_hash.to_byte_array();
         let hash = bytes_to_string(&payment_hash);
         let mostro_settings = Settings::get_mostro();
 
@@ -171,7 +172,7 @@ impl LndConnector {
         };
 
         let track_payment_req = TrackPaymentRequest {
-            payment_hash,
+            payment_hash: payment_hash.to_vec(),
             no_inflight_updates: true,
         };
 

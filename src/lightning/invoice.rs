@@ -26,7 +26,7 @@ pub async fn is_valid_invoice(
     let ln_addr = LightningAddress::from_str(&payment_request);
     // Is it a ln address
     if ln_addr.is_ok() {
-        if amount != Some(0) || ln_exists(&payment_request).await.is_err() {
+        if ln_exists(&payment_request).await.is_err() {
             return Err(MostroError::ParsingInvoiceError);
         }
     } else {

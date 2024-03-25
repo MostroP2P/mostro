@@ -46,7 +46,7 @@ pub async fn add_invoice_action(
     };
 
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_str(pk)?,
+        Some(pk) => PublicKey::from_str(pk)?,
         None => {
             error!("Buyer pubkey not found for order {}!", order.id);
             return Ok(());
@@ -119,7 +119,7 @@ pub async fn add_invoice_action(
         }
     }
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_str(&seller_pubkey)?;
+    let seller_pubkey = PublicKey::from_str(&seller_pubkey)?;
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

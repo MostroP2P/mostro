@@ -83,7 +83,7 @@ pub async fn dispute_action(
     let dispute = dispute.create(pool).await?;
 
     // We create a Message for the initiator
-    let initiator_pubkey = match XOnlyPublicKey::from_str(&message_sender) {
+    let initiator_pubkey = match PublicKey::from_str(&message_sender) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing initiator pubkey: {:#?}", e);
@@ -99,7 +99,7 @@ pub async fn dispute_action(
     .await;
 
     // We create a Message for the counterpart
-    let counterpart_pubkey = match XOnlyPublicKey::from_str(&counterpart) {
+    let counterpart_pubkey = match PublicKey::from_str(&counterpart) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing counterpart pubkey: {:#?}", e);

@@ -47,7 +47,7 @@ pub async fn take_buy_action(
         }
     };
     let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_str(pk)?,
+        Some(pk) => PublicKey::from_str(pk)?,
         None => {
             error!("Buyer pubkey not found for order {}!", order.id);
             return Ok(());

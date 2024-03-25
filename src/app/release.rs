@@ -38,7 +38,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts += 1;
     }
     let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
-    let buyer_key = XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+    let buyer_key = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
 
     send_cant_do_msg(Some(order.id), Some(msg), &buyer_key).await;
 
@@ -106,7 +106,7 @@ pub async fn release_action(
     )
     .await;
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = XOnlyPublicKey::from_str(&buyer_pubkey)?;
+    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey)?;
     send_new_order_msg(Some(order_id), Action::Release, None, &buyer_pubkey).await;
     let _ = do_payment(order_updated).await;
 
@@ -141,10 +141,8 @@ pub async fn do_payment(order: Order) -> Result<()> {
         async move {
             // We redeclare vars to use inside this block
             let my_keys = get_keys().unwrap();
-            let buyer_pubkey =
-                XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
-            let seller_pubkey =
-                XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
+            let buyer_pubkey = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
+            let seller_pubkey = PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
@@ -182,8 +180,8 @@ pub async fn do_payment(order: Order) -> Result<()> {
 
 async fn payment_success(
     order: &Order,
-    buyer_pubkey: &XOnlyPublicKey,
-    seller_pubkey: &XOnlyPublicKey,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
     my_keys: &Keys,
 ) {
     // Purchase completed message to buyer

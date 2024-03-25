@@ -62,10 +62,10 @@ pub async fn admin_settle_action(
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
     let seller_pubkey = order_updated.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = XOnlyPublicKey::from_str(seller_pubkey).unwrap();
+    let seller_pubkey = PublicKey::from_str(seller_pubkey).unwrap();
     send_dm(&seller_pubkey, message.clone()).await?;
     let buyer_pubkey = order_updated.buyer_pubkey.as_ref().unwrap();
-    let buyer_pubkey = XOnlyPublicKey::from_str(buyer_pubkey).unwrap();
+    let buyer_pubkey = PublicKey::from_str(buyer_pubkey).unwrap();
     send_dm(&buyer_pubkey, message.clone()).await?;
 
     let _ = do_payment(order_updated).await;

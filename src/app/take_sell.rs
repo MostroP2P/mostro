@@ -38,7 +38,7 @@ pub async fn take_sell_action(
     }
     let buyer_pubkey = event.pubkey;
     let seller_pubkey = match order.seller_pubkey.as_ref() {
-        Some(pk) => XOnlyPublicKey::from_str(pk)?,
+        Some(pk) => PublicKey::from_str(pk)?,
         None => {
             error!("Seller pubkey not found for order {}!", order.id);
             return Ok(());

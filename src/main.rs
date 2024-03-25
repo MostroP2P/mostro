@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     NOSTR_CLIENT
         .get()
         .unwrap()
-        .subscribe(vec![subscription])
+        .subscribe(vec![subscription], None)
         .await;
     let mut ln_client = LndConnector::new().await;
 

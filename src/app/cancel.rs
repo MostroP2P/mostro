@@ -105,7 +105,7 @@ pub async fn cancel_action(
                         &event.pubkey,
                     )
                     .await;
-                    let counterparty_pubkey = XOnlyPublicKey::from_str(&counterparty_pubkey)?;
+                    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                     send_new_order_msg(
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
@@ -128,7 +128,7 @@ pub async fn cancel_action(
                     &event.pubkey,
                 )
                 .await;
-                let counterparty_pubkey = XOnlyPublicKey::from_str(&counterparty_pubkey)?;
+                let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                 send_new_order_msg(
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByPeer,
@@ -158,7 +158,7 @@ pub async fn cancel_add_invoice(
     let user_pubkey = event.pubkey.to_string();
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = match XOnlyPublicKey::from_str(&seller_pubkey) {
+    let seller_pubkey = match PublicKey::from_str(&seller_pubkey) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing seller pubkey: {:#?}", e);
@@ -213,7 +213,7 @@ pub async fn cancel_pay_hold_invoice(
     let user_pubkey = event.pubkey.to_string();
     let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
     let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = match XOnlyPublicKey::from_str(seller_pubkey) {
+    let seller_pubkey = match PublicKey::from_str(seller_pubkey) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing seller pubkey: {:#?}", e);

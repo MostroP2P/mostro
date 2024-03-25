@@ -74,7 +74,7 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
-    let seller_pubkey = match XOnlyPublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
+    let seller_pubkey = match PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing seller pubkey: {:#?}", e);
@@ -82,7 +82,7 @@ pub async fn admin_cancel_action(
         }
     };
     send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = match XOnlyPublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
+    let buyer_pubkey = match PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
         Ok(pk) => pk,
         Err(e) => {
             error!("Error parsing buyer pubkey: {:#?}", e);

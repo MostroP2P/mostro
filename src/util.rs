@@ -128,7 +128,7 @@ pub async fn publish_order(
     new_order: &SmallOrder,
     initiator_pubkey: &str,
     master_pubkey: &str,
-    ack_pubkey: XOnlyPublicKey,
+    ack_pubkey: PublicKey,
 ) -> Result<()> {
     let mut fee = 0;
     if new_order.amount > 0 {
@@ -200,14 +200,13 @@ pub async fn publish_order(
         .map_err(|err| err.into())
 }
 
-pub async fn send_dm(receiver_pubkey: &XOnlyPublicKey, content: String) -> Result<()> {
+pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()> {
     info!("DM content: {content:#?}");
     // Get mostro keys
     let sender_keys = crate::util::get_keys().unwrap();
 
-    let event =
-        EventBuilder::new_encrypted_direct_msg(&sender_keys, *receiver_pubkey, content, None)?
-            .to_event(&sender_keys)?;
+    let event = EventBuilder::encrypted_direct_msg(&sender_keys, *receiver_pubkey, content, None)?
+        .to_event(&sender_keys)?;
     info!("Sending event: {event:#?}");
     NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
@@ -217,7 +216,7 @@ pub async fn send_dm(receiver_pubkey: &XOnlyPublicKey, content: String) -> Resul
 pub fn get_keys() -> Result<Keys> {
     let nostr_settings = Settings::get_nostr();
     // nostr private key
-    let my_keys = Keys::from_sk_str(&nostr_settings.nsec_privkey)?;
+    let my_keys = Keys::parse(nostr_settings.nsec_privkey)?;
 
     Ok(my_keys)
 }
@@ -297,7 +296,7 @@ pub async fn connect_nostr() -> Result<Client> {
     // Add relays
     for r in relays.into_iter() {
         let opts = RelayOptions::new();
-        client.add_relay_with_opts(r, None, opts).await?;
+        client.add_relay_with_opts(r, opts).await?;
     }
 
     // Connect to relays and keep connection alive
@@ -309,8 +308,8 @@ pub async fn connect_nostr() -> Result<Client> {
 pub async fn show_hold_invoice(
     my_keys: &Keys,
     payment_request: Option<String>,
-    buyer_pubkey: &XOnlyPublicKey,
-    seller_pubkey: &XOnlyPublicKey,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
     mut order: Order,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await;
@@ -415,10 +414,7 @@ pub async fn get_market_amount_and_fee(
 }
 
 /// Set order sats amount, this used when a buyer take a sell order
-pub async fn set_waiting_invoice_status(
-    order: &mut Order,
-    buyer_pubkey: XOnlyPublicKey,
-) -> Result<i64> {
+pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicKey) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
 
@@ -452,8 +448,8 @@ pub async fn set_waiting_invoice_status(
 
 /// Send message to buyer and seller to vote for counterpart
 pub async fn rate_counterpart(
-    buyer_pubkey: &XOnlyPublicKey,
-    seller_pubkey: &XOnlyPublicKey,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
     order: &Order,
 ) -> Result<()> {
     // Send dm to counterparts
@@ -518,7 +514,7 @@ pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
 pub async fn send_cant_do_msg(
     order_id: Option<Uuid>,
     message: Option<String>,
-    destination_key: &XOnlyPublicKey,
+    destination_key: &PublicKey,
 ) {
     // Prepare content in case
     let content = message.map(Content::TextMessage);
@@ -534,7 +530,7 @@ pub async fn send_new_order_msg(
     order_id: Option<Uuid>,
     action: Action,
     content: Option<Content>,
-    destination_key: &XOnlyPublicKey,
+    destination_key: &PublicKey,
 ) {
     // Send message to event creator
     let message = Message::new_order(order_id, None, action, content);

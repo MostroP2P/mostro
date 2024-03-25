@@ -29,7 +29,7 @@ pub fn new_event(
         tags.push(tag);
     }
 
-    EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, &tags).to_event(keys)
+    EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
 
 /// Transform an order fields to tags

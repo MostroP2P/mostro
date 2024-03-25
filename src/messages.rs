@@ -2,7 +2,7 @@ use anyhow::Result;
 use nostr_sdk::prelude::*;
 
 pub fn hold_invoice_description(
-    mostro_pubkey: XOnlyPublicKey,
+    mostro_pubkey: PublicKey,
     order_id: &str,
     fiat_code: &str,
     fiat_amount: &str,

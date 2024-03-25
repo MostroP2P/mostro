@@ -45,15 +45,12 @@ pub async fn run(
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event(_, event) = notification {
+            if let RelayPoolNotification::Event { event, .. } = notification {
                 if let Kind::EncryptedDirectMessage = event.kind {
                     // We validates if the event is correctly signed
                     event.verify()?;
-                    let message = decrypt(
-                        &my_keys.secret_key().unwrap(),
-                        &event.pubkey,
-                        &event.content,
-                    );
+                    let message =
+                        decrypt(my_keys.secret_key().unwrap(), &event.pubkey, &event.content);
                     if let Ok(m) = message {
                         let message = Message::from_json(&m);
                         if let Ok(msg) = message {

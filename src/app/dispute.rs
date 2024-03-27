@@ -8,7 +8,7 @@ use crate::NOSTR_CLIENT;
 use anyhow::Result;
 use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Message};
-use mostro_core::order::Order;
+use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
@@ -29,7 +29,23 @@ pub async fn dispute_action(
     }
 
     let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
+        Some(order) => {
+            if matches!(
+                Status::from_str(&order.status).unwrap(),
+                Status::Active | Status::FiatSent
+            ) {
+                order
+            } else {
+                send_cant_do_msg(
+                    Some(order.id),
+                    Some("Not allowed".to_string()),
+                    &event.pubkey,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         None => {
             error!("Order Id {order_id} not found!");
             return Ok(());

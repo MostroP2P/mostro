@@ -14,13 +14,6 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use tracing::{error, info};
 
-fn check_order_status_for_dispute(status: &str) -> bool {
-    match Status::from_str(status).unwrap() {
-        Status::Success => true,
-        _ => false,
-    }
-}
-
 pub async fn dispute_action(
     msg: Message,
     event: &Event,
@@ -37,7 +30,10 @@ pub async fn dispute_action(
 
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => {
-            if check_order_status_for_dispute(&order.status) {
+            if matches!(
+                Status::from_str(&order.status).unwrap(),
+                Status::Active | Status::FiatSent
+            ) {
                 order
             } else {
                 send_cant_do_msg(

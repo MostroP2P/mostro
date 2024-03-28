@@ -13,17 +13,18 @@ use sqlx_crud::Crud;
 use tracing::info;
 
 pub async fn npub_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
-    let my_keys = crate::util::get_keys().unwrap();
+    if let Ok(my_keys) = crate::util::get_keys() {
+        // Is mostro admin taking dispute?
+        if ev_pubkey.to_string() != my_keys.public_key().to_string() {
+            return true;
+        }
+    }
 
     // Is a solver taking a dispute
     if let Ok(solver) = find_solver_npub(pool, ev_pubkey.to_string()).await {
         if solver.is_solver != 0_i64 {
             return true;
         }
-    }
-    // Is mostro admin taking dispute?
-    if ev_pubkey.to_string() != my_keys.public_key().to_string() {
-        return true;
     }
 
     false

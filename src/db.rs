@@ -1,6 +1,7 @@
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::order::Status;
+use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
@@ -278,4 +279,19 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>
     .await?;
 
     Ok(order)
+}
+
+pub async fn find_solver_npub(pool: &SqlitePool, solver_npub: String) -> anyhow::Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+          SELECT *
+          FROM users
+          WHERE pubkey == ?1 AND  is_solver == true
+        "#,
+    )
+    .bind(solver_npub)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
 }

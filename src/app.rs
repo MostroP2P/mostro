@@ -49,7 +49,11 @@ pub async fn run(
                 if let Kind::EncryptedDirectMessage = event.kind {
                     // We validates if the event is correctly signed
                     event.verify()?;
-                    let message = decrypt(my_keys.secret_key()?, &event.pubkey, &event.content);
+                    let message = nip04::decrypt(
+                        my_keys.secret_key().unwrap(),
+                        &event.pubkey,
+                        &event.content,
+                    );
                     if let Ok(m) = message {
                         let message = Message::from_json(&m);
                         if let Ok(msg) = message {

@@ -115,8 +115,7 @@ pub async fn run(
                                                 .await?;
                                         }
                                         Action::AdminTakeDispute => {
-                                            admin_take_dispute_action(msg, &event, &my_keys, &pool)
-                                                .await?;
+                                            admin_take_dispute_action(msg, &event, &pool).await?;
                                         }
                                         _ => todo!(),
                                     }

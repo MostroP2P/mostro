@@ -1,3 +1,4 @@
+use crate::db::find_solver_npub;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm};
 use crate::NOSTR_CLIENT;
@@ -11,10 +12,26 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tracing::info;
 
+pub async fn npub_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
+    let my_keys = crate::util::get_keys().unwrap();
+
+    // Is a solver taking a dispute
+    if let Ok(solver) = find_solver_npub(pool, ev_pubkey.to_string()).await {
+        if solver.is_solver != 0_i64 {
+            return true;
+        }
+    }
+    // Is mostro admin taking dispute?
+    if ev_pubkey.to_string() != my_keys.public_key().to_string() {
+        return true;
+    }
+
+    false
+}
+
 pub async fn admin_take_dispute_action(
     msg: Message,
     event: &Event,
-    my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let dispute_id = msg.get_inner_message_kind().id.unwrap();
@@ -38,7 +55,7 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is Mostro
     // TODO: solvers also can take disputes
-    if event.pubkey.to_string() != my_keys.public_key().to_string() {
+    if !npub_event_can_solve(pool, &event.pubkey).await {
         // We create a Message
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
@@ -69,7 +86,7 @@ pub async fn admin_take_dispute_action(
         ("z".to_string(), "dispute".to_string()),
     ];
     // nip33 kind with dispute id as identifier
-    let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
+    let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
     NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 

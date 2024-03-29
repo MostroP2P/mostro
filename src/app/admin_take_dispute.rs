@@ -15,7 +15,7 @@ use tracing::info;
 pub async fn npub_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
-        if ev_pubkey.to_string() != my_keys.public_key().to_string() {
+        if ev_pubkey.to_string() == my_keys.public_key().to_string() {
             return true;
         }
     }

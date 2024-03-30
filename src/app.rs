@@ -33,6 +33,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::info;
 
 pub async fn run(
     my_keys: Keys,
@@ -117,7 +118,7 @@ pub async fn run(
                                         Action::AdminTakeDispute => {
                                             admin_take_dispute_action(msg, &event, &pool).await?;
                                         }
-                                        _ => todo!(),
+                                        _ => info!("Received message with action {:?}", action),
                                     }
                                 }
                             }

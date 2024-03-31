@@ -30,7 +30,13 @@ static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env::set_var("RUST_LOG", "none,mostro=info");
+    if cfg!(debug_assertions) {
+        // Debug, show all error + mostro logs
+        env::set_var("RUST_LOG", "error,mostro=info");
+    } else {
+        // Release, show only mostro logs
+        env::set_var("RUST_LOG", "none,mostro=info");
+    }
 
     // Tracing using RUST_LOG
     tracing_subscriber::registry()

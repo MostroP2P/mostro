@@ -289,15 +289,12 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
 pub async fn connect_nostr() -> Result<Client> {
     let my_keys = crate::util::get_keys()?;
     let nostr_settings = Settings::get_nostr();
+
     // Create new client
     let client = Client::new(&my_keys);
-    let relays = nostr_settings.relays;
 
     // Add relays
-    for r in relays.into_iter() {
-        let opts = RelayOptions::new();
-        client.add_relay_with_opts(r, opts).await?;
-    }
+    client.add_relays(nostr_settings.relays).await?;
 
     // Connect to relays and keep connection alive
     client.connect().await;

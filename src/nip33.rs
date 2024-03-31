@@ -22,10 +22,10 @@ pub fn new_event(
     extra_tags: Vec<(String, String)>,
 ) -> Result<Event, Error> {
     // This tag (nip33) allows us to change this event in particular in the future
-    let d_tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![identifier]);
-    let mut tags = vec![d_tag];
-    for tag in extra_tags {
-        let tag = Tag::Generic(TagKind::Custom(tag.0), vec![tag.1]);
+    let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
+    tags.push(Tag::Identifier(identifier)); // `d` tag
+    for (key, value) in extra_tags.into_iter() {
+        let tag = Tag::Generic(TagKind::Custom(key), vec![value]);
         tags.push(tag);
     }
 

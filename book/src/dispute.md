@@ -93,7 +93,7 @@ Mostro will send a confirmation message to the admin with the Order details:
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "admin-take-dispute",
+    "action": "admin-took-dispute",
     "content": {
       "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",

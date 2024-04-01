@@ -38,7 +38,7 @@ And a message to the buyer to let him know that the sats were released:
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "release",
+    "action": "released",
     "content": null
   }
 }

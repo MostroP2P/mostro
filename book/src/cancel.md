@@ -24,7 +24,7 @@ Mostro will send a message with action `cancel` confirming the order was cancele
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
-    "action": "cancel",
+    "action": "canceled",
     "content": null
   }
 }

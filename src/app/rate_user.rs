@@ -21,7 +21,7 @@ pub async fn get_counterpart_reputation(user: &str, my_keys: &Keys) -> Result<Op
     let filters = Filter::new()
         .author(my_keys.public_key())
         .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
-        .custom_tag(SingleLetterTag::uppercase(Alphabet::Z), vec!["rating"])
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::Z), vec!["rating"])
         .identifier(user.to_string());
 
     let mut user_reputation_event = NOSTR_CLIENT

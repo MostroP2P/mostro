@@ -51,7 +51,7 @@ pub async fn admin_cancel_action(
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
         // we update the dispute
-        d.status = DisputeStatus::SellerRefunded;
+        d.status = DisputeStatus::SellerRefunded.to_string();
         d.update(pool).await?;
         // We create a tag to show status of the dispute
         let tags = vec![

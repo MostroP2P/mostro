@@ -63,7 +63,7 @@ pub async fn admin_take_dispute_action(
     }
 
     // Update dispute fields
-    dispute.status = Status::InProgress;
+    dispute.status = Status::InProgress.to_string();
     dispute.solver_pubkey = Some(event.pubkey.to_string());
     dispute.taken_at = Timestamp::now().as_i64();
     // Save it to DB
@@ -73,7 +73,7 @@ pub async fn admin_take_dispute_action(
     let message = Message::new_dispute(
         Some(dispute_id),
         None,
-        Action::AdminTakeDispute,
+        Action::AdminAcceptDispute,
         Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;

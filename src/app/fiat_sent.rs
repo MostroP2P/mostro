@@ -50,10 +50,10 @@ pub async fn fiat_sent_action(
     };
     let peer = Peer::new(event.pubkey.to_string());
 
-    // We create a Message
+    // We a message to the seller
     send_new_order_msg(
         Some(order.id),
-        Action::FiatSent,
+        Action::FiatSentOk,
         Some(Content::Peer(peer)),
         &seller_pubkey,
     )
@@ -61,10 +61,9 @@ pub async fn fiat_sent_action(
     // We send a message to buyer to wait
     let peer = Peer::new(seller_pubkey.to_string());
 
-    // We create a Message
     send_new_order_msg(
         Some(order.id),
-        Action::FiatSent,
+        Action::FiatSentOk,
         Some(Content::Peer(peer)),
         &event.pubkey,
     )

@@ -451,9 +451,9 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(Some(order.id), Action::RateUser, None, buyer_pubkey).await;
+    send_new_order_msg(Some(order.id), Action::Rate, None, buyer_pubkey).await;
     // to seller
-    send_new_order_msg(Some(order.id), Action::RateUser, None, seller_pubkey).await;
+    send_new_order_msg(Some(order.id), Action::Rate, None, seller_pubkey).await;
 
     Ok(())
 }

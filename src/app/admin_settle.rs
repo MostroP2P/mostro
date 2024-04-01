@@ -32,8 +32,15 @@ pub async fn admin_settle_action(
         }
     };
 
-    settle_seller_hold_invoice(event, my_keys, ln_client, Action::AdminSettle, true, &order)
-        .await?;
+    settle_seller_hold_invoice(
+        event,
+        my_keys,
+        ln_client,
+        Action::AdminSettled,
+        true,
+        &order,
+    )
+    .await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
@@ -56,8 +63,8 @@ pub async fn admin_settle_action(
 
         NOSTR_CLIENT.get().unwrap().send_event(event).await?;
     }
-    // We create a Message
-    let message = Message::new_dispute(Some(order_updated.id), None, Action::AdminSettle, None);
+    // We create a Message for settle
+    let message = Message::new_dispute(Some(order_updated.id), None, Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
@@ -66,7 +73,7 @@ pub async fn admin_settle_action(
     send_dm(&seller_pubkey, message.clone()).await?;
     let buyer_pubkey = order_updated.buyer_pubkey.as_ref().unwrap();
     let buyer_pubkey = PublicKey::from_str(buyer_pubkey).unwrap();
-    send_dm(&buyer_pubkey, message.clone()).await?;
+    send_dm(&buyer_pubkey, message).await?;
 
     let _ = do_payment(order_updated).await;
 

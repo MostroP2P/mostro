@@ -73,7 +73,7 @@ pub async fn admin_take_dispute_action(
     let message = Message::new_dispute(
         Some(dispute_id),
         None,
-        Action::AdminAcceptDispute,
+        Action::AdminTookDispute,
         Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;

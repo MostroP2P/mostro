@@ -90,7 +90,7 @@ pub async fn release_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, my_keys, ln_client, Action::Release, false, &order).await?;
+    settle_seller_hold_invoice(event, my_keys, ln_client, Action::Released, false, &order).await?;
 
     let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
 
@@ -107,7 +107,7 @@ pub async fn release_action(
     .await;
     // We send a message to buyer indicating seller released funds
     let buyer_pubkey = PublicKey::from_str(&buyer_pubkey)?;
-    send_new_order_msg(Some(order_id), Action::Release, None, &buyer_pubkey).await;
+    send_new_order_msg(Some(order_id), Action::Released, None, &buyer_pubkey).await;
     let _ = do_payment(order_updated).await;
 
     Ok(())

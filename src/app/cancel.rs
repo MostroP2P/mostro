@@ -43,7 +43,7 @@ pub async fn cancel_action(
                 let _ = order_updated.update(pool).await;
             }
             // We create a Message for cancel
-            send_new_order_msg(Some(order.id), Action::Cancel, None, &event.pubkey).await;
+            send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
         }
 
         return Ok(());
@@ -176,8 +176,8 @@ pub async fn cancel_add_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::CooperativelyCanceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Cancel, None, &event.pubkey).await;
-        send_new_order_msg(Some(order.id), Action::Cancel, None, &seller_pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {
         // We re-publish the event with Pending status
@@ -231,8 +231,8 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::Canceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Cancel, None, &event.pubkey).await;
-        send_new_order_msg(Some(order.id), Action::Cancel, None, &seller_pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {
         // We re-publish the event with Pending status

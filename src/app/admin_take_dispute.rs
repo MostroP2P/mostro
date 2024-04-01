@@ -5,7 +5,7 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Content, Message, Peer};
 use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -77,9 +77,21 @@ pub async fn admin_take_dispute_action(
         Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;
-    // Send the message
-    send_dm(&event.pubkey, message.clone()).await?;
-
+    send_dm(&event.pubkey, message).await?;
+    // Now we create a message to both parties of the order
+    // to them know who will assist them on the dispute
+    let solver_pubkey = Peer::new(event.pubkey.to_hex());
+    let message = Message::new_order(
+        Some(order.id),
+        None,
+        Action::AdminTookDispute,
+        Some(Content::Peer(solver_pubkey)),
+    );
+    let buyer_pubkey = PublicKey::from_hex(order.buyer_pubkey.clone().unwrap())?;
+    let seller_pubkey = PublicKey::from_hex(order.seller_pubkey.clone().unwrap())?;
+    let message = message.as_json()?;
+    send_dm(&buyer_pubkey, message.clone()).await?;
+    send_dm(&seller_pubkey, message).await?;
     // We create a tag to show status of the dispute
     let tags = vec![
         ("s".to_string(), Status::InProgress.to_string()),

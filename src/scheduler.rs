@@ -2,7 +2,7 @@ use crate::app::release::do_payment;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
-use crate::util::update_order_event;
+use crate::util;
 use crate::NOSTR_CLIENT;
 
 use chrono::{TimeDelta, Utc};
@@ -11,7 +11,8 @@ use nostr_sdk::Event;
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
+use util::{get_keys, update_order_event};
 
 pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     info!("Creating scheduler");
@@ -29,7 +30,10 @@ async fn job_retry_failed_payments() {
     let retries_number = ln_settings.payment_attempts as i64;
     let interval = ln_settings.payment_retries_interval as u64;
 
-    let pool = crate::db::connect().await.unwrap();
+    let pool = match connect().await {
+        Ok(p) => p,
+        Err(e) => return error!("{e}"),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -41,7 +45,9 @@ async fn job_retry_failed_payments() {
             if let Ok(payment_failed_list) = crate::db::find_failed_payment(&pool).await {
                 for payment_failed in payment_failed_list.into_iter() {
                     if payment_failed.payment_attempts < retries_number {
-                        let _ = do_payment(payment_failed.clone()).await;
+                        if let Err(e) = do_payment(payment_failed.clone()).await {
+                            error!("{e}");
+                        }
                     }
                 }
             }
@@ -65,12 +71,14 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
 
             for ev in inner_list.lock().await.iter() {
                 // Send event to relay
-                match NOSTR_CLIENT.get().unwrap().send_event(ev.clone()).await {
-                    Ok(id) => {
-                        info!("Updated rate event with id {:?}", id)
-                    }
-                    Err(e) => {
-                        info!("Error on updating rate event {:?}", e.to_string())
+                if let Some(client) = NOSTR_CLIENT.get() {
+                    match &client.send_event(ev.clone()).await {
+                        Ok(id) => {
+                            info!("Updated rate event with id {:?}", id)
+                        }
+                        Err(e) => {
+                            info!("Error on updating rate event {:?}", e.to_string())
+                        }
                     }
                 }
             }
@@ -79,15 +87,14 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
             inner_list.lock().await.clear();
 
             let now = Utc::now();
-            let next_tick = now
-                .checked_add_signed(
-                    TimeDelta::try_seconds(interval as i64).expect("Wrong seconds value"),
-                )
-                .unwrap();
-            info!(
-                "Next tick for update users rating is {}",
-                next_tick.format("%a %b %e %T %Y")
-            );
+            if let Some(next_tick) = now.checked_add_signed(
+                TimeDelta::try_seconds(interval as i64).expect("Wrong seconds value"),
+            ) {
+                info!(
+                    "Next tick for update users rating is {}",
+                    next_tick.format("%a %b %e %T %Y")
+                );
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -97,8 +104,15 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
 async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
 
-    let pool = crate::db::connect().await.unwrap();
-    let keys = crate::util::get_keys().unwrap();
+    let pool = match connect().await {
+        Ok(p) => p,
+        Err(e) => return error!("{e}"),
+    };
+    let keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
     let mut ln_client = LndConnector::new().await;
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds;
@@ -115,10 +129,11 @@ async fn job_cancel_orders() {
                         || order.status == Status::WaitingPayment.to_string()
                     {
                         // If hold invoice is paid return funds to seller
-                        if order.hash.is_some() {
-                            // We return funds to seller
-                            let hash = order.hash.as_ref().unwrap();
-                            let _ = ln_client.cancel_hold_invoice(hash).await;
+                        // We return funds to seller
+                        if let Some(hash) = order.hash.as_ref() {
+                            if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
+                                error!("{e}");
+                            }
                             info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
                         };
                         let mut order = order.clone();
@@ -135,15 +150,27 @@ async fn job_cancel_orders() {
                         if order.status == Status::WaitingBuyerInvoice.to_string() {
                             if order.kind == Kind::Sell.to_string() {
                                 // Reset buyer pubkey to none
-                                edit_buyer_pubkey_order(&pool, order.id, None)
-                                    .await
-                                    .unwrap();
-                                let _ = edit_master_buyer_pubkey_order(&pool, order.id, None).await;
+                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
+                                if let Err(e) =
+                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
                             }
                             if order.kind == Kind::Buy.to_string() {
-                                let _ = edit_seller_pubkey_order(&pool, order.id, None).await;
-                                let _ =
-                                    edit_master_seller_pubkey_order(&pool, order.id, None).await;
+                                if let Err(e) =
+                                    edit_seller_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
+                                if let Err(e) =
+                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
                                 new_status = Status::Canceled;
                             };
                             info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
@@ -151,20 +178,29 @@ async fn job_cancel_orders() {
 
                         if order.status == Status::WaitingPayment.to_string() {
                             if order.kind == Kind::Sell.to_string() {
-                                edit_buyer_pubkey_order(&pool, order.id, None)
-                                    .await
-                                    .unwrap();
-                                let _ = edit_master_buyer_pubkey_order(&pool, order.id, None).await;
+                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
+                                if let Err(e) =
+                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
                                 new_status = Status::Canceled;
                             };
 
                             if order.kind == Kind::Buy.to_string() {
-                                edit_seller_pubkey_order(&pool, order.id, None)
-                                    .await
-                                    .unwrap();
-                                edit_master_seller_pubkey_order(&pool, order.id, None)
-                                    .await
-                                    .unwrap();
+                                if let Err(e) =
+                                    edit_seller_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
+                                if let Err(e) =
+                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
+                                {
+                                    error!("{e}");
+                                }
                             };
                             info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                         }
@@ -195,23 +231,28 @@ async fn job_cancel_orders() {
                 }
             }
             let now = Utc::now();
-            let next_tick = now
-                .checked_add_signed(
-                    TimeDelta::try_seconds(exp_seconds as i64).expect("Wrong seconds value"),
-                )
-                .unwrap();
-            info!(
-                "Next tick for late action users check is {}",
-                next_tick.format("%a %b %e %T %Y")
-            );
+            if let Some(next_tick) = now.checked_add_signed(
+                TimeDelta::try_seconds(exp_seconds as i64).expect("Wrong seconds value"),
+            ) {
+                info!(
+                    "Next tick for late action users check is {}",
+                    next_tick.format("%a %b %e %T %Y")
+                );
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
         }
     });
 }
 
 async fn job_expire_pending_older_orders() {
-    let pool = crate::db::connect().await.unwrap();
-    let keys = crate::util::get_keys().unwrap();
+    let pool = match connect().await {
+        Ok(p) => p,
+        Err(e) => return error!("{e}"),
+    };
+    let keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -228,13 +269,14 @@ async fn job_expire_pending_older_orders() {
                 }
             }
             let now = Utc::now();
-            let next_tick = now
-                .checked_add_signed(TimeDelta::try_minutes(1).expect("Wrong minutes value"))
-                .unwrap();
-            info!(
-                "Next tick for removal of older orders is {}",
-                next_tick.format("%a %b %e %T %Y")
-            );
+            if let Some(next_tick) =
+                now.checked_add_signed(TimeDelta::try_minutes(1).expect("Wrong minutes value"))
+            {
+                info!(
+                    "Next tick for removal of older orders is {}",
+                    next_tick.format("%a %b %e %T %Y")
+                );
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });

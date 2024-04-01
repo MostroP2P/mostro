@@ -287,11 +287,15 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
 }
 
 pub async fn connect_nostr() -> Result<Client> {
-    let my_keys = crate::util::get_keys()?;
     let nostr_settings = Settings::get_nostr();
 
+    let mut limits = RelayLimits::default();
+    limits.messages.max_size = 3_000;
+    limits.events.max_size = 2_000;
+    let opts = Options::new().relay_limits(limits);
+
     // Create new client
-    let client = Client::new(&my_keys);
+    let client = ClientBuilder::default().opts(opts).build();
 
     // Add relays
     client.add_relays(nostr_settings.relays).await?;

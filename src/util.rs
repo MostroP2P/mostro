@@ -321,7 +321,6 @@ pub async fn show_hold_invoice(
     let (invoice_response, preimage, hash) = ln_client
         .create_hold_invoice(
             &messages::hold_invoice_description(
-                my_keys.public_key(),
                 &order.id.to_string(),
                 &order.fiat_code,
                 &order.fiat_amount.to_string(),

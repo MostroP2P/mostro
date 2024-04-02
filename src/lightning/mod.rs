@@ -166,8 +166,8 @@ impl LndConnector {
 
         // We need to set a max fee amount
         // If the amount is small we use a different max routing fee
-        let max_fee = match amount.cmp(&100) {
-            Ordering::Less | Ordering::Equal => amount as f64 * 0.1,
+        let max_fee = match amount.cmp(&1000) {
+            Ordering::Less | Ordering::Equal => amount as f64 * 0.01,
             Ordering::Greater => amount as f64 * mostro_settings.max_routing_fee,
         };
 

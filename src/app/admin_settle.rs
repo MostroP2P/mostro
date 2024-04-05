@@ -1,7 +1,7 @@
 use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_dm, settle_seller_hold_invoice, update_order_event};
+use crate::util::{send_cant_do_msg, send_dm, settle_seller_hold_invoice, update_order_event};
 use crate::NOSTR_CLIENT;
 
 use anyhow::Result;
@@ -31,6 +31,16 @@ pub async fn admin_settle_action(
             return Ok(());
         }
     };
+
+    if order.status != Status::Dispute.to_string() {
+        let error = format!(
+            "Can't settle an order with status different than {}!",
+            Status::Dispute.to_string()
+        );
+        send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
+
+        return Ok(());
+    }
 
     settle_seller_hold_invoice(
         event,

@@ -35,6 +35,17 @@ pub async fn admin_cancel_action(
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         send_cant_do_msg(Some(order_id), None, &event.pubkey).await;
+
+        return Ok(());
+    }
+
+    if order.status != Status::Dispute.to_string() {
+        let error = format!(
+            "Can't settle an order with status different than {}!",
+            Status::Dispute.to_string()
+        );
+        send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
+
         return Ok(());
     }
 

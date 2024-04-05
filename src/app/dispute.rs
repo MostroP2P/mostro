@@ -85,6 +85,7 @@ pub async fn dispute_action(
         update_buyer_dispute = true;
         order.buyer_dispute = update_buyer_dispute;
     };
+    order.status = Status::Dispute.to_string();
 
     // Update the database with dispute information
     // Save the dispute to DB

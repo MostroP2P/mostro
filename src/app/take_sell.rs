@@ -28,9 +28,16 @@ pub async fn take_sell_action(
             return Ok(());
         }
     };
+    // Maker can't take own order
+    if order.creator_pubkey == event.pubkey.to_hex() {
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        return Ok(());
+    }
+
     if order.kind != Kind::Sell.to_string() {
         return Ok(());
     }
+
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;

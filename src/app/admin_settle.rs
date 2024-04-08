@@ -14,6 +14,7 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::error;
 
+use super::admin_take_dispute::npub_event_can_solve;
 use super::release::do_payment;
 
 pub async fn admin_settle_action(
@@ -23,6 +24,12 @@ pub async fn admin_settle_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
+    // Check if the pubkey is a solver or admin
+    if !npub_event_can_solve(pool, &event.pubkey).await {
+        // We create a Message
+        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+        return Ok(());
+    }
     let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,

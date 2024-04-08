@@ -35,6 +35,12 @@ pub async fn admin_take_dispute_action(
     event: &Event,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
+    // Check if the pubkey is a solver or admin
+    if !npub_event_can_solve(pool, &event.pubkey).await {
+        // We create a Message
+        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+        return Ok(());
+    }
     let dispute_id = msg.get_inner_message_kind().id.unwrap();
     let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
@@ -53,14 +59,6 @@ pub async fn admin_take_dispute_action(
     let mut new_order = order.as_new_order();
     new_order.master_buyer_pubkey = order.master_buyer_pubkey.clone();
     new_order.master_seller_pubkey = order.master_seller_pubkey.clone();
-
-    // Check if the pubkey is Mostro
-    // TODO: solvers also can take disputes
-    if !npub_event_can_solve(pool, &event.pubkey).await {
-        // We create a Message
-        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
-        return Ok(());
-    }
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();

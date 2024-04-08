@@ -34,7 +34,8 @@ pub async fn admin_add_solver_action(
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
-    let user = User::new(npubkey.to_string(), 0, 1, 0, 0);
+    let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
+    let user = User::new(public_key, 0, 1, 0, 0);
     // Use CRUD to create user
     match user.create(pool).await {
         Ok(r) => info!("Solver added: {:#?}", r),

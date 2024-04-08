@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use super::admin_take_dispute::npub_event_can_solve;
 use crate::db::find_dispute_by_order_id;
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
@@ -22,6 +23,13 @@ pub async fn admin_cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
+    // Check if the pubkey is a solver or admin
+    if !npub_event_can_solve(pool, &event.pubkey).await {
+        // We create a Message
+        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+        return Ok(());
+    }
+
     let order_id = msg.get_inner_message_kind().id.unwrap();
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
@@ -30,14 +38,6 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-
-    // Check if the pubkey is Mostro
-    if event.pubkey.to_string() != my_keys.public_key().to_string() {
-        // We create a Message
-        send_cant_do_msg(Some(order_id), None, &event.pubkey).await;
-
-        return Ok(());
-    }
 
     if order.status != Status::Dispute.to_string() {
         let error = format!(

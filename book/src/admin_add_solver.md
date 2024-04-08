@@ -6,7 +6,7 @@ The administrator can add or remove them at any time.
 
 The administrator can also solve disputes.
 
-An admin can add a solver, for this the admin will need to send an `order` message to Mostro with action `admin-add-solver`:
+To add a solver the admin will need to send an `order` message to Mostro with action `admin-add-solver`:
 
 ```json
 {

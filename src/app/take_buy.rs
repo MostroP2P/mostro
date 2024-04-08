@@ -26,9 +26,13 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
+    // Maker can't take own order
+    if order.creator_pubkey == event.pubkey.to_hex() {
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        return Ok(());
+    }
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
-        // We create a Message
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }

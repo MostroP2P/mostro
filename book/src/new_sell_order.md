@@ -1,4 +1,4 @@
-# Creating a new order
+# Creating a new sell order
 
 To create a new sell order the user should send a Nostr event kind 4 (an encrypted message) to Mostro with the following content:
 

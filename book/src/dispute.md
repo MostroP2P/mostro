@@ -61,7 +61,7 @@ Here is an example of the nip 33 event sent by Mostro:
     "kind": 38383,
     "tags": [
       ["d", "efc75871-2568-40b9-a6ee-c382d4d6de01"],
-      ["s", "pending"],
+      ["s", "initiated"],
       ["y", "mostrop2p"],
       ["z", "dispute"]
     ],

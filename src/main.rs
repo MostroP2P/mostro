@@ -9,6 +9,7 @@ pub mod messages;
 pub mod models;
 pub mod nip33;
 pub mod scheduler;
+pub mod stats;
 pub mod util;
 
 use crate::app::run;
@@ -18,6 +19,7 @@ use anyhow::Result;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use stats::MostroMessageStats;
 use std::env;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -55,6 +57,9 @@ async fn main() -> Result<()> {
     // Connect to database
     let pool = db::connect().await?;
 
+    // Init mostro stats
+    let mostro_stats: Arc<Mutex<MostroMessageStats>> = Arc::new(Mutex::new(MostroMessageStats::new()?));
+
     // Connect to relays
     // from now unwrap is safe - oncelock inited
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
@@ -75,7 +80,7 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await;
 
     // Start scheduler for tasks
-    start_scheduler(rate_list.clone()).await;
+    start_scheduler(rate_list.clone(), mostro_stats.clone()).await;
 
     run(
         my_keys,
@@ -83,6 +88,7 @@ async fn main() -> Result<()> {
         &mut ln_client,
         pool,
         rate_list.clone(),
+        mostro_stats.clone(),
     )
     .await
 }

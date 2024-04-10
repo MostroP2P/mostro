@@ -40,7 +40,7 @@ async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
                 let _ = f.write(s.unwrap().as_bytes());
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
 }

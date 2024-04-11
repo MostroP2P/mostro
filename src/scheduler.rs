@@ -2,6 +2,7 @@ use crate::app::release::do_payment;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::stats::MostroMessageStats;
 use crate::util;
 use crate::NOSTR_CLIENT;
 
@@ -9,20 +10,48 @@ use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::Event;
 use sqlx_crud::Crud;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use util::{get_keys, update_order_event};
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
+pub async fn start_scheduler(
+    rate_list: Arc<Mutex<Vec<Event>>>,
+    stats: Arc<Mutex<MostroMessageStats>>,
+) {
     info!("Creating scheduler");
 
     job_expire_pending_older_orders().await;
     job_update_rate_events(rate_list).await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
+    job_print_stats(stats).await;
 
     info!("Scheduler Started");
+}
+
+async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
+    let inner_stats = stats.clone();
+
+    tokio::spawn(async move {
+        loop {
+            info!(
+                "Stats on Mostro messages\r\n{:?}",
+                *inner_stats.lock().await
+            );
+            let s = serde_json::to_string(&*inner_stats.lock().await);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open("mostro_stats.json")
+            {
+                let _ = f.write(s.unwrap().as_bytes());
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 async fn job_retry_failed_payments() {

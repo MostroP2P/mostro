@@ -29,7 +29,6 @@ use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 const MAX_RETRY: u16 = 4;
-const MAX_EXPIRE_DAYS: i64 = 15;
 
 pub async fn retries_yadio_request(
     req_string: &str,
@@ -129,8 +128,8 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     // We calculate order expiration
     let mut expires_at: i64 = Timestamp::now().as_i64();
     if let Some(mut exp) = expire {
-        if exp > MAX_EXPIRE_DAYS {
-            exp = MAX_EXPIRE_DAYS
+        if exp > mostro_settings.max_expiration_days.into() {
+            exp = mostro_settings.max_expiration_days.into()
         };
         expires_at += Duration::days(exp).num_seconds();
     } else {

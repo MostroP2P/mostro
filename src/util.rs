@@ -128,10 +128,12 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     // We calculate order expiration
     let mut expires_at: i64 = Timestamp::now().as_i64();
     if let Some(mut exp) = expire {
-        if exp > mostro_settings.max_expiration_days.into() {
+        if exp
+            > expires_at + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds()
+        {
             exp = mostro_settings.max_expiration_days.into()
         };
-        expires_at += Duration::days(exp).num_seconds();
+        expires_at += exp;
     } else {
         expires_at += Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
     }

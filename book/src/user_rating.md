@@ -24,7 +24,7 @@ After a Mostro client receive this message, the user can rate the other party, t
     "pubkey": null,
     "action": "rate-user",
     "content": {
-      "RatingUser": 5 // User input
+      "rating_user": 5 // User input
     }
   }
 }

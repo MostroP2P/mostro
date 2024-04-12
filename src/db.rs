@@ -85,14 +85,12 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
 }
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
-    let mostro_settings = Settings::get_mostro();
-    let exp_hours = mostro_settings.expiration_hours as u64;
-    let expire_time = Timestamp::now() - (3600 * exp_hours);
+    let expire_time = Timestamp::now();
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE created_at < ?1 AND status == 'pending'
+          WHERE expires_at < ?1 AND status == 'pending'
         "#,
     )
     .bind(expire_time.to_string())

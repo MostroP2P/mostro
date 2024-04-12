@@ -10,6 +10,7 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Result};
+use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 const MAX_RETRY: u16 = 4;
+const MAX_EXPIRE_DAYS: i64 = 15;
 
 pub async fn retries_yadio_request(
     req_string: &str,
@@ -122,6 +124,21 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+pub fn get_expiration_date(expire: Option<i64>) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    // We calculate order expiration
+    let mut expires_at: i64 = Timestamp::now().as_i64();
+    if let Some(mut exp) = expire {
+        if exp > MAX_EXPIRE_DAYS {
+            exp = MAX_EXPIRE_DAYS
+        };
+        expires_at += Duration::days(exp).num_seconds();
+    } else {
+        expires_at += Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
+    }
+    expires_at
+}
+
 pub async fn publish_order(
     pool: &SqlitePool,
     keys: &Keys,
@@ -134,6 +151,10 @@ pub async fn publish_order(
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
     }
+
+    // Get expiration time of the order
+    let expiry_date = get_expiration_date(new_order.expires_at);
+
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -148,6 +169,7 @@ pub async fn publish_order(
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_i64(),
+        expires_at: expiry_date,
         ..Default::default()
     };
 
@@ -429,6 +451,7 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
+        None,
         None,
         None,
         None,

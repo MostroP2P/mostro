@@ -24,7 +24,7 @@ After a Mostro client receive this message, the user can rate the other party, t
     "pubkey": null,
     "action": "rate-user",
     "content": {
-      "RatingUser": 5 // User input
+      "rating_user": 5 // User input
     }
   }
 }
@@ -41,7 +41,9 @@ If Mostro received the correct message, it will send back a confirmation message
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
     "pubkey": null,
     "action": "rate-received",
-    "content": null
+    "content": {
+      "rating_user": 5
+    }
   }
 }
 ```

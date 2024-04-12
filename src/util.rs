@@ -10,6 +10,7 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Result};
+use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
@@ -122,6 +123,24 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+pub fn get_expiration_date(expire: Option<i64>) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    // We calculate order expiration
+    let expire_date: i64;
+    let expires_at_max: i64 = Timestamp::now().as_i64()
+        + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds();
+    if let Some(mut exp) = expire {
+        if exp > expires_at_max {
+            exp = expires_at_max;
+        };
+        expire_date = exp;
+    } else {
+        expire_date = Timestamp::now().as_i64()
+            + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
+    }
+    expire_date
+}
+
 pub async fn publish_order(
     pool: &SqlitePool,
     keys: &Keys,
@@ -134,6 +153,10 @@ pub async fn publish_order(
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
     }
+
+    // Get expiration time of the order
+    let expiry_date = get_expiration_date(new_order.expires_at);
+
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -148,6 +171,7 @@ pub async fn publish_order(
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_i64(),
+        expires_at: expiry_date,
         ..Default::default()
     };
 
@@ -429,6 +453,7 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
+        None,
         None,
         None,
         None,

@@ -136,6 +136,7 @@ pub async fn add_invoice_action(
             order.seller_pubkey.as_ref().cloned(),
             None,
             None,
+            None,
         );
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id

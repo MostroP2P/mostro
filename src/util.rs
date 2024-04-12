@@ -126,18 +126,19 @@ pub fn get_fee(amount: i64) -> i64 {
 pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     let mostro_settings = Settings::get_mostro();
     // We calculate order expiration
-    let mut expires_at: i64 = Timestamp::now().as_i64();
+    let expire_date: i64;
+    let expires_at_max: i64 = Timestamp::now().as_i64()
+        + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds();
     if let Some(mut exp) = expire {
-        if exp
-            > expires_at + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds()
-        {
-            exp = mostro_settings.max_expiration_days.into()
+        if exp > expires_at_max {
+            exp = expires_at_max;
         };
-        expires_at += exp;
+        expire_date = exp;
     } else {
-        expires_at += Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
+        expire_date = Timestamp::now().as_i64()
+            + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
     }
-    expires_at
+    expire_date
 }
 
 pub async fn publish_order(

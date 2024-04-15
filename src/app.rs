@@ -62,61 +62,165 @@ pub async fn run(
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
-                                            order_action(msg, &event, &my_keys, &pool).await?;
+                                            if let Err(e) =
+                                                order_action(msg, &event, &my_keys, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::TakeSell => {
-                                            take_sell_action(msg, &event, &my_keys, &pool).await?;
+                                            if let Err(e) =
+                                                take_sell_action(msg, &event, &my_keys, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::TakeBuy => {
-                                            take_buy_action(msg, &event, &my_keys, &pool).await?;
+                                            if let Err(e) =
+                                                take_buy_action(msg, &event, &my_keys, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::FiatSent => {
-                                            fiat_sent_action(msg, &event, &my_keys, &pool).await?;
+                                            if let Err(e) =
+                                                fiat_sent_action(msg, &event, &my_keys, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            };
                                         }
                                         Action::Release => {
-                                            release_action(msg, &event, &my_keys, &pool, ln_client)
-                                                .await?;
+                                            if let Err(e) = release_action(
+                                                msg, &event, &my_keys, &pool, ln_client,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::Cancel => {
-                                            cancel_action(msg, &event, &my_keys, &pool, ln_client)
-                                                .await?;
+                                            if let Err(e) = cancel_action(
+                                                msg, &event, &my_keys, &pool, ln_client,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::AddInvoice => {
-                                            add_invoice_action(msg, &event, &my_keys, &pool)
-                                                .await?;
+                                            if let Err(e) =
+                                                add_invoice_action(msg, &event, &my_keys, &pool)
+                                                    .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::PayInvoice => todo!(),
                                         Action::RateUser => {
-                                            update_user_reputation_action(
+                                            if let Err(e) = update_user_reputation_action(
                                                 msg,
                                                 &event,
                                                 &my_keys,
                                                 &pool,
                                                 rate_list.clone(),
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::Dispute => {
-                                            dispute_action(msg, &event, &my_keys, &pool).await?;
+                                            if let Err(e) =
+                                                dispute_action(msg, &event, &my_keys, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::AdminCancel => {
-                                            admin_cancel_action(
+                                            if let Err(e) = admin_cancel_action(
                                                 msg, &event, &my_keys, &pool, ln_client,
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::AdminSettle => {
-                                            admin_settle_action(
+                                            if let Err(e) = admin_settle_action(
                                                 msg, &event, &my_keys, &pool, ln_client,
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::AdminAddSolver => {
-                                            admin_add_solver_action(msg, &event, &my_keys, &pool)
-                                                .await?;
+                                            if let Err(e) = admin_add_solver_action(
+                                                msg, &event, &my_keys, &pool,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Action::AdminTakeDispute => {
-                                            admin_take_dispute_action(msg, &event, &pool).await?;
+                                            if let Err(e) =
+                                                admin_take_dispute_action(msg, &event, &pool).await
+                                            {
+                                                tracing::warn!(
+                                                    "Error in {} with context {}",
+                                                    action,
+                                                    e
+                                                );
+                                            }
                                         }
                                         _ => info!("Received message with action {:?}", action),
                                     }

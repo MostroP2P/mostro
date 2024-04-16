@@ -35,6 +35,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+fn warning_msg(action: &Action, e: anyhow::Error) {
+    tracing::warn!("Error in {} with context {}", action, e);
+}
+
 pub async fn run(
     my_keys: Keys,
     client: &Client,
@@ -49,7 +53,10 @@ pub async fn run(
             if let RelayPoolNotification::Event { event, .. } = notification {
                 if let Kind::EncryptedDirectMessage = event.kind {
                     // We validates if the event is correctly signed
-                    event.verify()?;
+                    if event.verify().is_err() {
+                        tracing::warn!("Error in event verification")
+                    };
+
                     let message = nip04::decrypt(
                         my_keys.secret_key().unwrap(),
                         &event.pubkey,
@@ -65,45 +72,29 @@ pub async fn run(
                                             if let Err(e) =
                                                 order_action(msg, &event, &my_keys, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::TakeSell => {
                                             if let Err(e) =
                                                 take_sell_action(msg, &event, &my_keys, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::TakeBuy => {
                                             if let Err(e) =
                                                 take_buy_action(msg, &event, &my_keys, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::FiatSent => {
                                             if let Err(e) =
                                                 fiat_sent_action(msg, &event, &my_keys, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
-                                            };
+                                                warning_msg(&action, e)
+                                            }
                                         }
                                         Action::Release => {
                                             if let Err(e) = release_action(
@@ -111,11 +102,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::Cancel => {
@@ -124,11 +111,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::AddInvoice => {
@@ -136,11 +119,7 @@ pub async fn run(
                                                 add_invoice_action(msg, &event, &my_keys, &pool)
                                                     .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::PayInvoice => todo!(),
@@ -154,22 +133,14 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::Dispute => {
                                             if let Err(e) =
                                                 dispute_action(msg, &event, &my_keys, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::AdminCancel => {
@@ -178,11 +149,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::AdminSettle => {
@@ -191,11 +158,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::AdminAddSolver => {
@@ -204,22 +167,14 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         Action::AdminTakeDispute => {
                                             if let Err(e) =
                                                 admin_take_dispute_action(msg, &event, &pool).await
                                             {
-                                                tracing::warn!(
-                                                    "Error in {} with context {}",
-                                                    action,
-                                                    e
-                                                );
+                                                warning_msg(&action, e)
                                             }
                                         }
                                         _ => info!("Received message with action {:?}", action),

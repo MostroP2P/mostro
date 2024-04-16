@@ -118,8 +118,14 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     }
-    let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = PublicKey::from_str(&seller_pubkey)?;
+
+    let seller_pubkey = PublicKey::from_str(
+        order
+            .seller_pubkey
+            .as_ref()
+            .expect("Wrong seller pubkey")
+            .as_str(),
+    )?;
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

@@ -51,7 +51,7 @@ pub async fn run(
                     // We validates if the event is correctly signed
                     event.verify()?;
                     let message = nip04::decrypt(
-                        my_keys.secret_key().unwrap(),
+                        my_keys.secret_key()?,
                         &event.pubkey,
                         &event.content,
                     );

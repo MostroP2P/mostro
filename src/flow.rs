@@ -1,4 +1,5 @@
 use crate::util::send_new_order_msg;
+use anyhow::{Result,Error};
 use mostro_core::message::{Action, Content};
 use mostro_core::order::{Kind, SmallOrder, Status};
 use nostr_sdk::prelude::*;
@@ -6,25 +7,18 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::{error, info};
 
-pub async fn hold_invoice_paid(hash: &str) {
-    let pool = crate::db::connect().await.unwrap();
-    let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
-    let my_keys = crate::util::get_keys().unwrap();
-    let seller_pubkey = match PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Order Id {} wrong seller pubkey: {:?}", order.id, e);
-            return;
-        }
-    };
-    let buyer_pubkey = match PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Order Id {} wrong buyer pubkey: {:?}", order.id, e);
-            return;
-        }
-    };
+pub async fn hold_invoice_paid(hash: &str) -> Result<()>{
+    let pool = crate::db::connect().await?;
+    let order = crate::db::find_order_by_hash(&pool, hash).await?;
+    let my_keys = crate::util::get_keys()?;
 
+    let (seller_pubkey, buyer_pubkey) = match (order.seller_pubkey, order.buyer_pubkey) {
+            (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, PublicKey::from_str(buyer.as_str())?),
+            (None, _) => return Err(Error::msg("Missing seller pubkey")),
+            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+            _ => return Err(Error::msg("Missing pubkeys")),
+    };
+    
     info!(
         "Order Id: {} - Seller paid invoice with hash: {hash}",
         order.id
@@ -34,7 +28,7 @@ pub async fn hold_invoice_paid(hash: &str) {
         Ok(k) => k,
         Err(e) => {
             error!("Order Id {} wrong kind: {:?}", order.id, e);
-            return;
+            return Err(e.into());
         }
     };
 
@@ -109,24 +103,28 @@ pub async fn hold_invoice_paid(hash: &str) {
 
     // Update the invoice_held_at field
     crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_i64())
-        .await
-        .unwrap();
+        .await?;
+        
+
+    Ok(())
 }
 
-pub async fn hold_invoice_settlement(hash: &str) {
-    let pool = crate::db::connect().await.unwrap();
-    let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
+pub async fn hold_invoice_settlement(hash: &str) -> Result<()>{
+    let pool = crate::db::connect().await?;
+    let order = crate::db::find_order_by_hash(&pool, hash).await?;
     info!(
         "Order Id: {} - Invoice with hash: {} was settled!",
         order.id, hash
     );
+    Ok(())
 }
 
-pub async fn hold_invoice_canceled(hash: &str) {
-    let pool = crate::db::connect().await.unwrap();
-    let order = crate::db::find_order_by_hash(&pool, hash).await.unwrap();
+pub async fn hold_invoice_canceled(hash: &str) -> Result<()> {
+    let pool = crate::db::connect().await?;
+    let order = crate::db::find_order_by_hash(&pool, hash).await?;
     info!(
         "Order Id: {} - Invoice with hash: {} was canceled!",
         order.id, hash
     );
+    Ok(())
 }

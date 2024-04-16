@@ -85,21 +85,24 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
-    let seller_pubkey = match PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing seller pubkey: {:#?}", e);
-            return Ok(());
-        }
-    };
+
+    
+
+    let seller_pubkey = PublicKey::from_str(
+        order
+            .seller_pubkey
+            .as_ref()
+            .expect("Wrong seller pubkey")
+            .as_str(),
+    )?;
     send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = match PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing buyer pubkey: {:#?}", e);
-            return Ok(());
-        }
-    };
+    let buyer_pubkey = PublicKey::from_str(
+        order
+            .buyer_pubkey
+            .as_ref()
+            .expect("Wrong buyer pubkey")
+            .as_str(),
+    )?;
     send_dm(&buyer_pubkey, message).await?;
 
     Ok(())

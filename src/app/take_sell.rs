@@ -4,7 +4,7 @@ use crate::util::{
     show_hold_invoice, update_order_event,
 };
 
-use anyhow::Result;
+use anyhow::{Result,Error};
 use mostro_core::message::Message;
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
@@ -44,13 +44,13 @@ pub async fn take_sell_action(
         return Ok(());
     }
     let buyer_pubkey = event.pubkey;
-    let seller_pubkey = match order.seller_pubkey.as_ref() {
-        Some(pk) => PublicKey::from_str(pk)?,
-        None => {
-            error!("Seller pubkey not found for order {}!", order.id);
-            return Ok(());
-        }
+
+    let seller_pubkey = match &order.seller_pubkey {
+        Some(seller) => PublicKey::from_str(seller.as_str())?,
+        _ => return Err(Error::msg("Missing seller pubkeys")),
     };
+
+
     let mut pr: Option<String> = None;
     // If a buyer sent me a lightning invoice we look on db an order with
     // that order id and save the buyer pubkey and invoice fields

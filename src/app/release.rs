@@ -7,7 +7,7 @@ use crate::util::{
     update_order_event,
 };
 
-use anyhow::Result;
+use anyhow::{Result,Error};
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -105,13 +105,10 @@ pub async fn release_action(
     .await;
 
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = PublicKey::from_str(
-        order
-            .buyer_pubkey
-            .as_ref()
-            .expect("Wrong buyer pubkey")
-            .as_str(),
-    )?;
+    let buyer_pubkey = match &order.buyer_pubkey {
+        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
+        _ => return Err(Error::msg("Missing buyer pubkeys")),
+    };
     send_new_order_msg(Some(order_id), Action::Released, None, &buyer_pubkey).await;
 
     let _ = do_payment(order_updated).await;
@@ -121,11 +118,11 @@ pub async fn release_action(
 
 pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
-    let payment_request = order
-        .buyer_invoice
-        .as_ref()
-        .expect("Wrong payment request invoice")
-        .to_string();
+    let payment_request = match order.buyer_invoice.as_ref() {
+        Some(req) => req.to_string(),
+        _ => return Err(Error::msg("Missing payment request")),
+    };
+
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
     let payment_request = if let Ok(addr) = ln_addr {

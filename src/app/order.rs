@@ -50,10 +50,12 @@ pub async fn order_action(
             return Ok(());
         }
 
-        if quote > mostro_settings.max_order_amount as i64 {
+        if quote > mostro_settings.max_order_amount as i64
+            || quote < mostro_settings.min_payment_amount as i64
+        {
             let msg = format!(
-                "Quote too high, max is {}",
-                mostro_settings.max_order_amount
+                "Quote is out of sats boundaries min is {} max is {}",
+                mostro_settings.min_payment_amount, mostro_settings.max_order_amount
             );
             send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
             return Ok(());

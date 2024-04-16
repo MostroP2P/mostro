@@ -154,7 +154,13 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that rated
-        send_new_order_msg(Some(order.id), Action::RateReceived, Some(Content::RatingUser(rating)), &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::RateReceived,
+            Some(Content::RatingUser(rating)),
+            &event.pubkey,
+        )
+        .await;
     }
 
     Ok(())

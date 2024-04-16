@@ -92,8 +92,6 @@ pub async fn release_action(
 
     settle_seller_hold_invoice(event, my_keys, ln_client, Action::Released, false, &order).await?;
 
-    let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
-
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
@@ -105,9 +103,17 @@ pub async fn release_action(
         &seller_pubkey,
     )
     .await;
+
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey)?;
+    let buyer_pubkey = PublicKey::from_str(
+        order
+            .buyer_pubkey
+            .as_ref()
+            .expect("Wrong buyer pubkey")
+            .as_str(),
+    )?;
     send_new_order_msg(Some(order_id), Action::Released, None, &buyer_pubkey).await;
+
     let _ = do_payment(order_updated).await;
 
     Ok(())
@@ -115,7 +121,11 @@ pub async fn release_action(
 
 pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
-    let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
+    let payment_request = order
+        .buyer_invoice
+        .as_ref()
+        .expect("Wrong payment request invoice")
+        .to_string();
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
     let payment_request = if let Ok(addr) = ln_addr {
@@ -137,12 +147,25 @@ pub async fn do_payment(order: Order) -> Result<()> {
         }
     }
 
+    let my_keys = get_keys()?;
+    let buyer_pubkey = PublicKey::from_str(
+        order
+            .buyer_pubkey
+            .as_ref()
+            .expect("Wrong buyer pubkey")
+            .as_str(),
+    )?;
+    let seller_pubkey = PublicKey::from_str(
+        order
+            .seller_pubkey
+            .as_ref()
+            .expect("Wrong seller pubkey")
+            .as_str(),
+    )?;
+
     let payment = {
         async move {
             // We redeclare vars to use inside this block
-            let my_keys = get_keys().unwrap();
-            let buyer_pubkey = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
-            let seller_pubkey = PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {

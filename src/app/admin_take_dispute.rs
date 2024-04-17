@@ -12,7 +12,7 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tracing::info;
 
-pub async fn npub_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
+pub async fn pubkey_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
         if ev_pubkey.to_string() == my_keys.public_key().to_string() {
@@ -36,7 +36,7 @@ pub async fn admin_take_dispute_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Check if the pubkey is a solver or admin
-    if !npub_event_can_solve(pool, &event.pubkey).await {
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
         // We create a Message
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());

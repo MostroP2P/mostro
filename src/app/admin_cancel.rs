@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use super::admin_take_dispute::npub_event_can_solve;
-use crate::db::find_dispute_by_order_id;
+use super::admin_take_dispute::pubkey_event_can_solve;
+use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
@@ -24,13 +24,32 @@ pub async fn admin_cancel_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     // Check if the pubkey is a solver or admin
-    if !npub_event_can_solve(pool, &event.pubkey).await {
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
         // We create a Message
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
 
     let order_id = msg.get_inner_message_kind().id.unwrap();
+
+    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+        Ok(false) => {
+            send_cant_do_msg(
+                None,
+                Some("Dispute not taken by you".to_string()),
+                &event.pubkey,
+            )
+            .await;
+
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Error checking if solver is assigned to order: {:?}", e);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {

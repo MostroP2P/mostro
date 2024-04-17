@@ -19,7 +19,6 @@ pub async fn add_invoice_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
-    // Safe unwrap as we verified the message
     let mut order = if let Some(order_id) = order_msg.id {
         match Order::by_id(pool, order_id).await? {
             Some(order) => order,

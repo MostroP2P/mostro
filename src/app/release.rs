@@ -90,7 +90,7 @@ pub async fn release_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, my_keys, ln_client, Action::Released, false, &order).await?;
+    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 

@@ -68,15 +68,7 @@ pub async fn admin_settle_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(
-        event,
-        my_keys,
-        ln_client,
-        Action::AdminSettled,
-        true,
-        &order,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order).await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 

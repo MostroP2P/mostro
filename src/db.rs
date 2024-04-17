@@ -281,7 +281,7 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>
     Ok(order)
 }
 
-pub async fn find_solver_npub(pool: &SqlitePool, solver_npub: String) -> anyhow::Result<User> {
+pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyhow::Result<User> {
     let user = sqlx::query_as::<_, User>(
         r#"
           SELECT *

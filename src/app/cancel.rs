@@ -1,7 +1,7 @@
 use crate::db::{edit_buyer_pubkey_order, edit_seller_pubkey_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind as OrderKind, Order, Status};
 use nostr_sdk::prelude::*;
@@ -66,8 +66,13 @@ pub async fn cancel_action(
         || order.status == Status::Dispute.to_string()
     {
         let user_pubkey = event.pubkey.to_string();
-        let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-        let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
+
+        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+            (Some(seller), Some(buyer)) => (seller, buyer),
+            (None, _) => return Err(Error::msg("Missing seller pubkey")),
+            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        };
+
         let counterparty_pubkey: String;
         if buyer_pubkey == &user_pubkey {
             order.buyer_cooperativecancel = true;
@@ -156,15 +161,13 @@ pub async fn cancel_add_invoice(
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
     let user_pubkey = event.pubkey.to_string();
-    let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = match PublicKey::from_str(&seller_pubkey) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing seller pubkey: {:#?}", e);
-            return Ok(());
-        }
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
+
     if buyer_pubkey != &user_pubkey {
         // We create a Message
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;

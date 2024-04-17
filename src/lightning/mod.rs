@@ -158,7 +158,7 @@ impl LndConnector {
         amount: i64,
         listener: Sender<PaymentMessage>,
     ) -> Result<(), MostroError> {
-        let invoice = decode_invoice(payment_request).unwrap();
+        let invoice = decode_invoice(payment_request)?;
         let payment_hash = invoice.payment_hash();
         let payment_hash = payment_hash.to_byte_array();
         let hash = bytes_to_string(&payment_hash);

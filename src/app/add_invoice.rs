@@ -1,7 +1,7 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, update_order_event};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::SmallOrder;
@@ -20,19 +20,19 @@ pub async fn add_invoice_action(
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
     // Safe unwrap as we verified the message
-    let order_id = order_msg.id.unwrap();
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
+    let mut order = if let Some(order_id) = order_msg.id {
+        match Order::by_id(pool, order_id).await? {
+            Some(order) => order,
+            None => return Err(Error::msg("Order Id {order_id} not found!")),
         }
+    } else {
+        return Err(Error::msg("Missing message Id"));
     };
 
     let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
-            error!("Order Id {order_id} wrong status: {e:?}");
+            error!("Order Id {} wrong status: {e:?}", order.id);
             return Ok(());
         }
     };
@@ -40,7 +40,7 @@ pub async fn add_invoice_action(
     let order_kind = match Kind::from_str(&order.kind) {
         Ok(k) => k,
         Err(e) => {
-            error!("Order Id {order_id} wrong kind: {e:?}");
+            error!("Order Id {} wrong kind: {e:?}", order.id);
             return Ok(());
         }
     };
@@ -55,7 +55,7 @@ pub async fn add_invoice_action(
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
         send_cant_do_msg(
-            Some(order_id),
+            Some(order.id),
             Some("Not allowed".to_string()),
             &event.pubkey,
         )
@@ -78,13 +78,13 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(e) => {
-                    send_cant_do_msg(Some(order_id), Some(e.to_string()), &event.pubkey).await;
+                    send_cant_do_msg(Some(order.id), Some(e.to_string()), &event.pubkey).await;
                     return Ok(());
                 }
             }
         };
     } else {
-        error!("Order Id {order_id} wrong get_payment_request");
+        error!("Order Id {} wrong get_payment_request", order.id);
         return Ok(());
     }
     // We save the invoice on db
@@ -94,12 +94,13 @@ pub async fn add_invoice_action(
         Status::WaitingBuyerInvoice => {}
         Status::SettledHoldInvoice => {
             order.payment_attempts = 0;
-            order.update(pool).await?;
+            order.clone().update(pool).await?;
             send_new_order_msg(
-                Some(order_id),
+                Some(order.id),
                 Action::AddInvoice,
                 Some(Content::TextMessage(format!(
-                    "Order Id {order_id}: Invoice updated!"
+                    "Order Id {}: Invoice updated!",
+                    order.id
                 ))),
                 &buyer_pubkey,
             )
@@ -108,9 +109,11 @@ pub async fn add_invoice_action(
         }
         _ => {
             send_cant_do_msg(
-                Some(order_id),
+                Some(order.id),
                 Some(format!(
-                    "You are not allowed to add an invoice because order Id {order_id} status is {}", order_status.to_string()
+                    "You are not allowed to add an invoice because order Id {} status is {}",
+                    order_status.to_string(),
+                    order.id
                 )),
                 &buyer_pubkey,
             )
@@ -118,8 +121,11 @@ pub async fn add_invoice_action(
             return Ok(());
         }
     }
-    let seller_pubkey = order.seller_pubkey.as_ref().cloned().unwrap();
-    let seller_pubkey = PublicKey::from_str(&seller_pubkey)?;
+
+    let seller_pubkey = match &order.seller_pubkey {
+        Some(seller) => PublicKey::from_str(seller.as_str())?,
+        _ => return Err(Error::msg("Missing pubkeys")),
+    };
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

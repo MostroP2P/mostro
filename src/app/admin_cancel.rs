@@ -7,7 +7,7 @@ use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -51,9 +51,10 @@ pub async fn admin_cancel_action(
 
     if order.hash.is_some() {
         // We return funds to seller
-        let hash = order.hash.as_ref().unwrap();
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
+        if let Some(hash) = order.hash.as_ref() {
+            ln_client.cancel_hold_invoice(hash).await?;
+            info!("Order Id {}: Funds returned to seller", &order.id);
+        }
     }
 
     // we check if there is a dispute
@@ -85,21 +86,17 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
-    let seller_pubkey = match PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing seller pubkey: {:#?}", e);
-            return Ok(());
-        }
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
+
     send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = match PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing buyer pubkey: {:#?}", e);
-            return Ok(());
-        }
-    };
     send_dm(&buyer_pubkey, message).await?;
 
     Ok(())

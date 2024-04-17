@@ -100,11 +100,15 @@ pub async fn get_market_quote(
         return Err(MostroError::NoCurrency);
     }
 
+    if req.0.is_none() {
+        return Err(MostroError::MalformedAPIRes);
+    }
+
     let quote = req.0.unwrap().json::<Yadio>().await;
     if quote.is_err() {
         return Err(MostroError::MalformedAPIRes);
     }
-    let quote = quote.unwrap();
+    let quote = quote?;
 
     let mut sats = quote.result * 100_000_000_f64;
 
@@ -406,14 +410,21 @@ pub async fn show_hold_invoice(
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    flow::hold_invoice_paid(&hash).await;
-                    info!("Invoice with hash {hash} accepted!");
+                    if let Err(e) = flow::hold_invoice_paid(&hash).await {
+                        info!("Invoice flow error {e}");
+                    } else {
+                        info!("Invoice with hash {hash} accepted!");
+                    }
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    flow::hold_invoice_settlement(&hash).await;
+                    if let Err(e) = flow::hold_invoice_settlement(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    flow::hold_invoice_canceled(&hash).await;
+                    if let Err(e) = flow::hold_invoice_canceled(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
                 }

@@ -23,7 +23,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     let mut order = order.clone();
 
     // Handle to db here
-    let pool = db::connect().await.unwrap();
+    let pool = db::connect().await?;
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -167,7 +167,9 @@ pub async fn do_payment(order: Order) -> Result<()> {
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys).await;
+                            let _ =
+                                payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys)
+                                    .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -198,7 +200,7 @@ async fn payment_success(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
-) {
+) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(
         Some(order.id),
@@ -213,12 +215,11 @@ async fn payment_success(
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let pool = db::connect().await.unwrap();
+        let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process
-            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success)
-                .await
-                .unwrap();
+            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success).await?;
         }
     }
+    Ok(())
 }

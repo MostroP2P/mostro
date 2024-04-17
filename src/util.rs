@@ -100,11 +100,15 @@ pub async fn get_market_quote(
         return Err(MostroError::NoCurrency);
     }
 
+    if req.0.is_none() {
+        return Err(MostroError::MalformedAPIRes);
+    }
+
     let quote = req.0.unwrap().json::<Yadio>().await;
     if quote.is_err() {
         return Err(MostroError::MalformedAPIRes);
     }
-    let quote = quote.unwrap();
+    let quote = quote?;
 
     let mut sats = quote.result * 100_000_000_f64;
 

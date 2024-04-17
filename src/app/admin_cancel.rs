@@ -51,9 +51,10 @@ pub async fn admin_cancel_action(
 
     if order.hash.is_some() {
         // We return funds to seller
-        let hash = order.hash.as_ref().unwrap();
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
+        if let Some(hash) = order.hash.as_ref() {
+            ln_client.cancel_hold_invoice(hash).await?;
+            info!("Order Id {}: Funds returned to seller", &order.id);
+        }
     }
 
     // we check if there is a dispute

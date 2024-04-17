@@ -1,4 +1,4 @@
-use crate::db::find_dispute_by_order_id;
+use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, settle_seller_hold_invoice, update_order_event};
@@ -14,7 +14,7 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::error;
 
-use super::admin_take_dispute::npub_event_can_solve;
+use super::admin_take_dispute::pubkey_event_can_solve;
 use super::release::do_payment;
 
 pub async fn admin_settle_action(
@@ -25,12 +25,31 @@ pub async fn admin_settle_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     // Check if the pubkey is a solver or admin
-    if !npub_event_can_solve(pool, &event.pubkey).await {
-        // We create a Message
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+
         return Ok(());
     }
     let order_id = msg.get_inner_message_kind().id.unwrap();
+
+    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+        Ok(false) => {
+            send_cant_do_msg(
+                None,
+                Some("Dispute not taken by you".to_string()),
+                &event.pubkey,
+            )
+            .await;
+
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Error checking if solver is assigned to order: {:?}", e);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {

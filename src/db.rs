@@ -5,6 +5,8 @@ use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
+use sqlx::sqlite::SqliteRow;
+use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -292,4 +294,23 @@ pub async fn find_solver_npub(pool: &SqlitePool, solver_npub: String) -> anyhow:
     .await?;
 
     Ok(user)
+}
+
+pub async fn is_assigned_solver(
+    pool: &SqlitePool,
+    solver_pubkey: &str,
+    order_id: Uuid,
+) -> anyhow::Result<bool> {
+    println!("solver_pubkey: {}", solver_pubkey);
+    println!("order_id: {}", order_id);
+    let result = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM disputes WHERE solver_pubkey = ? AND order_id = ?)",
+    )
+    .bind(solver_pubkey)
+    .bind(order_id)
+    .map(|row: SqliteRow| row.get(0))
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
 }

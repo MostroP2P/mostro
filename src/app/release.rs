@@ -7,7 +7,7 @@ use crate::util::{
     update_order_event,
 };
 
-use anyhow::{Result,Error};
+use anyhow::{Error, Result};
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -145,20 +145,15 @@ pub async fn do_payment(order: Order) -> Result<()> {
     }
 
     let my_keys = get_keys()?;
-    let buyer_pubkey = PublicKey::from_str(
-        order
-            .buyer_pubkey
-            .as_ref()
-            .expect("Wrong buyer pubkey")
-            .as_str(),
-    )?;
-    let seller_pubkey = PublicKey::from_str(
-        order
-            .seller_pubkey
-            .as_ref()
-            .expect("Wrong seller pubkey")
-            .as_str(),
-    )?;
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
 
     let payment = {
         async move {

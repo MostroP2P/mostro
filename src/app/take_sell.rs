@@ -4,7 +4,7 @@ use crate::util::{
     show_hold_invoice, update_order_event,
 };
 
-use anyhow::{Result,Error};
+use anyhow::{Error, Result};
 use mostro_core::message::Message;
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
@@ -49,7 +49,6 @@ pub async fn take_sell_action(
         Some(seller) => PublicKey::from_str(seller.as_str())?,
         _ => return Err(Error::msg("Missing seller pubkeys")),
     };
-
 
     let mut pr: Option<String> = None;
     // If a buyer sent me a lightning invoice we look on db an order with

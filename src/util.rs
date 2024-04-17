@@ -406,14 +406,21 @@ pub async fn show_hold_invoice(
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    flow::hold_invoice_paid(&hash).await;
-                    info!("Invoice with hash {hash} accepted!");
+                    if let Err(e) = flow::hold_invoice_paid(&hash).await {
+                        info!("Invoice flow error {e}");
+                    } else {
+                        info!("Invoice with hash {hash} accepted!");
+                    }
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    flow::hold_invoice_settlement(&hash).await;
+                    if let Err(e) = flow::hold_invoice_settlement(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    flow::hold_invoice_canceled(&hash).await;
+                    if let Err(e) = flow::hold_invoice_canceled(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
                 }

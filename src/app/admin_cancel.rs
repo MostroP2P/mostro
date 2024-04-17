@@ -7,7 +7,7 @@ use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -86,23 +86,16 @@ pub async fn admin_cancel_action(
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
 
-    
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
 
-    let seller_pubkey = PublicKey::from_str(
-        order
-            .seller_pubkey
-            .as_ref()
-            .expect("Wrong seller pubkey")
-            .as_str(),
-    )?;
     send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = PublicKey::from_str(
-        order
-            .buyer_pubkey
-            .as_ref()
-            .expect("Wrong buyer pubkey")
-            .as_str(),
-    )?;
     send_dm(&buyer_pubkey, message).await?;
 
     Ok(())

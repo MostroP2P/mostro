@@ -57,11 +57,8 @@ pub async fn run(
                         tracing::warn!("Error in event verification")
                     };
 
-                    let message = nip04::decrypt(
-                        my_keys.secret_key()?,
-                        &event.pubkey,
-                        &event.content,
-                    );
+                    let message =
+                        nip04::decrypt(my_keys.secret_key()?, &event.pubkey, &event.content);
                     if let Ok(m) = message {
                         let message = Message::from_json(&m);
                         if let Ok(msg) = message {

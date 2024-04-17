@@ -501,20 +501,13 @@ pub async fn rate_counterpart(
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
     event: &Event,
-    my_keys: &Keys,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
     order: &Order,
 ) -> Result<()> {
-    // It can be settle only by a seller or by admin
-    let pubkey = if is_admin {
-        my_keys.public_key().to_string()
-    } else {
-        order.seller_pubkey.as_ref().unwrap().to_string()
-    };
     // Check if the pubkey is right
-    if event.pubkey.to_string() != pubkey {
+    if !is_admin && event.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }

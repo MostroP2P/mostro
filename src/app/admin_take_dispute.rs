@@ -1,4 +1,4 @@
-use crate::db::find_solver_npub;
+use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm};
 use crate::NOSTR_CLIENT;
@@ -21,7 +21,7 @@ pub async fn pubkey_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) 
     }
 
     // Is a solver taking a dispute
-    if let Ok(solver) = find_solver_npub(pool, ev_pubkey.to_string()).await {
+    if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
         if solver.is_solver != 0_i64 {
             return true;
         }

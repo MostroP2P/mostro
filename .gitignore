@@ -14,3 +14,4 @@ settings.dev.toml
 settings.prod.toml
 
 book/book/
+bin/

@@ -9,7 +9,7 @@ use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
@@ -509,17 +509,17 @@ pub async fn settle_seller_hold_invoice(
     // Check if the pubkey is right
     if !is_admin && event.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
-        return Ok(());
-    }
-    if order.preimage.is_none() {
-        return Ok(());
+        return Err(Error::msg("Not allowed"));
     }
 
     // Settling the hold invoice
-    let preimage = order.preimage.as_ref().unwrap();
-    ln_client.settle_hold_invoice(preimage).await?;
-    info!("{action}: Order Id {}: hold invoice settled", order.id);
-
+    if let Some(preimage) = order.preimage.as_ref() {
+        ln_client.settle_hold_invoice(preimage).await?;
+        info!("{action}: Order Id {}: hold invoice settled", order.id);
+    } else {
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        return Err(Error::msg("No preimage"));
+    }
     Ok(())
 }
 

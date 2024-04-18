@@ -57,7 +57,6 @@ pub async fn run(
                         tracing::warn!("Error in event verification")
                     };
 
-
                     let message =
                         nip04::decrypt(my_keys.secret_key()?, &event.pubkey, &event.content);
 

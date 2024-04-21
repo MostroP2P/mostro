@@ -1,13 +1,13 @@
 use std::str::FromStr;
 
-use super::admin_take_dispute::npub_event_can_solve;
-use crate::db::find_dispute_by_order_id;
+use super::admin_take_dispute::pubkey_event_can_solve;
+use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -24,13 +24,36 @@ pub async fn admin_cancel_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     // Check if the pubkey is a solver or admin
-    if !npub_event_can_solve(pool, &event.pubkey).await {
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
         // We create a Message
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
 
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
+    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+        Ok(false) => {
+            send_cant_do_msg(
+                None,
+                Some("Dispute not taken by you".to_string()),
+                &event.pubkey,
+            )
+            .await;
+
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Error checking if solver is assigned to order: {:?}", e);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -51,9 +74,10 @@ pub async fn admin_cancel_action(
 
     if order.hash.is_some() {
         // We return funds to seller
-        let hash = order.hash.as_ref().unwrap();
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
+        if let Some(hash) = order.hash.as_ref() {
+            ln_client.cancel_hold_invoice(hash).await?;
+            info!("Order Id {}: Funds returned to seller", &order.id);
+        }
     }
 
     // we check if there is a dispute
@@ -85,21 +109,17 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
-    let seller_pubkey = match PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing seller pubkey: {:#?}", e);
-            return Ok(());
-        }
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
+
     send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = match PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing buyer pubkey: {:#?}", e);
-            return Ok(());
-        }
-    };
     send_dm(&buyer_pubkey, message).await?;
 
     Ok(())

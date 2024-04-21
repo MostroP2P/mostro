@@ -2,11 +2,11 @@
 echo "Clean project"
 if ls Cargo.lock 1> /dev/null 2>&1; then
     echo "Deleting Cargo.lock"
-    rm -rf ./Cargo.lock
+    rm ./Cargo.lock
 fi
 if ls sqlx-data.json 1> /dev/null 2>&1; then
     echo "Deleting old sqlx-data.json"
-    rm -rf ./sqlx-data.json
+    rm ./sqlx-data.json
 fi
 
 cargo clean

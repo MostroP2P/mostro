@@ -1,10 +1,10 @@
-use crate::db::find_dispute_by_order_id;
+use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, settle_seller_hold_invoice, update_order_event};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -14,7 +14,7 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::error;
 
-use super::admin_take_dispute::npub_event_can_solve;
+use super::admin_take_dispute::pubkey_event_can_solve;
 use super::release::do_payment;
 
 pub async fn admin_settle_action(
@@ -25,12 +25,36 @@ pub async fn admin_settle_action(
     ln_client: &mut LndConnector,
 ) -> Result<()> {
     // Check if the pubkey is a solver or admin
-    if !npub_event_can_solve(pool, &event.pubkey).await {
-        // We create a Message
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+
         return Ok(());
     }
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
+    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+        Ok(false) => {
+            send_cant_do_msg(
+                None,
+                Some("Dispute not taken by you".to_string()),
+                &event.pubkey,
+            )
+            .await;
+
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Error checking if solver is assigned to order: {:?}", e);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -49,15 +73,7 @@ pub async fn admin_settle_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(
-        event,
-        my_keys,
-        ln_client,
-        Action::AdminSettled,
-        true,
-        &order,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order).await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
@@ -85,12 +101,12 @@ pub async fn admin_settle_action(
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;
-    let seller_pubkey = order_updated.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = PublicKey::from_str(seller_pubkey).unwrap();
-    send_dm(&seller_pubkey, message.clone()).await?;
-    let buyer_pubkey = order_updated.buyer_pubkey.as_ref().unwrap();
-    let buyer_pubkey = PublicKey::from_str(buyer_pubkey).unwrap();
-    send_dm(&buyer_pubkey, message).await?;
+    if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
+        send_dm(&PublicKey::from_str(seller_pubkey)?, message.clone()).await?;
+    }
+    if let Some(ref buyer_pubkey) = order_updated.buyer_pubkey {
+        send_dm(&PublicKey::from_str(buyer_pubkey)?, message.clone()).await?;
+    }
 
     let _ = do_payment(order_updated).await;
 

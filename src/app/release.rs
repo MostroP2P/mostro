@@ -7,7 +7,7 @@ use crate::util::{
     update_order_event,
 };
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -23,7 +23,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     let mut order = order.clone();
 
     // Handle to db here
-    let pool = db::connect().await.unwrap();
+    let pool = db::connect().await?;
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -38,9 +38,13 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts += 1;
     }
     let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
-    let buyer_key = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
 
-    send_cant_do_msg(Some(order.id), Some(msg), &buyer_key).await;
+    let buyer_pubkey = match &order.buyer_pubkey {
+        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
+        None => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
+    send_cant_do_msg(Some(order.id), Some(msg), &buyer_pubkey).await;
 
     // Update order
     let result = order.update(&pool).await?;
@@ -54,7 +58,13 @@ pub async fn release_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    // Check if order id is ok
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -71,7 +81,12 @@ pub async fn release_action(
     };
     let seller_pubkey = event.pubkey;
 
-    let current_status = Status::from_str(&order.status).unwrap();
+    let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
+        current_status
+    } else {
+        return Err(Error::msg("Wrong order status"));
+    };
+
     if current_status != Status::Active
         && current_status != Status::FiatSent
         && current_status != Status::Dispute
@@ -90,9 +105,7 @@ pub async fn release_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, my_keys, ln_client, Action::Released, false, &order).await?;
-
-    let buyer_pubkey = order.buyer_pubkey.clone().unwrap();
+    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
@@ -105,9 +118,14 @@ pub async fn release_action(
         &seller_pubkey,
     )
     .await;
+
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = PublicKey::from_str(&buyer_pubkey)?;
+    let buyer_pubkey = match &order.buyer_pubkey {
+        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
+        _ => return Err(Error::msg("Missing buyer pubkeys")),
+    };
     send_new_order_msg(Some(order_id), Action::Released, None, &buyer_pubkey).await;
+
     let _ = do_payment(order_updated).await;
 
     Ok(())
@@ -115,7 +133,11 @@ pub async fn release_action(
 
 pub async fn do_payment(order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
-    let payment_request = order.buyer_invoice.as_ref().unwrap().to_string();
+    let payment_request = match order.buyer_invoice.as_ref() {
+        Some(req) => req.to_string(),
+        _ => return Err(Error::msg("Missing payment request")),
+    };
+
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
     let payment_request = if let Ok(addr) = ln_addr {
@@ -137,12 +159,20 @@ pub async fn do_payment(order: Order) -> Result<()> {
         }
     }
 
+    let my_keys = get_keys()?;
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
     let payment = {
         async move {
             // We redeclare vars to use inside this block
-            let my_keys = get_keys().unwrap();
-            let buyer_pubkey = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
-            let seller_pubkey = PublicKey::from_str(order.seller_pubkey.as_ref().unwrap()).unwrap();
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
                 if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
@@ -152,7 +182,9 @@ pub async fn do_payment(order: Order) -> Result<()> {
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys).await;
+                            let _ =
+                                payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys)
+                                    .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -183,7 +215,7 @@ async fn payment_success(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
-) {
+) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(
         Some(order.id),
@@ -198,12 +230,11 @@ async fn payment_success(
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let pool = db::connect().await.unwrap();
+        let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process
-            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success)
-                .await
-                .unwrap();
+            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success).await?;
         }
     }
+    Ok(())
 }

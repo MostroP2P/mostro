@@ -9,7 +9,8 @@ use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
+use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::*;
@@ -99,11 +100,15 @@ pub async fn get_market_quote(
         return Err(MostroError::NoCurrency);
     }
 
+    if req.0.is_none() {
+        return Err(MostroError::MalformedAPIRes);
+    }
+
     let quote = req.0.unwrap().json::<Yadio>().await;
     if quote.is_err() {
         return Err(MostroError::MalformedAPIRes);
     }
-    let quote = quote.unwrap();
+    let quote = quote?;
 
     let mut sats = quote.result * 100_000_000_f64;
 
@@ -122,6 +127,24 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+pub fn get_expiration_date(expire: Option<i64>) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    // We calculate order expiration
+    let expire_date: i64;
+    let expires_at_max: i64 = Timestamp::now().as_i64()
+        + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds();
+    if let Some(mut exp) = expire {
+        if exp > expires_at_max {
+            exp = expires_at_max;
+        };
+        expire_date = exp;
+    } else {
+        expire_date = Timestamp::now().as_i64()
+            + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
+    }
+    expire_date
+}
+
 pub async fn publish_order(
     pool: &SqlitePool,
     keys: &Keys,
@@ -134,6 +157,10 @@ pub async fn publish_order(
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
     }
+
+    // Get expiration time of the order
+    let expiry_date = get_expiration_date(new_order.expires_at);
+
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -148,6 +175,7 @@ pub async fn publish_order(
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_i64(),
+        expires_at: expiry_date,
         ..Default::default()
     };
 
@@ -382,14 +410,21 @@ pub async fn show_hold_invoice(
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    flow::hold_invoice_paid(&hash).await;
-                    info!("Invoice with hash {hash} accepted!");
+                    if let Err(e) = flow::hold_invoice_paid(&hash).await {
+                        info!("Invoice flow error {e}");
+                    } else {
+                        info!("Invoice with hash {hash} accepted!");
+                    }
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    flow::hold_invoice_settlement(&hash).await;
+                    if let Err(e) = flow::hold_invoice_settlement(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    flow::hold_invoice_canceled(&hash).await;
+                    if let Err(e) = flow::hold_invoice_canceled(&hash).await {
+                        info!("Invoice flow error {e}");
+                    }
                 } else {
                     info!("Invoice with hash: {hash} subscribed!");
                 }
@@ -433,6 +468,7 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         None,
         None,
         None,
+        None,
     );
     // We create a Message
     send_new_order_msg(
@@ -465,32 +501,25 @@ pub async fn rate_counterpart(
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
     event: &Event,
-    my_keys: &Keys,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
     order: &Order,
 ) -> Result<()> {
-    // It can be settle only by a seller or by admin
-    let pubkey = if is_admin {
-        my_keys.public_key().to_string()
-    } else {
-        order.seller_pubkey.as_ref().unwrap().to_string()
-    };
     // Check if the pubkey is right
-    if event.pubkey.to_string() != pubkey {
+    if !is_admin && event.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
-        return Ok(());
-    }
-    if order.preimage.is_none() {
-        return Ok(());
+        return Err(Error::msg("Not allowed"));
     }
 
     // Settling the hold invoice
-    let preimage = order.preimage.as_ref().unwrap();
-    ln_client.settle_hold_invoice(preimage).await?;
-    info!("{action}: Order Id {}: hold invoice settled", order.id);
-
+    if let Some(preimage) = order.preimage.as_ref() {
+        ln_client.settle_hold_invoice(preimage).await?;
+        info!("{action}: Order Id {}: hold invoice settled", order.id);
+    } else {
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        return Err(Error::msg("No preimage"));
+    }
     Ok(())
 }
 

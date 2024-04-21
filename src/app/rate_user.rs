@@ -3,7 +3,7 @@ use crate::util::{
 };
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::error;
+
+const MAX_RATING: u8 = 5;
+const MIN_RATING: u8 = 1;
 
 pub async fn get_counterpart_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
@@ -50,7 +53,11 @@ pub async fn update_user_reputation_action(
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -60,8 +67,12 @@ pub async fn update_user_reputation_action(
     };
 
     // Get needed info about users
-    let buyer = order.buyer_pubkey.unwrap();
-    let seller = order.seller_pubkey.unwrap();
+    let (seller, buyer) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (seller.to_owned(), buyer.to_owned()),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
     let message_sender = event.pubkey.to_string();
 
     if order.status != Status::Success.to_string() {
@@ -104,19 +115,18 @@ pub async fn update_user_reputation_action(
     };
 
     // Check if content of Peer is the same of counterpart
-    let mut rating = 0_u8;
+    let rating;
 
-    if let Content::RatingUser(v) = msg.get_inner_message_kind().content.to_owned().unwrap() {
+    if let Some(Content::RatingUser(v)) = msg.get_inner_message_kind().content.to_owned() {
         rating = v;
+    } else {
+        return Err(Error::msg("No rating present"));
     }
 
     // Ask counterpart reputation
     let rep = get_counterpart_reputation(&counterpart, my_keys).await?;
     // Here we have to update values of the review of the counterpart
     let mut reputation;
-    // min_rate is 1 and max_rate is 5
-    let min_rate = 1;
-    let max_rate = 5;
 
     if let Some(r) = rep {
         // Update user reputation
@@ -135,7 +145,7 @@ pub async fn update_user_reputation_action(
         // Assing new total rating to review
         reputation.total_rating = new_rating;
     } else {
-        reputation = Rating::new(1, rating as f64, min_rate, max_rate, rating);
+        reputation = Rating::new(1, rating as f64, MIN_RATING, MAX_RATING, rating);
     }
     let reputation = reputation.to_tags()?;
 
@@ -154,7 +164,13 @@ pub async fn update_user_reputation_action(
         .await?;
 
         // Send confirmation message to user that rated
-        send_new_order_msg(Some(order.id), Action::RateReceived, None, &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::RateReceived,
+            Some(Content::RatingUser(rating)),
+            &event.pubkey,
+        )
+        .await;
     }
 
     Ok(())

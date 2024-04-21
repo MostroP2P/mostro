@@ -5,7 +5,7 @@ use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_new_order_msg};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -20,7 +20,11 @@ pub async fn dispute_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
 
     // Check dispute for this order id is yet present.
     if find_dispute_by_order_id(pool, order_id).await.is_ok() {
@@ -52,8 +56,12 @@ pub async fn dispute_action(
         }
     };
 
-    let buyer = order.buyer_pubkey.clone().unwrap();
-    let seller = order.seller_pubkey.clone().unwrap();
+    let (seller, buyer) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (seller.to_owned(), buyer.to_owned()),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
     let message_sender = event.pubkey.to_string();
     // Get counterpart pubkey
     let mut counterpart: String = String::new();

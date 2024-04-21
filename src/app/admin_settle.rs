@@ -4,7 +4,7 @@ use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, settle_seller_hold_invoice, update_order_event};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -30,7 +30,12 @@ pub async fn admin_settle_action(
 
         return Ok(());
     }
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
 
     match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
         Ok(false) => {

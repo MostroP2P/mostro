@@ -38,9 +38,13 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts += 1;
     }
     let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
-    let buyer_key = PublicKey::from_str(order.buyer_pubkey.as_ref().unwrap()).unwrap();
 
-    send_cant_do_msg(Some(order.id), Some(msg), &buyer_key).await;
+    let buyer_pubkey = match &order.buyer_pubkey {
+        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
+        None => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
+    send_cant_do_msg(Some(order.id), Some(msg), &buyer_pubkey).await;
 
     // Update order
     let result = order.update(&pool).await?;
@@ -54,7 +58,13 @@ pub async fn release_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    // Check if order id is ok
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -71,7 +81,12 @@ pub async fn release_action(
     };
     let seller_pubkey = event.pubkey;
 
-    let current_status = Status::from_str(&order.status).unwrap();
+    let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
+        current_status
+    } else {
+        return Err(Error::msg("Wrong order status"));
+    };
+
     if current_status != Status::Active
         && current_status != Status::FiatSent
         && current_status != Status::Dispute

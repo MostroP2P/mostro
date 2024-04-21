@@ -1,6 +1,6 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::message::{Action, Content, Message, Peer};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
@@ -15,7 +15,11 @@ pub async fn fiat_sent_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {

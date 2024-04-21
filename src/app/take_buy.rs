@@ -2,7 +2,7 @@ use crate::util::{
     get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg, show_hold_invoice,
 };
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
@@ -18,7 +18,12 @@ pub async fn take_buy_action(
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {

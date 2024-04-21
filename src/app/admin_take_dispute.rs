@@ -3,13 +3,14 @@ use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm};
 use crate::NOSTR_CLIENT;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
 use mostro_core::message::{Action, Content, Message, Peer};
 use mostro_core::order::Order;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use tracing::info;
 
 pub async fn pubkey_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
@@ -41,7 +42,13 @@ pub async fn admin_take_dispute_action(
         send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
         return Ok(());
     }
-    let dispute_id = msg.get_inner_message_kind().id.unwrap();
+
+    let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
+        dispute_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
+
     let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
         None => {
@@ -55,7 +62,12 @@ pub async fn admin_take_dispute_action(
             return Ok(());
         }
     };
-    let order = Order::by_id(pool, dispute.order_id).await?.unwrap();
+
+    let order = match Order::by_id(pool, dispute.order_id).await? {
+        Some(o) => o,
+        None => return Err(Error::msg("No order id")),
+    };
+
     let mut new_order = order.as_new_order();
     new_order.master_buyer_pubkey = order.master_buyer_pubkey.clone();
     new_order.master_seller_pubkey = order.master_seller_pubkey.clone();
@@ -85,8 +97,16 @@ pub async fn admin_take_dispute_action(
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey)),
     );
-    let buyer_pubkey = PublicKey::from_hex(order.buyer_pubkey.clone().unwrap())?;
-    let seller_pubkey = PublicKey::from_hex(order.seller_pubkey.clone().unwrap())?;
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())?,
+            PublicKey::from_str(buyer.as_str())?,
+        ),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    };
+
     let message = message.as_json()?;
     send_dm(&buyer_pubkey, message.clone()).await?;
     send_dm(&seller_pubkey, message).await?;

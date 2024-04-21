@@ -17,7 +17,11 @@ pub async fn cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    let order_id = msg.get_inner_message_kind().id.unwrap();
+    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
+        order_id
+    } else {
+        return Err(Error::msg("No order id"));
+    };
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -89,9 +93,8 @@ pub async fn cancel_action(
                     send_cant_do_msg(Some(order_id), None, &event.pubkey).await;
                     return Ok(());
                 } else {
-                    if order.hash.is_some() {
+                    if let Some(hash) = &order.hash {
                         // We return funds to seller
-                        let hash = order.hash.as_ref().unwrap();
                         ln_client.cancel_hold_invoice(hash).await?;
                         info!(
                             "Cooperative cancel: Order Id {}: Funds returned to seller",
@@ -154,12 +157,13 @@ pub async fn cancel_add_invoice(
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
 ) -> Result<()> {
-    if order.hash.is_some() {
-        // We return funds to seller
-        let hash = order.hash.as_ref().unwrap();
+    if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
+    } else {
+        return Err(Error::msg("No hash present"));
     }
+
     let user_pubkey = event.pubkey.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
@@ -214,15 +218,13 @@ pub async fn cancel_pay_hold_invoice(
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
     let user_pubkey = event.pubkey.to_string();
-    let buyer_pubkey = order.buyer_pubkey.as_ref().unwrap();
-    let seller_pubkey = order.seller_pubkey.as_ref().unwrap();
-    let seller_pubkey = match PublicKey::from_str(seller_pubkey) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Error parsing seller pubkey: {:#?}", e);
-            return Ok(());
-        }
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
+        (None, _) => return Err(Error::msg("Missing seller pubkey")),
+        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
+
     if seller_pubkey.to_string() != user_pubkey {
         // We create a Message
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;

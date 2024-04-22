@@ -140,7 +140,7 @@ pub async fn update_user_reputation_action(
         reputation.last_rating = rating;
         reputation.total_reviews += 1;
         // Format with two decimals
-        let new_rating = format!("{:.2}", new_rating).parse::<f64>().unwrap();
+        let new_rating = format!("{:.2}", new_rating).parse::<f64>()?;
 
         // Assing new total rating to review
         reputation.total_rating = new_rating;

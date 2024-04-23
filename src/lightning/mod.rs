@@ -8,9 +8,9 @@ use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
-use nostr_sdk::hashes::Hash;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
+use nostr_sdk::secp256k1::hashes::Hash;
 use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,

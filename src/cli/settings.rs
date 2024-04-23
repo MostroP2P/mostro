@@ -182,7 +182,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
         settings_dir_default.push(home_dir);
     } else {
         // Get $HOME from env
-        let tmp = std::env::var("HOME").unwrap();
+        let tmp = std::env::var("HOME")?;
         // Os String
         home_dir = tmp.into();
         // Create default path with default .mostro value

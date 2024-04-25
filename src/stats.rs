@@ -6,14 +6,14 @@ use std::path::Path;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct MostroMessageStats {
-    received: u64,
-    new_order: u64,
-    new_dispute: u64,
-    release: u64,
-    bytes_recv: u64,
-    max_msg_bytes: u64,
-    min_msg_bytes: u64,
-    last_msg_bytes: u64,
+    pub received: u64,
+    pub new_order: u64,
+    pub new_dispute: u64,
+    pub release: u64,
+    pub bytes_recv: u64,
+    pub max_msg_bytes: u64,
+    pub min_msg_bytes: u64,
+    pub last_msg_bytes: u64,
 }
 
 impl core::fmt::Debug for MostroMessageStats {

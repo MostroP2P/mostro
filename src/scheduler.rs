@@ -2,6 +2,8 @@ use crate::app::release::do_payment;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::nip33::new_event;
+use crate::nip33::stats_to_tags;
 use crate::stats::MostroMessageStats;
 use crate::util;
 use crate::NOSTR_CLIENT;
@@ -32,6 +34,11 @@ pub async fn start_scheduler(
 }
 
 async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
+    let keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
     let inner_stats = stats.clone();
 
     tokio::spawn(async move {
@@ -49,7 +56,17 @@ async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
                 let _ = f.write(s.unwrap().as_bytes());
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            let tags = stats_to_tags(&*stats.clone().lock().await);
+            if let Ok(ev) = new_event(
+                &keys,
+                "",
+                format!("overall_stats_{}", keys.public_key()),
+                tags,
+            ) {
+                let _ = NOSTR_CLIENT.get().unwrap().send_event(ev).await;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     });
 }

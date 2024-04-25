@@ -1,3 +1,4 @@
+use crate::stats::MostroMessageStats;
 use mostro_core::order::Order;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
@@ -58,6 +59,30 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         ("y".to_string(), "mostrop2p".to_string()),
         // Table name
         ("z".to_string(), "order".to_string()),
+    ];
+
+    tags
+}
+
+/// Transform stats fields to tags
+///
+/// # Arguments
+///
+/// * `stats` - The order to transform
+///
+pub fn stats_to_tags(stats: &MostroMessageStats) -> Vec<(String, String)> {
+    let tags = vec![
+        // Total amount of new orders
+        ("new_orders".to_string(), stats.new_order.to_string()),
+        // Total amount of new disputes
+        ("new_disputes".to_string(), stats.new_dispute.to_string()),
+        // Total amount of successful orders
+        ("completed_orders".to_string(), stats.release.to_string()),
+        // amount (amt) - The amount of sats
+        // Label to identify this is a Mostro's order
+        ("y".to_string(), "mostrop2p".to_string()),
+        // Table name
+        ("z".to_string(), "overall-stats".to_string()),
     ];
 
     tags

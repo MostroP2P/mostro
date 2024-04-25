@@ -1,4 +1,5 @@
 use crate::stats::MostroMessageStats;
+use chrono::Duration;
 use mostro_core::order::Order;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
@@ -59,6 +60,11 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         ("y".to_string(), "mostrop2p".to_string()),
         // Table name
         ("z".to_string(), "order".to_string()),
+        // Nip 40 expiration time - 12 hours over expiration user time
+        (
+            "expiration".to_string(),
+            (order.expires_at + Duration::hours(12).num_seconds()).to_string(),
+        ),
     ];
 
     tags

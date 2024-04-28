@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
-pub struct MostroMessageStats {
+pub struct MostroStats {
     pub received: u64,
     pub new_order: u64,
     pub new_dispute: u64,
@@ -16,7 +16,19 @@ pub struct MostroMessageStats {
     pub last_msg_bytes: u64,
 }
 
-impl core::fmt::Debug for MostroMessageStats {
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct MostroMessageStats{
+    pub overall_stats : MostroStats,
+    pub monthly_stats : MostroStats,
+}
+
+impl MostroMessageStats{
+    pub fn reset_counters(&mut self) -> Self{
+        Self::default()
+    }
+}
+
+impl core::fmt::Debug for MostroStats {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         let mut ds = f.debug_struct("MostroMessageStats");
         ds.field("Total messages received", &self.received);
@@ -47,7 +59,9 @@ impl MostroMessageStats {
             .build()?;
         stats.try_deserialize()
     }
-
+    }
+    
+impl MostroStats{
     pub fn message_inc_counter(&mut self, kind: &Action) {
         match kind {
             Action::NewOrder => self.new_order += 1,

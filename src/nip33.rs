@@ -76,10 +76,10 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
 ///
 /// * `stats` - The order to transform
 ///
-pub fn stats_to_tags(stats: &MostroMessageStats) -> Vec<(String, String)> {
+pub fn stats_to_tags(stats: &MostroStats) -> Vec<(String, String)> {
     let tags = vec![
         // Total amount of new orders
-        ("new_orders".to_string(), stats.new_order.to_string()),
+        ("new_orders".to_string(), stats. new_order.to_string()),
         // Total amount of new disputes
         ("new_disputes".to_string(), stats.new_dispute.to_string()),
         // Total amount of successful orders

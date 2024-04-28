@@ -8,6 +8,8 @@ use crate::stats::MostroMessageStats;
 use crate::util;
 use crate::NOSTR_CLIENT;
 
+use chrono::{Datelike, DateTime};
+use chrono::NaiveDate;
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::Event;
@@ -29,9 +31,44 @@ pub async fn start_scheduler(
     job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_print_stats(stats).await;
+    job_reset_stats().await;
+
 
     info!("Scheduler Started");
 }
+
+async fn job_reset_stats() {
+    
+
+    tokio::spawn(async move {
+        loop {
+
+            info!(
+                "Checking new month"
+            );
+                // Get month and year
+                let now = Utc::now();
+                let (year, month) = (now.year(), now.month());
+                let (next_year, next_month) = match month{
+                    12 => (year+ 1, 1)
+                    _ => (year,month+1),
+                };
+                
+                // let next_month_interval = NaiveDate::from_ymd_opt(year, next_month, 1);
+                let next_month_interval = NaiveDate::from_ymd_opt(next_year, next_month, 1).unwrap().and_hms_opt(0, 1, 0).unwrap();
+                let next_month_interval = DateTime::<Utc>::from_naive_utc_and_offset(next_month_interval, Utc);
+                let interval = next_month_interval.signed_duration_since(now).num_days() as u64;
+
+                info!("{}",interval);
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+
+            }
+
+        });
+}
+
+
 
 async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
     let keys = match get_keys() {
@@ -43,9 +80,10 @@ async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
 
     tokio::spawn(async move {
         loop {
+            
             info!(
                 "Stats on Mostro messages\r\n{:?}",
-                *inner_stats.lock().await
+                inner_stats.lock().await.overall_stats
             );
             let s = serde_json::to_string(&*inner_stats.lock().await);
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -56,7 +94,7 @@ async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
                 let _ = f.write(s.unwrap().as_bytes());
             }
 
-            let tags = stats_to_tags(&*stats.clone().lock().await);
+            let tags = stats_to_tags(&stats.clone().lock().await.overall_stats);
             if let Ok(ev) = new_event(
                 &keys,
                 "",

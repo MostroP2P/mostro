@@ -55,7 +55,7 @@ async fn job_reset_stats() {
                 .unwrap();
             let next_month_interval =
                 DateTime::<Utc>::from_naive_utc_and_offset(next_month_interval, Utc);
-            let interval = next_month_interval.signed_duration_since(now).num_days() as u64;
+            let interval = next_month_interval.signed_duration_since(now).num_seconds() as u64;
 
             info!("{}", interval);
 

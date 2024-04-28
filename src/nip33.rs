@@ -1,9 +1,10 @@
-use crate::stats::MostroMessageStats;
 use chrono::Duration;
 use mostro_core::order::Order;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
+
+use crate::stats::MostroStats;
 
 /// Creates a new mostro nip33 event
 ///
@@ -79,7 +80,7 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
 pub fn stats_to_tags(stats: &MostroStats) -> Vec<(String, String)> {
     let tags = vec![
         // Total amount of new orders
-        ("new_orders".to_string(), stats. new_order.to_string()),
+        ("new_orders".to_string(), stats.new_order.to_string()),
         // Total amount of new disputes
         ("new_disputes".to_string(), stats.new_dispute.to_string()),
         // Total amount of successful orders

@@ -73,7 +73,11 @@ pub async fn run(
                         if let Ok(msg) = message {
                             if msg.get_inner_message_kind().verify() {
                                 if let Some(action) = msg.inner_action() {
-                                    mostro_stats.lock().await.overall_stats.message_inc_counter(&action);
+                                    mostro_stats
+                                        .lock()
+                                        .await
+                                        .overall_stats
+                                        .message_inc_counter(&action);
                                     match action {
                                         Action::NewOrder => {
                                             if let Err(e) =

@@ -17,13 +17,13 @@ pub struct MostroStats {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
-pub struct MostroMessageStats{
-    pub overall_stats : MostroStats,
-    pub monthly_stats : MostroStats,
+pub struct MostroMessageStats {
+    pub overall_stats: MostroStats,
+    pub monthly_stats: MostroStats,
 }
 
-impl MostroMessageStats{
-    pub fn reset_counters(&mut self) -> Self{
+impl MostroMessageStats {
+    pub fn reset_counters(&mut self) -> Self {
         Self::default()
     }
 }
@@ -59,9 +59,9 @@ impl MostroMessageStats {
             .build()?;
         stats.try_deserialize()
     }
-    }
-    
-impl MostroStats{
+}
+
+impl MostroStats {
     pub fn message_inc_counter(&mut self, kind: &Action) {
         match kind {
             Action::NewOrder => self.new_order += 1,

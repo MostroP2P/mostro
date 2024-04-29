@@ -1,6 +1,7 @@
 use config::{self, Config, ConfigError, File, FileFormat};
 use mostro_core::message::Action;
 use serde::{Deserialize, Serialize};
+use std::default;
 use std::io::Write;
 use std::path::Path;
 
@@ -16,15 +17,92 @@ pub struct MostroStats {
     pub last_msg_bytes: u64,
 }
 
+
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct MostroMessageStats {
     pub overall_stats: MostroStats,
     pub monthly_stats: MostroStats,
 }
 
+impl<'a> IntoIterator for &'a MostroMessageStats {
+    type Item = MostroStats;
+    type IntoIter = MostroStatsIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        MostroStatsIterator {
+            stats: self,
+            index: 0,
+        }
+    }
+}
+
+
+pub struct MostroStatsIterator<'a> {
+    stats: &'a MostroMessageStats,
+    index: usize,
+}
+
+impl<'a> Iterator for MostroStatsIterator<'a> {
+    type Item = MostroStats;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let res = match self.index {
+            0 => self.stats.overall_stats,
+            1 => self.stats.monthly_stats,
+            _ => return None,
+        };
+        self.index += 1;
+        Some(res)
+    }
+}
+
+
 impl MostroMessageStats {
     pub fn reset_counters(&mut self) -> Self {
         Self::default()
+    }
+
+    pub fn reset_monthly_counters(&mut self) {
+        self.monthly_stats = MostroStats::default()
+    }
+
+    pub fn reset_overall_counters(&mut self) {
+        self.overall_stats = MostroStats::default()
+    }
+
+    pub fn message_inc_counter(&mut self, kind: &Action) {
+
+     for mut stat in self.into_iter() {
+
+        match kind {
+            Action::NewOrder => stat.new_order += 1,
+            Action::Dispute => stat.new_dispute += 1,
+            Action::Release => stat.release += 1,
+            _ => stat.received += 1,
+        }
+    }
+    }
+
+
+
+    pub fn data_recv(&mut self, data: usize) {
+
+
+        for stat in iter.iter_mut(){
+            // Total byte receviced
+            stat.bytes_recv += data as u64;
+            // Last message bytes
+            stat.last_msg_bytes = data as u64;
+            // Max bytes
+            if stat.max_msg_bytes < data as u64 {
+                stat.max_msg_bytes = data as u64
+            }
+            // Min bytes
+            if stat.min_msg_bytes > data as u64 {
+                stat.min_msg_bytes = data as u64
+            }
+        }
     }
 }
 
@@ -61,28 +139,6 @@ impl MostroMessageStats {
     }
 }
 
-impl MostroStats {
-    pub fn message_inc_counter(&mut self, kind: &Action) {
-        match kind {
-            Action::NewOrder => self.new_order += 1,
-            Action::Dispute => self.new_dispute += 1,
-            Action::Release => self.release += 1,
-            _ => self.received += 1,
-        }
-    }
 
-    pub fn data_recv(&mut self, data: usize) {
-        // Total byte receviced
-        self.bytes_recv += data as u64;
-        // Last message bytes
-        self.last_msg_bytes = data as u64;
-        // Max bytes
-        if self.max_msg_bytes < data as u64 {
-            self.max_msg_bytes = data as u64
-        }
-        // Min bytes
-        if self.min_msg_bytes > data as u64 {
-            self.min_msg_bytes = data as u64
-        }
-    }
-}
+
+

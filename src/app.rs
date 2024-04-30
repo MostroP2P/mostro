@@ -55,11 +55,6 @@ pub async fn run(
             if let RelayPoolNotification::Event { event, .. } = notification {
                 if let Kind::EncryptedDirectMessage = event.kind {
                     // Get number of byte in the message
-
-                    for m in &*mostro_stats.lock().await{
-                        
-                    }
-
                     mostro_stats
                         .lock()
                         .await
@@ -77,10 +72,7 @@ pub async fn run(
                         if let Ok(msg) = message {
                             if msg.get_inner_message_kind().verify() {
                                 if let Some(action) = msg.inner_action() {
-                                    mostro_stats
-                                        .lock()
-                                        .await
-                                        .message_inc_counter(&action);
+                                    mostro_stats.lock().await.message_inc_counter(&action);
                                     match action {
                                         Action::NewOrder => {
                                             if let Err(e) =

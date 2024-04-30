@@ -14,6 +14,8 @@ use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::Event;
 use sqlx_crud::Crud;
+use std::ffi::OsString;
+use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -30,13 +32,15 @@ pub async fn start_scheduler(
     job_update_rate_events(rate_list).await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
-    job_print_stats(stats).await;
-    job_reset_stats().await;
+    job_print_stats(stats.clone()).await;
+    job_reset_stats(stats.clone()).await;
 
     info!("Scheduler Started");
 }
 
-async fn job_reset_stats() {
+async fn job_reset_stats(stats: Arc<Mutex<MostroMessageStats>>) {
+    let stats = stats.clone();
+
     tokio::spawn(async move {
         loop {
             info!("Checking new month");
@@ -48,6 +52,8 @@ async fn job_reset_stats() {
                 _ => (year, month + 1),
             };
 
+            info!("Last month was {} - new month is {}", month, next_month);
+
             // let next_month_interval = NaiveDate::from_ymd_opt(year, next_month, 1);
             let next_month_interval = NaiveDate::from_ymd_opt(next_year, next_month, 1)
                 .unwrap()
@@ -57,7 +63,30 @@ async fn job_reset_stats() {
                 DateTime::<Utc>::from_naive_utc_and_offset(next_month_interval, Utc);
             let interval = next_month_interval.signed_duration_since(now).num_seconds() as u64;
 
-            info!("{}", interval);
+            // Dir prefix
+            let year_dir: OsString = year.to_string().into();
+            let mut stats_year_dir = std::path::PathBuf::new();
+            let mut stats_month_file = std::path::PathBuf::new();
+
+            stats_year_dir.push(".stats/stats_");
+            stats_year_dir.push(year_dir);
+
+            if !stats_year_dir.is_dir() {
+                fs::create_dir(stats_year_dir.clone()).unwrap();
+                info!("Creating folder for stats of year {}", year);
+            }
+
+            stats_month_file.push(stats_year_dir);
+            let f: OsString = format!("{}_{}.json", month, year).into();
+            stats_month_file.push(f);
+
+            let mut f = std::fs::File::create(stats_month_file).unwrap();
+            let s = serde_json::to_string(&stats.lock().await.monthly_stats);
+            println!("{:?}", s);
+            let _ = f.write(s.unwrap().as_bytes());
+
+            // Clear monthly counter and sleep til next month
+            stats.lock().await.reset_monthly_counters();
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }

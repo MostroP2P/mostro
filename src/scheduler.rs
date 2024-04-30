@@ -64,12 +64,12 @@ async fn job_reset_stats(stats: Arc<Mutex<MostroMessageStats>>) {
             let interval = next_month_interval.signed_duration_since(now).num_seconds() as u64;
 
             // Dir prefix
-            let year_dir: OsString = year.to_string().into();
             let mut stats_year_dir = std::path::PathBuf::new();
             let mut stats_month_file = std::path::PathBuf::new();
 
-            stats_year_dir.push(".stats/stats_");
-            stats_year_dir.push(year_dir);
+            let stats_dir: OsString = format!("./stats/stats_{}", year).into();
+            stats_year_dir.push(stats_dir);
+            // stats_year_dir.push(year_dir);
 
             if !stats_year_dir.is_dir() {
                 fs::create_dir(stats_year_dir.clone()).unwrap();

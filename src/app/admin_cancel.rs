@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use super::admin_take_dispute::pubkey_event_can_solve;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
@@ -23,13 +22,6 @@ pub async fn admin_cancel_action(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<()> {
-    // Check if the pubkey is a solver or admin
-    if !pubkey_event_can_solve(pool, &event.pubkey).await {
-        // We create a Message
-        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
-        return Ok(());
-    }
-
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {

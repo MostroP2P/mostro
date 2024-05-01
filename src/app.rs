@@ -26,6 +26,7 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::lightning::LndConnector;
+use crate::stats::MostroMessageStats;
 
 use anyhow::Result;
 use mostro_core::message::{Action, Message};
@@ -45,6 +46,7 @@ pub async fn run(
     ln_client: &mut LndConnector,
     pool: Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
+    mostro_stats: Arc<Mutex<MostroMessageStats>>,
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
@@ -52,6 +54,11 @@ pub async fn run(
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 if let Kind::EncryptedDirectMessage = event.kind {
+                    // Get number of byte in the message
+                    mostro_stats
+                        .lock()
+                        .await
+                        .data_recv(event.as_json().as_bytes().len());
                     // We validates if the event is correctly signed
                     if event.verify().is_err() {
                         tracing::warn!("Error in event verification")
@@ -65,6 +72,7 @@ pub async fn run(
                         if let Ok(msg) = message {
                             if msg.get_inner_message_kind().verify() {
                                 if let Some(action) = msg.inner_action() {
+                                    mostro_stats.lock().await.message_inc_counter(&action);
                                     match action {
                                         Action::NewOrder => {
                                             if let Err(e) =

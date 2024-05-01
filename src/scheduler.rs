@@ -2,27 +2,133 @@ use crate::app::release::do_payment;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::nip33::new_event;
+use crate::nip33::stats_to_tags;
+use crate::stats::MostroMessageStats;
 use crate::util;
 use crate::NOSTR_CLIENT;
 
+use chrono::NaiveDate;
+use chrono::{DateTime, Datelike};
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::Event;
 use sqlx_crud::Crud;
+use std::ffi::OsString;
+use std::fs;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use util::{get_keys, update_order_event};
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
+pub async fn start_scheduler(
+    rate_list: Arc<Mutex<Vec<Event>>>,
+    stats: Arc<Mutex<MostroMessageStats>>,
+) {
     info!("Creating scheduler");
 
     job_expire_pending_older_orders().await;
     job_update_rate_events(rate_list).await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
+    job_print_stats(stats.clone()).await;
+    job_reset_stats(stats.clone()).await;
 
     info!("Scheduler Started");
+}
+
+async fn job_reset_stats(stats: Arc<Mutex<MostroMessageStats>>) {
+    let stats = stats.clone();
+
+    tokio::spawn(async move {
+        loop {
+            info!("Checking new month");
+            // Get month and year
+            let now = Utc::now();
+            let (year, month) = (now.year(), now.month());
+            let (next_year, next_month) = match month {
+                12 => (year + 1, 1),
+                _ => (year, month + 1),
+            };
+
+            info!("Last month was {} - new month is {}", month, next_month);
+
+            // let next_month_interval = NaiveDate::from_ymd_opt(year, next_month, 1);
+            let next_month_interval = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+                .unwrap()
+                .and_hms_opt(0, 1, 0)
+                .unwrap();
+            let next_month_interval =
+                DateTime::<Utc>::from_naive_utc_and_offset(next_month_interval, Utc);
+            let interval = next_month_interval.signed_duration_since(now).num_seconds() as u64;
+
+            // Dir prefix
+            let mut stats_year_dir = std::path::PathBuf::new();
+            let mut stats_month_file = std::path::PathBuf::new();
+
+            let stats_dir: OsString = format!("./stats/stats_{}", year).into();
+            stats_year_dir.push(stats_dir);
+            // stats_year_dir.push(year_dir);
+
+            if !stats_year_dir.is_dir() {
+                fs::create_dir(stats_year_dir.clone()).unwrap();
+                info!("Creating folder for stats of year {}", year);
+            }
+
+            stats_month_file.push(stats_year_dir);
+            let f: OsString = format!("{}_{}.json", month, year).into();
+            stats_month_file.push(f);
+
+            let mut f = std::fs::File::create(stats_month_file).unwrap();
+            let s = serde_json::to_string(&stats.lock().await.monthly_stats);
+            println!("{:?}", s);
+            let _ = f.write(s.unwrap().as_bytes());
+
+            // Clear monthly counter and sleep til next month
+            stats.lock().await.reset_monthly_counters();
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+async fn job_print_stats(stats: Arc<Mutex<MostroMessageStats>>) {
+    let keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
+    let inner_stats = stats.clone();
+
+    tokio::spawn(async move {
+        loop {
+            info!(
+                "Stats on Mostro messages\r\n{:?}",
+                inner_stats.lock().await.overall_stats
+            );
+            let s = serde_json::to_string(&*inner_stats.lock().await);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open("mostro_stats.json")
+            {
+                let _ = f.write(s.unwrap().as_bytes());
+            }
+
+            let tags = stats_to_tags(&stats.clone().lock().await.overall_stats);
+            if let Ok(ev) = new_event(
+                &keys,
+                "",
+                format!("overall_stats_{}", keys.public_key()),
+                tags,
+            ) {
+                let _ = NOSTR_CLIENT.get().unwrap().send_event(ev).await;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    });
 }
 
 async fn job_retry_failed_payments() {

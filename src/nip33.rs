@@ -1,3 +1,4 @@
+use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::Order;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -64,6 +65,64 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
             "expiration".to_string(),
             (order.expires_at + Duration::hours(12).num_seconds()).to_string(),
         ),
+    ];
+
+    tags
+}
+
+/// Transform mostro info fields to tags
+///
+/// # Arguments
+///
+///
+pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<(String, String)> {
+    let mostro_settings = Settings::get_mostro();
+    let ln_settings = Settings::get_ln();
+
+    let tags = vec![
+        // max_order_amount
+        ("mostro_pubkey".to_string(), mostro_pubkey.to_string()),
+        // max_order_amount
+        (
+            "max_order_amount".to_string(),
+            mostro_settings.max_order_amount.to_string(),
+        ),
+        // min_order_amount
+        (
+            "min_order_amount".to_string(),
+            mostro_settings.min_payment_amount.to_string(),
+        ),
+        // expiration_hours
+        (
+            "expiration_hours".to_string(),
+            mostro_settings.expiration_hours.to_string(),
+        ),
+        // expiration_seconds
+        (
+            "expiration_seconds".to_string(),
+            mostro_settings.expiration_seconds.to_string(),
+        ),
+        // fee
+        ("fee".to_string(), mostro_settings.fee.to_string()),
+        // hold_invoice_expiration_window
+        (
+            "hold_invoice_expiration_window".to_string(),
+            ln_settings.hold_invoice_expiration_window.to_string(),
+        ),
+        // hold_invoice_cltv_delta
+        (
+            "hold_invoice_cltv_delta".to_string(),
+            ln_settings.hold_invoice_cltv_delta.to_string(),
+        ),
+        // invoice_expiration_window
+        (
+            "invoice_expiration_window".to_string(),
+            ln_settings.hold_invoice_cltv_delta.to_string(),
+        ),
+        // Label to identify this is a Mostro's infos
+        ("y".to_string(), "mostrop2p".to_string()),
+        // Table name
+        ("z".to_string(), "info".to_string()),
     ];
 
     tags

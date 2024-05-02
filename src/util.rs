@@ -6,7 +6,6 @@ use crate::lightning;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
-use crate::nip33::info_to_tags;
 use crate::nip33::{new_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
@@ -567,14 +566,4 @@ pub async fn send_new_order_msg(
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
     }
-}
-
-pub async fn send_mostro_info(mostro_pubkey: &Keys) -> Result<()> {
-    let tags = info_to_tags(&mostro_pubkey.public_key());
-    let id = format!("Mostro npub {} info event", mostro_pubkey.public_key());
-
-    let info_ev = new_event(mostro_pubkey, "", id, tags)?;
-    NOSTR_CLIENT.get().unwrap().send_event(info_ev).await?;
-
-    Ok(())
 }

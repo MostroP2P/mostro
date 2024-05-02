@@ -175,13 +175,6 @@ pub async fn run(
                                                 warning_msg(&action, e)
                                             }
                                         }
-                                        Action::Info => {
-                                            if let Err(e) =
-                                                crate::util::send_mostro_info(&my_keys).await
-                                            {
-                                                warning_msg(&action, e)
-                                            }
-                                        }
                                         _ => info!("Received message with action {:?}", action),
                                     }
                                 }

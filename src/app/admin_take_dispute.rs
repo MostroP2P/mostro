@@ -13,17 +13,23 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
-pub async fn pubkey_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
+pub async fn pubkey_event_can_solve(
+    pool: &Pool<Sqlite>,
+    ev_pubkey: &PublicKey,
+    status: Status,
+) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
-        if ev_pubkey.to_string() == my_keys.public_key().to_string() {
+        if ev_pubkey.to_string() == my_keys.public_key().to_string()
+            && matches!(status, Status::InProgress | Status::Initiated)
+        {
             return true;
         }
     }
 
     // Is a solver taking a dispute
     if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
-        if solver.is_solver != 0_i64 {
+        if solver.is_solver != 0_i64 && status == Status::Initiated {
             return true;
         }
     }
@@ -36,19 +42,14 @@ pub async fn admin_take_dispute_action(
     event: &Event,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
-    // Check if the pubkey is a solver or admin
-    if !pubkey_event_can_solve(pool, &event.pubkey).await {
-        // We create a Message
-        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
-        return Ok(());
-    }
-
+    // Find dipute id in the message
     let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
         dispute_id
     } else {
         return Err(Error::msg("No order id"));
     };
 
+    // Fetch dispute from db
     let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
         None => {
@@ -61,6 +62,17 @@ pub async fn admin_take_dispute_action(
             .await;
             return Ok(());
         }
+    };
+
+    // Check if the pubkey is a solver or admin
+    if let Ok(dispute_status) = Status::from_str(&dispute.status) {
+        if !pubkey_event_can_solve(pool, &event.pubkey, dispute_status).await {
+            // We create a Message
+            send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+            return Ok(());
+        }
+    } else {
+        return Err(Error::msg("No dispute status"));
     };
 
     let order = match Order::by_id(pool, dispute.order_id).await? {

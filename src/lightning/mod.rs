@@ -10,7 +10,6 @@ use anyhow::Result;
 use easy_hasher::easy_hasher::*;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
-use nostr_sdk::bitcoin::hashes::sha256::Hash;
 use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,

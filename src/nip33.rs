@@ -88,7 +88,7 @@ pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<(String, String)> {
             env!("CARGO_PKG_VERSION").to_string(),
         ),
         // mostro commit id
-        ("mostro_version".to_string(), env!("GIT_HASH").to_string()),
+        ("mostro_commit_id".to_string(), env!("GIT_HASH").to_string()),
         // max_order_amount
         (
             "max_order_amount".to_string(),

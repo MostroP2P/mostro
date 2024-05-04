@@ -6,6 +6,7 @@ file="archs"
 manifest="manifest.txt"
 arch=`cat $file`
 mkdir -p bin
+rm bin/*
 for i in $arch; do
     echo "Cross compiling for $i"
     cross build --release --target $i
@@ -17,7 +18,7 @@ for i in $arch; do
     mkdir $i
     cp $filename $i/
     sha256sum $i/$filename >> ../../../bin/$manifest
-    tar -cjf $app-$i.tar.gz $i
+    tar -czf $app-$i.tar.gz $i
     sha256sum $app-$i.tar.gz >> ../../../bin/$manifest
     mv $app-$i.tar.gz ../../../bin
     rm -rf $i

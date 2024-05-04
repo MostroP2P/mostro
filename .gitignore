@@ -1,6 +1,7 @@
 /target
 .env
 mostro.db*
+mostro.log
 
 # Relay data
 /relay/data/*

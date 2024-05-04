@@ -21,8 +21,30 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     job_update_rate_events(rate_list).await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
+    job_info_event_send().await;
 
     info!("Scheduler Started");
+}
+
+async fn job_info_event_send() {
+    let mostro_pubkey = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
+    tokio::spawn(async move {
+        loop {
+            info!("Sending info about mostro");
+
+            let tags = crate::nip33::info_to_tags(&mostro_pubkey.public_key());
+            let id = format!("info-{}", mostro_pubkey.public_key());
+
+            let info_ev = crate::nip33::new_event(&mostro_pubkey, "", id, tags).unwrap();
+            let _ = NOSTR_CLIENT.get().unwrap().send_event(info_ev).await;
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        }
+    });
 }
 
 async fn job_retry_failed_payments() {

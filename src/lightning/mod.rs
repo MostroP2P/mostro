@@ -10,7 +10,6 @@ use anyhow::Result;
 use easy_hasher::easy_hasher::*;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
-use nostr_sdk::secp256k1::hashes::Hash;
 use tokio::sync::mpsc::Sender;
 use tonic_openssl_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
@@ -159,8 +158,7 @@ impl LndConnector {
         listener: Sender<PaymentMessage>,
     ) -> Result<(), MostroError> {
         let invoice = decode_invoice(payment_request)?;
-        let payment_hash = invoice.payment_hash();
-        let payment_hash = payment_hash.to_byte_array();
+        let payment_hash = invoice.signable_hash();
         let hash = bytes_to_string(&payment_hash);
         let mostro_settings = Settings::get_mostro();
 

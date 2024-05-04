@@ -82,6 +82,13 @@ pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<(String, String)> {
     let tags = vec![
         // max_order_amount
         ("mostro_pubkey".to_string(), mostro_pubkey.to_string()),
+        // mostro version
+        (
+            "mostro_version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        // mostro commit id
+        ("mostro_version".to_string(), env!("GIT_HASH").to_string()),
         // max_order_amount
         (
             "max_order_amount".to_string(),
@@ -117,7 +124,7 @@ pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<(String, String)> {
         // invoice_expiration_window
         (
             "invoice_expiration_window".to_string(),
-            ln_settings.hold_invoice_cltv_delta.to_string(),
+            ln_settings.hold_invoice_expiration_window.to_string(),
         ),
         // Label to identify this is a Mostro's infos
         ("y".to_string(), "mostrop2p".to_string()),

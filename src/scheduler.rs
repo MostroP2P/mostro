@@ -37,7 +37,7 @@ async fn job_info_event_send() {
             info!("Sending info about mostro");
 
             let tags = crate::nip33::info_to_tags(&mostro_pubkey.public_key());
-            let id = format!("Mostro npub {} info event", mostro_pubkey.public_key());
+            let id = format!("info-{}", mostro_pubkey.public_key());
 
             let info_ev = crate::nip33::new_event(&mostro_pubkey, "", id, tags).unwrap();
             let _ = NOSTR_CLIENT.get().unwrap().send_event(info_ev).await;

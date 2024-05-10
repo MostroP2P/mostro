@@ -573,9 +573,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.37"
+version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a0d04d43504c61aa6c7531f1871dd0d418d91130162063b789da00fd7057a5e"
+checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
@@ -1652,9 +1652,9 @@ dependencies = [
 
 [[package]]
 name = "lightning"
-version = "0.0.122"
+version = "0.0.123"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d9b36ae12b379905bfc429ce5d4e8ca4a55c8dd3de73074309bd0bcc053bcac"
+checksum = "5fd92d4aa159374be430c7590e169b4a6c0fb79018f5bc4ea1bffde536384db3"
 dependencies = [
  "bitcoin 0.30.2",
  "hex-conservative",
@@ -1662,14 +1662,13 @@ dependencies = [
 
 [[package]]
 name = "lightning-invoice"
-version = "0.30.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106fdb897e69df697480f45bf0a564b425af488fb0f7407e770a770c39b19a21"
+checksum = "26d07d01cf197bf2184b929b7dc94aa70d935aac6df896c256a3a9475b7e9d40"
 dependencies = [
  "bech32 0.9.1",
  "bitcoin 0.30.2",
  "lightning",
- "num-traits",
  "secp256k1 0.27.0",
 ]
 
@@ -1861,16 +1860,18 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.5.7"
+version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae55c1c489c71622adbc7bdd472e6eeaccb2c9dd9f4f3967147403561310972"
+checksum = "72951dc9f95702763a9d90fc94d9709a611fe12ae75a6658ff019d3c0ec6bd56"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde",
  "serde_json",
  "sqlx",
  "sqlx-crud",
  "uuid",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3874,6 +3875,7 @@ dependencies = [
  "rand",
  "serde",
  "uuid-macro-internal",
+ "wasm-bindgen",
 ]
 
 [[package]]

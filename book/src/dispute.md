@@ -1,6 +1,6 @@
 # Dispute
 
-A use can start a dispute in an order with status `pending` or `fiat-sent` sending action `dispute`, here is an example where the seller initiates a dispute:
+A use can start a dispute in an order with status `active` or `fiat-sent` sending action `dispute`, here is an example where the seller initiates a dispute:
 
 ```json
 {

@@ -171,6 +171,8 @@ pub async fn publish_order(
         amount: new_order.amount,
         fee,
         fiat_code: new_order.fiat_code.clone(),
+        min_amount: new_order.min_amount,
+        max_amount: new_order.max_amount,
         fiat_amount: new_order.fiat_amount,
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),

@@ -34,6 +34,17 @@ pub fn new_event(
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
 
+fn create_fiat_amt_string(order: &Order) -> String {
+    if order.min_amount.is_some() && order.max_amount.is_some() {
+        format!(
+            "{}-{}",
+            order.min_amount.unwrap(),
+            order.max_amount.unwrap()
+        )
+    } else {
+        order.fiat_amount.to_string()
+    }
+}
 /// Transform an order fields to tags
 ///
 /// # Arguments
@@ -45,7 +56,7 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         // kind (k) - The order kind (buy or sell)
         ("k".to_string(), order.kind.to_string()),
         // fiat_code (f) - The fiat code of the order
-        ("f".to_string(), order.fiat_code.to_string()),
+        ("f".to_string(), create_fiat_amt_string(order)),
         // status (s) - The order status
         ("s".to_string(), order.status.to_string()),
         // amount (amt) - The amount of sats

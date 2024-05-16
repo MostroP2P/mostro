@@ -131,7 +131,7 @@ pub async fn release_action(
     Ok(())
 }
 
-pub async fn do_payment(order: Order) -> Result<()> {
+pub async fn do_payment(mut order: Order) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
@@ -182,9 +182,13 @@ pub async fn do_payment(order: Order) -> Result<()> {
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ =
-                                payment_success(&order, &buyer_pubkey, &seller_pubkey, &my_keys)
-                                    .await;
+                            let _ = payment_success(
+                                &mut order,
+                                &buyer_pubkey,
+                                &seller_pubkey,
+                                &my_keys,
+                            )
+                            .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -211,7 +215,7 @@ pub async fn do_payment(order: Order) -> Result<()> {
 }
 
 async fn payment_success(
-    order: &Order,
+    order: &mut Order,
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
@@ -225,11 +229,30 @@ async fn payment_success(
     )
     .await;
 
+    let mut new_order_status = Status::Pending;
+
+    // Check if order is range type
+    // Add parent range id and update max amount
+    if order.max_amount.is_some() && order.min_amount.is_some() {
+        if let Some(max) = order.max_amount {
+            if let Some(new_max) = max.checked_sub(order.fiat_amount) {
+                if new_max > 0 {
+                    // Update order in case
+                    order.max_amount = Some(new_max);
+                    order.range_parent_id = Some(order.id);
+                    order.id = uuid::Uuid::new_v4();
+                } else {
+                    new_order_status = Status::Success;
+                }
+            }
+        }
+    }
+
     // Let's wait 5 secs before publish this new event
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
+    if let Ok(order_updated) = update_order_event(my_keys, new_order_status, order).await {
         let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process

@@ -99,7 +99,9 @@ pub async fn take_sell_action(
     }
 
     // We update the master pubkey
-    order.master_buyer_pubkey = msg.get_inner_message_kind().pubkey.clone();
+    order
+        .master_buyer_pubkey
+        .clone_from(&msg.get_inner_message_kind().pubkey);
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     // Timestamp take order time

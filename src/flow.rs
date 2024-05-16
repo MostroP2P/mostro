@@ -41,6 +41,8 @@ pub async fn hold_invoice_paid(hash: &str) -> Result<()> {
         None,
         order.amount,
         order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,

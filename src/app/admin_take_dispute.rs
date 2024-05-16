@@ -81,8 +81,12 @@ pub async fn admin_take_dispute_action(
     };
 
     let mut new_order = order.as_new_order();
-    new_order.master_buyer_pubkey = order.master_buyer_pubkey.clone();
-    new_order.master_seller_pubkey = order.master_seller_pubkey.clone();
+    new_order
+        .master_buyer_pubkey
+        .clone_from(&order.master_buyer_pubkey);
+    new_order
+        .master_seller_pubkey
+        .clone_from(&order.master_seller_pubkey);
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();

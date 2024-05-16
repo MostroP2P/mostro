@@ -67,7 +67,9 @@ pub async fn take_buy_action(
         return Ok(());
     }
     // We update the master pubkey
-    order.master_seller_pubkey = msg.get_inner_message_kind().pubkey.clone();
+    order
+        .master_seller_pubkey
+        .clone_from(&msg.get_inner_message_kind().pubkey);
 
     let seller_pubkey = event.pubkey;
     // Seller can take pending orders only

@@ -32,33 +32,46 @@ pub async fn order_action(
             }
         }
 
-        let quote = match order.amount {
-            0 => match get_market_quote(&order.fiat_amount, &order.fiat_code, 0).await {
-                Ok(amount) => amount,
-                Err(e) => {
-                    error!("{:?}", e.to_string());
-                    return Ok(());
-                }
-            },
-            _ => order.amount,
-        };
+        // Default case single amount
+        let mut amount_vec = vec![order.fiat_amount];
 
-        // Check amount is positive - extra safety check
-        if quote < 0 {
-            let msg = format!("Amount must be positive {} is not valid", order.amount);
-            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
-            return Ok(());
+        // Get max and and min amount in case of range order
+        // in case of single order do like usual
+        if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
+            amount_vec.clear();
+            amount_vec.push(min);
+            amount_vec.push(max);
         }
 
-        if quote > mostro_settings.max_order_amount as i64
-            || quote < mostro_settings.min_payment_amount as i64
-        {
-            let msg = format!(
-                "Quote is out of sats boundaries min is {} max is {}",
-                mostro_settings.min_payment_amount, mostro_settings.max_order_amount
-            );
-            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
-            return Ok(());
+        for fiat_amount in amount_vec {
+            let quote = match order.amount {
+                0 => match get_market_quote(&fiat_amount, &order.fiat_code, 0).await {
+                    Ok(amount) => amount,
+                    Err(e) => {
+                        error!("{:?}", e.to_string());
+                        return Ok(());
+                    }
+                },
+                _ => order.amount,
+            };
+
+            // Check amount is positive - extra safety check
+            if quote < 0 {
+                let msg = format!("Amount must be positive {} is not valid", order.amount);
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
+
+            if quote > mostro_settings.max_order_amount as i64
+                || quote < mostro_settings.min_payment_amount as i64
+            {
+                let msg = format!(
+                    "Quote is out of sats boundaries min is {} max is {}",
+                    mostro_settings.min_payment_amount, mostro_settings.max_order_amount
+                );
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
         }
 
         let initiator_ephemeral_pubkey = event.pubkey.to_string();

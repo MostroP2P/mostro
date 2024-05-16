@@ -461,6 +461,8 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         Some(status),
         buyer_final_amount,
         order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,

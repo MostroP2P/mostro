@@ -25,10 +25,13 @@ pub fn new_event(
 ) -> Result<Event, Error> {
     // This tag (nip33) allows us to change this event in particular in the future
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-    tags.push(Tag::Identifier(identifier)); // `d` tag
+    //tags.push(Tag::Identifier(identifier)); // `d` tag //Check with Yuki!
+    let tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![identifier]);
+    tags.push(tag);
+
     for (key, value) in extra_tags.into_iter() {
         let tag = Tag::Generic(TagKind::Custom(key), vec![value]);
-        tags.push(tag);
+        tags.push(tag.clone());
     }
 
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)

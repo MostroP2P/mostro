@@ -6,6 +6,7 @@ use crate::util::{
     get_keys, rate_counterpart, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
     update_order_event,
 };
+use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
 use lnurl::lightning_address::LightningAddress;
@@ -230,8 +231,6 @@ async fn payment_success(
     )
     .await;
 
-    let mut new_order_status = Status::Pending;
-
     // Check if order is range type
     // Add parent range id and update max amount
     if order.max_amount.is_some() && order.min_amount.is_some() {
@@ -239,17 +238,61 @@ async fn payment_success(
             if let Some(new_max) = max.checked_sub(order.fiat_amount) {
                 match new_max.cmp(&order.min_amount.unwrap()) {
                     Ordering::Equal => {
-                        order.max_amount = None;
-                        order.min_amount = None;
-                        order.fiat_amount = new_max
+                        // Update order in case max == min
+                        let pool = db::connect().await?;
+                        let mut new_order = order.clone();
+                        new_order.max_amount = None;
+                        new_order.min_amount = None;
+                        new_order.fiat_amount = new_max;
+                        new_order.status = Status::Pending.to_string();
+                        new_order.id = uuid::Uuid::new_v4();
+                        new_order.status = Status::Pending.to_string();
+                        // CRUD order creation
+                        new_order.clone().create(&pool).await?;
+                        // We transform the order fields to tags to use in the event
+                        let tags = crate::nip33::order_to_tags(&new_order);
+
+                        info!("range order tags to be republished: {:#?}", tags);
+                        // nip33 kind with order fields as tags and order id as identifier
+                        let event =
+                            crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
+
+                        let _ = NOSTR_CLIENT
+                            .get()
+                            .unwrap()
+                            .send_event(event)
+                            .await
+                            .map(|_s| ())
+                            .map_err(|err| err.to_string());
                     }
                     Ordering::Greater => {
-                        // Update order in case
-                        order.max_amount = Some(new_max);
-                        order.range_parent_id = Some(order.id);
-                        order.id = uuid::Uuid::new_v4();
+                        // Update order in case new max is still greater the min amount
+                        let pool = db::connect().await?;
+                        let mut new_order = order.clone();
+                        new_order.max_amount = Some(new_max);
+                        new_order.range_parent_id = Some(order.id);
+                        new_order.id = uuid::Uuid::new_v4();
+                        new_order.status = Status::Pending.to_string();
+                        // CRUD order creation
+                        new_order.clone().create(&pool).await?;
+                        // We transform the order fields to tags to use in the event
+                        let tags = crate::nip33::order_to_tags(&new_order);
+
+                        info!("range order tags to be republished: {:#?}", tags);
+                        // nip33 kind with order fields as tags and order id as identifier
+                        let event =
+                            crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
+
+                        let _ = NOSTR_CLIENT
+                            .get()
+                            .unwrap()
+                            .send_event(event)
+                            .await
+                            .map(|_s| ())
+                            .map_err(|err| err.to_string());
                     }
-                    Ordering::Less => new_order_status = Status::Success,
+                    // Update order status in case new max is smaller the min amount
+                    Ordering::Less => {}
                 }
             }
         }
@@ -259,7 +302,7 @@ async fn payment_success(
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(my_keys, new_order_status, order).await {
+    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process

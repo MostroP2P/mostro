@@ -14,6 +14,7 @@ use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
@@ -236,13 +237,19 @@ async fn payment_success(
     if order.max_amount.is_some() && order.min_amount.is_some() {
         if let Some(max) = order.max_amount {
             if let Some(new_max) = max.checked_sub(order.fiat_amount) {
-                if new_max > 0 {
-                    // Update order in case
-                    order.max_amount = Some(new_max);
-                    order.range_parent_id = Some(order.id);
-                    order.id = uuid::Uuid::new_v4();
-                } else {
-                    new_order_status = Status::Success;
+                match new_max.cmp(&order.min_amount.unwrap()) {
+                    Ordering::Equal => {
+                        order.max_amount = None;
+                        order.min_amount = None;
+                        order.fiat_amount = new_max
+                    }
+                    Ordering::Greater => {
+                        // Update order in case
+                        order.max_amount = Some(new_max);
+                        order.range_parent_id = Some(order.id);
+                        order.id = uuid::Uuid::new_v4();
+                    }
+                    Ordering::Less => new_order_status = Status::Success,
                 }
             }
         }

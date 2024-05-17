@@ -56,13 +56,13 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         // kind (k) - The order kind (buy or sell)
         ("k".to_string(), order.kind.to_string()),
         // fiat_code (f) - The fiat code of the order
-        ("f".to_string(), create_fiat_amt_string(order)),
+        ("f".to_string(), order.fiat_code.to_string()),
         // status (s) - The order status
         ("s".to_string(), order.status.to_string()),
         // amount (amt) - The amount of sats
         ("amt".to_string(), order.amount.to_string()),
         // fiat_amount (fa) - The fiat amount
-        ("fa".to_string(), order.fiat_amount.to_string()),
+        ("fa".to_string(), create_fiat_amt_string(order)),
         // payment_method (pm) - The payment method
         ("pm".to_string(), order.payment_method.to_string()),
         // premium (premium) - The premium

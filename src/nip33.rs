@@ -31,7 +31,7 @@ pub fn new_event(
 
     for (key, value) in extra_tags.into_iter() {
         let tag = Tag::Generic(TagKind::Custom(key), vec![value]);
-        tags.push(tag.clone());
+        tags.push(tag);
     }
 
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)

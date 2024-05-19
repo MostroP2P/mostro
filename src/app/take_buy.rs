@@ -1,5 +1,6 @@
 use crate::util::{
-    get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg, show_hold_invoice,
+    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg,
+    show_hold_invoice,
 };
 
 use anyhow::{Error, Result};
@@ -46,6 +47,17 @@ pub async fn take_buy_action(
         error!("Order Id {order_id} wrong kind");
         send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
+    }
+
+    // Get amount request if user requested one for range order - fiat amount will be used below
+    if let Some(am) = get_fiat_amount_requested(&order, &msg) {
+        order.fiat_amount = am;
+    } else {
+        let error = format!(
+            "Amount requested is not correct, probably out of range min {:#?} - max {:#?}",
+            order.min_amount, order.max_amount
+        );
+        send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
     }
 
     let order_status = match Status::from_str(&order.status) {

@@ -38,13 +38,10 @@ uuid = { version = "1.8.0", features = [
   "serde",
 ] }
 reqwest = { version = "0.12.1", features = ["json"] }
-mostro-core = { version = "0.5.11", features = ["sqlx"] }
+mostro-core = { version = "0.5.12", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 config = "0.14.0"
 clap = { version = "4.5.3", features = ["derive"] }
 lnurl-rs = "0.5.0"
 openssl = { version = "0.10", features = ["vendored"] }
-
-[patch.crates-io]
-mostro-core = { path = "../mostro-core" }

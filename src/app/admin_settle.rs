@@ -58,7 +58,7 @@ pub async fn admin_settle_action(
     if order.status != Status::Dispute.to_string() {
         let error = format!(
             "Can't settle an order with status different than {}!",
-            Status::Dispute.to_string()
+            Status::Dispute
         );
         send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
 

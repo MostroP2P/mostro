@@ -111,8 +111,7 @@ pub async fn add_invoice_action(
                 Some(order.id),
                 Some(format!(
                     "You are not allowed to add an invoice because order Id {} status is {}",
-                    order_status.to_string(),
-                    order.id
+                    order_status, order.id
                 )),
                 &buyer_pubkey,
             )
@@ -134,6 +133,8 @@ pub async fn add_invoice_action(
             Some(Status::Active),
             order.amount,
             order.fiat_code.clone(),
+            order.min_amount,
+            order.max_amount,
             order.fiat_amount,
             order.payment_method.clone(),
             order.premium,

@@ -171,6 +171,8 @@ pub async fn publish_order(
         amount: new_order.amount,
         fee,
         fiat_code: new_order.fiat_code.clone(),
+        min_amount: new_order.min_amount,
+        max_amount: new_order.max_amount,
         fiat_amount: new_order.fiat_amount,
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
@@ -381,6 +383,7 @@ pub async fn show_hold_invoice(
         Some(Content::PaymentRequest(
             Some(new_order),
             invoice_response.payment_request,
+            None,
         )),
         seller_pubkey,
     )
@@ -461,6 +464,8 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         Some(status),
         buyer_final_amount,
         order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
@@ -565,5 +570,23 @@ pub async fn send_new_order_msg(
     let message = Message::new_order(order_id, None, action, content);
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
+    }
+}
+
+pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
+    // Check if order is range and get amount request after checking boundaries
+    // set order fiat amount to the value requested preparing for hold invoice
+    if order.is_range_order() {
+        if let Some(amount_buyer) = msg.get_inner_message_kind().get_amount() {
+            match Some(amount_buyer) <= order.max_amount && Some(amount_buyer) >= order.min_amount {
+                true => Some(amount_buyer),
+                false => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        // If order is not a range order return an Option with fiat amount of the order
+        Some(order.fiat_amount)
     }
 }

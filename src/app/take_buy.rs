@@ -58,6 +58,7 @@ pub async fn take_buy_action(
             order.min_amount, order.max_amount
         );
         send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
+        return Ok(());
     }
 
     let order_status = match Status::from_str(&order.status) {

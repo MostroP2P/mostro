@@ -1,6 +1,6 @@
 use crate::Settings;
 use chrono::Duration;
-use mostro_core::order::Order;
+use mostro_core::order::{Order, Status};
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -25,7 +25,10 @@ pub fn new_event(
 ) -> Result<Event, Error> {
     // This tag (nip33) allows us to change this event in particular in the future
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-    tags.push(Tag::Identifier(identifier)); // `d` tag
+    //tags.push(Tag::Identifier(identifier)); // `d` tag //Check with Yuki!
+    let tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![identifier]);
+    tags.push(tag);
+
     for (key, value) in extra_tags.into_iter() {
         let tag = Tag::Generic(TagKind::Custom(key), vec![value]);
         tags.push(tag);
@@ -34,6 +37,20 @@ pub fn new_event(
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
 
+fn create_fiat_amt_string(order: &Order) -> String {
+    if order.min_amount.is_some()
+        && order.max_amount.is_some()
+        && order.status == Status::Pending.to_string()
+    {
+        format!(
+            "{}-{}",
+            order.min_amount.unwrap(),
+            order.max_amount.unwrap()
+        )
+    } else {
+        order.fiat_amount.to_string()
+    }
+}
 /// Transform an order fields to tags
 ///
 /// # Arguments
@@ -51,7 +68,7 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         // amount (amt) - The amount of sats
         ("amt".to_string(), order.amount.to_string()),
         // fiat_amount (fa) - The fiat amount
-        ("fa".to_string(), order.fiat_amount.to_string()),
+        ("fa".to_string(), create_fiat_amt_string(order)),
         // payment_method (pm) - The payment method
         ("pm".to_string(), order.payment_method.to_string()),
         // premium (premium) - The premium

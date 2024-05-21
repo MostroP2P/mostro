@@ -243,6 +243,7 @@ async fn payment_success(
                         let mut new_order = order.clone();
                         new_order.max_amount = None;
                         new_order.min_amount = None;
+                        new_order.amount = 0;
                         new_order.fiat_amount = new_max;
                         new_order.status = Status::Pending.to_string();
                         new_order.id = uuid::Uuid::new_v4();
@@ -271,6 +272,7 @@ async fn payment_success(
                         let mut new_order = order.clone();
                         new_order.max_amount = Some(new_max);
                         new_order.range_parent_id = Some(order.id);
+                        new_order.amount = 0;
                         new_order.id = uuid::Uuid::new_v4();
                         new_order.status = Status::Pending.to_string();
                         // CRUD order creation

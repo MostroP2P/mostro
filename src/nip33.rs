@@ -1,6 +1,6 @@
 use crate::Settings;
 use chrono::Duration;
-use mostro_core::order::Order;
+use mostro_core::order::{Order, Status};
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -38,7 +38,10 @@ pub fn new_event(
 }
 
 fn create_fiat_amt_string(order: &Order) -> String {
-    if order.min_amount.is_some() && order.max_amount.is_some() {
+    if order.min_amount.is_some()
+        && order.max_amount.is_some()
+        && order.status == Status::Pending.to_string()
+    {
         format!(
             "{}-{}",
             order.min_amount.unwrap(),

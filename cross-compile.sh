@@ -2,10 +2,12 @@
 # To make this work you need to have cross installed
 # cargo install cross
 app="mostro"
-file="archs"
+archs_file="archs"
 manifest="manifest.txt"
-arch=`cat $file`
-mkdir -p bin
+arch=`cat $archs_file`
+if [ ! -d bin ]; then
+  mkdir bin
+fi
 rm bin/*
 for i in $arch; do
     echo "Cross compiling for $i"

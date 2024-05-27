@@ -150,3 +150,21 @@ volumes:
 ### Option 2: Connect to any other relay
 
 You just need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file with the relays you will use.
+
+# Contribute
+
+You may be interested in contributing to Mostro. If you're looking for somewhere to start contributing, check out the [good first issue](https://github.com/MostroP2P/mostro/labels/good%20first%20issue) list.
+
+More info in our [contributing guide](CONTRIBUTING.md).
+
+## Rewards board
+
+To incentivize collaborators we have a **Rewards board**, we must clarify that Mostro is not a company but an open source project, the amounts offered are a way to thank for collaboration and we can offer it thanks to the generous donation of contributors, mostly anonymous, but also to two important institutions that have given us grants, you can check it [here](https://github.com/orgs/MostroP2P/projects/2/views/1).
+
+# License
+
+Mostro is licensed under the [MIT license](LICENSE).
+
+```
+
+```

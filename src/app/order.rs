@@ -38,9 +38,15 @@ pub async fn order_action(
         // Get max and and min amount in case of range order
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
-            amount_vec.clear();
-            amount_vec.push(min);
-            amount_vec.push(max);
+            if order.amount == 0 {
+                amount_vec.clear();
+                amount_vec.push(min);
+                amount_vec.push(max);
+            } else {
+                let msg = "Amount must be 0 in case of range order".to_string();
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
         }
 
         for fiat_amount in amount_vec {
@@ -55,12 +61,12 @@ pub async fn order_action(
                 _ => order.amount,
             };
 
-        // Check amount is positive - extra safety check
-        if quote < 0 {
-            let msg = format!("Amount must be positive {} is not valid", order.amount);
-            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
-            return Ok(());
-        }
+            // Check amount is positive - extra safety check
+            if quote < 0 {
+                let msg = format!("Amount must be positive {} is not valid", order.amount);
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
 
             if quote > mostro_settings.max_order_amount as i64
                 || quote < mostro_settings.min_payment_amount as i64

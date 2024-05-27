@@ -251,7 +251,7 @@ async fn payment_success(
                         // CRUD order creation
                         new_order.clone().create(&pool).await?;
                         // We transform the order fields to tags to use in the event
-                        let tags = crate::nip33::order_to_tags(&new_order);
+                        let tags = crate::nip33::order_to_tags(&new_order, None);
 
                         info!("range order tags to be republished: {:#?}", tags);
                         // nip33 kind with order fields as tags and order id as identifier
@@ -278,7 +278,7 @@ async fn payment_success(
                         // CRUD order creation
                         new_order.clone().create(&pool).await?;
                         // We transform the order fields to tags to use in the event
-                        let tags = crate::nip33::order_to_tags(&new_order);
+                        let tags = crate::nip33::order_to_tags(&new_order, None);
 
                         info!("range order tags to be republished: {:#?}", tags);
                         // nip33 kind with order fields as tags and order id as identifier

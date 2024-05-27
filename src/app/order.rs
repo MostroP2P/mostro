@@ -55,12 +55,12 @@ pub async fn order_action(
                 _ => order.amount,
             };
 
-        // Check amount is positive - extra safety check
-        if quote < 0 {
-            let msg = format!("Amount must be positive {} is not valid", order.amount);
-            send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
-            return Ok(());
-        }
+            // Check amount is positive - extra safety check
+            if quote < 0 {
+                let msg = format!("Amount must be positive {} is not valid", order.amount);
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
 
             if quote > mostro_settings.max_order_amount as i64
                 || quote < mostro_settings.min_payment_amount as i64

@@ -1,6 +1,7 @@
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
+use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -51,13 +52,22 @@ fn create_fiat_amt_string(order: &Order) -> String {
         order.fiat_amount.to_string()
     }
 }
+
+fn create_rating_string(rating: Option<Rating>) -> String {
+    if rating.is_some() {
+        format!("{:?}", rating.unwrap(),)
+    } else {
+        "No user reputation received".to_string()
+    }
+}
+
 /// Transform an order fields to tags
 ///
 /// # Arguments
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
+pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<(String, String)> {
     let tags = vec![
         // kind (k) - The order kind (buy or sell)
         ("k".to_string(), order.kind.to_string()),
@@ -73,6 +83,8 @@ pub fn order_to_tags(order: &Order) -> Vec<(String, String)> {
         ("pm".to_string(), order.payment_method.to_string()),
         // premium (premium) - The premium
         ("premium".to_string(), order.premium.to_string()),
+        // User rating
+        ("Rating".to_string(), create_rating_string(reputation)),
         // Label to identify this is a Mostro's order
         ("y".to_string(), "mostrop2p".to_string()),
         // Table name

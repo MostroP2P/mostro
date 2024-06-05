@@ -19,7 +19,7 @@ use tracing::error;
 const MAX_RATING: u8 = 5;
 const MIN_RATING: u8 = 1;
 
-pub async fn get_counterpart_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
+pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
     let filters = Filter::new()
         .author(my_keys.public_key())
@@ -124,7 +124,7 @@ pub async fn update_user_reputation_action(
     }
 
     // Ask counterpart reputation
-    let rep = get_counterpart_reputation(&counterpart, my_keys).await?;
+    let rep = get_user_reputation(&counterpart, my_keys).await?;
     // Here we have to update values of the review of the counterpart
     let mut reputation;
 

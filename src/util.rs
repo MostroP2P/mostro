@@ -1,4 +1,5 @@
 use crate::cli::settings::Settings;
+use crate::app::rate_user::get_user_reputation;
 use crate::db;
 use crate::error::MostroError;
 use crate::flow;
@@ -197,8 +198,10 @@ pub async fn publish_order(
     let mut order = new_order_db.clone().create(pool).await?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
+    // Get user reputation
+    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&new_order_db);
+    let tags = order_to_tags(&new_order_db, reputation);
 
     info!("order tags to be published: {:#?}", tags);
     // nip33 kind with order fields as tags and order id as identifier
@@ -292,7 +295,7 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
     // update order.status with new status
     order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order_updated);
+    let tags = order_to_tags(&order_updated, None);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, "", order.id.to_string(), tags)?;
     let order_id = order.id.to_string();

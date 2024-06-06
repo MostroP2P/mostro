@@ -82,7 +82,7 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<(String, 
         // payment_method (pm) - The payment method
         ("pm".to_string(), order.payment_method.to_string()),
         // premium (premium) - The premium
-        ("w".to_string(), order.premium.to_string()),
+        ("premium".to_string(), order.premium.to_string()),
         // User rating
         ("rating".to_string(), create_rating_string(reputation)),
         // Label to identify this is a Mostro's order

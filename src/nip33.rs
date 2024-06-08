@@ -1,8 +1,8 @@
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
-use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use mostro_core::rating::Rating;
+use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
 
@@ -38,10 +38,13 @@ pub fn new_event(
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
 
-
 fn create_rating_string(rating: Option<Rating>) -> String {
-    if rating.is_some() {
-        format!("{:?}", rating.unwrap(),)
+    if let Some(rating) = rating {
+        if let Ok(rating_json) = rating.as_json() {
+            rating_json
+        } else {
+            "bad format value".to_string()
+        }
     } else {
         "none".to_string()
     }

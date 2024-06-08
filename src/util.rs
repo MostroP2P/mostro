@@ -1,5 +1,5 @@
-use crate::cli::settings::Settings;
 use crate::app::rate_user::get_user_reputation;
+use crate::cli::settings::Settings;
 use crate::db;
 use crate::error::MostroError;
 use crate::flow;

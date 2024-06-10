@@ -106,7 +106,7 @@ pub async fn hold_invoice_paid(hash: &str) -> Result<()> {
     }
 
     // Update the invoice_held_at field
-    crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_i64())
+    crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_u64() as i64)
         .await?;
 
     Ok(())

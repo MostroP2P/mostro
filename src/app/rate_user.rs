@@ -23,7 +23,7 @@ pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Ra
     // Request NIP33 of the counterparts
     let filters = Filter::new()
         .author(my_keys.public_key())
-        .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
+        .kind(Kind::ParameterizedReplaceable(NOSTR_REPLACEABLE_EVENT_KIND))
         .custom_tag(SingleLetterTag::lowercase(Alphabet::Z), vec!["rating"])
         .identifier(user.to_string());
 

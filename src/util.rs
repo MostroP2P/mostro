@@ -132,7 +132,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     let mostro_settings = Settings::get_mostro();
     // We calculate order expiration
     let expire_date: i64;
-    let expires_at_max: i64 = Timestamp::now().as_i64()
+    let expires_at_max: i64 = Timestamp::now().as_u64() as i64
         + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds();
     if let Some(mut exp) = expire {
         if exp > expires_at_max {
@@ -140,7 +140,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
         };
         expire_date = exp;
     } else {
-        expire_date = Timestamp::now().as_i64()
+        expire_date = Timestamp::now().as_u64() as i64
             + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
     }
     expire_date
@@ -177,7 +177,7 @@ pub async fn publish_order(
         fiat_amount: new_order.fiat_amount,
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
-        created_at: Timestamp::now().as_i64(),
+        created_at: Timestamp::now().as_u64() as i64,
         expires_at: expiry_date,
         ..Default::default()
     };
@@ -197,6 +197,9 @@ pub async fn publish_order(
     // CRUD order creation
     let mut order = new_order_db.clone().create(pool).await?;
     let order_id = order.id;
+    // Get user reputation
+    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
+
     info!("New order saved Id: {}", order_id);
     // Get user reputation
     let reputation = get_user_reputation(initiator_pubkey, keys).await?;

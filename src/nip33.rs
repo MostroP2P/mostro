@@ -26,12 +26,10 @@ pub fn new_event(
 ) -> Result<Event, Error> {
     // This tag (nip33) allows us to change this event in particular in the future
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-    //tags.push(Tag::Identifier(identifier)); // `d` tag //Check with Yuki!
-    let tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![identifier]);
-    tags.push(tag);
+    tags.push(Tag::identifier(identifier)); // `d` tag //Check with Yuki!
 
     for (key, value) in extra_tags.into_iter() {
-        let tag = Tag::Generic(TagKind::Custom(key), vec![value]);
+        let tag = Tag::custom(TagKind::Custom(key.into()), vec![value]);
         tags.push(tag);
     }
 
@@ -64,6 +62,15 @@ fn create_fiat_amt_string(order: &Order) -> String {
         order.fiat_amount.to_string()
     }
 }
+
+fn create_rating_string(rating: Option<Rating>) -> String {
+    if rating.is_some() {
+        format!("{:?}", rating.unwrap(),)
+    } else {
+        "No user reputation received".to_string()
+    }
+}
+
 /// Transform an order fields to tags
 ///
 /// # Arguments

@@ -201,6 +201,8 @@ pub async fn publish_order(
     let reputation = get_user_reputation(initiator_pubkey, keys).await?;
 
     info!("New order saved Id: {}", order_id);
+    // Get user reputation
+    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
 

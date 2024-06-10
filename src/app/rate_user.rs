@@ -145,7 +145,7 @@ pub async fn update_user_reputation_action(
         // Assing new total rating to review
         reputation.total_rating = new_rating;
     } else {
-        reputation = Rating::new(1, rating as f64, MIN_RATING, MAX_RATING, rating);
+        reputation = Rating::new(1, rating as f64, rating, MIN_RATING, MAX_RATING);
     }
     let reputation = reputation.to_tags()?;
 

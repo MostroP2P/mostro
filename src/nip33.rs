@@ -36,6 +36,18 @@ pub fn new_event(
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
 
+fn create_rating_string(rating: Option<Rating>) -> String {
+    if let Some(rating) = rating {
+        if let Ok(rating_json) = rating.as_json() {
+            rating_json
+        } else {
+            "bad format value".to_string()
+        }
+    } else {
+        "none".to_string()
+    }
+}
+
 fn create_fiat_amt_string(order: &Order) -> String {
     if order.min_amount.is_some()
         && order.max_amount.is_some()
@@ -82,7 +94,7 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<(String, 
         // premium (premium) - The premium
         ("premium".to_string(), order.premium.to_string()),
         // User rating
-        ("Rating".to_string(), create_rating_string(reputation)),
+        ("rating".to_string(), create_rating_string(reputation)),
         // Label to identify this is a Mostro's order
         ("y".to_string(), "mostrop2p".to_string()),
         // Table name

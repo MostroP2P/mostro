@@ -63,14 +63,6 @@ fn create_fiat_amt_string(order: &Order) -> String {
     }
 }
 
-fn create_rating_string(rating: Option<Rating>) -> String {
-    if rating.is_some() {
-        format!("{:?}", rating.unwrap(),)
-    } else {
-        "No user reputation received".to_string()
-    }
-}
-
 /// Transform an order fields to tags
 ///
 /// # Arguments

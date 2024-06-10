@@ -197,9 +197,6 @@ pub async fn publish_order(
     // CRUD order creation
     let mut order = new_order_db.clone().create(pool).await?;
     let order_id = order.id;
-    // Get user reputation
-    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
-
     info!("New order saved Id: {}", order_id);
     // Get user reputation
     let reputation = get_user_reputation(initiator_pubkey, keys).await?;

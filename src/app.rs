@@ -33,8 +33,8 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
 use tracing::error;
+use tracing::info;
 
 fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
@@ -77,21 +77,24 @@ pub async fn run(
                                             }
                                             Action::TakeSell => {
                                                 if let Err(e) =
-                                                    take_sell_action(msg, &event, &my_keys, &pool).await
+                                                    take_sell_action(msg, &event, &my_keys, &pool)
+                                                        .await
                                                 {
                                                     warning_msg(&action, e)
                                                 }
                                             }
                                             Action::TakeBuy => {
                                                 if let Err(e) =
-                                                    take_buy_action(msg, &event, &my_keys, &pool).await
+                                                    take_buy_action(msg, &event, &my_keys, &pool)
+                                                        .await
                                                 {
                                                     warning_msg(&action, e)
                                                 }
                                             }
                                             Action::FiatSent => {
                                                 if let Err(e) =
-                                                    fiat_sent_action(msg, &event, &my_keys, &pool).await
+                                                    fiat_sent_action(msg, &event, &my_keys, &pool)
+                                                        .await
                                                 {
                                                     warning_msg(&action, e)
                                                 }
@@ -138,7 +141,8 @@ pub async fn run(
                                             }
                                             Action::Dispute => {
                                                 if let Err(e) =
-                                                    dispute_action(msg, &event, &my_keys, &pool).await
+                                                    dispute_action(msg, &event, &my_keys, &pool)
+                                                        .await
                                                 {
                                                     warning_msg(&action, e)
                                                 }
@@ -172,7 +176,8 @@ pub async fn run(
                                             }
                                             Action::AdminTakeDispute => {
                                                 if let Err(e) =
-                                                    admin_take_dispute_action(msg, &event, &pool).await
+                                                    admin_take_dispute_action(msg, &event, &pool)
+                                                        .await
                                                 {
                                                     warning_msg(&action, e)
                                                 }

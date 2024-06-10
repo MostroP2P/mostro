@@ -34,6 +34,7 @@ use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
+use tracing::error;
 
 fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
@@ -62,123 +63,126 @@ pub async fn run(
 
                     if let Ok(m) = message {
                         let message = Message::from_json(&m);
-                        if let Ok(msg) = message {
-                            if msg.get_inner_message_kind().verify() {
-                                if let Some(action) = msg.inner_action() {
-                                    match action {
-                                        Action::NewOrder => {
-                                            if let Err(e) =
-                                                order_action(msg, &event, &my_keys, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                        match message {
+                            Ok(msg) => {
+                                if msg.get_inner_message_kind().verify() {
+                                    if let Some(action) = msg.inner_action() {
+                                        match action {
+                                            Action::NewOrder => {
+                                                if let Err(e) =
+                                                    order_action(msg, &event, &my_keys, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::TakeSell => {
-                                            if let Err(e) =
-                                                take_sell_action(msg, &event, &my_keys, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::TakeSell => {
+                                                if let Err(e) =
+                                                    take_sell_action(msg, &event, &my_keys, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::TakeBuy => {
-                                            if let Err(e) =
-                                                take_buy_action(msg, &event, &my_keys, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::TakeBuy => {
+                                                if let Err(e) =
+                                                    take_buy_action(msg, &event, &my_keys, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::FiatSent => {
-                                            if let Err(e) =
-                                                fiat_sent_action(msg, &event, &my_keys, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::FiatSent => {
+                                                if let Err(e) =
+                                                    fiat_sent_action(msg, &event, &my_keys, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::Release => {
-                                            if let Err(e) = release_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::Release => {
+                                                if let Err(e) = release_action(
+                                                    msg, &event, &my_keys, &pool, ln_client,
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::Cancel => {
-                                            if let Err(e) = cancel_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::Cancel => {
+                                                if let Err(e) = cancel_action(
+                                                    msg, &event, &my_keys, &pool, ln_client,
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::AddInvoice => {
-                                            if let Err(e) =
-                                                add_invoice_action(msg, &event, &my_keys, &pool)
-                                                    .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::AddInvoice => {
+                                                if let Err(e) =
+                                                    add_invoice_action(msg, &event, &my_keys, &pool)
+                                                        .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::PayInvoice => todo!(),
-                                        Action::RateUser => {
-                                            if let Err(e) = update_user_reputation_action(
-                                                msg,
-                                                &event,
-                                                &my_keys,
-                                                &pool,
-                                                rate_list.clone(),
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::PayInvoice => todo!(),
+                                            Action::RateUser => {
+                                                if let Err(e) = update_user_reputation_action(
+                                                    msg,
+                                                    &event,
+                                                    &my_keys,
+                                                    &pool,
+                                                    rate_list.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::Dispute => {
-                                            if let Err(e) =
-                                                dispute_action(msg, &event, &my_keys, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::Dispute => {
+                                                if let Err(e) =
+                                                    dispute_action(msg, &event, &my_keys, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::AdminCancel => {
-                                            if let Err(e) = admin_cancel_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::AdminCancel => {
+                                                if let Err(e) = admin_cancel_action(
+                                                    msg, &event, &my_keys, &pool, ln_client,
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::AdminSettle => {
-                                            if let Err(e) = admin_settle_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::AdminSettle => {
+                                                if let Err(e) = admin_settle_action(
+                                                    msg, &event, &my_keys, &pool, ln_client,
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::AdminAddSolver => {
-                                            if let Err(e) = admin_add_solver_action(
-                                                msg, &event, &my_keys, &pool,
-                                            )
-                                            .await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::AdminAddSolver => {
+                                                if let Err(e) = admin_add_solver_action(
+                                                    msg, &event, &my_keys, &pool,
+                                                )
+                                                .await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
-                                        }
-                                        Action::AdminTakeDispute => {
-                                            if let Err(e) =
-                                                admin_take_dispute_action(msg, &event, &pool).await
-                                            {
-                                                warning_msg(&action, e)
+                                            Action::AdminTakeDispute => {
+                                                if let Err(e) =
+                                                    admin_take_dispute_action(msg, &event, &pool).await
+                                                {
+                                                    warning_msg(&action, e)
+                                                }
                                             }
+                                            _ => info!("Received message with action {:?}", action),
                                         }
-                                        _ => info!("Received message with action {:?}", action),
                                     }
                                 }
                             }
+                            Err(e) => error!("Failed to parse message from JSON: {:?}", e),
                         }
                     };
                 }

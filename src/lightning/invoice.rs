@@ -86,7 +86,7 @@ mod tests {
 
     fn init_settings_test() {
         let test_path = PathBuf::from("./");
-        set_var("RUN_MODE", "tpl");
+        set_var("RUN_MODE", ".tpl");
         MOSTRO_CONFIG.get_or_init(|| Settings::new(test_path).unwrap());
     }
 

@@ -124,13 +124,16 @@ pub fn init_global_settings(s: Settings) {
 
 impl Settings {
     pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
+        use std::env;
+        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "".into());
+        let run_mode = format!("{}.toml", run_mode);
         let file_name = {
             if !has_trailing_slash(config_path.as_path()) {
                 add_trailing_slash(&mut config_path);
-                let tmp = format!("{}settings.toml", config_path.display());
+                let tmp = format!("{}settings{}", config_path.display(), run_mode);
                 tmp
             } else {
-                format!("{}settings.toml", config_path.display())
+                format!("{}settings{}", config_path.display(), run_mode)
             }
         };
 

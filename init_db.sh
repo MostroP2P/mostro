@@ -1,15 +1,10 @@
 #!/bin/sh
 echo "Clean project"
-if ls Cargo.lock 1> /dev/null 2>&1; then
-    echo "Deleting Cargo.lock"
-    rm ./Cargo.lock
-fi
 if ls sqlx-data.json 1> /dev/null 2>&1; then
     echo "Deleting old sqlx-data.json"
     rm ./sqlx-data.json
 fi
 
-cargo clean
 echo "Reading database URL from settings.toml..."
 DATABASE_URL=$(awk -F'"' '/url *= */ {print $2}' settings.tpl.toml)
 export DATABASE_URL

@@ -2,7 +2,6 @@ use crate::MOSTRO_CONFIG;
 use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
@@ -125,14 +124,13 @@ pub fn init_global_settings(s: Settings) {
 
 impl Settings {
     pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
-        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "dev".into());
         let file_name = {
             if !has_trailing_slash(config_path.as_path()) {
                 add_trailing_slash(&mut config_path);
-                let tmp = format!("{}settings.{}.toml", config_path.display(), run_mode);
+                let tmp = format!("{}settings.toml", config_path.display());
                 tmp
             } else {
-                format!("{}settings.{}.toml", config_path.display(), run_mode)
+                format!("{}settings.toml", config_path.display())
             }
         };
 

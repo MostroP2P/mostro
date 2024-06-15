@@ -66,15 +66,17 @@ $ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 
 ## Install
 
-Clone the repository and then create a new `settings.dev.toml` file based on `settings.tpl.toml` file.
+If you want to run Mostro on your local machine, you can follow the instructions below, if you want to run it on a server, you can follow the instructions in the [INSTALL.md](INSTALL.md) file.
+
+Clone the repository and then create a new `settings.toml` file based on `settings.tpl.toml` file.
 
 ```
 $ git clone https://github.com/MostroP2P/mostro.git
 $ cd mostro
-$ cp settings.tpl.toml settings.dev.toml
+$ cp settings.tpl.toml settings.toml
 ```
 
-To connect to an LND node, you must define 4 variables within the [lightning] section of the settings.dev.toml file.
+To connect to an LND node, you must define 4 variables within the [lightning] section of the settings.toml file.
 
 _lnd_cert_file:_ LND node TLS certificate file path.
 
@@ -86,7 +88,7 @@ _lnd_grpc_port:_ LND node port to connect, example: `10009`.
 
 ### Database
 
-The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.dev.toml` file.
+The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.
 
 Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
@@ -97,12 +99,12 @@ $ ./init_db.sh
 
 ### Running it:
 
-Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.dev.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
+Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
 
-You must create a .mostro directory in /home/user/ and copy the settings.dev.toml and mostro.db files inside.
+You must create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
 
 ```bash
-$ mkdir $HOME/.mostro/ && cp settings.dev.toml mostro.db $HOME/.mostro/
+$ mkdir $HOME/.mostro/ && cp settings.toml mostro.db $HOME/.mostro/
 ```
 
 Finnaly run it:
@@ -124,7 +126,7 @@ This will spin a new docker container with an instance of [nostr-rs-relay](https
 
 So the relay URL you want to connect to is: `ws://localhost:7000`.
 
-You need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file:  
+You need to set `relays` in the `[nostr]` section of the `settings.toml` file:
 relays = ['ws://localhost:7000']
 
 #### Troubleshooting:
@@ -149,7 +151,7 @@ volumes:
 
 ### Option 2: Connect to any other relay
 
-You just need to set `relays` in the `[nostr]` section of the `settings.dev.toml` file with the relays you will use.
+You just need to set `relays` in the `[nostr]` section of the `settings.toml` file with the relays you will use.
 
 # Contribute
 

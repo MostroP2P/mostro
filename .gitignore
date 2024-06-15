@@ -11,8 +11,7 @@ mostro.log
 .vscode
 
 # settings file
-settings.dev.toml
-settings.prod.toml
+settings.toml
 
 book/book/
 bin/

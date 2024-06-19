@@ -1,0 +1,46 @@
+[lightning]
+# path to tls.cert file
+lnd_cert_file = '/lnd/alice/tls.cert'
+# path to macaroon file
+lnd_macaroon_file = '/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
+lnd_grpc_port = 10001
+lnd_grpc_host = '127.0.0.1'
+# lightning invoices sent by the buyer to Mostro should have at least
+# this expiration time in seconds
+invoice_expiration_window = 3600
+# Hold invoice cltv delta (expiration time in blocks)
+hold_invoice_cltv_delta = 144
+# This is the time that a taker has to pay the invoice (seller) or 
+# to add a new invoice (buyer), in seconds
+hold_invoice_expiration_window = 300
+# Retries for failed payments
+payment_attempts = 3
+# Retries interval for failed payments
+payment_retries_interval = 60
+
+[nostr]
+nsec_privkey = 'nsec1...'
+relays = ['ws://localhost:7000']
+
+[mostro]
+# Mostro Fee
+fee = 0
+# Max routing fee that we want to pay to the network, 0.001 = 0.1%
+max_routing_fee = 0.001
+# Max order amount (sats)
+max_order_amount = 1000000
+# Minimum amount for a payment in satoshis
+min_payment_amount = 100
+# Expiration order hours
+expiration_hours = 24
+# Max expiration days for an order
+max_expiration_days = 15
+# Expiration of pending orders
+expiration_seconds = 900
+# User rate events scheduled time interval
+user_rates_sent_interval_seconds = 3600
+
+
+
+[database]
+url = "sqlite:///config/mostro.db"

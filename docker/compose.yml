@@ -1,0 +1,6 @@
+services:
+  mostro:
+    build: .
+    volumes:
+      - ./config:/config  # settings.toml and mostro.db
+      - ~/.polar/networks/1/volumes/lnd:/lnd # LND data

@@ -1,6 +1,4 @@
-use crate::util::{
-    nostr_tags_to_tuple, send_cant_do_msg, send_new_order_msg, update_user_rating_event,
-};
+use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
@@ -40,7 +38,7 @@ pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Ra
 
     // Sort events by time
     user_reputation_event.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    let tags = nostr_tags_to_tuple(user_reputation_event[0].tags.clone());
+    let tags = user_reputation_event[0].tags.clone();
     let reputation = Rating::from_tags(tags)?;
 
     Ok(Some(reputation))

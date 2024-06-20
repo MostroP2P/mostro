@@ -66,52 +66,52 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 /// * `order` - The order to transform
 ///
 pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<Tag> {
-    let mut tags: Vec<Tag> = vec![];
-
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("k")),
-        vec![order.kind.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("f")),
-        vec![order.fiat_code.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("s")),
-        vec![order.status.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("amt")),
-        vec![order.amount.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("fa")),
-        vec![create_fiat_amt_array(order)],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("pm")),
-        vec![order.payment_method.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("premium")),
-        vec![order.premium.to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("rating")),
-        vec![create_rating_string(reputation)],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-        vec!["mostrop2p".to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("z")),
-        vec!["order".to_string()],
-    ));
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("expiration")),
-        vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
-    ));
+    let tags: Vec<Tag> = vec![
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("k")),
+            vec![order.kind.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("f")),
+            vec![order.fiat_code.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+            vec![order.status.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("amt")),
+            vec![order.amount.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("fa")),
+            create_fiat_amt_array(order),
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("pm")),
+            vec![order.payment_method.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("premium")),
+            vec![order.premium.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("rating")),
+            vec![create_rating_string(reputation)],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostrop2p".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["order".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("expiration")),
+            vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+        ),
+    ];
 
     tags
 }

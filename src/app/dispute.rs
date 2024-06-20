@@ -140,11 +140,21 @@ pub async fn dispute_action(
     .await;
 
     // We create a tag to show status of the dispute
-    let tags = vec![
-        ("s".to_string(), dispute.status.to_string()),
-        ("y".to_string(), "mostrop2p".to_string()),
-        ("z".to_string(), "dispute".to_string()),
+    let tags: Vec<Tag> = vec![
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+            vec![dispute.status.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostrop2p".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["dispute".to_string()],
+        ),
     ];
+
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "", dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");

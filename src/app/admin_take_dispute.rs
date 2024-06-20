@@ -127,10 +127,19 @@ pub async fn admin_take_dispute_action(
     send_dm(&buyer_pubkey, message.clone()).await?;
     send_dm(&seller_pubkey, message).await?;
     // We create a tag to show status of the dispute
-    let tags = vec![
-        ("s".to_string(), Status::InProgress.to_string()),
-        ("y".to_string(), "mostrop2p".to_string()),
-        ("z".to_string(), "dispute".to_string()),
+    let tags: Vec<Tag> = vec![
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+            vec![Status::InProgress.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostrop2p".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["dispute".to_string()],
+        ),
     ];
     // nip33 kind with dispute id as identifier
     let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;

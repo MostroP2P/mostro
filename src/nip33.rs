@@ -1,3 +1,5 @@
+use std::vec;
+
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
@@ -22,16 +24,11 @@ pub fn new_event(
     keys: &Keys,
     content: &str,
     identifier: String,
-    extra_tags: Vec<(String, String)>,
+    extra_tags: Vec<Tag>,
 ) -> Result<Event, Error> {
-    // This tag (nip33) allows us to change this event in particular in the future
-    let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-    tags.push(Tag::identifier(identifier)); // `d` tag //Check with Yuki!
-
-    for (key, value) in extra_tags.into_iter() {
-        let tag = Tag::custom(TagKind::Custom(key.into()), vec![value]);
-        tags.push(tag);
-    }
+    let mut tags: Vec<Tag> = vec![];
+    tags.push(Tag::identifier(identifier));
+    tags.append(&mut extra_tags.clone());
 
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags).to_event(keys)
 }
@@ -48,18 +45,17 @@ fn create_rating_string(rating: Option<Rating>) -> String {
     }
 }
 
-fn create_fiat_amt_string(order: &Order) -> String {
+fn create_fiat_amt_array(order: &Order) -> Vec<String> {
     if order.min_amount.is_some()
         && order.max_amount.is_some()
         && order.status == Status::Pending.to_string()
     {
-        format!(
-            "{}-{}",
-            order.min_amount.unwrap(),
-            order.max_amount.unwrap()
-        )
+        vec![
+            order.min_amount.unwrap().to_string(),
+            order.max_amount.unwrap().to_string(),
+        ]
     } else {
-        order.fiat_amount.to_string()
+        vec![order.fiat_amount.to_string()]
     }
 }
 
@@ -69,32 +65,51 @@ fn create_fiat_amt_string(order: &Order) -> String {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<(String, String)> {
-    let tags = vec![
-        // kind (k) - The order kind (buy or sell)
-        ("k".to_string(), order.kind.to_string()),
-        // fiat_code (f) - The fiat code of the order
-        ("f".to_string(), order.fiat_code.to_string()),
-        // status (s) - The order status
-        ("s".to_string(), order.status.to_string()),
-        // amount (amt) - The amount of sats
-        ("amt".to_string(), order.amount.to_string()),
-        // fiat_amount (fa) - The fiat amount
-        ("fa".to_string(), create_fiat_amt_string(order)),
-        // payment_method (pm) - The payment method
-        ("pm".to_string(), order.payment_method.to_string()),
-        // premium (premium) - The premium
-        ("premium".to_string(), order.premium.to_string()),
-        // User rating
-        ("rating".to_string(), create_rating_string(reputation)),
-        // Label to identify this is a Mostro's order
-        ("y".to_string(), "mostrop2p".to_string()),
-        // Table name
-        ("z".to_string(), "order".to_string()),
-        // Nip 40 expiration time - 12 hours over expiration user time
-        (
-            "expiration".to_string(),
-            (order.expires_at + Duration::hours(12).num_seconds()).to_string(),
+pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<Tag> {
+    let tags: Vec<Tag> = vec![
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("k")),
+            vec![order.kind.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("f")),
+            vec![order.fiat_code.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+            vec![order.status.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("amt")),
+            vec![order.amount.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("fa")),
+            create_fiat_amt_array(order),
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("pm")),
+            vec![order.payment_method.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("premium")),
+            vec![order.premium.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("rating")),
+            vec![create_rating_string(reputation)],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostrop2p".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["order".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("expiration")),
+            vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
         ),
     ];
 
@@ -106,61 +121,63 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<(String, 
 /// # Arguments
 ///
 ///
-pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<(String, String)> {
+pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<Tag> {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
-    let tags = vec![
-        // max_order_amount
-        ("mostro_pubkey".to_string(), mostro_pubkey.to_string()),
-        // mostro version
-        (
-            "mostro_version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
+    let tags: Vec<Tag> = vec![
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("mostro_pubkey")),
+            vec![mostro_pubkey.to_string()],
         ),
-        // mostro commit id
-        ("mostro_commit_id".to_string(), env!("GIT_HASH").to_string()),
-        // max_order_amount
-        (
-            "max_order_amount".to_string(),
-            mostro_settings.max_order_amount.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("mostro_version")),
+            vec![env!("CARGO_PKG_VERSION").to_string()],
         ),
-        // min_order_amount
-        (
-            "min_order_amount".to_string(),
-            mostro_settings.min_payment_amount.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("mostro_commit_id")),
+            vec![env!("GIT_HASH").to_string()],
         ),
-        // expiration_hours
-        (
-            "expiration_hours".to_string(),
-            mostro_settings.expiration_hours.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("max_order_amount")),
+            vec![mostro_settings.max_order_amount.to_string()],
         ),
-        // expiration_seconds
-        (
-            "expiration_seconds".to_string(),
-            mostro_settings.expiration_seconds.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("min_order_amount")),
+            vec![mostro_settings.min_payment_amount.to_string()],
         ),
-        // fee
-        ("fee".to_string(), mostro_settings.fee.to_string()),
-        // hold_invoice_expiration_window
-        (
-            "hold_invoice_expiration_window".to_string(),
-            ln_settings.hold_invoice_expiration_window.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("expiration_hours")),
+            vec![mostro_settings.expiration_hours.to_string()],
         ),
-        // hold_invoice_cltv_delta
-        (
-            "hold_invoice_cltv_delta".to_string(),
-            ln_settings.hold_invoice_cltv_delta.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("expiration_seconds")),
+            vec![mostro_settings.expiration_seconds.to_string()],
         ),
-        // invoice_expiration_window
-        (
-            "invoice_expiration_window".to_string(),
-            ln_settings.hold_invoice_expiration_window.to_string(),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("fee")),
+            vec![mostro_settings.fee.to_string()],
         ),
-        // Label to identify this is a Mostro's infos
-        ("y".to_string(), "mostrop2p".to_string()),
-        // Table name
-        ("z".to_string(), "info".to_string()),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("hold_invoice_expiration_window")),
+            vec![ln_settings.hold_invoice_expiration_window.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("hold_invoice_cltv_delta")),
+            vec![ln_settings.hold_invoice_cltv_delta.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("invoice_expiration_window")),
+            vec![ln_settings.hold_invoice_expiration_window.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostrop2p".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["info".to_string()],
+        ),
     ];
 
     tags

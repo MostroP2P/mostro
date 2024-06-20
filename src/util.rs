@@ -259,7 +259,7 @@ pub async fn update_user_rating_event(
     user: &str,
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
-    tags: Vec<(String, String)>,
+    tags: Vec<Tag>,
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
@@ -536,16 +536,6 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
         let _ = write!(output, "{:02x}", b);
         output
     })
-}
-
-pub fn nostr_tags_to_tuple(tags: Vec<Tag>) -> Vec<(String, String)> {
-    let mut tags_tuple = Vec::new();
-    for tag in tags {
-        let t = tag.as_vec();
-        tags_tuple.push((t[0].to_string(), t[1].to_string()));
-    }
-
-    tags_tuple
 }
 
 pub async fn send_cant_do_msg(

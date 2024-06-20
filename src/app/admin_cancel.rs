@@ -81,10 +81,19 @@ pub async fn admin_cancel_action(
         d.status = DisputeStatus::SellerRefunded.to_string();
         d.update(pool).await?;
         // We create a tag to show status of the dispute
-        let tags = vec![
-            ("s".to_string(), DisputeStatus::SellerRefunded.to_string()),
-            ("y".to_string(), "mostrop2p".to_string()),
-            ("z".to_string(), "dispute".to_string()),
+        let tags: Vec<Tag> = vec![
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+                vec![DisputeStatus::SellerRefunded.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+                vec!["mostrop2p".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+                vec!["dispute".to_string()],
+            ),
         ];
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;

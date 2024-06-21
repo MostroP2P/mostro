@@ -236,20 +236,31 @@ async fn payment_success(
     if order.max_amount.is_some() && order.min_amount.is_some() {
         if let Some(max) = order.max_amount {
             if let Some(new_max) = max.checked_sub(order.fiat_amount) {
+                let mut new_order = order.clone();
+                new_order.amount = 0;
+                new_order.hash = None;
+                new_order.preimage = None;
+                new_order.buyer_invoice = None;
+                new_order.taken_at = 0;
+                new_order.invoice_held_at = 0;
+                new_order.range_parent_id = Some(order.id);
+                if new_order.kind == "sell" {
+                    new_order.buyer_pubkey = None;
+                    new_order.master_buyer_pubkey = None;
+                } else {
+                    new_order.seller_pubkey = None;
+                    new_order.master_seller_pubkey = None;
+                }
                 match new_max.cmp(&order.min_amount.unwrap()) {
                     Ordering::Equal => {
                         // Update order in case max == min
                         let pool = db::connect().await?;
-                        let mut new_order = order.clone();
+                        new_order.fiat_amount = new_max;
                         new_order.max_amount = None;
                         new_order.min_amount = None;
-                        new_order.amount = 0;
-                        new_order.fiat_amount = new_max;
                         new_order.status = Status::Pending.to_string();
                         new_order.id = uuid::Uuid::new_v4();
                         new_order.status = Status::Pending.to_string();
-                        // CRUD order creation
-                        new_order.clone().create(&pool).await?;
                         // We transform the order fields to tags to use in the event
                         let tags = crate::nip33::order_to_tags(&new_order, None);
 
@@ -257,7 +268,11 @@ async fn payment_success(
                         // nip33 kind with order fields as tags and order id as identifier
                         let event =
                             crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-
+                        let event_id = event.id.to_string();
+                        // We update the order with the new event_id
+                        new_order.event_id = event_id;
+                        // CRUD order creation
+                        new_order.clone().create(&pool).await?;
                         let _ = NOSTR_CLIENT
                             .get()
                             .unwrap()
@@ -269,14 +284,12 @@ async fn payment_success(
                     Ordering::Greater => {
                         // Update order in case new max is still greater the min amount
                         let pool = db::connect().await?;
-                        let mut new_order = order.clone();
+                        // let mut new_order = order.clone();
                         new_order.max_amount = Some(new_max);
-                        new_order.range_parent_id = Some(order.id);
-                        new_order.amount = 0;
+                        new_order.fiat_amount = 0;
                         new_order.id = uuid::Uuid::new_v4();
                         new_order.status = Status::Pending.to_string();
                         // CRUD order creation
-                        new_order.clone().create(&pool).await?;
                         // We transform the order fields to tags to use in the event
                         let tags = crate::nip33::order_to_tags(&new_order, None);
 
@@ -284,7 +297,10 @@ async fn payment_success(
                         // nip33 kind with order fields as tags and order id as identifier
                         let event =
                             crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-
+                        let event_id = event.id.to_string();
+                        // We update the order with the new event_id
+                        new_order.event_id = event_id;
+                        new_order.clone().create(&pool).await?;
                         let _ = NOSTR_CLIENT
                             .get()
                             .unwrap()

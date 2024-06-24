@@ -110,14 +110,29 @@ pub async fn take_sell_action(
         }
     }
 
-    // We update the master pubkey
-    order
-        .master_buyer_pubkey
-        .clone_from(&msg.get_inner_message_kind().pubkey);
-    // Add buyer pubkey to order
-    order.buyer_pubkey = Some(buyer_pubkey.to_string());
-    // Timestamp take order time
-    order.taken_at = Timestamp::now().as_u64() as i64;
+    if order_status == Status::Pending {
+        // We update the master pubkey
+        order
+            .master_buyer_pubkey
+            .clone_from(&msg.get_inner_message_kind().pubkey);
+        // Add buyer pubkey to order
+        order.buyer_pubkey = Some(buyer_pubkey.to_string());
+        // Timestamp take order time
+        order.taken_at = Timestamp::now().as_u64() as i64;
+    }
+
+    if order_status == Status::WaitingBuyerInvoice {
+        if let Some(ref buyer) = order.buyer_pubkey {
+            if buyer != &buyer_pubkey.to_string() {
+                send_dm(
+                    &buyer_pubkey,
+                    format!("Order Id {order_id} was taken by another user!"),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {

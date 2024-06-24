@@ -75,10 +75,7 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
-    if buyer_pubkey == event.pubkey {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
-        return Ok(());
-    }
+
     // We update the master pubkey
     order
         .master_seller_pubkey

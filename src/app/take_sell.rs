@@ -42,6 +42,7 @@ pub async fn take_sell_action(
             order.min_amount, order.max_amount
         );
         send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
+        return Ok(());
     }
 
     // Maker can't take own order

@@ -127,10 +127,12 @@ impl LndConnector {
             .invoices()
             .settle_invoice(preimage_message)
             .await
-            .expect("Failed to settle hold invoice")
-            .into_inner();
+            .map_err(|e| e.to_string());
 
-        Ok(settle)
+        match settle {
+            Ok(settle) => Ok(settle.into_inner()),
+            Err(e) => Err(LndClientError::cancelled(e)),
+        }
     }
 
     pub async fn cancel_hold_invoice(
@@ -145,10 +147,12 @@ impl LndConnector {
             .invoices()
             .cancel_invoice(cancel_message)
             .await
-            .expect("Failed to cancel hold invoice")
-            .into_inner();
+            .map_err(|e| e.to_string());
 
-        Ok(cancel)
+        match cancel {
+            Ok(cancel) => Ok(cancel.into_inner()),
+            Err(e) => Err(LndClientError::cancelled(e)),
+        }
     }
 
     pub async fn send_payment(

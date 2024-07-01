@@ -8,7 +8,7 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, Message, MessageKind};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -53,6 +53,20 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
+
+    // Was order cooperatively cancelled?
+    if order.status == Status::CooperativelyCanceled.to_string() {
+        let message = MessageKind::new(
+            Some(order_id),
+            Some(event.pubkey.to_string()),
+            Action::CooperativeCancelAccepted,
+            None,
+        );
+        if let Ok(message) = message.as_json() {
+            let _ = send_dm(&event.pubkey, message).await;
+        }
+        return Ok(());
+    }
 
     if order.status != Status::Dispute.to_string() {
         let error = format!(

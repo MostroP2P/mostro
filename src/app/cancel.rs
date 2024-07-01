@@ -102,6 +102,8 @@ pub async fn cancel_action(
                         );
                     }
                     order.status = Status::CooperativelyCanceled.to_string();
+                    // update db
+                    let order = order.update(pool).await?;
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
                     update_order_event(my_keys, Status::CooperativelyCanceled, &order).await?;

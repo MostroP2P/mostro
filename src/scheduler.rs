@@ -7,8 +7,10 @@ use crate::NOSTR_CLIENT;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
-use nostr_sdk::Event;
+use nostr_sdk::EventBuilder;
+use nostr_sdk::{Event, Kind as NostrKind, Tag, Url};
 use sqlx_crud::Crud;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -22,8 +24,37 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_info_event_send().await;
+    job_relay_list().await;
 
     info!("Scheduler Started");
+}
+
+async fn job_relay_list() {
+    let mostro_pubkey = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
+    tokio::spawn(async move {
+        loop {
+            info!("Sending Mostro relay list");
+
+            let interval = Settings::get_mostro().publish_relays_interval as u64;
+            let relay_list = Settings::get_nostr().relays;
+            let mut relay_tags: Vec<Tag> = vec![];
+
+            for r in relay_list {
+                relay_tags.push(Tag::relay_metadata(Url::from_str(&r).unwrap(), None))
+            }
+
+            if let Ok(relay_ev) =
+                EventBuilder::new(NostrKind::RelayList, "", relay_tags).to_event(&mostro_pubkey)
+            {
+                let _ = NOSTR_CLIENT.get().unwrap().send_event(relay_ev).await;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
 }
 
 async fn job_info_event_send() {

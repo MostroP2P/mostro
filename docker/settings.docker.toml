@@ -39,7 +39,8 @@ max_expiration_days = 15
 expiration_seconds = 900
 # User rate events scheduled time interval
 user_rates_sent_interval_seconds = 3600
-
+# Relay list event time interval
+publish_relays_interval = 60
 
 
 [database]

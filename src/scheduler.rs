@@ -7,7 +7,6 @@ use crate::NOSTR_CLIENT;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
-use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Event, Kind as NostrKind, Tag, Url};
 use sqlx_crud::Crud;
@@ -48,12 +47,8 @@ async fn job_relay_list() {
                 relay_tags.push(Tag::relay_metadata(Url::from_str(&r).unwrap(), None))
             }
 
-            if let Ok(relay_ev) = EventBuilder::new(
-                NostrKind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
-                "",
-                relay_tags,
-            )
-            .to_event(&mostro_pubkey)
+            if let Ok(relay_ev) =
+                EventBuilder::new(NostrKind::RelayList, "", relay_tags).to_event(&mostro_pubkey)
             {
                 let _ = NOSTR_CLIENT.get().unwrap().send_event(relay_ev).await;
             }

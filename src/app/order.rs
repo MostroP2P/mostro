@@ -1,9 +1,9 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_market_quote, publish_order, send_cant_do_msg, send_dm};
+use crate::util::{get_market_quote, publish_order, send_cant_do_msg};
 
 use anyhow::Result;
-use mostro_core::message::{Action, Message, MessageKind};
+use mostro_core::message::Message;
 use nostr_sdk::{Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
@@ -39,15 +39,9 @@ pub async fn order_action(
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
             if min >= max {
-                let message = MessageKind::new(
-                    order.id,
-                    Some(event.pubkey.to_string()),
-                    Action::CantDo,
-                    None,
-                );
-                if let Ok(message) = message.as_json() {
-                    let _ = send_dm(&event.pubkey, message).await;
-                }
+                let msg = format!("Min amount is greater than max amount");
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
             }
             if order.amount == 0 {
                 amount_vec.clear();

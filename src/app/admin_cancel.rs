@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::db::{find_dispute_by_order_id, is_assigned_solver};
+use crate::db::{find_dispute_by_order_id, is_assigned_solver, find_solver_pubkey};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
@@ -15,6 +15,28 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tracing::{error, info};
 
+pub async fn pubkey_event_can_solve(
+    pool: &Pool<Sqlite>,
+    ev_pubkey: &PublicKey,
+) -> bool {
+    if let Ok(my_keys) = crate::util::get_keys() {
+        // Is mostro admin taking dispute?
+        if ev_pubkey.to_string() == my_keys.public_key().to_string()
+        {
+            return true;
+        }
+    }
+
+    // Is a solver taking a dispute
+    if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
+        if solver.is_solver != 0_i64 {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub async fn admin_cancel_action(
     msg: Message,
     event: &Event,
@@ -28,24 +50,6 @@ pub async fn admin_cancel_action(
         return Err(Error::msg("No order id"));
     };
 
-    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
-        Ok(false) => {
-            send_cant_do_msg(
-                None,
-                Some("Dispute not taken by you".to_string()),
-                &event.pubkey,
-            )
-            .await;
-
-            return Ok(());
-        }
-        Err(e) => {
-            error!("Error checking if solver is assigned to order: {:?}", e);
-            return Ok(());
-        }
-        _ => {}
-    }
-
     let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
@@ -53,6 +57,12 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
+    
+    // Check if the pubkey is a solver or admin
+        if !pubkey_event_can_solve(pool, &event.pubkey).await {            
+            send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+            return Ok(());
+        }    
 
     // Was order cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
@@ -70,12 +80,30 @@ pub async fn admin_cancel_action(
 
     if order.status != Status::Dispute.to_string() {
         let error = format!(
-            "Can't settle an order with status different than {}!",
+            "Can't cancel an order with status different than {}!",
             Status::Dispute
         );
         send_cant_do_msg(Some(order.id), Some(error), &event.pubkey).await;
 
         return Ok(());
+    }
+
+    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+        Ok(false) => {
+            send_cant_do_msg(
+                None,
+                Some("Dispute not taken by you".to_string()),
+                &event.pubkey,
+            )
+            .await;
+
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Error checking if solver is assigned to order: {:?}", e);
+            return Ok(());
+        }
+        _ => {}
     }
 
     if order.hash.is_some() {

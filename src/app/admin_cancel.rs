@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::db::{find_dispute_by_order_id, is_assigned_solver, find_solver_pubkey};
+use crate::db::{find_dispute_by_order_id, find_solver_pubkey, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{send_cant_do_msg, send_dm, update_order_event};
@@ -15,14 +15,10 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tracing::{error, info};
 
-pub async fn pubkey_event_can_solve(
-    pool: &Pool<Sqlite>,
-    ev_pubkey: &PublicKey,
-) -> bool {
+pub async fn pubkey_event_can_solve(pool: &Pool<Sqlite>, ev_pubkey: &PublicKey) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
-        if ev_pubkey.to_string() == my_keys.public_key().to_string()
-        {
+        if ev_pubkey.to_string() == my_keys.public_key().to_string() {
             return true;
         }
     }
@@ -57,12 +53,12 @@ pub async fn admin_cancel_action(
             return Ok(());
         }
     };
-    
+
     // Check if the pubkey is a solver or admin
-        if !pubkey_event_can_solve(pool, &event.pubkey).await {            
-            send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
-            return Ok(());
-        }    
+    if !pubkey_event_can_solve(pool, &event.pubkey).await {
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        return Ok(());
+    }
 
     // Was order cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {

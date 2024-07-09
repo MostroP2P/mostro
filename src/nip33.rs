@@ -100,16 +100,24 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Vec<Tag> {
             vec![create_rating_string(reputation)],
         ),
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-            vec!["mostrop2p".to_string()],
+            TagKind::Custom(std::borrow::Cow::Borrowed("network")),
+            vec!["mainnet".to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
-            vec!["order".to_string()],
+            TagKind::Custom(std::borrow::Cow::Borrowed("layer")),
+            vec!["lightning".to_string()],
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("expiration")),
             vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            vec!["mostro".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            vec!["order".to_string()],
         ),
     ];
 

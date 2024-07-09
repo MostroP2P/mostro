@@ -38,6 +38,11 @@ pub async fn order_action(
         // Get max and and min amount in case of range order
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
+            if min >= max {
+                let msg = format!("Min amount is greater than max amount");
+                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                return Ok(());
+            }
             if order.amount == 0 {
                 amount_vec.clear();
                 amount_vec.push(min);

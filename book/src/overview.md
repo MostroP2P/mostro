@@ -2,7 +2,7 @@
 
 ## Overview
 
-All messages broadcasted by Mostro daemon are [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) and use `38383` as event `kind`, a list of standard event kinds can be found [here](https://github.com/nostr-protocol/nips#event-kinds)
+In order to have a shared order's book, Mostro daemon send [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/01.md#kinds) with `38383` as event `kind`, you can find more details about that specific event [here](./order-event.md)
 
 ## Communication between users and Mostro
 

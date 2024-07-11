@@ -109,6 +109,9 @@ Seconds later Mostro will try to pay the buyer's invoice, if the payment is succ
       ["fa", "100"],
       ["pm", "face to face"],
       ["premium", "1"],
+      ["network", "mainnet"],
+      ["layer", "lightning"],
+      ["expiration", "1719391096"],
       ["y", "mostrop2p"],
       ["z", "order"]
     ],

@@ -77,6 +77,9 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
       ["fa", "100"],
       ["pm", "face to face"],
       ["premium", "1"],
+      ["network", "mainnet"],
+      ["layer", "lightning"],
+      ["expiration", "1719391096"],
       ["y", "mostrop2p"],
       ["z", "order"]
     ],

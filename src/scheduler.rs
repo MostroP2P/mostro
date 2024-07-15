@@ -4,6 +4,7 @@ use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::NOSTR_CLIENT;
+use crate::bitcoin_price::BitcoinPriceManager;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
@@ -25,6 +26,7 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     job_retry_failed_payments().await;
     job_info_event_send().await;
     job_relay_list().await;
+    job_update_bitcoin_prices().await;
 
     info!("Scheduler Started");
 }
@@ -331,6 +333,18 @@ async fn job_expire_pending_older_orders() {
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+async fn job_update_bitcoin_prices() {
+    tokio::spawn(async {
+        loop {
+            info!("Updating Bitcoin prices");
+            if let Err(e) = BitcoinPriceManager::update_prices().await {
+                error!("Failed to update Bitcoin prices: {}", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
         }
     });
 }

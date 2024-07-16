@@ -39,7 +39,7 @@ pub async fn order_action(
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
             if min >= max {
-                let msg = format!("Min amount is greater than max amount");
+                let msg = "Min amount is greater than max amount".to_string();
                 send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
                 return Ok(());
             }

@@ -15,6 +15,7 @@ use crate::app::run;
 use crate::cli::settings::{init_global_settings, Settings};
 use crate::cli::settings_init;
 use anyhow::Result;
+use db::find_held_invoices;
 use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
@@ -24,6 +25,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tracing::error;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use util::invoice_subscribe;
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -73,6 +75,14 @@ async fn main() -> Result<()> {
         .subscribe(vec![subscription], None)
         .await;
     let mut ln_client = LndConnector::new().await;
+
+    if let Ok(held_invoices) = find_held_invoices(&pool).await {
+        for i in held_invoices.iter() {
+            if let Some(hash) = &i.hash {
+                invoice_subscribe(hash.as_bytes().to_vec()).await;
+            }
+        }
+    }
 
     // Start scheduler for tasks
     start_scheduler(rate_list.clone()).await;

@@ -142,27 +142,9 @@ pub async fn take_sell_action(
         // Update order with new sats value
         order.amount = new_sats_amount;
         order.fee = fee;
-
-        if pr.is_none() {
-            match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
-                Ok(_) => {
-                    // Update order status
-                    if let Ok(order_updated) =
-                        update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await
-                    {
-                        let _ = order_updated.update(pool).await;
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    error!("Error setting market order sats amount: {:#?}", e);
-                    return Ok(());
-                }
-            }
-        } else {
-            show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
-        }
-    } else if pr.is_none() {
+    }
+    
+    if pr.is_none() {
         match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
             Ok(_) => {
                 // Update order status
@@ -170,6 +152,7 @@ pub async fn take_sell_action(
                     update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await
                 {
                     let _ = order_updated.update(pool).await;
+                    return Ok(());
                 }
             }
             Err(e) => {
@@ -180,6 +163,5 @@ pub async fn take_sell_action(
     } else {
         show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
     }
-
     Ok(())
 }

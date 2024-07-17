@@ -143,7 +143,7 @@ pub async fn take_sell_action(
         order.amount = new_sats_amount;
         order.fee = fee;
     }
-    
+
     if pr.is_none() {
         match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
             Ok(_) => {

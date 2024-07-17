@@ -1845,6 +1845,7 @@ dependencies = [
  "lnurl-rs",
  "mostro-core",
  "nostr-sdk",
+ "once_cell",
  "openssl",
  "reqwest",
  "serde",

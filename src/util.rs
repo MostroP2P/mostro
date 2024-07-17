@@ -1,4 +1,5 @@
 use crate::app::rate_user::get_user_reputation;
+use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
 use crate::db;
 use crate::error::MostroError;
@@ -53,6 +54,11 @@ pub async fn retries_yadio_request(
         .context("Something went wrong with API request, try again!")?;
 
     Ok((Some(res), fiat_list_check))
+}
+
+pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64> {
+    BitcoinPriceManager::get_price(fiat_code)
+        .ok_or_else(|| anyhow::anyhow!("Failed to get Bitcoin price"))
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price

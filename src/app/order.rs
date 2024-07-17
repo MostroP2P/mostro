@@ -1,6 +1,6 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_market_quote, publish_order, send_cant_do_msg};
+use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
 
 use anyhow::Result;
 use mostro_core::message::Message;
@@ -54,10 +54,13 @@ pub async fn order_action(
             }
         }
 
-        for fiat_amount in amount_vec {
+        for (_, fiat_amount) in amount_vec.iter().enumerate() {
             let quote = match order.amount {
-                0 => match get_market_quote(&fiat_amount, &order.fiat_code, 0).await {
-                    Ok(amount) => amount,
+                0 => match get_bitcoin_price(&order.fiat_code) {
+                    Ok(price) => {
+                        let quote = *fiat_amount as f64 / price;
+                        (quote * 1E8) as i64
+                    },
                     Err(e) => {
                         error!("{:?}", e.to_string());
                         return Ok(());

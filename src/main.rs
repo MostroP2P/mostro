@@ -23,7 +23,7 @@ use std::env;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::invoice_subscribe;
 
@@ -77,8 +77,9 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await;
 
     if let Ok(held_invoices) = find_held_invoices(&pool).await {
-        for i in held_invoices.iter() {
-            if let Some(hash) = &i.hash {
+        for invoice in held_invoices.iter() {
+            if let Some(hash) = &invoice.hash {
+                info!("Resubscribing order id - {}", invoice.id);
                 invoice_subscribe(hash.as_bytes().to_vec()).await;
             }
         }

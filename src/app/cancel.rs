@@ -93,14 +93,14 @@ pub async fn cancel_action(
     }
 
     if order.kind == OrderKind::Sell.to_string()
-        && order.status == Status::WaitingBuyerInvoice.to_string()
+        && (order.status == Status::WaitingBuyerInvoice.to_string()
+            || order.status == Status::WaitingBuyerInvoice.to_string())
     {
         cancel_add_invoice(ln_client, &mut order, event, pool, my_keys).await?;
     }
 
     if order.kind == OrderKind::Buy.to_string()
-        && (order.status == Status::WaitingPayment.to_string()
-            || order.status == Status::WaitingBuyerInvoice.to_string())
+        && order.status == Status::WaitingPayment.to_string()
     {
         cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys).await?;
     }

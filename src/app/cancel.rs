@@ -99,7 +99,8 @@ pub async fn cancel_action(
     }
 
     if order.kind == OrderKind::Buy.to_string()
-        && order.status == Status::WaitingPayment.to_string()
+        && (order.status == Status::WaitingPayment.to_string()
+            || order.status == Status::WaitingBuyerInvoice.to_string())
     {
         cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys).await?;
     }
@@ -201,8 +202,6 @@ pub async fn cancel_add_invoice(
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
-    } else {
-        return Err(Error::msg("No hash present"));
     }
 
     let user_pubkey = event.pubkey.to_string();

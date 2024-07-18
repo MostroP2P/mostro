@@ -30,66 +30,28 @@ pub async fn cancel_action(
         }
     };
 
-    let user_pubkey = event.pubkey.to_string();
-
-    match Status::from_str(&order.status).unwrap() {
-        Status::Pending => {
-            // Validates if this user is the order creator
-            if user_pubkey != order.creator_pubkey {
-                // We create a Message
-                send_cant_do_msg(
-                    Some(order_id),
-                    Some("Not allowed!".to_string()),
-                    &event.pubkey,
-                )
-                .await;
-            } else {
-                // We publish a new replaceable kind nostr event with the status updated
-                // and update on local database the status and new event id
-                if let Ok(order_updated) =
-                    update_order_event(my_keys, Status::Canceled, &order).await
-                {
-                    let _ = order_updated.update(pool).await;
-                }
-                // We create a Message for cancel
-                send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+    if order.status == Status::Pending.to_string() {
+        let user_pubkey = event.pubkey.to_string();
+        // Validates if this user is the order creator
+        if user_pubkey != order.creator_pubkey {
+            // We create a Message
+            send_cant_do_msg(
+                Some(order_id),
+                Some("Not allowed!".to_string()),
+                &event.pubkey,
+            )
+            .await;
+        } else {
+            // We publish a new replaceable kind nostr event with the status updated
+            // and update on local database the status and new event id
+            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
+                let _ = order_updated.update(pool).await;
             }
+            // We create a Message for cancel
+            send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
         }
-        Status::WaitingPayment | Status::WaitingBuyerInvoice => {
-            // Validates if this user is the order creator
-            if (order.kind == OrderKind::Sell.to_string()
-                && user_pubkey != *order.buyer_pubkey.as_ref().unwrap())
-                || (order.kind == OrderKind::Buy.to_string()
-                    && user_pubkey != *order.seller_pubkey.as_ref().unwrap())
-            {
-                // We publish a new replaceable kind nostr event with the status updated
-                // and update on local database the status and new event id
-                if let Ok(order_updated) =
-                    update_order_event(my_keys, Status::Pending, &order).await
-                {
-                    let _ = order_updated.update(pool).await;
-                }
-                // We create a Message for cancel
-                send_new_order_msg(Some(order.id), Action::Cancel, None, &event.pubkey).await;
 
-                // We create a Message
-                send_cant_do_msg(
-                    Some(order_id),
-                    Some("Not allowed!".to_string()),
-                    &event.pubkey,
-                )
-                .await;
-            } else {
-                // We create a Message
-                send_cant_do_msg(
-                    Some(order_id),
-                    Some("Not allowed!".to_string()),
-                    &event.pubkey,
-                )
-                .await;
-            }
-        }
-        _ => {}
+        return Ok(());
     }
 
     if order.kind == OrderKind::Sell.to_string()

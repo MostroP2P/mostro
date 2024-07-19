@@ -29,6 +29,7 @@ pub async fn cancel_action(
             return Ok(());
         }
     };
+
     if order.status == Status::Pending.to_string() {
         let user_pubkey = event.pubkey.to_string();
         // Validates if this user is the order creator
@@ -54,7 +55,8 @@ pub async fn cancel_action(
     }
 
     if order.kind == OrderKind::Sell.to_string()
-        && order.status == Status::WaitingBuyerInvoice.to_string()
+        && (order.status == Status::WaitingBuyerInvoice.to_string()
+            || order.status == Status::WaitingBuyerInvoice.to_string())
     {
         cancel_add_invoice(ln_client, &mut order, event, pool, my_keys).await?;
     }
@@ -162,8 +164,6 @@ pub async fn cancel_add_invoice(
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
-    } else {
-        return Err(Error::msg("No hash present"));
     }
 
     let user_pubkey = event.pubkey.to_string();

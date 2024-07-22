@@ -30,13 +30,7 @@ pub async fn admin_cancel_action(
 
     match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
         Ok(false) => {
-            send_cant_do_msg(
-                None,
-                Some("Dispute not taken by you".to_string()),
-                &event.pubkey,
-            )
-            .await;
-
+            send_new_order_msg(Some(order_id), Action::IsNotYourDispute, None, &event.pubkey).await;
             return Ok(());
         }
         Err(e) => {

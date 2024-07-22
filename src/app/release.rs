@@ -39,14 +39,12 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     } else if order.payment_attempts < retries_number {
         order.payment_attempts += 1;
     }
-    let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
-
     let buyer_pubkey = match &order.buyer_pubkey {
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         None => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    send_cant_do_msg(Some(order.id), Some(msg), &buyer_pubkey).await;
+    send_new_order_msg(Some(order.id), Action::PaymentFailed, None, &buyer_pubkey).await;
 
     // Update order
     let result = order.update(&pool).await?;

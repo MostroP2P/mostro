@@ -89,16 +89,7 @@ pub async fn add_invoice_action(
         Status::SettledHoldInvoice => {
             order.payment_attempts = 0;
             order.clone().update(pool).await?;
-            send_new_order_msg(
-                Some(order.id),
-                Action::AddInvoice,
-                Some(Content::TextMessage(format!(
-                    "Order Id {}: Invoice updated!",
-                    order.id
-                ))),
-                &buyer_pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(order.id), Action::InvoiceUpdated, None, &buyer_pubkey).await;
             return Ok(());
         }
         _ => {

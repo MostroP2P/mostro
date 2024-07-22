@@ -46,8 +46,7 @@ pub async fn order_action(
                 amount_vec.push(min);
                 amount_vec.push(max);
             } else {
-                let msg = "Amount must be 0 in case of range order".to_string();
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }
@@ -69,8 +68,7 @@ pub async fn order_action(
 
             // Check amount is positive - extra safety check
             if quote < 0 {
-                let msg = format!("Amount must be positive {} is not valid", order.amount);
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.pubkey).await;
                 return Ok(());
             }
 

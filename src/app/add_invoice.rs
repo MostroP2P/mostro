@@ -71,8 +71,8 @@ pub async fn add_invoice_action(
             .await
             {
                 Ok(_) => payment_request,
-                Err(e) => {
-                    send_cant_do_msg(Some(order.id), Some(e.to_string()), &event.pubkey).await;
+                Err(_) => {
+                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
                     return Ok(());
                 }
             }

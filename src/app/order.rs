@@ -25,9 +25,7 @@ pub async fn order_action(
                 .map(|sats| sats / 1000)
                 .is_some()
             {
-                let error = String::from("Invoice with an amount different from zero receive on new order, please send 0 amount invoice or no invoice at all!");
-                send_cant_do_msg(order.id, Some(error), &event.pubkey).await;
-
+                send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }

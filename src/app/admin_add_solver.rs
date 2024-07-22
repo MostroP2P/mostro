@@ -31,7 +31,7 @@ pub async fn admin_add_solver_action(
     // Check if the pubkey is Mostro
     if event.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        send_cant_do_msg(None, Some("Not allowed".to_string()), &event.pubkey).await;
+        send_cant_do_msg(None, None, &event.pubkey).await;
         return Ok(());
     }
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();

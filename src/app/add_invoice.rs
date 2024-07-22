@@ -53,12 +53,7 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
-        send_cant_do_msg(
-            Some(order.id),
-            Some("Not allowed".to_string()),
-            &event.pubkey,
-        )
-        .await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 

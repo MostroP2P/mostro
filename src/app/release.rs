@@ -98,12 +98,7 @@ pub async fn release_action(
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(
-            Some(order.id),
-            Some("You are not allowed to release funds for this order!".to_string()),
-            &event.pubkey,
-        )
-        .await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 

@@ -54,12 +54,7 @@ pub async fn admin_take_dispute_action(
         Some(dispute) => dispute,
         None => {
             // We create a Message
-            send_cant_do_msg(
-                Some(dispute_id),
-                Some("Dispute not found".to_string()),
-                &event.pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(dispute_id), Action::NotFound, None, &event.pubkey).await;
             return Ok(());
         }
     };

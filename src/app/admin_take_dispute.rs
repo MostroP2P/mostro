@@ -1,6 +1,6 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{send_cant_do_msg, send_dm};
+use crate::util::{send_cant_do_msg, send_dm, send_new_order_msg};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};

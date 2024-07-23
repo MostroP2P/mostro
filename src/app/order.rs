@@ -1,9 +1,9 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
+use crate::util::{get_market_quote, publish_order, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::Result;
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message};
 use nostr_sdk::{Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;

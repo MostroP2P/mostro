@@ -1,11 +1,11 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_dm,
+    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg,
     set_waiting_invoice_status, show_hold_invoice, update_order_event,
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};

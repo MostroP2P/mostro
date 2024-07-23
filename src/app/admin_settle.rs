@@ -1,7 +1,7 @@
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_cant_do_msg, send_dm, settle_seller_hold_invoice, update_order_event};
+use crate::util::{send_dm, send_new_order_msg, settle_seller_hold_invoice, update_order_event};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};

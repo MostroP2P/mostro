@@ -30,7 +30,6 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
-    let time_window = ln_settings.payment_retries_interval * retries_number as u32;
 
     // Mark payment as failed
     if !order.failed_payment {

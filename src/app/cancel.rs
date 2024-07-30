@@ -215,9 +215,10 @@ pub async fn cancel_pay_hold_invoice(
 ) -> Result<()> {
     if order.hash.is_some() {
         // We return funds to seller
-        let hash = order.hash.as_ref().unwrap();
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
+        if let Some(hash) = order.hash.as_ref() {
+            ln_client.cancel_hold_invoice(hash).await?;
+            info!("Order Id {}: Funds returned to seller", &order.id);
+        }
     }
     let user_pubkey = event.pubkey.to_string();
 

@@ -1,9 +1,9 @@
+use anyhow::Result;
+use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use serde::Deserialize;
-use anyhow::Result;
 use tracing::info;
-use once_cell::sync::Lazy;
 
 const YADIO_API_URL: &str = "https://api.yadio.io/exrates/BTC";
 
@@ -13,7 +13,8 @@ struct YadioResponse {
     btc: HashMap<String, f64>,
 }
 
-static BITCOIN_PRICES: Lazy<RwLock<HashMap<String, f64>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static BITCOIN_PRICES: Lazy<RwLock<HashMap<String, f64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 pub struct BitcoinPriceManager;
 
@@ -22,7 +23,7 @@ impl BitcoinPriceManager {
         let response = reqwest::get(YADIO_API_URL).await?;
         let yadio_response: YadioResponse = response.json().await?;
         info!(
-            "Bitcoin prices updated. Got BTC price in {} fiat currencies", 
+            "Bitcoin prices updated. Got BTC price in {} fiat currencies",
             yadio_response.btc.keys().collect::<Vec<&String>>().len()
         );
 

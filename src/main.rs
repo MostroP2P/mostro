@@ -1,4 +1,5 @@
 pub mod app;
+mod bitcoin_price;
 pub mod cli;
 pub mod db;
 pub mod error;
@@ -10,7 +11,6 @@ pub mod models;
 pub mod nip33;
 pub mod scheduler;
 pub mod util;
-mod bitcoin_price;
 
 use crate::app::run;
 use crate::cli::settings::{init_global_settings, Settings};

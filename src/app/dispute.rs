@@ -34,11 +34,18 @@ pub async fn dispute_action(
 
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => {
-            if matches!(
-                Status::from_str(&order.status).unwrap(),
-                Status::Active | Status::FiatSent
-            ) {
-                order
+            if let Ok(st) = Status::from_str(&order.status) {
+                if matches!(st, Status::Active | Status::FiatSent) {
+                    order
+                } else {
+                    send_cant_do_msg(
+                        Some(order.id),
+                        Some("Not allowed".to_string()),
+                        &event.pubkey,
+                    )
+                    .await;
+                    return Ok(());
+                }
             } else {
                 send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
                 return Ok(());

@@ -243,66 +243,79 @@ async fn payment_success(
                     new_order.seller_pubkey = None;
                     new_order.master_seller_pubkey = None;
                 }
-                match new_max.cmp(&order.min_amount.unwrap()) {
-                    Ordering::Equal => {
-                        // Update order in case max == min
-                        let pool = db::connect().await?;
-                        new_order.fiat_amount = new_max;
-                        new_order.max_amount = None;
-                        new_order.min_amount = None;
-                        new_order.status = Status::Pending.to_string();
-                        new_order.id = uuid::Uuid::new_v4();
-                        new_order.status = Status::Pending.to_string();
-                        // We transform the order fields to tags to use in the event
-                        let tags = crate::nip33::order_to_tags(&new_order, None);
+                if let Some(min_amount) = &order.min_amount {
+                    match new_max.cmp(min_amount) {
+                        Ordering::Equal => {
+                            // Update order in case max == min
+                            let pool = db::connect().await?;
+                            new_order.fiat_amount = new_max;
+                            new_order.max_amount = None;
+                            new_order.min_amount = None;
+                            new_order.status = Status::Pending.to_string();
+                            new_order.id = uuid::Uuid::new_v4();
+                            new_order.status = Status::Pending.to_string();
+                            // We transform the order fields to tags to use in the event
+                            let tags = crate::nip33::order_to_tags(&new_order, None);
 
-                        info!("range order tags to be republished: {:#?}", tags);
-                        // nip33 kind with order fields as tags and order id as identifier
-                        let event =
-                            crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-                        let event_id = event.id.to_string();
-                        // We update the order with the new event_id
-                        new_order.event_id = event_id;
-                        // CRUD order creation
-                        new_order.clone().create(&pool).await?;
-                        let _ = NOSTR_CLIENT
-                            .get()
-                            .unwrap()
-                            .send_event(event)
-                            .await
-                            .map(|_s| ())
-                            .map_err(|err| err.to_string());
-                    }
-                    Ordering::Greater => {
-                        // Update order in case new max is still greater the min amount
-                        let pool = db::connect().await?;
-                        // let mut new_order = order.clone();
-                        new_order.max_amount = Some(new_max);
-                        new_order.fiat_amount = 0;
-                        new_order.id = uuid::Uuid::new_v4();
-                        new_order.status = Status::Pending.to_string();
-                        // CRUD order creation
-                        // We transform the order fields to tags to use in the event
-                        let tags = crate::nip33::order_to_tags(&new_order, None);
+                            info!("range order tags to be republished: {:#?}", tags);
+                            // nip33 kind with order fields as tags and order id as identifier
+                            let event = crate::nip33::new_event(
+                                my_keys,
+                                "",
+                                new_order.id.to_string(),
+                                tags,
+                            )?;
+                            let event_id = event.id.to_string();
+                            // We update the order with the new event_id
+                            new_order.event_id = event_id;
+                            // CRUD order creation
+                            new_order.clone().create(&pool).await?;
+                            let _ = NOSTR_CLIENT
+                                .get()
+                                .unwrap()
+                                .send_event(event)
+                                .await
+                                .map(|_s| ())
+                                .map_err(|err| err.to_string());
+                        }
+                        Ordering::Greater => {
+                            // Update order in case new max is still greater the min amount
+                            let pool = db::connect().await?;
+                            // let mut new_order = order.clone();
+                            new_order.max_amount = Some(new_max);
+                            new_order.fiat_amount = 0;
+                            new_order.id = uuid::Uuid::new_v4();
+                            new_order.status = Status::Pending.to_string();
+                            // CRUD order creation
+                            // We transform the order fields to tags to use in the event
+                            let tags = crate::nip33::order_to_tags(&new_order, None);
 
-                        info!("range order tags to be republished: {:#?}", tags);
-                        // nip33 kind with order fields as tags and order id as identifier
-                        let event =
-                            crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-                        let event_id = event.id.to_string();
-                        // We update the order with the new event_id
-                        new_order.event_id = event_id;
-                        new_order.clone().create(&pool).await?;
-                        let _ = NOSTR_CLIENT
-                            .get()
-                            .unwrap()
-                            .send_event(event)
-                            .await
-                            .map(|_s| ())
-                            .map_err(|err| err.to_string());
+                            info!("range order tags to be republished: {:#?}", tags);
+                            // nip33 kind with order fields as tags and order id as identifier
+                            let event = crate::nip33::new_event(
+                                my_keys,
+                                "",
+                                new_order.id.to_string(),
+                                tags,
+                            )?;
+                            let event_id = event.id.to_string();
+                            // We update the order with the new event_id
+                            new_order.event_id = event_id;
+                            new_order.clone().create(&pool).await?;
+                            let _ = NOSTR_CLIENT
+                                .get()
+                                .unwrap()
+                                .send_event(event)
+                                .await
+                                .map(|_s| ())
+                                .map_err(|err| err.to_string());
+                        }
+                        // Update order status in case new max is smaller the min amount
+                        Ordering::Less => {}
                     }
-                    // Update order status in case new max is smaller the min amount
-                    Ordering::Less => {}
+                } else {
+                    send_cant_do_msg(Some(order.id), None, buyer_pubkey).await;
+                    send_cant_do_msg(Some(order.id), None, seller_pubkey).await;
                 }
             }
         }

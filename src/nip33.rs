@@ -46,14 +46,15 @@ fn create_rating_string(rating: Option<Rating>) -> String {
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    if order.min_amount.is_some()
-        && order.max_amount.is_some()
-        && order.status == Status::Pending.to_string()
-    {
-        vec![
-            order.min_amount.unwrap().to_string(),
-            order.max_amount.unwrap().to_string(),
-        ]
+    if order.status == Status::Pending.to_string() {
+        match (order.min_amount, order.max_amount) {
+            (Some(min), Some(max)) => {
+                vec![min.to_string(), max.to_string()]
+            }
+            _ => {
+                vec![order.fiat_amount.to_string()]
+            }
+        }
     } else {
         vec![order.fiat_amount.to_string()]
     }

@@ -1,10 +1,10 @@
 use crate::app::release::do_payment;
+use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::NOSTR_CLIENT;
-use crate::bitcoin_price::BitcoinPriceManager;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
@@ -72,7 +72,10 @@ async fn job_info_event_send() {
             let tags = crate::nip33::info_to_tags(&mostro_pubkey.public_key());
             let id = format!("info-{}", mostro_pubkey.public_key());
 
-            let info_ev = crate::nip33::new_event(&mostro_pubkey, "", id, tags).unwrap();
+            let info_ev = match crate::nip33::new_event(&mostro_pubkey, "", id, tags) {
+                Ok(info) => info,
+                Err(e) => return error!("{e}"),
+            };
             let _ = NOSTR_CLIENT.get().unwrap().send_event(info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;

@@ -54,13 +54,13 @@ pub async fn order_action(
             }
         }
 
-        for (_, fiat_amount) in amount_vec.iter().enumerate() {
+        for fiat_amount in amount_vec.iter() {
             let quote = match order.amount {
                 0 => match get_bitcoin_price(&order.fiat_code) {
                     Ok(price) => {
                         let quote = *fiat_amount as f64 / price;
                         (quote * 1E8) as i64
-                    },
+                    }
                     Err(e) => {
                         error!("{:?}", e.to_string());
                         return Ok(());

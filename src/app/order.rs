@@ -1,9 +1,9 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
+use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::Result;
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message};
 use nostr_sdk::{Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
@@ -25,9 +25,7 @@ pub async fn order_action(
                 .map(|sats| sats / 1000)
                 .is_some()
             {
-                let error = String::from("Invoice with an amount different from zero receive on new order, please send 0 amount invoice or no invoice at all!");
-                send_cant_do_msg(order.id, Some(error), &event.pubkey).await;
-
+                send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }

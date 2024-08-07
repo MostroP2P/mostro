@@ -41,7 +41,7 @@ pub async fn edit_buyer_pubkey_order(
         buyer_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -64,7 +64,7 @@ pub async fn edit_seller_pubkey_order(
         seller_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -170,7 +170,7 @@ pub async fn update_order_to_initial_state(
         0,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -193,7 +193,7 @@ pub async fn edit_master_buyer_pubkey_order(
         master_buyer_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -216,7 +216,7 @@ pub async fn edit_master_seller_pubkey_order(
         master_seller_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -237,7 +237,7 @@ pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> any
         taken_at,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -260,7 +260,7 @@ pub async fn update_order_invoice_held_at_time(
         invoice_held_at,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 

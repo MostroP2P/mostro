@@ -168,6 +168,10 @@ pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Vec<Tag> {
             vec![mostro_settings.fee.to_string()],
         ),
         Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("Pow")),
+            vec![mostro_settings.pow.to_string()],
+        ),
+        Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("hold_invoice_expiration_window")),
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),

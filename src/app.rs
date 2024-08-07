@@ -26,6 +26,7 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::lightning::LndConnector;
+use crate::Settings;
 
 use anyhow::Result;
 use mostro_core::message::{Action, Message};
@@ -49,9 +50,16 @@ pub async fn run(
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
-
+        // Get pow from config
+        let pow = Settings::get_mostro().pow;
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                // Verify pow
+                if !event.check_pow(pow) {
+                    //Discard
+                    info!("Not POW verified event!");
+                    continue;
+                }
                 if let Kind::EncryptedDirectMessage = event.kind {
                     // We validates if the event is correctly signed
                     if event.verify().is_err() {

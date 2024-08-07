@@ -1,6 +1,6 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{send_cant_do_msg, send_dm};
+use crate::util::{send_cant_do_msg, send_dm, send_new_order_msg};
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
@@ -54,12 +54,7 @@ pub async fn admin_take_dispute_action(
         Some(dispute) => dispute,
         None => {
             // We create a Message
-            send_cant_do_msg(
-                Some(dispute_id),
-                Some("Dispute not found".to_string()),
-                &event.pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(dispute_id), Action::NotFound, None, &event.pubkey).await;
             return Ok(());
         }
     };

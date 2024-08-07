@@ -4,7 +4,7 @@ use crate::util::{
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -85,15 +85,7 @@ pub async fn take_buy_action(
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
-        send_new_order_msg(
-            Some(order.id),
-            Action::FiatSent,
-            Some(Content::TextMessage(format!(
-                "Order Id {order_id} was already taken!"
-            ))),
-            &seller_pubkey,
-        )
-        .await;
+        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &seller_pubkey).await;
         return Ok(());
     }
 

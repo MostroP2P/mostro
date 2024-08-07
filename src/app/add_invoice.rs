@@ -107,15 +107,7 @@ pub async fn add_invoice_action(
             return Ok(());
         }
         _ => {
-            send_cant_do_msg(
-                Some(order.id),
-                Some(format!(
-                    "You are not allowed to add an invoice because order Id {} status is {}",
-                    order_status, order.id
-                )),
-                &buyer_pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
             return Ok(());
         }
     }

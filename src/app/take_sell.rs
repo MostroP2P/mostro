@@ -1,11 +1,11 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_dm,
+    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg,
     set_waiting_invoice_status, show_hold_invoice, update_order_event,
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -102,11 +102,7 @@ pub async fn take_sell_action(
     match order_status {
         Status::Pending | Status::WaitingBuyerInvoice => {}
         _ => {
-            send_dm(
-                &buyer_pubkey,
-                format!("Order Id {order_id} was already taken!"),
-            )
-            .await?;
+            send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &buyer_pubkey).await;
             return Ok(());
         }
     }
@@ -125,11 +121,7 @@ pub async fn take_sell_action(
     if order_status == Status::WaitingBuyerInvoice {
         if let Some(ref buyer) = order.buyer_pubkey {
             if buyer != &buyer_pubkey.to_string() {
-                send_dm(
-                    &buyer_pubkey,
-                    format!("Order Id {order_id} was taken by another user!"),
-                )
-                .await?;
+                send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &buyer_pubkey).await;
                 return Ok(());
             }
         }

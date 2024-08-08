@@ -38,12 +38,7 @@ pub async fn dispute_action(
                 if matches!(st, Status::Active | Status::FiatSent) {
                     order
                 } else {
-                    send_cant_do_msg(
-                        Some(order.id),
-                        Some("Not allowed".to_string()),
-                        &event.pubkey,
-                    )
-                    .await;
+                    send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
                     return Ok(());
                 }
             } else {

@@ -30,7 +30,6 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
-    let time_window = ln_settings.payment_retries_interval * retries_number as u32;
 
     // Mark payment as failed
     if !order.failed_payment {
@@ -38,15 +37,13 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts = 0;
     } else if order.payment_attempts < retries_number {
         order.payment_attempts += 1;
-    }
-    let msg = format!("I tried to send you the sats but the payment of your invoice failed, I will try {} more times in {} minutes window, please check your node/wallet is online",retries_number,time_window);
-
+    }    
     let buyer_pubkey = match &order.buyer_pubkey {
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         None => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    send_cant_do_msg(Some(order.id), Some(msg), &buyer_pubkey).await;
+    send_new_order_msg(Some(order.id), Action::PaymentFailed, None, &buyer_pubkey).await;
 
     // Update order
     let result = order.update(&pool).await?;
@@ -93,17 +90,12 @@ pub async fn release_action(
         && current_status != Status::FiatSent
         && current_status != Status::Dispute
     {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
         return Ok(());
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(
-            Some(order.id),
-            Some("You are not allowed to release funds for this order!".to_string()),
-            &event.pubkey,
-        )
-        .await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 

@@ -53,12 +53,7 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.pubkey {
-        send_cant_do_msg(
-            Some(order.id),
-            Some("Not allowed".to_string()),
-            &event.pubkey,
-        )
-        .await;
+        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
         return Ok(());
     }
 
@@ -76,8 +71,8 @@ pub async fn add_invoice_action(
             .await
             {
                 Ok(_) => payment_request,
-                Err(e) => {
-                    send_cant_do_msg(Some(order.id), Some(e.to_string()), &event.pubkey).await;
+                Err(_) => {
+                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
                     return Ok(());
                 }
             }
@@ -94,28 +89,11 @@ pub async fn add_invoice_action(
         Status::SettledHoldInvoice => {
             order.payment_attempts = 0;
             order.clone().update(pool).await?;
-            send_new_order_msg(
-                Some(order.id),
-                Action::AddInvoice,
-                Some(Content::TextMessage(format!(
-                    "Order Id {}: Invoice updated!",
-                    order.id
-                ))),
-                &buyer_pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(order.id), Action::InvoiceUpdated, None, &buyer_pubkey).await;
             return Ok(());
         }
         _ => {
-            send_cant_do_msg(
-                Some(order.id),
-                Some(format!(
-                    "You are not allowed to add an invoice because order Id {} status is {}",
-                    order_status, order.id
-                )),
-                &buyer_pubkey,
-            )
-            .await;
+            send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
             return Ok(());
         }
     }

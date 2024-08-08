@@ -1,9 +1,9 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
-use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
+use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::Result;
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message};
 use nostr_sdk::{Event, Keys};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
@@ -25,9 +25,7 @@ pub async fn order_action(
                 .map(|sats| sats / 1000)
                 .is_some()
             {
-                let error = String::from("Invoice with an amount different from zero receive on new order, please send 0 amount invoice or no invoice at all!");
-                send_cant_do_msg(order.id, Some(error), &event.pubkey).await;
-
+                send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }
@@ -39,8 +37,7 @@ pub async fn order_action(
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
             if min >= max {
-                let msg = "Min amount is greater than max amount".to_string();
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_cant_do_msg(order.id, None, &event.pubkey).await;
                 return Ok(());
             }
             if order.amount == 0 {
@@ -48,8 +45,7 @@ pub async fn order_action(
                 amount_vec.push(min);
                 amount_vec.push(max);
             } else {
-                let msg = "Amount must be 0 in case of range order".to_string();
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }
@@ -71,19 +67,14 @@ pub async fn order_action(
 
             // Check amount is positive - extra safety check
             if quote < 0 {
-                let msg = format!("Amount must be positive {} is not valid", order.amount);
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.pubkey).await;
                 return Ok(());
             }
 
             if quote > mostro_settings.max_order_amount as i64
                 || quote < mostro_settings.min_payment_amount as i64
             {
-                let msg = format!(
-                    "Quote is out of sats boundaries min is {} max is {}",
-                    mostro_settings.min_payment_amount, mostro_settings.max_order_amount
-                );
-                send_cant_do_msg(order.id, Some(msg), &event.pubkey).await;
+                send_new_order_msg(None, Action::OutOfRangeSatsAmount, None, &event.pubkey).await;
                 return Ok(());
             }
         }

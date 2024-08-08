@@ -101,6 +101,7 @@ pub struct Mostro {
     pub user_rates_sent_interval_seconds: u32,
     pub max_expiration_days: u32,
     pub publish_relays_interval: u32,
+    pub pow: u8,
 }
 
 impl TryFrom<Settings> for Mostro {

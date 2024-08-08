@@ -41,6 +41,8 @@ expiration_seconds = 900
 user_rates_sent_interval_seconds = 3600
 # Relay list event time interval
 publish_relays_interval = 60
+# Requested POW
+pow = 0
 
 
 

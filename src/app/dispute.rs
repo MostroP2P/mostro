@@ -7,7 +7,7 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -38,7 +38,13 @@ pub async fn dispute_action(
                 if matches!(st, Status::Active | Status::FiatSent) {
                     order
                 } else {
-                    send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
+                    send_new_order_msg(
+                        Some(order.id),
+                        Action::NotAllowedByStatus,
+                        None,
+                        &event.pubkey,
+                    )
+                    .await;
                     return Ok(());
                 }
             } else {
@@ -114,7 +120,7 @@ pub async fn dispute_action(
     send_new_order_msg(
         Some(order_id),
         Action::DisputeInitiatedByYou,
-        None,
+        Some(Content::Dispute(dispute.clone().id)),
         &initiator_pubkey,
     )
     .await;
@@ -130,7 +136,7 @@ pub async fn dispute_action(
     send_new_order_msg(
         Some(order_id),
         Action::DisputeInitiatedByPeer,
-        None,
+        Some(Content::Dispute(dispute.clone().id)),
         &counterpart_pubkey,
     )
     .await;

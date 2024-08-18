@@ -25,7 +25,9 @@ Mostro will send this message to the seller:
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "dispute-initiated-by-you",
-    "content": null
+    "content": {
+      "dispute": "efc75871-2568-40b9-a6ee-c382d4d6de01"
+    }
   }
 }
 ```
@@ -39,7 +41,9 @@ And here is the message to the buyer:
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
     "pubkey": null,
     "action": "dispute-initiated-by-peer",
-    "content": null
+    "content": {
+      "dispute": "efc75871-2568-40b9-a6ee-c382d4d6de01"
+    }
   }
 }
 ```

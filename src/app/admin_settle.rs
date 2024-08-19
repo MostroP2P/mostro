@@ -102,7 +102,7 @@ pub async fn admin_settle_action(
         NOSTR_CLIENT.get().unwrap().send_event(event).await?;
     }
     // We create a Message for settle
-    let message = Message::new_dispute(Some(order_updated.id), None, Action::AdminSettled, None);
+    let message = Message::new_order(Some(order_updated.id), None, Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.pubkey, message.clone()).await?;

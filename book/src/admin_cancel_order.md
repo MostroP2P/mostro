@@ -30,9 +30,9 @@ Mostro will send this message to the both parties buyer/seller and to the admin:
 }
 ```
 
-## Mostro updates nip 33 events
+## Mostro updates parameterized replaceable events
 
-Mostro will publish two nip33 messages, one for the order to update the status to `canceled-by-admin`, this means that the hold invoice was canceled and the seller's funds were returned:
+Mostro will publish two parameterized replaceable events, one for the order to update the status to `canceled-by-admin`, this means that the hold invoice was canceled and the seller's funds were returned:
 
 ```json
 [
@@ -61,7 +61,7 @@ Mostro will publish two nip33 messages, one for the order to update the status t
 ]
 ```
 
-And updates nip33 dispute event with status `seller-refunded`:
+And updates parameterized replaceable dispute event with status `seller-refunded`:
 
 ```json
 [

@@ -60,7 +60,7 @@ Right after seller release sats Mostro will try to pay the buyer's lightning inv
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `settled-hold-invoice`:
+Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `settled-hold-invoice`:
 
 ```json
 [
@@ -89,7 +89,7 @@ Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d8
 ]
 ```
 
-Seconds later Mostro will try to pay the buyer's invoice, if the payment is successful Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `success`:
+Seconds later Mostro will try to pay the buyer's invoice, if the payment is successful Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `success`:
 
 ```json
 [

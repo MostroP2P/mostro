@@ -48,7 +48,7 @@ If Mostro received the correct message, it will send back a confirmation message
 }
 ```
 
-Mostro updates the nip 33 rating event, in this event the `d` tag will be the user pubkey `00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78` and looks like this:
+Mostro updates the parameterized replaceable rating event, in this event the `d` tag will be the user pubkey `00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78` and looks like this:
 
 ```json
 [

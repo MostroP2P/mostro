@@ -95,7 +95,7 @@ Mostro will send a confirmation message to the admin with the Order details:
 {
   "dispute": {
     "version": 1,
-    "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
+    "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
     "pubkey": null,
     "action": "admin-took-dispute",
     "content": {
@@ -103,7 +103,7 @@ Mostro will send a confirmation message to the admin with the Order details:
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
         "kind": "sell",
         "status": "active",
-        "amount": 3333,
+        "amount": 7851,
         "fiat_code": "VES",
         "fiat_amount": 100,
         "payment_method": "face to face",

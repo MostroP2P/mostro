@@ -53,7 +53,13 @@ pub async fn take_buy_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        send_new_order_msg(Some(order.id), Action::OutOfRangeFiatAmount, None, &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::OutOfRangeFiatAmount,
+            None,
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -81,7 +87,13 @@ pub async fn take_buy_action(
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message
-        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &seller_pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::NotAllowedByStatus,
+            None,
+            &seller_pubkey,
+        )
+        .await;
         return Ok(());
     }
 

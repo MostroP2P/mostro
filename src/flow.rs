@@ -51,6 +51,8 @@ pub async fn hold_invoice_paid(hash: &str) -> Result<()> {
         None,
         Some(order.created_at),
         Some(order.expires_at),
+        None,
+        None,
     );
     let status;
 

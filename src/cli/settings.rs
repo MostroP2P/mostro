@@ -102,6 +102,7 @@ pub struct Mostro {
     pub max_expiration_days: u32,
     pub publish_relays_interval: u32,
     pub pow: u8,
+    pub publish_mostro_info_interval: u32,
 }
 
 impl TryFrom<Settings> for Mostro {

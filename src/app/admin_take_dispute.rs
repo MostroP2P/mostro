@@ -87,17 +87,13 @@ pub async fn admin_take_dispute_action(
     dispute.status = Status::InProgress.to_string();
     dispute.solver_pubkey = Some(event.pubkey.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
+
+    info!("Dispute {} taken by {}", dispute_id, event.pubkey);
+    // Assign token for admin message
+    new_order.seller_token = dispute.seller_token;
+    new_order.buyer_token = dispute.buyer_token;
     // Save it to DB
     dispute.update(pool).await?;
-    info!("Dispute {} taken by {}", dispute_id, event.pubkey);
-
-    // Generate tokens for the users to avoid fake resolver
-    let buyer_token = rand::random::<u16>();
-    let seller_token = rand::random::<u16>();
-
-    // Assign token for admin message
-    new_order.seller_token = Some(seller_token);
-    new_order.buyer_token = Some(buyer_token);
 
     // We create a Message for admin
     let message = Message::new_dispute(
@@ -115,14 +111,14 @@ pub async fn admin_take_dispute_action(
         Some(order.id),
         None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey.clone(), Some(buyer_token))),
+        Some(Content::Peer(solver_pubkey.clone())),
     );
 
     let msg_to_seller = Message::new_order(
         Some(order.id),
         None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey, Some(seller_token))),
+        Some(Content::Peer(solver_pubkey)),
     );
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {

@@ -63,7 +63,7 @@ pub async fn fiat_sent_action(
     send_new_order_msg(
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer, None)),
+        Some(Content::Peer(peer)),
         &seller_pubkey,
     )
     .await;
@@ -73,7 +73,7 @@ pub async fn fiat_sent_action(
     send_new_order_msg(
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer, None)),
+        Some(Content::Peer(peer)),
         &event.pubkey,
     )
     .await;

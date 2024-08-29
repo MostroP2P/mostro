@@ -48,11 +48,11 @@ And here is the message to the buyer:
 }
 ```
 
-Mostro will not update the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `dispute`, this is because the order is still active, the dispute is just a way to let the admins and the other party know that there is a problem with the order.
+Mostro will not update the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `dispute`, this is because the order is still active, the dispute is just a way to let the admins and the other party know that there is a problem with the order.
 
-## Mostro send a nip 33 event to show the dispute
+## Mostro send a parameterized replaceable event to show the dispute
 
-Here is an example of the nip 33 event sent by Mostro:
+Here is an example of the event sent by Mostro:
 
 ```json
 [
@@ -103,7 +103,7 @@ Mostro will send a confirmation message to the admin with the Order details:
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
         "kind": "sell",
         "status": "active",
-        "amount": 0,
+        "amount": 3333,
         "fiat_code": "VES",
         "fiat_amount": 100,
         "payment_method": "face to face",
@@ -118,7 +118,7 @@ Mostro will send a confirmation message to the admin with the Order details:
 }
 ```
 
-Also Mostro will broadcast a new nip33 dispute event to update the Dispute `status` to `in-progress`:
+Also Mostro will broadcast a new parameterized replaceable dispute event to update the Dispute `status` to `in-progress`:
 
 ```json
 [

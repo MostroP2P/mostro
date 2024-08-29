@@ -30,7 +30,7 @@ Mostro will send a message with action `cancel` confirming the order was cancele
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `canceled`:
+Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `canceled`:
 
 ```json
 [
@@ -106,7 +106,7 @@ And this message to the buyer:
 }
 ```
 
-Mostro updates the nip 33 event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `cooperatively-canceled`:
+Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `cooperatively-canceled`:
 
 ```json
 [

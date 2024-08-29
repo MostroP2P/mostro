@@ -41,7 +41,10 @@ expiration_seconds = 900
 user_rates_sent_interval_seconds = 3600
 # Relay list event time interval
 publish_relays_interval = 60
-
+# Requested POW
+pow = 0
+# Publish mostro info interval
+publish_mostro_info_interval = 300
 
 [database]
 url = "sqlite:///config/mostro.db"

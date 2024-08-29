@@ -64,6 +64,7 @@ async fn job_info_event_send() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
+    let interval = Settings::get_mostro().publish_mostro_info_interval as u64;
 
     tokio::spawn(async move {
         loop {
@@ -78,7 +79,7 @@ async fn job_info_event_send() {
             };
             let _ = NOSTR_CLIENT.get().unwrap().send_event(info_ev).await;
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
 }

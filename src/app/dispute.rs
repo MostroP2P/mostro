@@ -10,6 +10,7 @@ use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
+use rand::Rng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use tracing::{error, info};
@@ -108,8 +109,10 @@ pub async fn dispute_action(
 
     let mut dispute = Dispute::new(order_id);
     // Generate tokens for the users to avoid fake resolver
-    dispute.buyer_token = Some(rand::random::<u16>());
-    dispute.seller_token = Some(rand::random::<u16>());
+    let mut rng = rand::thread_rng();
+    dispute.buyer_token = Some(rng.gen_range(100..=999));
+    dispute.seller_token = Some(rng.gen_range(100..=999));
+
     let (initiator_token, counterpart_token) = match seller_dispute {
         true => (dispute.seller_token, dispute.buyer_token),
         false => (dispute.buyer_token, dispute.seller_token),

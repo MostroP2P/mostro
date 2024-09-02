@@ -100,9 +100,9 @@ pub async fn take_sell_action(
         }
     };
 
-    // Buyer can take Pending or WaitingBuyerInvoice orders only
+    // Buyer can take Pending orders only
     match order_status {
-        Status::Pending | Status::WaitingBuyerInvoice => {}
+        Status::Pending => {}
         _ => {
             send_new_order_msg(
                 Some(order.id),
@@ -124,21 +124,6 @@ pub async fn take_sell_action(
         order.buyer_pubkey = Some(buyer_pubkey.to_string());
         // Timestamp take order time
         order.taken_at = Timestamp::now().as_u64() as i64;
-    }
-
-    if order_status == Status::WaitingBuyerInvoice {
-        if let Some(ref buyer) = order.buyer_pubkey {
-            if buyer != &buyer_pubkey.to_string() {
-                send_new_order_msg(
-                    Some(order.id),
-                    Action::NotAllowedByStatus,
-                    None,
-                    &buyer_pubkey,
-                )
-                .await;
-                return Ok(());
-            }
-        }
     }
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer

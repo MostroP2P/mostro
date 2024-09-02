@@ -488,6 +488,8 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
         None,
         None,
         None,
+        None,
+        None,
     );
     // We create a Message
     send_new_order_msg(

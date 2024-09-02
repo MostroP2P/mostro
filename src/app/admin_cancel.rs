@@ -30,7 +30,13 @@ pub async fn admin_cancel_action(
 
     match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
         Ok(false) => {
-            send_new_order_msg(Some(order_id), Action::IsNotYourDispute, None, &event.pubkey).await;
+            send_new_order_msg(
+                Some(order_id),
+                Action::IsNotYourDispute,
+                None,
+                &event.pubkey,
+            )
+            .await;
             return Ok(());
         }
         Err(e) => {
@@ -63,7 +69,13 @@ pub async fn admin_cancel_action(
     }
 
     if order.status != Status::Dispute.to_string() {
-        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::NotAllowedByStatus,
+            None,
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
 

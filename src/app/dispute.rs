@@ -10,6 +10,7 @@ use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use nostr_sdk::prelude::*;
+use rand::Rng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use tracing::{error, info};
@@ -105,7 +106,18 @@ pub async fn dispute_action(
         // Need to update dispute status
         order.update(pool).await?;
     }
-    let dispute = Dispute::new(order_id);
+
+    let mut dispute = Dispute::new(order_id);
+    // Generate tokens for the users to avoid fake resolver
+    let mut rng = rand::thread_rng();
+    dispute.buyer_token = Some(rng.gen_range(100..=999));
+    dispute.seller_token = Some(rng.gen_range(100..=999));
+
+    let (initiator_token, counterpart_token) = match seller_dispute {
+        true => (dispute.seller_token, dispute.buyer_token),
+        false => (dispute.buyer_token, dispute.seller_token),
+    };
+
     // Use CRUD create method
     let dispute = dispute.create(pool).await?;
 
@@ -117,10 +129,11 @@ pub async fn dispute_action(
             return Ok(());
         }
     };
+
     send_new_order_msg(
         Some(order_id),
         Action::DisputeInitiatedByYou,
-        Some(Content::Dispute(dispute.clone().id)),
+        Some(Content::Dispute(dispute.clone().id, initiator_token)),
         &initiator_pubkey,
     )
     .await;
@@ -136,7 +149,7 @@ pub async fn dispute_action(
     send_new_order_msg(
         Some(order_id),
         Action::DisputeInitiatedByPeer,
-        Some(Content::Dispute(dispute.clone().id)),
+        Some(Content::Dispute(dispute.clone().id, counterpart_token)),
         &counterpart_pubkey,
     )
     .await;

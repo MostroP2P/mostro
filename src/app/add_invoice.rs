@@ -72,7 +72,8 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(_) => {
-                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey).await;
+                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey)
+                        .await;
                     return Ok(());
                 }
             }
@@ -93,7 +94,13 @@ pub async fn add_invoice_action(
             return Ok(());
         }
         _ => {
-            send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
+            send_new_order_msg(
+                Some(order.id),
+                Action::NotAllowedByStatus,
+                None,
+                &event.pubkey,
+            )
+            .await;
             return Ok(());
         }
     }
@@ -118,6 +125,8 @@ pub async fn add_invoice_action(
             order.premium,
             order.buyer_pubkey.as_ref().cloned(),
             order.seller_pubkey.as_ref().cloned(),
+            None,
+            None,
             None,
             None,
             None,

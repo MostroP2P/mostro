@@ -37,7 +37,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         order.payment_attempts = 0;
     } else if order.payment_attempts < retries_number {
         order.payment_attempts += 1;
-    }    
+    }
     let buyer_pubkey = match &order.buyer_pubkey {
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         None => return Err(Error::msg("Missing buyer pubkey")),
@@ -90,7 +90,13 @@ pub async fn release_action(
         && current_status != Status::FiatSent
         && current_status != Status::Dispute
     {
-        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::NotAllowedByStatus,
+            None,
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
 

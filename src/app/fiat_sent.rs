@@ -29,7 +29,13 @@ pub async fn fiat_sent_action(
     };
     // Send to user a DM with the error
     if order.status != Status::Active.to_string() {
-        send_new_order_msg(Some(order.id), Action::NotAllowedByStatus, None, &event.pubkey).await;
+        send_new_order_msg(
+            Some(order.id),
+            Action::NotAllowedByStatus,
+            None,
+            &event.pubkey,
+        )
+        .await;
         return Ok(());
     }
     // Check if the pubkey is the buyer

@@ -87,9 +87,14 @@ pub async fn admin_take_dispute_action(
     dispute.status = Status::InProgress.to_string();
     dispute.solver_pubkey = Some(event.pubkey.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
+
+    info!("Dispute {} taken by {}", dispute_id, event.pubkey);
+    // Assign token for admin message
+    new_order.seller_token = dispute.seller_token;
+    new_order.buyer_token = dispute.buyer_token;
     // Save it to DB
     dispute.update(pool).await?;
-    info!("Dispute {} taken by {}", dispute_id, event.pubkey);
+
     // We create a Message for admin
     let message = Message::new_dispute(
         Some(dispute_id),
@@ -102,7 +107,14 @@ pub async fn admin_take_dispute_action(
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.pubkey.to_hex());
-    let message = Message::new_order(
+    let msg_to_buyer = Message::new_order(
+        Some(order.id),
+        None,
+        Action::AdminTookDispute,
+        Some(Content::Peer(solver_pubkey.clone())),
+    );
+
+    let msg_to_seller = Message::new_order(
         Some(order.id),
         None,
         Action::AdminTookDispute,
@@ -118,9 +130,8 @@ pub async fn admin_take_dispute_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message = message.as_json()?;
-    send_dm(&buyer_pubkey, message.clone()).await?;
-    send_dm(&seller_pubkey, message).await?;
+    send_dm(&buyer_pubkey, msg_to_buyer.as_json()?).await?;
+    send_dm(&seller_pubkey, msg_to_seller.as_json()?).await?;
     // We create a tag to show status of the dispute
     let tags: Vec<Tag> = vec![
         Tag::custom(

@@ -36,7 +36,7 @@ pub struct PaymentMessage {
 }
 
 impl LndConnector {
-    pub async fn new() -> Self {
+    pub async fn new() -> anyhow::Result<Self>{
         let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
@@ -47,9 +47,10 @@ impl LndConnector {
             ln_settings.lnd_macaroon_file,
         )
         .await
-        .expect("Failed connecting to LND");
+        .map_err(|e| MostroError::LnPaymentError(e.to_string()))?;
 
-        Self { client }
+        // Safe unwrap here
+        Ok(Self { client })        
     }
 
     pub async fn create_hold_invoice(
@@ -75,10 +76,13 @@ impl LndConnector {
             .invoices()
             .add_hold_invoice(invoice)
             .await
-            .expect("Failed to add hold invoice")
-            .into_inner();
+            .map_err(|e| e.to_string());
 
-        Ok((holdinvoice, preimage.to_vec(), hash.to_vec()))
+            match holdinvoice {
+                Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
+                Err(e) => Err(LndClientError::cancelled(e)),
+            }
+    
     }
 
     pub async fn subscribe_invoice(&mut self, r_hash: Vec<u8>, listener: Sender<InvoiceMessage>) {

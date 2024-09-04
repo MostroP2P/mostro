@@ -22,7 +22,7 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
 
     job_expire_pending_older_orders().await;
     job_update_rate_events(rate_list).await;
-    job_cancel_orders().await;
+    let _ = job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_info_event_send().await;
     job_relay_list().await;
@@ -160,19 +160,19 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
     });
 }
 
-async fn job_cancel_orders() {
+async fn job_cancel_orders() -> anyhow::Result<()> {
     info!("Create a pool to connect to db");
 
     let pool = match connect().await {
         Ok(p) => p,
-        Err(e) => return error!("{e}"),
+        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
     };
     let keys = match get_keys() {
         Ok(keys) => keys,
-        Err(e) => return error!("{e}"),
+        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
     };
 
-    let mut ln_client = LndConnector::new().await;
+    let mut ln_client = LndConnector::new().await?;
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds;
 
@@ -301,6 +301,7 @@ async fn job_cancel_orders() {
             tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
         }
     });
+    Ok(())
 }
 
 async fn job_expire_pending_older_orders() {

@@ -47,7 +47,7 @@ impl LndConnector {
             ln_settings.lnd_macaroon_file,
         )
         .await
-        .map_err(|e| MostroError::LnPaymentError(e.to_string()))?;
+        .map_err(|e| MostroError::LnNodeError(e.to_string()))?;
 
         // Safe unwrap here
         Ok(Self { client })        
@@ -85,7 +85,7 @@ impl LndConnector {
     
     }
 
-    pub async fn subscribe_invoice(&mut self, r_hash: Vec<u8>, listener: Sender<InvoiceMessage>) {
+    pub async fn subscribe_invoice(&mut self, r_hash: Vec<u8>, listener: Sender<InvoiceMessage>) -> anyhow::Result<()> {
         let mut invoice_stream = self
             .client
             .invoices()
@@ -95,10 +95,12 @@ impl LndConnector {
                 },
             )
             .await
-            .expect("Failed to call subscribe_single_invoice")
-            .into_inner();
-
-        while let Some(invoice) = invoice_stream
+            .and_then(|res| Ok(res.into_inner()))
+            .map_err(|e| MostroError::LnNodeError(e.to_string()));
+            
+            
+            
+        while let Some(invoice) = invoice_stream.unwrap()
             .message()
             .await
             .expect("Failed to receive invoices")
@@ -117,6 +119,7 @@ impl LndConnector {
                     .expect("Failed to send a message");
             }
         }
+        Ok(())
     }
 
     pub async fn settle_hold_invoice(

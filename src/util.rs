@@ -418,7 +418,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()>{
 
     let invoice_task = {
         async move {
-            ln_client_invoices.subscribe_invoice(hash, tx).await;
+            ln_client_invoices.subscribe_invoice(hash, tx).await.map_err(|e| MostroError::LnNodeError(e.to_string()));
         }
     };
     tokio::spawn(invoice_task);

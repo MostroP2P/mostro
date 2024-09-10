@@ -23,4 +23,5 @@
 - [Admin Cancel order](./admin_cancel_order.md)
 - [Admin Add Solver](./admin_add_solver.md)
 - [Actions](./actions.md)
+  - [Message suggestions for actions](./message_suggestions_for_actions.md)
 - [Order event](./order-event.md)

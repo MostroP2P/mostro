@@ -145,7 +145,7 @@ pub async fn do_payment(mut order: Order) -> Result<()> {
     } else {
         payment_request
     };
-    let mut ln_client_payment = LndConnector::new().await;
+    let mut ln_client_payment = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);

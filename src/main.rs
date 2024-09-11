@@ -75,13 +75,15 @@ async fn main() -> Result<()> {
         .unwrap()
         .subscribe(vec![subscription], None)
         .await;
-    let mut ln_client = LndConnector::new().await;
+    let mut ln_client = LndConnector::new().await?;
 
     if let Ok(held_invoices) = find_held_invoices(&pool).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
                 info!("Resubscribing order id - {}", invoice.id);
-                invoice_subscribe(hash.as_bytes().to_vec()).await;
+                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec()).await {
+                    tracing::error!("Ln node error {e}")
+                }
             }
         }
     }

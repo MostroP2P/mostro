@@ -352,7 +352,7 @@ pub async fn show_hold_invoice(
     seller_pubkey: &PublicKey,
     mut order: Order,
 ) -> anyhow::Result<()> {
-    let mut ln_client = lightning::LndConnector::new().await;
+    let mut ln_client = lightning::LndConnector::new().await?;
     // Add fee of seller to hold invoice
     let new_amount = order.amount + order.fee;
 
@@ -412,13 +412,16 @@ pub async fn show_hold_invoice(
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>) {
-    let mut ln_client_invoices = lightning::LndConnector::new().await;
+pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()> {
+    let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     let invoice_task = {
         async move {
-            ln_client_invoices.subscribe_invoice(hash, tx).await;
+            let _ = ln_client_invoices
+                .subscribe_invoice(hash, tx)
+                .await
+                .map_err(|e| MostroError::LnNodeError(e.to_string()));
         }
     };
     tokio::spawn(invoice_task);
@@ -451,6 +454,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>) {
         }
     };
     tokio::spawn(subs);
+    Ok(())
 }
 
 pub async fn get_market_amount_and_fee(

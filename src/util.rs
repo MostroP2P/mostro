@@ -412,13 +412,16 @@ pub async fn show_hold_invoice(
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()>{
+pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     let invoice_task = {
         async move {
-            ln_client_invoices.subscribe_invoice(hash, tx).await.map_err(|e| MostroError::LnNodeError(e.to_string()));
+            let _ = ln_client_invoices
+                .subscribe_invoice(hash, tx)
+                .await
+                .map_err(|e| MostroError::LnNodeError(e.to_string()));
         }
     };
     tokio::spawn(invoice_task);

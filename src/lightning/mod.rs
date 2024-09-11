@@ -36,7 +36,7 @@ pub struct PaymentMessage {
 }
 
 impl LndConnector {
-    pub async fn new() -> anyhow::Result<Self>{
+    pub async fn new() -> anyhow::Result<Self> {
         let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
@@ -50,7 +50,7 @@ impl LndConnector {
         .map_err(|e| MostroError::LnNodeError(e.to_string()))?;
 
         // Safe unwrap here
-        Ok(Self { client })        
+        Ok(Self { client })
     }
 
     pub async fn create_hold_invoice(
@@ -78,15 +78,18 @@ impl LndConnector {
             .await
             .map_err(|e| e.to_string());
 
-            match holdinvoice {
-                Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
-                Err(e) => Err(LndClientError::cancelled(e)),
-            }
-    
+        match holdinvoice {
+            Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
+            Err(e) => Err(LndClientError::cancelled(e)),
+        }
     }
 
-    pub async fn subscribe_invoice(&mut self, r_hash: Vec<u8>, listener: Sender<InvoiceMessage>) -> anyhow::Result<()> {
-        let mut invoice_stream = self
+    pub async fn subscribe_invoice(
+        &mut self,
+        r_hash: Vec<u8>,
+        listener: Sender<InvoiceMessage>,
+    ) -> anyhow::Result<()> {
+        let invoice_stream = self
             .client
             .invoices()
             .subscribe_single_invoice(
@@ -95,15 +98,14 @@ impl LndConnector {
                 },
             )
             .await
-            .and_then(|res| Ok(res.into_inner()))
-            .map_err(|e| MostroError::LnNodeError(e.to_string()));
-            
-            
-            
-        while let Some(invoice) = invoice_stream.unwrap()
+            .map_err(|e| MostroError::LnNodeError(e.to_string()))?;
+
+        let mut inner_invoice = invoice_stream.into_inner();
+
+        while let Some(invoice) = inner_invoice
             .message()
             .await
-            .expect("Failed to receive invoices")
+            .map_err(|e| MostroError::LnNodeError(e.to_string()))?
         {
             if let Some(state) =
                 tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
@@ -116,7 +118,7 @@ impl LndConnector {
                     .clone()
                     .send(msg)
                     .await
-                    .expect("Failed to send a message");
+                    .map_err(|e| MostroError::LnNodeError(e.to_string()))?
             }
         }
         Ok(())
@@ -236,13 +238,18 @@ impl LndConnector {
             .map_err(|e| MostroError::LnPaymentError(e.to_string()))?
             .into_inner();
 
-        while let Some(payment) = stream.message().await.expect("Failed paying invoice") {
+        while let Ok(Some(payment)) = stream
+            .message()
+            .await
+            .map_err(|e| MostroError::LnPaymentError(e.to_string()))
+        {
+            //   ("Failed paying invoice") {
             let msg = PaymentMessage { payment };
             listener
                 .clone()
                 .send(msg)
                 .await
-                .expect("Failed to send a message");
+                .map_err(|e| MostroError::LnNodeError(e.to_string()))?
         }
 
         Ok(())

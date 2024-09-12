@@ -66,10 +66,9 @@ async fn main() -> Result<()> {
     };
 
     let my_keys = util::get_keys()?;
-
     let subscription = Filter::new()
         .pubkey(my_keys.public_key())
-        .since(Timestamp::now());
+        .since(Timestamp::now() - 172800);
 
     NOSTR_CLIENT
         .get()

@@ -329,7 +329,7 @@ pub async fn connect_nostr() -> Result<Client> {
 
     let mut limits = RelayLimits::default();
     limits.messages.max_size = Some(3_000);
-    limits.events.max_size = Some(2_000);
+    limits.events.max_size = Some(3_500);
     let opts = Options::new().relay_limits(limits);
 
     // Create new client

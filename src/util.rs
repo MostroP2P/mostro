@@ -241,11 +241,13 @@ pub async fn publish_order(
 }
 
 pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()> {
-    info!("DM content: {content:#?}");
     // Get mostro keys
     let sender_keys = crate::util::get_keys().unwrap();
-    let event = gift_wrap(&sender_keys, *receiver_pubkey, content, None)?;
-    info!("Sending event: {event:#?}");
+    let event = gift_wrap(&sender_keys, *receiver_pubkey, content.clone(), None)?;
+    info!(
+        "Sending DM, Event ID: {} with content: {:#?}",
+        event.id, content
+    );
     NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     Ok(())

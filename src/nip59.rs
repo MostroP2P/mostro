@@ -24,7 +24,7 @@ pub fn gift_wrap(
     let rumor: UnsignedEvent = EventBuilder::text_note(content, []).to_unsigned_event(receiver);
     let seal: Event = seal(sender_keys, &receiver, rumor)?.to_event(sender_keys)?;
 
-    gift_wrap_from_seal(sender_keys, &receiver, &seal, expiration)
+    gift_wrap_from_seal(&receiver, &seal, expiration)
 }
 
 pub fn seal(
@@ -37,7 +37,7 @@ pub fn seal(
     // Derive conversation key
     let ck = ConversationKey::derive(sender_private_key, receiver_pubkey);
     // Encrypt content
-    let encrypted_content = encrypt_to_bytes(&ck, rumor.as_json()).unwrap();
+    let encrypted_content = encrypt_to_bytes(&ck, rumor.as_json())?;
     // Encode with base64
     let b64decoded_content = general_purpose::STANDARD.encode(encrypted_content);
     // Compose builder
@@ -46,16 +46,15 @@ pub fn seal(
 }
 
 pub fn gift_wrap_from_seal(
-    sender_keys: &Keys,
     receiver: &PublicKey,
     seal: &Event,
     expiration: Option<Timestamp>,
 ) -> Result<Event, BuilderError> {
     let ephemeral_keys: Keys = Keys::generate();
     // Derive conversation key
-    let ck = ConversationKey::derive(sender_keys.secret_key()?, receiver);
+    let ck = ConversationKey::derive(ephemeral_keys.secret_key()?, receiver);
     // Encrypt content
-    let encrypted_content = encrypt_to_bytes(&ck, seal.as_json()).unwrap();
+    let encrypted_content = encrypt_to_bytes(&ck, seal.as_json())?;
 
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + usize::from(expiration.is_some()));
     tags.push(Tag::public_key(*receiver));
@@ -72,19 +71,35 @@ pub fn gift_wrap_from_seal(
 
 pub fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, BuilderError> {
     let ck = ConversationKey::derive(keys.secret_key()?, &gift_wrap.pubkey);
-    let b64decoded_content = general_purpose::STANDARD
-        .decode(gift_wrap.content.as_bytes())
-        .unwrap();
+    let b64decoded_content = match general_purpose::STANDARD.decode(gift_wrap.content.as_bytes()) {
+        Ok(b64decoded_content) => b64decoded_content,
+        Err(e) => {
+            return Err(BuilderError::NIP44(
+                nostr_sdk::nips::nip44::Error::NotFound(e.to_string()),
+            ))
+        }
+    };
     // Decrypt and verify seal
     let seal = decrypt_to_bytes(&ck, b64decoded_content)?;
     let seal = String::from_utf8(seal).expect("Found invalid UTF-8");
-    let seal: Event = Event::from_json(seal).unwrap();
-    seal.verify().unwrap();
+    let seal = match Event::from_json(seal) {
+        Ok(seal) => seal,
+        Err(e) => {
+            return Err(BuilderError::NIP44(
+                nostr_sdk::nips::nip44::Error::NotFound(e.to_string()),
+            ))
+        }
+    };
 
     let ck = ConversationKey::derive(keys.secret_key()?, &seal.pubkey);
-    let b64decoded_content = general_purpose::STANDARD
-        .decode(seal.content.as_bytes())
-        .unwrap();
+    let b64decoded_content = match general_purpose::STANDARD.decode(seal.content.as_bytes()) {
+        Ok(b64decoded_content) => b64decoded_content,
+        Err(e) => {
+            return Err(BuilderError::NIP44(
+                nostr_sdk::nips::nip44::Error::NotFound(e.to_string()),
+            ))
+        }
+    };
     // Decrypt rumor
     let rumor = decrypt_to_bytes(&ck, b64decoded_content)?;
     let rumor = String::from_utf8(rumor).expect("Found invalid UTF-8");

@@ -3,6 +3,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Content, Message, Peer};
 use mostro_core::order::{Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -11,7 +12,7 @@ use tracing::error;
 
 pub async fn fiat_sent_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
@@ -33,14 +34,14 @@ pub async fn fiat_sent_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.pubkey,
+            &event.sender,
         )
         .await;
         return Ok(());
     }
     // Check if the pubkey is the buyer
-    if Some(event.pubkey.to_string()) != order.buyer_pubkey {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+    if Some(event.sender.to_string()) != order.buyer_pubkey {
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -57,7 +58,7 @@ pub async fn fiat_sent_action(
             return Ok(());
         }
     };
-    let peer = Peer::new(event.pubkey.to_string());
+    let peer = Peer::new(event.sender.to_string());
 
     // We a message to the seller
     send_new_order_msg(
@@ -74,7 +75,7 @@ pub async fn fiat_sent_action(
         Some(order.id),
         Action::FiatSentOk,
         Some(Content::Peer(peer)),
-        &event.pubkey,
+        &event.sender,
     )
     .await;
 

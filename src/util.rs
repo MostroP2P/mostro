@@ -9,12 +9,14 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
+use crate::nip59::gift_wrap;
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
@@ -240,13 +242,13 @@ pub async fn publish_order(
 }
 
 pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()> {
-    info!("DM content: {content:#?}");
     // Get mostro keys
     let sender_keys = crate::util::get_keys().unwrap();
-
-    let event = EventBuilder::encrypted_direct_msg(&sender_keys, *receiver_pubkey, content, None)?
-        .to_event(&sender_keys)?;
-    info!("Sending event: {event:#?}");
+    let event = gift_wrap(&sender_keys, *receiver_pubkey, content.clone(), None)?;
+    info!(
+        "Sending DM, Event ID: {} with content: {:#?}",
+        event.id, content
+    );
     NOSTR_CLIENT.get().unwrap().send_event(event).await?;
 
     Ok(())
@@ -330,7 +332,7 @@ pub async fn connect_nostr() -> Result<Client> {
 
     let mut limits = RelayLimits::default();
     limits.messages.max_size = Some(3_000);
-    limits.events.max_size = Some(2_000);
+    limits.events.max_size = Some(3_500);
     let opts = Options::new().relay_limits(limits);
 
     // Create new client
@@ -525,15 +527,15 @@ pub async fn rate_counterpart(
 /// Settle a seller hold invoice
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
-    event: &Event,
+    event: &UnwrappedGift,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
     order: &Order,
 ) -> Result<()> {
     // Check if the pubkey is right
-    if !is_admin && event.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+    if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Err(Error::msg("Not allowed"));
     }
 
@@ -542,7 +544,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Err(Error::msg("No preimage"));
     }
     Ok(())

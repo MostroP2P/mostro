@@ -9,6 +9,7 @@ use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use rand::Rng;
 use sqlx::{Pool, Sqlite};
@@ -17,7 +18,7 @@ use tracing::{error, info};
 
 pub async fn dispute_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
@@ -43,7 +44,7 @@ pub async fn dispute_action(
                         Some(order.id),
                         Action::NotAllowedByStatus,
                         None,
-                        &event.pubkey,
+                        &event.sender,
                     )
                     .await;
                     return Ok(());
@@ -65,7 +66,7 @@ pub async fn dispute_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.pubkey.to_string();
+    let message_sender = event.sender.to_string();
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
     let mut buyer_dispute: bool = false;
@@ -83,7 +84,7 @@ pub async fn dispute_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     };
 

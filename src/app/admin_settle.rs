@@ -8,6 +8,7 @@ use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::message::{Action, Message, MessageKind};
 use mostro_core::order::{Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -18,7 +19,7 @@ use super::release::do_payment;
 
 pub async fn admin_settle_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -29,13 +30,13 @@ pub async fn admin_settle_action(
         return Err(Error::msg("No order id"));
     };
 
-    match is_assigned_solver(pool, &event.pubkey.to_string(), order_id).await {
+    match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
-                &event.pubkey,
+                &event.sender,
             )
             .await;
             return Ok(());
@@ -59,12 +60,12 @@ pub async fn admin_settle_action(
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(
             Some(order_id),
-            Some(event.pubkey.to_string()),
+            Some(event.sender.to_string()),
             Action::CooperativeCancelAccepted,
             None,
         );
         if let Ok(message) = message.as_json() {
-            let _ = send_dm(&event.pubkey, message).await;
+            let _ = send_dm(&event.sender, message).await;
         }
         return Ok(());
     }
@@ -74,7 +75,7 @@ pub async fn admin_settle_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.pubkey,
+            &event.sender,
         )
         .await;
         return Ok(());
@@ -117,7 +118,7 @@ pub async fn admin_settle_action(
     let message = Message::new_order(Some(order_updated.id), None, Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(&event.pubkey, message.clone()).await?;
+    send_dm(&event.sender, message.clone()).await?;
     if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
         send_dm(&PublicKey::from_str(seller_pubkey)?, message.clone()).await?;
     }

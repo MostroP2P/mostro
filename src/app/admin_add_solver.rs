@@ -3,6 +3,7 @@ use crate::util::{send_cant_do_msg, send_dm};
 use anyhow::Result;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::user::User;
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -10,7 +11,7 @@ use tracing::{error, info};
 
 pub async fn admin_add_solver_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
@@ -29,9 +30,9 @@ pub async fn admin_add_solver_action(
     };
 
     // Check if the pubkey is Mostro
-    if event.pubkey.to_string() != my_keys.public_key().to_string() {
+    if event.sender.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        send_cant_do_msg(None, None, &event.pubkey).await;
+        send_cant_do_msg(None, None, &event.sender).await;
         return Ok(());
     }
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
@@ -45,7 +46,7 @@ pub async fn admin_add_solver_action(
     let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
-    send_dm(&event.pubkey, message).await?;
+    send_dm(&event.sender, message).await?;
 
     Ok(())
 }

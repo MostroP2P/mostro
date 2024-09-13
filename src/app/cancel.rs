@@ -1,9 +1,11 @@
 use crate::db::{edit_buyer_pubkey_order, edit_seller_pubkey_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
+
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind as OrderKind, Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -12,7 +14,7 @@ use tracing::{error, info};
 
 pub async fn cancel_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -30,12 +32,12 @@ pub async fn cancel_action(
         }
     };
 
+    let user_pubkey = event.sender.to_string();
     if order.status == Status::Pending.to_string() {
-        let user_pubkey = event.pubkey.to_string();
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
             // We create a Message
-            send_new_order_msg(Some(order.id), Action::IsNotYourOrder, None, &event.pubkey).await;
+            send_new_order_msg(Some(order.id), Action::IsNotYourOrder, None, &event.sender).await;
         } else {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
@@ -43,7 +45,7 @@ pub async fn cancel_action(
                 let _ = order_updated.update(pool).await;
             }
             // We create a Message for cancel
-            send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+            send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
         }
 
         return Ok(());
@@ -66,8 +68,6 @@ pub async fn cancel_action(
         || order.status == Status::FiatSent.to_string()
         || order.status == Status::Dispute.to_string()
     {
-        let user_pubkey = event.pubkey.to_string();
-
         let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
             (Some(seller), Some(buyer)) => (seller, buyer),
             (None, _) => return Err(Error::msg("Missing seller pubkey")),
@@ -87,7 +87,7 @@ pub async fn cancel_action(
             Some(ref initiator_pubkey) => {
                 if initiator_pubkey == &user_pubkey {
                     // We create a Message
-                    send_cant_do_msg(Some(order_id), None, &event.pubkey).await;
+                    send_cant_do_msg(Some(order_id), None, &event.sender).await;
                     return Ok(());
                 } else {
                     if let Some(hash) = &order.hash {
@@ -109,7 +109,7 @@ pub async fn cancel_action(
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
-                        &event.pubkey,
+                        &event.sender,
                     )
                     .await;
                     let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
@@ -132,7 +132,7 @@ pub async fn cancel_action(
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByYou,
                     None,
-                    &event.pubkey,
+                    &event.sender,
                 )
                 .await;
                 let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
@@ -152,7 +152,7 @@ pub async fn cancel_action(
 pub async fn cancel_add_invoice(
     ln_client: &mut LndConnector,
     order: &mut Order,
-    event: &Event,
+    event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
 ) -> Result<()> {
@@ -161,7 +161,7 @@ pub async fn cancel_add_invoice(
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
 
-    let user_pubkey = event.pubkey.to_string();
+    let user_pubkey = event.sender.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
@@ -171,7 +171,7 @@ pub async fn cancel_add_invoice(
 
     if buyer_pubkey != &user_pubkey {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -180,7 +180,7 @@ pub async fn cancel_add_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::CooperativelyCanceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
         send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {
@@ -204,7 +204,7 @@ pub async fn cancel_add_invoice(
 pub async fn cancel_pay_hold_invoice(
     ln_client: &mut LndConnector,
     order: &mut Order,
-    event: &Event,
+    event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
 ) -> Result<()> {
@@ -215,7 +215,7 @@ pub async fn cancel_pay_hold_invoice(
             info!("Order Id {}: Funds returned to seller", &order.id);
         }
     }
-    let user_pubkey = event.pubkey.to_string();
+    let user_pubkey = event.sender.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
@@ -225,7 +225,7 @@ pub async fn cancel_pay_hold_invoice(
 
     if seller_pubkey.to_string() != user_pubkey {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -234,7 +234,7 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::Canceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.pubkey).await;
+        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
         send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {

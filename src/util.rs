@@ -16,6 +16,7 @@ use anyhow::{Context, Error, Result};
 use chrono::Duration;
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
@@ -522,15 +523,15 @@ pub async fn rate_counterpart(
 /// Settle a seller hold invoice
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
-    event: &Event,
+    event: &UnwrappedGift,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
     order: &Order,
 ) -> Result<()> {
     // Check if the pubkey is right
-    if !is_admin && event.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+    if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Err(Error::msg("Not allowed"));
     }
 
@@ -539,7 +540,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Err(Error::msg("No preimage"));
     }
     Ok(())

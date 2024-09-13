@@ -6,6 +6,7 @@ use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -46,7 +47,7 @@ pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Ra
 
 pub async fn update_user_reputation_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
@@ -71,10 +72,10 @@ pub async fn update_user_reputation_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.pubkey.to_string();
+    let message_sender = event.sender.to_string();
 
     if order.status != Status::Success.to_string() {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         error!("Order Id {order_id} wrong status");
         return Ok(());
     }
@@ -95,7 +96,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     };
 
@@ -166,7 +167,7 @@ pub async fn update_user_reputation_action(
             Some(order.id),
             Action::RateReceived,
             Some(Content::RatingUser(rating)),
-            &event.pubkey,
+            &event.sender,
         )
         .await;
     }

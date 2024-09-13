@@ -6,6 +6,7 @@ use anyhow::{Error, Result};
 use mostro_core::message::{Action, Content, Message};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -14,7 +15,7 @@ use tracing::error;
 
 pub async fn add_invoice_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
@@ -52,8 +53,8 @@ pub async fn add_invoice_action(
         }
     };
     // Only the buyer can add an invoice
-    if buyer_pubkey != event.pubkey {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+    if buyer_pubkey != event.sender {
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -72,7 +73,7 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(_) => {
-                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.pubkey)
+                    send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.sender)
                         .await;
                     return Ok(());
                 }
@@ -98,7 +99,7 @@ pub async fn add_invoice_action(
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
-                &event.pubkey,
+                &event.sender,
             )
             .await;
             return Ok(());

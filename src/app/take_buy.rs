@@ -6,6 +6,7 @@ use crate::util::{
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind, Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -14,7 +15,7 @@ use tracing::error;
 
 pub async fn take_buy_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
@@ -33,19 +34,19 @@ pub async fn take_buy_action(
         }
     };
     // Maker can't take own order
-    if order.creator_pubkey == event.pubkey.to_hex() {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+    if order.creator_pubkey == event.sender.to_hex() {
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
     // We check if the message have a pubkey
     if msg.get_inner_message_kind().pubkey.is_none() {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
     if order.kind != Kind::Buy.to_string() {
         error!("Order Id {order_id} wrong kind");
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -57,7 +58,7 @@ pub async fn take_buy_action(
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,
-            &event.pubkey,
+            &event.sender,
         )
         .await;
         return Ok(());
@@ -83,7 +84,7 @@ pub async fn take_buy_action(
         .master_seller_pubkey
         .clone_from(&msg.get_inner_message_kind().pubkey);
 
-    let seller_pubkey = event.pubkey;
+    let seller_pubkey = event.sender;
     // Seller can take pending orders only
     if order_status != Status::Pending {
         // We create a Message

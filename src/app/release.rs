@@ -12,6 +12,7 @@ use anyhow::{Error, Result};
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -52,7 +53,7 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
 
 pub async fn release_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -78,7 +79,7 @@ pub async fn release_action(
             return Ok(());
         }
     };
-    let seller_pubkey = event.pubkey;
+    let seller_pubkey = event.sender;
 
     let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
         current_status
@@ -94,14 +95,14 @@ pub async fn release_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.pubkey,
+            &event.sender,
         )
         .await;
         return Ok(());
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(Some(order.id), None, &event.pubkey).await;
+        send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 

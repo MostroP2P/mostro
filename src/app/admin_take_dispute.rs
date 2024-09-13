@@ -7,6 +7,7 @@ use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
 use mostro_core::message::{Action, Content, Message, Peer};
 use mostro_core::order::Order;
+use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -39,7 +40,7 @@ pub async fn pubkey_event_can_solve(
 
 pub async fn admin_take_dispute_action(
     msg: Message,
-    event: &Event,
+    event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
     // Find dipute id in the message
@@ -54,16 +55,16 @@ pub async fn admin_take_dispute_action(
         Some(dispute) => dispute,
         None => {
             // We create a Message
-            send_new_order_msg(Some(dispute_id), Action::NotFound, None, &event.pubkey).await;
+            send_new_order_msg(Some(dispute_id), Action::NotFound, None, &event.sender).await;
             return Ok(());
         }
     };
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.pubkey, dispute_status).await {
+        if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(Some(dispute_id), None, &event.pubkey).await;
+            send_cant_do_msg(Some(dispute_id), None, &event.sender).await;
             return Ok(());
         }
     } else {
@@ -85,10 +86,10 @@ pub async fn admin_take_dispute_action(
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();
-    dispute.solver_pubkey = Some(event.pubkey.to_string());
+    dispute.solver_pubkey = Some(event.sender.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
 
-    info!("Dispute {} taken by {}", dispute_id, event.pubkey);
+    info!("Dispute {} taken by {}", dispute_id, event.sender);
     // Assign token for admin message
     new_order.seller_token = dispute.seller_token;
     new_order.buyer_token = dispute.buyer_token;
@@ -103,10 +104,10 @@ pub async fn admin_take_dispute_action(
         Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;
-    send_dm(&event.pubkey, message).await?;
+    send_dm(&event.sender, message).await?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
-    let solver_pubkey = Peer::new(event.pubkey.to_hex());
+    let solver_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
         Some(order.id),
         None,

@@ -68,9 +68,9 @@ pub async fn run(
                         tracing::warn!("Error in event verification")
                     };
 
-                    let unwrapped_gift = unwrap_gift_wrap(&my_keys, &event)?;
+                    let event = unwrap_gift_wrap(&my_keys, &event)?;
 
-                    let message = Message::from_json(&unwrapped_gift.rumor.content);
+                    let message = Message::from_json(&event.rumor.content);
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {

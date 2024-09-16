@@ -1,12 +1,11 @@
 # Creating a new sell range order
 
-To create a new range order the user should send a Nostr event kind 4 (an encrypted message) to Mostro with the following content:
+To create a new range order the user should send a Nostr nip59 event to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
-    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78", // Seller's real pubkey
     "action": "new-order",
     "content": {
       "order": {
@@ -26,20 +25,19 @@ To create a new range order the user should send a Nostr event kind 4 (an encryp
 }
 ```
 
-We two new fields, `min_amount` and `max_amount`, to define the range of the order. The `fiat_amount` field is set to 0 to indicate that the order is for a range of amounts.
+Here we have two new fields, `min_amount` and `max_amount`, to define the range of the order. The `fiat_amount` field is set to 0 to indicate that the order is for a range of amounts.
 
 When a taker takes the order, the amount will be set on the message.
 
 ## Confirmation message
 
-Mostro will send back a nip04 event as a confirmation message to the user like the following:
+Mostro will send back a nip59 event as a confirmation message to the user like the following:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "content": {
       "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",

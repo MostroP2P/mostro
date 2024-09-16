@@ -1,13 +1,12 @@
 # Taking a sell order
 
-If the order amount is `0` the buyer don't know the exact amount to create the invoice, buyer will send a message in a Nostr event kind 4 to Mostro with the following content:
+If the order amount is `0` the buyer don't know the exact amount to create the invoice, buyer will send a message in a Gift wrap Nostr event (nip59) to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "take-sell",
     "content": null
   }

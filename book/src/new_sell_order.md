@@ -1,12 +1,11 @@
 # Creating a new sell order
 
-To create a new sell order the user should send a Nostr event kind 4 (an encrypted message) to Mostro with the following content:
+To create a new sell order the user should send a Gift wrap Nostr event to Mostro, the rumor event should have the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
-    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78", // Seller's real pubkey
     "action": "new-order",
     "content": {
       "order": {
@@ -31,7 +30,6 @@ Let's explain some of the fields:
 - kind: `sell` or `buy`
 - status: Is always `pending` when creating a new order
 - amount: 0 for when we want to sell with at market price, otherwise the amount in satoshis
-- pubkey: Real user's npub, we use this when the message was sent from an ephemeral key
 - created_at: No need to send the correct unix timestamp, Mostro will replace it with the current time
 
 The event to send to Mostro would look like this:
@@ -39,9 +37,9 @@ The event to send to Mostro would look like this:
 ```json
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
-  "kind": 4,
+  "kind": 1059,
   "pubkey": "1f5bb148a25bca31506594722e746b10acf2641a12725b12072dcbc46ade544d", // Seller's ephemeral pubkey
-  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "content": "sealed-rumor-content",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"] // Mostro's pubkey
   ],
@@ -52,7 +50,7 @@ The event to send to Mostro would look like this:
 
 ## Confirmation message
 
-Mostro will send back a nip04 event as a confirmation message to the user like the following:
+Mostro will send back a nip59 event as a confirmation message to the user like the following (unencrypted rumor's content example):
 
 ```json
 {

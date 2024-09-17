@@ -1,12 +1,11 @@
 # Creating a new order
 
-Creating buy order with a [lightning address](https://github.com/andrerfneves/lightning-address) would make the process way faster and easy going, to acomplish the buyer should send a Nostr event kind 4 (an encrypted message) to Mostro with the following content:
+Creating buy order with a [lightning address](https://github.com/andrerfneves/lightning-address) would make the process way faster and easy going, to acomplish the buyer should send a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427", // Buyer's real pubkey
     "action": "new-order",
     "content": {
       "order": {
@@ -30,9 +29,9 @@ The nostr event will look like this:
 ```json
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
-  "kind": 4,
+  "kind": 1059,
   "pubkey": "9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b", // Buyer's ephemeral pubkey
-  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "content": "sealed-rumor-content",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"] // Mostro's pubkey
   ],
@@ -43,18 +42,17 @@ The nostr event will look like this:
 
 ## Confirmation message
 
-Mostro will send back a nip04 event as a confirmation message to the user like the following:
+Mostro will send back a nip59 event as a confirmation message to the user like the following:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "content": {
       "order": {
         "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-        "kind": "sell",
+        "kind": "buy",
         "status": "pending",
         "amount": 0,
         "fiat_code": "VES",
@@ -84,7 +82,7 @@ Mostro publishes this order as an event kind `38383` with status `pending`:
     "kind": 38383,
     "tags": [
       ["d", "ede61c96-4c13-4519-bf3a-dcf7f1e9d842"],
-      ["k", "sell"],
+      ["k", "buy"],
       ["f", "VES"],
       ["s", "pending"],
       ["amt", "0"],

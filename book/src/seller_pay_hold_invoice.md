@@ -1,13 +1,12 @@
 # Seller pays hold invoice
 
-When the seller is the maker and the order was taken by a buyer, Mostro will send to the seller a message asking to pay the hold invoice, the content of the message will look like this:
+When the seller is the maker and the order was taken by a buyer, Mostro will send to the seller a message asking to pay the hold invoice, the rumor's content of the message will look like this:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "pay-invoice",
     "content": {
       "payment_request": [
@@ -29,14 +28,13 @@ When the seller is the maker and the order was taken by a buyer, Mostro will sen
 }
 ```
 
-After the hold invoice is paid and the buyer already sent the invoice to receive the sats, Mostro will send a new message to seller with the following content:
+After the hold invoice is paid and the buyer already sent the invoice to receive the sats, Mostro will send a new message to seller with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "buyer-took-order",
     "content": {
       "order": {
@@ -125,7 +123,6 @@ Mostro send this message to the seller:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "waiting-buyer-invoice",
     "content": null
   }
@@ -139,7 +136,6 @@ And this message to the buyer:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "add-invoice",
     "content": {
       "order": {

@@ -1,13 +1,12 @@
 # Taking a sell order with a lightning address
 
-The buyer can use a [lightning address](https://github.com/andrerfneves/lightning-address) to receive funds and avoid to create and send lightning invoices on each trade, to acomplish this the buyer will send a message in a Nostr event kind 4 to Mostro with the following content:
+The buyer can use a [lightning address](https://github.com/andrerfneves/lightning-address) to receive funds and avoid to manually create and send lightning invoices on each trade, to acomplish this the buyer will send a message in a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "take-sell",
     "content": {
       "payment_request": [null, "mostro_p2p@ln.tips"]
@@ -21,9 +20,9 @@ The event to send to Mostro would look like this:
 ```json
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
-  "kind": 4,
+  "kind": 1059,
   "pubkey": "9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b",
-  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "content": "sealed-rumor-content",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"]
   ],
@@ -41,14 +40,13 @@ Mostro send a nip 04 event to the buyer with a wrapped `order` in the content, i
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "waiting-seller-to-pay",
     "content": null
   }
 }
 ```
 
-Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingPayment`:
+Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `waiting-payment`:
 
 ```json
 [

@@ -1,13 +1,12 @@
 # Fiat sent
 
-After the buyer sends the fiat money to the seller, the buyer should send a message to Mostro indicating that the fiat money was sent, the message will look like this:
+After the buyer sends the fiat money to the seller, the buyer should send a message in a Gift wrap Nostr event to Mostro indicating that the fiat money was sent, the rumor's content would look like this:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "fiat-sent",
     "content": null
   }
@@ -19,9 +18,9 @@ The event to send to Mostro would look like this:
 ```json
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
-  "kind": 4,
+  "kind": 1059,
   "pubkey": "9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b",
-  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "content": "sealed-rumor-content",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"]
   ],
@@ -32,14 +31,13 @@ The event to send to Mostro would look like this:
 
 ## Mostro response
 
-Mostro send a messages to both parties confirming `fiat-sent` action and sending again the counterpart pubkey, here an example of the message to the buyer:
+Mostro send messages to both parties confirming `fiat-sent` action and sending again the counterpart pubkey, here an example of the message to the buyer:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "fiat-sent-ok",
     "content": {
       "Peer": {

@@ -1,13 +1,12 @@
 # Taking a sell range order
 
-If the order fiat amount is a range like `10-20` the buyer must indicate a fiat amount to take the order, buyer will send a message in a Nostr event kind 4 to Mostro with the following content:
+If the order fiat amount is a range like `10-20` the buyer must indicate a fiat amount to take the order, buyer will send a message in a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "take-sell",
     "content": {
       "amount": 15
@@ -18,14 +17,13 @@ If the order fiat amount is a range like `10-20` the buyer must indicate a fiat 
 
 ## Mostro response
 
-In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have, here the unencrypted content of the message:
+In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have, here the rumor's content of the message:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "add-invoice",
     "content": {
       "order": {
@@ -82,14 +80,13 @@ Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4
 
 ## Using a lightning address
 
-The buyer can use a [lightning address](https://github.com/andrerfneves/lightning-address) to receive funds and avoid to create and send lightning invoices on each trade, with a range order we set the fiat amount as the third element of the `payment_request` array, to acomplish this the buyer will send a message in a Nostr event kind 4 to Mostro with the following content:
+The buyer can use a [lightning address](https://github.com/andrerfneves/lightning-address) to receive funds and avoid to create and send lightning invoices on each trade, with a range order we set the fiat amount as the third element of the `payment_request` array, to acomplish this the buyer will send a message in a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0000147e939bef2b81c27af4c1b702c90c3843f7212a34934bff1e049b7f1427",
     "action": "take-sell",
     "content": {
       "payment_request": [null, "mostro_p2p@ln.tips", 15]

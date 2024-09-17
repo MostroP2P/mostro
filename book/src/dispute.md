@@ -7,7 +7,6 @@ A use can start a dispute in an order with status `active` or `fiat-sent` sendin
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "dispute",
     "content": null
   }
@@ -23,7 +22,6 @@ Mostro will send this message to the seller:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "dispute-initiated-by-you",
     "content": {
       "dispute": "efc75871-2568-40b9-a6ee-c382d4d6de01"
@@ -39,7 +37,6 @@ And here is the message to the buyer:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "dispute-initiated-by-peer",
     "content": {
       "dispute": "efc75871-2568-40b9-a6ee-c382d4d6de01"
@@ -82,21 +79,19 @@ Mostro admin will see the dispute and can take it using the dispute `Id` from `d
   "dispute": {
     "version": 1,
     "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
-    "pubkey": null,
     "action": "admin-take-dispute",
     "content": null
   }
 }
 ```
 
-Mostro will send a confirmation message to the admin with the Order details:
+Mostro will send a confirmation message to the admin with the order details:
 
 ```json
 {
   "dispute": {
     "version": 1,
     "id": "efc75871-2568-40b9-a6ee-c382d4d6de01",
-    "pubkey": null,
     "action": "admin-took-dispute",
     "content": {
       "order": {
@@ -118,7 +113,7 @@ Mostro will send a confirmation message to the admin with the Order details:
 }
 ```
 
-Also Mostro will broadcast a new parameterized replaceable dispute event to update the Dispute `status` to `in-progress`:
+Also Mostro will broadcast a new parameterized replaceable dispute event to update the dispute `status` to `in-progress`:
 
 ```json
 [

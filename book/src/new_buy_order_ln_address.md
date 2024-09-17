@@ -1,6 +1,6 @@
 # Creating a new order
 
-Creating buy order with a [lightning address](https://github.com/andrerfneves/lightning-address) would make the process way faster and easy going, to acomplish the buyer should send a Gift wrap Nostr event (nip59) to Mostro with the following rumor's content:
+Creating buy order with a [lightning address](https://github.com/andrerfneves/lightning-address) would make the process way faster and easy going, to acomplish the buyer should send a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {

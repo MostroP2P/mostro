@@ -1,6 +1,6 @@
 # Creating a new buy order
 
-To create a new buy order the user should send a Gift wrap Nostr event (nip59) to Mostro with the following rumor's content:
+To create a new buy order the user should send a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {

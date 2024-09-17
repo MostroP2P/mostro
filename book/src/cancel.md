@@ -1,13 +1,12 @@
 # Cancel Order
 
-A user can cancel an Order created by himself and with status `pending` sending action `cancel`, the message content will look like this:
+A user can cancel an order created by himself and with status `pending` sending action `cancel`, the rumor's content of the message will look like this:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "00000ba40c5795451705bb9c165b3af93c846894d3062a9cd7fcba090eb3bf78",
     "action": "cancel",
     "content": null
   }
@@ -16,14 +15,13 @@ A user can cancel an Order created by himself and with status `pending` sending 
 
 ## Mostro response
 
-Mostro will send a message with action `cancel` confirming the order was canceled, here an example of the message:
+Mostro will send a message with action `cancel` confirming the order was canceled, here an example of rumor's content of the message:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "canceled",
     "content": null
   }
@@ -71,7 +69,6 @@ A user can cancel an `active` order, but will need the counterparty to agree, le
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "cancel",
     "content": null
   }
@@ -85,7 +82,6 @@ Mostro will send this message to the seller:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "cooperative-cancel-initiated-by-you",
     "content": null
   }
@@ -99,7 +95,6 @@ And this message to the buyer:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "cooperative-cancel-initiated-by-peer",
     "content": null
   }
@@ -142,7 +137,6 @@ The buyer can accept the cooperative cancellation sending this message:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "cancel",
     "content": null
   }
@@ -156,7 +150,6 @@ And Mostro will send this message to both parties:
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "cooperative-cancel-accepted",
     "content": null
   }

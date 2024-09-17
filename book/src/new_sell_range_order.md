@@ -1,6 +1,6 @@
 # Creating a new sell range order
 
-To create a new range order the user should send a Nostr nip59 event to Mostro with the following rumor's content:
+To create a new range order the user should send a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {

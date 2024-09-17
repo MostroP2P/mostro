@@ -1,6 +1,6 @@
 # Taking a sell order
 
-If the order amount is `0` the buyer don't know the exact amount to create the invoice, buyer will send a message in a Gift wrap Nostr event (nip59) to Mostro with the following rumor's content:
+If the order amount is `0` the buyer don't know the exact amount to create the invoice, buyer will send a message in a Gift wrap Nostr event to Mostro with the following rumor's content:
 
 ```json
 {
@@ -18,9 +18,9 @@ The event to send to Mostro would look like this:
 ```json
 {
   "id": "cade205b849a872d74ba4d2a978135dbc05b4e5f483bb4403c42627dfd24f67d",
-  "kind": 4,
+  "kind": 1059,
   "pubkey": "9a42ac72d6466a6dbe5b4b07a8717ee13e55abb6bdd810ea9c321c9a32ee837b",
-  "content": "base64-encoded-aes-256-cbc-encrypted-JSON-serialized-string",
+  "content": "sealed-rumor-content",
   "tags": [
     ["p", "dbe0b1be7aafd3cfba92d7463edbd4e33b2969f61bd554d37ac56f032e13355a"]
   ],
@@ -31,14 +31,13 @@ The event to send to Mostro would look like this:
 
 ## Mostro response
 
-In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have, here the unencrypted content of the message:
+In order to continue the buyer needs to send a lightning network invoice to Mostro, in this case the amount of the order is `0`, so Mostro will need to calculate the amount of sats for this order, then Mostro will send back a message asking for a LN invoice indicating the correct amount of sats that the invoice should have, here the rumor's content of the message:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "add-invoice",
     "content": {
       "order": {
@@ -90,14 +89,13 @@ Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4
 
 ## Buyer sends LN invoice
 
-The buyer sends a nip 04 event to Mostro with the lightning invoice, the action should be the same the buyer just received in the last message from Mostro (`add-invoice`), here the unencrypted content of the event for an invoice with no amount:
+The buyer sends a Gift wrap Nostr event to Mostro with the lightning invoice, the action should be the same the buyer just received in the last message from Mostro (`add-invoice`), here the rumor's content of the event for an invoice with no amount:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "add-invoice",
     "content": {
       "payment_request": [
@@ -114,21 +112,20 @@ If the invoice includes an amount, the last element of the `payment_request` arr
 
 ## Mostro response
 
-Mostro send a nip 04 event to the buyer with a wrapped `order` in the content, it would look like this:
+Mostro send a Gift wrap Nostr event to the buyer with a wrapped `order` in the rumor's content, it would look like this:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": null,
     "action": "waiting-seller-to-pay",
     "content": null
   }
 }
 ```
 
-Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `WaitingPayment`:
+Mostro updates the parameterized replaceable event with `d` tag `ede61c96-4c13-4519-bf3a-dcf7f1e9d842` to change the status to `waiting-payment`:
 
 ```json
 [

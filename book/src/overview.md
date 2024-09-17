@@ -19,7 +19,6 @@ These fields are relative to the wrapper, here an example of a `fiat-sent` Order
   "order": {
     "version": 1,
     "id": "ede61c96-4c13-4519-bf3a-dcf7f1e9d842",
-    "pubkey": "0001be6bd50247846a28cce439a10470a39b1b6c81d5c3be2475156a413e1e3a",
     "action": "fiat-sent",
     "content": null
   }

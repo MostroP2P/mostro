@@ -1,6 +1,6 @@
 # Creating a new sell order
 
-To create a new sell order the user should send a Gift wrap Nostr event (nip59) to Mostro, the rumor event should have the following rumor's content:
+To create a new sell order the user should send a Gift wrap Nostr event to Mostro, the rumor event should have the following rumor's content:
 
 ```json
 {

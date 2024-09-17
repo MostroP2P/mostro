@@ -1,27 +1,25 @@
 # User rating
 
-After a successful trade Mostro send a nip04 event to both parties to let them know they can rate each other, here an example how the message look like:
+After a successful trade Mostro send a Gift wrap Nostr event to both parties to let them know they can rate each other, here an example how the message look like:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
-    "pubkey": null,
     "action": "rate",
     "content": null
   }
 }
 ```
 
-After a Mostro client receive this message, the user can rate the other party, the rating is a number between 1 and 5, to rate the client must receive user's input and create a new nip04 event to send to Mostro with this content:
+After a Mostro client receive this message, the user can rate the other party, the rating is a number between 1 and 5, to rate the client must receive user's input and create a new Gift wrap Nostr event to send to Mostro with this content:
 
 ```json
 {
   "order": {
     "version": 1,
     "id": "7e44aa5d-855a-4b17-865e-8ca3834a91a3",
-    "pubkey": null,
     "action": "rate-user",
     "content": {
       "rating_user": 5 // User input
@@ -32,7 +30,7 @@ After a Mostro client receive this message, the user can rate the other party, t
 
 ## Confirmation message
 
-If Mostro received the correct message, it will send back a confirmation message to the user with `Action: rate-received`:
+If Mostro received the correct message, it will send back a confirmation message to the user with the action `rate-received`:
 
 ```json
 {

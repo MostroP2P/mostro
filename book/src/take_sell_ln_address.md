@@ -33,7 +33,7 @@ The event to send to Mostro would look like this:
 
 ## Mostro response
 
-Mostro send a nip 04 event to the buyer with a wrapped `order` in the content, it would look like this:
+Mostro send a Gift wrap Nostr event to the buyer with a wrapped `order` in the rumor's content, it would look like this:
 
 ```json
 {

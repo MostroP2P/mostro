@@ -58,11 +58,6 @@ pub async fn take_sell_action(
         return Ok(());
     }
 
-    // We check if the message have a pubkey
-    if msg.get_inner_message_kind().pubkey.is_none() {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
-        return Ok(());
-    }
     let buyer_pubkey = event.sender;
 
     let seller_pubkey = match &order.seller_pubkey {
@@ -116,16 +111,10 @@ pub async fn take_sell_action(
         }
     }
 
-    if order_status == Status::Pending {
-        // We update the master pubkey
-        order
-            .master_buyer_pubkey
-            .clone_from(&msg.get_inner_message_kind().pubkey);
-        // Add buyer pubkey to order
-        order.buyer_pubkey = Some(buyer_pubkey.to_string());
-        // Timestamp take order time
-        order.taken_at = Timestamp::now().as_u64() as i64;
-    }
+    // Add buyer pubkey to order
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    // Timestamp take order time
+    order.taken_at = Timestamp::now().as_u64() as i64;
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {

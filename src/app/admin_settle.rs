@@ -58,12 +58,7 @@ pub async fn admin_settle_action(
 
     // Was orde cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
-        let message = MessageKind::new(
-            Some(order_id),
-            Some(event.sender.to_string()),
-            Action::CooperativeCancelAccepted,
-            None,
-        );
+        let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
             let _ = send_dm(&event.sender, message).await;
         }
@@ -115,7 +110,7 @@ pub async fn admin_settle_action(
         NOSTR_CLIENT.get().unwrap().send_event(event).await?;
     }
     // We create a Message for settle
-    let message = Message::new_order(Some(order_updated.id), None, Action::AdminSettled, None);
+    let message = Message::new_order(Some(order_updated.id), Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.sender, message.clone()).await?;

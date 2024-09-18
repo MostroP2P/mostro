@@ -99,7 +99,6 @@ pub async fn admin_take_dispute_action(
     // We create a Message for admin
     let message = Message::new_dispute(
         Some(dispute_id),
-        None,
         Action::AdminTookDispute,
         Some(Content::Order(new_order)),
     );
@@ -110,14 +109,12 @@ pub async fn admin_take_dispute_action(
     let solver_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
         Some(order.id),
-        None,
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey.clone())),
     );
 
     let msg_to_seller = Message::new_order(
         Some(order.id),
-        None,
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey)),
     );

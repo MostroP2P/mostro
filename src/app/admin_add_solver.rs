@@ -43,7 +43,7 @@ pub async fn admin_add_solver_action(
         Err(ee) => error!("Error creating solver: {:#?}", ee),
     }
     // We create a Message for admin
-    let message = Message::new_dispute(None, None, Action::AdminAddSolver, None);
+    let message = Message::new_dispute(None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
     send_dm(&event.sender, message).await?;

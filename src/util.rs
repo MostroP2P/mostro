@@ -159,7 +159,6 @@ pub async fn publish_order(
     keys: &Keys,
     new_order: &SmallOrder,
     initiator_pubkey: &str,
-    master_pubkey: &str,
     ack_pubkey: PublicKey,
 ) -> Result<()> {
     let mut fee = 0;
@@ -193,10 +192,8 @@ pub async fn publish_order(
     if new_order.kind == Some(OrderKind::Buy) {
         new_order_db.kind = OrderKind::Buy.to_string();
         new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
-        new_order_db.master_buyer_pubkey = Some(master_pubkey.to_string());
     } else {
         new_order_db.seller_pubkey = Some(initiator_pubkey.to_string());
-        new_order_db.master_seller_pubkey = Some(master_pubkey.to_string());
     }
 
     // Request price from API in case amount is 0
@@ -566,7 +563,7 @@ pub async fn send_cant_do_msg(
     let content = message.map(Content::TextMessage);
 
     // Send message to event creator
-    let message = Message::cant_do(order_id, None, content);
+    let message = Message::cant_do(order_id, content);
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
     }
@@ -579,7 +576,7 @@ pub async fn send_new_order_msg(
     destination_key: &PublicKey,
 ) {
     // Send message to event creator
-    let message = Message::new_order(order_id, None, action, content);
+    let message = Message::new_order(order_id, action, content);
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
     }

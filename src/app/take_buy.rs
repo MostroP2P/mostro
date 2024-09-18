@@ -38,11 +38,6 @@ pub async fn take_buy_action(
         send_cant_do_msg(Some(order.id), None, &event.sender).await;
         return Ok(());
     }
-    // We check if the message have a pubkey
-    if msg.get_inner_message_kind().pubkey.is_none() {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
-        return Ok(());
-    }
 
     if order.kind != Kind::Buy.to_string() {
         error!("Order Id {order_id} wrong kind");
@@ -79,25 +74,22 @@ pub async fn take_buy_action(
         }
     };
 
-    // We update the master pubkey
-    order
-        .master_seller_pubkey
-        .clone_from(&msg.get_inner_message_kind().pubkey);
-
+    // We update the pubkey
     let seller_pubkey = event.sender;
     // Seller can take pending orders only
-    if order_status != Status::Pending {
-        // We create a Message
-        send_new_order_msg(
-            Some(order.id),
-            Action::NotAllowedByStatus,
-            None,
-            &seller_pubkey,
-        )
-        .await;
-        return Ok(());
+    match order_status {
+        Status::Pending => {}
+        _ => {
+            send_new_order_msg(
+                Some(order.id),
+                Action::NotAllowedByStatus,
+                None,
+                &seller_pubkey,
+            )
+            .await;
+            return Ok(());
+        }
     }
-
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         let (new_sats_amount, fee) =

@@ -81,21 +81,11 @@ pub async fn order_action(
             }
         }
 
-        let master_pubkey = match msg.get_inner_message_kind().pubkey {
-            Some(ref pk) => pk,
-            None => {
-                // We create a Message
-                send_cant_do_msg(order.id, None, &event.sender).await;
-                return Ok(());
-            }
-        };
-
         publish_order(
             pool,
             my_keys,
             order,
             &event.sender.to_string(),
-            master_pubkey,
             event.sender,
         )
         .await?;

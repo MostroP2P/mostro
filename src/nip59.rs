@@ -21,7 +21,8 @@ pub fn gift_wrap(
     content: String,
     expiration: Option<Timestamp>,
 ) -> Result<Event, BuilderError> {
-    let rumor: UnsignedEvent = EventBuilder::text_note(content, []).to_unsigned_event(receiver);
+    let rumor: UnsignedEvent =
+        EventBuilder::text_note(content, []).to_unsigned_event(sender_keys.public_key());
     let seal: Event = seal(sender_keys, &receiver, rumor)?.to_event(sender_keys)?;
 
     gift_wrap_from_seal(&receiver, &seal, expiration)

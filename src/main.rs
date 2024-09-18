@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_message_deserialize_serialize() {
-        let sample_message = r#"{"order":{"version":1,"id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","pubkey":null,"action":"fiat-sent","content":null}}"#;
+        let sample_message = r#"{"order":{"version":1,"id":"7dd204d2-d06c-4406-a3d9-4415f4a8b9c9","action":"fiat-sent","content":null}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(message.verify());
         let json_message = message.as_json().unwrap();
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_wrong_message_should_fail() {
-        let sample_message = r#"{"order":{"version":1,"pubkey":null,"action":"take-sell","content":{"order":{"kind":"sell","status":"pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"SEPA","premium":1,"payment_request":null,"created_at":1640839235}}}}"#;
+        let sample_message = r#"{"order":{"version":1,"action":"take-sell","content":{"order":{"kind":"sell","status":"pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"SEPA","premium":1,"payment_request":null,"created_at":1640839235}}}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(!message.verify());
     }

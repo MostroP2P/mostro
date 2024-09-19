@@ -1,4 +1,7 @@
-use crate::db::{edit_buyer_pubkey_order, edit_seller_pubkey_order, update_order_to_initial_state};
+use crate::db::{
+    edit_buyer_pubkey_order, edit_seller_pubkey_order, find_order_by_id,
+    update_order_to_initial_state,
+};
 use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
@@ -24,15 +27,16 @@ pub async fn cancel_action(
     } else {
         return Err(Error::msg("No order id"));
     };
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
+    let user_pubkey = event.sender.to_string();
+
+    let mut order = match find_order_by_id(pool, order_id, &user_pubkey).await {
+        Ok(order) => order,
+        Err(_) => {
+            error!("Order Id {order_id} not found for user with pubkey: {user_pubkey}");
             return Ok(());
         }
     };
 
-    let user_pubkey = event.sender.to_string();
     if order.status == Status::Pending.to_string() {
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {

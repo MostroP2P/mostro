@@ -328,3 +328,23 @@ pub async fn is_assigned_solver(
 
     Ok(result)
 }
+
+pub async fn find_order_by_id(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    user_pubkey: &str,
+) -> anyhow::Result<Order> {
+    let order = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE id = ?1 AND (buyer_pubkey = ?2 OR seller_pubkey = ?2)
+        "#,
+    )
+    .bind(order_id)
+    .bind(user_pubkey)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(order)
+}

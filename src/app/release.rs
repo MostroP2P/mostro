@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
+use tonic_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
 
 pub async fn check_failure_retries(order: &Order) -> Result<Order> {

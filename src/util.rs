@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tonic_lnd::lnrpc::invoice::InvoiceState;
 use tracing::error;
 use tracing::info;
 use uuid::Uuid;

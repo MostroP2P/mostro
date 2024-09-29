@@ -86,10 +86,14 @@ impl LndConnector {
     pub async fn subscribe_invoice(
         &mut self,
         r_hash: Vec<u8>,
-        req: Request<InvoiceSubscription>,
+        listener: Sender<InvoiceState>,
     ) -> anyhow::Result<()> {
         let invoice_stream = self
-            .client.lightning().subscribe_invoices(req)
+            .client.lightning()
+            .subscribe_invoices(tonic_lnd::lnrpc::InvoiceSubscription {
+                add_index: 0,
+                settle_index: 0,
+            })
             .await
             .map_err(|e| MostroError::LnNodeError(e.to_string()))?;
 
@@ -103,13 +107,13 @@ impl LndConnector {
             if let Some(state) =
                 tonic_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
             {
-                let msg = InvoiceMessage {
-                    hash: r_hash.clone(),
-                    state,
-                };
+                // let msg = InvoiceMessage {
+                //     hash: r_hash.clone(),
+                //     state,
+                // };
                 listener
                     .clone()
-                    .send(msg)
+                    .send(state)
                     .await
                     .map_err(|e| MostroError::LnNodeError(e.to_string()))?
             }
@@ -126,8 +130,10 @@ impl LndConnector {
         let preimage_message = SettleInvoiceMsg { preimage };
         let settle = self
             .client
-            .invoices()
-            .settle_invoice(preimage_message)
+            .lightning().se
+
+            // .invoices()
+            // .settle_invoice(preimage_message)
             .await
             .map_err(|e| e.to_string());
 

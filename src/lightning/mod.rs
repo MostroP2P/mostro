@@ -11,11 +11,9 @@ use easy_hasher::easy_hasher::*;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
-use tonic_lnd::lnrpc::invoicesrpc::{
-    AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
-    SettleInvoiceMsg, SettleInvoiceResp,
-};
-use tonic_lnd::lnrpc::{invoice::InvoiceState, Payment};
+use tonic_lnd::lnrpc::{AddInvoiceResponse, InvoiceSubscription};
+use tonic_lnd::lnrpc::{invoice::InvoiceState, Payment, Invoice};
+use tonic_lnd::tonic::Request;
 use tonic_lnd::LightningClient;
 use tonic_lnd::{Client,ConnectError};
 use tracing::info;
@@ -58,15 +56,15 @@ impl LndConnector {
         &mut self,
         description: &str,
         amount: i64,
-    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), ConnectError> {
+    ) -> Result<(AddInvoiceResponse, Vec<u8>, Vec<u8>), ConnectError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
         let ln_settings = Settings::get_ln();
         let cltv_expiry = ln_settings.hold_invoice_cltv_delta as u64;
-
-        let invoice = AddHoldInvoiceRequest {
-            hash: hash.to_vec(),
+        
+        let invoice = Invoice {
+            r_hash: hash.to_vec(),
             memo: description.to_string(),
             value: amount,
             cltv_expiry,
@@ -88,16 +86,10 @@ impl LndConnector {
     pub async fn subscribe_invoice(
         &mut self,
         r_hash: Vec<u8>,
-        listener: Sender<InvoiceMessage>,
+        req: Request<InvoiceSubscription>,
     ) -> anyhow::Result<()> {
         let invoice_stream = self
-            .client.lightning().subscribe_invoices(listener)
-            .invoices()
-            .subscribe_single_invoice(
-                tonic_lnd::invoicesrpc::SubscribeSingleInvoiceRequest {
-                    r_hash: r_hash.clone(),
-                },
-            )
+            .client.lightning().subscribe_invoices(req)
             .await
             .map_err(|e| MostroError::LnNodeError(e.to_string()))?;
 

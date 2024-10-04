@@ -1,6 +1,0 @@
-[book]
-authors = ["Francisco Calderón"]
-language = "en"
-multilingual = false
-src = "src"
-title = "Mostro messages specs"

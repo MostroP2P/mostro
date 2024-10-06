@@ -8,14 +8,15 @@ use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
+use fedimint_tonic_lnd::tonic::Status;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use tokio::sync::mpsc::Sender;
-use tonic_lnd::lnrpc::{AddInvoiceResponse, InvoiceSubscription};
-use tonic_lnd::lnrpc::{invoice::InvoiceState, Payment, Invoice};
-use tonic_lnd::tonic::Request;
-use tonic_lnd::LightningClient;
-use tonic_lnd::{Client,ConnectError};
+use fedimint_tonic_lnd::lnrpc::{AddInvoiceResponse, InvoiceSubscription};
+use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, Payment, Invoice};
+use fedimint_tonic_lnd::invoicesrpc::{AddHoldInvoiceRequest, AddHoldInvoiceResp};
+use fedimint_tonic_lnd::{ConnectError, LightningClient};
+use fedimint_tonic_lnd::{Client,};
 use tracing::info;
 // use tonic_lnd::lnrpc::
 
@@ -40,7 +41,7 @@ impl LndConnector {
         let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
-        let client = tonic_lnd::connect(
+        let client = fedimint_tonic_lnd::connect(
             ln_settings.lnd_grpc_host,
             ln_settings.lnd_cert_file,
             ln_settings.lnd_macaroon_file,
@@ -56,15 +57,15 @@ impl LndConnector {
         &mut self,
         description: &str,
         amount: i64,
-    ) -> Result<(AddInvoiceResponse, Vec<u8>, Vec<u8>), ConnectError> {
+    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), String > {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
         let ln_settings = Settings::get_ln();
         let cltv_expiry = ln_settings.hold_invoice_cltv_delta as u64;
         
-        let invoice = Invoice {
-            r_hash: hash.to_vec(),
+        let invoice = AddHoldInvoiceRequest {
+            hash: hash.to_vec(),
             memo: description.to_string(),
             value: amount,
             cltv_expiry,
@@ -72,14 +73,14 @@ impl LndConnector {
         };
         let holdinvoice = self
             .client
-            .lightning()
-            .add_invoice(invoice)
+            .invoices()
+            .add_hold_invoice(invoice)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| e);
 
         match holdinvoice {
             Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
-            Err(e) => Err(e),
+            Err(e) => Err(e.message().to_string()),
         }
     }
 
@@ -90,7 +91,7 @@ impl LndConnector {
     ) -> anyhow::Result<()> {
         let invoice_stream = self
             .client.lightning()
-            .subscribe_invoices(tonic_lnd::lnrpc::InvoiceSubscription {
+            .subscribe_invoices(fedimint_tonic_lnd::lnrpc::InvoiceSubscription {
                 add_index: 0,
                 settle_index: 0,
             })
@@ -105,12 +106,12 @@ impl LndConnector {
             .map_err(|e| MostroError::LnNodeError(e.to_string()))?
         {
             if let Some(state) =
-                tonic_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
+            fedimint_tonic_lnd::lnrpc::invoice::InvoiceState::try_from(invoice.state)
             {
-                // let msg = InvoiceMessage {
-                //     hash: r_hash.clone(),
-                //     state,
-                // };
+                let msg = InvoiceMessage {
+                    hash: r_hash.clone(),
+                    state,
+                };
                 listener
                     .clone()
                     .send(state)

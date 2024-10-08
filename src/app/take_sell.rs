@@ -34,20 +34,6 @@ pub async fn take_sell_action(
         }
     };
 
-    // Get amount request if user requested one for range order - fiat amount will be used below
-    if let Some(am) = get_fiat_amount_requested(&order, &msg) {
-        order.fiat_amount = am;
-    } else {
-        send_new_order_msg(
-            Some(order.id),
-            Action::OutOfRangeFiatAmount,
-            None,
-            &event.sender,
-        )
-        .await;
-        return Ok(());
-    }
-
     // Maker can't take own order
     if order.creator_pubkey == event.sender.to_hex() {
         send_cant_do_msg(Some(order.id), None, &event.sender).await;
@@ -109,6 +95,20 @@ pub async fn take_sell_action(
             .await;
             return Ok(());
         }
+    }
+    
+    // Get amount request if user requested one for range order - fiat amount will be used below
+    if let Some(am) = get_fiat_amount_requested(&order, &msg) {
+        order.fiat_amount = am;
+    } else {
+        send_new_order_msg(
+            Some(order.id),
+            Action::OutOfRangeFiatAmount,
+            None,
+            &event.sender,
+        )
+        .await;
+        return Ok(());
     }
 
     // Add buyer pubkey to order

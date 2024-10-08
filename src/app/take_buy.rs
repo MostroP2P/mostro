@@ -45,20 +45,6 @@ pub async fn take_buy_action(
         return Ok(());
     }
 
-    // Get amount request if user requested one for range order - fiat amount will be used below
-    if let Some(am) = get_fiat_amount_requested(&order, &msg) {
-        order.fiat_amount = am;
-    } else {
-        send_new_order_msg(
-            Some(order.id),
-            Action::OutOfRangeFiatAmount,
-            None,
-            &event.sender,
-        )
-        .await;
-        return Ok(());
-    }
-
     let order_status = match Status::from_str(&order.status) {
         Ok(s) => s,
         Err(e) => {
@@ -90,6 +76,21 @@ pub async fn take_buy_action(
             return Ok(());
         }
     }
+    
+    // Get amount request if user requested one for range order - fiat amount will be used below
+    if let Some(am) = get_fiat_amount_requested(&order, &msg) {
+        order.fiat_amount = am;
+    } else {
+        send_new_order_msg(
+            Some(order.id),
+            Action::OutOfRangeFiatAmount,
+            None,
+            &event.sender,
+        )
+        .await;
+        return Ok(());
+    } 
+    
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         let (new_sats_amount, fee) =

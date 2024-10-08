@@ -60,7 +60,6 @@ pub struct Lightning {
     pub lnd_cert_file: String,
     pub lnd_macaroon_file: String,
     pub lnd_grpc_host: String,
-    pub lnd_grpc_port: u32,
     pub invoice_expiration_window: u32,
     pub hold_invoice_cltv_delta: u32,
     pub hold_invoice_expiration_window: u32,

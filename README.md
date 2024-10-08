@@ -82,9 +82,7 @@ _lnd_cert_file:_ LND node TLS certificate file path.
 
 _lnd_macaroon_file:_ Macaroon file path, the macaroon file contains permission for doing actions on the lnd node.
 
-_lnd_grpc_host:_ IP address or domain name from the LND node, example: `127.0.0.1`.
-
-_lnd_grpc_port:_ LND node port to connect, example: `10009`.
+_lnd_grpc_host:_ IP address or domain name from the LND node and port, example: `https://127.0.0.1:10009`.
 
 ### Database
 

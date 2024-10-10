@@ -1,7 +1,6 @@
 use crate::cli::settings::Settings;
-use crate::lightning::invoice::decode_invoice;
+use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg, send_new_order_msg};
-
 use anyhow::Result;
 use mostro_core::message::{Action, Message};
 use nostr::nips::nip59::UnwrappedGift;
@@ -19,16 +18,22 @@ pub async fn order_action(
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 
-        // Reject all new invoices in a neworder with amount != 0
+        // Allows lightning address or invoice
+        // If user add a bolt11 invoice with a wrong amount the payment will fail later
         if let Some(invoice) = msg.get_inner_message_kind().get_payment_request() {
-            let invoice = decode_invoice(&invoice)?;
-            if invoice
-                .amount_milli_satoshis()
-                .map(|sats| sats / 1000)
-                .is_some()
-            {
-                send_new_order_msg(None, Action::IncorrectInvoiceAmount, None, &event.sender).await;
-                return Ok(());
+            // Verify if LN address is valid
+            match is_valid_invoice(invoice.clone(), None, None).await {
+                Ok(_) => (),
+                Err(_) => {
+                    send_new_order_msg(
+                        order.id,
+                        Action::IncorrectInvoiceAmount,
+                        None,
+                        &event.sender,
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
         }
 

@@ -18,7 +18,8 @@ pub async fn order_action(
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 
-        // Reject all new invoices in a neworder with amount != 0
+        // Allows lightning address or invoice
+        // If user add a bolt11 invoice with a wrong amount the payment will fail later
         if let Some(invoice) = msg.get_inner_message_kind().get_payment_request() {
             // Verify if LN address is valid
             match is_valid_invoice(invoice.clone(), None, None).await {

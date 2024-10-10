@@ -3,8 +3,8 @@
 lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
 # path to macaroon file
 lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
-lnd_grpc_port = 10001
-lnd_grpc_host = '127.0.0.1'
+# lnd grpc host and port
+lnd_grpc_host = 'https://127.0.0.1:10001'
 # lightning invoices sent by the buyer to Mostro should have at least
 # this expiration time in seconds
 invoice_expiration_window = 3600

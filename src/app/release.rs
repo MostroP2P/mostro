@@ -9,6 +9,7 @@ use crate::util::{
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
+use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::message::{Action, Message};
 use mostro_core::order::{Order, Status};
@@ -19,7 +20,6 @@ use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
 use tracing::{error, info};
 
 pub async fn check_failure_retries(order: &Order) -> Result<Order> {
@@ -176,7 +176,7 @@ pub async fn do_payment(mut order: Order) -> Result<()> {
             // We redeclare vars to use inside this block
             // Receiving msgs from send_payment()
             while let Some(msg) = rx.recv().await {
-                if let Some(status) = PaymentStatus::from_i32(msg.payment.status) {
+                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
                     match status {
                         PaymentStatus::Succeeded => {
                             info!(

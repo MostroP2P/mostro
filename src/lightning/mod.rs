@@ -8,20 +8,21 @@ use crate::util::bytes_to_string;
 
 use anyhow::Result;
 use easy_hasher::easy_hasher::*;
-use nostr_sdk::nostr::hashes::hex::FromHex;
-use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
-use tokio::sync::mpsc::Sender;
-use tonic_openssl_lnd::invoicesrpc::{
+use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use tonic_openssl_lnd::lnrpc::{invoice::InvoiceState, Payment};
-use tonic_openssl_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
-use tonic_openssl_lnd::{LndClient, LndClientError};
+use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, Payment};
+use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
+use fedimint_tonic_lnd::Client;
+use nostr_sdk::nostr::hashes::hex::FromHex;
+use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
+use tokio::sync::mpsc::Sender;
 use tracing::info;
+// use tonic_lnd::lnrpc::
 
 pub struct LndConnector {
-    client: LndClient,
+    client: Client,
 }
 
 #[derive(Debug, Clone)]
@@ -40,9 +41,8 @@ impl LndConnector {
         let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
-        let client = tonic_openssl_lnd::connect(
+        let client = fedimint_tonic_lnd::connect(
             ln_settings.lnd_grpc_host,
-            ln_settings.lnd_grpc_port,
             ln_settings.lnd_cert_file,
             ln_settings.lnd_macaroon_file,
         )
@@ -57,7 +57,7 @@ impl LndConnector {
         &mut self,
         description: &str,
         amount: i64,
-    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), LndClientError> {
+    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
@@ -76,11 +76,11 @@ impl LndConnector {
             .invoices()
             .add_hold_invoice(invoice)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| MostroError::LnNodeError(e.to_string()));
 
         match holdinvoice {
             Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
-            Err(e) => Err(LndClientError::cancelled(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -93,7 +93,7 @@ impl LndConnector {
             .client
             .invoices()
             .subscribe_single_invoice(
-                tonic_openssl_lnd::invoicesrpc::SubscribeSingleInvoiceRequest {
+                fedimint_tonic_lnd::invoicesrpc::SubscribeSingleInvoiceRequest {
                     r_hash: r_hash.clone(),
                 },
             )
@@ -107,8 +107,7 @@ impl LndConnector {
             .await
             .map_err(|e| MostroError::LnNodeError(e.to_string()))?
         {
-            if let Some(state) =
-                tonic_openssl_lnd::lnrpc::invoice::InvoiceState::from_i32(invoice.state)
+            let state = fedimint_tonic_lnd::lnrpc::invoice::InvoiceState::try_from(invoice.state)?;
             {
                 let msg = InvoiceMessage {
                     hash: r_hash.clone(),
@@ -127,7 +126,7 @@ impl LndConnector {
     pub async fn settle_hold_invoice(
         &mut self,
         preimage: &str,
-    ) -> Result<SettleInvoiceResp, LndClientError> {
+    ) -> Result<SettleInvoiceResp, MostroError> {
         let preimage = FromHex::from_hex(preimage).expect("Wrong preimage");
 
         let preimage_message = SettleInvoiceMsg { preimage };
@@ -136,18 +135,18 @@ impl LndConnector {
             .invoices()
             .settle_invoice(preimage_message)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| MostroError::LnNodeError(e.to_string()));
 
         match settle {
             Ok(settle) => Ok(settle.into_inner()),
-            Err(e) => Err(LndClientError::cancelled(e)),
+            Err(e) => Err(e),
         }
     }
 
     pub async fn cancel_hold_invoice(
         &mut self,
         hash: &str,
-    ) -> Result<CancelInvoiceResp, LndClientError> {
+    ) -> Result<CancelInvoiceResp, MostroError> {
         let payment_hash = FromHex::from_hex(hash).expect("Wrong payment hash");
 
         let cancel_message = CancelInvoiceMsg { payment_hash };
@@ -156,11 +155,11 @@ impl LndConnector {
             .invoices()
             .cancel_invoice(cancel_message)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| MostroError::LnNodeError(e.to_string()));
 
         match cancel {
             Ok(cancel) => Ok(cancel.into_inner()),
-            Err(e) => Err(LndClientError::cancelled(e)),
+            Err(e) => Err(e),
         }
     }
 

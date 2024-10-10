@@ -104,8 +104,7 @@ Here some parameters you might want to change:
 
 - **lnd_cert_file**: path to tls.cert file
 - **lnd_macaroon_file**: path to macaroon file
-- **lnd_grpc_port**: lnd gRPC port
-- **lnd_grpc_host**: lnd gRPC host
+- **lnd_grpc_host**: lnd gRPC host and port
 - **nsec_privkey** : Your mostro private key
 - **relays** : List of relays you want to connect to
 

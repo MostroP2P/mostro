@@ -208,8 +208,6 @@ pub async fn publish_order(
     let reputation = get_user_reputation(initiator_pubkey, keys).await?;
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
-
-    info!("order tags to be published: {:#?}", tags);
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)?;
     info!("Order event to be published: {event:#?}");

@@ -41,24 +41,24 @@ Run `cargo fmt` and `cargo clippy` before committing to ensure that code is cons
 
 ### Configure Git user name and email metadata
 
-See https://help.github.com/articles/setting-your-username-in-git/ for instructions.
+See <https://help.github.com/articles/setting-your-username-in-git/> for instructions.
 
 ### Write well-formed commit messages
 
-From https://chris.beams.io/posts/git-commit/#seven-rules:
+From <https://chris.beams.io/posts/git-commit/#seven-rules>:
 
-1.  Separate subject from body with a blank line
-2.  Limit the subject line to 50 characters (\*)
-3.  Capitalize the subject line
-4.  Do not end the subject line with a period
-5.  Use the imperative mood in the subject line
-6.  Wrap the body at 72 characters (\*)
-7.  Use the body to explain what and why vs. how
+1. Separate subject from body with a blank line
+2. Limit the subject line to 50 characters (\*)
+3. Capitalize the subject line
+4. Do not end the subject line with a period
+5. Use the imperative mood in the subject line
+6. Wrap the body at 72 characters (\*)
+7. Use the body to explain what and why vs. how
 
 ### Sign your commits with GPG
 
-See https://github.com/blog/2144-gpg-signature-verification for background and
-https://help.github.com/articles/signing-commits-with-gpg/ for instructions.
+See <https://github.com/blog/2144-gpg-signature-verification> for background and
+<https://help.github.com/articles/signing-commits-with-gpg/> for instructions.
 
 ### Keep the git history clean
 

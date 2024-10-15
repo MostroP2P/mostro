@@ -115,8 +115,8 @@ The data is saved in a sqlite db file named by default `mostro.db`, this file is
 Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
 ```bash
-$ cargo install sqlx-cli --version 0.6.2
-$ ./init_db.sh
+cargo install sqlx-cli --version 0.6.2
+./init_db.sh
 ```
 
 Check the DB files are there
@@ -266,6 +266,7 @@ Press CTRL+C to stop it
 
 Try some sqlite commands like:
 
+```bash
     cd /opt/mostro
     sqlite3 mostro.db
     ...
@@ -274,6 +275,7 @@ Try some sqlite commands like:
     sqlite> select * from orders;
     sqlite> select count(*) from orders;
     ...
+```
 
 ## Connect your client
 

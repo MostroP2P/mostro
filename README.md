@@ -50,27 +50,26 @@ To handle a Mostro is not going to be that easy, a Mostro admin needs to have a 
 
 Users will be able to rate Mostros and Mostros will compete to obtain more users in order to survive. Bad Mostros should be rejected by users and will lose incentives to keep existing.
 
-## Requirements:
+## Requirements
 
 0. You need Rust version 1.74 or higher to compile.
 1. You will need a lightning network node.
 
-## Install dependencies:
+## Install dependencies
 
 To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/tools/install), then run the following commands:
 
+```bash
+sudo apt update
+sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
 ```
-$ sudo apt update
-$ sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
-```
+
 To compile on Mac, then use brew:
 
-```
-$ brew update
+```bash
+brew update
 brew install cmake pkg-config openssl sqlite3
-
 ```
-
 
 ## Install
 
@@ -78,13 +77,13 @@ If you want to run Mostro on your local machine, you can follow the instructions
 
 Clone the repository and then create a new `settings.toml` file based on `settings.tpl.toml` file.
 
-```
-$ git clone https://github.com/MostroP2P/mostro.git
-$ cd mostro
-$ cp settings.tpl.toml settings.toml
+```bash
+git clone https://github.com/MostroP2P/mostro.git
+cd mostro
+cp settings.tpl.toml settings.toml
 ```
 
-To connect to an LND node, you must define 4 variables within the [lightning] section of the settings.toml file.
+To connect to an LND node, you must define 3 variables within the [lightning] section of the settings.toml file.
 
 _lnd_cert_file:_ LND node TLS certificate file path.
 
@@ -99,24 +98,24 @@ The data is saved in a sqlite db file named by default `mostro.db`, this file is
 Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
 
 ```bash
-$ cargo install sqlx-cli --version 0.6.2
-$ ./init_db.sh
+cargo install sqlx-cli --version 0.6.2
+./init_db.sh
 ```
 
-### Running it:
+### Running it
 
 Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
 
 You must create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
 
 ```bash
-$ mkdir $HOME/.mostro/ && cp settings.toml mostro.db $HOME/.mostro/
+mkdir $HOME/.mostro/ && cp settings.toml mostro.db $HOME/.mostro/
 ```
 
 Finnaly run it:
 
 ```bash
-$ cargo run
+cargo run
 ```
 
 ## Connecting to relay
@@ -135,11 +134,11 @@ So the relay URL you want to connect to is: `ws://localhost:7000`.
 You need to set `relays` in the `[nostr]` section of the `settings.toml` file:
 relays = ['ws://localhost:7000']
 
-#### Troubleshooting:
+#### Troubleshooting
 
 If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the docker-compose.yml file in the relay directory with:
 
-```bash
+```yml
 version: '3.8'
 
 services:
@@ -159,20 +158,16 @@ volumes:
 
 You just need to set `relays` in the `[nostr]` section of the `settings.toml` file with the relays you will use.
 
-# Contribute
+## Contribute
 
 You may be interested in contributing to Mostro. If you're looking for somewhere to start contributing, check out the [good first issue](https://github.com/MostroP2P/mostro/labels/good%20first%20issue) list.
 
 More info in our [contributing guide](CONTRIBUTING.md).
 
-## Rewards board
+### Rewards board
 
 To incentivize collaborators we have a **Rewards board**, we must clarify that Mostro is not a company but an open source project, the amounts offered are a way to thank for collaboration and we can offer it thanks to the generous donation of contributors, mostly anonymous, but also to two important institutions that have given us grants, you can check it [here](https://github.com/orgs/MostroP2P/projects/2/views/1).
 
-# License
+## License
 
 Mostro is licensed under the [MIT license](LICENSE).
-
-```
-
-```

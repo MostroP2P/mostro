@@ -1,32 +1,37 @@
 # Build stage
-FROM rust:latest as builder
-
-# Install dependencies
-RUN apt-get update && \
-    apt-get install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
-
-# Clone repository
-RUN git clone https://github.com/MostroP2P/mostro.git /mostro
+FROM rust:1.81 AS builder
 
 # Set working directory
 WORKDIR /mostro
+
+# Copy source code
+COPY . .
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler
 
 # Build the project in release mode
 RUN cargo build --release
 
 # Production stage
-FROM rust:slim-bookworm
+FROM debian:bookworm-slim
 
-# Copy builded binary from build stage
+# Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
 
+WORKDIR /mostro
+
 # Copy settings and empty database
-COPY ./settings.docker.toml /mostro/settings.docker.toml
-COPY ./empty.mostro.db /mostro/empty.mostro.db
+COPY --chown=mostrouser:mostrouser ./docker/settings.docker.toml ./docker/empty.mostro.db ./
 
 # Copy start script
-COPY start.sh /mostro/start.sh
-RUN chmod +x /mostro/start.sh
+COPY --chown=mostrouser:mostrouser ./docker/start.sh ./start.sh
+RUN chmod +x ./start.sh
+
+# Add a non-root user and switch to it
+RUN useradd -m mostrouser
+USER mostrouser
 
 # Start mostro (copy settings and database if it's not created yet)
-CMD ["/mostro/start.sh"]
+ENTRYPOINT ["./start.sh"]

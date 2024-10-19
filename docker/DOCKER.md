@@ -13,10 +13,14 @@ The `compose.yml` file is configured as follows:
 ```yaml
 services:
   mostro:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     volumes:
-      - ~/mostro:/config # settings.toml and mostro.db
+      - ./config:/config  # settings.toml and mostro.db
       - ~/.polar/networks/1/volumes/lnd:/lnd # LND data
+    platform: linux/amd64
+
 ```
 
 ## Building and Running the Docker Container

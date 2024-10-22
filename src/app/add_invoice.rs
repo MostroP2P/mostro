@@ -18,6 +18,7 @@ pub async fn add_invoice_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
     let mut order = if let Some(order_id) = order_msg.id {
@@ -54,7 +55,7 @@ pub async fn add_invoice_action(
     };
     // Only the buyer can add an invoice
     if buyer_pubkey != event.sender {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -171,7 +172,15 @@ pub async fn add_invoice_action(
         )
         .await;
     } else {
-        show_hold_invoice(my_keys, None, &buyer_pubkey, &seller_pubkey, order).await?;
+        show_hold_invoice(
+            my_keys,
+            None,
+            &buyer_pubkey,
+            &seller_pubkey,
+            order,
+            msg.get_inner_message_kind().request_id,
+        )
+        .await?;
     }
 
     Ok(())

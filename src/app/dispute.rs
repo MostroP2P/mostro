@@ -21,6 +21,7 @@ pub async fn dispute_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -85,7 +86,7 @@ pub async fn dispute_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     };
 

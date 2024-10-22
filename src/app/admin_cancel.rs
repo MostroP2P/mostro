@@ -22,6 +22,7 @@ pub async fn admin_cancel_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -58,7 +59,12 @@ pub async fn admin_cancel_action(
 
     // Was order cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
-        let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
+        let message = MessageKind::new(
+            request_id,
+            Some(order_id),
+            Action::CooperativeCancelAccepted,
+            None,
+        );
         if let Ok(message) = message.as_json() {
             let _ = send_dm(&event.sender, message).await;
         }
@@ -119,7 +125,7 @@ pub async fn admin_cancel_action(
     let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order).await?;
     order_updated.update(pool).await?;
     // We create a Message for cancel
-    let message = Message::new_order(Some(order.id), Action::AdminCanceled, None);
+    let message = Message::new_order(request_id, Some(order.id), Action::AdminCanceled, None);
     let message = message.as_json()?;
     // Message to admin
     send_dm(&event.sender, message.clone()).await?;

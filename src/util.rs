@@ -390,7 +390,7 @@ pub async fn show_hold_invoice(
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
     send_new_order_msg(
-        msg.get_inner_message_kind().request_id,
+        request_id,
         Some(order.id),
         Action::PayInvoice,
         Some(Content::PaymentRequest(
@@ -411,13 +411,13 @@ pub async fn show_hold_invoice(
     )
     .await;
 
-    let _ = invoice_subscribe(hash, request_id).await;
+    let _ = invoice_subscribe(hash, Some(request_id)).await;
 
     Ok(())
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>, request_id:u64) -> anyhow::Result<()> {
+pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> anyhow::Result<()> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
@@ -466,7 +466,7 @@ pub async fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
     premium: i64,
-    request_id:u64,
+    _request_id: u64,
 ) -> Result<(i64, i64)> {
     // Update amount order
     let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
@@ -476,7 +476,11 @@ pub async fn get_market_amount_and_fee(
 }
 
 /// Set order sats amount, this used when a buyer take a sell order
-pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicKey) -> Result<i64> {
+pub async fn set_waiting_invoice_status(
+    order: &mut Order,
+    buyer_pubkey: PublicKey,
+    request_id: u64,
+) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
 
@@ -519,18 +523,11 @@ pub async fn rate_counterpart(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     order: &Order,
-    request_id :u64,
+    request_id: u64,
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Rate,
-        None,
-        buyer_pubkey,
-    )
-    .await;
+    send_new_order_msg(request_id, Some(order.id), Action::Rate, None, buyer_pubkey).await;
     // to seller
     send_new_order_msg(
         request_id,
@@ -552,10 +549,11 @@ pub async fn settle_seller_hold_invoice(
     action: Action,
     is_admin: bool,
     order: &Order,
+    request_id: u64,
 ) -> Result<()> {
     // Check if the pubkey is right
     if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Err(Error::msg("Not allowed"));
     }
 
@@ -564,7 +562,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Err(Error::msg("No preimage"));
     }
     Ok(())
@@ -578,6 +576,7 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
 }
 
 pub async fn send_cant_do_msg(
+    request_id: u64,
     order_id: Option<Uuid>,
     message: Option<String>,
     destination_key: &PublicKey,
@@ -586,7 +585,7 @@ pub async fn send_cant_do_msg(
     let content = message.map(Content::TextMessage);
 
     // Send message to event creator
-    let message = Message::cant_do(order_id, content);
+    let message = Message::cant_do(request_id, order_id, content);
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
     }

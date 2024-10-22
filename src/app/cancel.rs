@@ -21,7 +21,7 @@ pub async fn cancel_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    request_id : u64,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -80,7 +80,7 @@ pub async fn cancel_action(
     if order.kind == OrderKind::Buy.to_string()
         && order.status == Status::WaitingPayment.to_string()
     {
-        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys,request_id).await?;
+        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
     }
 
     if order.status == Status::Active.to_string()
@@ -106,7 +106,7 @@ pub async fn cancel_action(
             Some(ref initiator_pubkey) => {
                 if initiator_pubkey == &user_pubkey {
                     // We create a Message
-                    send_cant_do_msg(Some(order_id), None, &event.sender).await;
+                    send_cant_do_msg(request_id, Some(order_id), None, &event.sender).await;
                     return Ok(());
                 } else {
                     if let Some(hash) = &order.hash {
@@ -178,7 +178,7 @@ pub async fn cancel_add_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
-    request_id : u64,
+    request_id: u64,
 ) -> Result<()> {
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
@@ -195,7 +195,7 @@ pub async fn cancel_add_invoice(
 
     if buyer_pubkey != &user_pubkey {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -245,7 +245,7 @@ pub async fn cancel_pay_hold_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
-    request_id : u64,
+    request_id: u64,
 ) -> Result<()> {
     if order.hash.is_some() {
         // We return funds to seller
@@ -264,7 +264,7 @@ pub async fn cancel_pay_hold_invoice(
 
     if seller_pubkey.to_string() != user_pubkey {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 

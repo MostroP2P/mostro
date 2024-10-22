@@ -42,6 +42,7 @@ pub async fn admin_take_dispute_action(
     msg: Message,
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     // Find dipute id in the message
     let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
@@ -71,7 +72,7 @@ pub async fn admin_take_dispute_action(
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
         if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(Some(dispute_id), None, &event.sender).await;
+            send_cant_do_msg(request_id, Some(dispute_id), None, &event.sender).await;
             return Ok(());
         }
     } else {
@@ -123,6 +124,7 @@ pub async fn admin_take_dispute_action(
     );
 
     let msg_to_seller = Message::new_order(
+        request_id,
         Some(order.id),
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey)),

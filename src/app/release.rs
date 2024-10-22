@@ -22,7 +22,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order, request_id:u64) -> Result<Order> {
+pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Result<Order> {
     let mut order = order.clone();
 
     // Handle to db here
@@ -45,7 +45,7 @@ pub async fn check_failure_retries(order: &Order, request_id:u64) -> Result<Orde
     };
 
     send_new_order_msg(
-        request_id,
+        request_id.unwrap_or(1),
         Some(order.id),
         Action::PaymentFailed,
         None,
@@ -64,7 +64,7 @@ pub async fn release_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    request_id : u64,
+    request_id: u64,
 ) -> Result<()> {
     // Check if order id is ok
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -111,11 +111,19 @@ pub async fn release_action(
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
+    settle_seller_hold_invoice(
+        event,
+        ln_client,
+        Action::Released,
+        false,
+        &order,
+        request_id,
+    )
+    .await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
@@ -144,12 +152,12 @@ pub async fn release_action(
     )
     .await;
 
-    let _ = do_payment(order_updated,request_id).await;
+    let _ = do_payment(order_updated, Some(request_id)).await;
 
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order,request_id:u64) -> Result<()> {
+pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
@@ -169,7 +177,7 @@ pub async fn do_payment(mut order: Order,request_id:u64) -> Result<()> {
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
+        if let Ok(failed_payment) = check_failure_retries(&order, None).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -205,7 +213,7 @@ pub async fn do_payment(mut order: Order,request_id:u64) -> Result<()> {
                                 &buyer_pubkey,
                                 &seller_pubkey,
                                 &my_keys,
-                                request_id,
+                                request_id.unwrap_or(1),
                             )
                             .await;
                         }
@@ -216,7 +224,9 @@ pub async fn do_payment(mut order: Order,request_id:u64) -> Result<()> {
                             );
 
                             // Mark payment as failed
-                            if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
+                            if let Ok(failed_payment) =
+                                check_failure_retries(&order, request_id).await
+                            {
                                 info!(
                                     "Order id {} has {} failed payments retries",
                                     failed_payment.id, failed_payment.payment_attempts
@@ -238,7 +248,7 @@ async fn payment_success(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
-    request_id : u64,
+    request_id: u64,
 ) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(
@@ -341,8 +351,8 @@ async fn payment_success(
                         Ordering::Less => {}
                     }
                 } else {
-                    send_cant_do_msg(Some(order.id), None, buyer_pubkey).await;
-                    send_cant_do_msg(Some(order.id), None, seller_pubkey).await;
+                    send_cant_do_msg(request_id, Some(order.id), None, buyer_pubkey).await;
+                    send_cant_do_msg(request_id, Some(order.id), None, seller_pubkey).await;
                 }
             }
         }
@@ -356,7 +366,7 @@ async fn payment_success(
         let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
             // Adding here rate process
-            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success).await?;
+            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success, request_id).await?;
         }
     }
     Ok(())

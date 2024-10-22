@@ -33,6 +33,7 @@ pub async fn admin_settle_action(
     match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
@@ -58,7 +59,8 @@ pub async fn admin_settle_action(
 
     // Was orde cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
-        let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
+        let message = MessageKind::new(                    msg.get_inner_message_kind().request_id,
+        Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
             let _ = send_dm(&event.sender, message).await;
         }
@@ -67,6 +69,7 @@ pub async fn admin_settle_action(
 
     if order.status != Status::Dispute.to_string() {
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,

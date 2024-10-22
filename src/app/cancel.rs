@@ -21,6 +21,7 @@ pub async fn cancel_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    request_id : u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -41,7 +42,14 @@ pub async fn cancel_action(
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
             // We create a Message
-            send_new_order_msg(Some(order.id), Action::IsNotYourOrder, None, &event.sender).await;
+            send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
+                Some(order.id),
+                Action::IsNotYourOrder,
+                None,
+                &event.sender,
+            )
+            .await;
         } else {
             // We publish a new replaceable kind nostr event with the status updated
             // and update on local database the status and new event id
@@ -49,7 +57,14 @@ pub async fn cancel_action(
                 let _ = order_updated.update(pool).await;
             }
             // We create a Message for cancel
-            send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.sender,
+            )
+            .await;
         }
 
         return Ok(());
@@ -59,13 +74,13 @@ pub async fn cancel_action(
         && (order.status == Status::WaitingBuyerInvoice.to_string()
             || order.status == Status::WaitingBuyerInvoice.to_string())
     {
-        cancel_add_invoice(ln_client, &mut order, event, pool, my_keys).await?;
+        cancel_add_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
     }
 
     if order.kind == OrderKind::Buy.to_string()
         && order.status == Status::WaitingPayment.to_string()
     {
-        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys).await?;
+        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys,request_id).await?;
     }
 
     if order.status == Status::Active.to_string()
@@ -110,6 +125,7 @@ pub async fn cancel_action(
                     update_order_event(my_keys, Status::CooperativelyCanceled, &order).await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
                     send_new_order_msg(
+                        msg.get_inner_message_kind().request_id,
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
@@ -118,6 +134,7 @@ pub async fn cancel_action(
                     .await;
                     let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                     send_new_order_msg(
+                        msg.get_inner_message_kind().request_id,
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
@@ -133,6 +150,7 @@ pub async fn cancel_action(
                 let order = order.update(pool).await?;
                 // We create a Message to start a cooperative cancel and send it to both parties
                 send_new_order_msg(
+                    msg.get_inner_message_kind().request_id,
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByYou,
                     None,
@@ -141,6 +159,7 @@ pub async fn cancel_action(
                 .await;
                 let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                 send_new_order_msg(
+                    msg.get_inner_message_kind().request_id,
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByPeer,
                     None,
@@ -159,6 +178,7 @@ pub async fn cancel_add_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
+    request_id : u64,
 ) -> Result<()> {
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
@@ -184,8 +204,22 @@ pub async fn cancel_add_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::CooperativelyCanceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &event.sender,
+        )
+        .await;
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &seller_pubkey,
+        )
+        .await;
         Ok(())
     } else {
         // We re-publish the event with Pending status
@@ -211,6 +245,7 @@ pub async fn cancel_pay_hold_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
+    request_id : u64,
 ) -> Result<()> {
     if order.hash.is_some() {
         // We return funds to seller
@@ -238,8 +273,22 @@ pub async fn cancel_pay_hold_invoice(
         // and update on local database the status and new event id
         update_order_event(my_keys, Status::Canceled, order).await?;
         // We create a Message for cancel
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &event.sender).await;
-        send_new_order_msg(Some(order.id), Action::Canceled, None, &seller_pubkey).await;
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &event.sender,
+        )
+        .await;
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &seller_pubkey,
+        )
+        .await;
         Ok(())
     } else {
         // We re-publish the event with Pending status

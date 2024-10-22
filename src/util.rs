@@ -161,6 +161,7 @@ pub async fn publish_order(
     new_order: &SmallOrder,
     initiator_pubkey: &str,
     ack_pubkey: PublicKey,
+    request_id: u64,
 ) -> Result<()> {
     let mut fee = 0;
     if new_order.amount > 0 {
@@ -221,6 +222,7 @@ pub async fn publish_order(
 
     // Send message as ack with small order
     send_new_order_msg(
+        request_id,
         Some(order_id),
         Action::NewOrder,
         Some(Content::Order(order)),
@@ -313,7 +315,7 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
         status.to_string()
     );
 
-    if NOSTR_CLIENT.get().unwrap().send_event(event).await.is_err(){
+    if NOSTR_CLIENT.get().unwrap().send_event(event).await.is_err() {
         tracing::warn!("order id : {} is expired", order_updated.id)
     }
 
@@ -351,6 +353,7 @@ pub async fn show_hold_invoice(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     mut order: Order,
+    request_id: u64,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Add fee of seller to hold invoice
@@ -387,6 +390,7 @@ pub async fn show_hold_invoice(
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
     send_new_order_msg(
+        msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::PayInvoice,
         Some(Content::PaymentRequest(
@@ -399,6 +403,7 @@ pub async fn show_hold_invoice(
     .await;
     // We send a message to buyer to know that seller was requested to pay the invoice
     send_new_order_msg(
+        request_id,
         Some(order.id),
         Action::WaitingSellerToPay,
         None,
@@ -406,13 +411,13 @@ pub async fn show_hold_invoice(
     )
     .await;
 
-    let _ = invoice_subscribe(hash).await;
+    let _ = invoice_subscribe(hash, request_id).await;
 
     Ok(())
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()> {
+pub async fn invoice_subscribe(hash: Vec<u8>, request_id:u64) -> anyhow::Result<()> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
@@ -432,7 +437,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>) -> anyhow::Result<()> {
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    if let Err(e) = flow::hold_invoice_paid(&hash).await {
+                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id).await {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");
@@ -461,6 +466,7 @@ pub async fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
     premium: i64,
+    request_id:u64,
 ) -> Result<(i64, i64)> {
     // Update amount order
     let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
@@ -497,6 +503,7 @@ pub async fn set_waiting_invoice_status(order: &mut Order, buyer_pubkey: PublicK
     );
     // We create a Message
     send_new_order_msg(
+        request_id,
         Some(order.id),
         Action::AddInvoice,
         Some(Content::Order(order_data)),
@@ -512,12 +519,27 @@ pub async fn rate_counterpart(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     order: &Order,
+    request_id :u64,
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(Some(order.id), Action::Rate, None, buyer_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+    )
+    .await;
     // to seller
-    send_new_order_msg(Some(order.id), Action::Rate, None, seller_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        seller_pubkey,
+    )
+    .await;
 
     Ok(())
 }
@@ -571,13 +593,14 @@ pub async fn send_cant_do_msg(
 }
 
 pub async fn send_new_order_msg(
+    request_id: u64,
     order_id: Option<Uuid>,
     action: Action,
     content: Option<Content>,
     destination_key: &PublicKey,
 ) {
     // Send message to event creator
-    let message = Message::new_order(order_id, action, content);
+    let message = Message::new_order(request_id, order_id, action, content);
     if let Ok(message) = message.as_json() {
         let _ = send_dm(destination_key, message).await;
     }

@@ -164,6 +164,7 @@ pub async fn update_user_reputation_action(
 
         // Send confirmation message to user that rated
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::RateReceived,
             Some(Content::RatingUser(rating)),

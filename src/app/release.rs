@@ -22,7 +22,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order) -> Result<Order> {
+pub async fn check_failure_retries(order: &Order, request_id:u64) -> Result<Order> {
     let mut order = order.clone();
 
     // Handle to db here
@@ -44,7 +44,14 @@ pub async fn check_failure_retries(order: &Order) -> Result<Order> {
         None => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    send_new_order_msg(Some(order.id), Action::PaymentFailed, None, &buyer_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::PaymentFailed,
+        None,
+        &buyer_pubkey,
+    )
+    .await;
 
     // Update order
     let result = order.update(&pool).await?;
@@ -57,6 +64,7 @@ pub async fn release_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    request_id : u64,
 ) -> Result<()> {
     // Check if order id is ok
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -92,6 +100,7 @@ pub async fn release_action(
         && current_status != Status::Dispute
     {
         send_new_order_msg(
+            request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
@@ -113,6 +122,7 @@ pub async fn release_action(
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
     send_new_order_msg(
+        request_id,
         Some(order_id),
         Action::HoldInvoicePaymentSettled,
         None,
@@ -125,14 +135,21 @@ pub async fn release_action(
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         _ => return Err(Error::msg("Missing buyer pubkeys")),
     };
-    send_new_order_msg(Some(order_id), Action::Released, None, &buyer_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order_id),
+        Action::Released,
+        None,
+        &buyer_pubkey,
+    )
+    .await;
 
-    let _ = do_payment(order_updated).await;
+    let _ = do_payment(order_updated,request_id).await;
 
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order) -> Result<()> {
+pub async fn do_payment(mut order: Order,request_id:u64) -> Result<()> {
     // Finally we try to pay buyer's invoice
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
@@ -152,7 +169,7 @@ pub async fn do_payment(mut order: Order) -> Result<()> {
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(&order).await {
+        if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -188,6 +205,7 @@ pub async fn do_payment(mut order: Order) -> Result<()> {
                                 &buyer_pubkey,
                                 &seller_pubkey,
                                 &my_keys,
+                                request_id,
                             )
                             .await;
                         }
@@ -198,7 +216,7 @@ pub async fn do_payment(mut order: Order) -> Result<()> {
                             );
 
                             // Mark payment as failed
-                            if let Ok(failed_payment) = check_failure_retries(&order).await {
+                            if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
                                 info!(
                                     "Order id {} has {} failed payments retries",
                                     failed_payment.id, failed_payment.payment_attempts
@@ -220,9 +238,11 @@ async fn payment_success(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
+    request_id : u64,
 ) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(
+        request_id,
         Some(order.id),
         Action::PurchaseCompleted,
         None,

@@ -32,6 +32,7 @@ pub async fn admin_cancel_action(
     match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
@@ -66,6 +67,7 @@ pub async fn admin_cancel_action(
 
     if order.status != Status::Dispute.to_string() {
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,

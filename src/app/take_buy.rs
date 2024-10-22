@@ -18,6 +18,7 @@ pub async fn take_buy_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id : u64,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -67,6 +68,7 @@ pub async fn take_buy_action(
         Status::Pending => {}
         _ => {
             send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
@@ -76,12 +78,13 @@ pub async fn take_buy_action(
             return Ok(());
         }
     }
-    
+
     // Get amount request if user requested one for range order - fiat amount will be used below
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,
@@ -89,8 +92,8 @@ pub async fn take_buy_action(
         )
         .await;
         return Ok(());
-    } 
-    
+    }
+
     // Check market price value in sats - if order was with market price then calculate
     if order.amount == 0 {
         let (new_sats_amount, fee) =

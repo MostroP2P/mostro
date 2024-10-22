@@ -41,6 +41,7 @@ pub async fn dispute_action(
                     order
                 } else {
                     send_new_order_msg(
+                        msg.get_inner_message_kind().request_id,
                         Some(order.id),
                         Action::NotAllowedByStatus,
                         None,
@@ -132,6 +133,7 @@ pub async fn dispute_action(
     };
 
     send_new_order_msg(
+        msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByYou,
         Some(Content::Dispute(dispute.clone().id, initiator_token)),
@@ -148,6 +150,7 @@ pub async fn dispute_action(
         }
     };
     send_new_order_msg(
+        msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByPeer,
         Some(Content::Dispute(dispute.clone().id, counterpart_token)),

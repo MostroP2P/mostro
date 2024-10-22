@@ -79,6 +79,9 @@ pub async fn run(
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {
+
+                                let request_id = msg.get_inner_message_kind().request_id;
+
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
@@ -90,14 +93,14 @@ pub async fn run(
                                         }
                                         Action::TakeSell => {
                                             if let Err(e) =
-                                                take_sell_action(msg, &event, &my_keys, &pool).await
+                                                take_sell_action(msg, &event, &my_keys, &pool, request_id).await
                                             {
                                                 warning_msg(&action, e)
                                             }
                                         }
                                         Action::TakeBuy => {
                                             if let Err(e) =
-                                                take_buy_action(msg, &event, &my_keys, &pool).await
+                                                take_buy_action(msg, &event, &my_keys, &pool, request_id).await
                                             {
                                                 warning_msg(&action, e)
                                             }
@@ -111,7 +114,7 @@ pub async fn run(
                                         }
                                         Action::Release => {
                                             if let Err(e) = release_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
+                                                msg, &event, &my_keys, &pool, ln_client,request_id
                                             )
                                             .await
                                             {
@@ -120,7 +123,7 @@ pub async fn run(
                                         }
                                         Action::Cancel => {
                                             if let Err(e) = cancel_action(
-                                                msg, &event, &my_keys, &pool, ln_client,
+                                                msg, &event, &my_keys, &pool, ln_client,request_id
                                             )
                                             .await
                                             {

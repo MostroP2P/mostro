@@ -55,7 +55,14 @@ pub async fn admin_take_dispute_action(
         Some(dispute) => dispute,
         None => {
             // We create a Message
-            send_new_order_msg(Some(dispute_id), Action::NotFound, None, &event.sender).await;
+            send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
+                Some(dispute_id),
+                Action::NotFound,
+                None,
+                &event.sender,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -98,6 +105,7 @@ pub async fn admin_take_dispute_action(
 
     // We create a Message for admin
     let message = Message::new_dispute(
+        msg.get_inner_message_kind().request_id,
         Some(dispute_id),
         Action::AdminTookDispute,
         Some(Content::Order(new_order)),
@@ -108,6 +116,7 @@ pub async fn admin_take_dispute_action(
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
+        msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey.clone())),

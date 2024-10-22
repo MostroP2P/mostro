@@ -14,6 +14,7 @@ pub async fn order_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id:u64,
 ) -> Result<()> {
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
@@ -26,6 +27,7 @@ pub async fn order_action(
                 Ok(_) => (),
                 Err(_) => {
                     send_new_order_msg(
+                        msg.get_inner_message_kind().request_id,
                         order.id,
                         Action::IncorrectInvoiceAmount,
                         None,
@@ -52,7 +54,14 @@ pub async fn order_action(
                 amount_vec.push(min);
                 amount_vec.push(max);
             } else {
-                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.sender).await;
+                send_new_order_msg(
+                    msg.get_inner_message_kind().request_id,
+                    None,
+                    Action::InvalidSatsAmount,
+                    None,
+                    &event.sender,
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -74,14 +83,28 @@ pub async fn order_action(
 
             // Check amount is positive - extra safety check
             if quote < 0 {
-                send_new_order_msg(None, Action::InvalidSatsAmount, None, &event.sender).await;
+                send_new_order_msg(
+                    msg.get_inner_message_kind().request_id,
+                    None,
+                    Action::InvalidSatsAmount,
+                    None,
+                    &event.sender,
+                )
+                .await;
                 return Ok(());
             }
 
             if quote > mostro_settings.max_order_amount as i64
                 || quote < mostro_settings.min_payment_amount as i64
             {
-                send_new_order_msg(None, Action::OutOfRangeSatsAmount, None, &event.sender).await;
+                send_new_order_msg(
+                    msg.get_inner_message_kind().request_id,
+                    None,
+                    Action::OutOfRangeSatsAmount,
+                    None,
+                    &event.sender,
+                )
+                .await;
                 return Ok(());
             }
         }

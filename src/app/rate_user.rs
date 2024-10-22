@@ -51,6 +51,7 @@ pub async fn update_user_reputation_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -75,7 +76,7 @@ pub async fn update_user_reputation_action(
     let message_sender = event.sender.to_string();
 
     if order.status != Status::Success.to_string() {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         error!("Order Id {order_id} wrong status");
         return Ok(());
     }
@@ -96,7 +97,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     };
 
@@ -164,6 +165,7 @@ pub async fn update_user_reputation_action(
 
         // Send confirmation message to user that rated
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::RateReceived,
             Some(Content::RatingUser(rating)),

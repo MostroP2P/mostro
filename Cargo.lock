@@ -1864,8 +1864,9 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.6.8"
-source = "git+https://github.com/MostroP2P/mostro-core?branch=bilthon-test#5217ba692c7e43346189b55fea1ebcf1ac34440e"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c615cf67e7952594d7c7a9e65a831284f3a45ac2fc90796dde7626dc5024b266"
 dependencies = [
  "anyhow",
  "chrono",

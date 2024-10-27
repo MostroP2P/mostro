@@ -69,11 +69,6 @@ pub async fn run(
                     };
 
                     let event = unwrap_gift_wrap(&my_keys, &event)?;
-                    // Here we discard messages older than the real since parameter
-                    let now = chrono::Utc::now().timestamp() as u64;
-                    if event.rumor.created_at.as_u64() < now {
-                        continue;
-                    }
 
                     let message = Message::from_json(&event.rumor.content);
                     match message {

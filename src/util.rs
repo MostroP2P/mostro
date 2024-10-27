@@ -313,7 +313,7 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
         status.to_string()
     );
 
-    if NOSTR_CLIENT.get().unwrap().send_event(event).await.is_err(){
+    if NOSTR_CLIENT.get().unwrap().send_event(event).await.is_err() {
         tracing::warn!("order id : {} is expired", order_updated.id)
     }
 

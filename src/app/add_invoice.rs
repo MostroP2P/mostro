@@ -73,8 +73,13 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(_) => {
-                    send_new_order_msg(Some(order.id), Action::IncorrectInvoiceAmount, None, &event.sender)
-                        .await;
+                    send_new_order_msg(
+                        Some(order.id),
+                        Action::IncorrectInvoiceAmount,
+                        None,
+                        &event.sender,
+                    )
+                    .await;
                     return Ok(());
                 }
             }

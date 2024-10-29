@@ -69,9 +69,12 @@ pub async fn run(
                     };
 
                     let event = unwrap_gift_wrap(&my_keys, &event)?;
-                    // Here we discard messages older than the real since parameter
-                    let now = chrono::Utc::now().timestamp() as u64;
-                    if event.rumor.created_at.as_u64() < now {
+                    // We discard events older than 10 seconds
+                    let since_time = chrono::Utc::now()
+                        .checked_sub_signed(chrono::Duration::seconds(10))
+                        .unwrap()
+                        .timestamp() as u64;
+                    if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
 

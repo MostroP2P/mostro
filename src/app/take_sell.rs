@@ -96,7 +96,7 @@ pub async fn take_sell_action(
             return Ok(());
         }
     }
-    
+
     // Get amount request if user requested one for range order - fiat amount will be used below
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;

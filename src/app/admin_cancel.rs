@@ -3,8 +3,7 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_dm, send_new_order_msg, update_order_event};
-use crate::NOSTR_CLIENT;
+use crate::util::{get_nostr_client, send_dm, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
@@ -109,7 +108,9 @@ pub async fn admin_cancel_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
 
-        NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+        if let Ok(client) = get_nostr_client() {
+            let _ = client.send_event(event).await;
+        }
     }
 
     // We publish a new replaceable kind nostr event with the status updated

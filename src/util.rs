@@ -28,6 +28,7 @@ use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 // use fedimint_tonic_lnd::Client;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
+use std::collections::HashMap;
 use tracing::error;
 use tracing::info;
 use uuid::Uuid;
@@ -245,7 +246,10 @@ pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()>
         "Sending DM, Event ID: {} with content: {:#?}",
         event.id, content
     );
-    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+
+    if let Ok(client) = get_nostr_client() {
+        let _ = client.send_event(event).await;
+    }
 
     Ok(())
 }
@@ -313,8 +317,10 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
         status.to_string()
     );
 
-    if NOSTR_CLIENT.get().unwrap().send_event(event).await.is_err(){
-        tracing::warn!("order id : {} is expired", order_updated.id)
+    if let Ok(client) = get_nostr_client() {
+        if client.send_event(event).await.is_err() {
+            tracing::warn!("order id : {} is expired", order_updated.id)
+        }
     }
 
     println!(
@@ -598,5 +604,23 @@ pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
     } else {
         // If order is not a range order return an Option with fiat amount of the order
         Some(order.fiat_amount)
+    }
+}
+
+/// Getter function with error management for nostr Client
+pub fn get_nostr_client() -> Result<&'static Client> {
+    if let Some(client) = NOSTR_CLIENT.get() {
+        Ok(client)
+    } else {
+        Err(Error::msg("Client not initialized!"))
+    }
+}
+
+/// Getter function with error management for nostr relays
+pub async fn get_nostr_relays() -> Option<HashMap<Url, Relay>> {
+    if let Some(client) = NOSTR_CLIENT.get() {
+        Some(client.relays().await)
+    } else {
+        None
     }
 }

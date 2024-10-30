@@ -74,8 +74,9 @@ async fn main() -> Result<()> {
     let client = match get_nostr_client() {
         Ok(client) => client,
         Err(e) => {
-            tracing::error!("Ln node error {e}");
-            exit(0)
+            tracing::error!("Failed to initialize Nostr client. Cannot proceed: {e}");
+            // Clean up any resources if needed
+            exit(1)
         }
     };
 

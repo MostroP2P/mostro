@@ -148,9 +148,18 @@ pub async fn admin_take_dispute_action(
     let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
 
-    if let Ok(client) = get_nostr_client() {
-        let _ = client.send_event(event).await;
-    }
+    let client = get_nostr_client().map_err(|e| {
+        info!(
+            "Failed to get nostr client for dispute {}: {}",
+            dispute_id, e
+        );
+        e
+    })?;
+
+    client.send_event(event).await.map_err(|e| {
+        info!("Failed to send dispute {} status event: {}", dispute_id, e);
+        e
+    })?;
 
     Ok(())
 }

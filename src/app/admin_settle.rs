@@ -108,8 +108,15 @@ pub async fn admin_settle_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
 
-        if let Ok(client) = get_nostr_client() {
-            let _ = client.send_event(event).await;
+        match get_nostr_client() {
+            Ok(client) => {
+                if let Err(e) = client.send_event(event).await {
+                    error!("Failed to send dispute settlement event: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to get Nostr client for dispute settlement: {}", e);
+            }
         }
     }
     // We create a Message for settle

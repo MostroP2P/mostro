@@ -9,9 +9,8 @@ use crate::NOSTR_CLIENT;
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
-use nostr_sdk::{Event, Kind as NostrKind, Tag, Url};
+use nostr_sdk::{Event, Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -42,11 +41,13 @@ async fn job_relay_list() {
             info!("Sending Mostro relay list");
 
             let interval = Settings::get_mostro().publish_relays_interval as u64;
-            let relay_list = Settings::get_nostr().relays;
+            let relays = NOSTR_CLIENT.get().unwrap().relays().await;
             let mut relay_tags: Vec<Tag> = vec![];
 
-            for r in relay_list {
-                relay_tags.push(Tag::relay_metadata(Url::from_str(&r).unwrap(), None))
+            for (_, r) in relays.iter() {
+                if r.is_connected().await {
+                    relay_tags.push(Tag::relay_metadata(r.url(), None))
+                }
             }
 
             if let Ok(relay_ev) =

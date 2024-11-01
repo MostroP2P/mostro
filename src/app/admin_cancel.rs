@@ -58,7 +58,8 @@ pub async fn admin_cancel_action(
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
-            let _ = send_dm(&event.sender, message).await;
+            let sender_keys = crate::util::get_keys().unwrap();
+            let _ = send_dm(&event.sender, sender_keys, message).await;
         }
         return Ok(());
     }
@@ -126,7 +127,8 @@ pub async fn admin_cancel_action(
     let message = Message::new_order(Some(order.id), Action::AdminCanceled, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(&event.sender, message.clone()).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys, message.clone()).await?;
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
@@ -136,9 +138,9 @@ pub async fn admin_cancel_action(
         (None, _) => return Err(Error::msg("Missing seller pubkey")),
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
-
-    send_dm(&seller_pubkey, message.clone()).await?;
-    send_dm(&buyer_pubkey, message).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&seller_pubkey, sender_keys.clone(), message.clone()).await?;
+    send_dm(&buyer_pubkey, sender_keys, message).await?;
 
     Ok(())
 }

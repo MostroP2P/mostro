@@ -238,8 +238,11 @@ pub async fn publish_order(
         .map_err(|err| err.into())
 }
 
-pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()> {
-    let sender_keys = Keys::generate();
+pub async fn send_dm(
+    receiver_pubkey: &PublicKey,
+    sender_keys: Keys,
+    content: String,
+) -> Result<()> {
     let event = gift_wrap(&sender_keys, *receiver_pubkey, content.clone(), None)?;
     info!(
         "Sending DM, Event ID: {} with content: {:#?}",
@@ -571,7 +574,8 @@ pub async fn send_cant_do_msg(
     // Send message to event creator
     let message = Message::cant_do(order_id, content);
     if let Ok(message) = message.as_json() {
-        let _ = send_dm(destination_key, message).await;
+        let sender_keys = crate::util::get_keys().unwrap();
+        let _ = send_dm(destination_key, sender_keys, message).await;
     }
 }
 
@@ -584,7 +588,8 @@ pub async fn send_new_order_msg(
     // Send message to event creator
     let message = Message::new_order(order_id, action, content);
     if let Ok(message) = message.as_json() {
-        let _ = send_dm(destination_key, message).await;
+        let sender_keys = crate::util::get_keys().unwrap();
+        let _ = send_dm(destination_key, sender_keys, message).await;
     }
 }
 
@@ -698,7 +703,8 @@ mod tests {
         // Mock the send_dm function
         let receiver_pubkey = Keys::generate().public_key();
         let content = "Test message".to_string();
-        let result = send_dm(&receiver_pubkey, content).await;
+        let sender_keys = Keys::generate();
+        let result = send_dm(&receiver_pubkey, sender_keys, content).await;
         assert!(result.is_ok());
     }
 

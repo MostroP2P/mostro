@@ -61,7 +61,8 @@ pub async fn admin_settle_action(
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
-            let _ = send_dm(&event.sender, message).await;
+            let sender_keys = crate::util::get_keys().unwrap();
+            let _ = send_dm(&event.sender, sender_keys, message).await;
         }
         return Ok(());
     }
@@ -123,12 +124,23 @@ pub async fn admin_settle_action(
     let message = Message::new_order(Some(order_updated.id), Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(&event.sender, message.clone()).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys.clone(), message.clone()).await?;
     if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
-        send_dm(&PublicKey::from_str(seller_pubkey)?, message.clone()).await?;
+        send_dm(
+            &PublicKey::from_str(seller_pubkey)?,
+            sender_keys.clone(),
+            message.clone(),
+        )
+        .await?;
     }
     if let Some(ref buyer_pubkey) = order_updated.buyer_pubkey {
-        send_dm(&PublicKey::from_str(buyer_pubkey)?, message.clone()).await?;
+        send_dm(
+            &PublicKey::from_str(buyer_pubkey)?,
+            sender_keys,
+            message.clone(),
+        )
+        .await?;
     }
 
     let _ = do_payment(order_updated).await;

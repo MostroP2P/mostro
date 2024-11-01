@@ -3,8 +3,7 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_dm, send_new_order_msg, update_order_event};
-use crate::NOSTR_CLIENT;
+use crate::util::{get_nostr_client, send_dm, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
@@ -59,7 +58,8 @@ pub async fn admin_cancel_action(
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
-            let _ = send_dm(&event.sender, message).await;
+            let sender_keys = crate::util::get_keys().unwrap();
+            let _ = send_dm(&event.sender, sender_keys, message).await;
         }
         return Ok(());
     }
@@ -109,7 +109,14 @@ pub async fn admin_cancel_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
 
-        NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+        match get_nostr_client() {
+            Ok(client) => {
+                if let Err(e) = client.send_event(event).await {
+                    error!("Failed to send dispute status event: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to get Nostr client: {}", e),
+        }
     }
 
     // We publish a new replaceable kind nostr event with the status updated
@@ -120,7 +127,8 @@ pub async fn admin_cancel_action(
     let message = Message::new_order(Some(order.id), Action::AdminCanceled, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(&event.sender, message.clone()).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys, message.clone()).await?;
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
@@ -130,9 +138,9 @@ pub async fn admin_cancel_action(
         (None, _) => return Err(Error::msg("Missing seller pubkey")),
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
-
-    send_dm(&seller_pubkey, message.clone()).await?;
-    send_dm(&buyer_pubkey, message).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&seller_pubkey, sender_keys.clone(), message.clone()).await?;
+    send_dm(&buyer_pubkey, sender_keys, message).await?;
 
     Ok(())
 }

@@ -1,8 +1,9 @@
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{send_dm, send_new_order_msg, settle_seller_hold_invoice, update_order_event};
-use crate::NOSTR_CLIENT;
+use crate::util::{
+    get_nostr_client, send_dm, send_new_order_msg, settle_seller_hold_invoice, update_order_event,
+};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
@@ -60,7 +61,8 @@ pub async fn admin_settle_action(
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
         if let Ok(message) = message.as_json() {
-            let _ = send_dm(&event.sender, message).await;
+            let sender_keys = crate::util::get_keys().unwrap();
+            let _ = send_dm(&event.sender, sender_keys, message).await;
         }
         return Ok(());
     }
@@ -107,18 +109,38 @@ pub async fn admin_settle_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
 
-        NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+        match get_nostr_client() {
+            Ok(client) => {
+                if let Err(e) = client.send_event(event).await {
+                    error!("Failed to send dispute settlement event: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to get Nostr client for dispute settlement: {}", e);
+            }
+        }
     }
     // We create a Message for settle
     let message = Message::new_order(Some(order_updated.id), Action::AdminSettled, None);
     let message = message.as_json()?;
     // Message to admin
-    send_dm(&event.sender, message.clone()).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys.clone(), message.clone()).await?;
     if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
-        send_dm(&PublicKey::from_str(seller_pubkey)?, message.clone()).await?;
+        send_dm(
+            &PublicKey::from_str(seller_pubkey)?,
+            sender_keys.clone(),
+            message.clone(),
+        )
+        .await?;
     }
     if let Some(ref buyer_pubkey) = order_updated.buyer_pubkey {
-        send_dm(&PublicKey::from_str(buyer_pubkey)?, message.clone()).await?;
+        send_dm(
+            &PublicKey::from_str(buyer_pubkey)?,
+            sender_keys,
+            message.clone(),
+        )
+        .await?;
     }
 
     let _ = do_payment(order_updated).await;

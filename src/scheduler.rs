@@ -4,7 +4,7 @@ use crate::cli::settings::Settings;
 use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
-use crate::NOSTR_CLIENT;
+use crate::util::get_nostr_client;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
@@ -14,7 +14,7 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use util::{get_keys, update_order_event};
+use util::{get_keys, get_nostr_relays, update_order_event};
 
 pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     info!("Creating scheduler");
@@ -41,19 +41,22 @@ async fn job_relay_list() {
             info!("Sending Mostro relay list");
 
             let interval = Settings::get_mostro().publish_relays_interval as u64;
-            let relays = NOSTR_CLIENT.get().unwrap().relays().await;
-            let mut relay_tags: Vec<Tag> = vec![];
+            if let Some(relays) = get_nostr_relays().await {
+                let mut relay_tags: Vec<Tag> = vec![];
 
-            for (_, r) in relays.iter() {
-                if r.is_connected().await {
-                    relay_tags.push(Tag::relay_metadata(r.url(), None))
+                for (_, r) in relays.iter() {
+                    if r.is_connected().await {
+                        relay_tags.push(Tag::relay_metadata(r.url(), None))
+                    }
                 }
-            }
 
-            if let Ok(relay_ev) =
-                EventBuilder::new(NostrKind::RelayList, "", relay_tags).to_event(&mostro_pubkey)
-            {
-                let _ = NOSTR_CLIENT.get().unwrap().send_event(relay_ev).await;
+                if let Ok(relay_ev) =
+                    EventBuilder::new(NostrKind::RelayList, "", relay_tags).to_event(&mostro_pubkey)
+                {
+                    if let Ok(client) = get_nostr_client() {
+                        let _ = client.send_event(relay_ev).await;
+                    }
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -78,7 +81,10 @@ async fn job_info_event_send() {
                 Ok(info) => info,
                 Err(e) => return error!("{e}"),
             };
-            let _ = NOSTR_CLIENT.get().unwrap().send_event(info_ev).await;
+
+            if let Ok(client) = get_nostr_client() {
+                let _ = client.send_event(info_ev).await;
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -131,8 +137,8 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
 
             for ev in inner_list.lock().await.iter() {
                 // Send event to relay
-                if let Some(client) = NOSTR_CLIENT.get() {
-                    match &client.send_event(ev.clone()).await {
+                if let Ok(client) = get_nostr_client() {
+                    match client.send_event(ev.clone()).await {
                         Ok(id) => {
                             info!("Updated rate event with id {:?}", id)
                         }

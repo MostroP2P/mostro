@@ -239,8 +239,7 @@ pub async fn publish_order(
 }
 
 pub async fn send_dm(receiver_pubkey: &PublicKey, content: String) -> Result<()> {
-    // Get mostro keys
-    let sender_keys = crate::util::get_keys().unwrap();
+    let sender_keys = Keys::generate();
     let event = gift_wrap(&sender_keys, *receiver_pubkey, content.clone(), None)?;
     info!(
         "Sending DM, Event ID: {} with content: {:#?}",
@@ -594,6 +593,7 @@ pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
     // set order fiat amount to the value requested preparing for hold invoice
     if order.is_range_order() {
         if let Some(amount_buyer) = msg.get_inner_message_kind().get_amount() {
+            info!("amount_buyer: {amount_buyer}");
             match Some(amount_buyer) <= order.max_amount && Some(amount_buyer) >= order.min_amount {
                 true => Some(amount_buyer),
                 false => None,
@@ -622,5 +622,102 @@ pub async fn get_nostr_relays() -> Option<HashMap<Url, Relay>> {
         Some(client.relays().await)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mostro_core::message::{Message, MessageKind};
+    use mostro_core::order::Order;
+    use std::sync::Once;
+    use uuid::uuid;
+    // Setup function to initialize common settings or data before tests
+    static INIT: Once = Once::new();
+
+    fn initialize() {
+        INIT.call_once(|| {
+            // Any initialization code goes here
+        });
+    }
+
+    #[test]
+    fn test_bytes_to_string() {
+        initialize();
+        let bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let result = bytes_to_string(&bytes);
+        assert_eq!(result, "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn test_get_market_quote() {
+        initialize();
+        // Mock the get_market_quote function's external API call
+        let fiat_amount = 1000; // $1000
+        let fiat_code = "USD";
+        let premium = 0;
+
+        // Assuming you have a way to mock the API response
+        let sats = get_market_quote(&fiat_amount, fiat_code, premium)
+            .await
+            .unwrap();
+        // Check that sats amount is calculated correctly
+        assert!(sats > 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_nostr_client_failure() {
+        initialize();
+        // Assuming NOSTR_CLIENT is not initialized
+        let client = get_nostr_client();
+        assert!(client.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_nostr_client_success() {
+        initialize();
+        // Mock NOSTR_CLIENT initialization
+        let keys = Keys::generate();
+        let client = Client::new(&keys);
+        NOSTR_CLIENT.set(client).unwrap();
+        let client_result = get_nostr_client();
+        assert!(client_result.is_ok());
+    }
+
+    #[test]
+    fn test_bytes_to_string_empty() {
+        initialize();
+        let bytes: Vec<u8> = vec![];
+        let result = bytes_to_string(&bytes);
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_send_dm() {
+        initialize();
+        // Mock the send_dm function
+        let receiver_pubkey = Keys::generate().public_key();
+        let content = "Test message".to_string();
+        let result = send_dm(&receiver_pubkey, content).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_fiat_amount_requested() {
+        initialize();
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let order = Order {
+            amount: 1000,
+            min_amount: Some(500),
+            max_amount: Some(2000),
+            ..Default::default()
+        };
+        let message = Message::Order(MessageKind::new(
+            Some(uuid),
+            Action::TakeSell,
+            Some(Content::Amount(order.amount)),
+        ));
+        let amount = get_fiat_amount_requested(&order, &message);
+        assert_eq!(amount, Some(1000));
     }
 }

@@ -271,7 +271,7 @@ pub async fn update_user_rating_event(
     user: &str,
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
-    tags: Vec<Tag>,
+    tags: Tags,
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
@@ -347,7 +347,9 @@ pub async fn connect_nostr() -> Result<Client> {
     let client = ClientBuilder::default().opts(opts).build();
 
     // Add relays
-    client.add_relays(nostr_settings.relays).await?;
+    for relay in nostr_settings.relays.iter() {
+        client.add_relay(relay).await?;
+    }
 
     // Connect to relays and keep connection alive
     client.connect().await;
@@ -704,8 +706,7 @@ mod tests {
     async fn test_get_nostr_client_success() {
         initialize();
         // Mock NOSTR_CLIENT initialization
-        let keys = Keys::generate();
-        let client = Client::new(&keys);
+        let client = Client::default();
         NOSTR_CLIENT.set(client).unwrap();
         let client_result = get_nostr_client();
         assert!(client_result.is_ok());

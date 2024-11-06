@@ -107,7 +107,7 @@ pub async fn admin_settle_action(
         d.status = DisputeStatus::Settled.to_string();
         d.update(pool).await?;
         // We create a tag to show status of the dispute
-        let tags: Vec<Tag> = vec![
+        let tags: Tags = Tags::new(vec![
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("s")),
                 vec![DisputeStatus::Settled.to_string()],
@@ -120,7 +120,7 @@ pub async fn admin_settle_action(
                 TagKind::Custom(std::borrow::Cow::Borrowed("z")),
                 vec!["dispute".to_string()],
             ),
-        ];
+        ]);
 
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;

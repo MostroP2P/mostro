@@ -43,7 +43,7 @@ pub async fn cancel_action(
         if user_pubkey != order.creator_pubkey {
             // We create a Message
             send_new_order_msg(
-                msg.get_inner_message_kind().request_id,
+                request_id,
                 Some(order.id),
                 Action::IsNotYourOrder,
                 None,
@@ -125,7 +125,7 @@ pub async fn cancel_action(
                     update_order_event(my_keys, Status::CooperativelyCanceled, &order).await?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
                     send_new_order_msg(
-                        msg.get_inner_message_kind().request_id,
+                        request_id,
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
@@ -134,7 +134,7 @@ pub async fn cancel_action(
                     .await;
                     let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                     send_new_order_msg(
-                        msg.get_inner_message_kind().request_id,
+                        request_id,
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
@@ -150,7 +150,7 @@ pub async fn cancel_action(
                 let order = order.update(pool).await?;
                 // We create a Message to start a cooperative cancel and send it to both parties
                 send_new_order_msg(
-                    msg.get_inner_message_kind().request_id,
+                    request_id,
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByYou,
                     None,
@@ -159,7 +159,7 @@ pub async fn cancel_action(
                 .await;
                 let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                 send_new_order_msg(
-                    msg.get_inner_message_kind().request_id,
+                    request_id,
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByPeer,
                     None,

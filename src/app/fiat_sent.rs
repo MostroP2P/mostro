@@ -32,7 +32,7 @@ pub async fn fiat_sent_action(
     // Send to user a DM with the error
     if order.status != Status::Active.to_string() {
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
@@ -64,7 +64,7 @@ pub async fn fiat_sent_action(
 
     // We a message to the seller
     send_new_order_msg(
-        msg.get_inner_message_kind().request_id,
+        request_id,
         Some(order.id),
         Action::FiatSentOk,
         Some(Content::Peer(peer)),

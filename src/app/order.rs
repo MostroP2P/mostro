@@ -27,7 +27,7 @@ pub async fn order_action(
                 Ok(_) => (),
                 Err(_) => {
                     send_new_order_msg(
-                        msg.get_inner_message_kind().request_id,
+                        request_id,
                         order.id,
                         Action::IncorrectInvoiceAmount,
                         None,
@@ -49,13 +49,9 @@ pub async fn order_action(
                 send_cant_do_msg(request_id, order.id, None, &event.sender).await;
                 return Ok(());
             }
-            if order.amount == 0 {
-                amount_vec.clear();
-                amount_vec.push(min);
-                amount_vec.push(max);
-            } else {
+            if order.amount != 0 {
                 send_new_order_msg(
-                    msg.get_inner_message_kind().request_id,
+                    request_id,
                     None,
                     Action::InvalidSatsAmount,
                     None,
@@ -64,6 +60,9 @@ pub async fn order_action(
                 .await;
                 return Ok(());
             }
+            amount_vec.clear();
+            amount_vec.push(min);
+            amount_vec.push(max);
         }
 
         for fiat_amount in amount_vec.iter() {
@@ -84,7 +83,7 @@ pub async fn order_action(
             // Check amount is positive - extra safety check
             if quote < 0 {
                 send_new_order_msg(
-                    msg.get_inner_message_kind().request_id,
+                    request_id,
                     None,
                     Action::InvalidSatsAmount,
                     None,

@@ -94,7 +94,7 @@ pub async fn take_sell_action(
         Status::Pending => {}
         _ => {
             send_new_order_msg(
-                msg.get_inner_message_kind().request_id,
+                request_id,
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
@@ -110,7 +110,7 @@ pub async fn take_sell_action(
         order.fiat_amount = am;
     } else {
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            request_id,
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,

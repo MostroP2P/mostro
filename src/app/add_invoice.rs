@@ -75,7 +75,7 @@ pub async fn add_invoice_action(
                 Ok(_) => payment_request,
                 Err(_) => {
                     send_new_order_msg(
-                        msg.get_inner_message_kind().request_id,
+                        request_id,
                         Some(order.id),
                         Action::IncorrectInvoiceAmount,
                         None,
@@ -99,7 +99,7 @@ pub async fn add_invoice_action(
             order.payment_attempts = 0;
             order.clone().update(pool).await?;
             send_new_order_msg(
-                msg.get_inner_message_kind().request_id,
+                request_id,
                 Some(order.id),
                 Action::InvoiceUpdated,
                 None,
@@ -110,7 +110,7 @@ pub async fn add_invoice_action(
         }
         _ => {
             send_new_order_msg(
-                msg.get_inner_message_kind().request_id,
+                request_id,
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
@@ -155,7 +155,7 @@ pub async fn add_invoice_action(
 
         // We send a confirmation message to seller
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            request_id,
             Some(order.id),
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
@@ -164,7 +164,7 @@ pub async fn add_invoice_action(
         .await;
         // We send a message to buyer saying seller paid
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
             Some(Content::Order(order_data)),
@@ -178,7 +178,7 @@ pub async fn add_invoice_action(
             &buyer_pubkey,
             &seller_pubkey,
             order,
-            msg.get_inner_message_kind().request_id,
+            request_id,
         )
         .await?;
     }

@@ -97,7 +97,7 @@ pub async fn order_action(
                 || quote < mostro_settings.min_payment_amount as i64
             {
                 send_new_order_msg(
-                    msg.get_inner_message_kind().request_id,
+                    request_id,
                     None,
                     Action::OutOfRangeSatsAmount,
                     None,

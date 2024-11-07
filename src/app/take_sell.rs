@@ -127,12 +127,8 @@ pub async fn take_sell_action(
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
-        let (new_sats_amount, fee) = get_market_amount_and_fee(
-            order.fiat_amount,
-            &order.fiat_code,
-            order.premium,
-        )
-        .await?;
+        let (new_sats_amount, fee) =
+            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
         // Update order with new sats value
         order.amount = new_sats_amount;
         order.fee = fee;

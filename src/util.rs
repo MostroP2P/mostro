@@ -741,7 +741,7 @@ mod tests {
             ..Default::default()
         };
         let message = Message::Order(MessageKind::new(
-            1,
+            Some(1),
             Some(uuid),
             Action::TakeSell,
             Some(Content::Amount(order.amount)),

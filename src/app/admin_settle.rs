@@ -24,8 +24,10 @@ pub async fn admin_settle_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    request_id: u64,
 ) -> Result<()> {
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
@@ -164,7 +166,7 @@ pub async fn admin_settle_action(
         .await?;
     }
 
-    let _ = do_payment(order_updated, Some(request_id)).await;
+    let _ = do_payment(order_updated, request_id).await;
 
     Ok(())
 }

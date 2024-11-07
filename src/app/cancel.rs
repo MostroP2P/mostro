@@ -21,8 +21,10 @@ pub async fn cancel_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    request_id: u64,
 ) -> Result<()> {
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
@@ -178,7 +180,7 @@ pub async fn cancel_add_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
@@ -245,7 +247,7 @@ pub async fn cancel_pay_hold_invoice(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
     my_keys: &Keys,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     if order.hash.is_some() {
         // We return funds to seller

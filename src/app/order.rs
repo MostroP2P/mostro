@@ -14,8 +14,10 @@ pub async fn order_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
 ) -> Result<()> {
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 

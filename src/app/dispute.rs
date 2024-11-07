@@ -21,8 +21,10 @@ pub async fn dispute_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
 ) -> Result<()> {
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {

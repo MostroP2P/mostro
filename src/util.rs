@@ -162,7 +162,7 @@ pub async fn publish_order(
     new_order: &SmallOrder,
     initiator_pubkey: &str,
     ack_pubkey: PublicKey,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     let mut fee = 0;
     if new_order.amount > 0 {
@@ -363,7 +363,7 @@ pub async fn show_hold_invoice(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     mut order: Order,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Add fee of seller to hold invoice
@@ -421,7 +421,7 @@ pub async fn show_hold_invoice(
     )
     .await;
 
-    let _ = invoice_subscribe(hash, Some(request_id)).await;
+    let _ = invoice_subscribe(hash, request_id).await;
 
     Ok(())
 }
@@ -476,7 +476,6 @@ pub async fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
     premium: i64,
-    _request_id: u64,
 ) -> Result<(i64, i64)> {
     // Update amount order
     let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
@@ -489,7 +488,7 @@ pub async fn get_market_amount_and_fee(
 pub async fn set_waiting_invoice_status(
     order: &mut Order,
     buyer_pubkey: PublicKey,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<i64> {
     let kind = OrderKind::from_str(&order.kind).unwrap();
     let status = Status::WaitingBuyerInvoice;
@@ -533,7 +532,7 @@ pub async fn rate_counterpart(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     order: &Order,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
@@ -559,7 +558,7 @@ pub async fn settle_seller_hold_invoice(
     action: Action,
     is_admin: bool,
     order: &Order,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Check if the pubkey is right
     if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
@@ -586,7 +585,7 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
 }
 
 pub async fn send_cant_do_msg(
-    request_id: u64,
+    request_id: Option<u64>,
     order_id: Option<Uuid>,
     message: Option<String>,
     destination_key: &PublicKey,
@@ -603,7 +602,7 @@ pub async fn send_cant_do_msg(
 }
 
 pub async fn send_new_order_msg(
-    request_id: u64,
+    request_id: Option<u64>,
     order_id: Option<Uuid>,
     action: Action,
     content: Option<Content>,
@@ -742,7 +741,7 @@ mod tests {
             ..Default::default()
         };
         let message = Message::Order(MessageKind::new(
-            1,
+            Some(1),
             Some(uuid),
             Action::TakeSell,
             Some(Content::Amount(order.amount)),

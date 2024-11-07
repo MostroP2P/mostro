@@ -24,6 +24,7 @@ pub async fn admin_settle_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -34,6 +35,7 @@ pub async fn admin_settle_action(
     match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
+                msg.get_inner_message_kind().request_id,
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
@@ -59,7 +61,12 @@ pub async fn admin_settle_action(
 
     // Was orde cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
-        let message = MessageKind::new(Some(order_id), Action::CooperativeCancelAccepted, None);
+        let message = MessageKind::new(
+            msg.get_inner_message_kind().request_id,
+            Some(order_id),
+            Action::CooperativeCancelAccepted,
+            None,
+        );
         if let Ok(message) = message.as_json() {
             let sender_keys = crate::util::get_keys().unwrap();
             let _ = send_dm(&event.sender, sender_keys, message).await;
@@ -69,6 +76,7 @@ pub async fn admin_settle_action(
 
     if order.status != Status::Dispute.to_string() {
         send_new_order_msg(
+            msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
@@ -78,7 +86,15 @@ pub async fn admin_settle_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order).await?;
+    settle_seller_hold_invoice(
+        event,
+        ln_client,
+        Action::AdminSettled,
+        true,
+        &order,
+        request_id,
+    )
+    .await?;
 
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
 
@@ -121,7 +137,12 @@ pub async fn admin_settle_action(
         }
     }
     // We create a Message for settle
-    let message = Message::new_order(Some(order_updated.id), Action::AdminSettled, None);
+    let message = Message::new_order(
+        request_id,
+        Some(order_updated.id),
+        Action::AdminSettled,
+        None,
+    );
     let message = message.as_json()?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();
@@ -143,7 +164,7 @@ pub async fn admin_settle_action(
         .await?;
     }
 
-    let _ = do_payment(order_updated).await;
+    let _ = do_payment(order_updated, Some(request_id)).await;
 
     Ok(())
 }

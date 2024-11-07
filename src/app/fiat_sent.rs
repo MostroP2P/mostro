@@ -15,6 +15,7 @@ pub async fn fiat_sent_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
@@ -31,6 +32,7 @@ pub async fn fiat_sent_action(
     // Send to user a DM with the error
     if order.status != Status::Active.to_string() {
         send_new_order_msg(
+            request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
@@ -41,7 +43,7 @@ pub async fn fiat_sent_action(
     }
     // Check if the pubkey is the buyer
     if Some(event.sender.to_string()) != order.buyer_pubkey {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -62,6 +64,7 @@ pub async fn fiat_sent_action(
 
     // We a message to the seller
     send_new_order_msg(
+        request_id,
         Some(order.id),
         Action::FiatSentOk,
         Some(Content::Peer(peer)),
@@ -72,6 +75,7 @@ pub async fn fiat_sent_action(
     let peer = Peer::new(seller_pubkey.to_string());
 
     send_new_order_msg(
+        msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::FiatSentOk,
         Some(Content::Peer(peer)),

@@ -111,7 +111,7 @@ async fn job_retry_failed_payments() {
             if let Ok(payment_failed_list) = crate::db::find_failed_payment(&pool).await {
                 for payment_failed in payment_failed_list.into_iter() {
                     if payment_failed.payment_attempts < retries_number {
-                        if let Err(e) = do_payment(payment_failed.clone()).await {
+                        if let Err(e) = do_payment(payment_failed.clone(), None).await {
                             error!("{e}");
                         }
                     }

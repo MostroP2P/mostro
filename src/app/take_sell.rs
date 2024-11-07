@@ -19,6 +19,7 @@ pub async fn take_sell_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -36,7 +37,7 @@ pub async fn take_sell_action(
 
     // Maker can't take own order
     if order.creator_pubkey == event.sender.to_hex() {
-        send_cant_do_msg(Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
 
@@ -66,7 +67,13 @@ pub async fn take_sell_action(
             {
                 Ok(_) => Some(payment_request),
                 Err(e) => {
-                    send_cant_do_msg(Some(order.id), Some(e.to_string()), &event.sender).await;
+                    send_cant_do_msg(
+                        request_id,
+                        Some(order.id),
+                        Some(e.to_string()),
+                        &event.sender,
+                    )
+                    .await;
                     error!("{e}");
                     return Ok(());
                 }
@@ -87,6 +94,7 @@ pub async fn take_sell_action(
         Status::Pending => {}
         _ => {
             send_new_order_msg(
+                request_id,
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
@@ -102,6 +110,7 @@ pub async fn take_sell_action(
         order.fiat_amount = am;
     } else {
         send_new_order_msg(
+            request_id,
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,
@@ -118,15 +127,20 @@ pub async fn take_sell_action(
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
     if order.amount == 0 {
-        let (new_sats_amount, fee) =
-            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
+        let (new_sats_amount, fee) = get_market_amount_and_fee(
+            order.fiat_amount,
+            &order.fiat_code,
+            order.premium,
+            request_id,
+        )
+        .await?;
         // Update order with new sats value
         order.amount = new_sats_amount;
         order.fee = fee;
     }
 
     if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey).await {
+        match set_waiting_invoice_status(&mut order, buyer_pubkey, request_id).await {
             Ok(_) => {
                 // Update order status
                 if let Ok(order_updated) =
@@ -142,7 +156,15 @@ pub async fn take_sell_action(
             }
         }
     } else {
-        show_hold_invoice(my_keys, pr, &buyer_pubkey, &seller_pubkey, order).await?;
+        show_hold_invoice(
+            my_keys,
+            pr,
+            &buyer_pubkey,
+            &seller_pubkey,
+            order,
+            request_id,
+        )
+        .await?;
     }
     Ok(())
 }

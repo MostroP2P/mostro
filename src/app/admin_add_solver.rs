@@ -14,6 +14,7 @@ pub async fn admin_add_solver_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
+    request_id: u64,
 ) -> Result<()> {
     let inner_message = msg.get_inner_message_kind();
     let content = if let Some(content) = &inner_message.content {
@@ -32,7 +33,7 @@ pub async fn admin_add_solver_action(
     // Check if the pubkey is Mostro
     if event.sender.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        send_cant_do_msg(None, None, &event.sender).await;
+        send_cant_do_msg(request_id, None, None, &event.sender).await;
         return Ok(());
     }
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
@@ -43,7 +44,7 @@ pub async fn admin_add_solver_action(
         Err(ee) => error!("Error creating solver: {:#?}", ee),
     }
     // We create a Message for admin
-    let message = Message::new_dispute(None, Action::AdminAddSolver, None);
+    let message = Message::new_dispute(request_id, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
     let sender_keys = crate::util::get_keys().unwrap();

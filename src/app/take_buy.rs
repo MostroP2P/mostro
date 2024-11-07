@@ -18,7 +18,6 @@ pub async fn take_buy_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: Option<u64>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -26,6 +25,8 @@ pub async fn take_buy_action(
     } else {
         return Err(Error::msg("No order id"));
     };
+
+    let request_id = msg.get_inner_message_kind().request_id;
 
     let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,

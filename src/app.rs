@@ -102,10 +102,8 @@ pub async fn run(
                                             }
                                         }
                                         Action::TakeBuy => {
-                                            if let Err(e) = take_buy_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                take_buy_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }

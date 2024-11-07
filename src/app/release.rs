@@ -145,14 +145,7 @@ pub async fn release_action(
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         _ => return Err(Error::msg("Missing buyer pubkeys")),
     };
-    send_new_order_msg(
-        request_id,
-        Some(order_id),
-        Action::Released,
-        None,
-        &buyer_pubkey,
-    )
-    .await;
+    send_new_order_msg(None, Some(order_id), Action::Released, None, &buyer_pubkey).await;
 
     let _ = do_payment(order_updated, request_id).await;
 
@@ -254,7 +247,7 @@ async fn payment_success(
 ) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(
-        request_id,
+        None,
         Some(order.id),
         Action::PurchaseCompleted,
         None,
@@ -353,7 +346,7 @@ async fn payment_success(
                         Ordering::Less => {}
                     }
                 } else {
-                    send_cant_do_msg(request_id, Some(order.id), None, buyer_pubkey).await;
+                    send_cant_do_msg(None, Some(order.id), None, buyer_pubkey).await;
                     send_cant_do_msg(request_id, Some(order.id), None, seller_pubkey).await;
                 }
             }

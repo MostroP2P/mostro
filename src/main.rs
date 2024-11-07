@@ -22,12 +22,13 @@ use lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
+use std::process::exit;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use util::invoice_subscribe;
+use util::{get_nostr_client, invoice_subscribe};
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -70,11 +71,18 @@ async fn main() -> Result<()> {
         .pubkey(my_keys.public_key())
         .since(Timestamp::now() - 172800);
 
-    NOSTR_CLIENT
-        .get()
-        .unwrap()
-        .subscribe(vec![subscription], None)
-        .await;
+    let client = match get_nostr_client() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("Failed to initialize Nostr client. Cannot proceed: {e}");
+            // Clean up any resources if needed
+            exit(1)
+        }
+    };
+
+    // Client subscription
+    client.subscribe(vec![subscription], None).await;
+
     let mut ln_client = LndConnector::new().await?;
 
     if let Ok(held_invoices) = find_held_invoices(&pool).await {
@@ -91,14 +99,7 @@ async fn main() -> Result<()> {
     // Start scheduler for tasks
     start_scheduler(rate_list.clone()).await;
 
-    run(
-        my_keys,
-        NOSTR_CLIENT.get().unwrap(),
-        &mut ln_client,
-        pool,
-        rate_list.clone(),
-    )
-    .await
+    run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
 }
 
 #[cfg(test)]

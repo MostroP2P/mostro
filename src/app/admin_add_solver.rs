@@ -47,7 +47,8 @@ pub async fn admin_add_solver_action(
     let message = Message::new_dispute(request_id, None, Action::AdminAddSolver, None);
     let message = message.as_json()?;
     // Send the message
-    send_dm(&event.sender, message).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys, message).await?;
 
     Ok(())
 }

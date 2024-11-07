@@ -2,8 +2,7 @@ use std::str::FromStr;
 
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
-use crate::util::{send_cant_do_msg, send_new_order_msg};
-use crate::NOSTR_CLIENT;
+use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
@@ -178,7 +177,10 @@ pub async fn dispute_action(
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "", dispute.id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
-    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+
+    if let Ok(client) = get_nostr_client() {
+        let _ = client.send_event(event).await;
+    }
 
     Ok(())
 }

@@ -1,7 +1,6 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{send_cant_do_msg, send_dm, send_new_order_msg};
-use crate::NOSTR_CLIENT;
+use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
@@ -112,7 +111,8 @@ pub async fn admin_take_dispute_action(
         Some(Content::Order(new_order)),
     );
     let message = message.as_json()?;
-    send_dm(&event.sender, message).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&event.sender, sender_keys, message).await?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.sender.to_hex());
@@ -138,9 +138,9 @@ pub async fn admin_take_dispute_action(
         (None, _) => return Err(Error::msg("Missing seller pubkey")),
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
-
-    send_dm(&buyer_pubkey, msg_to_buyer.as_json()?).await?;
-    send_dm(&seller_pubkey, msg_to_seller.as_json()?).await?;
+    let sender_keys = crate::util::get_keys().unwrap();
+    send_dm(&buyer_pubkey, sender_keys.clone(), msg_to_buyer.as_json()?).await?;
+    send_dm(&seller_pubkey, sender_keys, msg_to_seller.as_json()?).await?;
     // We create a tag to show status of the dispute
     let tags: Vec<Tag> = vec![
         Tag::custom(
@@ -159,7 +159,19 @@ pub async fn admin_take_dispute_action(
     // nip33 kind with dispute id as identifier
     let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;
     info!("Dispute event to be published: {event:#?}");
-    NOSTR_CLIENT.get().unwrap().send_event(event).await?;
+
+    let client = get_nostr_client().map_err(|e| {
+        info!(
+            "Failed to get nostr client for dispute {}: {}",
+            dispute_id, e
+        );
+        e
+    })?;
+
+    client.send_event(event).await.map_err(|e| {
+        info!("Failed to send dispute {} status event: {}", dispute_id, e);
+        e
+    })?;
 
     Ok(())
 }

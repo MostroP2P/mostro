@@ -82,9 +82,6 @@ pub async fn run(
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {
-                                // Get the optional request id
-                                let request_id = msg.get_inner_message_kind().request_id;
-
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
@@ -102,10 +99,8 @@ pub async fn run(
                                             }
                                         }
                                         Action::TakeBuy => {
-                                            if let Err(e) = take_buy_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                take_buy_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }

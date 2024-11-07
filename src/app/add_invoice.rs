@@ -155,7 +155,7 @@ pub async fn add_invoice_action(
 
         // We send a confirmation message to seller
         send_new_order_msg(
-            request_id,
+            None,
             Some(order.id),
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),

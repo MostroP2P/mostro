@@ -14,7 +14,7 @@ pub async fn admin_add_solver_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     let inner_message = msg.get_inner_message_kind();
     let content = if let Some(content) = &inner_message.content {

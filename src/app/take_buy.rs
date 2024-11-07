@@ -18,7 +18,7 @@ pub async fn take_buy_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -34,14 +34,9 @@ pub async fn take_buy_action(
             return Ok(());
         }
     };
-    // Maker can't take own order
-    if order.creator_pubkey == event.sender.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
-        return Ok(());
-    }
 
-    if order.kind != Kind::Buy.to_string() {
-        error!("Order Id {order_id} wrong kind");
+    // Maker can't take own order
+    if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.sender.to_hex() {
         send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
         return Ok(());
     }
@@ -100,7 +95,6 @@ pub async fn take_buy_action(
             order.fiat_amount,
             &order.fiat_code,
             order.premium,
-            request_id,
         )
         .await?;
         // Update order with new sats value

@@ -41,7 +41,7 @@ pub async fn admin_take_dispute_action(
     msg: Message,
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Find dipute id in the message
     let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {

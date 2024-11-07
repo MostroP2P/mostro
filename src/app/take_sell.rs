@@ -19,7 +19,7 @@ pub async fn take_sell_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -131,7 +131,6 @@ pub async fn take_sell_action(
             order.fiat_amount,
             &order.fiat_code,
             order.premium,
-            request_id,
         )
         .await?;
         // Update order with new sats value

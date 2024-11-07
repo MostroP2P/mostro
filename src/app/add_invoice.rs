@@ -18,7 +18,7 @@ pub async fn add_invoice_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
     let mut order = if let Some(order_id) = order_msg.id {

@@ -61,7 +61,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         order_data.status = Some(status);
         // We send a confirmation message to seller
         send_new_order_msg(
-            request_id.unwrap_or(1),
+            request_id,
             Some(order.id),
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
@@ -70,7 +70,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         .await;
         // We send a message to buyer saying seller paid
         send_new_order_msg(
-            request_id.unwrap_or(1),
+            request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
             Some(Content::Order(order_data)),
@@ -86,7 +86,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         order_data.master_seller_pubkey = None;
         // We ask to buyer for a new invoice
         send_new_order_msg(
-            request_id.unwrap_or(1),
+            request_id,
             Some(order.id),
             Action::AddInvoice,
             Some(Content::Order(order_data)),
@@ -96,7 +96,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
 
         // We send a message to seller we are waiting for buyer invoice
         send_new_order_msg(
-            request_id.unwrap_or(1),
+            request_id,
             Some(order.id),
             Action::WaitingBuyerInvoice,
             None,

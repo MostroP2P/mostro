@@ -45,7 +45,7 @@ pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Re
     };
 
     send_new_order_msg(
-        request_id.unwrap_or(1),
+        request_id,
         Some(order.id),
         Action::PaymentFailed,
         None,
@@ -64,7 +64,7 @@ pub async fn release_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Check if order id is ok
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -152,7 +152,7 @@ pub async fn release_action(
     )
     .await;
 
-    let _ = do_payment(order_updated, Some(request_id)).await;
+    let _ = do_payment(order_updated, request_id).await;
 
     Ok(())
 }
@@ -177,7 +177,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(&order, None).await {
+        if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -213,7 +213,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
                                 &buyer_pubkey,
                                 &seller_pubkey,
                                 &my_keys,
-                                request_id.unwrap_or(1),
+                                request_id,
                             )
                             .await;
                         }
@@ -248,7 +248,7 @@ async fn payment_success(
     buyer_pubkey: &PublicKey,
     seller_pubkey: &PublicKey,
     my_keys: &Keys,
-    request_id: u64,
+    request_id: Option<u64>,
 ) -> Result<()> {
     // Purchase completed message to buyer
     send_new_order_msg(

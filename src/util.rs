@@ -320,7 +320,7 @@ pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> R
         order_id,
         status.to_string()
     );
-  
+
     if let Ok(client) = get_nostr_client() {
         if client.send_event(event).await.is_err() {
             tracing::warn!("order id : {} is expired", order_updated.id)
@@ -741,6 +741,7 @@ mod tests {
             ..Default::default()
         };
         let message = Message::Order(MessageKind::new(
+            1,
             Some(uuid),
             Action::TakeSell,
             Some(Content::Amount(order.amount)),

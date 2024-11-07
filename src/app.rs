@@ -88,19 +88,15 @@ pub async fn run(
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {
-                                            if let Err(e) = order_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                order_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }
                                         }
                                         Action::TakeSell => {
-                                            if let Err(e) = take_sell_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                take_sell_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }
@@ -115,17 +111,15 @@ pub async fn run(
                                             }
                                         }
                                         Action::FiatSent => {
-                                            if let Err(e) = fiat_sent_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                fiat_sent_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }
                                         }
                                         Action::Release => {
                                             if let Err(e) = release_action(
-                                                msg, &event, &my_keys, &pool, ln_client, request_id,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await
                                             {
@@ -134,7 +128,7 @@ pub async fn run(
                                         }
                                         Action::Cancel => {
                                             if let Err(e) = cancel_action(
-                                                msg, &event, &my_keys, &pool, ln_client, request_id,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await
                                             {
@@ -142,10 +136,9 @@ pub async fn run(
                                             }
                                         }
                                         Action::AddInvoice => {
-                                            if let Err(e) = add_invoice_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                add_invoice_action(msg, &event, &my_keys, &pool)
+                                                    .await
                                             {
                                                 warning_msg(&action, e)
                                             }
@@ -158,7 +151,6 @@ pub async fn run(
                                                 &my_keys,
                                                 &pool,
                                                 rate_list.clone(),
-                                                request_id,
                                             )
                                             .await
                                             {
@@ -166,17 +158,15 @@ pub async fn run(
                                             }
                                         }
                                         Action::Dispute => {
-                                            if let Err(e) = dispute_action(
-                                                msg, &event, &my_keys, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                dispute_action(msg, &event, &my_keys, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }
                                         }
                                         Action::AdminCancel => {
                                             if let Err(e) = admin_cancel_action(
-                                                msg, &event, &my_keys, &pool, ln_client, request_id,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await
                                             {
@@ -185,7 +175,7 @@ pub async fn run(
                                         }
                                         Action::AdminSettle => {
                                             if let Err(e) = admin_settle_action(
-                                                msg, &event, &my_keys, &pool, ln_client, request_id,
+                                                msg, &event, &my_keys, &pool, ln_client,
                                             )
                                             .await
                                             {
@@ -194,7 +184,7 @@ pub async fn run(
                                         }
                                         Action::AdminAddSolver => {
                                             if let Err(e) = admin_add_solver_action(
-                                                msg, &event, &my_keys, &pool, request_id,
+                                                msg, &event, &my_keys, &pool,
                                             )
                                             .await
                                             {
@@ -202,10 +192,8 @@ pub async fn run(
                                             }
                                         }
                                         Action::AdminTakeDispute => {
-                                            if let Err(e) = admin_take_dispute_action(
-                                                msg, &event, &pool, request_id,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                admin_take_dispute_action(msg, &event, &pool).await
                                             {
                                                 warning_msg(&action, e)
                                             }

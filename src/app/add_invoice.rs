@@ -18,9 +18,9 @@ pub async fn add_invoice_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    request_id: Option<u64>,
 ) -> Result<()> {
     let order_msg = msg.get_inner_message_kind();
+    let request_id = msg.get_inner_message_kind().request_id;
     let mut order = if let Some(order_id) = order_msg.id {
         match Order::by_id(pool, order_id).await? {
             Some(order) => order,

@@ -52,8 +52,10 @@ pub async fn update_user_reputation_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     rate_list: Arc<Mutex<Vec<Event>>>,
-    request_id: Option<u64>,
 ) -> Result<()> {
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {

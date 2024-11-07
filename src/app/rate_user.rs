@@ -29,8 +29,9 @@ pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Ra
     let mut user_reputation_event = NOSTR_CLIENT
         .get()
         .unwrap()
-        .get_events_of(vec![filters], Some(Duration::from_secs(10)))
-        .await?;
+        .fetch_events(vec![filters], Some(Duration::from_secs(10)))
+        .await?
+        .to_vec();
 
     // Check if vector of answers is empty
     if user_reputation_event.is_empty() {

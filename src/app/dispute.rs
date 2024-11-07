@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::str::FromStr;
 
 use crate::db::find_dispute_by_order_id;
@@ -159,20 +160,20 @@ pub async fn dispute_action(
     .await;
 
     // We create a tag to show status of the dispute
-    let tags: Vec<Tag> = vec![
+    let tags: Tags = Tags::new(vec![
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+            TagKind::Custom(Cow::Borrowed("s")),
             vec![dispute.status.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            TagKind::Custom(Cow::Borrowed("y")),
             vec!["mostrop2p".to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+            TagKind::Custom(Cow::Borrowed("z")),
             vec!["dispute".to_string()],
         ),
-    ];
+    ]);
 
     // nip33 kind with dispute id as identifier
     let event = new_event(my_keys, "", dispute.id.to_string(), tags)?;

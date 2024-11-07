@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
     };
 
     // Client subscription
-    client.subscribe(vec![subscription], None).await;
+    client.subscribe(vec![subscription], None).await?;
 
     let mut ln_client = LndConnector::new().await?;
 

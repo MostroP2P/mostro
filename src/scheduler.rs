@@ -31,7 +31,7 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
 }
 
 async fn job_relay_list() {
-    let mostro_pubkey = match get_keys() {
+    let mostro_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
@@ -45,13 +45,13 @@ async fn job_relay_list() {
                 let mut relay_tags: Vec<Tag> = vec![];
 
                 for (_, r) in relays.iter() {
-                    if r.is_connected().await {
-                        relay_tags.push(Tag::relay_metadata(r.url(), None))
+                    if r.is_connected() {
+                        relay_tags.push(Tag::relay_metadata(r.url().clone(), None))
                     }
                 }
 
-                if let Ok(relay_ev) =
-                    EventBuilder::new(NostrKind::RelayList, "", relay_tags).to_event(&mostro_pubkey)
+                if let Ok(relay_ev) = EventBuilder::new(NostrKind::RelayList, "", relay_tags)
+                    .sign_with_keys(&mostro_keys)
                 {
                     if let Ok(client) = get_nostr_client() {
                         let _ = client.send_event(relay_ev).await;
@@ -64,7 +64,7 @@ async fn job_relay_list() {
 }
 
 async fn job_info_event_send() {
-    let mostro_pubkey = match get_keys() {
+    let mostro_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
@@ -74,10 +74,10 @@ async fn job_info_event_send() {
         loop {
             info!("Sending info about mostro");
 
-            let tags = crate::nip33::info_to_tags(&mostro_pubkey.public_key());
-            let id = format!("info-{}", mostro_pubkey.public_key());
+            let tags = crate::nip33::info_to_tags(&mostro_keys.public_key());
+            let id = format!("info-{}", mostro_keys.public_key());
 
-            let info_ev = match crate::nip33::new_event(&mostro_pubkey, "", id, tags) {
+            let info_ev = match crate::nip33::new_event(&mostro_keys, "", id, tags) {
                 Ok(info) => info,
                 Err(e) => return error!("{e}"),
             };

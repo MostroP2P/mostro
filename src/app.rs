@@ -82,9 +82,6 @@ pub async fn run(
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {
-                                // Get the optional request id
-                                let request_id = msg.get_inner_message_kind().request_id;
-
                                 if let Some(action) = msg.inner_action() {
                                     match action {
                                         Action::NewOrder => {

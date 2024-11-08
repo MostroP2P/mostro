@@ -66,7 +66,7 @@ pub async fn fiat_sent_action(
 
     // We a message to the seller
     send_new_order_msg(
-        request_id,
+        None,
         Some(order.id),
         Action::FiatSentOk,
         Some(Content::Peer(peer)),

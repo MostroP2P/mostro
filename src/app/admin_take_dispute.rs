@@ -119,14 +119,14 @@ pub async fn admin_take_dispute_action(
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
-        request_id,
+        None,
         Some(order.id),
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey.clone())),
     );
 
     let msg_to_seller = Message::new_order(
-        request_id,
+        None,
         Some(order.id),
         Action::AdminTookDispute,
         Some(Content::Peer(solver_pubkey)),

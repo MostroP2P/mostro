@@ -136,7 +136,7 @@ pub async fn cancel_action(
                     .await;
                     let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                     send_new_order_msg(
-                        request_id,
+                        None,
                         Some(order.id),
                         Action::CooperativeCancelAccepted,
                         None,
@@ -161,7 +161,7 @@ pub async fn cancel_action(
                 .await;
                 let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
                 send_new_order_msg(
-                    request_id,
+                    None,
                     Some(order.id),
                     Action::CooperativeCancelInitiatedByPeer,
                     None,
@@ -215,7 +215,7 @@ pub async fn cancel_add_invoice(
         )
         .await;
         send_new_order_msg(
-            request_id,
+            None,
             Some(order.id),
             Action::Canceled,
             None,
@@ -284,7 +284,7 @@ pub async fn cancel_pay_hold_invoice(
         )
         .await;
         send_new_order_msg(
-            request_id,
+            None,
             Some(order.id),
             Action::Canceled,
             None,

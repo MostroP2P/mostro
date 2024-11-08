@@ -19,8 +19,11 @@ pub async fn add_invoice_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<()> {
+    // Get the order message
     let order_msg = msg.get_inner_message_kind();
-    let request_id = msg.get_inner_message_kind().request_id;
+    // Get the request id
+    let request_id = order_msg.request_id;
+    // Get the order
     let mut order = if let Some(order_id) = order_msg.id {
         match Order::by_id(pool, order_id).await? {
             Some(order) => order,

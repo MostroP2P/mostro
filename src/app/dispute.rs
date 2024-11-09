@@ -198,7 +198,7 @@ pub async fn dispute_action(
         Ok(pk) => pk,
         Err(e) => {
             tracing::error!("Error parsing initiator pubkey: {:#?}", e);
-            return Ok(());
+            return Err(Error::msg("Failed to parse initiator public key"));
         }
     };
 

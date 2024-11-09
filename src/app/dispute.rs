@@ -226,7 +226,7 @@ pub async fn dispute_action(
         Ok(pk) => pk,
         Err(e) => {
             tracing::error!("Error parsing initiator pubkey: {:#?}", e);
-            return Ok(());
+            return Err(Error::msg("Failed to parse initiator public key"));
         }
     };
 
@@ -244,7 +244,7 @@ pub async fn dispute_action(
         Ok(pk) => pk,
         Err(e) => {
             tracing::error!("Error parsing counterpart pubkey: {:#?}", e);
-            return Ok(());
+            return Err(Error::msg("Failed to parse counterpart public key"));
         }
     };
     send_new_order_msg(

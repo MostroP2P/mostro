@@ -1,3 +1,7 @@
+//! This module handles dispute-related functionality for the P2P trading system.
+//! It provides mechanisms for users to initiate disputes, notify counterparties,
+//! and publish dispute events to the network.
+
 use std::borrow::Cow;
 use std::str::FromStr;
 
@@ -16,6 +20,10 @@ use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use uuid::Uuid;
 
+/// Publishes a dispute event to the Nostr network.
+/// 
+/// Creates and publishes a NIP-33 replaceable event containing dispute details
+/// including status and application metadata.
 async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> {
     // Create tags for the dispute event
     let tags = Tags::new(vec![
@@ -65,6 +73,11 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> 
     }
 }
 
+/// Gets information about the counterparty in a dispute.
+///
+/// Returns a tuple containing:
+/// - The counterparty's public key as a String
+/// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
 fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<(String, bool)> {
     match sender {
         s if s == buyer => Ok((seller.to_string(), true)), // buyer is initiator
@@ -76,6 +89,11 @@ fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<(Stri
     }
 }
 
+/// Validates and retrieves an order from the database.
+///
+/// Checks that:
+/// - The order exists
+/// - The order status allows disputes (Active or FiatSent)
 async fn get_valid_order(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
@@ -116,6 +134,15 @@ async fn get_valid_order(
     Ok(order)
 }
 
+/// Main handler for dispute actions.
+///
+/// This function:
+/// 1. Validates the order and dispute status
+/// 2. Updates the order status
+/// 3. Creates a new dispute record
+/// 4. Generates security tokens for both parties
+/// 5. Notifies both parties
+/// 6. Publishes the dispute event to the network
 pub async fn dispute_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -159,6 +186,7 @@ pub async fn dispute_action(
     // Get the opposite dispute status
     let is_seller_dispute = !is_buyer_dispute;
 
+    // Update dispute flags based on who initiated
     let mut update_seller_dispute = false;
     let mut update_buyer_dispute = false;
     if is_seller_dispute && !order.seller_dispute {
@@ -179,8 +207,8 @@ pub async fn dispute_action(
         order.update(pool).await?;
     }
 
+    // Create new dispute record and generate security tokens
     let mut dispute = Dispute::new(order_id);
-    // Generate tokens for the users to avoid fake resolver
     let mut rng = rand::thread_rng();
     dispute.buyer_token = Some(rng.gen_range(100..=999));
     dispute.seller_token = Some(rng.gen_range(100..=999));
@@ -190,10 +218,10 @@ pub async fn dispute_action(
         false => (dispute.buyer_token, dispute.seller_token),
     };
 
-    // Use CRUD create method
+    // Save dispute to database
     let dispute = dispute.create(pool).await?;
 
-    // We create a Message for the initiator
+    // Send notification to dispute initiator
     let initiator_pubkey = match PublicKey::from_str(&message_sender) {
         Ok(pk) => pk,
         Err(e) => {
@@ -211,7 +239,7 @@ pub async fn dispute_action(
     )
     .await;
 
-    // We create a Message for the counterpart
+    // Send notification to counterparty
     let counterpart_pubkey = match PublicKey::from_str(&counterpart) {
         Ok(pk) => pk,
         Err(e) => {
@@ -227,7 +255,8 @@ pub async fn dispute_action(
         &counterpart_pubkey,
     )
     .await;
-    // After sending notifications to both parties
+    
+    // Publish dispute event to network
     if let Err(e) = publish_dispute_event(&dispute, my_keys).await {
         tracing::error!("Failed to publish dispute event: {}", e);
     }

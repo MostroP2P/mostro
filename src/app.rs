@@ -36,7 +36,6 @@ use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-
 /// Helper function to log warning messages for action errors
 fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
@@ -57,24 +56,26 @@ async fn handle_message_action(
         Action::NewOrder => order_action(msg, event, my_keys, pool).await,
         Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await,
         Action::TakeBuy => take_buy_action(msg, event, my_keys, pool).await,
-        
+
         // Payment-related actions
         Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
         Action::Release => release_action(msg, event, my_keys, pool, ln_client).await,
         Action::AddInvoice => add_invoice_action(msg, event, my_keys, pool).await,
         Action::PayInvoice => todo!(),
-        
+
         // Dispute and rating actions
         Action::Dispute => dispute_action(msg, event, my_keys, pool).await,
-        Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool, rate_list).await,
+        Action::RateUser => {
+            update_user_reputation_action(msg, event, my_keys, pool, rate_list).await
+        }
         Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client).await,
-        
+
         // Admin actions
         Action::AdminCancel => admin_cancel_action(msg, event, my_keys, pool, ln_client).await,
         Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client).await,
         Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool).await,
         Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool).await,
-        
+
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -83,7 +84,7 @@ async fn handle_message_action(
 }
 
 /// Main event loop that processes incoming Nostr events.
-/// 
+///
 /// # Arguments
 /// * `my_keys` - The node's keypair
 /// * `client` - Nostr client instance
@@ -147,7 +148,9 @@ pub async fn run(
                                 }
                             }
                         }
-                        Err(e) => tracing::warn!("Failed to parse event message from JSON: {:?}", e),
+                        Err(e) => {
+                            tracing::warn!("Failed to parse event message from JSON: {:?}", e)
+                        }
                     }
                 }
             }

@@ -214,14 +214,7 @@ pub async fn cancel_add_invoice(
             &event.sender,
         )
         .await;
-        send_new_order_msg(
-            None,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &seller_pubkey,
-        )
-        .await;
+        send_new_order_msg(None, Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {
         // We re-publish the event with Pending status
@@ -283,14 +276,7 @@ pub async fn cancel_pay_hold_invoice(
             &event.sender,
         )
         .await;
-        send_new_order_msg(
-            None,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &seller_pubkey,
-        )
-        .await;
+        send_new_order_msg(None, Some(order.id), Action::Canceled, None, &seller_pubkey).await;
         Ok(())
     } else {
         // We re-publish the event with Pending status

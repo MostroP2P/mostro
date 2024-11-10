@@ -3,9 +3,6 @@
 mostro.db*
 mostro.log
 
-# Relay data
-/relay/data/*
-
 # IDE's
 .idea
 .vscode
@@ -15,3 +12,6 @@ settings.toml
 
 book/book/
 bin/
+
+# Docker related config and data
+docker/config

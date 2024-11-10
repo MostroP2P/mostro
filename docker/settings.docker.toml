@@ -1,8 +1,8 @@
 [lightning]
 # path to tls.cert file
-lnd_cert_file = '/lnd/alice/tls.cert'
+lnd_cert_file = '/config/lnd/tls.cert'
 # path to macaroon file
-lnd_macaroon_file = '/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
+lnd_macaroon_file = '/config/lnd/admin.macaroon'
 # lnd grpc host and port
 lnd_grpc_host = 'https://host.docker.internal:10001'
 # lightning invoices sent by the buyer to Mostro should have at least
@@ -10,7 +10,7 @@ lnd_grpc_host = 'https://host.docker.internal:10001'
 invoice_expiration_window = 3600
 # Hold invoice cltv delta (expiration time in blocks)
 hold_invoice_cltv_delta = 144
-# This is the time that a taker has to pay the invoice (seller) or 
+# This is the time that a taker has to pay the invoice (seller) or
 # to add a new invoice (buyer), in seconds
 hold_invoice_expiration_window = 300
 # Retries for failed payments
@@ -20,7 +20,7 @@ payment_retries_interval = 60
 
 [nostr]
 nsec_privkey = 'nsec1...'
-relays = ['ws://localhost:7000']
+relays = ['ws://host.docker.internal:7000', 'ws://localhost:7000']
 
 [mostro]
 # Mostro Fee

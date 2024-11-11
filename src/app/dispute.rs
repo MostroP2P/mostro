@@ -160,8 +160,7 @@ pub async fn dispute_action(
 
     // Check dispute for this order id is yet present.
     if find_dispute_by_order_id(pool, order_id).await.is_ok() {
-        tracing::error!("Dispute yet opened for this order id: {order_id}");
-        return Ok(());
+        return Err(Error::msg(format!("Dispute already exists for order {}", order_id)));
     }
 
     // Get and validate order

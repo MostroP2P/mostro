@@ -21,7 +21,7 @@ use sqlx_crud::traits::Crud;
 use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
-/// 
+///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details
 /// including status and application metadata.
 async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> {
@@ -163,7 +163,10 @@ pub async fn dispute_action(
 
     // Check dispute for this order id is yet present.
     if find_dispute_by_order_id(pool, order_id).await.is_ok() {
-        return Err(Error::msg(format!("Dispute already exists for order {}", order_id)));
+        return Err(Error::msg(format!(
+            "Dispute already exists for order {}",
+            order_id
+        )));
     }
 
     // Get and validate order
@@ -257,10 +260,8 @@ pub async fn dispute_action(
         &counterpart_pubkey,
     )
     .await;
-    
+
     // Publish dispute event to network
     publish_dispute_event(&dispute, my_keys).await?;
-    Ok(())
-
     Ok(())
 }

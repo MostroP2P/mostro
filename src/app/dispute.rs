@@ -259,9 +259,8 @@ pub async fn dispute_action(
     .await;
     
     // Publish dispute event to network
-    if let Err(e) = publish_dispute_event(&dispute, my_keys).await {
-        tracing::error!("Failed to publish dispute event: {}", e);
-    }
+    publish_dispute_event(&dispute, my_keys).await?;
+    Ok(())
 
     Ok(())
 }

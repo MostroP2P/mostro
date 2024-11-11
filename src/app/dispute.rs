@@ -123,7 +123,10 @@ async fn get_valid_order(
                     &event.sender,
                 )
                 .await;
-                return Err(Error::msg("Order status does not allow disputes"));
+                return Err(Error::msg(format!(
+                    "Order {} with status {} does not allow disputes. Must be Active or FiatSent",
+                    order.id, order.status
+                )));
             }
         }
         Err(_) => {

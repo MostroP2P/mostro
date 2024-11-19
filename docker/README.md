@@ -27,10 +27,15 @@ To build and run the Docker container using Docker Compose, follow these steps:
    git clone https://github.com/MostroP2P/mostro.git
    ```
 
-2. Ensure you have the `settings.toml` configuration file and the `mostro.db` SQLite database in a `config` directory (acording to the `volumes` section). If you don't have those files from a previous installation, then the first time they will be created as follows:
+2. Ensure you have the `settings.toml` configuration file and the `mostro.db` SQLite database in a `config` directory (acording to the `volumes` section in compose.yml file). If you don't have those files from a previous installation, then the first time they will be created as follows:
 
-   - `docker/config/settings.toml` from the `docker/settings.docker.toml` template
-   - `docker/config/mostro.db` from the `docker/empty.mostro.db` database
+   ```sh
+   mkdir docker/config
+   cp docker/settings.docker.toml docker/config/settings.toml
+   cp docker/empty.mostro.db docker/config/mostro.db
+   ```
+
+   _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file._
 
 3. Set the `LND_CERT_FILE` and `LND_MACAROON_FILE` to the paths of the LND TLS certificate and macaroon files on the `docker/.env` file. These files will be copied to the `docker/config/lnd` directory. For example:
 

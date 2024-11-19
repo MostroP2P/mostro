@@ -1,3 +1,4 @@
+SHELL := $(shell which bash)
 docker-build:
 	@set -o pipefail; \
 	cd docker && \

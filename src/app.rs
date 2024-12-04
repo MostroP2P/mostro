@@ -43,6 +43,8 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use mostro_core::user::User;
+use sqlx_crud::Crud;
 
 /// Helper function to log warning messages for action errors
 fn warning_msg(action: &Action, e: anyhow::Error) {
@@ -146,11 +148,34 @@ pub async fn run(
                         continue;
                     }
 
+
                     // Parse and process the message
                     let message = Message::from_json(&event.rumor.content);
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {
+                                let is_trade_index = msg.get_inner_message_kind().trade_index.is_some;
+                                // Function to search if user is yet present in db
+                                match db::is_new_user(event.sender){
+                                    Ok(user) => {
+                                        let next_trade_index = user.trade_index + 1;
+                                        if is_trade_index == next_trade_index {
+                                            user.trade_index = next_trade_index;
+                                            if msg.get_inner_message_kind().verify_content_signature(event.sender){
+                                                if let Ok(user) = user.update(pool).await{
+                                                    tracing::info!("Update user trade index");
+                                                }
+                                            }
+                                        }
+                                    },
+                                    Err(_) => {
+                                        let new_user = User::new{ pubkey: event.sender, trade_index: next_trade_index, ..Default::default()};
+                                        if let Ok(user) = new_user.update(pool).await{
+                                            tracing::info!("Added new user for rate");
+                                        }
+                                    },
+                                }
+
                                 if let Some(action) = msg.inner_action() {
                                     if let Err(e) = handle_message_action(
                                         &action,

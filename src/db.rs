@@ -310,6 +310,21 @@ pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyho
     Ok(user)
 }
 
+pub async fn is_new_user(pool: &SqlitePool, npub: String) -> anyhow::Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            SELECT *
+            FROM users
+            WHERE pubkey == ?1
+        "#,
+    )
+    .bind(npub)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
 pub async fn is_assigned_solver(
     pool: &SqlitePool,
     solver_pubkey: &str,

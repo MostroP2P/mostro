@@ -5,5 +5,6 @@ CREATE TABLE IF NOT EXISTS users (
   is_solver integer not null default 0,
   is_banned integer not null default 0,
   category integer not null default 0,
-  created_at integer not null
+  created_at integer not null,
+  trade_index integer not null default 0
 );

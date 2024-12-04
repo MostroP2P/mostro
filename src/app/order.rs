@@ -18,6 +18,8 @@ pub async fn order_action(
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
+    let pubkey_0 = event.sender
+
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 

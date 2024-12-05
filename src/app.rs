@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use mostro_core::user::User;
 use sqlx_crud::Crud;
-
+use crate::db::is_user_present;
 /// Helper function to log warning messages for action errors
 fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
@@ -147,29 +147,27 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
-
-
+                    
                     // Parse and process the message
                     let message = Message::from_json(&event.rumor.content);
                     match message {
                         Ok(msg) => {
                             if msg.get_inner_message_kind().verify() {
-                                let is_trade_index = msg.get_inner_message_kind().trade_index.is_some;
+                                let message_kind = msg.get_inner_message_kind();
                                 // Function to search if user is yet present in db
-                                match db::is_new_user(event.sender){
+                                match is_user_present(&pool, event.sender.to_string()).await{
                                     Ok(user) => {
-                                        let next_trade_index = user.trade_index + 1;
-                                        if is_trade_index == next_trade_index {
-                                            user.trade_index = next_trade_index;
+                                        if user.trade_index < message_kind.get_trade_index() {
+                                            user.trade_index = message_kind.get_trade_index();
                                             if msg.get_inner_message_kind().verify_content_signature(event.sender){
-                                                if let Ok(user) = user.update(pool).await{
+                                                if let Ok(user) = user.update(&pool).await{
                                                     tracing::info!("Update user trade index");
                                                 }
                                             }
                                         }
                                     },
                                     Err(_) => {
-                                        let new_user = User::new{ pubkey: event.sender, trade_index: next_trade_index, ..Default::default()};
+                                        let new_user = User::new{ pubkey: event.sender, trade_index: message_kind.get_trade_index(), ..Default::default()};
                                         if let Ok(user) = new_user.update(pool).await{
                                             tracing::info!("Added new user for rate");
                                         }

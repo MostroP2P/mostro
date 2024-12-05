@@ -310,7 +310,7 @@ pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyho
     Ok(user)
 }
 
-pub async fn is_new_user(pool: &SqlitePool, npub: String) -> anyhow::Result<User> {
+pub async fn is_user_present(pool: &SqlitePool, npub: String) -> anyhow::Result<User> {
     let user = sqlx::query_as::<_, User>(
         r#"
             SELECT *

@@ -37,18 +37,53 @@ use crate::nip59::unwrap_gift_wrap;
 use crate::Settings;
 
 // External dependencies
+use crate::db::is_user_present;
 use anyhow::Result;
 use mostro_core::message::{Action, Message};
+use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
+use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use mostro_core::user::User;
-use sqlx_crud::Crud;
-use crate::db::is_user_present;
 /// Helper function to log warning messages for action errors
 fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
+}
+
+/// Function to search if user is yet present in db
+async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Message) {
+    let message_kind = msg.get_inner_message_kind();
+    if let Action::NewOrder | Action::TakeBuy | Action::TakeSell = message_kind.action {
+        match is_user_present(&pool, event.sender.to_string()).await {
+            Ok(mut user) => {
+                if let (true, index) = message_kind.has_trade_index() {
+                    if index > user.trade_index
+                        && msg
+                            .get_inner_message_kind()
+                            .verify_content_signature(event.sender)
+                    {
+                        user.trade_index = index;
+                        if let Ok(_) = user.update(&pool).await {
+                            tracing::info!("Update user trade index");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                if let (true, trade_index) = message_kind.has_trade_index() {
+                    let new_user = User {
+                        pubkey: event.sender.to_string(),
+                        trade_index,
+                        ..Default::default()
+                    };
+                    if let Ok(_) = new_user.update(&pool).await {
+                        tracing::info!("Added new user for rate");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Handles the processing of a single message action by routing it to the appropriate handler
@@ -147,33 +182,13 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
-                    
+
                     // Parse and process the message
                     let message = Message::from_json(&event.rumor.content);
                     match message {
                         Ok(msg) => {
-                            if msg.get_inner_message_kind().verify() {
-                                let message_kind = msg.get_inner_message_kind();
-                                // Function to search if user is yet present in db
-                                match is_user_present(&pool, event.sender.to_string()).await{
-                                    Ok(user) => {
-                                        if user.trade_index < message_kind.get_trade_index() {
-                                            user.trade_index = message_kind.get_trade_index();
-                                            if msg.get_inner_message_kind().verify_content_signature(event.sender){
-                                                if let Ok(user) = user.update(&pool).await{
-                                                    tracing::info!("Update user trade index");
-                                                }
-                                            }
-                                        }
-                                    },
-                                    Err(_) => {
-                                        let new_user = User::new{ pubkey: event.sender, trade_index: message_kind.get_trade_index(), ..Default::default()};
-                                        if let Ok(user) = new_user.update(pool).await{
-                                            tracing::info!("Added new user for rate");
-                                        }
-                                    },
-                                }
-
+                            let message_kind = msg.get_inner_message_kind();
+                            if message_kind.verify() {
                                 if let Some(action) = msg.inner_action() {
                                     if let Err(e) = handle_message_action(
                                         &action,

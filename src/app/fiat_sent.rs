@@ -39,6 +39,7 @@ pub async fn fiat_sent_action(
             Action::NotAllowedByStatus,
             None,
             &event.sender,
+            None,
         )
         .await;
         return Ok(());
@@ -71,6 +72,7 @@ pub async fn fiat_sent_action(
         Action::FiatSentOk,
         Some(Content::Peer(peer)),
         &seller_pubkey,
+        None,
     )
     .await;
     // We send a message to buyer to wait
@@ -82,6 +84,7 @@ pub async fn fiat_sent_action(
         Action::FiatSentOk,
         Some(Content::Peer(peer)),
         &event.sender,
+        None,
     )
     .await;
 

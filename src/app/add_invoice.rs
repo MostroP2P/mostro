@@ -83,6 +83,7 @@ pub async fn add_invoice_action(
                         Action::IncorrectInvoiceAmount,
                         None,
                         &event.sender,
+                        None,
                     )
                     .await;
                     return Ok(());
@@ -107,6 +108,7 @@ pub async fn add_invoice_action(
                 Action::InvoiceUpdated,
                 None,
                 &buyer_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -118,6 +120,7 @@ pub async fn add_invoice_action(
                 Action::NotAllowedByStatus,
                 None,
                 &event.sender,
+                None,
             )
             .await;
             return Ok(());
@@ -163,6 +166,7 @@ pub async fn add_invoice_action(
             Action::BuyerTookOrder,
             Some(Content::Order(order_data.clone())),
             &seller_pubkey,
+            None,
         )
         .await;
         // We send a message to buyer saying seller paid
@@ -172,6 +176,7 @@ pub async fn add_invoice_action(
             Action::HoldInvoicePaymentAccepted,
             Some(Content::Order(order_data)),
             &buyer_pubkey,
+            None,
         )
         .await;
     } else {

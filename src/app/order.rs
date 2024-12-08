@@ -18,8 +18,6 @@ pub async fn order_action(
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
-    let pubkey_0 = event.sender;
-
     if let Some(order) = msg.get_inner_message_kind().get_order() {
         let mostro_settings = Settings::get_mostro();
 
@@ -36,6 +34,7 @@ pub async fn order_action(
                         Action::IncorrectInvoiceAmount,
                         None,
                         &event.sender,
+                        None,
                     )
                     .await;
                     return Ok(());
@@ -92,6 +91,7 @@ pub async fn order_action(
                     Action::InvalidSatsAmount,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Ok(());
@@ -106,6 +106,7 @@ pub async fn order_action(
                     Action::OutOfRangeSatsAmount,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Ok(());
@@ -119,6 +120,7 @@ pub async fn order_action(
             &event.sender.to_string(),
             event.sender,
             request_id,
+            msg.get_inner_message_kind().trade_index,
         )
         .await?;
     }

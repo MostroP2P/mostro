@@ -69,6 +69,7 @@ pub async fn take_buy_action(
                 Action::NotAllowedByStatus,
                 None,
                 &seller_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -85,6 +86,7 @@ pub async fn take_buy_action(
             Action::OutOfRangeFiatAmount,
             None,
             &event.sender,
+            None,
         )
         .await;
         return Ok(());

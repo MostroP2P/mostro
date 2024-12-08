@@ -77,7 +77,7 @@ async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Messag
                         trade_index,
                         ..Default::default()
                     };
-                    if let Ok(_) = new_user.update(&pool).await {
+                    if let Ok(_) = new_user.create(&pool).await {
                         tracing::info!("Added new user for rate");
                     }
                 }

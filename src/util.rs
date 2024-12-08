@@ -555,7 +555,15 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(request_id, Some(order.id), Action::Rate, None, buyer_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
     // to seller
     send_new_order_msg(
         request_id,
@@ -563,6 +571,7 @@ pub async fn rate_counterpart(
         Action::Rate,
         None,
         seller_pubkey,
+        None,
     )
     .await;
 
@@ -581,7 +590,7 @@ pub async fn settle_seller_hold_invoice(
 ) -> Result<()> {
     // Check if the pubkey is right
     if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender, None).await;
         return Err(Error::msg("Not allowed"));
     }
 
@@ -590,7 +599,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.sender, None).await;
         return Err(Error::msg("No preimage"));
     }
     Ok(())
@@ -613,7 +622,7 @@ pub async fn send_cant_do_msg(
     let content = message.map(Content::TextMessage);
 
     // Send message to event creator
-    let message = Message::cant_do(request_id, order_id, content, None);
+    let message = Message::cant_do(order_id, request_id, content, None);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;
@@ -629,7 +638,7 @@ pub async fn send_new_order_msg(
     trade_index: Option<i64>,
 ) {
     // Send message to event creator
-    let message = Message::new_order(request_id, order_id, None, action, content, None);
+    let message = Message::new_order(order_id, request_id, trade_index, action, content, None);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;

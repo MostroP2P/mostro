@@ -425,7 +425,7 @@ pub async fn show_hold_invoice(
             None,
         )),
         seller_pubkey,
-        None,
+        order.trade_index_seller,
     )
     .await;
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -435,7 +435,7 @@ pub async fn show_hold_invoice(
         Action::WaitingSellerToPay,
         None,
         buyer_pubkey,
-        None,
+        order.trade_index_buyer,
     )
     .await;
 
@@ -539,7 +539,7 @@ pub async fn set_waiting_invoice_status(
         Action::AddInvoice,
         Some(Content::Order(order_data)),
         &buyer_pubkey,
-        None,
+        order.trade_index_buyer,
     )
     .await;
 

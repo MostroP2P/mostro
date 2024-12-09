@@ -4,7 +4,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, send_new_order_ms
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::message::{Action, Content, Message, Peer};
+use mostro_core::message::{Action, Payload, Message, Peer};
 use mostro_core::order::Order;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -63,6 +63,7 @@ pub async fn admin_take_dispute_action(
                 Action::NotFound,
                 None,
                 &event.sender,
+                None
             )
             .await;
             return Ok(());
@@ -107,10 +108,12 @@ pub async fn admin_take_dispute_action(
 
     // We create a Message for admin
     let message = Message::new_dispute(
-        request_id,
         Some(dispute_id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Order(new_order)),
+        Some(Payload::Order(new_order)),
+        None,
     );
     let message = message.as_json()?;
     let sender_keys = crate::util::get_keys().unwrap();
@@ -119,17 +122,21 @@ pub async fn admin_take_dispute_action(
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
-        None,
         Some(order.id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey.clone())),
+        Some(Payload::Peer(solver_pubkey.clone())),
+        None,
     );
 
     let msg_to_seller = Message::new_order(
-        None,
         Some(order.id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey)),
+        Some(Payload::Peer(solver_pubkey)),
+        None,
     );
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {

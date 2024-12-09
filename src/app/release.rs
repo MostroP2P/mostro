@@ -50,6 +50,7 @@ pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Re
         Action::PaymentFailed,
         None,
         &buyer_pubkey,
+        None
     )
     .await;
 
@@ -137,6 +138,7 @@ pub async fn release_action(
         Action::HoldInvoicePaymentSettled,
         None,
         &seller_pubkey,
+        None
     )
     .await;
 
@@ -145,7 +147,7 @@ pub async fn release_action(
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         _ => return Err(Error::msg("Missing buyer pubkeys")),
     };
-    send_new_order_msg(None, Some(order_id), Action::Released, None, &buyer_pubkey).await;
+    send_new_order_msg(None, Some(order_id), Action::Released, None, &buyer_pubkey, None).await;
 
     let _ = do_payment(order_updated, request_id).await;
 
@@ -252,6 +254,7 @@ async fn payment_success(
         Action::PurchaseCompleted,
         None,
         buyer_pubkey,
+        None
     )
     .await;
 

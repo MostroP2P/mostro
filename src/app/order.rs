@@ -34,6 +34,7 @@ pub async fn order_action(
                         Action::IncorrectInvoiceAmount,
                         None,
                         &event.sender,
+                        None,
                     )
                     .await;
                     return Ok(());
@@ -90,6 +91,7 @@ pub async fn order_action(
                     Action::InvalidSatsAmount,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Ok(());
@@ -104,6 +106,7 @@ pub async fn order_action(
                     Action::OutOfRangeSatsAmount,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Ok(());
@@ -117,6 +120,7 @@ pub async fn order_action(
             &event.sender.to_string(),
             event.sender,
             request_id,
+            msg.get_inner_message_kind().trade_index,
         )
         .await?;
     }

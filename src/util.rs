@@ -14,13 +14,14 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::fmt::Write;
+use std::path::is_separator;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
@@ -163,7 +164,55 @@ pub async fn publish_order(
     initiator_pubkey: &str,
     ack_pubkey: PublicKey,
     request_id: Option<u64>,
+    trade_index: Option<i64>,
 ) -> Result<()> {
+    // Prepare a new default order
+    let new_order_db = prepare_new_order(new_order, initiator_pubkey, trade_index).await?;
+
+    // CRUD order creation
+    let mut order = new_order_db.clone().create(pool).await?;
+    let order_id = order.id;
+    info!("New order saved Id: {}", order_id);
+    // Get user reputation
+    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
+    // We transform the order fields to tags to use in the event
+    let tags = order_to_tags(&new_order_db, reputation);
+    // nip33 kind with order fields as tags and order id as identifier
+    let event = new_event(keys, "", order_id.to_string(), tags)?;
+    info!("Order event to be published: {event:#?}");
+    let event_id = event.id.to_string();
+    info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
+    // We update the order with the new event_id
+    order.event_id = event_id;
+    order.update(pool).await?;
+    let mut order = new_order_db.as_new_order();
+    order.id = Some(order_id);
+
+    // Send message as ack with small order
+    send_new_order_msg(
+        request_id,
+        Some(order_id),
+        Action::NewOrder,
+        Some(Payload::Order(order)),
+        &ack_pubkey,
+        trade_index,
+    )
+    .await;
+
+    NOSTR_CLIENT
+        .get()
+        .unwrap()
+        .send_event(event)
+        .await
+        .map(|_s| ())
+        .map_err(|err| err.into())
+}
+
+async fn prepare_new_order(
+    new_order: &SmallOrder,
+    initiator_pubkey: &str,
+    trade_index: Option<i64>,
+) -> Result<Order> {
     let mut fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
@@ -195,49 +244,16 @@ pub async fn publish_order(
     if new_order.kind == Some(OrderKind::Buy) {
         new_order_db.kind = OrderKind::Buy.to_string();
         new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.trade_index_buyer = trade_index;
     } else {
         new_order_db.seller_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.trade_index_seller = trade_index;
     }
 
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
 
-    // CRUD order creation
-    let mut order = new_order_db.clone().create(pool).await?;
-    let order_id = order.id;
-    info!("New order saved Id: {}", order_id);
-    // Get user reputation
-    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
-    // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&new_order_db, reputation);
-    // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags)?;
-    info!("Order event to be published: {event:#?}");
-    let event_id = event.id.to_string();
-    info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
-    // We update the order with the new event_id
-    order.event_id = event_id;
-    order.update(pool).await?;
-    let mut order = new_order_db.as_new_order();
-    order.id = Some(order_id);
-
-    // Send message as ack with small order
-    send_new_order_msg(
-        request_id,
-        Some(order_id),
-        Action::NewOrder,
-        Some(Content::Order(order)),
-        &ack_pubkey,
-    )
-    .await;
-
-    NOSTR_CLIENT
-        .get()
-        .unwrap()
-        .send_event(event)
-        .await
-        .map(|_s| ())
-        .map_err(|err| err.into())
+    Ok(new_order_db)
 }
 
 pub async fn send_dm(
@@ -403,12 +419,13 @@ pub async fn show_hold_invoice(
         request_id,
         Some(order.id),
         Action::PayInvoice,
-        Some(Content::PaymentRequest(
+        Some(Payload::PaymentRequest(
             Some(new_order),
             invoice_response.payment_request,
             None,
         )),
         seller_pubkey,
+        order.trade_index_seller,
     )
     .await;
     // We send a message to buyer to know that seller was requested to pay the invoice
@@ -418,6 +435,7 @@ pub async fn show_hold_invoice(
         Action::WaitingSellerToPay,
         None,
         buyer_pubkey,
+        order.trade_index_buyer,
     )
     .await;
 
@@ -519,8 +537,9 @@ pub async fn set_waiting_invoice_status(
         request_id,
         Some(order.id),
         Action::AddInvoice,
-        Some(Content::Order(order_data)),
+        Some(Payload::Order(order_data)),
         &buyer_pubkey,
+        order.trade_index_buyer,
     )
     .await;
 
@@ -536,7 +555,15 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(request_id, Some(order.id), Action::Rate, None, buyer_pubkey).await;
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
     // to seller
     send_new_order_msg(
         request_id,
@@ -544,6 +571,7 @@ pub async fn rate_counterpart(
         Action::Rate,
         None,
         seller_pubkey,
+        None,
     )
     .await;
 
@@ -591,10 +619,10 @@ pub async fn send_cant_do_msg(
     destination_key: &PublicKey,
 ) {
     // Prepare content in case
-    let content = message.map(Content::TextMessage);
+    let content = message.map(Payload::TextMessage);
 
     // Send message to event creator
-    let message = Message::cant_do(request_id, order_id, content);
+    let message = Message::cant_do(order_id, request_id, content, None);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;
@@ -605,11 +633,12 @@ pub async fn send_new_order_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
     action: Action,
-    content: Option<Content>,
+    content: Option<Payload>,
     destination_key: &PublicKey,
+    trade_index: Option<i64>,
 ) {
     // Send message to event creator
-    let message = Message::new_order(request_id, order_id, action, content);
+    let message = Message::new_order(order_id, request_id, trade_index, action, content, None);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;
@@ -744,7 +773,7 @@ mod tests {
             Some(1),
             Some(uuid),
             Action::TakeSell,
-            Some(Content::Amount(order.amount)),
+            Some(Payload::Amount(order.amount)),
         ));
         let amount = get_fiat_amount_requested(&order, &message);
         assert_eq!(amount, Some(1000));

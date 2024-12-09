@@ -3,7 +3,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, updat
 
 use anyhow::{Error, Result};
 
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -164,7 +164,7 @@ pub async fn add_invoice_action(
             None,
             Some(order.id),
             Action::BuyerTookOrder,
-            Some(Content::Order(order_data.clone())),
+            Some(Payload::Order(order_data.clone())),
             &seller_pubkey,
             None,
         )
@@ -174,7 +174,7 @@ pub async fn add_invoice_action(
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::Order(order_data)),
+            Some(Payload::Order(order_data)),
             &buyer_pubkey,
             None,
         )

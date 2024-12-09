@@ -11,7 +11,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -239,8 +239,9 @@ pub async fn dispute_action(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByYou,
-        Some(Content::Dispute(dispute.clone().id, initiator_token)),
+        Some(Payload::Dispute(dispute.clone().id, initiator_token)),
         &initiator_pubkey,
+        None
     )
     .await;
 
@@ -256,8 +257,9 @@ pub async fn dispute_action(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByPeer,
-        Some(Content::Dispute(dispute.clone().id, counterpart_token)),
+        Some(Payload::Dispute(dispute.clone().id, counterpart_token)),
         &counterpart_pubkey,
+        None
     )
     .await;
 

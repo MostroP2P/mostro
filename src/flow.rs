@@ -1,6 +1,6 @@
 use crate::util::send_new_order_msg;
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content};
+use mostro_core::message::{Action, Payload};
 use mostro_core::order::{Kind, SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
@@ -64,7 +64,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             request_id,
             Some(order.id),
             Action::BuyerTookOrder,
-            Some(Content::Order(order_data.clone())),
+            Some(Payload::Order(order_data.clone())),
             &seller_pubkey,
         )
         .await;
@@ -73,7 +73,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::Order(order_data)),
+            Some(Payload::Order(order_data)),
             &buyer_pubkey,
         )
         .await;
@@ -89,7 +89,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             request_id,
             Some(order.id),
             Action::AddInvoice,
-            Some(Content::Order(order_data)),
+            Some(Payload::Order(order_data)),
             &buyer_pubkey,
         )
         .await;

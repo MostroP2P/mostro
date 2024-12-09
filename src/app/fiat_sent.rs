@@ -1,7 +1,7 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content, Message, Peer};
+use mostro_core::message::{Action, Payload, Message, Peer};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -70,7 +70,7 @@ pub async fn fiat_sent_action(
         None,
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer)),
+        Some(Payload::Peer(peer)),
         &seller_pubkey,
         None,
     )
@@ -82,7 +82,7 @@ pub async fn fiat_sent_action(
         msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer)),
+        Some(Payload::Peer(peer)),
         &event.sender,
         None,
     )

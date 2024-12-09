@@ -14,7 +14,7 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -193,7 +193,7 @@ pub async fn publish_order(
         request_id,
         Some(order_id),
         Action::NewOrder,
-        Some(Content::Order(order)),
+        Some(Payload::Order(order)),
         &ack_pubkey,
         trade_index,
     )
@@ -419,7 +419,7 @@ pub async fn show_hold_invoice(
         request_id,
         Some(order.id),
         Action::PayInvoice,
-        Some(Content::PaymentRequest(
+        Some(Payload::PaymentRequest(
             Some(new_order),
             invoice_response.payment_request,
             None,
@@ -537,7 +537,7 @@ pub async fn set_waiting_invoice_status(
         request_id,
         Some(order.id),
         Action::AddInvoice,
-        Some(Content::Order(order_data)),
+        Some(Payload::Order(order_data)),
         &buyer_pubkey,
         order.trade_index_buyer,
     )
@@ -619,7 +619,7 @@ pub async fn send_cant_do_msg(
     destination_key: &PublicKey,
 ) {
     // Prepare content in case
-    let content = message.map(Content::TextMessage);
+    let content = message.map(Payload::TextMessage);
 
     // Send message to event creator
     let message = Message::cant_do(order_id, request_id, content, None);
@@ -633,7 +633,7 @@ pub async fn send_new_order_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
     action: Action,
-    content: Option<Content>,
+    content: Option<Payload>,
     destination_key: &PublicKey,
     trade_index: Option<i64>,
 ) {
@@ -773,7 +773,7 @@ mod tests {
             Some(1),
             Some(uuid),
             Action::TakeSell,
-            Some(Content::Amount(order.amount)),
+            Some(Payload::Amount(order.amount)),
         ));
         let amount = get_fiat_amount_requested(&order, &message);
         assert_eq!(amount, Some(1000));

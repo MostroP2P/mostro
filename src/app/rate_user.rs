@@ -2,7 +2,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -120,7 +120,7 @@ pub async fn update_user_reputation_action(
     // Check if content of Peer is the same of counterpart
     let rating;
 
-    if let Some(Content::RatingUser(v)) = msg.get_inner_message_kind().content.to_owned() {
+    if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().content.to_owned() {
         rating = v;
     } else {
         return Err(Error::msg("No rating present"));
@@ -171,7 +171,7 @@ pub async fn update_user_reputation_action(
             msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::RateReceived,
-            Some(Content::RatingUser(rating)),
+            Some(Payload::RatingUser(rating)),
             &event.sender,
         )
         .await;

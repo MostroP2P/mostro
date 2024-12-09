@@ -61,7 +61,7 @@ async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Messag
                     if index > user.trade_index
                         && msg
                             .get_inner_message_kind()
-                            .verify_content_signature(event.sender)
+                            .verify_signature(event.sender, event.rumor.content.)
                     {
                         user.trade_index = index;
                         if let Ok(_) = user.update(&pool).await {

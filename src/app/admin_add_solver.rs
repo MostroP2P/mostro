@@ -1,7 +1,7 @@
 use crate::util::{send_cant_do_msg, send_dm};
 
 use anyhow::Result;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Payload, Message};
 use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -25,7 +25,7 @@ pub async fn admin_add_solver_action(
         error!("No pubkey found!");
         return Ok(());
     };
-    let npubkey = if let Content::TextMessage(p) = content {
+    let npubkey = if let Payload::TextMessage(p) = content {
         p
     } else {
         error!("No pubkey found!");
@@ -39,14 +39,14 @@ pub async fn admin_add_solver_action(
         return Ok(());
     }
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
-    let user = User::new(public_key, 0, 1, 0, 0);
+    let user = User::new(public_key, 0, 1, 0, 0, None);
     // Use CRUD to create user
     match user.create(pool).await {
         Ok(r) => info!("Solver added: {:#?}", r),
         Err(ee) => error!("Error creating solver: {:#?}", ee),
     }
     // We create a Message for admin
-    let message = Message::new_dispute(request_id, None, Action::AdminAddSolver, None);
+    let message = Message::new_dispute(request_id, None, None, Action::AdminAddSolver, None, None);
     let message = message.as_json()?;
     // Send the message
     let sender_keys = crate::util::get_keys().unwrap();

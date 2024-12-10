@@ -5,7 +5,7 @@ use crate::util::{
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -72,7 +72,7 @@ pub async fn take_sell_action(
                     send_cant_do_msg(
                         request_id,
                         Some(order.id),
-                        Some(e.to_string()),
+                        Some(CantDoReason::InvalidInvoice),
                         &event.sender,
                     )
                     .await;

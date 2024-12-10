@@ -1,7 +1,7 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Payload, Message, Peer};
+use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

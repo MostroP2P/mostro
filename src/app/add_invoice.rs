@@ -3,7 +3,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, updat
 
 use anyhow::{Error, Result};
 
-use mostro_core::message::{Action, Payload, Message};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;

@@ -34,12 +34,13 @@ use crate::app::take_sell::take_sell_action;
 // Core functionality imports
 use crate::lightning::LndConnector;
 use crate::nip59::unwrap_gift_wrap;
+use crate::util::send_cant_do_msg;
 use crate::Settings;
 
 // External dependencies
 use crate::db::is_user_present;
 use anyhow::Result;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -51,11 +52,23 @@ fn warning_msg(action: &Action, e: anyhow::Error) {
     tracing::warn!("Error in {} with context {}", action, e);
 }
 
-/// Function to search if user is yet present in db
-async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Message) {
+/// Function to check if a user is present in the database and update or create their trade index.
+///
+/// This function performs the following tasks:
+/// 1. It checks if the action associated with the incoming message is related to trading (NewOrder, TakeBuy, or TakeSell).
+/// 2. If the user is found in the database, it verifies the trade index and the signature of the message.
+///    - If valid, it updates the user's trade index.
+///    - If invalid, it logs a warning and sends a message indicating the issue.
+/// 3. If the user is not found, it creates a new user entry with the provided trade index if applicable.
+///
+/// # Arguments
+/// * `pool` - The database connection pool used to query and update user data.
+/// * `event` - The unwrapped gift event containing the sender's information.
+/// * `msg` - The message containing action details and trade index information.
+async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Message) {
     let message_kind = msg.get_inner_message_kind();
     if let Action::NewOrder | Action::TakeBuy | Action::TakeSell = message_kind.action {
-        match is_user_present(&pool, event.sender.to_string()).await {
+        match is_user_present(pool, event.sender.to_string()).await {
             Ok(mut user) => {
                 if let (true, index) = message_kind.has_trade_index() {
                     let (_, sig): (String, nostr_sdk::secp256k1::schnorr::Signature) =
@@ -66,9 +79,18 @@ async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Messag
                             .verify_signature(event.sender, sig)
                     {
                         user.trade_index = index;
-                        if let Ok(_) = user.update(&pool).await {
+                        if user.update(pool).await.is_ok() {
                             tracing::info!("Update user trade index");
                         }
+                    } else {
+                        tracing::info!("Invalid signature or trade index");
+                        send_cant_do_msg(
+                            None,
+                            msg.get_inner_message_kind().id,
+                            Some(CantDoReason::InvalidTradeIndex),
+                            &event.sender,
+                        )
+                        .await;
                     }
                 }
             }
@@ -79,7 +101,7 @@ async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Messag
                         trade_index,
                         ..Default::default()
                     };
-                    if let Ok(_) = new_user.create(&pool).await {
+                    if new_user.create(pool).await.is_ok() {
                         tracing::info!("Added new user for rate");
                     }
                 }
@@ -184,12 +206,15 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
-
                     // Parse and process the message
                     let message = Message::from_json(&event.rumor.content);
+
                     match message {
                         Ok(msg) => {
                             let message_kind = msg.get_inner_message_kind();
+                            // Check if message is message with trade index
+                            check_trade_index(&pool, &event, &msg).await;
+
                             if message_kind.verify() {
                                 if let Some(action) = msg.inner_action() {
                                     if let Err(e) = handle_message_action(

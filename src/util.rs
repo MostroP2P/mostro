@@ -14,6 +14,7 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
+use mostro_core::message::CantDoReason;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -614,14 +615,11 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
 pub async fn send_cant_do_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
-    message: Option<String>,
+    reason: Option<CantDoReason>,
     destination_key: &PublicKey,
 ) {
-    // Prepare payload in case
-    let payload = message.map(Payload::TextMessage);
-
     // Send message to event creator
-    let message = Message::cant_do(order_id, request_id, payload);
+    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;

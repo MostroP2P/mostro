@@ -67,6 +67,11 @@ pub async fn order_action(
             amount_vec.push(max);
         }
 
+        if order.premium != 0 && order.amount !=0 && order.fiat_amount !=0 {
+            send_cant_do_msg(None, None, &event.sender).await;
+            return Ok(());
+        }
+
         for fiat_amount in amount_vec.iter() {
             let quote = match order.amount {
                 0 => match get_bitcoin_price(&order.fiat_code) {

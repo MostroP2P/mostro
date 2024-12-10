@@ -5,7 +5,7 @@ use crate::util::{
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -72,7 +72,7 @@ pub async fn take_sell_action(
                     send_cant_do_msg(
                         request_id,
                         Some(order.id),
-                        Some(e.to_string()),
+                        Some(CantDoReason::InvalidInvoice),
                         &event.sender,
                     )
                     .await;
@@ -101,6 +101,7 @@ pub async fn take_sell_action(
                 Action::NotAllowedByStatus,
                 None,
                 &buyer_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -117,6 +118,7 @@ pub async fn take_sell_action(
             Action::OutOfRangeFiatAmount,
             None,
             &event.sender,
+            None,
         )
         .await;
         return Ok(());
@@ -124,6 +126,7 @@ pub async fn take_sell_action(
 
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_u64() as i64;
 

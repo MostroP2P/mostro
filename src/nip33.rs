@@ -29,8 +29,10 @@ pub fn new_event(
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
     tags.extend(extra_tags);
+    let tags = Tags::new(tags);
 
-    EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content, tags)
+    EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
+        .tags(tags)
         .sign_with_keys(keys)
 }
 

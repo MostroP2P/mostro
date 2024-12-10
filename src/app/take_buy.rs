@@ -69,6 +69,7 @@ pub async fn take_buy_action(
                 Action::NotAllowedByStatus,
                 None,
                 &seller_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -85,6 +86,7 @@ pub async fn take_buy_action(
             Action::OutOfRangeFiatAmount,
             None,
             &event.sender,
+            None,
         )
         .await;
         return Ok(());
@@ -99,6 +101,8 @@ pub async fn take_buy_action(
         order.fee = fee;
     }
 
+    // Update trade index for seller
+    order.trade_index_seller = msg.get_inner_message_kind().trade_index;
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_u64() as i64;
 

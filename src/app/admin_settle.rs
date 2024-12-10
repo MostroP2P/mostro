@@ -33,6 +33,7 @@ pub async fn admin_settle_action(
     } else {
         return Err(Error::msg("No order id"));
     };
+    let inner_message = msg.get_inner_message_kind();
 
     match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
@@ -42,6 +43,7 @@ pub async fn admin_settle_action(
                 Action::IsNotYourDispute,
                 None,
                 &event.sender,
+                inner_message.trade_index,
             )
             .await;
             return Ok(());
@@ -64,8 +66,9 @@ pub async fn admin_settle_action(
     // Was orde cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(
-            msg.get_inner_message_kind().request_id,
             Some(order_id),
+            msg.get_inner_message_kind().request_id,
+            inner_message.trade_index,
             Action::CooperativeCancelAccepted,
             None,
         );
@@ -78,11 +81,12 @@ pub async fn admin_settle_action(
 
     if order.status != Status::Dispute.to_string() {
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            inner_message.request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
             &event.sender,
+            inner_message.trade_index,
         )
         .await;
         return Ok(());
@@ -140,8 +144,9 @@ pub async fn admin_settle_action(
     }
     // We create a Message for settle
     let message = Message::new_order(
-        request_id,
         Some(order_updated.id),
+        request_id,
+        inner_message.trade_index,
         Action::AdminSettled,
         None,
     );

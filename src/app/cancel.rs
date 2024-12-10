@@ -50,6 +50,7 @@ pub async fn cancel_action(
                 Action::IsNotYourOrder,
                 None,
                 &event.sender,
+                None,
             )
             .await;
         } else {
@@ -65,7 +66,7 @@ pub async fn cancel_action(
                 Action::Canceled,
                 None,
                 &event.sender,
-                None
+                None,
             )
             .await;
         }
@@ -133,7 +134,7 @@ pub async fn cancel_action(
                         Action::CooperativeCancelAccepted,
                         None,
                         &event.sender,
-                        None
+                        None,
                     )
                     .await;
                     let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
@@ -143,7 +144,7 @@ pub async fn cancel_action(
                         Action::CooperativeCancelAccepted,
                         None,
                         &counterparty_pubkey,
-                        None
+                        None,
                     )
                     .await;
                     info!("Cancel: Order Id {order_id} canceled cooperatively!");
@@ -160,7 +161,7 @@ pub async fn cancel_action(
                     Action::CooperativeCancelInitiatedByYou,
                     None,
                     &event.sender,
-                    None
+                    None,
                 )
                 .await;
                 let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
@@ -170,7 +171,7 @@ pub async fn cancel_action(
                     Action::CooperativeCancelInitiatedByPeer,
                     None,
                     &counterparty_pubkey,
-                    None
+                    None,
                 )
                 .await;
             }
@@ -217,10 +218,18 @@ pub async fn cancel_add_invoice(
             Action::Canceled,
             None,
             &event.sender,
-            None
+            None,
         )
         .await;
-        send_new_order_msg(None, Some(order.id), Action::Canceled, None, &seller_pubkey, None).await;
+        send_new_order_msg(
+            None,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &seller_pubkey,
+            None,
+        )
+        .await;
         Ok(())
     } else {
         // We re-publish the event with Pending status
@@ -280,10 +289,18 @@ pub async fn cancel_pay_hold_invoice(
             Action::Canceled,
             None,
             &event.sender,
-            None
+            None,
         )
         .await;
-        send_new_order_msg(None, Some(order.id), Action::Canceled, None, &seller_pubkey, None).await;
+        send_new_order_msg(
+            None,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &seller_pubkey,
+            None,
+        )
+        .await;
         Ok(())
     } else {
         // We re-publish the event with Pending status

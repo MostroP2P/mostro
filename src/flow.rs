@@ -66,6 +66,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             Action::BuyerTookOrder,
             Some(Payload::Order(order_data.clone())),
             &seller_pubkey,
+            None,
         )
         .await;
         // We send a message to buyer saying seller paid
@@ -75,6 +76,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             Action::HoldInvoicePaymentAccepted,
             Some(Payload::Order(order_data)),
             &buyer_pubkey,
+            None,
         )
         .await;
     } else {
@@ -91,6 +93,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             Action::AddInvoice,
             Some(Payload::Order(order_data)),
             &buyer_pubkey,
+            None,
         )
         .await;
 
@@ -101,6 +104,7 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             Action::WaitingBuyerInvoice,
             None,
             &seller_pubkey,
+            None,
         )
         .await;
     }

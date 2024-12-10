@@ -59,6 +59,7 @@ pub async fn order_action(
                     Action::InvalidSatsAmount,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Ok(());

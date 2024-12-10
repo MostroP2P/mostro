@@ -11,7 +11,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, Payload, Message};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -121,6 +121,7 @@ async fn get_valid_order(
                     Action::NotAllowedByStatus,
                     None,
                     &event.sender,
+                    None,
                 )
                 .await;
                 return Err(Error::msg(format!(
@@ -241,7 +242,7 @@ pub async fn dispute_action(
         Action::DisputeInitiatedByYou,
         Some(Payload::Dispute(dispute.clone().id, initiator_token)),
         &initiator_pubkey,
-        None
+        None,
     )
     .await;
 
@@ -259,7 +260,7 @@ pub async fn dispute_action(
         Action::DisputeInitiatedByPeer,
         Some(Payload::Dispute(dispute.clone().id, counterpart_token)),
         &counterpart_pubkey,
-        None
+        None,
     )
     .await;
 

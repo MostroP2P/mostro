@@ -31,15 +31,17 @@ pub async fn admin_cancel_action(
     } else {
         return Err(Error::msg("No order id"));
     };
+    let inner_message = msg.get_inner_message_kind();
 
     match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
-                msg.get_inner_message_kind().request_id,
+                inner_message.request_id,
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
                 &event.sender,
+                inner_message.trade_index,
             )
             .await;
             return Ok(());
@@ -62,8 +64,9 @@ pub async fn admin_cancel_action(
     // Was order cooperatively cancelled?
     if order.status == Status::CooperativelyCanceled.to_string() {
         let message = MessageKind::new(
-            request_id,
             Some(order_id),
+            request_id,
+            inner_message.trade_index,
             Action::CooperativeCancelAccepted,
             None,
         );
@@ -76,11 +79,12 @@ pub async fn admin_cancel_action(
 
     if order.status != Status::Dispute.to_string() {
         send_new_order_msg(
-            msg.get_inner_message_kind().request_id,
+            inner_message.request_id,
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
             &event.sender,
+            inner_message.trade_index,
         )
         .await;
         return Ok(());
@@ -135,7 +139,13 @@ pub async fn admin_cancel_action(
     let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order).await?;
     order_updated.update(pool).await?;
     // We create a Message for cancel
-    let message = Message::new_order(request_id, Some(order.id), Action::AdminCanceled, None);
+    let message = Message::new_order(
+        Some(order.id),
+        request_id,
+        inner_message.trade_index,
+        Action::AdminCanceled,
+        None,
+    );
     let message = message.as_json()?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();

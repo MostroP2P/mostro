@@ -14,14 +14,13 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
-use mostro_core::message::{Action, Payload, Message};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::fmt::Write;
-use std::path::is_separator;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
@@ -259,12 +258,12 @@ async fn prepare_new_order(
 pub async fn send_dm(
     receiver_pubkey: &PublicKey,
     sender_keys: Keys,
-    content: String,
+    payload: String,
 ) -> Result<()> {
-    let event = gift_wrap(&sender_keys, *receiver_pubkey, content.clone(), None)?;
+    let event = gift_wrap(&sender_keys, *receiver_pubkey, payload.clone(), None)?;
     info!(
-        "Sending DM, Event ID: {} with content: {:#?}",
-        event.id, content
+        "Sending DM, Event ID: {} with payload: {:#?}",
+        event.id, payload
     );
 
     if let Ok(client) = get_nostr_client() {
@@ -618,11 +617,11 @@ pub async fn send_cant_do_msg(
     message: Option<String>,
     destination_key: &PublicKey,
 ) {
-    // Prepare content in case
-    let content = message.map(Payload::TextMessage);
+    // Prepare payload in case
+    let payload = message.map(Payload::TextMessage);
 
     // Send message to event creator
-    let message = Message::cant_do(order_id, request_id, content, None);
+    let message = Message::cant_do(order_id, request_id, payload);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;
@@ -633,12 +632,12 @@ pub async fn send_new_order_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
     action: Action,
-    content: Option<Payload>,
+    payload: Option<Payload>,
     destination_key: &PublicKey,
     trade_index: Option<i64>,
 ) {
     // Send message to event creator
-    let message = Message::new_order(order_id, request_id, trade_index, action, content, None);
+    let message = Message::new_order(order_id, request_id, trade_index, action, payload);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
         let _ = send_dm(destination_key, sender_keys, message).await;
@@ -674,7 +673,7 @@ pub fn get_nostr_client() -> Result<&'static Client> {
 }
 
 /// Getter function with error management for nostr relays
-pub async fn get_nostr_relays() -> Option<HashMap<Url, Relay>> {
+pub async fn get_nostr_relays() -> Option<HashMap<RelayUrl, Relay>> {
     if let Some(client) = NOSTR_CLIENT.get() {
         Some(client.relays().await)
     } else {
@@ -753,9 +752,9 @@ mod tests {
         initialize();
         // Mock the send_dm function
         let receiver_pubkey = Keys::generate().public_key();
-        let content = "Test message".to_string();
+        let payload = "Test message".to_string();
         let sender_keys = Keys::generate();
-        let result = send_dm(&receiver_pubkey, sender_keys, content).await;
+        let result = send_dm(&receiver_pubkey, sender_keys, payload).await;
         assert!(result.is_ok());
     }
 
@@ -770,8 +769,9 @@ mod tests {
             ..Default::default()
         };
         let message = Message::Order(MessageKind::new(
-            Some(1),
             Some(uuid),
+            Some(1),
+            Some(1),
             Action::TakeSell,
             Some(Payload::Amount(order.amount)),
         ));

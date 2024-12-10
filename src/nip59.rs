@@ -1,4 +1,5 @@
 use base64::engine::{general_purpose, Engine};
+use mostro_core::message::Message;
 use nostr_sdk::event::builder::Error as BuilderError;
 use nostr_sdk::nostr::nips::nip44::v2::{decrypt_to_bytes, encrypt_to_bytes, ConversationKey};
 use nostr_sdk::prelude::*;
@@ -18,10 +19,17 @@ use nostr_sdk::prelude::*;
 pub fn gift_wrap(
     sender_keys: &Keys,
     receiver: PublicKey,
-    content: String,
+    payload: String,
     expiration: Option<Timestamp>,
 ) -> Result<Event, BuilderError> {
-    let rumor: UnsignedEvent = EventBuilder::text_note(content, []).build(sender_keys.public_key());
+    // We convert back the string to a message
+    let message = Message::from_json(&payload).unwrap();
+    // We sign the message
+    let sig = message.get_inner_message_kind().sign(sender_keys);
+    // We compose the content
+    let content = (message, sig);
+    let content = serde_json::to_string(&content).unwrap();
+    let rumor: UnsignedEvent = EventBuilder::text_note(content).build(sender_keys.public_key());
     let seal: Event = seal(sender_keys, &receiver, rumor)?.sign_with_keys(sender_keys)?;
 
     gift_wrap_from_seal(&receiver, &seal, expiration)
@@ -39,7 +47,7 @@ pub fn seal(
     // Encode with base64
     let b64decoded_content = general_purpose::STANDARD.encode(encrypted_content);
     // Compose builder
-    Ok(EventBuilder::new(Kind::Seal, b64decoded_content, [])
+    Ok(EventBuilder::new(Kind::Seal, b64decoded_content)
         .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK)))
 }
 
@@ -60,11 +68,16 @@ pub fn gift_wrap_from_seal(
     if let Some(timestamp) = expiration {
         tags.push(Tag::expiration(timestamp));
     }
+    let tags = Tags::new(tags);
     // Encode with base64
     let b64decoded_content = general_purpose::STANDARD.encode(encrypted_content);
-    EventBuilder::new(Kind::GiftWrap, b64decoded_content, tags)
+    let event = EventBuilder::new(Kind::GiftWrap, b64decoded_content)
+        .tags(tags)
         .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK))
-        .sign_with_keys(&ephemeral_keys)
+        .build(ephemeral_keys.public_key())
+        .sign_with_keys(&ephemeral_keys)?;
+
+    Ok(event)
 }
 
 pub fn unwrap_gift_wrap(keys: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, BuilderError> {

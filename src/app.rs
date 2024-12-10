@@ -58,10 +58,12 @@ async fn process_message(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: Messag
         match is_user_present(&pool, event.sender.to_string()).await {
             Ok(mut user) => {
                 if let (true, index) = message_kind.has_trade_index() {
+                    let (_, sig): (String, nostr_sdk::secp256k1::schnorr::Signature) =
+                        serde_json::from_str(&event.rumor.content).unwrap();
                     if index > user.trade_index
                         && msg
                             .get_inner_message_kind()
-                            .verify_signature(event.sender, event.rumor.content.)
+                            .verify_signature(event.sender, sig)
                     {
                         user.trade_index = index;
                         if let Ok(_) = user.update(&pool).await {

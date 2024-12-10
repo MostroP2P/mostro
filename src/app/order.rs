@@ -67,7 +67,7 @@ pub async fn order_action(
             amount_vec.push(max);
         }
 
-        if order.premium != 0 && order.amount !=0 && order.fiat_amount !=0 {
+        if order.premium != 0 && order.amount != 0 && order.fiat_amount != 0 {
             send_cant_do_msg(request_id, None, None, &event.sender).await;
             return Ok(());
         }

@@ -750,7 +750,15 @@ mod tests {
         initialize();
         // Mock the send_dm function
         let receiver_pubkey = Keys::generate().public_key();
-        let payload = "Test message".to_string();
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let message = Message::Order(MessageKind::new(
+            Some(uuid),
+            None,
+            None,
+            Action::FiatSent,
+            None,
+        ));
+        let payload = message.as_json().unwrap();
         let sender_keys = Keys::generate();
         let result = send_dm(&receiver_pubkey, sender_keys, payload).await;
         assert!(result.is_ok());

@@ -206,35 +206,32 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
-                    // Parse and process the message
-                    let message = Message::from_json(&event.rumor.content);
+                    let (message, sig): (Message, Signature) =
+                        serde_json::from_str(&event.rumor.content).unwrap();
+                    let inner_message = message.get_inner_message_kind();
+                    if !inner_message.verify_signature(event.rumor.pubkey, sig) {
+                        tracing::warn!("Error in event verification");
+                        continue;
+                    }
 
-                    match message {
-                        Ok(msg) => {
-                            let message_kind = msg.get_inner_message_kind();
-                            // Check if message is message with trade index
-                            check_trade_index(&pool, &event, &msg).await;
+                    // Check if message is message with trade index
+                    check_trade_index(&pool, &event, &message).await;
 
-                            if message_kind.verify() {
-                                if let Some(action) = msg.inner_action() {
-                                    if let Err(e) = handle_message_action(
-                                        &action,
-                                        msg,
-                                        &event,
-                                        &my_keys,
-                                        &pool,
-                                        ln_client,
-                                        rate_list.clone(),
-                                    )
-                                    .await
-                                    {
-                                        warning_msg(&action, e)
-                                    }
-                                }
+                    if inner_message.verify() {
+                        if let Some(action) = message.inner_action() {
+                            if let Err(e) = handle_message_action(
+                                &action,
+                                message,
+                                &event,
+                                &my_keys,
+                                &pool,
+                                ln_client,
+                                rate_list.clone(),
+                            )
+                            .await
+                            {
+                                warning_msg(&action, e)
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse event message from JSON: {:?}", e)
                         }
                     }
                 }

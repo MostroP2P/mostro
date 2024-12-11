@@ -36,5 +36,6 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_attempts integer default 0,
   failed_payment integer default 0,
   expires_at integer not null,
-  trade_index integer default 0
+  trade_index_seller integer default 0,
+  trade_index_buyer integer default 0
 );

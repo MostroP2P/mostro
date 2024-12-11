@@ -301,6 +301,7 @@ pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyho
           SELECT *
           FROM users
           WHERE pubkey == ?1 AND  is_solver == true
+          LIMIT 1
         "#,
     )
     .bind(solver_npub)
@@ -315,7 +316,7 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::R
         r#"
             SELECT *
             FROM users
-            WHERE i0_pubkey == ?1
+            WHERE pubkey == ?1
             LIMIT 1
         "#,
     )

@@ -67,6 +67,15 @@ pub async fn order_action(
             amount_vec.push(max);
         }
 
+        let premium = (order.premium != 0).then_some(order.premium);
+        let amount = (order.amount != 0).then_some(order.amount);
+        let fiat_amount = (order.fiat_amount != 0).then_some(order.fiat_amount);
+
+        if premium.is_some() && amount.is_some() && fiat_amount.is_some() {
+            send_cant_do_msg(request_id, None, None, &event.sender).await;
+            return Ok(());
+        }
+
         for fiat_amount in amount_vec.iter() {
             let quote = match order.amount {
                 0 => match get_bitcoin_price(&order.fiat_code) {

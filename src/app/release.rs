@@ -115,7 +115,7 @@ pub async fn release_action(
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 

@@ -74,7 +74,7 @@ pub async fn admin_take_dispute_action(
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
         if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(request_id, Some(dispute_id), None, &event.sender).await;
+            send_cant_do_msg(request_id, Some(dispute_id), None, &event.rumor.pubkey).await;
             return Ok(());
         }
     } else {

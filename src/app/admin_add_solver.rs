@@ -35,7 +35,7 @@ pub async fn admin_add_solver_action(
     // Check if the pubkey is Mostro
     if event.sender.to_string() != my_keys.public_key().to_string() {
         // We create a Message
-        send_cant_do_msg(request_id, None, None, &event.sender).await;
+        send_cant_do_msg(request_id, None, None, &event.rumor.pubkey).await;
         return Ok(());
     }
     let trade_index = inner_message.trade_index.unwrap_or(0);

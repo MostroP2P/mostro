@@ -79,7 +79,7 @@ pub async fn update_user_reputation_action(
     let message_sender = event.sender.to_string();
 
     if order.status != Status::Success.to_string() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         error!("Order Id {order_id} wrong status");
         return Ok(());
     }
@@ -100,7 +100,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     };
 

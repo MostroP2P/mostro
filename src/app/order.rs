@@ -33,7 +33,7 @@ pub async fn order_action(
                         order.id,
                         Action::IncorrectInvoiceAmount,
                         None,
-                        &event.sender,
+                        &event.rumor.pubkey,
                         None,
                     )
                     .await;
@@ -49,7 +49,7 @@ pub async fn order_action(
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
             if min >= max {
-                send_cant_do_msg(request_id, order.id, None, &event.sender).await;
+                send_cant_do_msg(request_id, order.id, None, &event.rumor.pubkey).await;
                 return Ok(());
             }
             if order.amount != 0 {
@@ -58,7 +58,7 @@ pub async fn order_action(
                     None,
                     Action::InvalidSatsAmount,
                     None,
-                    &event.sender,
+                    &event.rumor.pubkey,
                     None,
                 )
                 .await;
@@ -91,7 +91,7 @@ pub async fn order_action(
                     None,
                     Action::InvalidSatsAmount,
                     None,
-                    &event.sender,
+                    &event.rumor.pubkey,
                     None,
                 )
                 .await;
@@ -106,7 +106,7 @@ pub async fn order_action(
                     None,
                     Action::OutOfRangeSatsAmount,
                     None,
-                    &event.sender,
+                    &event.rumor.pubkey,
                     None,
                 )
                 .await;
@@ -119,7 +119,7 @@ pub async fn order_action(
             my_keys,
             order,
             &event.sender.to_string(),
-            event.sender,
+            event.rumor.pubkey,
             request_id,
             msg.get_inner_message_kind().trade_index,
         )

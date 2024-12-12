@@ -38,7 +38,7 @@ pub async fn take_buy_action(
 
     // Maker can't take own order
     if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.sender.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 

@@ -110,7 +110,7 @@ pub async fn cancel_action(
             Some(ref initiator_pubkey) => {
                 if initiator_pubkey == &user_pubkey {
                     // We create a Message
-                    send_cant_do_msg(request_id, Some(order_id), None, &event.sender).await;
+                    send_cant_do_msg(request_id, Some(order_id), None, &event.rumor.pubkey).await;
                     return Ok(());
                 } else {
                     if let Some(hash) = &order.hash {
@@ -203,7 +203,7 @@ pub async fn cancel_add_invoice(
 
     if buyer_pubkey != &user_pubkey {
         // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 
@@ -274,7 +274,7 @@ pub async fn cancel_pay_hold_invoice(
 
     if seller_pubkey.to_string() != user_pubkey {
         // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 

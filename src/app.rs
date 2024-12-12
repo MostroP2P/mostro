@@ -71,14 +71,14 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
         match is_user_present(pool, event.sender.to_string()).await {
             Ok(mut user) => {
                 if let (true, index) = message_kind.has_trade_index() {
-                    let (_, sig): (String, nostr_sdk::secp256k1::schnorr::Signature) =
+                    let (_, sig): (Message, nostr_sdk::secp256k1::schnorr::Signature) =
                         serde_json::from_str(&event.rumor.content).unwrap();
-                    if index > user.trade_index
+                    if index > user.last_trade_index
                         && msg
                             .get_inner_message_kind()
                             .verify_signature(event.sender, sig)
                     {
-                        user.trade_index = index;
+                        user.last_trade_index = index;
                         if user.update(pool).await.is_ok() {
                             tracing::info!("Update user trade index");
                         }
@@ -88,17 +88,17 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                             None,
                             msg.get_inner_message_kind().id,
                             Some(CantDoReason::InvalidTradeIndex),
-                            &event.sender,
+                            &event.rumor.pubkey,
                         )
                         .await;
                     }
                 }
             }
             Err(_) => {
-                if let (true, trade_index) = message_kind.has_trade_index() {
+                if let (true, last_trade_index) = message_kind.has_trade_index() {
                     let new_user = User {
                         pubkey: event.sender.to_string(),
-                        trade_index,
+                        last_trade_index,
                         ..Default::default()
                     };
                     if new_user.create(pool).await.is_ok() {

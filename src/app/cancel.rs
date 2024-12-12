@@ -40,6 +40,21 @@ pub async fn cancel_action(
         }
     };
 
+    if order.status == Status::Canceled.to_string()
+        || order.status == Status::CooperativelyCanceled.to_string()
+        || order.status == Status::CanceledByAdmin.to_string()
+    {
+        error!("Order {} is already canceled", order_id);
+        send_cant_do_msg(
+            request_id,
+            Some(order_id),
+            Some("Order already canceled".to_string()),
+            &event.sender,
+        )
+        .await;
+        return Ok(());
+    }
+
     if order.status == Status::Pending.to_string() {
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
@@ -73,8 +88,7 @@ pub async fn cancel_action(
     }
 
     if order.kind == OrderKind::Sell.to_string()
-        && (order.status == Status::WaitingBuyerInvoice.to_string()
-            || order.status == Status::WaitingBuyerInvoice.to_string())
+        && (order.status == Status::WaitingBuyerInvoice.to_string())
     {
         cancel_add_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
     }

@@ -268,7 +268,9 @@ pub async fn send_dm(
     );
 
     if let Ok(client) = get_nostr_client() {
-        let _ = client.send_event(event).await;
+        if let Err(e) = client.send_event(event).await {
+            error!("Failed to send event: {}", e);
+        }
     }
 
     Ok(())

@@ -121,6 +121,12 @@ pub async fn update_user_reputation_action(
     let rating;
 
     if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
+        if !(MIN_RATING..=MAX_RATING).contains(&v) {
+            return Err(Error::msg(format!(
+                "Rating must be between {} and {}",
+                MIN_RATING, MAX_RATING
+            )));
+        }
         rating = v;
     } else {
         return Err(Error::msg("No rating present"));

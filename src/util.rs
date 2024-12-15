@@ -162,12 +162,12 @@ pub async fn publish_order(
     keys: &Keys,
     new_order: &SmallOrder,
     initiator_pubkey: &str,
-    ack_pubkey: PublicKey,
+    trade_pubkey: PublicKey,
     request_id: Option<u64>,
     trade_index: Option<i64>,
 ) -> Result<()> {
     // Prepare a new default order
-    let new_order_db = prepare_new_order(new_order, initiator_pubkey, trade_index).await?;
+    let new_order_db = prepare_new_order(new_order, initiator_pubkey, trade_index, trade_pubkey).await?;
 
     // CRUD order creation
     let mut order = new_order_db.clone().create(pool).await?;
@@ -194,7 +194,7 @@ pub async fn publish_order(
         Some(order_id),
         Action::NewOrder,
         Some(Payload::Order(order)),
-        &ack_pubkey,
+        &trade_pubkey,
         trade_index,
     )
     .await;
@@ -212,6 +212,7 @@ async fn prepare_new_order(
     new_order: &SmallOrder,
     initiator_pubkey: &str,
     trade_index: Option<i64>,
+    trade_pubkey: PublicKey,
 ) -> Result<Order> {
     let mut fee = 0;
     if new_order.amount > 0 {
@@ -243,10 +244,10 @@ async fn prepare_new_order(
 
     if new_order.kind == Some(OrderKind::Buy) {
         new_order_db.kind = OrderKind::Buy.to_string();
-        new_order_db.buyer_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
         new_order_db.trade_index_buyer = trade_index;
     } else {
-        new_order_db.seller_pubkey = Some(initiator_pubkey.to_string());
+        new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
         new_order_db.trade_index_seller = trade_index;
     }
 
@@ -261,6 +262,9 @@ pub async fn send_dm(
     sender_keys: Keys,
     payload: String,
 ) -> Result<()> {
+
+    info!("sender key {} - receiver key {}", sender_keys.public_key().to_hex(), receiver_pubkey.to_hex());
+
     let event = gift_wrap(&sender_keys, *receiver_pubkey, payload.clone(), None)?;
     info!(
         "Sending DM, Event ID: {} with payload: {:#?}",

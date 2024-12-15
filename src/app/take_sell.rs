@@ -47,7 +47,8 @@ pub async fn take_sell_action(
         return Ok(());
     }
 
-    let buyer_pubkey = event.sender;
+    // Get trade pubkey of the buyer
+    let buyer_trade_pubkey = event.rumor.pubkey;
 
     let seller_pubkey = match &order.seller_pubkey {
         Some(seller) => PublicKey::from_str(seller.as_str())?,
@@ -100,7 +101,7 @@ pub async fn take_sell_action(
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
-                &buyer_pubkey,
+                &buyer_trade_pubkey,
                 None,
             )
             .await;
@@ -125,7 +126,7 @@ pub async fn take_sell_action(
     }
 
     // Add buyer pubkey to order
-    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.buyer_pubkey = Some(buyer_trade_pubkey.to_string());
     order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_u64() as i64;
@@ -140,7 +141,7 @@ pub async fn take_sell_action(
     }
 
     if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, request_id).await {
+        match set_waiting_invoice_status(&mut order, buyer_trade_pubkey, request_id).await {
             Ok(_) => {
                 // Update order status
                 if let Ok(order_updated) =
@@ -159,7 +160,7 @@ pub async fn take_sell_action(
         show_hold_invoice(
             my_keys,
             pr,
-            &buyer_pubkey,
+            &buyer_trade_pubkey,
             &seller_pubkey,
             order,
             request_id,

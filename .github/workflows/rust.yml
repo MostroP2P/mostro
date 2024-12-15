@@ -11,6 +11,7 @@ env:
   SQLX_OFFLINE: true
   MIN_PAYMENT_AMT: 100
   INVOICE_EXPIRATION_WINDOW: 3600
+  DATABASE_URL: sqlite://./mostro.db
 
 jobs:
   tests:

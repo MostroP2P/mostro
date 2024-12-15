@@ -167,7 +167,13 @@ pub async fn publish_order(
     trade_index: Option<i64>,
 ) -> Result<()> {
     // Prepare a new default order
-    let new_order_db = prepare_new_order(new_order, initiator_pubkey, trade_index, trade_pubkey).await?;
+    let new_order_db =
+        match prepare_new_order(new_order, initiator_pubkey, trade_index, trade_pubkey).await {
+            Some(order) => order,
+            None => {
+                return Ok(());
+            }
+        };
 
     // CRUD order creation
     let mut order = new_order_db.clone().create(pool).await?;
@@ -213,7 +219,7 @@ async fn prepare_new_order(
     initiator_pubkey: &str,
     trade_index: Option<i64>,
     trade_pubkey: PublicKey,
-) -> Result<Order> {
+) -> Option<Order> {
     let mut fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
@@ -242,19 +248,32 @@ async fn prepare_new_order(
         ..Default::default()
     };
 
-    if new_order.kind == Some(OrderKind::Buy) {
-        new_order_db.kind = OrderKind::Buy.to_string();
-        new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
-        new_order_db.trade_index_buyer = trade_index;
-    } else {
-        new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
-        new_order_db.trade_index_seller = trade_index;
+    match new_order.kind {
+        Some(OrderKind::Buy) => {
+            new_order_db.kind = OrderKind::Buy.to_string();
+            new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
+            new_order_db.trade_index_buyer = trade_index;
+        }
+        Some(OrderKind::Sell) => {
+            new_order_db.kind = OrderKind::Sell.to_string();
+            new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
+            new_order_db.trade_index_seller = trade_index;
+        }
+        None => {
+            send_cant_do_msg(
+                None,
+                None,
+                Some(CantDoReason::InvalidOrderKind),
+                &trade_pubkey,
+            )
+            .await;
+            return None;
+        }
     }
 
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
-
-    Ok(new_order_db)
+    Some(new_order_db)
 }
 
 pub async fn send_dm(
@@ -262,8 +281,11 @@ pub async fn send_dm(
     sender_keys: Keys,
     payload: String,
 ) -> Result<()> {
-
-    info!("sender key {} - receiver key {}", sender_keys.public_key().to_hex(), receiver_pubkey.to_hex());
+    info!(
+        "sender key {} - receiver key {}",
+        sender_keys.public_key().to_hex(),
+        receiver_pubkey.to_hex()
+    );
 
     let event = gift_wrap(&sender_keys, *receiver_pubkey, payload.clone(), None)?;
     info!(

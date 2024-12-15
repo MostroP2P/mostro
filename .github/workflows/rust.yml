@@ -19,8 +19,18 @@ jobs:
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
-    
+
       - uses: actions/checkout@v3
+      - name: Install sqlx
+        run: cargo install sqlx-cli --version 0.6.2
+      - name: Init DB
+        run: sqlx database create
+      - name: Run migrations
+        run: sqlx migrate run
+      - name: Prepare offline file
+        run: cargo sqlx prepare
+      - name: Check offline file
+        run: cargo prepare --check
 
       - name: Run tests
         run: cargo test --verbose

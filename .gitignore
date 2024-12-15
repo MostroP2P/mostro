@@ -2,6 +2,7 @@
 .env
 mostro.db*
 mostro.log
+sqlx-data.json
 
 # IDE's
 .idea

@@ -17,21 +17,56 @@ jobs:
   tests:
     runs-on: ubuntu-latest
 
+    permissions:
+      # Give the default GITHUB_TOKEN write permission to commit and push the
+      # added or changed files to the repository.
+      contents: write
+    
+  
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+       
+      - name: Select branch PR
+        if: ${{ github.ref != 'refs/heads/main' }}
+        uses: actions/checkout@v4        
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+        
+      - name: Select branch main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/checkout@v4        
+        with:
+          ref: main
 
-      - uses: actions/checkout@v3
       - name: Install sqlx
         run: cargo install sqlx-cli --version 0.6.2
       - name: Init DB
-        run: sqlx database create
+        run: |  
+          sqlx database create || exit 1  
+          # Verify database creation  
+          test -f "./mostro.db" || { echo "Database file not created"; exit 1; }
+
       - name: Run migrations
-        run: sqlx migrate run
+        run: |  
+          sqlx migrate run || exit 1 
+          # Verify migrations  
+          sqlx migrate info || exit 1
       - name: Prepare offline file
         run: cargo sqlx prepare
       - name: Check offline file
-        run: cargo prepare --check
+        run: cargo sqlx prepare --check
+
+      - name: Commit mostro.db and sqlx-data.json
+        uses: EndBug/add-and-commit@v9
+        with:
+          default_author: github_actions
+          message: 'chore(db): Update mostro.db and sqlx-data.json [skip ci]'
+          committer_name: GitHub Actions
+          committer_email: actions@github.com
+          add: |
+            - mostro.db --force
+            - sqlx-data.json --force
 
       - name: Run tests
         run: cargo test --verbose

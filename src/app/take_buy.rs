@@ -58,7 +58,7 @@ pub async fn take_buy_action(
     };
 
     // We update the pubkey
-    let seller_pubkey = event.sender;
+    let seller_pubkey = event.rumor.pubkey;
     // Seller can take pending orders only
     match order_status {
         Status::Pending => {}

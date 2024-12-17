@@ -16,6 +16,7 @@ pub enum MostroError {
     LnAddressWrongAmount,
     LnPaymentError(String),
     LnNodeError(String),
+    InvalidOrderKind,
 }
 
 impl std::error::Error for MostroError {}
@@ -37,6 +38,7 @@ impl fmt::Display for MostroError {
             MostroError::LnAddressParseError  => write!(f, "Ln address parsing error - please check your address"),
             MostroError::LnPaymentError(e) => write!(f, "Lightning payment failure cause: {}",e),
             MostroError::LnNodeError(e) => write!(f, "Lightning node connection failure caused by: {}",e),
+            MostroError::InvalidOrderKind => write!(f, "Invalid order kind"),
         }
     }
 }

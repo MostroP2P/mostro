@@ -301,9 +301,26 @@ pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyho
           SELECT *
           FROM users
           WHERE pubkey == ?1 AND  is_solver == true
+          LIMIT 1
         "#,
     )
     .bind(solver_npub)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
+pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            SELECT *
+            FROM users
+            WHERE pubkey == ?1
+            LIMIT 1
+        "#,
+    )
+    .bind(public_key)
     .fetch_one(pool)
     .await?;
 

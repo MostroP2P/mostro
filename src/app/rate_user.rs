@@ -2,7 +2,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -76,10 +76,10 @@ pub async fn update_user_reputation_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.sender.to_string();
+    let message_sender = event.rumor.pubkey.to_string();
 
     if order.status != Status::Success.to_string() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         error!("Order Id {order_id} wrong status");
         return Ok(());
     }
@@ -100,7 +100,7 @@ pub async fn update_user_reputation_action(
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     };
 
@@ -120,7 +120,13 @@ pub async fn update_user_reputation_action(
     // Check if content of Peer is the same of counterpart
     let rating;
 
-    if let Some(Content::RatingUser(v)) = msg.get_inner_message_kind().content.to_owned() {
+    if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
+        if !(MIN_RATING..=MAX_RATING).contains(&v) {
+            return Err(Error::msg(format!(
+                "Rating must be between {} and {}",
+                MIN_RATING, MAX_RATING
+            )));
+        }
         rating = v;
     } else {
         return Err(Error::msg("No rating present"));
@@ -171,8 +177,9 @@ pub async fn update_user_reputation_action(
             msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::RateReceived,
-            Some(Content::RatingUser(rating)),
-            &event.sender,
+            Some(Payload::RatingUser(rating)),
+            &event.rumor.pubkey,
+            None,
         )
         .await;
     }

@@ -1,7 +1,7 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Content, Message, Peer};
+use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -38,14 +38,15 @@ pub async fn fiat_sent_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
+            None,
         )
         .await;
         return Ok(());
     }
     // Check if the pubkey is the buyer
-    if Some(event.sender.to_string()) != order.buyer_pubkey {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+    if Some(event.rumor.pubkey.to_string()) != order.buyer_pubkey {
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 
@@ -62,15 +63,16 @@ pub async fn fiat_sent_action(
             return Ok(());
         }
     };
-    let peer = Peer::new(event.sender.to_string());
+    let peer = Peer::new(event.rumor.pubkey.to_string());
 
     // We a message to the seller
     send_new_order_msg(
         None,
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer)),
+        Some(Payload::Peer(peer)),
         &seller_pubkey,
+        None,
     )
     .await;
     // We send a message to buyer to wait
@@ -80,8 +82,9 @@ pub async fn fiat_sent_action(
         msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::FiatSentOk,
-        Some(Content::Peer(peer)),
-        &event.sender,
+        Some(Payload::Peer(peer)),
+        &event.rumor.pubkey,
+        None,
     )
     .await;
 

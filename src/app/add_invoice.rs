@@ -3,7 +3,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, updat
 
 use anyhow::{Error, Result};
 
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, CantDoReason, Message, Payload};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -57,8 +57,14 @@ pub async fn add_invoice_action(
         }
     };
     // Only the buyer can add an invoice
-    if buyer_pubkey != event.sender {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+    if buyer_pubkey != event.rumor.pubkey {
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -82,7 +88,8 @@ pub async fn add_invoice_action(
                         Some(order.id),
                         Action::IncorrectInvoiceAmount,
                         None,
-                        &event.sender,
+                        &event.rumor.pubkey,
+                        None,
                     )
                     .await;
                     return Ok(());
@@ -107,6 +114,7 @@ pub async fn add_invoice_action(
                 Action::InvoiceUpdated,
                 None,
                 &buyer_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -117,7 +125,8 @@ pub async fn add_invoice_action(
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
-                &event.sender,
+                &event.rumor.pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -161,8 +170,9 @@ pub async fn add_invoice_action(
             None,
             Some(order.id),
             Action::BuyerTookOrder,
-            Some(Content::Order(order_data.clone())),
+            Some(Payload::Order(order_data.clone())),
             &seller_pubkey,
+            None,
         )
         .await;
         // We send a message to buyer saying seller paid
@@ -170,8 +180,9 @@ pub async fn add_invoice_action(
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Content::Order(order_data)),
+            Some(Payload::Order(order_data)),
             &buyer_pubkey,
+            None,
         )
         .await;
     } else {

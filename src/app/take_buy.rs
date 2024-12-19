@@ -37,8 +37,8 @@ pub async fn take_buy_action(
     };
 
     // Maker can't take own order
-    if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.sender.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+    if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.rumor.pubkey.to_hex() {
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 
@@ -58,7 +58,7 @@ pub async fn take_buy_action(
     };
 
     // We update the pubkey
-    let seller_pubkey = event.sender;
+    let seller_pubkey = event.rumor.pubkey;
     // Seller can take pending orders only
     match order_status {
         Status::Pending => {}
@@ -69,6 +69,7 @@ pub async fn take_buy_action(
                 Action::NotAllowedByStatus,
                 None,
                 &seller_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -84,7 +85,8 @@ pub async fn take_buy_action(
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
+            None,
         )
         .await;
         return Ok(());
@@ -99,6 +101,8 @@ pub async fn take_buy_action(
         order.fee = fee;
     }
 
+    // Update trade index for seller
+    order.trade_index_seller = msg.get_inner_message_kind().trade_index;
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_u64() as i64;
 

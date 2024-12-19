@@ -5,7 +5,7 @@ use crate::util::{
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -38,8 +38,8 @@ pub async fn take_sell_action(
     };
 
     // Maker can't take own order
-    if order.creator_pubkey == event.sender.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+    if order.creator_pubkey == event.rumor.pubkey.to_hex() {
+        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
 
@@ -47,7 +47,8 @@ pub async fn take_sell_action(
         return Ok(());
     }
 
-    let buyer_pubkey = event.sender;
+    // Get trade pubkey of the buyer
+    let buyer_trade_pubkey = event.rumor.pubkey;
 
     let seller_pubkey = match &order.seller_pubkey {
         Some(seller) => PublicKey::from_str(seller.as_str())?,
@@ -72,8 +73,8 @@ pub async fn take_sell_action(
                     send_cant_do_msg(
                         request_id,
                         Some(order.id),
-                        Some(e.to_string()),
-                        &event.sender,
+                        Some(CantDoReason::InvalidInvoice),
+                        &event.rumor.pubkey,
                     )
                     .await;
                     error!("{e}");
@@ -100,7 +101,8 @@ pub async fn take_sell_action(
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
-                &buyer_pubkey,
+                &buyer_trade_pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -116,14 +118,16 @@ pub async fn take_sell_action(
             Some(order.id),
             Action::OutOfRangeFiatAmount,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
+            None,
         )
         .await;
         return Ok(());
     }
 
     // Add buyer pubkey to order
-    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.buyer_pubkey = Some(buyer_trade_pubkey.to_string());
+    order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
     // Timestamp take order time
     order.taken_at = Timestamp::now().as_u64() as i64;
 
@@ -137,7 +141,7 @@ pub async fn take_sell_action(
     }
 
     if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_pubkey, request_id).await {
+        match set_waiting_invoice_status(&mut order, buyer_trade_pubkey, request_id).await {
             Ok(_) => {
                 // Update order status
                 if let Ok(order_updated) =
@@ -156,7 +160,7 @@ pub async fn take_sell_action(
         show_hold_invoice(
             my_keys,
             pr,
-            &buyer_pubkey,
+            &buyer_trade_pubkey,
             &seller_pubkey,
             order,
             request_id,

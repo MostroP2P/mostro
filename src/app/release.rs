@@ -11,7 +11,7 @@ use crate::NOSTR_CLIENT;
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -115,7 +115,13 @@ pub async fn release_action(
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -358,8 +364,20 @@ async fn payment_success(
                         Ordering::Less => {}
                     }
                 } else {
-                    send_cant_do_msg(None, Some(order.id), None, buyer_pubkey).await;
-                    send_cant_do_msg(request_id, Some(order.id), None, seller_pubkey).await;
+                    send_cant_do_msg(
+                        None,
+                        Some(order.id),
+                        Some(CantDoReason::InvalidAmount),
+                        buyer_pubkey,
+                    )
+                    .await;
+                    send_cant_do_msg(
+                        request_id,
+                        Some(order.id),
+                        Some(CantDoReason::InvalidAmount),
+                        seller_pubkey,
+                    )
+                    .await;
                 }
             }
         }

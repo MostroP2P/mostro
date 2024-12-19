@@ -617,8 +617,16 @@ pub async fn settle_seller_hold_invoice(
     request_id: Option<u64>,
 ) -> Result<()> {
     // Check if the pubkey is right
-    if !is_admin && event.sender.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+    if !is_admin
+        && event.rumor.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string()
+    {
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Err(Error::msg("Not allowed"));
     }
 
@@ -627,7 +635,13 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidInvoice),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Err(Error::msg("No preimage"));
     }
     Ok(())

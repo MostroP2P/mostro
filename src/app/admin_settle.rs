@@ -35,14 +35,14 @@ pub async fn admin_settle_action(
     };
     let inner_message = msg.get_inner_message_kind();
 
-    match is_assigned_solver(pool, &event.sender.to_string(), order_id).await {
+    match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order_id).await {
         Ok(false) => {
             send_new_order_msg(
                 msg.get_inner_message_kind().request_id,
                 Some(order_id),
                 Action::IsNotYourDispute,
                 None,
-                &event.sender,
+                &event.rumor.pubkey,
                 inner_message.trade_index,
             )
             .await;
@@ -74,7 +74,7 @@ pub async fn admin_settle_action(
         );
         if let Ok(message) = message.as_json() {
             let sender_keys = crate::util::get_keys().unwrap();
-            let _ = send_dm(&event.sender, sender_keys, message).await;
+            let _ = send_dm(&event.rumor.pubkey, sender_keys, message).await;
         }
         return Ok(());
     }
@@ -85,7 +85,7 @@ pub async fn admin_settle_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
             inner_message.trade_index,
         )
         .await;
@@ -153,7 +153,7 @@ pub async fn admin_settle_action(
     let message = message.as_json()?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.sender, sender_keys.clone(), message.clone()).await?;
+    send_dm(&event.rumor.pubkey, sender_keys.clone(), message.clone()).await?;
     if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
         send_dm(
             &PublicKey::from_str(seller_pubkey)?,

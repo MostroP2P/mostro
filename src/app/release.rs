@@ -90,7 +90,7 @@ pub async fn release_action(
             return Ok(());
         }
     };
-    let seller_pubkey = event.sender;
+    let seller_pubkey = event.rumor.pubkey;
 
     let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
         current_status
@@ -107,7 +107,7 @@ pub async fn release_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
             None,
         )
         .await;

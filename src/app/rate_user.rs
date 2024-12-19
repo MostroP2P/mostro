@@ -76,7 +76,7 @@ pub async fn update_user_reputation_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.sender.to_string();
+    let message_sender = event.rumor.pubkey.to_string();
 
     if order.status != Status::Success.to_string() {
         send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
@@ -178,7 +178,7 @@ pub async fn update_user_reputation_action(
             Some(order.id),
             Action::RateReceived,
             Some(Payload::RatingUser(rating)),
-            &event.sender,
+            &event.rumor.pubkey,
             None,
         )
         .await;

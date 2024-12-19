@@ -38,14 +38,14 @@ pub async fn fiat_sent_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
             None,
         )
         .await;
         return Ok(());
     }
     // Check if the pubkey is the buyer
-    if Some(event.sender.to_string()) != order.buyer_pubkey {
+    if Some(event.rumor.pubkey.to_string()) != order.buyer_pubkey {
         send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
     }
@@ -63,7 +63,7 @@ pub async fn fiat_sent_action(
             return Ok(());
         }
     };
-    let peer = Peer::new(event.sender.to_string());
+    let peer = Peer::new(event.rumor.pubkey.to_string());
 
     // We a message to the seller
     send_new_order_msg(
@@ -83,7 +83,7 @@ pub async fn fiat_sent_action(
         Some(order.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
-        &event.sender,
+        &event.rumor.pubkey,
         None,
     )
     .await;

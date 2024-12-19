@@ -118,7 +118,7 @@ pub async fn order_action(
             pool,
             my_keys,
             order,
-            &event.sender.to_string(),
+            &event.rumor.pubkey.to_string(),
             event.rumor.pubkey,
             request_id,
             msg.get_inner_message_kind().trade_index,

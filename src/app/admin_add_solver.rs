@@ -33,7 +33,7 @@ pub async fn admin_add_solver_action(
     };
 
     // Check if the pubkey is Mostro
-    if event.sender.to_string() != my_keys.public_key().to_string() {
+    if event.rumor.pubkey.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         send_cant_do_msg(request_id, None, None, &event.rumor.pubkey).await;
         return Ok(());
@@ -51,7 +51,7 @@ pub async fn admin_add_solver_action(
     let message = message.as_json()?;
     // Send the message
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.sender, sender_keys, message).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message).await?;
 
     Ok(())
 }

@@ -383,8 +383,8 @@ pub async fn connect_nostr() -> Result<Client> {
     let nostr_settings = Settings::get_nostr();
 
     let mut limits = RelayLimits::default();
-    limits.messages.max_size = Some(3_000);
-    limits.events.max_size = Some(3_500);
+    limits.messages.max_size = Some(6_000);
+    limits.events.max_size = Some(6_500);
     let opts = Options::new().relay_limits(limits);
 
     // Create new client

@@ -120,7 +120,7 @@ async fn get_valid_order(
                     Some(order.id),
                     Action::NotAllowedByStatus,
                     None,
-                    &event.sender,
+                    &event.rumor.pubkey,
                     None,
                 )
                 .await;
@@ -179,7 +179,7 @@ pub async fn dispute_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.sender.to_string();
+    let message_sender = event.rumor.pubkey.to_string();
     let (counterpart, is_buyer_dispute) =
         match get_counterpart_info(&message_sender, &buyer, &seller) {
             Ok((counterpart, is_buyer_dispute)) => (counterpart, is_buyer_dispute),

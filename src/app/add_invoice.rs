@@ -3,7 +3,7 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, updat
 
 use anyhow::{Error, Result};
 
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::message::{Action, CantDoReason, Message, Payload};
 use mostro_core::order::SmallOrder;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -57,8 +57,14 @@ pub async fn add_invoice_action(
         }
     };
     // Only the buyer can add an invoice
-    if buyer_pubkey != event.sender {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+    if buyer_pubkey != event.rumor.pubkey {
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -82,7 +88,7 @@ pub async fn add_invoice_action(
                         Some(order.id),
                         Action::IncorrectInvoiceAmount,
                         None,
-                        &event.sender,
+                        &event.rumor.pubkey,
                         None,
                     )
                     .await;
@@ -119,7 +125,7 @@ pub async fn add_invoice_action(
                 Some(order.id),
                 Action::NotAllowedByStatus,
                 None,
-                &event.sender,
+                &event.rumor.pubkey,
                 None,
             )
             .await;

@@ -11,7 +11,7 @@ use crate::NOSTR_CLIENT;
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -50,6 +50,7 @@ pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Re
         Action::PaymentFailed,
         None,
         &buyer_pubkey,
+        None,
     )
     .await;
 
@@ -89,7 +90,7 @@ pub async fn release_action(
             return Ok(());
         }
     };
-    let seller_pubkey = event.sender;
+    let seller_pubkey = event.rumor.pubkey;
 
     let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
         current_status
@@ -106,14 +107,21 @@ pub async fn release_action(
             Some(order.id),
             Action::NotAllowedByStatus,
             None,
-            &event.sender,
+            &event.rumor.pubkey,
+            None,
         )
         .await;
         return Ok(());
     }
 
     if &seller_pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 
@@ -137,6 +145,7 @@ pub async fn release_action(
         Action::HoldInvoicePaymentSettled,
         None,
         &seller_pubkey,
+        None,
     )
     .await;
 
@@ -145,7 +154,15 @@ pub async fn release_action(
         Some(buyer) => PublicKey::from_str(buyer.as_str())?,
         _ => return Err(Error::msg("Missing buyer pubkeys")),
     };
-    send_new_order_msg(None, Some(order_id), Action::Released, None, &buyer_pubkey).await;
+    send_new_order_msg(
+        None,
+        Some(order_id),
+        Action::Released,
+        None,
+        &buyer_pubkey,
+        None,
+    )
+    .await;
 
     let _ = do_payment(order_updated, request_id).await;
 
@@ -252,6 +269,7 @@ async fn payment_success(
         Action::PurchaseCompleted,
         None,
         buyer_pubkey,
+        None,
     )
     .await;
 
@@ -271,9 +289,11 @@ async fn payment_success(
                 if new_order.kind == "sell" {
                     new_order.buyer_pubkey = None;
                     new_order.master_buyer_pubkey = None;
+                    new_order.trade_index_buyer = None;
                 } else {
                     new_order.seller_pubkey = None;
                     new_order.master_seller_pubkey = None;
+                    new_order.trade_index_seller = None;
                 }
                 if let Some(min_amount) = &order.min_amount {
                     match new_max.cmp(min_amount) {
@@ -346,8 +366,20 @@ async fn payment_success(
                         Ordering::Less => {}
                     }
                 } else {
-                    send_cant_do_msg(None, Some(order.id), None, buyer_pubkey).await;
-                    send_cant_do_msg(request_id, Some(order.id), None, seller_pubkey).await;
+                    send_cant_do_msg(
+                        None,
+                        Some(order.id),
+                        Some(CantDoReason::InvalidAmount),
+                        buyer_pubkey,
+                    )
+                    .await;
+                    send_cant_do_msg(
+                        request_id,
+                        Some(order.id),
+                        Some(CantDoReason::InvalidAmount),
+                        seller_pubkey,
+                    )
+                    .await;
                 }
             }
         }

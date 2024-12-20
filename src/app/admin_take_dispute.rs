@@ -4,7 +4,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, send_new_order_ms
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::message::{Action, Content, Message, Peer};
+use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Order;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -62,7 +62,8 @@ pub async fn admin_take_dispute_action(
                 Some(dispute_id),
                 Action::NotFound,
                 None,
-                &event.sender,
+                &event.rumor.pubkey,
+                None,
             )
             .await;
             return Ok(());
@@ -71,9 +72,9 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
+        if !pubkey_event_can_solve(pool, &event.rumor.pubkey, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(request_id, Some(dispute_id), None, &event.sender).await;
+            send_cant_do_msg(request_id, Some(dispute_id), None, &event.rumor.pubkey).await;
             return Ok(());
         }
     } else {
@@ -95,10 +96,10 @@ pub async fn admin_take_dispute_action(
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();
-    dispute.solver_pubkey = Some(event.sender.to_string());
+    dispute.solver_pubkey = Some(event.rumor.pubkey.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
 
-    info!("Dispute {} taken by {}", dispute_id, event.sender);
+    info!("Dispute {} taken by {}", dispute_id, event.rumor.pubkey);
     // Assign token for admin message
     new_order.seller_token = dispute.seller_token;
     new_order.buyer_token = dispute.buyer_token;
@@ -107,29 +108,32 @@ pub async fn admin_take_dispute_action(
 
     // We create a Message for admin
     let message = Message::new_dispute(
-        request_id,
         Some(dispute_id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Order(new_order)),
+        Some(Payload::Order(new_order)),
     );
     let message = message.as_json()?;
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.sender, sender_keys, message).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message).await?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
-    let solver_pubkey = Peer::new(event.sender.to_hex());
+    let solver_pubkey = Peer::new(event.rumor.pubkey.to_hex());
     let msg_to_buyer = Message::new_order(
-        None,
         Some(order.id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey.clone())),
+        Some(Payload::Peer(solver_pubkey.clone())),
     );
 
     let msg_to_seller = Message::new_order(
-        None,
         Some(order.id),
+        request_id,
+        None,
         Action::AdminTookDispute,
-        Some(Content::Peer(solver_pubkey)),
+        Some(Payload::Peer(solver_pubkey)),
     );
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {

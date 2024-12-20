@@ -11,7 +11,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, Content, Message};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -120,7 +120,8 @@ async fn get_valid_order(
                     Some(order.id),
                     Action::NotAllowedByStatus,
                     None,
-                    &event.sender,
+                    &event.rumor.pubkey,
+                    None,
                 )
                 .await;
                 return Err(Error::msg(format!(
@@ -178,12 +179,12 @@ pub async fn dispute_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
 
-    let message_sender = event.sender.to_string();
+    let message_sender = event.rumor.pubkey.to_string();
     let (counterpart, is_buyer_dispute) =
         match get_counterpart_info(&message_sender, &buyer, &seller) {
             Ok((counterpart, is_buyer_dispute)) => (counterpart, is_buyer_dispute),
             Err(_) => {
-                send_cant_do_msg(request_id, Some(order.id), None, &event.sender).await;
+                send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
                 return Ok(());
             }
         };
@@ -239,8 +240,9 @@ pub async fn dispute_action(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByYou,
-        Some(Content::Dispute(dispute.clone().id, initiator_token)),
+        Some(Payload::Dispute(dispute.clone().id, initiator_token)),
         &initiator_pubkey,
+        None,
     )
     .await;
 
@@ -256,8 +258,9 @@ pub async fn dispute_action(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByPeer,
-        Some(Content::Dispute(dispute.clone().id, counterpart_token)),
+        Some(Payload::Dispute(dispute.clone().id, counterpart_token)),
         &counterpart_pubkey,
+        None,
     )
     .await;
 

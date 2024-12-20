@@ -157,30 +157,39 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     expire_date
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_order(
     pool: &SqlitePool,
     keys: &Keys,
     new_order: &SmallOrder,
-    initiator_pubkey: &str,
+    initiator_pubkey: PublicKey,
+    identity_pubkey: PublicKey,
     trade_pubkey: PublicKey,
     request_id: Option<u64>,
     trade_index: Option<i64>,
 ) -> Result<()> {
     // Prepare a new default order
-    let new_order_db =
-        match prepare_new_order(new_order, initiator_pubkey, trade_index, trade_pubkey).await {
-            Some(order) => order,
-            None => {
-                return Ok(());
-            }
-        };
+    let new_order_db = match prepare_new_order(
+        new_order,
+        initiator_pubkey,
+        trade_index,
+        identity_pubkey,
+        trade_pubkey,
+    )
+    .await
+    {
+        Some(order) => order,
+        None => {
+            return Ok(());
+        }
+    };
 
     // CRUD order creation
     let mut order = new_order_db.clone().create(pool).await?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
-    let reputation = get_user_reputation(initiator_pubkey, keys).await?;
+    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys).await?;
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
     // nip33 kind with order fields as tags and order id as identifier
@@ -216,8 +225,9 @@ pub async fn publish_order(
 
 async fn prepare_new_order(
     new_order: &SmallOrder,
-    initiator_pubkey: &str,
+    initiator_pubkey: PublicKey,
     trade_index: Option<i64>,
+    identity_pubkey: PublicKey,
     trade_pubkey: PublicKey,
 ) -> Option<Order> {
     let mut fee = 0;
@@ -252,11 +262,13 @@ async fn prepare_new_order(
         Some(OrderKind::Buy) => {
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
+            new_order_db.master_buyer_pubkey = Some(identity_pubkey.to_string());
             new_order_db.trade_index_buyer = trade_index;
         }
         Some(OrderKind::Sell) => {
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
+            new_order_db.master_seller_pubkey = Some(identity_pubkey.to_string());
             new_order_db.trade_index_seller = trade_index;
         }
         None => {

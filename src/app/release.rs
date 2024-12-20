@@ -289,9 +289,11 @@ async fn payment_success(
                 if new_order.kind == "sell" {
                     new_order.buyer_pubkey = None;
                     new_order.master_buyer_pubkey = None;
+                    new_order.trade_index_buyer = None;
                 } else {
                     new_order.seller_pubkey = None;
                     new_order.master_seller_pubkey = None;
+                    new_order.trade_index_seller = None;
                 }
                 if let Some(min_amount) = &order.min_amount {
                     match new_max.cmp(min_amount) {

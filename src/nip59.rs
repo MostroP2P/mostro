@@ -23,12 +23,22 @@ pub fn gift_wrap(
     expiration: Option<Timestamp>,
 ) -> Result<Event, BuilderError> {
     // We convert back the string to a message
-    let message = Message::from_json(&payload).unwrap();
+    let message = Message::from_json(&payload).map_err(|e| {
+        BuilderError::NIP59(nip59::Error::Event(nostr::event::Error::Json(format!(
+            "Failed to parse message: {}",
+            e
+        ))))
+    })?;
     // We sign the message
     let sig = message.get_inner_message_kind().sign(sender_keys);
     // We compose the content
     let content = (message, sig);
-    let content = serde_json::to_string(&content).unwrap();
+    let content = serde_json::to_string(&content).map_err(|e| {
+        BuilderError::NIP59(nip59::Error::Event(nostr::event::Error::Json(format!(
+            "Failed to serialize content: {}",
+            e
+        ))))
+    })?;
     let rumor: UnsignedEvent = EventBuilder::text_note(content).build(sender_keys.public_key());
     let seal: Event = seal(sender_keys, &receiver, rumor)?.sign_with_keys(sender_keys)?;
 

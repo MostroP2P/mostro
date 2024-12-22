@@ -1,3 +1,4 @@
+use crate::db::add_new_user;
 use crate::util::{send_cant_do_msg, send_dm};
 
 use anyhow::Result;
@@ -6,7 +7,6 @@ use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use tracing::{error, info};
 
 pub async fn admin_add_solver_action(
@@ -42,7 +42,7 @@ pub async fn admin_add_solver_action(
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
     let user = User::new(public_key, 0, 1, 0, 0, trade_index);
     // Use CRUD to create user
-    match user.create(pool).await {
+    match add_new_user(pool, user.pubkey, user.last_trade_index).await {
         Ok(r) => info!("Solver added: {:#?}", r),
         Err(ee) => error!("Error creating solver: {:#?}", ee),
     }

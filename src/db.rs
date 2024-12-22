@@ -327,6 +327,72 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::R
     Ok(user)
 }
 
+pub async fn add_new_user(
+    pool: &SqlitePool,
+    public_key: String,
+    last_trade_index: i64,
+) -> anyhow::Result<User> {
+    let created_at: Timestamp = Timestamp::now();
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            INSERT INTO users (pubkey, last_trade_index, created_at) 
+            VALUES (?1, ?2, ?3)
+            RETURNING *
+        "#,
+    )
+    .bind(public_key)
+    .bind(last_trade_index)
+    .bind(created_at.to_string())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
+pub async fn update_user_trade_index(
+    pool: &SqlitePool,
+    public_key: String,
+    trade_index: i64,
+) -> anyhow::Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            UPDATE users SET trade_index = ?1 WHERE pubkey = ?2
+        "#,
+    )
+    .bind(trade_index)
+    .bind(public_key)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
+pub async fn update_user_rating(
+    pool: &SqlitePool,
+    public_key: String,
+    last_rating: i64,
+    min_rating: i64,
+    max_rating: i64,
+    total_reviews: i64,
+    total_rating: i64,
+) -> anyhow::Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
+        "#,
+    )
+    .bind(last_rating)
+    .bind(min_rating)
+    .bind(max_rating)
+    .bind(total_reviews)
+    .bind(total_rating)
+    .bind(public_key)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
 pub async fn is_assigned_solver(
     pool: &SqlitePool,
     solver_pubkey: &str,

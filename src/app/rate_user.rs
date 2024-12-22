@@ -1,7 +1,7 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event};
 use crate::NOSTR_CLIENT;
 
-use crate::db::is_user_present;
+use crate::db::{is_user_present, update_user_rating};
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
@@ -159,7 +159,19 @@ pub async fn update_user_reputation_action(
     .to_tags()?;
 
     // Save new rating to db
-    user_to_vote.update(pool).await?;
+    if let Err(e) = update_user_rating(
+        pool,
+        user_to_vote.pubkey,
+        user_to_vote.last_rating,
+        user_to_vote.min_rating,
+        user_to_vote.max_rating,
+        user_to_vote.total_reviews,
+        user_to_vote.total_rating,
+    )
+    .await
+    {
+        return Err(Error::msg(format!("Error updating user rating : {}", e)));
+    }
 
     if buyer_rating || seller_rating {
         // Update db with rate flags

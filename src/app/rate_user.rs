@@ -1,6 +1,7 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event};
 use crate::NOSTR_CLIENT;
 
+use crate::db::is_user_present;
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
@@ -90,10 +91,10 @@ pub async fn update_user_reputation_action(
 
     // Find the counterpart public key
     if message_sender == buyer {
-        counterpart = seller;
+        counterpart = order.master_seller_pubkey.unwrap();
         buyer_rating = true;
     } else if message_sender == seller {
-        counterpart = buyer;
+        counterpart = order.master_buyer_pubkey.unwrap();
         seller_rating = true;
     };
 
@@ -132,31 +133,33 @@ pub async fn update_user_reputation_action(
         return Err(Error::msg("No rating present"));
     }
 
-    // Ask counterpart reputation
-    let rep = get_user_reputation(&counterpart, my_keys).await?;
-    // Here we have to update values of the review of the counterpart
-    let mut reputation;
+    // Get counter to vote from db
+    let mut user_to_vote = is_user_present(pool, counterpart.clone()).await?;
 
-    if let Some(r) = rep {
-        // Update user reputation
-        // Going on with calculation
-        reputation = r;
-        let old_rating = reputation.total_rating;
-        let last_rating = reputation.last_rating;
-        let new_rating =
-            old_rating + (last_rating as f64 - old_rating) / (reputation.total_reviews as f64);
+    // Update user reputation
+    // Going on with calculation
+    let old_rating = user_to_vote.total_rating;
+    let last_rating = user_to_vote.last_rating;
+    let new_rating = old_rating + (last_rating - old_rating) / (user_to_vote.total_reviews);
 
-        reputation.last_rating = rating;
-        reputation.total_reviews += 1;
-        // Format with two decimals
-        let new_rating = format!("{:.2}", new_rating).parse::<f64>()?;
+    user_to_vote.last_rating = rating.into();
+    user_to_vote.total_reviews += 1;
 
-        // Assing new total rating to review
-        reputation.total_rating = new_rating;
-    } else {
-        reputation = Rating::new(1, rating as f64, rating, MIN_RATING, MAX_RATING);
-    }
-    let reputation = reputation.to_tags()?;
+    // Assign new total rating to review
+    user_to_vote.total_rating = new_rating;
+
+    // Create new rating event
+    let reputation_event = Rating::new(
+        user_to_vote.total_reviews as u64,
+        user_to_vote.total_rating as f64,
+        user_to_vote.last_rating as u8,
+        user_to_vote.min_rating as u8,
+        user_to_vote.max_rating as u8,
+    )
+    .to_tags()?;
+
+    // Save new rating to db
+    user_to_vote.update(pool).await?;
 
     if buyer_rating || seller_rating {
         // Update db with rate flags
@@ -164,7 +167,7 @@ pub async fn update_user_reputation_action(
             &counterpart,
             update_buyer_rate,
             update_seller_rate,
-            reputation,
+            reputation_event,
             order.id,
             my_keys,
             pool,

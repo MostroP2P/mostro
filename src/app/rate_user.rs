@@ -16,8 +16,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::error;
 
-const MAX_RATING: u8 = 5;
-const MIN_RATING: u8 = 1;
+pub const MAX_RATING: u8 = 5;
+pub const MIN_RATING: u8 = 1;
 
 pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
@@ -151,8 +151,13 @@ pub async fn update_user_reputation_action(
     user_to_vote.total_reviews += 1;
     let old_rating = user_to_vote.total_rating as f64;
     // recompute new rating
-    user_to_vote.total_rating = old_rating
-        + ((user_to_vote.last_rating as f64) - old_rating) / (user_to_vote.total_reviews as f64);
+    if user_to_vote.total_reviews <= 1 {
+        user_to_vote.total_rating = rating.into();
+    } else {
+        user_to_vote.total_rating = old_rating
+            + ((user_to_vote.last_rating as f64) - old_rating)
+                / (user_to_vote.total_reviews as f64);
+    }
     // Store last rating
     user_to_vote.last_rating = rating.into();
     // Create new rating event

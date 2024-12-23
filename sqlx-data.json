@@ -10,6 +10,16 @@
     },
     "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
+  "071917afd7e1d00e2ae860779a1471d281f7aa45da61f7a7bdbd4625a3966a5d": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Right": 6
+      }
+    },
+    "query": "\n            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6\n        "
+  },
   "77ea98f6af16fa6e5a7d604965593700c563f88d88cb10b348bdc4200c87ad1d": {
     "describe": {
       "columns": [],

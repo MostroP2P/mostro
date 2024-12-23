@@ -1,3 +1,4 @@
+use crate::app::rate_user::{MAX_RATING, MIN_RATING};
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::order::Status;
@@ -391,7 +392,7 @@ pub async fn update_user_rating(
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
-) -> anyhow::Result<User> {
+) -> anyhow::Result<bool> {
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
         return Err(anyhow::anyhow!("Invalid public key format"));
@@ -403,7 +404,7 @@ pub async fn update_user_rating(
     if !(0..=5).contains(&min_rating) || !(0..=5).contains(&max_rating) {
         return Err(anyhow::anyhow!("Invalid min/max rating values"));
     }
-    if min_rating > last_rating || last_rating > max_rating {
+    if MIN_RATING as i64 > last_rating || last_rating > MAX_RATING as i64 {
         return Err(anyhow::anyhow!(
             "Rating values must satisfy: min_rating <= last_rating <= max_rating"
         ));
@@ -414,25 +415,22 @@ pub async fn update_user_rating(
     if total_rating < 0.0 || total_rating > (total_reviews * 5) as f64 {
         return Err(anyhow::anyhow!("Invalid total rating"));
     }
-    if let Ok(user) = sqlx::query_as::<_, User>(
+    let rows_affected = sqlx::query!(
         r#"
             UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
-            RETURNING *
         "#,
+        last_rating,
+        min_rating,
+        max_rating,
+        total_reviews,
+        total_rating,
+        public_key,
     )
-    .bind(last_rating)
-    .bind(min_rating)
-    .bind(max_rating)
-    .bind(total_reviews)
-    .bind(total_rating)
-    .bind(public_key)
-    .fetch_one(pool)
-    .await{
-        Ok(user)
-    }
-    else {
-        Err(anyhow::anyhow!("No user found"))
-    }
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
 }
 
 pub async fn is_assigned_solver(

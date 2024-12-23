@@ -141,21 +141,20 @@ pub async fn update_user_reputation_action(
 
     // Update user reputation
     // Going on with calculation
-    let old_rating = user_to_vote.total_rating;
     // increment first
     user_to_vote.total_reviews += 1;
-    // recompute rating
-    let new_rating = old_rating + (rating as i64 - old_rating) / (user_to_vote.total_reviews);
-
+    // Store last rating
     user_to_vote.last_rating = rating.into();
+    // recompute rating
+    user_to_vote.total_rating =
+        ((user_to_vote.total_rating * (user_to_vote.total_reviews - 1) as f64) + rating as f64)
+            / user_to_vote.total_reviews as f64;
 
-    // Assign new total rating to review
-    user_to_vote.total_rating = new_rating;
     // Create new rating event
     let reputation_event = Rating::new(
         user_to_vote.total_reviews as u64,
         user_to_vote.total_rating as f64,
-        rating as u8,
+        user_to_vote.last_rating as u8,
         user_to_vote.min_rating as u8,
         user_to_vote.max_rating as u8,
     )

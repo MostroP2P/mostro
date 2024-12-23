@@ -358,6 +358,14 @@ pub async fn update_user_trade_index(
     public_key: String,
     trade_index: i64,
 ) -> anyhow::Result<User> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
+    // Validate trade_index
+    if trade_index < 0 {
+        return Err(anyhow::anyhow!("Invalid trade_index: must be non-negative"));
+    }
     if let Ok(user) = sqlx::query_as::<_, User>(
         r#"
             UPDATE users SET trade_index = ?1 WHERE pubkey = ?2
@@ -365,13 +373,13 @@ pub async fn update_user_trade_index(
         "#,
     )
     .bind(trade_index)
-    .bind(public_key)
+    .bind(public_key.clone())
     .fetch_one(pool)
     .await
     {
         Ok(user)
     } else {
-        Err(anyhow::anyhow!("No user found"))
+        Err(anyhow::anyhow!("No user found with public key: {}", public_key))
     }
 }
 

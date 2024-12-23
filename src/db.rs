@@ -384,12 +384,25 @@ pub async fn update_user_rating(
     total_reviews: i64,
     total_rating: i64,
 ) -> anyhow::Result<User> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
     // Validate rating values
-    if !(0..5).contains(&last_rating) {
+    if !(0..=5).contains(&last_rating) {
         return Err(anyhow::anyhow!("Invalid rating value"));
+    }
+    if !(0..=5).contains(&min_rating) || !(0..=5).contains(&max_rating) {
+        return Err(anyhow::anyhow!("Invalid min/max rating values"));
+    }
+    if min_rating > last_rating || last_rating > max_rating {
+        return Err(anyhow::anyhow!("Rating values must satisfy: min_rating <= last_rating <= max_rating"));
     }
     if total_reviews < 0 {
         return Err(anyhow::anyhow!("Invalid total reviews"));
+    }
+    if total_rating < 0 || total_rating > total_reviews * 5 {
+        return Err(anyhow::anyhow!("Invalid total rating"));
     }
     if let Ok(user) = sqlx::query_as::<_, User>(
         r#"

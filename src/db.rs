@@ -379,7 +379,10 @@ pub async fn update_user_trade_index(
     {
         Ok(user)
     } else {
-        Err(anyhow::anyhow!("No user found with public key: {}", public_key))
+        Err(anyhow::anyhow!(
+            "No user found with public key: {}",
+            public_key
+        ))
     }
 }
 
@@ -404,7 +407,9 @@ pub async fn update_user_rating(
         return Err(anyhow::anyhow!("Invalid min/max rating values"));
     }
     if min_rating > last_rating || last_rating > max_rating {
-        return Err(anyhow::anyhow!("Rating values must satisfy: min_rating <= last_rating <= max_rating"));
+        return Err(anyhow::anyhow!(
+            "Rating values must satisfy: min_rating <= last_rating <= max_rating"
+        ));
     }
     if total_reviews < 0 {
         return Err(anyhow::anyhow!("Invalid total reviews"));

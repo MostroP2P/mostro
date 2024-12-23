@@ -119,19 +119,18 @@ pub async fn update_user_reputation_action(
     };
 
     // Check if content of Peer is the same of counterpart
-    let rating;
-
-    if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
-        if !(MIN_RATING..=MAX_RATING).contains(&v) {
-            return Err(Error::msg(format!(
-                "Rating must be between {} and {}",
-                MIN_RATING, MAX_RATING
-            )));
-        }
-        rating = v;
-    } else {
-        return Err(Error::msg("No rating present"));
-    }
+    let rating =
+        if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
+            if !(MIN_RATING..=MAX_RATING).contains(&v) {
+                return Err(Error::msg(format!(
+                    "Rating must be between {} and {}",
+                    MIN_RATING, MAX_RATING
+                )));
+            }
+            v
+        } else {
+            return Err(Error::msg("No rating present"));
+        };
 
     // Get counter to vote from db
     let mut user_to_vote = is_user_present(pool, counterpart.clone()).await?;
@@ -139,12 +138,10 @@ pub async fn update_user_reputation_action(
     // Update user reputation
     // Going on with calculation
     let old_rating = user_to_vote.total_rating;
-    let last_rating = user_to_vote.last_rating;
-    
     // increment first
     user_to_vote.total_reviews += 1;
     // recompute rating
-    let new_rating = old_rating + (rating.into() - old_rating) / (user_to_vote.total_reviews as f64);
+    let new_rating = old_rating + (rating as i64 - old_rating) / (user_to_vote.total_reviews);
 
     user_to_vote.last_rating = rating.into();
 
@@ -154,7 +151,7 @@ pub async fn update_user_reputation_action(
     let reputation_event = Rating::new(
         user_to_vote.total_reviews as u64,
         user_to_vote.total_rating as f64,
-        user_to_vote.last_rating as u8,
+        rating as u8,
         user_to_vote.min_rating as u8,
         user_to_vote.max_rating as u8,
     )

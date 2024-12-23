@@ -104,9 +104,18 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                         last_trade_index,
                         ..Default::default()
                     };
-                    add_new_user(pool, new_user.pubkey, new_user.last_trade_index)
-                        .await
-                        .unwrap();
+                    if let Err(e) =
+                        add_new_user(pool, new_user.pubkey, new_user.last_trade_index).await
+                    {
+                        tracing::error!("Error creating new user: {}", e);
+                        send_cant_do_msg(
+                            None,
+                            msg.get_inner_message_kind().id,
+                            Some(CantDoReason::InvalidTextMessage),
+                            &event.rumor.pubkey,
+                        )
+                        .await;
+                    }
                 }
             }
         }

@@ -332,6 +332,10 @@ pub async fn add_new_user(
     public_key: String,
     last_trade_index: i64,
 ) -> anyhow::Result<User> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
     let created_at: Timestamp = Timestamp::now();
     let user = sqlx::query_as::<_, User>(
         r#"
@@ -354,17 +358,21 @@ pub async fn update_user_trade_index(
     public_key: String,
     trade_index: i64,
 ) -> anyhow::Result<User> {
-    let user = sqlx::query_as::<_, User>(
+    if let Ok(user) = sqlx::query_as::<_, User>(
         r#"
             UPDATE users SET trade_index = ?1 WHERE pubkey = ?2
+            RETURNING *
         "#,
     )
     .bind(trade_index)
     .bind(public_key)
     .fetch_one(pool)
-    .await?;
-
-    Ok(user)
+    .await
+    {
+        Ok(user)
+    } else {
+        Err(anyhow::anyhow!("No user found"))
+    }
 }
 
 pub async fn update_user_rating(
@@ -376,9 +384,17 @@ pub async fn update_user_rating(
     total_reviews: i64,
     total_rating: i64,
 ) -> anyhow::Result<User> {
-    let user = sqlx::query_as::<_, User>(
+    // Validate rating values
+    if !(0..5).contains(&last_rating) {
+        return Err(anyhow::anyhow!("Invalid rating value"));
+    }
+    if total_reviews < 0 {
+        return Err(anyhow::anyhow!("Invalid total reviews"));
+    }
+    if let Ok(user) = sqlx::query_as::<_, User>(
         r#"
             UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
+            RETURNING *
         "#,
     )
     .bind(last_rating)
@@ -388,9 +404,12 @@ pub async fn update_user_rating(
     .bind(total_rating)
     .bind(public_key)
     .fetch_one(pool)
-    .await?;
-
-    Ok(user)
+    .await{
+        Ok(user)
+    }
+    else {
+        Err(anyhow::anyhow!("No user found"))
+    }
 }
 
 pub async fn is_assigned_solver(

@@ -341,7 +341,7 @@ pub async fn add_new_user(
         r#"
             INSERT INTO users (pubkey, last_trade_index, created_at) 
             VALUES (?1, ?2, ?3)
-            RETURNING *
+            RETURNING pubkey
         "#,
     )
     .bind(public_key)
@@ -357,7 +357,7 @@ pub async fn update_user_trade_index(
     pool: &SqlitePool,
     public_key: String,
     trade_index: i64,
-) -> anyhow::Result<User> {
+) -> anyhow::Result<bool> {
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
         return Err(anyhow::anyhow!("Invalid public key format"));
@@ -366,24 +366,21 @@ pub async fn update_user_trade_index(
     if trade_index < 0 {
         return Err(anyhow::anyhow!("Invalid trade_index: must be non-negative"));
     }
-    if let Ok(user) = sqlx::query_as::<_, User>(
+
+    let mut conn = pool.acquire().await?;
+
+    let rows_affected = sqlx::query!(
         r#"
-            UPDATE users SET trade_index = ?1 WHERE pubkey = ?2
-            RETURNING *
+            UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2
         "#,
+        trade_index,
+        public_key,
     )
-    .bind(trade_index)
-    .bind(public_key.clone())
-    .fetch_one(pool)
-    .await
-    {
-        Ok(user)
-    } else {
-        Err(anyhow::anyhow!(
-            "No user found with public key: {}",
-            public_key
-        ))
-    }
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
 }
 
 pub async fn update_user_rating(

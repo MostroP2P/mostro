@@ -80,8 +80,12 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                             .verify_signature(event.rumor.pubkey, sig)
                     {
                         user.last_trade_index = index;
-                        if let Err(e) =
-                            update_user_trade_index(pool, user.pubkey, user.last_trade_index).await
+                        if let Err(e) = update_user_trade_index(
+                            pool,
+                            event.sender.to_string(),
+                            user.last_trade_index,
+                        )
+                        .await
                         {
                             tracing::error!("Error updating user trade index: {}", e);
                         }

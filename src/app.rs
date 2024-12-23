@@ -77,7 +77,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     if index > user.last_trade_index
                         && msg
                             .get_inner_message_kind()
-                            .verify_signature(event.sender, sig)
+                            .verify_signature(event.rumor.pubkey, sig)
                     {
                         user.last_trade_index = index;
                         if let Err(e) =

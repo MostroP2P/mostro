@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   category integer not null default 0,
   last_trade_index integer not null default 0,
   total_reviews integer not null default 0,
-  total_rating integer not null default 0,
+  total_rating float not null default 0,
   last_rating integer not null default 0,
   max_rating integer not null default 0,
   min_rating integer not null default 0,

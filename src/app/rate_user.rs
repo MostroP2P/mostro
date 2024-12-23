@@ -91,10 +91,14 @@ pub async fn update_user_reputation_action(
 
     // Find the counterpart public key
     if message_sender == buyer {
-        counterpart = order.master_seller_pubkey.unwrap();
+        counterpart = order
+            .master_seller_pubkey
+            .ok_or_else(|| Error::msg("Missing master seller pubkey"))?;
         buyer_rating = true;
     } else if message_sender == seller {
-        counterpart = order.master_buyer_pubkey.unwrap();
+        counterpart = order
+            .master_buyer_pubkey
+            .ok_or_else(|| Error::msg("Missing master buyer pubkey"))?;
         seller_rating = true;
     };
 

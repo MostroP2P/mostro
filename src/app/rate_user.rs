@@ -153,10 +153,18 @@ pub async fn update_user_reputation_action(
     // recompute new rating
     if user_to_vote.total_reviews <= 1 {
         user_to_vote.total_rating = rating.into();
+        user_to_vote.max_rating = rating.into();
+        user_to_vote.min_rating = rating.into();
     } else {
         user_to_vote.total_rating = old_rating
             + ((user_to_vote.last_rating as f64) - old_rating)
                 / (user_to_vote.total_reviews as f64);
+        if user_to_vote.max_rating < rating.into() {
+            user_to_vote.max_rating = rating.into();
+        }
+        if user_to_vote.min_rating > rating.into() {
+            user_to_vote.min_rating = rating.into();
+        }
     }
     // Store last rating
     user_to_vote.last_rating = rating.into();

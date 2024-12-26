@@ -334,7 +334,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> anyhow::Result<(
     let result = sqlx::query(
         "
             INSERT INTO users (pubkey, is_admin, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
     )
     .bind(new_user.pubkey)

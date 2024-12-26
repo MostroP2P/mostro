@@ -68,56 +68,79 @@ fn warning_msg(action: &Action, e: anyhow::Error) {
 /// * `msg` - The message containing action details and trade index information.
 async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Message) {
     let message_kind = msg.get_inner_message_kind();
-    if let Action::NewOrder | Action::TakeBuy | Action::TakeSell = message_kind.action {
-        match is_user_present(pool, event.sender.to_string()).await {
-            Ok(user) => {
-                if let (true, index) = message_kind.has_trade_index() {
-                    let (_, sig): (Message, nostr_sdk::secp256k1::schnorr::Signature) =
-                        serde_json::from_str(&event.rumor.content).unwrap();
-                    if index <= user.last_trade_index {
-                        tracing::info!("Invalid trade index");
-                        send_cant_do_msg(
-                            None,
-                            message_kind.id,
-                            Some(CantDoReason::InvalidTradeIndex),
-                            &event.rumor.pubkey,
-                        )
-                        .await;
-                    } else if message_kind.verify_signature(event.rumor.pubkey, sig) {
-                        if let Err(e) =
-                            update_user_trade_index(pool, event.sender.to_string(), index).await
-                        {
-                            tracing::error!("Error updating user trade index: {}", e);
-                        }
-                    } else {
-                        tracing::info!("Invalid signature");
-                        send_cant_do_msg(
-                            None,
-                            message_kind.id,
-                            Some(CantDoReason::InvalidSignature),
-                            &event.rumor.pubkey,
-                        )
-                        .await;
+
+    // Only process actions related to trading
+    if !matches!(
+        message_kind.action,
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell
+    ) {
+        return;
+    }
+
+    // If user is present, we check the trade index and signature
+    match is_user_present(pool, event.sender.to_string()).await {
+        Ok(user) => {
+            if let (true, index) = message_kind.has_trade_index() {
+                let content: (Message, Signature) = match serde_json::from_str::<(
+                    Message,
+                    nostr_sdk::secp256k1::schnorr::Signature,
+                )>(&event.rumor.content)
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Error deserializing content: {}", e);
+                        return;
                     }
+                };
+
+                let (_, sig) = content;
+
+                if index <= user.last_trade_index {
+                    tracing::info!("Invalid trade index");
+                    send_cant_do_msg(
+                        None,
+                        message_kind.id,
+                        Some(CantDoReason::InvalidTradeIndex),
+                        &event.rumor.pubkey,
+                    )
+                    .await;
+                    return;
+                }
+
+                if !message_kind.verify_signature(event.rumor.pubkey, sig) {
+                    tracing::info!("Invalid signature");
+                    send_cant_do_msg(
+                        None,
+                        message_kind.id,
+                        Some(CantDoReason::InvalidSignature),
+                        &event.rumor.pubkey,
+                    )
+                    .await;
+                    return;
+                }
+
+                if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
+                {
+                    tracing::error!("Error updating user trade index: {}", e);
                 }
             }
-            Err(_) => {
-                if let (true, last_trade_index) = message_kind.has_trade_index() {
-                    let new_user: User = User {
-                        pubkey: event.sender.to_string(),
-                        last_trade_index,
-                        ..Default::default()
-                    };
-                    if let Err(e) = add_new_user(pool, new_user).await {
-                        tracing::error!("Error creating new user: {}", e);
-                        send_cant_do_msg(
-                            None,
-                            msg.get_inner_message_kind().id,
-                            Some(CantDoReason::InvalidTextMessage),
-                            &event.rumor.pubkey,
-                        )
-                        .await;
-                    }
+        }
+        Err(_) => {
+            if let (true, last_trade_index) = message_kind.has_trade_index() {
+                let new_user: User = User {
+                    pubkey: event.sender.to_string(),
+                    last_trade_index,
+                    ..Default::default()
+                };
+                if let Err(e) = add_new_user(pool, new_user).await {
+                    tracing::error!("Error creating new user: {}", e);
+                    send_cant_do_msg(
+                        None,
+                        msg.get_inner_message_kind().id,
+                        Some(CantDoReason::InvalidTextMessage),
+                        &event.rumor.pubkey,
+                    )
+                    .await;
                 }
             }
         }

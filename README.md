@@ -20,7 +20,7 @@ Mostro will handle Bitcoin using a Lightning Network node, the node will create 
 
 Mostro will need a private key to be able to create, sign and send events through Nostr network.
 
-In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](https://mostro.network/messages):
+In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](https://mostro.network/protocol/):
 
 ```mermaid
 sequenceDiagram
@@ -123,8 +123,8 @@ cargo run
 ### Option 1: Run Mostro with a private dockerized relay
 
 ```bash
-cd relay
-docker compose up -d
+cd docker
+docker compose up nostr-relay
 ```
 
 This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
@@ -136,12 +136,20 @@ relays = ['ws://localhost:7000']
 
 #### Troubleshooting
 
-If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the docker-compose.yml file in the relay directory with:
+If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the `compose.yml` file in the `docker` directory with:
 
 ```yml
-version: '3.8'
-
 services:
+  mostro:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./config:/config  # settings.toml and mostro.db
+    platform: linux/amd64
+    networks:
+      - default
+
   nostr-relay:
     image: scsibug/nostr-rs-relay
     container_name: nostr-relay
@@ -149,7 +157,12 @@ services:
       - '${MOSTRO_RELAY_LOCAL_PORT:-7000}:8080'
     volumes:
       - 'mostro_data:/usr/src/app/db:Z'
-      - './config.toml:/usr/src/app/config.toml:ro,Z'
+      - './config/relay/config.toml:/usr/src/app/config.toml:ro,Z'
+
+networks:
+  default:
+    driver: bridge
+
 volumes:
   mostro_data:
 ```
@@ -157,6 +170,10 @@ volumes:
 ### Option 2: Connect to any other relay
 
 You just need to set `relays` in the `[nostr]` section of the `settings.toml` file with the relays you will use.
+
+## Dockerized Mostro
+
+If you want to run a dockerized version of Mostro, you can follow the step-by-step instructions in the [Docker Guide for MostroP2P](./docker/README.md).
 
 ## Contribute
 
@@ -167,6 +184,10 @@ More info in our [contributing guide](CONTRIBUTING.md).
 ### Rewards board
 
 To incentivize collaborators we have a **Rewards board**, we must clarify that Mostro is not a company but an open source project, the amounts offered are a way to thank for collaboration and we can offer it thanks to the generous donation of contributors, mostly anonymous, but also to two important institutions that have given us grants, you can check it [here](https://github.com/orgs/MostroP2P/projects/2/views/1).
+
+## Documentation
+- Protocol documentation: [https://mostro.network/protocol](https://mostro.network/protocol/)
+- Frequently Asked Questions: in [English](https://mostro.network/docs-english/), in [Spanish](https://mostro.network/docs-spanish/).
 
 ## License
 

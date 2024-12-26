@@ -352,11 +352,12 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> anyhow::Result<(
     .execute(pool)
     .await;
 
-    if result.is_ok() {
-        tracing::info!("New user created successfully");
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Error creating new user"))
+    match result {
+        Ok(_) => {
+            tracing::info!("New user created successfully");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("Error creating new user: {}", e)),
     }
 }
 

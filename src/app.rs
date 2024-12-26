@@ -108,9 +108,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                         last_trade_index,
                         ..Default::default()
                     };
-                    if let Err(e) =
-                        add_new_user(pool, new_user.pubkey, new_user.last_trade_index).await
-                    {
+                    if let Err(e) = add_new_user(pool, new_user).await {
                         tracing::error!("Error creating new user: {}", e);
                         send_cant_do_msg(
                             None,

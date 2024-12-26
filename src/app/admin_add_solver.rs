@@ -42,7 +42,7 @@ pub async fn admin_add_solver_action(
     let public_key = PublicKey::from_bech32(npubkey)?.to_hex();
     let user = User::new(public_key, 0, 1, 0, 0, trade_index);
     // Use CRUD to create user
-    match add_new_user(pool, user.pubkey, user.last_trade_index).await {
+    match add_new_user(pool, user).await {
         Ok(r) => info!("Solver added: {:#?}", r),
         Err(ee) => error!("Error creating solver: {:#?}", ee),
     }

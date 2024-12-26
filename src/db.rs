@@ -328,30 +328,37 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::R
     Ok(user)
 }
 
-pub async fn add_new_user(
-    pool: &SqlitePool,
-    public_key: String,
-    last_trade_index: i64,
-) -> anyhow::Result<User> {
+pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> anyhow::Result<()> {
     // Validate public key format (32-bytes hex)
-    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
-        return Err(anyhow::anyhow!("Invalid public key format"));
-    }
     let created_at: Timestamp = Timestamp::now();
-    let user = sqlx::query_as::<_, User>(
-        r#"
-            INSERT INTO users (pubkey, last_trade_index, created_at) 
-            VALUES (?1, ?2, ?3)
-            RETURNING pubkey
-        "#,
+    let result = sqlx::query(
+        "
+            INSERT INTO users (pubkey, is_admin, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at) 
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ",
     )
-    .bind(public_key)
-    .bind(last_trade_index)
+    .bind(new_user.pubkey)
+    .bind(new_user.is_admin)
+    .bind(new_user.is_solver)
+    .bind(new_user.is_banned)
+    .bind(new_user.category)
+    .bind(new_user.last_trade_index)
+    .bind(new_user.total_reviews)
+    .bind(new_user.total_rating)
+    .bind(new_user.last_rating)
+    .bind(new_user.max_rating)
+    .bind(new_user.min_rating)
     .bind(created_at.to_string())
-    .fetch_one(pool)
-    .await?;
+    .execute(pool)
+    .await;
 
-    Ok(user)
+    match result {
+        Ok(_) => {
+            tracing::info!("New user created successfully");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("Error creating new user: {}", e)),
+    }
 }
 
 pub async fn update_user_trade_index(

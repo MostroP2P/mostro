@@ -101,7 +101,9 @@ pub async fn take_buy_action(
         order.fee = fee;
     }
 
-    // Update trade index for seller
+    // Add seller identity pubkey to order
+    order.master_seller_pubkey = Some(event.sender.to_string());
+    // Add seller trade index to order
     order.trade_index_seller = msg.get_inner_message_kind().trade_index;
     // Timestamp order take time
     order.taken_at = Timestamp::now().as_u64() as i64;

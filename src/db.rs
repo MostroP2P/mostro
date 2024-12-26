@@ -1,3 +1,4 @@
+use crate::app::rate_user::{MAX_RATING, MIN_RATING};
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::order::Status;
@@ -325,6 +326,111 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::R
     .await?;
 
     Ok(user)
+}
+
+pub async fn add_new_user(
+    pool: &SqlitePool,
+    public_key: String,
+    last_trade_index: i64,
+) -> anyhow::Result<User> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
+    let created_at: Timestamp = Timestamp::now();
+    let user = sqlx::query_as::<_, User>(
+        r#"
+            INSERT INTO users (pubkey, last_trade_index, created_at) 
+            VALUES (?1, ?2, ?3)
+            RETURNING pubkey
+        "#,
+    )
+    .bind(public_key)
+    .bind(last_trade_index)
+    .bind(created_at.to_string())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
+pub async fn update_user_trade_index(
+    pool: &SqlitePool,
+    public_key: String,
+    trade_index: i64,
+) -> anyhow::Result<bool> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
+    // Validate trade_index
+    if trade_index < 0 {
+        return Err(anyhow::anyhow!("Invalid trade_index: must be non-negative"));
+    }
+
+    let mut conn = pool.acquire().await?;
+
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2
+        "#,
+        trade_index,
+        public_key,
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn update_user_rating(
+    pool: &SqlitePool,
+    public_key: String,
+    last_rating: i64,
+    min_rating: i64,
+    max_rating: i64,
+    total_reviews: i64,
+    total_rating: f64,
+) -> anyhow::Result<bool> {
+    // Validate public key format (32-bytes hex)
+    if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
+        return Err(anyhow::anyhow!("Invalid public key format"));
+    }
+    // Validate rating values
+    if !(0..=5).contains(&last_rating) {
+        return Err(anyhow::anyhow!("Invalid rating value"));
+    }
+    if !(0..=5).contains(&min_rating) || !(0..=5).contains(&max_rating) {
+        return Err(anyhow::anyhow!("Invalid min/max rating values"));
+    }
+    if MIN_RATING as i64 > last_rating || last_rating > MAX_RATING as i64 {
+        return Err(anyhow::anyhow!(
+            "Rating values must satisfy: min_rating <= last_rating <= max_rating"
+        ));
+    }
+    if total_reviews < 0 {
+        return Err(anyhow::anyhow!("Invalid total reviews"));
+    }
+    if total_rating < 0.0 || total_rating > (total_reviews * 5) as f64 {
+        return Err(anyhow::anyhow!("Invalid total rating"));
+    }
+    let rows_affected = sqlx::query!(
+        r#"
+            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
+        "#,
+        last_rating,
+        min_rating,
+        max_rating,
+        total_reviews,
+        total_rating,
+        public_key,
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(rows_affected > 0)
 }
 
 pub async fn is_assigned_solver(

@@ -31,7 +31,9 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 
+use crate::db::update_user_trade_index;
 // Core functionality imports
+use crate::db::add_new_user;
 use crate::lightning::LndConnector;
 use crate::nip59::unwrap_gift_wrap;
 use crate::util::send_cant_do_msg;
@@ -44,7 +46,6 @@ use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 /// Helper function to log warning messages for action errors
@@ -76,11 +77,17 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     if index > user.last_trade_index
                         && msg
                             .get_inner_message_kind()
-                            .verify_signature(event.sender, sig)
+                            .verify_signature(event.rumor.pubkey, sig)
                     {
                         user.last_trade_index = index;
-                        if user.update(pool).await.is_ok() {
-                            tracing::info!("Update user trade index");
+                        if let Err(e) = update_user_trade_index(
+                            pool,
+                            event.sender.to_string(),
+                            user.last_trade_index,
+                        )
+                        .await
+                        {
+                            tracing::error!("Error updating user trade index: {}", e);
                         }
                     } else {
                         tracing::info!("Invalid signature or trade index");
@@ -96,13 +103,22 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
             }
             Err(_) => {
                 if let (true, last_trade_index) = message_kind.has_trade_index() {
-                    let new_user = User {
+                    let new_user: User = User {
                         pubkey: event.sender.to_string(),
                         last_trade_index,
                         ..Default::default()
                     };
-                    if new_user.create(pool).await.is_ok() {
-                        tracing::info!("Added new user for rate");
+                    if let Err(e) =
+                        add_new_user(pool, new_user.pubkey, new_user.last_trade_index).await
+                    {
+                        tracing::error!("Error creating new user: {}", e);
+                        send_cant_do_msg(
+                            None,
+                            msg.get_inner_message_kind().id,
+                            Some(CantDoReason::InvalidTextMessage),
+                            &event.rumor.pubkey,
+                        )
+                        .await;
                     }
                 }
             }

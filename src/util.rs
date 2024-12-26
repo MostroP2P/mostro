@@ -778,9 +778,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_nostr_client_failure() {
         initialize();
-        // Assuming NOSTR_CLIENT is not initialized
-        let client = get_nostr_client();
-        assert!(client.is_err());
+        // Ensure NOSTR_CLIENT is not initialized for the test
+        let client = NOSTR_CLIENT.get();
+        assert!(client.is_none());
     }
 
     #[tokio::test]

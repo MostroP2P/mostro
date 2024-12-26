@@ -1,8 +1,9 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event};
 use crate::NOSTR_CLIENT;
 
+use crate::db::{is_user_present, update_user_rating};
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::message::{Action, CantDoReason, Message, Payload};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
@@ -15,8 +16,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::error;
 
-const MAX_RATING: u8 = 5;
-const MIN_RATING: u8 = 1;
+pub const MAX_RATING: u8 = 5;
+pub const MIN_RATING: u8 = 1;
 
 pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Rating>> {
     // Request NIP33 of the counterparts
@@ -85,22 +86,39 @@ pub async fn update_user_reputation_action(
     }
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
+    let mut counterpart_trade_pubkey: String = String::new();
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
     // Find the counterpart public key
     if message_sender == buyer {
-        counterpart = seller;
+        counterpart = order
+            .master_seller_pubkey
+            .ok_or_else(|| Error::msg("Missing master seller pubkey"))?;
         buyer_rating = true;
+        counterpart_trade_pubkey = order
+            .buyer_pubkey
+            .ok_or_else(|| Error::msg("Missing buyer pubkey"))?;
     } else if message_sender == seller {
-        counterpart = buyer;
+        counterpart = order
+            .master_buyer_pubkey
+            .ok_or_else(|| Error::msg("Missing master buyer pubkey"))?;
         seller_rating = true;
+        counterpart_trade_pubkey = order
+            .seller_pubkey
+            .ok_or_else(|| Error::msg("Missing seller pubkey"))?;
     };
 
     // Add a check in case of no counterpart found
     if counterpart.is_empty() {
         // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     };
 
@@ -118,53 +136,77 @@ pub async fn update_user_reputation_action(
     };
 
     // Check if content of Peer is the same of counterpart
-    let rating;
+    let rating =
+        if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
+            if !(MIN_RATING..=MAX_RATING).contains(&v) {
+                return Err(Error::msg(format!(
+                    "Rating must be between {} and {}",
+                    MIN_RATING, MAX_RATING
+                )));
+            }
+            v
+        } else {
+            return Err(Error::msg("No rating present"));
+        };
 
-    if let Some(Payload::RatingUser(v)) = msg.get_inner_message_kind().payload.to_owned() {
-        if !(MIN_RATING..=MAX_RATING).contains(&v) {
-            return Err(Error::msg(format!(
-                "Rating must be between {} and {}",
-                MIN_RATING, MAX_RATING
-            )));
+    // Get counter to vote from db
+    let mut user_to_vote = is_user_present(pool, counterpart.clone()).await?;
+
+    // Update user reputation
+    // Going on with calculation
+    // increment first
+    user_to_vote.total_reviews += 1;
+    let old_rating = user_to_vote.total_rating as f64;
+    // recompute new rating
+    if user_to_vote.total_reviews <= 1 {
+        user_to_vote.total_rating = rating.into();
+        user_to_vote.max_rating = rating.into();
+        user_to_vote.min_rating = rating.into();
+    } else {
+        user_to_vote.total_rating = old_rating
+            + ((user_to_vote.last_rating as f64) - old_rating)
+                / (user_to_vote.total_reviews as f64);
+        if user_to_vote.max_rating < rating.into() {
+            user_to_vote.max_rating = rating.into();
         }
-        rating = v;
-    } else {
-        return Err(Error::msg("No rating present"));
+        if user_to_vote.min_rating > rating.into() {
+            user_to_vote.min_rating = rating.into();
+        }
     }
+    // Store last rating
+    user_to_vote.last_rating = rating.into();
+    // Create new rating event
+    let reputation_event = Rating::new(
+        user_to_vote.total_reviews as u64,
+        user_to_vote.total_rating as f64,
+        user_to_vote.last_rating as u8,
+        user_to_vote.min_rating as u8,
+        user_to_vote.max_rating as u8,
+    )
+    .to_tags()?;
 
-    // Ask counterpart reputation
-    let rep = get_user_reputation(&counterpart, my_keys).await?;
-    // Here we have to update values of the review of the counterpart
-    let mut reputation;
-
-    if let Some(r) = rep {
-        // Update user reputation
-        // Going on with calculation
-        reputation = r;
-        let old_rating = reputation.total_rating;
-        let last_rating = reputation.last_rating;
-        let new_rating =
-            old_rating + (last_rating as f64 - old_rating) / (reputation.total_reviews as f64);
-
-        reputation.last_rating = rating;
-        reputation.total_reviews += 1;
-        // Format with two decimals
-        let new_rating = format!("{:.2}", new_rating).parse::<f64>()?;
-
-        // Assing new total rating to review
-        reputation.total_rating = new_rating;
-    } else {
-        reputation = Rating::new(1, rating as f64, rating, MIN_RATING, MAX_RATING);
+    // Save new rating to db
+    if let Err(e) = update_user_rating(
+        pool,
+        user_to_vote.pubkey,
+        user_to_vote.last_rating,
+        user_to_vote.min_rating,
+        user_to_vote.max_rating,
+        user_to_vote.total_reviews,
+        user_to_vote.total_rating,
+    )
+    .await
+    {
+        return Err(Error::msg(format!("Error updating user rating : {}", e)));
     }
-    let reputation = reputation.to_tags()?;
 
     if buyer_rating || seller_rating {
         // Update db with rate flags
         update_user_rating_event(
-            &counterpart,
+            &counterpart_trade_pubkey,
             update_buyer_rate,
             update_seller_rate,
-            reputation,
+            reputation_event,
             order.id,
             my_keys,
             pool,

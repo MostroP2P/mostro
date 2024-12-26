@@ -94,7 +94,7 @@ pub async fn update_user_reputation_action(
     if message_sender == buyer {
         counterpart = order
             .master_seller_pubkey
-            .ok_or_else(|| Error::msg("Missing master seller pubkey"))?;
+            .ok_or_else(|| Error::msg("Missing seller identity pubkey"))?;
         buyer_rating = true;
         counterpart_trade_pubkey = order
             .buyer_pubkey
@@ -102,7 +102,7 @@ pub async fn update_user_reputation_action(
     } else if message_sender == seller {
         counterpart = order
             .master_buyer_pubkey
-            .ok_or_else(|| Error::msg("Missing master buyer pubkey"))?;
+            .ok_or_else(|| Error::msg("Missing buyer identity pubkey"))?;
         seller_rating = true;
         counterpart_trade_pubkey = order
             .seller_pubkey

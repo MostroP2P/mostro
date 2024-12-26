@@ -70,31 +70,31 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
     let message_kind = msg.get_inner_message_kind();
     if let Action::NewOrder | Action::TakeBuy | Action::TakeSell = message_kind.action {
         match is_user_present(pool, event.sender.to_string()).await {
-            Ok(mut user) => {
+            Ok(user) => {
                 if let (true, index) = message_kind.has_trade_index() {
                     let (_, sig): (Message, nostr_sdk::secp256k1::schnorr::Signature) =
                         serde_json::from_str(&event.rumor.content).unwrap();
-                    if index > user.last_trade_index
-                        && msg
-                            .get_inner_message_kind()
-                            .verify_signature(event.rumor.pubkey, sig)
-                    {
-                        user.last_trade_index = index;
-                        if let Err(e) = update_user_trade_index(
-                            pool,
-                            event.sender.to_string(),
-                            user.last_trade_index,
+                    if index <= user.last_trade_index {
+                        tracing::info!("Invalid trade index");
+                        send_cant_do_msg(
+                            None,
+                            message_kind.id,
+                            Some(CantDoReason::InvalidTradeIndex),
+                            &event.rumor.pubkey,
                         )
-                        .await
+                        .await;
+                    } else if message_kind.verify_signature(event.rumor.pubkey, sig) {
+                        if let Err(e) =
+                            update_user_trade_index(pool, event.sender.to_string(), index).await
                         {
                             tracing::error!("Error updating user trade index: {}", e);
                         }
                     } else {
-                        tracing::info!("Invalid signature or trade index");
+                        tracing::info!("Invalid signature");
                         send_cant_do_msg(
                             None,
-                            msg.get_inner_message_kind().id,
-                            Some(CantDoReason::InvalidTradeIndex),
+                            message_kind.id,
+                            Some(CantDoReason::InvalidSignature),
                             &event.rumor.pubkey,
                         )
                         .await;

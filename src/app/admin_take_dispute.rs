@@ -87,11 +87,12 @@ pub async fn admin_take_dispute_action(
     };
 
     let mut new_order = order.as_new_order();
+    // Only in this case we use the trade pubkey fields to store the master pubkey
     new_order
-        .master_buyer_pubkey
+        .buyer_trade_pubkey
         .clone_from(&order.master_buyer_pubkey);
     new_order
-        .master_seller_pubkey
+        .seller_trade_pubkey
         .clone_from(&order.master_seller_pubkey);
 
     // Update dispute fields

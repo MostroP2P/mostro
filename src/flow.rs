@@ -84,8 +84,8 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         order_data.amount = new_amount;
         status = Status::WaitingBuyerInvoice;
         order_data.status = Some(status);
-        order_data.master_buyer_pubkey = None;
-        order_data.master_seller_pubkey = None;
+        order_data.buyer_trade_pubkey = None;
+        order_data.seller_trade_pubkey = None;
         // We ask to buyer for a new invoice
         send_new_order_msg(
             request_id,

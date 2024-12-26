@@ -86,6 +86,7 @@ pub async fn update_user_reputation_action(
     }
     // Get counterpart pubkey
     let mut counterpart: String = String::new();
+    let mut counterpart_trade_pubkey: String = String::new();
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
@@ -95,11 +96,17 @@ pub async fn update_user_reputation_action(
             .master_seller_pubkey
             .ok_or_else(|| Error::msg("Missing master seller pubkey"))?;
         buyer_rating = true;
+        counterpart_trade_pubkey = order
+            .buyer_pubkey
+            .ok_or_else(|| Error::msg("Missing buyer pubkey"))?;
     } else if message_sender == seller {
         counterpart = order
             .master_buyer_pubkey
             .ok_or_else(|| Error::msg("Missing master buyer pubkey"))?;
         seller_rating = true;
+        counterpart_trade_pubkey = order
+            .seller_pubkey
+            .ok_or_else(|| Error::msg("Missing seller pubkey"))?;
     };
 
     // Add a check in case of no counterpart found
@@ -196,7 +203,7 @@ pub async fn update_user_reputation_action(
     if buyer_rating || seller_rating {
         // Update db with rate flags
         update_user_rating_event(
-            &counterpart,
+            &counterpart_trade_pubkey,
             update_buyer_rate,
             update_seller_rate,
             reputation_event,

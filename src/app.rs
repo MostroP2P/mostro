@@ -137,7 +137,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     send_cant_do_msg(
                         None,
                         msg.get_inner_message_kind().id,
-                        Some(CantDoReason::InvalidTextMessage),
+                        Some(CantDoReason::CantCreateUser),
                         &event.rumor.pubkey,
                     )
                     .await;

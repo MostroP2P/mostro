@@ -11,7 +11,7 @@ use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::message::{Action, CantDoReason, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -184,7 +184,13 @@ pub async fn dispute_action(
         match get_counterpart_info(&message_sender, &buyer, &seller) {
             Ok((counterpart, is_buyer_dispute)) => (counterpart, is_buyer_dispute),
             Err(_) => {
-                send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+                send_cant_do_msg(
+                    request_id,
+                    Some(order.id),
+                    Some(CantDoReason::InvalidPubkey),
+                    &event.rumor.pubkey,
+                )
+                .await;
                 return Ok(());
             }
         };

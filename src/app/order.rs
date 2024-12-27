@@ -2,7 +2,7 @@ use crate::cli::settings::Settings;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg, send_new_order_msg};
 use anyhow::Result;
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
@@ -49,7 +49,13 @@ pub async fn order_action(
         // in case of single order do like usual
         if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
             if min >= max {
-                send_cant_do_msg(request_id, order.id, None, &event.rumor.pubkey).await;
+                send_cant_do_msg(
+                    request_id,
+                    order.id,
+                    Some(CantDoReason::InvalidAmount),
+                    &event.rumor.pubkey,
+                )
+                .await;
                 return Ok(());
             }
             if order.amount != 0 {
@@ -70,11 +76,16 @@ pub async fn order_action(
         }
 
         let premium = (order.premium != 0).then_some(order.premium);
-        let amount = (order.amount != 0).then_some(order.amount);
         let fiat_amount = (order.fiat_amount != 0).then_some(order.fiat_amount);
 
-        if premium.is_some() && amount.is_some() && fiat_amount.is_some() {
-            send_cant_do_msg(request_id, None, None, &event.sender).await;
+        if premium.is_some() && fiat_amount.is_some() {
+            send_cant_do_msg(
+                request_id,
+                None,
+                Some(CantDoReason::InvalidParameters),
+                &event.sender,
+            )
+            .await;
             return Ok(());
         }
 

@@ -637,7 +637,7 @@ pub async fn settle_seller_hold_invoice(
         send_cant_do_msg(
             request_id,
             Some(order.id),
-            Some(CantDoReason::InvalidPeer),
+            Some(CantDoReason::InvalidPubkey),
             &event.rumor.pubkey,
         )
         .await;

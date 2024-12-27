@@ -1,5 +1,4 @@
 pub mod invoice;
-use std::cmp::Ordering;
 
 use crate::cli::settings::Settings;
 use crate::error::MostroError;
@@ -12,14 +11,14 @@ use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, Payment};
+use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
+use std::cmp::Ordering;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
-// use tonic_lnd::lnrpc::
 
 pub struct LndConnector {
     client: Client,
@@ -252,5 +251,39 @@ impl LndConnector {
         }
 
         Ok(())
+    }
+
+    pub async fn get_node_info(&mut self) -> Result<GetInfoResponse, MostroError> {
+        let info = self.client.lightning().get_info(GetInfoRequest {}).await;
+
+        match info {
+            Ok(i) => Ok(i.into_inner()),
+            Err(e) => Err(MostroError::LnNodeError(e.to_string())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LnStatus {
+    pub version: String,
+    pub node_pubkey: String,
+    pub commit_hash: String,
+    pub node_alias: String,
+    pub chains: Vec<String>,
+    pub networks: Vec<String>,
+    pub uris: Vec<String>,
+}
+
+impl LnStatus {
+    pub fn from_get_info_response(info: GetInfoResponse) -> Self {
+        Self {
+            version: info.version,
+            node_pubkey: info.identity_pubkey,
+            commit_hash: info.commit_hash,
+            node_alias: info.alias,
+            chains: info.chains.iter().map(|c| c.chain.to_string()).collect(),
+            networks: info.chains.iter().map(|c| c.network.to_string()).collect(),
+            uris: info.uris.iter().map(|u| u.to_string()).collect(),
+        }
     }
 }

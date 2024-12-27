@@ -1,3 +1,4 @@
+use crate::lightning::LnStatus;
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
@@ -133,21 +134,17 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Tags {
 /// # Arguments
 ///
 ///
-pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Tags {
+pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
     let tags: Tags = Tags::new(vec![
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_pubkey")),
-            vec![mostro_pubkey.to_string()],
-        ),
-        Tag::custom(
             TagKind::Custom(Cow::Borrowed("mostro_version")),
             vec![env!("CARGO_PKG_VERSION").to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_commit_id")),
+            TagKind::Custom(Cow::Borrowed("mostro_commit_hash")),
             vec![env!("GIT_HASH").to_string()],
         ),
         Tag::custom(
@@ -185,6 +182,34 @@ pub fn info_to_tags(mostro_pubkey: &PublicKey) -> Tags {
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("invoice_expiration_window")),
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_version")),
+            vec![ln_status.version.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_node_pubkey")),
+            vec![ln_status.node_pubkey.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_commit_hash")),
+            vec![ln_status.commit_hash.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_node_alias")),
+            vec![ln_status.node_alias.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_chains")),
+            vec![ln_status.chains.join(",")],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_networks")),
+            vec![ln_status.networks.join(",")],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("lnd_uris")),
+            vec![ln_status.uris.join(",")],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),

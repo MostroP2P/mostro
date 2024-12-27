@@ -6,7 +6,7 @@ use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Kind as OrderKind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -39,6 +39,20 @@ pub async fn cancel_action(
             return Ok(());
         }
     };
+
+    if order.status == Status::Canceled.to_string()
+        || order.status == Status::CooperativelyCanceled.to_string()
+        || order.status == Status::CanceledByAdmin.to_string()
+    {
+        send_cant_do_msg(
+            request_id,
+            Some(order_id),
+            Some(CantDoReason::OrderAlreadyCanceled),
+            &event.rumor.pubkey,
+        )
+        .await;
+        return Ok(());
+    }
 
     if order.status == Status::Pending.to_string() {
         // Validates if this user is the order creator
@@ -75,8 +89,7 @@ pub async fn cancel_action(
     }
 
     if order.kind == OrderKind::Sell.to_string()
-        && (order.status == Status::WaitingBuyerInvoice.to_string()
-            || order.status == Status::WaitingBuyerInvoice.to_string())
+        && order.status == Status::WaitingBuyerInvoice.to_string()
     {
         cancel_add_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
     }

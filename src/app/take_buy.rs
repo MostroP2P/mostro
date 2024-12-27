@@ -4,7 +4,7 @@ use crate::util::{
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, Message};
+use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -38,7 +38,13 @@ pub async fn take_buy_action(
 
     // Maker can't take own order
     if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.rumor.pubkey.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPubkey),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 

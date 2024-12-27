@@ -80,7 +80,13 @@ pub async fn update_user_reputation_action(
     let message_sender = event.rumor.pubkey.to_string();
 
     if order.status != Status::Success.to_string() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidOrderStatus),
+            &event.rumor.pubkey,
+        )
+        .await;
         error!("Order Id {order_id} wrong status");
         return Ok(());
     }

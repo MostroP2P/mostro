@@ -39,7 +39,13 @@ pub async fn take_sell_action(
 
     // Maker can't take own order
     if order.creator_pubkey == event.rumor.pubkey.to_hex() {
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPubkey),
+            &event.rumor.pubkey,
+        )
+        .await;
         return Ok(());
     }
 

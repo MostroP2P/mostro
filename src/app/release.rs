@@ -409,8 +409,20 @@ async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
     if let (Some(buyer_pubkey), Some(seller_pubkey)) =
         (order.buyer_pubkey.as_ref(), order.seller_pubkey.as_ref())
     {
-        let buyer_pubkey = PublicKey::from_str(buyer_pubkey).unwrap();
-        let seller_pubkey = PublicKey::from_str(seller_pubkey).unwrap();
+        let buyer_pubkey = match PublicKey::from_str(buyer_pubkey) {
+            Ok(pk) => pk,
+            Err(e) => {
+                error!("Failed to parse buyer pubkey: {:?}", e);
+                return;
+            }
+        };
+        let seller_pubkey = match PublicKey::from_str(seller_pubkey) {
+            Ok(pk) => pk,
+            Err(e) => {
+                error!("Failed to parse seller pubkey: {:?}", e);
+                return;
+            }
+        };
 
         send_cant_do_msg(
             None,

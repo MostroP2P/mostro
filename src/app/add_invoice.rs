@@ -83,13 +83,11 @@ pub async fn add_invoice_action(
             {
                 Ok(_) => payment_request,
                 Err(_) => {
-                    send_new_order_msg(
+                    send_cant_do_msg(
                         request_id,
                         Some(order.id),
-                        Action::IncorrectInvoiceAmount,
-                        None,
+                        Some(CantDoReason::InvalidAmount),
                         &event.rumor.pubkey,
-                        None,
                     )
                     .await;
                     return Ok(());
@@ -120,13 +118,11 @@ pub async fn add_invoice_action(
             return Ok(());
         }
         _ => {
-            send_new_order_msg(
+            send_cant_do_msg(
                 request_id,
                 Some(order.id),
-                Action::NotAllowedByStatus,
-                None,
+                Some(CantDoReason::NotAllowedByStatus),
                 &event.rumor.pubkey,
-                None,
             )
             .await;
             return Ok(());

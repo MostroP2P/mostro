@@ -1,5 +1,5 @@
 use crate::cli::settings::Settings;
-use crate::db;
+use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
@@ -7,11 +7,10 @@ use crate::util::{
     update_order_event,
 };
 use crate::NOSTR_CLIENT;
-
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::message::{Action, CantDoReason, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -102,15 +101,14 @@ pub async fn release_action(
         && current_status != Status::FiatSent
         && current_status != Status::Dispute
     {
-        send_new_order_msg(
+        send_cant_do_msg(
             request_id,
             Some(order.id),
-            Action::NotAllowedByStatus,
-            None,
+            Some(CantDoReason::NotAllowedByStatus),
             &event.rumor.pubkey,
-            None,
         )
         .await;
+
         return Ok(());
     }
 
@@ -273,122 +271,26 @@ async fn payment_success(
     )
     .await;
 
-    // Check if order is range type
-    // Add parent range id and update max amount
-    if order.max_amount.is_some() && order.min_amount.is_some() {
-        if let Some(max) = order.max_amount {
-            if let Some(new_max) = max.checked_sub(order.fiat_amount) {
-                let mut new_order = order.clone();
-                new_order.amount = 0;
-                new_order.hash = None;
-                new_order.preimage = None;
-                new_order.buyer_invoice = None;
-                new_order.taken_at = 0;
-                new_order.invoice_held_at = 0;
-                new_order.range_parent_id = Some(order.id);
-                if new_order.kind == "sell" {
-                    new_order.buyer_pubkey = None;
-                    new_order.master_buyer_pubkey = None;
-                    new_order.trade_index_buyer = None;
-                } else {
-                    new_order.seller_pubkey = None;
-                    new_order.master_seller_pubkey = None;
-                    new_order.trade_index_seller = None;
-                }
-                if let Some(min_amount) = &order.min_amount {
-                    match new_max.cmp(min_amount) {
-                        Ordering::Equal => {
-                            // Update order in case max == min
-                            let pool = db::connect().await?;
-                            new_order.fiat_amount = new_max;
-                            new_order.max_amount = None;
-                            new_order.min_amount = None;
-                            new_order.status = Status::Pending.to_string();
-                            new_order.id = uuid::Uuid::new_v4();
-                            new_order.status = Status::Pending.to_string();
-                            // We transform the order fields to tags to use in the event
-                            let tags = crate::nip33::order_to_tags(&new_order, None);
-
-                            info!("range order tags to be republished: {:#?}", tags);
-                            // nip33 kind with order fields as tags and order id as identifier
-                            let event = crate::nip33::new_event(
-                                my_keys,
-                                "",
-                                new_order.id.to_string(),
-                                tags,
-                            )?;
-                            let event_id = event.id.to_string();
-                            // We update the order with the new event_id
-                            new_order.event_id = event_id;
-                            // CRUD order creation
-                            new_order.clone().create(&pool).await?;
-                            let _ = NOSTR_CLIENT
-                                .get()
-                                .unwrap()
-                                .send_event(event)
-                                .await
-                                .map(|_s| ())
-                                .map_err(|err| err.to_string());
-                        }
-                        Ordering::Greater => {
-                            // Update order in case new max is still greater the min amount
-                            let pool = db::connect().await?;
-                            // let mut new_order = order.clone();
-                            new_order.max_amount = Some(new_max);
-                            new_order.fiat_amount = 0;
-                            new_order.id = uuid::Uuid::new_v4();
-                            new_order.status = Status::Pending.to_string();
-                            // CRUD order creation
-                            // We transform the order fields to tags to use in the event
-                            let tags = crate::nip33::order_to_tags(&new_order, None);
-
-                            info!("range order tags to be republished: {:#?}", tags);
-                            // nip33 kind with order fields as tags and order id as identifier
-                            let event = crate::nip33::new_event(
-                                my_keys,
-                                "",
-                                new_order.id.to_string(),
-                                tags,
-                            )?;
-                            let event_id = event.id.to_string();
-                            // We update the order with the new event_id
-                            new_order.event_id = event_id;
-                            new_order.clone().create(&pool).await?;
-                            let _ = NOSTR_CLIENT
-                                .get()
-                                .unwrap()
-                                .send_event(event)
-                                .await
-                                .map(|_s| ())
-                                .map_err(|err| err.to_string());
-                        }
-                        // Update order status in case new max is smaller the min amount
-                        Ordering::Less => {}
-                    }
-                } else {
-                    send_cant_do_msg(
-                        None,
-                        Some(order.id),
-                        Some(CantDoReason::InvalidAmount),
-                        buyer_pubkey,
-                    )
-                    .await;
-                    send_cant_do_msg(
-                        request_id,
-                        Some(order.id),
-                        Some(CantDoReason::InvalidAmount),
-                        seller_pubkey,
-                    )
-                    .await;
-                }
-            }
-        }
+    let (is_range, child_order) = get_child_order(order, request_id, my_keys).await?;
+    if is_range {
+        // Let's wait 5 secs before publish this new event
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // We send a message to the order creator with the new order
+        let creator_pubkey = child_order.creator_pubkey.clone();
+        let creator_pubkey = PublicKey::from_str(&creator_pubkey)?;
+        let new_order = child_order.as_new_order();
+        // As we are creating a new order from Mostro to user, we need to ask to the user
+        // for the trade_pubkey and the last_trade_index to update the user trade_index and order trade_pubkey
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::NewOrder,
+            Some(Payload::Order(new_order)),
+            &creator_pubkey,
+            None,
+        )
+        .await;
     }
-
-    // Let's wait 5 secs before publish this new event
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {
@@ -397,4 +299,133 @@ async fn payment_success(
         }
     }
     Ok(())
+}
+
+/// Check if order is range type
+/// Add parent range id and update max amount
+/// publish a new replaceable kind nostr event with the status updated
+/// and update on local database the status and new event id
+pub async fn get_child_order(
+    order: &mut Order,
+    request_id: Option<u64>,
+    my_keys: &Keys,
+) -> Result<(bool, Order)> {
+    let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
+        return Ok((false, order.clone()));
+    };
+
+    if let Some(new_max) = max_amount.checked_sub(order.fiat_amount) {
+        let mut new_order = create_base_order(order);
+
+        match new_max.cmp(&min_amount) {
+            Ordering::Equal => {
+                update_order_for_equal(new_max, &mut new_order, my_keys).await?;
+                return Ok((true, new_order));
+            }
+            Ordering::Greater => {
+                update_order_for_greater(new_max, &mut new_order, my_keys).await?;
+                return Ok((true, new_order));
+            }
+            Ordering::Less => {
+                notify_invalid_amount(order, request_id).await;
+            }
+        }
+    }
+
+    Ok((false, order.clone()))
+}
+
+fn create_base_order(order: &Order) -> Order {
+    let mut new_order = order.clone();
+    new_order.amount = 0;
+    new_order.hash = None;
+    new_order.preimage = None;
+    new_order.buyer_invoice = None;
+    new_order.taken_at = 0;
+    new_order.invoice_held_at = 0;
+    new_order.range_parent_id = Some(order.id);
+
+    if new_order.kind == "sell" {
+        new_order.buyer_pubkey = None;
+        new_order.master_buyer_pubkey = None;
+        new_order.trade_index_buyer = None;
+    } else {
+        new_order.seller_pubkey = None;
+        new_order.master_seller_pubkey = None;
+        new_order.trade_index_seller = None;
+    }
+
+    new_order
+}
+
+async fn update_order_for_equal(new_max: i64, new_order: &mut Order, my_keys: &Keys) -> Result<()> {
+    let pool = db::connect().await?;
+    new_order.fiat_amount = new_max;
+    new_order.max_amount = None;
+    new_order.min_amount = None;
+    new_order.status = Status::Pending.to_string();
+    new_order.id = uuid::Uuid::new_v4();
+
+    let tags = crate::nip33::order_to_tags(new_order, None);
+    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
+    new_order.event_id = event.id.to_string();
+    new_order.clone().create(&pool).await?;
+    NOSTR_CLIENT
+        .get()
+        .unwrap()
+        .send_event(event)
+        .await
+        .map_err(|err| anyhow::Error::msg(err.to_string()))?;
+
+    Ok(())
+}
+
+async fn update_order_for_greater(
+    new_max: i64,
+    new_order: &mut Order,
+    my_keys: &Keys,
+) -> Result<()> {
+    let pool = db::connect().await?;
+    new_order.max_amount = Some(new_max);
+    new_order.fiat_amount = 0;
+    new_order.id = uuid::Uuid::new_v4();
+    new_order.status = Status::Pending.to_string();
+
+    let tags = crate::nip33::order_to_tags(new_order, None);
+    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
+    new_order.event_id = event.id.to_string();
+    new_order.clone().create(&pool).await?;
+    NOSTR_CLIENT
+        .get()
+        .unwrap()
+        .send_event(event)
+        .await
+        .map_err(|err| anyhow::Error::msg(err.to_string()))?;
+
+    Ok(())
+}
+
+async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
+    if let (Some(buyer_pubkey), Some(seller_pubkey)) =
+        (order.buyer_pubkey.as_ref(), order.seller_pubkey.as_ref())
+    {
+        let buyer_pubkey = PublicKey::from_str(buyer_pubkey).unwrap();
+        let seller_pubkey = PublicKey::from_str(seller_pubkey).unwrap();
+
+        send_cant_do_msg(
+            None,
+            Some(order.id),
+            Some(CantDoReason::InvalidAmount),
+            &buyer_pubkey,
+        )
+        .await;
+
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidAmount),
+            &seller_pubkey,
+        )
+        .await;
+    }
 }

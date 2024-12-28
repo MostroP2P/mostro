@@ -115,15 +115,14 @@ async fn get_valid_order(
             // Only allow disputes for Active or FiatSent orders
             if !matches!(status, Status::Active | Status::FiatSent) {
                 // Notify the sender that the action is not allowed for this status
-                send_new_order_msg(
+                send_cant_do_msg(
                     request_id,
                     Some(order.id),
-                    Action::NotAllowedByStatus,
-                    None,
+                    Some(CantDoReason::NotAllowedByStatus),
                     &event.rumor.pubkey,
-                    None,
                 )
                 .await;
+
                 return Err(Error::msg(format!(
                     "Order {} with status {} does not allow disputes. Must be Active or FiatSent",
                     order.id, order.status

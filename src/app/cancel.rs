@@ -57,14 +57,11 @@ pub async fn cancel_action(
     if order.status == Status::Pending.to_string() {
         // Validates if this user is the order creator
         if user_pubkey != order.creator_pubkey {
-            // We create a Message
-            send_new_order_msg(
+            send_cant_do_msg(
                 request_id,
                 Some(order.id),
-                Action::IsNotYourOrder,
-                None,
+                Some(CantDoReason::IsNotYourOrder),
                 &event.rumor.pubkey,
-                None,
             )
             .await;
         } else {

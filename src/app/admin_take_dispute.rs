@@ -1,6 +1,6 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, send_new_order_msg};
+use crate::util::{get_nostr_client, send_cant_do_msg, send_dm};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
@@ -56,16 +56,14 @@ pub async fn admin_take_dispute_action(
     let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
         None => {
-            // We create a Message
-            send_new_order_msg(
+            send_cant_do_msg(
                 request_id,
                 Some(dispute_id),
-                Action::NotFound,
-                None,
+                Some(CantDoReason::NotFound),
                 &event.rumor.pubkey,
-                None,
             )
             .await;
+
             return Ok(());
         }
     };

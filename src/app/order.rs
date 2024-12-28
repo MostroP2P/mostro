@@ -1,8 +1,8 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg, send_new_order_msg};
+use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
 use anyhow::Result;
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::message::{CantDoReason, Message};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
@@ -28,15 +28,14 @@ pub async fn order_action(
             match is_valid_invoice(invoice.clone(), None, None).await {
                 Ok(_) => (),
                 Err(_) => {
-                    send_new_order_msg(
+                    send_cant_do_msg(
                         request_id,
                         order.id,
-                        Action::IncorrectInvoiceAmount,
-                        None,
+                        Some(CantDoReason::InvalidAmount),
                         &event.rumor.pubkey,
-                        None,
                     )
                     .await;
+
                     return Ok(());
                 }
             }
@@ -59,15 +58,14 @@ pub async fn order_action(
                 return Ok(());
             }
             if order.amount != 0 {
-                send_new_order_msg(
+                send_cant_do_msg(
                     request_id,
                     None,
-                    Action::InvalidSatsAmount,
-                    None,
+                    Some(CantDoReason::InvalidAmount),
                     &event.rumor.pubkey,
-                    None,
                 )
                 .await;
+
                 return Ok(());
             }
             amount_vec.clear();
@@ -106,28 +104,25 @@ pub async fn order_action(
 
             // Check amount is positive - extra safety check
             if quote < 0 {
-                send_new_order_msg(
+                send_cant_do_msg(
                     request_id,
                     None,
-                    Action::InvalidSatsAmount,
-                    None,
+                    Some(CantDoReason::InvalidAmount),
                     &event.rumor.pubkey,
-                    None,
                 )
                 .await;
+
                 return Ok(());
             }
 
             if quote > mostro_settings.max_order_amount as i64
                 || quote < mostro_settings.min_payment_amount as i64
             {
-                send_new_order_msg(
+                send_cant_do_msg(
                     request_id,
                     None,
-                    Action::OutOfRangeSatsAmount,
-                    None,
+                    Some(CantDoReason::OutOfRangeSatsAmount),
                     &event.rumor.pubkey,
-                    None,
                 )
                 .await;
                 return Ok(());

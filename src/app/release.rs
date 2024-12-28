@@ -328,6 +328,7 @@ pub async fn get_child_order(
             }
             Ordering::Less => {
                 notify_invalid_amount(order, request_id).await;
+                return Ok((false, order.clone()));
             }
         }
     }
@@ -337,6 +338,8 @@ pub async fn get_child_order(
 
 fn create_base_order(order: &Order) -> Order {
     let mut new_order = order.clone();
+    new_order.id = uuid::Uuid::new_v4();
+    new_order.status = Status::Pending.to_string();
     new_order.amount = 0;
     new_order.hash = None;
     new_order.preimage = None;
@@ -363,8 +366,6 @@ async fn update_order_for_equal(new_max: i64, new_order: &mut Order, my_keys: &K
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-    new_order.status = Status::Pending.to_string();
-    new_order.id = uuid::Uuid::new_v4();
 
     let tags = crate::nip33::order_to_tags(new_order, None);
     let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
@@ -372,7 +373,7 @@ async fn update_order_for_equal(new_max: i64, new_order: &mut Order, my_keys: &K
     new_order.clone().create(&pool).await?;
     NOSTR_CLIENT
         .get()
-        .unwrap()
+        .ok_or_else(|| anyhow::Error::msg("NOSTR_CLIENT not initialized"))?
         .send_event(event)
         .await
         .map_err(|err| anyhow::Error::msg(err.to_string()))?;
@@ -388,8 +389,6 @@ async fn update_order_for_greater(
     let pool = db::connect().await?;
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-    new_order.id = uuid::Uuid::new_v4();
-    new_order.status = Status::Pending.to_string();
 
     let tags = crate::nip33::order_to_tags(new_order, None);
     let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
@@ -397,7 +396,7 @@ async fn update_order_for_greater(
     new_order.clone().create(&pool).await?;
     NOSTR_CLIENT
         .get()
-        .unwrap()
+        .ok_or_else(|| anyhow::Error::msg("NOSTR_CLIENT not initialized"))?
         .send_event(event)
         .await
         .map_err(|err| anyhow::Error::msg(err.to_string()))?;

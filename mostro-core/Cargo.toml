@@ -1,0 +1,29 @@
+[package]
+name = "mostro-core"
+version = "0.6.21"
+edition = "2021"
+license = "MIT"
+authors = ["Francisco Calderón <negrunch@grunch.dev>"]
+description = "Mostro Core library"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true, optional = true }
+sqlx-crud = { workspace = true, optional = true }
+wasm-bindgen = { version = "0.2.92", optional = true }
+bitcoin = "0.32.5"
+bitcoin_hashes = "0.15.0"
+nostr-sdk = { workspace = true }
+
+
+[features]
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen"]
+sqlx = ["dep:wasm-bindgen", "dep:sqlx", "dep:sqlx-crud"]

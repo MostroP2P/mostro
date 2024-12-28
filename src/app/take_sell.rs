@@ -1,11 +1,11 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, send_new_order_msg,
+    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg,
     set_waiting_invoice_status, show_hold_invoice, update_order_event,
 };
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::message::{CantDoReason, Message};
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -102,15 +102,14 @@ pub async fn take_sell_action(
     match order_status {
         Status::Pending => {}
         _ => {
-            send_new_order_msg(
+            send_cant_do_msg(
                 request_id,
                 Some(order.id),
-                Action::NotAllowedByStatus,
-                None,
+                Some(CantDoReason::NotAllowedByStatus),
                 &buyer_trade_pubkey,
-                None,
             )
             .await;
+
             return Ok(());
         }
     }
@@ -119,15 +118,14 @@ pub async fn take_sell_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        send_new_order_msg(
+        send_cant_do_msg(
             request_id,
             Some(order.id),
-            Action::OutOfRangeFiatAmount,
-            None,
+            Some(CantDoReason::OutOfRangeFiatAmount),
             &event.rumor.pubkey,
-            None,
         )
         .await;
+
         return Ok(());
     }
 

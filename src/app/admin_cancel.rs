@@ -4,11 +4,11 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_dm, send_new_order_msg, update_order_event};
+use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, update_order_event};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
-use mostro_core::message::{Action, Message, MessageKind};
+use mostro_core::message::{Action, CantDoReason, Message, MessageKind};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -35,15 +35,14 @@ pub async fn admin_cancel_action(
 
     match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order_id).await {
         Ok(false) => {
-            send_new_order_msg(
-                inner_message.request_id,
+            send_cant_do_msg(
+                request_id,
                 Some(order_id),
-                Action::IsNotYourDispute,
-                None,
+                Some(CantDoReason::IsNotYourDispute),
                 &event.rumor.pubkey,
-                inner_message.trade_index,
             )
             .await;
+
             return Ok(());
         }
         Err(e) => {
@@ -78,15 +77,14 @@ pub async fn admin_cancel_action(
     }
 
     if order.status != Status::Dispute.to_string() {
-        send_new_order_msg(
-            inner_message.request_id,
+        send_cant_do_msg(
+            request_id,
             Some(order.id),
-            Action::NotAllowedByStatus,
-            None,
+            Some(CantDoReason::NotAllowedByStatus),
             &event.rumor.pubkey,
-            inner_message.trade_index,
         )
         .await;
+
         return Ok(());
     }
 

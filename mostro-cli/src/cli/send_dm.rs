@@ -32,7 +32,6 @@ pub async fn execute_send_dm(
         std::process::exit(0)
     };
 
-
     send_message_sync(client, None, &trade_keys, receiver, message, true, true).await?;
 
     Ok(())

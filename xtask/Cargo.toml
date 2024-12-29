@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cargo_metadata = "0.19.1"
+clap = { workspace = true }
+ihex = "3.0.0"
+tracing = "0.1.40"
+tracing-subscriber = { workspace = true }

@@ -23,7 +23,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-nostr-sdk = { workspace = true }
+nostr-sdk = { git  = "https://github.com/rust-nostr/nostr", features = ["nip06", "nip44", "nip59"], rev ="70db575d51965240aab1e1b3f1edab782c0ef625"}
 tokio = { version = "1.42.0", features = ["full"] }
 comfy-table = "7.0.1"
 log = "0.4.17"

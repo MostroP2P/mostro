@@ -30,7 +30,7 @@ fn create_mostro_db() -> Result<Vec<String>> {
             if let Some(file_name) = file.file_name().to_str() {
                 if file_name.ends_with(".sql") {
                     let table_content = std::fs::read_to_string(migrations_root().join(file_name))
-                        .expect("Failed to read file");
+                        .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))?;
                     tables.push(table_content);
                 }
             }

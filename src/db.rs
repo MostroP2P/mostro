@@ -48,13 +48,15 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
     let conn = if !db_path.exists() {
-        let _file = std::fs::File::create_new(db_path).unwrap();
+        let _file = std::fs::File::create_new(db_path)
+            .map_err(|e| anyhow::anyhow!("Error creating db file: {}", e))?;
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
                 tracing::info!("created mostro db file: {}", db_url);
                 if let Ok(tables) = create_mostro_db() {
                     for table in tables {
-                        sqlx::query(&table).execute(&pool).await.unwrap();
+                        sqlx::query(&table).execute(&pool).await
+                            .map_err(|e| anyhow::anyhow!("Migration failed: {}", e))?;
                     }
                 }
                 pool

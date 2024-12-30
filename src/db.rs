@@ -1,29 +1,73 @@
 use crate::app::rate_user::{MAX_RATING, MIN_RATING};
+use anyhow::Result;
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::order::Status;
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
-use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
+use std::path::Path;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::cli::settings::Settings;
 
-pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
+fn migrations_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .to_path_buf()
+}
+
+// Get all migrations files
+fn create_mostro_db() -> Result<Vec<String>> {
+    let mut tables = Vec::new();
+    if let Ok(files) = std::fs::read_dir(migrations_root()) {
+        for file in files.flatten() {
+            if let Some(file_name) = file.file_name().to_str() {
+                if file_name.ends_with(".sql") {
+                    let table_content = std::fs::read_to_string(migrations_root().join(file_name))
+                        .expect("Failed to read file");
+                    tables.push(table_content);
+                }
+            }
+        }
+    }
+    Ok(tables)
+}
+
+pub async fn connect() -> Result<Pool<Sqlite>> {
+    // Get mostro settings
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url;
     db_url.push_str("mostro.db");
-    if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-        panic!("Not database found, please create a new one first!");
-    }
-    let pool = SqlitePool::connect(&db_url).await?;
-
-    Ok(pool)
+    // Remove sqlite:// from db_url
+    let tmp = db_url.replace("sqlite://", "");
+    let db_path = Path::new(&tmp);
+    let conn = if !db_path.exists() {
+        let _file = std::fs::File::create_new(db_path).unwrap();
+        match SqlitePool::connect(&db_url).await {
+            Ok(pool) => {
+                tracing::info!("created mostro db file: {}", db_url);
+                if let Ok(tables) = create_mostro_db() {
+                    for table in tables {
+                        sqlx::query(&table).execute(&pool).await.unwrap();
+                    }
+                }
+                pool
+            }
+            Err(e) => {
+                tracing::error!("Error creating mostro db file: {}", e);
+                return Err(anyhow::anyhow!("Error creating mostro db file: {}", e));
+            }
+        }
+    } else {
+        SqlitePool::connect(&db_url).await?
+    };
+    Ok(conn)
 }
 
 pub async fn edit_buyer_pubkey_order(

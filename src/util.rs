@@ -317,9 +317,13 @@ pub async fn send_dm(
 pub fn get_keys() -> Result<Keys> {
     let nostr_settings = Settings::get_nostr();
     // nostr private key
-    let my_keys = Keys::parse(nostr_settings.nsec_privkey)?;
-
-    Ok(my_keys)
+    match Keys::parse(nostr_settings.nsec_privkey) {
+        Ok(my_keys) => Ok(my_keys),
+        Err(e) => {
+            tracing::error!("Failed to parse nostr private key: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

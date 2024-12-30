@@ -3,7 +3,6 @@ use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::ffi::OsString;
-use std::fs;
 use std::io::{stdin, stdout, BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -198,8 +197,8 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
 
     // If settings dir is not existing
     if !folder_default {
-        println!(
-            "Creating .mostro default directory {}",
+        tracing::info!(
+            "Creating mostro default directory with path: {}",
             settings_dir_default.display()
         );
         print!("Are you sure? (Y/n) > ");
@@ -215,9 +214,16 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
 
         match user_input.to_lowercase().as_str().trim_end() {
             "y" | "" => {
-                fs::create_dir(settings_dir_default.clone())?;
-                println!("You have created mostro default directory!");
-                println!("Please, copy settings.tpl.toml and mostro.db too files in {} folder then edit settings file fields with right values (see README.md)", settings_dir_default.display());
+                if std::fs::create_dir(settings_dir_default.clone()).is_ok() {
+                    tracing::info!("You have created mostro default directory!");
+                    let mut config_file =
+                        std::fs::File::create_new(settings_dir_default.join("settings.toml"))?;
+                    let buf = include_bytes!("../../settings.tpl.toml");
+                    config_file.write_all(buf)?;
+                    config_file.flush()?;
+                }
+                println!("Copied template settings file to {} folder, please edit settings file fields with your values (see README.md)", settings_dir_default.display());
+                println!("Mostro database will be created automatically, but before complete correctly settings toml file");
                 process::exit(0);
             }
             "n" => {

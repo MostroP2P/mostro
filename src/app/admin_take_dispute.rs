@@ -121,7 +121,7 @@ pub async fn admin_take_dispute_action(
     );
     let message = message.as_json()?;
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message, None).await?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.rumor.pubkey.to_hex());
@@ -150,8 +150,14 @@ pub async fn admin_take_dispute_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&buyer_pubkey, sender_keys.clone(), msg_to_buyer.as_json()?).await?;
-    send_dm(&seller_pubkey, sender_keys, msg_to_seller.as_json()?).await?;
+    send_dm(
+        &buyer_pubkey,
+        sender_keys.clone(),
+        msg_to_buyer.as_json()?,
+        None,
+    )
+    .await?;
+    send_dm(&seller_pubkey, sender_keys, msg_to_seller.as_json()?, None).await?;
     // We create a tag to show status of the dispute
     let tags: Tags = Tags::new(vec![
         Tag::custom(

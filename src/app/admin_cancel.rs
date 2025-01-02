@@ -71,7 +71,7 @@ pub async fn admin_cancel_action(
         );
         if let Ok(message) = message.as_json() {
             let sender_keys = crate::util::get_keys().unwrap();
-            let _ = send_dm(&event.rumor.pubkey, sender_keys, message).await;
+            let _ = send_dm(&event.rumor.pubkey, sender_keys, message, None).await;
         }
         return Ok(());
     }
@@ -147,7 +147,7 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message.clone()).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message.clone(), None).await?;
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
@@ -158,8 +158,8 @@ pub async fn admin_cancel_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&seller_pubkey, sender_keys.clone(), message.clone()).await?;
-    send_dm(&buyer_pubkey, sender_keys, message).await?;
+    send_dm(&seller_pubkey, sender_keys.clone(), message.clone(), None).await?;
+    send_dm(&buyer_pubkey, sender_keys, message, None).await?;
 
     Ok(())
 }

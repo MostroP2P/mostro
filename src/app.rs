@@ -35,13 +35,12 @@ use crate::app::trade_pubkey::trade_pubkey_action;
 use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
+use crate::db::is_user_present;
 use crate::lightning::LndConnector;
-use crate::nip59::unwrap_gift_wrap;
 use crate::util::send_cant_do_msg;
 use crate::Settings;
 
 // External dependencies
-use crate::db::is_user_present;
 use anyhow::Result;
 use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::user::User;
@@ -236,7 +235,13 @@ pub async fn run(
                         tracing::warn!("Error in event verification")
                     };
 
-                    let event = unwrap_gift_wrap(&my_keys, &event)?;
+                    let event = match nip59::extract_rumor(&my_keys, &event).await {
+                        Ok(u) => u,
+                        Err(_) => {
+                            println!("Error unwrapping gift");
+                            continue;
+                        }
+                    };
                     // Discard events older than 10 seconds to prevent replay attacks
                     let since_time = chrono::Utc::now()
                         .checked_sub_signed(chrono::Duration::seconds(10))

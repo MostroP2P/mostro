@@ -222,9 +222,8 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
                     config_file.write_all(buf)?;
                     config_file.flush()?;
                 }
-                println!("Copied template settings file to {} folder, please edit settings file fields with your values (see README.md)", settings_dir_default.display());
-                println!("Mostro database will be created automatically, but before complete correctly settings toml file");
-                process::exit(0);
+                println!("Copied template settings file to {} folder and creating mostro.db database file", settings_dir_default.display());
+                return Ok(settings_dir_default);
             }
             "n" => {
                 println!("Try again with another folder...");
@@ -235,8 +234,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
                 process::exit(0);
             }
         };
-    } else {
-        // Set path
-        Ok(settings_dir_default)
     }
+    // Set path
+    Ok(settings_dir_default)
 }

@@ -55,7 +55,9 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
                 tracing::info!("created mostro db file: {}", db_url);
                 if let Ok(tables) = create_mostro_db() {
                     for table in tables {
-                        sqlx::query(&table).execute(&pool).await
+                        sqlx::query(&table)
+                            .execute(&pool)
+                            .await
                             .map_err(|e| anyhow::anyhow!("Migration failed: {}", e))?;
                     }
                 }

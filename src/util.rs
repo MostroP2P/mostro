@@ -331,7 +331,7 @@ pub async fn send_dm(
 pub fn get_keys() -> Result<Keys> {
     let nostr_settings = Settings::get_nostr();
     // nostr private key
-    match Keys::parse(nostr_settings.nsec_privkey) {
+    match Keys::parse(&nostr_settings.nsec_privkey) {
         Ok(my_keys) => Ok(my_keys),
         Err(e) => {
             tracing::error!("Failed to parse nostr private key: {}", e);

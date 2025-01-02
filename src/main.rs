@@ -9,7 +9,6 @@ pub mod lnurl;
 pub mod messages;
 pub mod models;
 pub mod nip33;
-pub mod nip59;
 pub mod scheduler;
 pub mod util;
 

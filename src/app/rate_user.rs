@@ -23,14 +23,14 @@ pub async fn get_user_reputation(user: &str, my_keys: &Keys) -> Result<Option<Ra
     // Request NIP33 of the counterparts
     let filters = Filter::new()
         .author(my_keys.public_key())
-        .kind(Kind::ParameterizedReplaceable(NOSTR_REPLACEABLE_EVENT_KIND))
+        .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
         .custom_tag(SingleLetterTag::lowercase(Alphabet::Z), vec!["rating"])
         .identifier(user.to_string());
 
     let mut user_reputation_event = NOSTR_CLIENT
         .get()
         .unwrap()
-        .fetch_events(vec![filters], Some(Duration::from_secs(10)))
+        .fetch_events(vec![filters], Duration::from_secs(10))
         .await?
         .to_vec();
 

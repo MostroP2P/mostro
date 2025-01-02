@@ -4,11 +4,11 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_dm, send_new_order_msg, update_order_event};
+use crate::util::{get_nostr_client, send_cant_do_msg, send_dm, update_order_event};
 
 use anyhow::{Error, Result};
 use mostro_core::dispute::Status as DisputeStatus;
-use mostro_core::message::{Action, Message, MessageKind};
+use mostro_core::message::{Action, CantDoReason, Message, MessageKind};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -35,15 +35,14 @@ pub async fn admin_cancel_action(
 
     match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order_id).await {
         Ok(false) => {
-            send_new_order_msg(
-                inner_message.request_id,
+            send_cant_do_msg(
+                request_id,
                 Some(order_id),
-                Action::IsNotYourDispute,
-                None,
+                Some(CantDoReason::IsNotYourDispute),
                 &event.rumor.pubkey,
-                inner_message.trade_index,
             )
             .await;
+
             return Ok(());
         }
         Err(e) => {
@@ -72,21 +71,20 @@ pub async fn admin_cancel_action(
         );
         if let Ok(message) = message.as_json() {
             let sender_keys = crate::util::get_keys().unwrap();
-            let _ = send_dm(&event.rumor.pubkey, sender_keys, message).await;
+            let _ = send_dm(&event.rumor.pubkey, sender_keys, message, None).await;
         }
         return Ok(());
     }
 
     if order.status != Status::Dispute.to_string() {
-        send_new_order_msg(
-            inner_message.request_id,
+        send_cant_do_msg(
+            request_id,
             Some(order.id),
-            Action::NotAllowedByStatus,
-            None,
+            Some(CantDoReason::NotAllowedByStatus),
             &event.rumor.pubkey,
-            inner_message.trade_index,
         )
         .await;
+
         return Ok(());
     }
 
@@ -149,7 +147,7 @@ pub async fn admin_cancel_action(
     let message = message.as_json()?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message.clone()).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message.clone(), None).await?;
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
@@ -160,8 +158,8 @@ pub async fn admin_cancel_action(
         (_, None) => return Err(Error::msg("Missing buyer pubkey")),
     };
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&seller_pubkey, sender_keys.clone(), message.clone()).await?;
-    send_dm(&buyer_pubkey, sender_keys, message).await?;
+    send_dm(&seller_pubkey, sender_keys.clone(), message.clone(), None).await?;
+    send_dm(&buyer_pubkey, sender_keys, message, None).await?;
 
     Ok(())
 }

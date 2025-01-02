@@ -9,13 +9,13 @@ pub mod lnurl;
 pub mod messages;
 pub mod models;
 pub mod nip33;
-pub mod nip59;
 pub mod scheduler;
 pub mod util;
 
 use crate::app::run;
 use crate::cli::settings::{init_global_settings, Settings};
 use crate::cli::settings_init;
+use crate::lightning::LnStatus;
 use anyhow::Result;
 use db::find_held_invoices;
 use lightning::LndConnector;
@@ -32,6 +32,7 @@ use util::{get_nostr_client, invoice_subscribe};
 
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
+static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,6 +86,11 @@ async fn main() -> Result<()> {
     client.subscribe(vec![subscription], None).await?;
 
     let mut ln_client = LndConnector::new().await?;
+    let ln_status = ln_client.get_node_info().await?;
+    let ln_status = LnStatus::from_get_info_response(ln_status);
+    if LN_STATUS.set(ln_status).is_err() {
+        panic!("No connection to LND node - shutting down Mostro!");
+    };
 
     if let Ok(held_invoices) = find_held_invoices(&pool).await {
         for invoice in held_invoices.iter() {

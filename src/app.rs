@@ -15,6 +15,7 @@ pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
+pub mod trade_pubkey; // Trade pubkey action
 
 // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
@@ -30,17 +31,16 @@ use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
-
+use crate::app::trade_pubkey::trade_pubkey_action;
 use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
+use crate::db::is_user_present;
 use crate::lightning::LndConnector;
-use crate::nip59::unwrap_gift_wrap;
 use crate::util::send_cant_do_msg;
 use crate::Settings;
 
 // External dependencies
-use crate::db::is_user_present;
 use anyhow::Result;
 use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::user::User;
@@ -72,7 +72,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
     // Only process actions related to trading
     if !matches!(
         message_kind.action,
-        Action::NewOrder | Action::TakeBuy | Action::TakeSell
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell | Action::TradePubkey
     ) {
         return;
     }
@@ -191,6 +191,7 @@ async fn handle_message_action(
         Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client).await,
         Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool).await,
         Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool).await,
+        Action::TradePubkey => trade_pubkey_action(msg, event, pool).await,
 
         _ => {
             tracing::info!("Received message with action {:?}", action);
@@ -234,7 +235,13 @@ pub async fn run(
                         tracing::warn!("Error in event verification")
                     };
 
-                    let event = unwrap_gift_wrap(&my_keys, &event)?;
+                    let event = match nip59::extract_rumor(&my_keys, &event).await {
+                        Ok(u) => u,
+                        Err(_) => {
+                            println!("Error unwrapping gift");
+                            continue;
+                        }
+                    };
                     // Discard events older than 10 seconds to prevent replay attacks
                     let since_time = chrono::Utc::now()
                         .checked_sub_signed(chrono::Duration::seconds(10))

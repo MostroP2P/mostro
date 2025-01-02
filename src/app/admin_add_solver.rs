@@ -57,7 +57,7 @@ pub async fn admin_add_solver_action(
     let message = message.as_json()?;
     // Send the message
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message).await?;
+    send_dm(&event.rumor.pubkey, sender_keys, message, None).await?;
 
     Ok(())
 }

@@ -9,7 +9,6 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
-use crate::nip59::gift_wrap;
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
@@ -292,14 +291,29 @@ pub async fn send_dm(
     receiver_pubkey: &PublicKey,
     sender_keys: Keys,
     payload: String,
+    expiration: Option<Timestamp>,
 ) -> Result<()> {
     info!(
         "sender key {} - receiver key {}",
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
+    let message = Message::from_json(&payload).unwrap();
+    // We sign the message
+    let sig = message.get_inner_message_kind().sign(&sender_keys);
+    // We compose the content
+    let content = (message, sig);
+    let content = serde_json::to_string(&content).unwrap();
+    // We create the rumor
+    let rumor = EventBuilder::text_note(content).build(sender_keys.public_key());
+    let mut tags: Vec<Tag> = Vec::with_capacity(1 + usize::from(expiration.is_some()));
 
-    let event = gift_wrap(&sender_keys, *receiver_pubkey, payload.clone(), None)?;
+    if let Some(timestamp) = expiration {
+        tags.push(Tag::expiration(timestamp));
+    }
+    let tags = Tags::new(tags);
+
+    let event = EventBuilder::gift_wrap(&sender_keys, receiver_pubkey, rumor, tags).await?;
     info!(
         "Sending DM, Event ID: {} with payload: {:#?}",
         event.id, payload
@@ -682,7 +696,7 @@ pub async fn send_cant_do_msg(
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message).await;
+        let _ = send_dm(destination_key, sender_keys, message, None).await;
     }
 }
 
@@ -698,7 +712,7 @@ pub async fn send_new_order_msg(
     let message = Message::new_order(order_id, request_id, trade_index, action, payload);
     if let Ok(message) = message.as_json() {
         let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message).await;
+        let _ = send_dm(destination_key, sender_keys, message, None).await;
     }
 }
 
@@ -820,7 +834,7 @@ mod tests {
         ));
         let payload = message.as_json().unwrap();
         let sender_keys = Keys::generate();
-        let result = send_dm(&receiver_pubkey, sender_keys, payload).await;
+        let result = send_dm(&receiver_pubkey, sender_keys, payload, None).await;
         assert!(result.is_ok());
     }
 

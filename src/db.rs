@@ -17,9 +17,17 @@ use uuid::Uuid;
 use crate::cli::settings::Settings;
 
 fn migrations_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    if Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("migrations")
-        .to_path_buf()
+        .exists()
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .to_path_buf()
+    } else {
+        tracing::error!("Migrations directory not found");
+        std::process::exit(1);
+    }
 }
 
 // Get all migrations files

@@ -3,14 +3,12 @@ use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{stdin, stdout, BufRead, Write};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process;
 
 #[cfg(windows)]
 fn has_trailing_slash(p: &Path) -> bool {
@@ -198,39 +196,20 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
 
     // If settings dir is not existing
     if !folder_default {
-        println!(
-            "Creating .mostro default directory {}",
+        if std::fs::create_dir(settings_dir_default.clone()).is_ok() {
+            tracing::info!("Created mostro default directory!");
+            let mut config_file =
+                std::fs::File::create_new(settings_dir_default.join("settings.toml"))?;
+            let buf = include_bytes!("../../settings.tpl.toml");
+            config_file.write_all(buf)?;
+            config_file.flush()?;
+        }
+        tracing::info!(
+            "Created settings file based on template and copied to {} directory",
             settings_dir_default.display()
         );
-        print!("Are you sure? (Y/n) > ");
-
-        // Ask user confirm for default folder
-        let mut user_input = String::new();
-        let _input = stdin();
-
-        stdout().flush()?;
-
-        let mut answer = stdin().lock();
-        answer.read_line(&mut user_input)?;
-
-        match user_input.to_lowercase().as_str().trim_end() {
-            "y" | "" => {
-                fs::create_dir(settings_dir_default.clone())?;
-                println!("You have created mostro default directory!");
-                println!("Please, copy settings.tpl.toml and mostro.db too files in {} folder then edit settings file fields with right values (see README.md)", settings_dir_default.display());
-                process::exit(0);
-            }
-            "n" => {
-                println!("Try again with another folder...");
-                process::exit(0);
-            }
-            &_ => {
-                println!("Can't get what you're saying!");
-                process::exit(0);
-            }
-        };
-    } else {
-        // Set path
-        Ok(settings_dir_default)
+        return Ok(settings_dir_default);
     }
+    // Set path
+    Ok(settings_dir_default)
 }

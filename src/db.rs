@@ -1,29 +1,85 @@
 use crate::app::rate_user::{MAX_RATING, MIN_RATING};
+use anyhow::Result;
 use mostro_core::dispute::Dispute;
 use mostro_core::order::Order;
 use mostro_core::order::Status;
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
-use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
+use std::path::Path;
 use uuid::Uuid;
 
 use crate::cli::settings::Settings;
 
-pub async fn connect() -> Result<Pool<Sqlite>, sqlx::Error> {
+pub async fn connect() -> Result<Pool<Sqlite>> {
+    // Get mostro settings
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url;
     db_url.push_str("mostro.db");
-    if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-        panic!("Not database found, please create a new one first!");
-    }
-    let pool = SqlitePool::connect(&db_url).await?;
-
-    Ok(pool)
+    // Remove sqlite:// from db_url
+    let tmp = db_url.replace("sqlite://", "");
+    let db_path = Path::new(&tmp);
+    let conn = if !db_path.exists() {
+        let _file = std::fs::File::create_new(db_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create database file at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
+        match SqlitePool::connect(&db_url).await {
+            Ok(pool) => {
+                tracing::info!(
+                    "Successfully created Mostro database file at {}",
+                    db_path.display(),
+                );
+                match sqlx::migrate!().run(&pool).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        // Clean up the created file on migration failure
+                        if let Err(cleanup_err) = std::fs::remove_file(db_path) {
+                            tracing::error!(
+                                error = %cleanup_err,
+                                path = %db_path.display(),
+                                "Failed to create database connection"
+                            );
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Failed to create database connection at {}: {}",
+                            db_path.display(),
+                            e
+                        ));
+                    }
+                }
+                pool
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %db_path.display(),
+                    "Failed to create database connection"
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to create database connection at {}: {}",
+                    db_path.display(),
+                    e
+                ));
+            }
+        }
+    } else {
+        SqlitePool::connect(&db_url).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to existing database at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?
+    };
+    Ok(conn)
 }
 
 pub async fn edit_buyer_pubkey_order(
@@ -273,7 +329,7 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
         r#"
           SELECT *
           FROM orders
-          WHERE invoice_held_at !=0 true AND  status == 'active'
+          WHERE invoice_held_at !=0 AND  status == 'active'
         "#,
     )
     .fetch_all(pool)

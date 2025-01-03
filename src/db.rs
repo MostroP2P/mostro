@@ -24,30 +24,60 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
     let conn = if !db_path.exists() {
-        let _file = std::fs::File::create_new(db_path)
-            .map_err(|e| anyhow::anyhow!("Error creating db file: {}", e))?;
+        let _file = std::fs::File::create_new(db_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create database file at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
-                tracing::info!("created mostro db file: {}", db_url);
+                tracing::info!(
+                    path = %db_path.display(),
+                    "Successfully created Mostro database file"
+                );
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => (),
                     Err(e) => {
                         // Clean up the created file on migration failure
                         if let Err(cleanup_err) = std::fs::remove_file(db_path) {
-                            tracing::warn!("Failed to clean up db file: {}", cleanup_err);
+                            tracing::error!(
+                                error = %cleanup_err,
+                                path = %db_path.display(),
+                                "Failed to create database connection"
+                            );
                         }
-                        return Err(anyhow::anyhow!("Failed to run migrations: {}", e));
+                        return Err(anyhow::anyhow!(
+                            "Failed to create database connection at {}: {}",
+                            db_path.display(),
+                            e
+                        ));
                     }
                 }
                 pool
             }
             Err(e) => {
-                tracing::error!("Error creating mostro db file: {}", e);
-                return Err(anyhow::anyhow!("Error creating mostro db file: {}", e));
+                tracing::error!(
+                    error = %e,
+                    path = %db_path.display(),
+                    "Failed to create database connection"
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to create database connection at {}: {}",
+                    db_path.display(),
+                    e
+                ));
             }
         }
     } else {
-        SqlitePool::connect(&db_url).await?
+        SqlitePool::connect(&db_url).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to existing database at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?
     };
     Ok(conn)
 }

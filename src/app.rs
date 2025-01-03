@@ -260,14 +260,21 @@ pub async fn run(
                             }
                         };
                     let inner_message = message.get_inner_message_kind();
+
+                    let sender_matches_rumor = event.sender == event.rumor.pubkey;
+
                     if let Some(sig) = sig {
-                        // If seal and rumor pubkeys are different, we have to verify the signature in the content
-                        if event.sender != event.rumor.pubkey
+                        // Verify signature only if sender and rumor pubkey are different
+                        if !sender_matches_rumor
                             && !inner_message.verify_signature(event.rumor.pubkey, sig)
                         {
                             tracing::warn!("Error in event verification");
                             continue;
                         }
+                    } else if !sender_matches_rumor {
+                        // If there is no signature and the sender does not match the rumor pubkey, there is also an error
+                        tracing::warn!("Error in event verification");
+                        continue;
                     }
 
                     // Check if message is message with trade index

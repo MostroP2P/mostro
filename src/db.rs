@@ -32,6 +32,10 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => (),
                     Err(e) => {
+                        // Clean up the created file on migration failure
+                        if let Err(cleanup_err) = std::fs::remove_file(db_path) {
+                            tracing::warn!("Failed to clean up db file: {}", cleanup_err);
+                        }
                         return Err(anyhow::anyhow!("Failed to run migrations: {}", e));
                     }
                 }

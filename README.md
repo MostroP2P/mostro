@@ -52,7 +52,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 
 ## Requirements
 
-0. You need Rust version 1.74 or higher to compile.
+0. You need Rust version 1.82 or higher to compile.
 1. You will need a lightning network node.
 
 ## Install dependencies
@@ -75,12 +75,11 @@ brew install cmake pkg-config openssl sqlite3
 
 If you want to run Mostro on your local machine, you can follow the instructions below, if you want to run it on a server, you can follow the instructions in the [INSTALL.md](INSTALL.md) file.
 
-Clone the repository and then create a new `settings.toml` file based on `settings.tpl.toml` file.
+Clone the repository and then edit the `settings.tpl.toml` file with your Mostro Nostr private key and other settings.
 
 ```bash
 git clone https://github.com/MostroP2P/mostro.git
 cd mostro
-cp settings.tpl.toml settings.toml
 ```
 
 To connect to an LND node, you must define 3 variables within the [lightning] section of the settings.toml file.
@@ -95,22 +94,13 @@ _lnd_grpc_host:_ IP address or domain name from the LND node and port, example: 
 
 The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.
 
-Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
-
-```bash
-cargo install sqlx-cli --version 0.6.2
-./init_db.sh
-```
+This file is automatically created and initialized when you run the Mostro daemon for the first time.
 
 ### Running it
 
 Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
 
-You must create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
-
-```bash
-mkdir $HOME/.mostro/ && cp settings.toml mostro.db $HOME/.mostro/
-```
+When you run mostro for first time it will create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
 
 Finnaly run it:
 
@@ -123,8 +113,7 @@ cargo run
 ### Option 1: Run Mostro with a private dockerized relay
 
 ```bash
-cd docker
-docker compose up nostr-relay
+make docker-up
 ```
 
 This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
@@ -134,46 +123,11 @@ So the relay URL you want to connect to is: `ws://localhost:7000`.
 You need to set `relays` in the `[nostr]` section of the `settings.toml` file:
 relays = ['ws://localhost:7000']
 
-#### Troubleshooting
-
-If in the relay logs the error appears: `unable to open database file: /usr/src/app/db/nostr.db` you need to modify the `compose.yml` file in the `docker` directory with:
-
-```yml
-services:
-  mostro:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    volumes:
-      - ./config:/config  # settings.toml and mostro.db
-    platform: linux/amd64
-    networks:
-      - default
-
-  nostr-relay:
-    image: scsibug/nostr-rs-relay
-    container_name: nostr-relay
-    ports:
-      - '${MOSTRO_RELAY_LOCAL_PORT:-7000}:8080'
-    volumes:
-      - 'mostro_data:/usr/src/app/db:Z'
-      - './config/relay/config.toml:/usr/src/app/config.toml:ro,Z'
-
-networks:
-  default:
-    driver: bridge
-
-volumes:
-  mostro_data:
-```
-
-### Option 2: Connect to any other relay
-
-You just need to set `relays` in the `[nostr]` section of the `settings.toml` file with the relays you will use.
-
 ## Dockerized Mostro
 
 If you want to run a dockerized version of Mostro, you can follow the step-by-step instructions in the [Docker Guide for MostroP2P](./docker/README.md).
+
+Or you can use [mostro-regtest](https://github.com/MostroP2P/mostro-regtest) to run a local nostr relay, lightning node and a Mostro instance.
 
 ## Contribute
 
@@ -186,6 +140,7 @@ More info in our [contributing guide](CONTRIBUTING.md).
 To incentivize collaborators we have a **Rewards board**, we must clarify that Mostro is not a company but an open source project, the amounts offered are a way to thank for collaboration and we can offer it thanks to the generous donation of contributors, mostly anonymous, but also to two important institutions that have given us grants, you can check it [here](https://github.com/orgs/MostroP2P/projects/2/views/1).
 
 ## Documentation
+
 - Protocol documentation: [https://mostro.network/protocol](https://mostro.network/protocol/)
 - Frequently Asked Questions: in [English](https://mostro.network/docs-english/), in [Spanish](https://mostro.network/docs-spanish/).
 

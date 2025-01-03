@@ -11,41 +11,9 @@ use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use std::path::Path;
-use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::cli::settings::Settings;
-
-fn migrations_root() -> PathBuf {
-    if Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("migrations")
-        .exists()
-    {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("migrations")
-            .to_path_buf()
-    } else {
-        tracing::error!("Migrations directory not found");
-        std::process::exit(1);
-    }
-}
-
-// Get all migrations files
-fn create_mostro_db() -> Result<Vec<String>> {
-    let mut tables = Vec::new();
-    if let Ok(files) = std::fs::read_dir(migrations_root()) {
-        for file in files.flatten() {
-            if let Some(file_name) = file.file_name().to_str() {
-                if file_name.ends_with(".sql") {
-                    let table_content = std::fs::read_to_string(migrations_root().join(file_name))
-                        .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))?;
-                    tables.push(table_content);
-                }
-            }
-        }
-    }
-    Ok(tables)
-}
 
 pub async fn connect() -> Result<Pool<Sqlite>> {
     // Get mostro settings
@@ -61,12 +29,10 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
                 tracing::info!("created mostro db file: {}", db_url);
-                if let Ok(tables) = create_mostro_db() {
-                    for table in tables {
-                        sqlx::query(&table)
-                            .execute(&pool)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Migration failed: {}", e))?;
+                match sqlx::migrate!().run(&pool).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to run migrations: {}", e));
                     }
                 }
                 pool

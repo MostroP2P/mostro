@@ -34,8 +34,8 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
                 tracing::info!(
-                    path = %db_path.display(),
-                    "Successfully created Mostro database file"
+                    "Successfully created Mostro database file at {}",
+                    db_path.display(),
                 );
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => (),

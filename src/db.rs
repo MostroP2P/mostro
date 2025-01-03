@@ -329,7 +329,7 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
         r#"
           SELECT *
           FROM orders
-          WHERE invoice_held_at !=0 true AND  status == 'active'
+          WHERE invoice_held_at !=0 AND  status == 'active'
         "#,
     )
     .fetch_all(pool)

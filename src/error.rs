@@ -5,6 +5,7 @@ pub enum MostroError {
     ParsingInvoiceError,
     ParsingNumberError,
     InvoiceExpiredError,
+    InvoiceInvalidError,
     MinExpirationTimeError,
     MinAmountError,
     WrongAmountError,
@@ -17,6 +18,11 @@ pub enum MostroError {
     LnPaymentError(String),
     LnNodeError(String),
     InvalidOrderKind,
+    InvalidOrderStatus,
+    InvalidPubkey,
+    InvalidOrderId,
+    HoldInvoiceError,
+    OrderNotFound,
 }
 
 impl std::error::Error for MostroError {}
@@ -28,6 +34,7 @@ impl fmt::Display for MostroError {
             MostroError::ParsingNumberError => write!(f, "Error parsing the number"),
             MostroError::InvoiceExpiredError => write!(f, "Invoice has expired"),
             MostroError::MinExpirationTimeError => write!(f, "Minimal expiration time on invoice"),
+            MostroError::InvoiceInvalidError => write!(f, "Invoice is invalid"),
             MostroError::MinAmountError => write!(f, "Minimal payment amount"),
             MostroError::WrongAmountError => write!(f, "The amount on this invoice is wrong"),
             MostroError::NoAPIResponse => write!(f, "Price API not answered - retry"),
@@ -39,6 +46,11 @@ impl fmt::Display for MostroError {
             MostroError::LnPaymentError(e) => write!(f, "Lightning payment failure cause: {}",e),
             MostroError::LnNodeError(e) => write!(f, "Lightning node connection failure caused by: {}",e),
             MostroError::InvalidOrderKind => write!(f, "Invalid order kind"),
+            MostroError::InvalidOrderStatus => write!(f, "Invalid order status"),
+            MostroError::InvalidPubkey => write!(f, "Invalid pubkey"),
+            MostroError::InvalidOrderId => write!(f, "Invalid order id"),
+            MostroError::HoldInvoiceError => write!(f, "Error showing hold invoice"),
+            MostroError::OrderNotFound => write!(f, "Order not found"),
         }
     }
 }

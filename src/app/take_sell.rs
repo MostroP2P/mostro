@@ -1,3 +1,4 @@
+use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg,
@@ -19,7 +20,7 @@ pub async fn take_sell_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
@@ -27,38 +28,36 @@ pub async fn take_sell_action(
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(Error::msg("No order id"));
+        return Err(MostroError::InvalidOrderId);
     };
 
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            return Ok(());
+    let mut order = match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            return Err(MostroError::InvalidOrderId);
+        }
+        Err(_) => {
+            return Err(MostroError::OrderNotFound);
         }
     };
 
-    // Maker can't take own order
-    if order.creator_pubkey == event.rumor.pubkey.to_hex() {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPubkey),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
+    // Check if the order is a buy order and if its status is active
+    if !order.is_sell_order() {
+        return Err(MostroError::InvalidOrderKind);
+    };
+    // Check if the order status is pending
+    if !order.check_status(Status::Pending) {
+        return Err(MostroError::InvalidOrderStatus);
     }
 
-    if order.kind != Kind::Sell.to_string() {
-        return Ok(());
+    // Validate that the order was sent from the correct maker
+    if !order.sent_from_maker(event.rumor.pubkey.to_hex()) {
+        return Err(MostroError::InvalidPubkey);
     }
 
-    // Get trade pubkey of the buyer
-    let buyer_trade_pubkey = event.rumor.pubkey;
-
-    let seller_pubkey = match &order.seller_pubkey {
-        Some(seller) => PublicKey::from_str(seller.as_str())?,
-        _ => return Err(Error::msg("Missing seller pubkeys")),
+    let seller_pubkey = match order.get_seller_pubkey() {
+        Some(pk) => pk,
+        None => return Err(MostroError::InvalidPubkey),
     };
 
     let mut pr: Option<String> = None;
@@ -75,43 +74,9 @@ pub async fn take_sell_action(
             .await
             {
                 Ok(_) => Some(payment_request),
-                Err(e) => {
-                    send_cant_do_msg(
-                        request_id,
-                        Some(order.id),
-                        Some(CantDoReason::InvalidInvoice),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
-                    error!("{e}");
-                    return Ok(());
-                }
+                Err(_) => return Err(MostroError::InvoiceInvalidError),
             }
         };
-    }
-
-    let order_status = match Status::from_str(&order.status) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Order Id {order_id} wrong status: {e:?}");
-            return Ok(());
-        }
-    };
-
-    // Buyer can take Pending orders only
-    match order_status {
-        Status::Pending => {}
-        _ => {
-            send_cant_do_msg(
-                request_id,
-                Some(order.id),
-                Some(CantDoReason::NotAllowedByStatus),
-                &buyer_trade_pubkey,
-            )
-            .await;
-
-            return Ok(());
-        }
     }
 
     // Get amount request if user requested one for range order - fiat amount will be used below
@@ -128,7 +93,8 @@ pub async fn take_sell_action(
 
         return Ok(());
     }
-
+    // Get trade pubkey of the buyer
+    let buyer_trade_pubkey = event.rumor.pubkey;
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(buyer_trade_pubkey.to_string());
     // Add buyer identity pubkey to order

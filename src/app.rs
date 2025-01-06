@@ -36,6 +36,7 @@ use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
+use crate::error::MostroError;
 use crate::lightning::LndConnector;
 use crate::util::send_cant_do_msg;
 use crate::Settings;
@@ -171,7 +172,9 @@ async fn handle_message_action(
         // Order-related actions
         Action::NewOrder => order_action(msg, event, my_keys, pool).await,
         Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await,
-        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool).await,
+        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
 
         // Payment-related actions
         Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
@@ -265,7 +268,7 @@ pub async fn run(
                         if let Some(action) = message.inner_action() {
                             if let Err(e) = handle_message_action(
                                 &action,
-                                message,
+                                message.clone(),
                                 &event,
                                 &my_keys,
                                 &pool,
@@ -274,7 +277,32 @@ pub async fn run(
                             )
                             .await
                             {
-                                warning_msg(&action, e)
+                                match e.downcast_ref::<MostroError>() {
+                                    Some(err) => {
+                                        let cantdo = match err {
+                                            MostroError::InvalidOrderKind => {
+                                                Some(CantDoReason::InvalidOrderKind)
+                                            }
+                                            MostroError::InvalidOrderStatus => {
+                                                Some(CantDoReason::NotAllowedByStatus)
+                                            }
+                                            MostroError::InvalidPubkey => {
+                                                Some(CantDoReason::InvalidPubkey)
+                                            }
+                                            _ => None,
+                                        };
+                                        send_cant_do_msg(
+                                            inner_message.request_id,
+                                            inner_message.id,
+                                            cantdo,
+                                            &event.rumor.pubkey,
+                                        )
+                                        .await;
+                                    }
+                                    None => {
+                                        warning_msg(&action, e);
+                                    }
+                                }
                             }
                         }
                     }

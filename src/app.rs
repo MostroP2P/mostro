@@ -39,6 +39,7 @@ use crate::db::is_user_present;
 use crate::error::MostroError;
 use crate::lightning::LndConnector;
 use crate::util::send_cant_do_msg;
+use crate::MessageQueues;
 use crate::Settings;
 
 // External dependencies
@@ -158,7 +159,6 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 /// * `my_keys` - Node keypair for signing/verification
 /// * `pool` - Database connection pool
 /// * `ln_client` - Lightning network connector
-/// * `rate_list` - Shared list of rating events
 async fn handle_message_action(
     action: &Action,
     msg: Message,
@@ -166,15 +166,12 @@ async fn handle_message_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     match action {
         // Order-related actions
         Action::NewOrder => order_action(msg, event, my_keys, pool).await,
-        Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await,
-        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool)
-            .await
-            .map_err(|e| e.into()),
+        Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await.map_err(|e| e.into()),
+        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool).await.map_err(|e| e.into()),
 
         // Payment-related actions
         Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
@@ -185,7 +182,7 @@ async fn handle_message_action(
         // Dispute and rating actions
         Action::Dispute => dispute_action(msg, event, my_keys, pool).await,
         Action::RateUser => {
-            update_user_reputation_action(msg, event, my_keys, pool, rate_list).await
+            update_user_reputation_action(msg, event, my_keys, pool).await
         }
         Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client).await,
 
@@ -217,7 +214,6 @@ pub async fn run(
     client: &Client,
     ln_client: &mut LndConnector,
     pool: Pool<Sqlite>,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
@@ -273,36 +269,10 @@ pub async fn run(
                                 &my_keys,
                                 &pool,
                                 ln_client,
-                                rate_list.clone(),
                             )
                             .await
                             {
-                                match e.downcast_ref::<MostroError>() {
-                                    Some(err) => {
-                                        let cantdo = match err {
-                                            MostroError::InvalidOrderKind => {
-                                                Some(CantDoReason::InvalidOrderKind)
-                                            }
-                                            MostroError::InvalidOrderStatus => {
-                                                Some(CantDoReason::NotAllowedByStatus)
-                                            }
-                                            MostroError::InvalidPubkey => {
-                                                Some(CantDoReason::InvalidPubkey)
-                                            }
-                                            _ => None,
-                                        };
-                                        send_cant_do_msg(
-                                            inner_message.request_id,
-                                            inner_message.id,
-                                            cantdo,
-                                            &event.rumor.pubkey,
-                                        )
-                                        .await;
-                                    }
-                                    None => {
-                                        warning_msg(&action, e);
-                                    }
-                                }
+                                warning_msg(&action, e);
                             }
                         }
                     }

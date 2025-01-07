@@ -1,7 +1,7 @@
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
-use crate::db::*;
+use crate::{db::*, MESSAGE_QUEUES};
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::util::get_nostr_client;
@@ -9,6 +9,7 @@ use crate::LN_STATUS;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
+use nostr_sdk::prelude::PublicKey;
 use mostro_core::message::Message;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Event, Kind as NostrKind, Tag};
@@ -16,39 +17,52 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use util::{get_keys, get_nostr_relays, update_order_event};
+use crate::MessageQueues;
+use util::{get_keys, get_nostr_relays, update_order_event,send_dm};
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, order_msg_list : Arc<Mutex<Vec<Message>>> , cantdo_msg_list : Arc<Mutex<Vec<Message>>>) {
+pub async fn start_scheduler() {
     info!("Creating scheduler");
 
     job_expire_pending_older_orders().await;
-    job_update_rate_events(rate_list).await;
+    job_update_rate_events().await;
     let _ = job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_info_event_send().await;
     job_relay_list().await;
     job_update_bitcoin_prices().await;
-    job_flush_messages_queue(order_msg_list, cantdo_msg_list).await;
+    job_flush_messages_queue().await;
 
     info!("Scheduler Started");
 }
 
-async fn job_flush_messages_queue( order_msg_list : Arc<Mutex<Vec<Message>>> , cantdo_msg_list : Arc<Mutex<Vec<Message>>>) {
+async fn job_flush_messages_queue() {
+    // Clone for closure owning with Arc
+    let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
+    let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
 
+    // Spawn a new task to flush the messages queue
     tokio::spawn(async move {
         loop {
             info!("Flushing messages in queue");
             // Send message to event creator
             for message in  order_msg_list.lock().await.iter() {
-                if let Ok(message) = message.as_json() {
+                let destination_key = message.1;
+                if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
                     let _ = send_dm(destination_key, sender_keys, message, None).await;
                 }
+            }
+            for message in  cantdo_msg_list.lock().await.iter() {
+                let destination_key = message.1;
+                if let Ok(message) = message.0.as_json() {
+                    let sender_keys = crate::util::get_keys().unwrap();
+                    let _ = send_dm(destination_key, sender_keys, message, None).await;
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        });
-    }
+        }
+    });
+}
 
 
 
@@ -144,9 +158,9 @@ async fn job_retry_failed_payments() {
     });
 }
 
-async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
+async fn job_update_rate_events() {
     // Clone for closure owning with Arc
-    let inner_list = rate_list.clone();
+    let queue_order_rate = MESSAGE_QUEUES.read().await.queue_order_rate.clone();
     let mostro_settings = Settings::get_mostro();
     let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
 
@@ -157,7 +171,7 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
                 interval
             );
 
-            for ev in inner_list.lock().await.iter() {
+            for ev in queue_order_rate.lock().await.iter() {
                 // Send event to relay
                 if let Ok(client) = get_nostr_client() {
                     match client.send_event(ev.clone()).await {
@@ -172,7 +186,7 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
             }
 
             // Clear list after send events
-            inner_list.lock().await.clear();
+            queue_order_rate.lock().await.clear();
 
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(

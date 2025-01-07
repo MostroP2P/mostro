@@ -1,5 +1,5 @@
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_user_rating_event};
-use crate::NOSTR_CLIENT;
+use crate::{MessageQueues, NOSTR_CLIENT};
 
 use crate::db::{is_user_present, update_user_rating};
 use anyhow::{Error, Result};
@@ -52,7 +52,6 @@ pub async fn update_user_reputation_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
@@ -216,7 +215,6 @@ pub async fn update_user_reputation_action(
             order.id,
             my_keys,
             pool,
-            rate_list,
         )
         .await?;
 

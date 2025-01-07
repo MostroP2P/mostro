@@ -9,6 +9,7 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
+use crate::MESSAGE_QUEUES;
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
@@ -288,7 +289,7 @@ async fn prepare_new_order(
 }
 
 pub async fn send_dm(
-    receiver_pubkey: &PublicKey,
+    receiver_pubkey: PublicKey,
     sender_keys: Keys,
     payload: String,
     expiration: Option<Timestamp>,
@@ -349,7 +350,6 @@ pub async fn update_user_rating_event(
     order_id: Uuid,
     keys: &Keys,
     pool: &SqlitePool,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     // Get order from id
     let mut order = match Order::by_id(pool, order_id).await? {
@@ -371,8 +371,7 @@ pub async fn update_user_rating_event(
     order.update(pool).await?;
 
     // Add event message to global list
-    rate_list.lock().await.push(event);
-
+    MESSAGE_QUEUES.write().await.queue_order_rate.push(event);
     Ok(())
 }
 

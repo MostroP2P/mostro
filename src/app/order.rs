@@ -1,6 +1,7 @@
 use crate::cli::settings::Settings;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
+use crate::MessageQueues;
 use anyhow::Result;
 use mostro_core::message::{CantDoReason, Message};
 use nostr::nips::nip59::UnwrappedGift;

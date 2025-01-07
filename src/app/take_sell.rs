@@ -12,7 +12,6 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::str::FromStr;
 use tracing::error;
 
 pub async fn take_sell_action(

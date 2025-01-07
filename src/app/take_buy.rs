@@ -1,11 +1,11 @@
-use crate::error::MostroError;
 use crate::util::{get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice};
+use crate::MESSAGE_QUEUES;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use mostro_core::error::CantDoReason;
 
 use anyhow::Result;
-use mostro_core::message::Message;
+use mostro_core::message::{Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -42,6 +42,8 @@ pub async fn take_buy_action(
 
     // Check if the order is a buy order and if its status is active
     if !order.is_buy_order() {
+        let message = Message::cant_do(Some(order_id), request_id, Some(Payload::CantDo(Some(CantDoReason::InvalidOrderKind))));
+        MESSAGE_QUEUES.write().await.queue_order_cantdo.lock().await.push((message, event.rumor.pubkey));
         return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
     };
     // Check if the order status is pending
@@ -58,7 +60,6 @@ pub async fn take_buy_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        list
         return Err(MostroError::WrongAmountError);
     }
 

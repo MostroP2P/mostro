@@ -23,9 +23,9 @@ use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
 use std::process::exit;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::sync::OnceLock;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
@@ -33,6 +33,15 @@ use util::{get_nostr_client, invoice_subscribe};
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+pub struct MessageQueues {
+    pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+    pub queue_order_cantdo: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+    pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
+}
+
+static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> = LazyLock::new(|| RwLock::new(MessageQueues::default()));
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,12 +58,6 @@ async fn main() -> Result<()> {
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
-
-    let rate_list: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
-
-    let order_msg_list    : Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
-    let order_cantdo_list : Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
-
 
     // Init path from cli
     let config_path = settings_init()?;
@@ -108,9 +111,9 @@ async fn main() -> Result<()> {
     }
 
     // Start scheduler for tasks
-    start_scheduler(rate_list.clone()).await;
+    start_scheduler().await;
 
-    run(my_keys, client, &mut ln_client, pool, rate_list.clone()).await
+    run(my_keys, client, &mut ln_client, pool).await
 }
 
 #[cfg(test)]

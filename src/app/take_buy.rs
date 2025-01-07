@@ -1,5 +1,8 @@
 use crate::error::MostroError;
 use crate::util::{get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
+use mostro_core::error::CantDoReason;
 
 use anyhow::Result;
 use mostro_core::message::Message;
@@ -20,7 +23,7 @@ pub async fn take_buy_action(
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(MostroError::InvalidOrderId);
+        return Err(MostroInternalErr(ServiceError::NoAPIResponse))
     };
 
     // Get the request ID from the message
@@ -30,31 +33,32 @@ pub async fn take_buy_action(
     let mut order = match Order::by_id(pool, order_id).await {
         Ok(Some(order)) => order,
         Ok(None) => {
-            return Err(MostroError::InvalidOrderId);
+            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
         }
         Err(_) => {
-            return Err(MostroError::OrderNotFound);
+            return Err(MostroInternalErr(ServiceError::DbAccessError));
         }
     };
 
     // Check if the order is a buy order and if its status is active
     if !order.is_buy_order() {
-        return Err(MostroError::InvalidOrderKind);
+        return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
     };
     // Check if the order status is pending
     if !order.check_status(Status::Pending) {
-        return Err(MostroError::InvalidOrderStatus);
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Validate that the order was sent from the correct maker
     if !order.sent_from_maker(event.rumor.pubkey.to_hex()) {
-        return Err(MostroError::InvalidPubkey);
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
     // Get the fiat amount requested by the user for range orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
+        list
         return Err(MostroError::WrongAmountError);
     }
 

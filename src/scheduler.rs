@@ -9,6 +9,7 @@ use crate::LN_STATUS;
 
 use chrono::{TimeDelta, Utc};
 use mostro_core::order::{Kind, Status};
+use mostro_core::message::Message;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Event, Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
@@ -17,7 +18,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 use util::{get_keys, get_nostr_relays, update_order_event};
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
+pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>, order_msg_list : Arc<Mutex<Vec<Message>>> , cantdo_msg_list : Arc<Mutex<Vec<Message>>>) {
     info!("Creating scheduler");
 
     job_expire_pending_older_orders().await;
@@ -27,9 +28,29 @@ pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
     job_info_event_send().await;
     job_relay_list().await;
     job_update_bitcoin_prices().await;
+    job_flush_messages_queue(order_msg_list, cantdo_msg_list).await;
 
     info!("Scheduler Started");
 }
+
+async fn job_flush_messages_queue( order_msg_list : Arc<Mutex<Vec<Message>>> , cantdo_msg_list : Arc<Mutex<Vec<Message>>>) {
+
+    tokio::spawn(async move {
+        loop {
+            info!("Flushing messages in queue");
+            // Send message to event creator
+            for message in  order_msg_list.lock().await.iter() {
+                if let Ok(message) = message.as_json() {
+                    let sender_keys = crate::util::get_keys().unwrap();
+                    let _ = send_dm(destination_key, sender_keys, message, None).await;
+                }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        });
+    }
+
+
 
 async fn job_relay_list() {
     let mostro_keys = match get_keys() {

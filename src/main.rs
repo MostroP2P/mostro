@@ -2,7 +2,6 @@ pub mod app;
 mod bitcoin_price;
 pub mod cli;
 pub mod db;
-pub mod error;
 pub mod flow;
 pub mod lightning;
 pub mod lnurl;
@@ -19,6 +18,7 @@ use crate::lightning::LnStatus;
 use anyhow::Result;
 use db::find_held_invoices;
 use lightning::LndConnector;
+use mostro_core::message::Message;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
         .init();
 
     let rate_list: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
+
+    let order_msg_list    : Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
+    let order_cantdo_list : Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
+
 
     // Init path from cli
     let config_path = settings_init()?;

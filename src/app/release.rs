@@ -279,8 +279,10 @@ async fn payment_success(
         let creator_pubkey = child_order.creator_pubkey.clone();
         let creator_pubkey = PublicKey::from_str(&creator_pubkey)?;
         let new_order = child_order.as_new_order();
-        // As we are creating a new order from Mostro to user, we need to ask to the user
-        // for the trade_pubkey and the last_trade_index to update the user trade_index and order trade_pubkey
+        // As we are creating a new order from Mostro to user, we need the user let us know
+        // for the trade_pubkey and the last_trade_index to update, but also the user needs to know
+        // that the order has been created and the new order id, so we send a NewOrder message and wait for
+        // a message from the user with action TradePubkey with trade_pubkey and last_trade_index
         send_new_order_msg(
             request_id,
             Some(order.id),

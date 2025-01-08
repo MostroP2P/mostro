@@ -5,8 +5,8 @@ use chrono::prelude::*;
 use chrono::TimeDelta;
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 use lnurl::lightning_address::LightningAddress;
+use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use std::str::FromStr;
-use mostro_core::error::MostroError;
 
 /// Decode a lightning invoice (bolt11)
 pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroError> {
@@ -27,7 +27,7 @@ pub async fn is_valid_invoice(
     // Is it a ln address
     if ln_addr.is_ok() {
         if ln_exists(&payment_request).await.is_err() {
-            return Err(MostroError::ParsingInvoiceError);
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
         }
     } else {
         let invoice = decode_invoice(&payment_request)?;
@@ -41,20 +41,20 @@ pub async fn is_valid_invoice(
         if let Some(amt) = amount {
             if let Some(res) = amt.checked_sub(fee) {
                 if amount_sat != res && amount_sat != 0 {
-                    return Err(MostroError::WrongAmountError);
+                    return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
                 }
             } else {
                 //case overflow in subtraction
-                return Err(MostroError::WrongAmountError);
+                return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
             }
         }
 
         if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
-            return Err(MostroError::MinAmountError);
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
         }
 
         if invoice.is_expired() {
-            return Err(MostroError::InvoiceExpiredError);
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
         }
 
         let parsed = payment_request.parse::<SignedRawBolt11Invoice>()?;
@@ -69,7 +69,7 @@ pub async fn is_valid_invoice(
             invoice.expiry_time().as_secs() + parsed_invoice.data.timestamp.as_unix_timestamp();
 
         if expires_at < latest_date {
-            return Err(MostroError::MinExpirationTimeError);
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
         }
     }
 
@@ -82,8 +82,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::is_valid_invoice;
-    use crate::{cli::settings::Settings, error::MostroError, MOSTRO_CONFIG};
-
+    use crate::{cli::settings::Settings, MOSTRO_CONFIG};
+    use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
     fn init_settings_test() {
         let test_path = PathBuf::from("./");
         set_var("RUN_MODE", ".tpl");
@@ -95,7 +95,10 @@ mod tests {
         init_settings_test();
         let payment_request = "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4sdqqcqzpgxqyz5vqsp5a3axmz77s5vafmheq56uh49rmy59r9a3d0dm0220l8lzdp5jrtxs9qyyssqu0ft47j0r4lu997zuqgf92y8mppatwgzhrl0hzte7mzmwrqzf2238ylch82ehhv7pfcq6qcyu070dg85vu55het2edyljuezvcw5pzgqfncf3d".to_string();
         let wrong_amount_err = is_valid_invoice(payment_request, Some(23), None);
-        assert_eq!(Err(MostroError::WrongAmountError), wrong_amount_err.await);
+        assert_eq!(
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            wrong_amount_err.await
+        );
     }
 
     #[tokio::test]
@@ -103,7 +106,10 @@ mod tests {
         init_settings_test();
         let payment_request = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n".to_string();
         let expired_err = is_valid_invoice(payment_request, None, None);
-        assert_eq!(Err(MostroError::InvoiceExpiredError), expired_err.await);
+        assert_eq!(
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            expired_err.await
+        );
     }
 
     #[tokio::test]
@@ -111,6 +117,9 @@ mod tests {
         init_settings_test();
         let payment_request = "lnbcrt10n1pjwqagdpp5qwa89czezks35s73fkjspxdssh7h4mmfs4643ey7fgxlng4d3jxqdqqcqzpgxqyz5vqsp5jjlmj6hlq0zxsg5t7n6h6a95ux3ej2w3w2csvdgcpndyvut3aaqs9qyyssqg6py7mmjlcgrscvvq4x3c6kr6f6reqanwkk7rjajm4wepggh4lnku3msrjt3045l0fsl4trh3ctg8ew756wq86mz72mguusey7m0a5qq83t8n6".to_string();
         let min_amount_err = is_valid_invoice(payment_request, None, None);
-        assert_eq!(Err(MostroError::MinAmountError), min_amount_err.await);
+        assert_eq!(
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            min_amount_err.await
+        );
     }
 }

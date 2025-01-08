@@ -13,10 +13,10 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
+use mostro_core::error::MostroError;
 use mostro_core::message::CantDoReason;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
-use mostro_core::error::MostroError;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -592,16 +592,15 @@ pub async fn set_waiting_invoice_status(
         None,
     );
     // We create a Message
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::AddInvoice,
         Some(Payload::Order(order_data)),
-        &buyer_pubkey,
+        buyer_pubkey,
         order.trade_index_buyer,
     )
     .await;
-
     Ok(order.amount)
 }
 
@@ -707,7 +706,13 @@ pub async fn enqueue_cant_do_msg(
 ) {
     // Send message to event creator
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
-    MESSAGE_QUEUES.write().await.queue_order_cantdo.lock().await.push((message, destination_key));
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_cantdo
+        .lock()
+        .await
+        .push((message, destination_key));
 }
 
 pub async fn enqueue_order_msg(
@@ -720,9 +725,14 @@ pub async fn enqueue_order_msg(
 ) {
     // Send message to event creator
     let message = Message::new_order(order_id, request_id, trade_index, action, payload);
-    MESSAGE_QUEUES.write().await.queue_order_msg.lock().await.push((message, destination_key));
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_msg
+        .lock()
+        .await
+        .push((message, destination_key));
 }
-
 
 pub async fn send_new_order_msg(
     request_id: Option<u64>,

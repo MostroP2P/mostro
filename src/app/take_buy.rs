@@ -1,8 +1,10 @@
-use crate::util::{enqueue_cant_do_msg, get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice};
+use crate::util::{
+    enqueue_cant_do_msg, get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice,
+};
 use crate::MESSAGE_QUEUES;
+use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
-use mostro_core::error::CantDoReason;
 
 use anyhow::Result;
 use mostro_core::message::{Message, Payload};
@@ -23,7 +25,7 @@ pub async fn take_buy_action(
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(MostroInternalErr(ServiceError::NoAPIResponse))
+        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
     };
 
     // Get the request ID from the message
@@ -64,7 +66,10 @@ pub async fn take_buy_action(
     // If the order amount is zero, calculate the market price in sats
     if order.has_no_amount() {
         match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
-            Ok(amount_fees   ) => {order.amount = amount_fees.0; order.fee = amount_fees.1}
+            Ok(amount_fees) => {
+                order.amount = amount_fees.0;
+                order.fee = amount_fees.1
+            }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };
     }
@@ -73,7 +78,7 @@ pub async fn take_buy_action(
     let seller_pubkey = event.rumor.pubkey;
     let buyer_pubkey = match order.get_buyer_pubkey() {
         Some(pk) => pk,
-        None => return Err(MostroError::InvalidPubkey),
+        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
 
     // Add seller identity and trade index to the order

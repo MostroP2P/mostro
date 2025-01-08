@@ -1,24 +1,24 @@
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
-use crate::{db::*, MESSAGE_QUEUES};
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::util::get_nostr_client;
 use crate::LN_STATUS;
+use crate::{db::*, MESSAGE_QUEUES};
 
+use crate::MessageQueues;
 use chrono::{TimeDelta, Utc};
+use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::prelude::PublicKey;
-use mostro_core::message::Message;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Event, Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use crate::MessageQueues;
-use util::{get_keys, get_nostr_relays, update_order_event,send_dm};
+use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler() {
     info!("Creating scheduler");
@@ -45,14 +45,14 @@ async fn job_flush_messages_queue() {
         loop {
             info!("Flushing messages in queue");
             // Send message to event creator
-            for message in  order_msg_list.lock().await.iter() {
+            for message in order_msg_list.lock().await.iter() {
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
                     let _ = send_dm(destination_key, sender_keys, message, None).await;
                 }
             }
-            for message in  cantdo_msg_list.lock().await.iter() {
+            for message in cantdo_msg_list.lock().await.iter() {
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
@@ -63,8 +63,6 @@ async fn job_flush_messages_queue() {
         }
     });
 }
-
-
 
 async fn job_relay_list() {
     let mostro_keys = match get_keys() {

@@ -36,19 +36,16 @@ use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
-use crate::error::MostroError;
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
-use crate::MessageQueues;
 use crate::Settings;
-
 
 // External dependencies
 use anyhow::Result;
-use mostro_core::message::{Action, CantDoReason, Message};
-use mostro_core::user::User;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
+use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
@@ -101,11 +98,11 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 
                 if index <= user.last_trade_index {
                     tracing::info!("Invalid trade index");
-                    send_cant_do_msg(
+                    enqueue_cant_do_msg(
                         None,
                         message_kind.id,
                         Some(CantDoReason::InvalidTradeIndex),
-                        &event.rumor.pubkey,
+                        event.rumor.pubkey,
                     )
                     .await;
                     return;
@@ -113,11 +110,11 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 
                 if !message_kind.verify_signature(event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
-                    send_cant_do_msg(
+                    enqueue_cant_do_msg(
                         None,
-                        message_kind.id,
-                        Some(CantDoReason::InvalidSignature),
-                        &event.rumor.pubkey,
+                        None,
+                        CantDoReason::InvalidSignature,
+                        event.rumor.pubkey,
                     )
                     .await;
                     return;
@@ -138,13 +135,13 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {
                     tracing::error!("Error creating new user: {}", e);
-                    // send_cant_do_msg(
-                    //     None,
-                    //     msg.get_inner_message_kind().id,
-                    //     Some(CantDoReason::CantCreateUser),
-                    //     &event.rumor.pubkey,
-                    // )
-                    // .await;
+                    enqueue_cant_do_msg(
+                        None,
+                        message_kind.id,
+                        CantDoReason::CantCreateUser,
+                        event.rumor.pubkey,
+                    )
+                    .await;
                 }
             }
         }
@@ -172,8 +169,12 @@ async fn handle_message_action(
     match action {
         // Order-related actions
         Action::NewOrder => order_action(msg, event, my_keys, pool).await,
-        Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await.map_err(|e| e.into()),
-        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool).await.map_err(|e| e.into()),
+        Action::TakeSell => take_sell_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
 
         // Payment-related actions
         Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
@@ -183,9 +184,7 @@ async fn handle_message_action(
 
         // Dispute and rating actions
         Action::Dispute => dispute_action(msg, event, my_keys, pool).await,
-        Action::RateUser => {
-            update_user_reputation_action(msg, event, my_keys, pool).await
-        }
+        Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool).await,
         Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client).await,
 
         // Admin actions
@@ -277,15 +276,25 @@ pub async fn run(
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
                                         let cantdoreason = match err {
-                                            MostroError::MostroCantDo(cause) => enqueue_cant_do_msg(inner_message.request_id, inner_message.id, cause, event.rumor.pubkey,).await,
-                                            MostroError::MostroInternalErr(e)=> warning_msg(&action, e),
+                                            MostroError::MostroCantDo(cause) => {
+                                                enqueue_cant_do_msg(
+                                                    inner_message.request_id,
+                                                    inner_message.id,
+                                                    cause,
+                                                    event.rumor.pubkey,
+                                                )
+                                                .await
+                                            }
+                                            MostroError::MostroInternalErr(e) => {
+                                                warning_msg(&action, e)
+                                            }
                                         };
-                                    },
+                                    }
                                     Err(_) => {
                                         todo!()
                                         // warning_msg(&action, e);
-                                    }                         
-                               }
+                                    }
+                                }
                             }
                         }
                     }

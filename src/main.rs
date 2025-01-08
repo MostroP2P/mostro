@@ -23,8 +23,8 @@ use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
 use std::process::exit;
-use std::sync::{Arc, LazyLock};
 use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -41,7 +41,8 @@ pub struct MessageQueues {
     pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
 }
 
-static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> = LazyLock::new(|| RwLock::new(MessageQueues::default()));
+static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> =
+    LazyLock::new(|| RwLock::new(MessageQueues::default()));
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -3,8 +3,8 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, rate_counterpart, send_new_order_msg, settle_seller_hold_invoice,
-    update_order_event,send_cant_do_msg
+    get_keys, rate_counterpart, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
+    update_order_event,
 };
 use crate::NOSTR_CLIENT;
 use anyhow::{Error, Result};

@@ -1,6 +1,6 @@
-use crate::error::MostroError;
 use anyhow::{Context, Result};
 use serde_json::Value;
+use mostro_core::error::MostroError;
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let (user, domain) = match address.split_once('@') {

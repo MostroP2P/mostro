@@ -38,20 +38,22 @@ use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::error::MostroError;
 use crate::lightning::LndConnector;
-use crate::util::send_cant_do_msg;
+use crate::util::enqueue_cant_do_msg;
 use crate::MessageQueues;
 use crate::Settings;
+
 
 // External dependencies
 use anyhow::Result;
 use mostro_core::message::{Action, CantDoReason, Message};
 use mostro_core::user::User;
+use mostro_core::error::MostroError;
+use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+
 /// Helper function to log warning messages for action errors
-fn warning_msg(action: &Action, e: anyhow::Error) {
+fn warning_msg(action: &Action, e: ServiceError) {
     tracing::warn!("Error in {} with context {}", action, e);
 }
 
@@ -136,13 +138,13 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {
                     tracing::error!("Error creating new user: {}", e);
-                    send_cant_do_msg(
-                        None,
-                        msg.get_inner_message_kind().id,
-                        Some(CantDoReason::CantCreateUser),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
+                    // send_cant_do_msg(
+                    //     None,
+                    //     msg.get_inner_message_kind().id,
+                    //     Some(CantDoReason::CantCreateUser),
+                    //     &event.rumor.pubkey,
+                    // )
+                    // .await;
                 }
             }
         }
@@ -272,7 +274,18 @@ pub async fn run(
                             )
                             .await
                             {
-                                warning_msg(&action, e);
+                                match e.downcast::<MostroError>() {
+                                    Ok(err) => {
+                                        let cantdoreason = match err {
+                                            MostroError::MostroCantDo(cause) => enqueue_cant_do_msg(inner_message.request_id, inner_message.id, cause, event.rumor.pubkey,).await,
+                                            MostroError::MostroInternalErr(e)=> warning_msg(&action, e),
+                                        };
+                                    },
+                                    Err(_) => {
+                                        todo!()
+                                        // warning_msg(&action, e);
+                                    }                         
+                               }
                             }
                         }
                     }

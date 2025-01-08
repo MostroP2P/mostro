@@ -1,12 +1,15 @@
-use crate::error::MostroError;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg,
     set_waiting_invoice_status, show_hold_invoice, update_order_event,
 };
 
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
+use mostro_core::error::CantDoReason;
+
 use anyhow::{Error, Result};
-use mostro_core::message::{CantDoReason, Message};
+use mostro_core::message::Message;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -20,43 +23,45 @@ pub async fn take_sell_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<(), MostroError> {
-    // Get request id
-    let request_id = msg.get_inner_message_kind().request_id;
-
+    // Extract order ID from the message, returning an error if not found
     // Safe unwrap as we verified the message
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(MostroError::InvalidOrderId);
+        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
     };
+
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+
 
     let mut order = match Order::by_id(pool, order_id).await {
         Ok(Some(order)) => order,
         Ok(None) => {
-            return Err(MostroError::InvalidOrderId);
+            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
         }
         Err(_) => {
-            return Err(MostroError::OrderNotFound);
+            return Err(MostroInternalErr(ServiceError::OrderNotFound));
         }
     };
 
     // Check if the order is a buy order and if its status is active
-    if !order.is_sell_order() {
-        return Err(MostroError::InvalidOrderKind);
+    if let Err(cause) = order.is_sell_order() {
+        return Err(MostroInternalErr(cause));
     };
     // Check if the order status is pending
-    if !order.check_status(Status::Pending) {
-        return Err(MostroError::InvalidOrderStatus);
+    if let Err(cause) = order.check_status(Status::Pending) {
+        return Err(MostroInternalErr(cause));
     }
 
     // Validate that the order was sent from the correct maker
-    if !order.sent_from_maker(event.rumor.pubkey.to_hex()) {
-        return Err(MostroError::InvalidPubkey);
+    if let Err(cause) = order.sent_from_maker(event.rumor.pubkey.to_hex()) {
+        return Err(MostroInternalErr(cause));
     }
 
     let seller_pubkey = match order.get_seller_pubkey() {
         Some(pk) => pk,
-        None => return Err(MostroError::InvalidPubkey),
+        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey),
     };
 
     let mut pr: Option<String> = None;
@@ -73,7 +78,7 @@ pub async fn take_sell_action(
             .await
             {
                 Ok(_) => Some(payment_request),
-                Err(_) => return Err(MostroError::InvoiceInvalidError),
+                Err(_) => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
             }
         };
     }
@@ -82,34 +87,24 @@ pub async fn take_sell_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::OutOfRangeFiatAmount),
-            &event.rumor.pubkey,
-        )
-        .await;
-
-        return Ok(());
+        return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
-    // Get trade pubkey of the buyer
-    let buyer_trade_pubkey = event.rumor.pubkey;
+
     // Add buyer pubkey to order
-    order.buyer_pubkey = Some(buyer_trade_pubkey.to_string());
+    order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(event.sender.to_string());
     // Add buyer trade index to order
     order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
     // Timestamp take order time
-    order.taken_at = Timestamp::now().as_u64() as i64;
+    order.set_timestamp_now();
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
-    if order.amount == 0 {
-        let (new_sats_amount, fee) =
-            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
-        // Update order with new sats value
-        order.amount = new_sats_amount;
-        order.fee = fee;
+    if order.has_no_amount() {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+            Ok(amount_fees   ) => {order.amount = amount_fees.0; order.fee = amount_fees.1}
+            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
+        };
     }
 
     if pr.is_none() {

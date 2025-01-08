@@ -1,5 +1,4 @@
 use crate::cli::settings::Settings;
-use crate::error::MostroError;
 use crate::lnurl::ln_exists;
 
 use chrono::prelude::*;
@@ -7,6 +6,7 @@ use chrono::TimeDelta;
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 use lnurl::lightning_address::LightningAddress;
 use std::str::FromStr;
+use mostro_core::error::MostroError;
 
 /// Decode a lightning invoice (bolt11)
 pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroError> {

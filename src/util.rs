@@ -2,7 +2,6 @@ use crate::app::rate_user::get_user_reputation;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
 use crate::db;
-use crate::error::MostroError;
 use crate::flow;
 use crate::lightning;
 use crate::lightning::LndConnector;
@@ -17,6 +16,7 @@ use chrono::Duration;
 use mostro_core::message::CantDoReason;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use mostro_core::error::MostroError;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -698,6 +698,31 @@ pub async fn send_cant_do_msg(
         let _ = send_dm(destination_key, sender_keys, message, None).await;
     }
 }
+
+pub async fn enqueue_cant_do_msg(
+    request_id: Option<u64>,
+    order_id: Option<Uuid>,
+    reason: CantDoReason,
+    destination_key: PublicKey,
+) {
+    // Send message to event creator
+    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
+    MESSAGE_QUEUES.write().await.queue_order_cantdo.lock().await.push((message, destination_key));
+}
+
+pub async fn enqueue_order_msg(
+    request_id: Option<u64>,
+    order_id: Option<Uuid>,
+    action: Action,
+    payload: Option<Payload>,
+    destination_key: PublicKey,
+    trade_index: Option<i64>,
+) {
+    // Send message to event creator
+    let message = Message::new_order(order_id, request_id, trade_index, action, payload);
+    MESSAGE_QUEUES.write().await.queue_order_msg.lock().await.push((message, destination_key));
+}
+
 
 pub async fn send_new_order_msg(
     request_id: Option<u64>,

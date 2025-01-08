@@ -1,4 +1,4 @@
-use crate::util::{get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice};
+use crate::util::{enqueue_cant_do_msg, get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice};
 use crate::MESSAGE_QUEUES;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -41,39 +41,32 @@ pub async fn take_buy_action(
     };
 
     // Check if the order is a buy order and if its status is active
-    if !order.is_buy_order() {
-        let message = Message::cant_do(Some(order_id), request_id, Some(Payload::CantDo(Some(CantDoReason::InvalidOrderKind))));
-        MESSAGE_QUEUES.write().await.queue_order_cantdo.lock().await.push((message, event.rumor.pubkey));
-        return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
+    if let Err(cause) = order.is_buy_order() {
+        return Err(MostroCantDo(cause));
     };
     // Check if the order status is pending
-    if !order.check_status(Status::Pending) {
-        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+    if let Err(cause) = order.check_status(Status::Pending) {
+        return Err(MostroCantDo(cause));
     }
 
     // Validate that the order was sent from the correct maker
-    if !order.sent_from_maker(event.rumor.pubkey.to_hex()) {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    if let Err(cause) = order.sent_from_maker(event.rumor.pubkey.to_hex()) {
+        return Err(MostroCantDo(cause));
     }
 
     // Get the fiat amount requested by the user for range orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        return Err(MostroError::WrongAmountError);
+        return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
 
     // If the order amount is zero, calculate the market price in sats
-    if order.amount == 0 {
-        if let Ok((new_sats_amount, fee)) =
-            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await
-        {
-            // Update order with new sats value and fee
-            order.amount = new_sats_amount;
-            order.fee = fee;
-        } else {
-            return Err(MostroError::NoAPIResponse);
-        }
+    if order.has_no_amount() {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+            Ok(amount_fees   ) => {order.amount = amount_fees.0; order.fee = amount_fees.1}
+            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
+        };
     }
 
     // Get seller and buyer public keys
@@ -88,7 +81,7 @@ pub async fn take_buy_action(
     order.trade_index_seller = msg.get_inner_message_kind().trade_index;
 
     // Timestamp the order take time
-    order.taken_at = Timestamp::now().as_u64() as i64;
+    order.set_timestamp_now();
 
     // Show hold invoice and return success or error
     if let Ok(()) = show_hold_invoice(
@@ -103,6 +96,6 @@ pub async fn take_buy_action(
     {
         Ok(())
     } else {
-        Err(MostroError::HoldInvoiceError)
+        Err(MostroInternalErr(ServiceError::HoldInvoiceError))
     }
 }

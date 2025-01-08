@@ -3,8 +3,9 @@ use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, updat
 
 use anyhow::{Error, Result};
 
-use mostro_core::message::{Action, CantDoReason, Message, Payload};
+use mostro_core::message::{Action,  Message, Payload};
 use mostro_core::order::SmallOrder;
+use mostro_core::error::CantDoReason;
 use mostro_core::order::{Kind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -21,16 +22,17 @@ pub async fn add_invoice_action(
 ) -> Result<()> {
     // Get the order message
     let order_msg = msg.get_inner_message_kind();
-    // Get the request id
-    let request_id = order_msg.request_id;
-    // Get the order
-    let mut order = if let Some(order_id) = order_msg.id {
-        match Order::by_id(pool, order_id).await? {
-            Some(order) => order,
-            None => return Err(Error::msg("Order Id {order_id} not found!")),
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
+    
+    let mut order = match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
         }
-    } else {
-        return Err(Error::msg("Missing message Id"));
+        Err(_) => {
+            return Err(MostroInternalErr(ServiceError::OrderNotFound));
+        }
     };
 
     let order_status = match Status::from_str(&order.status) {

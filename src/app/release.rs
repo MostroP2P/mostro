@@ -67,6 +67,10 @@ pub async fn release_action(
 ) -> Result<()> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
+    let next_trade: Option<(String, u32)> = match &msg.get_inner_message_kind().payload {
+        Some(Payload::NextTrade(pubkey, index)) => Some((pubkey.clone(), *index)),
+        _ => None,
+    };
 
     // Check if order id is ok
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
@@ -133,7 +137,38 @@ pub async fn release_action(
     )
     .await?;
 
-    let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
+    let mut order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
+
+    let (is_range, child_order) = get_child_order(&mut order_updated, request_id, my_keys).await?;
+    // If we have the next trade data and the order is a range order we create a new order
+    if is_range && next_trade.is_some() {
+        if let Some((next_trade_pubkey, next_trade_index)) = next_trade.clone() {
+            // As we are creating a new order from Mostro to user,
+            // we need save the trade_pubkey and the last_trade_index for the next trade
+            let mut child_order = child_order.clone();
+            child_order.seller_pubkey = Some(next_trade_pubkey.clone());
+            child_order.creator_pubkey = next_trade_pubkey.clone();
+            let next_trade_index = Some(next_trade_index as i64);
+            child_order.trade_index_seller = next_trade_index;
+            let pool = db::connect().await?;
+            // We create the new order to send to the user
+            let new_order = child_order.as_new_order();
+            // We save the new order as a child of the parent range order
+            child_order.update(&pool).await?;
+            let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+
+            // We send a message to the order creator with the new order
+            send_new_order_msg(
+                request_id,
+                new_order.id,
+                Action::NewOrder,
+                Some(Payload::Order(new_order)),
+                &next_trade_pubkey,
+                next_trade_index,
+            )
+            .await;
+        }
+    }
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
@@ -162,13 +197,13 @@ pub async fn release_action(
     )
     .await;
 
+    // Finally we try to pay buyer's invoice
     let _ = do_payment(order_updated, request_id).await;
 
     Ok(())
 }
 
 pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()> {
-    // Finally we try to pay buyer's invoice
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
         _ => return Err(Error::msg("Missing payment request")),
@@ -218,6 +253,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
+
                             let _ = payment_success(
                                 &mut order,
                                 &buyer_pubkey,
@@ -271,28 +307,6 @@ async fn payment_success(
     )
     .await;
 
-    let (is_range, child_order) = get_child_order(order, request_id, my_keys).await?;
-    if is_range {
-        // Let's wait 5 secs before publish this new event
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        // We send a message to the order creator with the new order
-        let creator_pubkey = child_order.creator_pubkey.clone();
-        let creator_pubkey = PublicKey::from_str(&creator_pubkey)?;
-        let new_order = child_order.as_new_order();
-        // As we are creating a new order from Mostro to user, we need the user let us know
-        // for the trade_pubkey and the last_trade_index to update, but also the user needs to know
-        // that the order has been created and the new order id, so we send a NewOrder message and wait for
-        // a message from the user with action TradePubkey with trade_pubkey and last_trade_index
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
-            Action::NewOrder,
-            Some(Payload::Order(new_order)),
-            &creator_pubkey,
-            None,
-        )
-        .await;
-    }
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let pool = db::connect().await?;
         if let Ok(order_success) = order_updated.update(&pool).await {

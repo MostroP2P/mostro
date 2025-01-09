@@ -457,9 +457,9 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_hashes"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0982261c82a50d89d1a411602afee0498b3e0debe3d36693f0c661352809639"
+checksum = "7e5d09f16329cd545d7e6008b2c6b2af3a90bc678cf41ac3d2f6755943301b16"
 dependencies = [
  "bitcoin-io 0.2.0",
  "hex-conservative 0.3.0",
@@ -1970,13 +1970,13 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.6.23"
+version = "0.6.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ed0d3908c9d24077612066b597bd500ab7ec80584c6032938229996f624185"
+checksum = "d09cc9a5dc67cbdda958e53f72fe6c8a7e3a036d31b84d54f79ae06e28fb0fa2"
 dependencies = [
  "anyhow",
  "bitcoin",
- "bitcoin_hashes 0.15.0",
+ "bitcoin_hashes 0.16.0",
  "chrono",
  "nostr-sdk",
  "serde",

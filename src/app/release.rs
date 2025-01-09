@@ -152,7 +152,9 @@ pub async fn release_action(
             let next_trade_index = Some(next_trade_index as i64);
             child_order.trade_index_seller = next_trade_index;
             let pool = db::connect().await?;
+            // We create the new order to send to the user
             let new_order = child_order.as_new_order();
+            // We save the new order as a child of the parent range order
             child_order.update(&pool).await?;
             let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
 

@@ -146,7 +146,6 @@ pub async fn release_action(
             // As we are creating a new order from Mostro to user,
             // we need save the trade_pubkey and the last_trade_index for the next trade
             let mut child_order = child_order.clone();
-            let next_trade_pubkey = next_trade_pubkey.to_string();
             child_order.seller_pubkey = Some(next_trade_pubkey.clone());
             child_order.creator_pubkey = next_trade_pubkey.clone();
             let next_trade_index = Some(next_trade_index as i64);

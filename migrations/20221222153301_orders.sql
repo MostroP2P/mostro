@@ -37,5 +37,7 @@ CREATE TABLE IF NOT EXISTS orders (
   failed_payment integer default 0,
   expires_at integer not null,
   trade_index_seller integer default 0,
-  trade_index_buyer integer default 0
+  trade_index_buyer integer default 0,
+  next_trade_pubkey char(64),
+  next_trade_index integer default 0
 );

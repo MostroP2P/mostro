@@ -75,16 +75,19 @@ pub async fn release_action(
     let order_id = msg
         .get_inner_message_kind()
         .id
-        .ok_or(Error::msg("No order id"))?;
+        .ok_or(Error::msg("Order ID is required but was not provided"))?;
 
     let mut order = Order::by_id(pool, order_id)
         .await?
-        .ok_or(Error::msg("Order not found"))?;
+        .ok_or(Error::msg(format!(
+            "Order {} not found in database",
+            order_id
+        )))?;
 
-    let seller_pubkey_hex = order
-        .seller_pubkey
-        .as_ref()
-        .ok_or(Error::msg("No seller pubkey found"))?;
+    let seller_pubkey_hex = order.seller_pubkey.as_ref().ok_or(Error::msg(format!(
+        "Seller public key not found for order {}",
+        order_id
+    )))?;
 
     let current_status =
         Status::from_str(&order.status).map_err(|_| Error::msg("Wrong order status"))?;
@@ -167,7 +170,17 @@ pub async fn release_action(
     Ok(())
 }
 
-// Helper function to manage child order creation for range orders
+/// Manages the creation and update of child orders in a range order sequence
+///
+/// # Arguments
+/// * `child_order` - The child order to be created/updated
+/// * `order` - The parent order
+/// * `next_trade` - Optional tuple of (pubkey, index) for the next trade
+/// * `pool` - Database connection pool
+/// * `request_id` - Optional request ID for messaging
+///
+/// # Returns
+/// Result indicating success or failure of the operation
 async fn handle_child_order(
     child_order: &mut Order,
     order: &Order,

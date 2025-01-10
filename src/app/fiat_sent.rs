@@ -97,7 +97,8 @@ pub async fn fiat_sent_action(
     )
     .await;
 
-    // If the buyer is the maker and we received the next trade field data, we save it
+    // Update next trade fields only when the buyer is the maker of a range order
+    // These fields will be used to create the next child order in the range
     if order.creator_pubkey == event.rumor.pubkey.to_string() && next_trade.is_some() {
         if let Some((pubkey, index)) = next_trade {
             order.next_trade_pubkey = Some(pubkey.clone());

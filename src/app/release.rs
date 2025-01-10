@@ -72,39 +72,27 @@ pub async fn release_action(
         _ => None,
     };
 
-    // Check if order id is ok
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(Error::msg("No order id"));
-    };
+    let order_id = msg
+        .get_inner_message_kind()
+        .id
+        .ok_or(Error::msg("No order id"))?;
 
-    let order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
-        }
-    };
-    let seller_pubkey_hex = match order.seller_pubkey {
-        Some(ref pk) => pk,
-        None => {
-            error!("Order Id {}: Seller pubkey not found!", order.id);
-            return Ok(());
-        }
-    };
-    let seller_pubkey = event.rumor.pubkey;
+    let mut order = Order::by_id(pool, order_id)
+        .await?
+        .ok_or(Error::msg("Order not found"))?;
 
-    let current_status = if let Ok(current_status) = Status::from_str(&order.status) {
-        current_status
-    } else {
-        return Err(Error::msg("Wrong order status"));
-    };
+    let seller_pubkey_hex = order
+        .seller_pubkey
+        .as_ref()
+        .ok_or(Error::msg("No seller pubkey found"))?;
 
-    if current_status != Status::Active
-        && current_status != Status::FiatSent
-        && current_status != Status::Dispute
-    {
+    let current_status =
+        Status::from_str(&order.status).map_err(|_| Error::msg("Wrong order status"))?;
+
+    if !matches!(
+        current_status,
+        Status::Active | Status::FiatSent | Status::Dispute
+    ) {
         send_cant_do_msg(
             request_id,
             Some(order.id),
@@ -112,11 +100,10 @@ pub async fn release_action(
             &event.rumor.pubkey,
         )
         .await;
-
         return Ok(());
     }
 
-    if &seller_pubkey.to_string() != seller_pubkey_hex {
+    if &event.rumor.pubkey.to_string() != seller_pubkey_hex {
         send_cant_do_msg(
             request_id,
             Some(order.id),
@@ -137,56 +124,15 @@ pub async fn release_action(
     )
     .await?;
 
-    let mut order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
-
-    let (is_range, child_order) = get_child_order(&mut order_updated, request_id, my_keys).await?;
-    // If we have the next trade data and the order is a range order we create a new order
-    if is_range && next_trade.is_some() {
-        if let Some((next_trade_pubkey, next_trade_index)) = next_trade.clone() {
-            // As we are creating a new order from Mostro to user,
-            // we need save the trade_pubkey and the last_trade_index for the next trade
-            let mut child_order = child_order.clone();
-            child_order.seller_pubkey = Some(next_trade_pubkey.clone());
-            child_order.creator_pubkey = next_trade_pubkey.clone();
-            let next_trade_index = Some(next_trade_index as i64);
-            child_order.trade_index_seller = next_trade_index;
-            let pool = db::connect().await?;
-            // We create the new order to send to the user
-            let new_order = child_order.as_new_order();
-            // We save the new order as a child of the parent range order
-            child_order.update(&pool).await?;
-            let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
-
-            // We send a message to the order creator with the new order
-            send_new_order_msg(
-                request_id,
-                new_order.id,
-                Action::NewOrder,
-                Some(Payload::Order(new_order)),
-                &next_trade_pubkey,
-                next_trade_index,
-            )
-            .await;
-        }
-    }
-
-    // We send a HoldInvoicePaymentSettled message to seller, the client should
-    // indicate *funds released* message to seller
-    send_new_order_msg(
-        request_id,
-        Some(order_id),
-        Action::HoldInvoicePaymentSettled,
-        None,
-        &seller_pubkey,
-        None,
-    )
-    .await;
-
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = match &order.buyer_pubkey {
-        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
-        _ => return Err(Error::msg("Missing buyer pubkeys")),
-    };
+    let buyer_pubkey = PublicKey::from_str(
+        order
+            .buyer_pubkey
+            .as_ref()
+            .ok_or(Error::msg("Missing buyer pubkey"))?
+            .as_str(),
+    )?;
+
     send_new_order_msg(
         None,
         Some(order_id),
@@ -196,10 +142,65 @@ pub async fn release_action(
         None,
     )
     .await;
+    order = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
+
+    // Handle child order for range orders
+    if let Ok((true, mut child_order)) = get_child_order(&mut order, request_id, my_keys).await {
+        handle_child_order(&mut child_order, &order, next_trade, pool, request_id).await?;
+    }
+
+    // We send a HoldInvoicePaymentSettled message to seller, the client should
+    // indicate *funds released* message to seller
+    send_new_order_msg(
+        request_id,
+        Some(order_id),
+        Action::HoldInvoicePaymentSettled,
+        None,
+        &event.rumor.pubkey,
+        None,
+    )
+    .await;
 
     // Finally we try to pay buyer's invoice
-    let _ = do_payment(order_updated, request_id).await;
+    let _ = do_payment(order, request_id).await;
 
+    Ok(())
+}
+
+// Helper function to manage child order creation for range orders
+async fn handle_child_order(
+    child_order: &mut Order,
+    order: &Order,
+    next_trade: Option<(String, u32)>,
+    pool: &Pool<Sqlite>,
+    request_id: Option<u64>,
+) -> Result<()> {
+    if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
+        if &order.creator_pubkey == order.seller_pubkey.as_ref().unwrap() {
+            child_order.seller_pubkey = Some(next_trade_pubkey.clone());
+            child_order.creator_pubkey = next_trade_pubkey.clone();
+            child_order.trade_index_seller = Some(next_trade_index as i64);
+        } else if &order.creator_pubkey == order.buyer_pubkey.as_ref().unwrap() {
+            child_order.buyer_pubkey = Some(next_trade_pubkey.clone());
+            child_order.creator_pubkey = next_trade_pubkey.clone();
+            child_order.trade_index_buyer = order.next_trade_index;
+        }
+
+        let new_order = child_order.as_new_order();
+        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+        send_new_order_msg(
+            request_id,
+            new_order.id,
+            Action::NewOrder,
+            Some(Payload::Order(new_order)),
+            &next_trade_pubkey,
+            child_order
+                .trade_index_buyer
+                .or(child_order.trade_index_buyer),
+        )
+        .await;
+        child_order.clone().update(pool).await?;
+    }
     Ok(())
 }
 

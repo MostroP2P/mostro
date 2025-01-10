@@ -33,12 +33,13 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
         })?;
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
-                tracing::info!(
-                    "Successfully created Mostro database file at {}",
-                    db_path.display(),
-                );
                 match sqlx::migrate!().run(&pool).await {
-                    Ok(_) => (),
+                    Ok(_) => {
+                        tracing::info!(
+                            "Successfully created Mostro database file at {}",
+                            db_path.display(),
+                        );
+                    }
                     Err(e) => {
                         // Clean up the created file on migration failure
                         if let Err(cleanup_err) = std::fs::remove_file(db_path) {

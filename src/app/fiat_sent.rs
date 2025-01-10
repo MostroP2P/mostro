@@ -24,7 +24,7 @@ pub async fn fiat_sent_action(
     } else {
         return Err(Error::msg("No order id"));
     };
-    let order = match Order::by_id(pool, order_id).await? {
+    let mut order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -54,6 +54,10 @@ pub async fn fiat_sent_action(
         .await;
         return Ok(());
     }
+    let next_trade: Option<(String, u32)> = match &msg.get_inner_message_kind().payload {
+        Some(Payload::NextTrade(pubkey, index)) => Some((pubkey.clone(), *index)),
+        _ => None,
+    };
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
@@ -92,6 +96,15 @@ pub async fn fiat_sent_action(
         None,
     )
     .await;
+
+    // If the buyer is the maker and we received the next trade field data, we save it
+    if order.creator_pubkey == event.rumor.pubkey.to_string() && next_trade.is_some() {
+        if let Some((pubkey, index)) = next_trade {
+            order.next_trade_pubkey = Some(pubkey.clone());
+            order.next_trade_index = Some(index as i64);
+            order.update(pool).await?;
+        }
+    }
 
     Ok(())
 }

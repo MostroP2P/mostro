@@ -196,7 +196,7 @@ async fn handle_child_order(
             &next_trade_pubkey,
             child_order
                 .trade_index_buyer
-                .or(child_order.trade_index_buyer),
+                .or(child_order.trade_index_seller),
         )
         .await;
         child_order.clone().update(pool).await?;

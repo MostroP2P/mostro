@@ -58,7 +58,6 @@ pub async fn fiat_sent_action(
         Some(Payload::NextTrade(pubkey, index)) => Some((pubkey.clone(), *index)),
         _ => None,
     };
-
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     if let Ok(order_updated) = update_order_event(my_keys, Status::FiatSent, &order).await {

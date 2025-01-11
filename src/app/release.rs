@@ -67,11 +67,6 @@ pub async fn release_action(
 ) -> Result<()> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
-    let next_trade: Option<(String, u32)> = match &msg.get_inner_message_kind().payload {
-        Some(Payload::NextTrade(pubkey, index)) => Some((pubkey.clone(), *index)),
-        _ => None,
-    };
-
     let order_id = msg
         .get_inner_message_kind()
         .id
@@ -89,6 +84,32 @@ pub async fn release_action(
         order_id
     )))?;
 
+    // Only seller can release funds
+    if &event.rumor.pubkey.to_string() != seller_pubkey_hex {
+        send_cant_do_msg(
+            request_id,
+            Some(order.id),
+            Some(CantDoReason::InvalidPeer),
+            &event.rumor.pubkey,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let next_trade: Option<(String, u32)> = match event.rumor.pubkey.to_string() {
+        pubkey if pubkey == order.creator_pubkey => {
+            if let Some(Payload::NextTrade(pubkey, index)) = &msg.get_inner_message_kind().payload {
+                Some((pubkey.clone(), *index))
+            } else {
+                None
+            }
+        }
+        _ => match (order.next_trade_pubkey.as_ref(), order.next_trade_index) {
+            (Some(pubkey), Some(index)) => Some((pubkey.clone(), index as u32)),
+            _ => None,
+        },
+    };
+
     let current_status =
         Status::from_str(&order.status).map_err(|_| Error::msg("Wrong order status"))?;
 
@@ -100,17 +121,6 @@ pub async fn release_action(
             request_id,
             Some(order.id),
             Some(CantDoReason::NotAllowedByStatus),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
-    }
-
-    if &event.rumor.pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPeer),
             &event.rumor.pubkey,
         )
         .await;
@@ -198,6 +208,8 @@ async fn handle_child_order(
             child_order.creator_pubkey = next_trade_pubkey.clone();
             child_order.trade_index_buyer = order.next_trade_index;
         }
+        child_order.next_trade_index = None;
+        child_order.next_trade_pubkey = None;
 
         let new_order = child_order.as_new_order();
         let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
@@ -207,9 +219,7 @@ async fn handle_child_order(
             Action::NewOrder,
             Some(Payload::Order(new_order)),
             &next_trade_pubkey,
-            child_order
-                .trade_index_buyer
-                .or(child_order.trade_index_seller),
+            Some(next_trade_index as i64),
         )
         .await;
         child_order.clone().update(pool).await?;

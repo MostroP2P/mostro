@@ -24,7 +24,7 @@ pub async fn fiat_sent_action(
     } else {
         return Err(Error::msg("No order id"));
     };
-    let mut order = match Order::by_id(pool, order_id).await? {
+    let order = match Order::by_id(pool, order_id).await? {
         Some(order) => order,
         None => {
             error!("Order Id {order_id} not found!");
@@ -60,14 +60,18 @@ pub async fn fiat_sent_action(
     };
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(my_keys, Status::FiatSent, &order).await {
-        let _ = order_updated.update(pool).await;
-    }
+    let mut order_updated = match update_order_event(my_keys, Status::FiatSent, &order).await {
+        Ok(order) => order.update(pool).await?,
+        Err(_) => {
+            error!("Can't update order {}!", order.id);
+            return Ok(());
+        }
+    };
 
-    let seller_pubkey = match order.seller_pubkey.as_ref() {
+    let seller_pubkey = match order_updated.seller_pubkey.as_ref() {
         Some(pk) => PublicKey::from_str(pk)?,
         None => {
-            error!("Seller pubkey not found for order {}!", order.id);
+            error!("Seller pubkey not found for order {}!", order_updated.id);
             return Ok(());
         }
     };
@@ -76,7 +80,7 @@ pub async fn fiat_sent_action(
     // We a message to the seller
     send_new_order_msg(
         None,
-        Some(order.id),
+        Some(order_updated.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
         &seller_pubkey,
@@ -88,7 +92,7 @@ pub async fn fiat_sent_action(
 
     send_new_order_msg(
         msg.get_inner_message_kind().request_id,
-        Some(order.id),
+        Some(order_updated.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
         &event.rumor.pubkey,
@@ -98,11 +102,11 @@ pub async fn fiat_sent_action(
 
     // Update next trade fields only when the buyer is the maker of a range order
     // These fields will be used to create the next child order in the range
-    if order.creator_pubkey == event.rumor.pubkey.to_string() && next_trade.is_some() {
+    if order_updated.creator_pubkey == event.rumor.pubkey.to_string() && next_trade.is_some() {
         if let Some((pubkey, index)) = next_trade {
-            order.next_trade_pubkey = Some(pubkey.clone());
-            order.next_trade_index = Some(index as i64);
-            order.update(pool).await?;
+            order_updated.next_trade_pubkey = Some(pubkey.clone());
+            order_updated.next_trade_index = Some(index as i64);
+            order_updated.update(pool).await?;
         }
     }
 

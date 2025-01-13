@@ -63,7 +63,7 @@ pub async fn fiat_sent_action(
     let mut order_updated = match update_order_event(my_keys, Status::FiatSent, &order).await {
         Ok(order) => order.update(pool).await?,
         Err(_) => {
-            error!("Can't update order {}!", order.id);
+            error!("Failed to update order {}: {}", order.id, e);
             return Ok(());
         }
     };
@@ -106,7 +106,13 @@ pub async fn fiat_sent_action(
         if let Some((pubkey, index)) = next_trade {
             order_updated.next_trade_pubkey = Some(pubkey.clone());
             order_updated.next_trade_index = Some(index as i64);
-            order_updated.update(pool).await?;
+            if let Err(e) = order_updated.update(pool).await {
+                error!(
+                    "Failed to update next trade fields for order {}: {}",
+                    order_id, e
+                );
+                return Ok(());
+            }
         }
     }
 

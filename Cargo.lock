@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "mostro"
-version = "0.12.8"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "bitcoin",

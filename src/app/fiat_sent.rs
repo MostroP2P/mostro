@@ -62,7 +62,7 @@ pub async fn fiat_sent_action(
     // and update on local database the status and new event id
     let mut order_updated = match update_order_event(my_keys, Status::FiatSent, &order).await {
         Ok(order) => order.update(pool).await?,
-        Err(_) => {
+        Err(e) => {
             error!("Failed to update order {}: {}", order.id, e);
             return Ok(());
         }

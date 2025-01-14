@@ -161,7 +161,7 @@ pub async fn release_action(
     {
         if let Ok(client) = get_nostr_client() {
             if client.send_event(event).await.is_err() {
-                tracing::warn!("Failed sending event with order id: {}", child_order.id)
+                tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
             }
         }
         handle_child_order(child_order, &order, next_trade, pool, request_id).await?;
@@ -204,7 +204,7 @@ async fn handle_child_order(
     request_id: Option<u64>,
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
-        let mut child_order = child_order.clone();
+        let mut child_order = child_order;
         if &order.creator_pubkey == order.seller_pubkey.as_ref().unwrap() {
             child_order.seller_pubkey = Some(next_trade_pubkey.clone());
             child_order.creator_pubkey = next_trade_pubkey.clone();
@@ -407,6 +407,17 @@ fn create_base_order(order: &Order) -> Order {
     new_order
 }
 
+fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event> {
+    let tags = crate::nip33::order_to_tags(new_order, None);
+    let event =
+        crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags).map_err(|e| {
+            tracing::error!("Failed to create event for order {}: {}", new_order.id, e);
+            e
+        })?;
+    new_order.event_id = event.id.to_string();
+    Ok(event)
+}
+
 async fn order_for_equal(
     new_max: i64,
     new_order: &mut Order,
@@ -415,10 +426,7 @@ async fn order_for_equal(
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-
-    let tags = crate::nip33::order_to_tags(new_order, None);
-    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-    new_order.event_id = event.id.to_string();
+    let event = create_order_event(new_order, my_keys)?;
 
     Ok((new_order.clone(), event))
 }
@@ -430,10 +438,7 @@ async fn order_for_greater(
 ) -> Result<(Order, Event)> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-
-    let tags = crate::nip33::order_to_tags(new_order, None);
-    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
-    new_order.event_id = event.id.to_string();
+    let event = create_order_event(new_order, my_keys)?;
 
     Ok((new_order.clone(), event))
 }

@@ -3,10 +3,9 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, rate_counterpart, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
-    update_order_event,
+    get_keys, get_nostr_client, rate_counterpart, send_cant_do_msg, send_new_order_msg,
+    settle_seller_hold_invoice, update_order_event,
 };
-use crate::NOSTR_CLIENT;
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -156,10 +155,16 @@ pub async fn release_action(
     )
     .await;
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
-
     // Handle child order for range orders
-    if let Ok((true, mut child_order)) = get_child_order(&mut order, request_id, my_keys).await {
-        handle_child_order(&mut child_order, &order, next_trade, pool, request_id).await?;
+    if let Ok((Some(child_order), Some(event))) =
+        get_child_order(order.clone(), request_id, my_keys).await
+    {
+        if let Ok(client) = get_nostr_client() {
+            if client.send_event(event).await.is_err() {
+                tracing::warn!("Failed sending event with order id: {}", child_order.id)
+            }
+        }
+        handle_child_order(child_order, &order, next_trade, pool, request_id).await?;
     }
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
@@ -192,13 +197,14 @@ pub async fn release_action(
 /// # Returns
 /// Result indicating success or failure of the operation
 async fn handle_child_order(
-    child_order: &mut Order,
+    child_order: Order,
     order: &Order,
     next_trade: Option<(String, u32)>,
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
+        let mut child_order = child_order.clone();
         if &order.creator_pubkey == order.seller_pubkey.as_ref().unwrap() {
             child_order.seller_pubkey = Some(next_trade_pubkey.clone());
             child_order.creator_pubkey = next_trade_pubkey.clone();
@@ -222,7 +228,7 @@ async fn handle_child_order(
             Some(next_trade_index as i64),
         )
         .await;
-        child_order.clone().update(pool).await?;
+        child_order.create(pool).await?;
     }
     Ok(())
 }
@@ -346,34 +352,34 @@ async fn payment_success(
 /// publish a new replaceable kind nostr event with the status updated
 /// and update on local database the status and new event id
 pub async fn get_child_order(
-    order: &mut Order,
+    order: Order,
     request_id: Option<u64>,
     my_keys: &Keys,
-) -> Result<(bool, Order)> {
+) -> Result<(Option<Order>, Option<Event>)> {
     let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
-        return Ok((false, order.clone()));
+        return Ok((None, None));
     };
 
     if let Some(new_max) = max_amount.checked_sub(order.fiat_amount) {
-        let mut new_order = create_base_order(order);
+        let mut new_order = create_base_order(&order);
 
         match new_max.cmp(&min_amount) {
             Ordering::Equal => {
-                update_order_for_equal(new_max, &mut new_order, my_keys).await?;
-                return Ok((true, new_order));
+                let (order, event) = order_for_equal(new_max, &mut new_order, my_keys).await?;
+                return Ok((Some(order), Some(event)));
             }
             Ordering::Greater => {
-                update_order_for_greater(new_max, &mut new_order, my_keys).await?;
-                return Ok((true, new_order));
+                let (order, event) = order_for_greater(new_max, &mut new_order, my_keys).await?;
+                return Ok((Some(order), Some(event)));
             }
             Ordering::Less => {
-                notify_invalid_amount(order, request_id).await;
-                return Ok((false, order.clone()));
+                notify_invalid_amount(&order, request_id).await;
+                return Ok((None, None));
             }
         }
     }
 
-    Ok((false, order.clone()))
+    Ok((None, None))
 }
 
 fn create_base_order(order: &Order) -> Order {
@@ -401,8 +407,11 @@ fn create_base_order(order: &Order) -> Order {
     new_order
 }
 
-async fn update_order_for_equal(new_max: i64, new_order: &mut Order, my_keys: &Keys) -> Result<()> {
-    let pool = db::connect().await?;
+async fn order_for_equal(
+    new_max: i64,
+    new_order: &mut Order,
+    my_keys: &Keys,
+) -> Result<(Order, Event)> {
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
@@ -410,38 +419,23 @@ async fn update_order_for_equal(new_max: i64, new_order: &mut Order, my_keys: &K
     let tags = crate::nip33::order_to_tags(new_order, None);
     let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
     new_order.event_id = event.id.to_string();
-    new_order.clone().create(&pool).await?;
-    NOSTR_CLIENT
-        .get()
-        .ok_or_else(|| anyhow::Error::msg("NOSTR_CLIENT not initialized"))?
-        .send_event(event)
-        .await
-        .map_err(|err| anyhow::Error::msg(err.to_string()))?;
 
-    Ok(())
+    Ok((new_order.clone(), event))
 }
 
-async fn update_order_for_greater(
+async fn order_for_greater(
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
-) -> Result<()> {
-    let pool = db::connect().await?;
+) -> Result<(Order, Event)> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
 
     let tags = crate::nip33::order_to_tags(new_order, None);
     let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)?;
     new_order.event_id = event.id.to_string();
-    new_order.clone().create(&pool).await?;
-    NOSTR_CLIENT
-        .get()
-        .ok_or_else(|| anyhow::Error::msg("NOSTR_CLIENT not initialized"))?
-        .send_event(event)
-        .await
-        .map_err(|err| anyhow::Error::msg(err.to_string()))?;
 
-    Ok(())
+    Ok((new_order.clone(), event))
 }
 
 async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {

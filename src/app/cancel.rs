@@ -255,6 +255,16 @@ pub async fn cancel_add_invoice(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id
         );
+        // Confirmation message to buyer
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &event.rumor.pubkey,
+            None,
+        )
+        .await;
         Ok(())
     }
 }

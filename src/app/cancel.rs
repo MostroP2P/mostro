@@ -336,6 +336,16 @@ pub async fn cancel_pay_hold_invoice(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id
         );
+        // Notify to seller the order was canceled
+        send_new_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            &event.rumor.pubkey,
+            None,
+        )
+        .await;
         Ok(())
     }
 }

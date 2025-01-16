@@ -277,13 +277,6 @@ pub async fn cancel_pay_hold_invoice(
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
-    if order.hash.is_some() {
-        // We return funds to seller
-        if let Some(hash) = order.hash.as_ref() {
-            ln_client.cancel_hold_invoice(hash).await?;
-            info!("Order Id {}: Funds returned to seller", &order.id);
-        }
-    }
     let user_pubkey = event.rumor.pubkey.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
@@ -296,6 +289,14 @@ pub async fn cancel_pay_hold_invoice(
         // We create a Message
         send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
         return Ok(());
+    }
+
+    if order.hash.is_some() {
+        // We cancel the hold invoice, if it was paid those funds return to seller
+        if let Some(hash) = order.hash.as_ref() {
+            ln_client.cancel_hold_invoice(hash).await?;
+            info!("Order Id {}: Hold invoice canceled", &order.id);
+        }
     }
 
     if order.creator_pubkey == seller_pubkey.to_string() {

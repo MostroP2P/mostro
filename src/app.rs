@@ -275,7 +275,7 @@ pub async fn run(
                             {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
-                                        let cantdoreason = match err {
+                                        match err {
                                             MostroError::MostroCantDo(cause) => {
                                                 enqueue_cant_do_msg(
                                                     inner_message.request_id,

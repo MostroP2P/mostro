@@ -1,162 +1,91 @@
-use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{send_cant_do_msg, send_new_order_msg, show_hold_invoice, update_order_event};
+use crate::util::{
+    enqueue_order_msg, get_order, show_hold_invoice, update_order_event, validate_invoice,
+};
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 
-use mostro_core::error::CantDoReason;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::SmallOrder;
-use mostro_core::order::{Kind, Order, Status};
+use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::str::FromStr;
-use tracing::error;
 
 pub async fn add_invoice_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
-    // Get the order message
-    let order_msg = msg.get_inner_message_kind();
-    // Get request id
-    let request_id = msg.get_inner_message_kind().request_id;
+) -> Result<(), MostroError> {
+    // Get order
+    let mut order = get_order(&msg, pool).await?;
 
-    let mut order = match Order::by_id(pool, order_id).await {
-        Ok(Some(order)) => order,
-        Ok(None) => {
-            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
-        }
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::OrderNotFound));
-        }
-    };
-
-    let order_status = match Status::from_str(&order.status) {
+    // Get order status
+    let order_status = match order.get_order_status() {
         Ok(s) => s,
-        Err(e) => {
-            error!("Order Id {} wrong status: {e:?}", order.id);
-            return Ok(());
+        Err(cause) => {
+            return Err(MostroInternalErr(cause));
         }
     };
-
-    let order_kind = match Kind::from_str(&order.kind) {
+    // Get order kind
+    let order_kind = match order.get_order_kind() {
         Ok(k) => k,
-        Err(e) => {
-            error!("Order Id {} wrong kind: {e:?}", order.id);
-            return Ok(());
+        Err(cause) => {
+            return Err(MostroInternalErr(cause));
         }
     };
 
-    let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => PublicKey::from_str(pk)?,
-        None => {
-            error!("Buyer pubkey not found for order {}!", order.id);
-            return Ok(());
-        }
+    let buyer_pubkey = match order.get_buyer_pubkey() {
+        Some(pk) => pk,
+        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
+
     // Only the buyer can add an invoice
     if buyer_pubkey != event.rumor.pubkey {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPeer),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
+        return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
 
-    // Invoice variable
-    let invoice: String;
-    // If a buyer sent me a lightning invoice or a ln address we handle it
-    if let Some(payment_request) = order_msg.get_payment_request() {
-        invoice = {
-            // Verify if invoice is valid
-            match is_valid_invoice(
-                payment_request.clone(),
-                Some(order.amount as u64),
-                Some(order.fee as u64),
-            )
-            .await
-            {
-                Ok(_) => payment_request,
-                Err(_) => {
-                    send_cant_do_msg(
-                        request_id,
-                        Some(order.id),
-                        Some(CantDoReason::InvalidAmount),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
-                    return Ok(());
-                }
-            }
-        };
-    } else {
-        error!("Order Id {} wrong get_payment_request", order.id);
-        return Ok(());
-    }
     // We save the invoice on db
-    order.buyer_invoice = Some(invoice);
+    order.buyer_invoice = validate_invoice(&msg, &order).await?;
+
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     match order_status {
         Status::WaitingBuyerInvoice => {}
         Status::SettledHoldInvoice => {
             order.payment_attempts = 0;
-            order.clone().update(pool).await?;
-            send_new_order_msg(
-                request_id,
+            order
+                .clone()
+                .update(pool)
+                .await
+                .map_err(|_| MostroInternalErr(ServiceError::DbAccessError));
+            enqueue_order_msg(
+                msg.get_inner_message_kind().request_id,
                 Some(order.id),
                 Action::InvoiceUpdated,
                 None,
-                &buyer_pubkey,
+                buyer_pubkey,
                 None,
             )
             .await;
             return Ok(());
         }
         _ => {
-            send_cant_do_msg(
-                request_id,
-                Some(order.id),
-                Some(CantDoReason::NotAllowedByStatus),
-                &event.rumor.pubkey,
-            )
-            .await;
-            return Ok(());
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
         }
     }
 
-    let seller_pubkey = match &order.seller_pubkey {
-        Some(seller) => PublicKey::from_str(seller.as_str())?,
-        _ => return Err(Error::msg("Missing pubkeys")),
+    // Get seller pubkey
+    let seller_pubkey = match order.get_seller_pubkey() {
+        Some(pk) => pk,
+        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
-        let order_data = SmallOrder::new(
-            Some(order.id),
-            Some(order_kind),
-            Some(Status::Active),
-            order.amount,
-            order.fiat_code.clone(),
-            order.min_amount,
-            order.max_amount,
-            order.fiat_amount,
-            order.payment_method.clone(),
-            order.premium,
-            order.buyer_pubkey.as_ref().cloned(),
-            order.seller_pubkey.as_ref().cloned(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let order_data = SmallOrder::from(order.clone());
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
         if let Ok(order_updated) = update_order_event(my_keys, Status::Active, &order).await {
@@ -164,36 +93,40 @@ pub async fn add_invoice_action(
         }
 
         // We send a confirmation message to seller
-        send_new_order_msg(
+        enqueue_order_msg(
             None,
-            Some(order.id),
+            Some(order.clone().id),
             Action::BuyerTookOrder,
             Some(Payload::Order(order_data.clone())),
-            &seller_pubkey,
+            seller_pubkey,
             None,
         )
         .await;
         // We send a message to buyer saying seller paid
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
+        enqueue_order_msg(
+            msg.get_inner_message_kind().request_id,
+            Some(order.clone().id),
             Action::HoldInvoicePaymentAccepted,
             Some(Payload::Order(order_data)),
-            &buyer_pubkey,
+            buyer_pubkey,
             None,
         )
         .await;
     } else {
-        show_hold_invoice(
+        if let Err(cause) = show_hold_invoice(
             my_keys,
             None,
             &buyer_pubkey,
             &seller_pubkey,
             order,
-            request_id,
+            msg.get_inner_message_kind().request_id,
         )
-        .await?;
+        .await
+        {
+            return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+                cause.to_string(),
+            )));
+        }
     }
-
     Ok(())
 }

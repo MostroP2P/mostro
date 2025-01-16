@@ -5,7 +5,6 @@ use crate::lightning::invoice::decode_invoice;
 use crate::util::bytes_to_string;
 
 use anyhow::Result;
-use mostro_core::error::{MostroError, ServiceError, MostroInternalErr};
 use easy_hasher::easy_hasher::*;
 use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
@@ -14,6 +13,7 @@ use fedimint_tonic_lnd::invoicesrpc::{
 use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
+use mostro_core::error::{MostroError, MostroInternalErr, ServiceError};
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use std::cmp::Ordering;
@@ -195,7 +195,9 @@ impl LndConnector {
         // We only send the payment if it wasn't attempted before
         if track.is_ok() {
             info!("Aborting paying invoice with hash {} to buyer", hash);
-            return Err(MostroInternalErr(ServiceError::LnPaymentError("Track error".to_string())));
+            return Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "Track error".to_string(),
+            )));
         }
 
         let mut request = SendPaymentRequest {
@@ -212,7 +214,9 @@ impl LndConnector {
                         "Aborting paying invoice with wrong amount to buyer, hash: {}",
                         hash
                     );
-                    return Err(MostroInternalErr(ServiceError::LnPaymentError("Wrong amount".to_string())));
+                    return Err(MostroInternalErr(ServiceError::LnPaymentError(
+                        "Wrong amount".to_string(),
+                    )));
                 }
             }
             None => {

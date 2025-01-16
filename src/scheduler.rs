@@ -43,9 +43,9 @@ async fn job_flush_messages_queue() {
     // Spawn a new task to flush the messages queue
     tokio::spawn(async move {
         loop {
-            info!("Flushing messages in queue");
             // Send message to event creator
             for message in order_msg_list.lock().await.iter() {
+                info!("Flushing messages in queue");
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
@@ -53,6 +53,7 @@ async fn job_flush_messages_queue() {
                 }
             }
             for message in cantdo_msg_list.lock().await.iter() {
+                info!("Flushing cantdo messages in queue");
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();

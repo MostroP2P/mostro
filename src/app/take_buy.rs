@@ -1,13 +1,12 @@
 use crate::util::{
-    enqueue_cant_do_msg, get_fiat_amount_requested, get_market_amount_and_fee, show_hold_invoice,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
 };
-use crate::MESSAGE_QUEUES;
-use mostro_core::error::CantDoReason;
+
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 
 use anyhow::Result;
-use mostro_core::message::{Message, Payload};
+use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -22,25 +21,10 @@ pub async fn take_buy_action(
 ) -> Result<(), MostroError> {
     // Extract order ID from the message, returning an error if not found
     // Safe unwrap as we verified the message
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
-    };
+    let mut order = get_order(&msg, pool).await?;
 
     // Get the request ID from the message
     let request_id = msg.get_inner_message_kind().request_id;
-
-    // Retrieve the order from the database using the order ID
-    let mut order = match Order::by_id(pool, order_id).await {
-        Ok(Some(order)) => order,
-        Ok(None) => {
-            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
-        }
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError));
-        }
-    };
 
     // Check if the order is a buy order and if its status is active
     if let Err(cause) = order.is_buy_order() {

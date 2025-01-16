@@ -1,16 +1,15 @@
 use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg,
-    set_waiting_invoice_status, show_hold_invoice, update_order_event,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, send_cant_do_msg,
+    set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
 };
 
-use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 use mostro_core::message::Message;
-use mostro_core::order::{Kind, Order, Status};
+use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -44,56 +43,17 @@ async fn update_order_status(
     }
 }
 
-async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<String>, MostroError> {
-    // init payment request to None
-    let mut payment_request = None;
-    // if payment request is present
-    if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
-        // if invoice is valid
-        if is_valid_invoice(
-            pr.clone(),
-            Some(order.amount as u64),
-            Some(order.fee as u64),
-        )
-        .await
-        .is_err()
-        {
-            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-        }
-        // if invoice is valid return it
-        else {
-            payment_request = Some(pr);
-        }
-    }
-    Ok(payment_request)
-}
-
 pub async fn take_sell_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<(), MostroError> {
-    // Extract order ID from the message, returning an error if not found
-    // Safe unwrap as we verified the message
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
-    };
+    // Get order
+    let mut order = get_order(&msg, pool).await?;
 
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
-
-    let mut order = match Order::by_id(pool, order_id).await {
-        Ok(Some(order)) => order,
-        Ok(None) => {
-            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
-        }
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError));
-        }
-    };
 
     // Check if the order is a sell order and if its status is active
     if let Err(cause) = order.is_sell_order() {

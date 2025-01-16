@@ -4,6 +4,7 @@ use crate::cli::settings::Settings;
 use crate::db;
 use crate::flow;
 use crate::lightning;
+use crate::lightning::invoice::is_valid_invoice;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
@@ -13,12 +14,15 @@ use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
-use mostro_core::error::MostroError;
-use mostro_core::message::CantDoReason;
+use mostro_core::error::CantDoReason;
+use mostro_core::error::ServiceError;
+use mostro_core::error::{MostroError, MostroInternalErr};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use sqlx::Pool;
+use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::fmt::Write;
@@ -688,7 +692,7 @@ pub async fn send_cant_do_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
     reason: Option<CantDoReason>,
-    destination_key: &PublicKey,
+    destination_key: PublicKey,
 ) {
     // Send message to event creator
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
@@ -785,6 +789,45 @@ pub async fn get_nostr_relays() -> Option<HashMap<RelayUrl, Relay>> {
     } else {
         None
     }
+}
+
+pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, MostroError> {
+    let order_msg = msg.get_inner_message_kind();
+    let order_id = order_msg
+        .id
+        .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
+    let order = Order::by_id(pool, order_id)
+        .await
+        .map_err(|_| MostroInternalErr(ServiceError::DbAccessError))?;
+    if let Some(order) = order {
+        Ok(order)
+    } else {
+        Err(MostroInternalErr(ServiceError::InvalidOrderId))
+    }
+}
+
+pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<String>, MostroError> {
+    // init payment request to None
+    let mut payment_request = None;
+    // if payment request is present
+    if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
+        // if invoice is valid
+        if is_valid_invoice(
+            pr.clone(),
+            Some(order.amount as u64),
+            Some(order.fee as u64),
+        )
+        .await
+        .is_err()
+        {
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+        }
+        // if invoice is valid return it
+        else {
+            payment_request = Some(pr);
+        }
+    }
+    Ok(payment_request)
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, get_nostr_client, rate_counterpart, send_cant_do_msg, send_new_order_msg,
-    settle_seller_hold_invoice, update_order_event,
+    get_keys, get_nostr_client, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
+    update_order_event,
 };
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
@@ -179,6 +179,17 @@ pub async fn release_action(
     )
     .await;
 
+    // Send DM to seller to rate counterpart
+    send_new_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        &event.rumor.pubkey,
+        None,
+    )
+    .await;
+
     // Finally we try to pay buyer's invoice
     let _ = do_payment(order, request_id).await;
 
@@ -262,13 +273,9 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
 
     let my_keys = get_keys()?;
 
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())?,
-            PublicKey::from_str(buyer.as_str())?,
-        ),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+    let buyer_pubkey = match &order.buyer_pubkey {
+        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
+        None => return Err(Error::msg("Missing buyer pubkey")),
     };
 
     let payment = {
@@ -284,14 +291,9 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
                                 order.id, msg.payment.payment_hash
                             );
 
-                            let _ = payment_success(
-                                &mut order,
-                                &buyer_pubkey,
-                                &seller_pubkey,
-                                &my_keys,
-                                request_id,
-                            )
-                            .await;
+                            let _ =
+                                payment_success(&mut order, &buyer_pubkey, &my_keys, request_id)
+                                    .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -322,7 +324,6 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
 async fn payment_success(
     order: &mut Order,
     buyer_pubkey: &PublicKey,
-    seller_pubkey: &PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
@@ -339,9 +340,17 @@ async fn payment_success(
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let pool = db::connect().await?;
-        if let Ok(order_success) = order_updated.update(&pool).await {
-            // Adding here rate process
-            rate_counterpart(buyer_pubkey, seller_pubkey, &order_success, request_id).await?;
+        if let Ok(order) = order_updated.update(&pool).await {
+            // Send dm to buyer to rate counterpart
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Rate,
+                None,
+                buyer_pubkey,
+                None,
+            )
+            .await;
         }
     }
     Ok(())

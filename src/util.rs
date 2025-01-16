@@ -606,38 +606,6 @@ pub async fn set_waiting_invoice_status(
     Ok(order.amount)
 }
 
-/// Send message to buyer and seller to vote for counterpart
-pub async fn rate_counterpart(
-    buyer_pubkey: &PublicKey,
-    seller_pubkey: &PublicKey,
-    order: &Order,
-    request_id: Option<u64>,
-) -> Result<()> {
-    // Send dm to counterparts
-    // to buyer
-    send_new_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Rate,
-        None,
-        buyer_pubkey,
-        None,
-    )
-    .await;
-    // to seller
-    send_new_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Rate,
-        None,
-        seller_pubkey,
-        None,
-    )
-    .await;
-
-    Ok(())
-}
-
 /// Settle a seller hold invoice
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(

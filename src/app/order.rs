@@ -75,13 +75,14 @@ pub async fn order_action(
 
         let premium = (order.premium != 0).then_some(order.premium);
         let fiat_amount = (order.fiat_amount != 0).then_some(order.fiat_amount);
+        let amount = (order.amount != 0).then_some(order.amount);
 
-        if premium.is_some() && fiat_amount.is_some() {
+        if premium.is_some() && fiat_amount.is_some() && amount.is_some() {
             send_cant_do_msg(
                 request_id,
                 None,
                 Some(CantDoReason::InvalidParameters),
-                &event.sender,
+                &event.rumor.pubkey,
             )
             .await;
             return Ok(());

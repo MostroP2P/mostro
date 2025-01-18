@@ -120,7 +120,7 @@ pub async fn cancel_action(
                 None,
             )
             .await;
-            
+
             let taker_pubkey = PublicKey::from_str(&taker_pubkey)?;
             //We notify the taker that the order was cancelled
             send_new_order_msg(
@@ -132,28 +132,16 @@ pub async fn cancel_action(
                 None,
             )
             .await;
+            
         } else if user_pubkey == taker_pubkey {
-            if let Ok(order_updated) = update_order_event(my_keys, Status::Pending, &order).await {
-                let _ = order_updated.update(pool).await;
-            }
             if let Some(hash) = &order.hash {
                 ln_client.cancel_hold_invoice(hash).await?;
                 info!("Order Id {}: Funds returned to seller", &order.id);
             }
 
-            send_new_order_msg(
-                request_id,
-                Some(order.id),
-                Action::Canceled,
-                None,
-                &event.rumor.pubkey,
-                None,
-            )
-            .await;
-
             let creator_pubkey = PublicKey::from_str(&order.creator_pubkey)?;
             //We notify the creator that the order was cancelled only if the taker had already done his part before
-            
+
             if order.kind == OrderKind::Buy.to_string()
                 && order.status == Status::WaitingBuyerInvoice.to_string()
             {
@@ -167,7 +155,7 @@ pub async fn cancel_action(
                 )
                 .await;
             }
-            
+
             if order.kind == OrderKind::Sell.to_string()
                 && order.status == Status::WaitingPayment.to_string()
             {
@@ -181,6 +169,20 @@ pub async fn cancel_action(
                 )
                 .await;
             }
+
+            if let Ok(order_updated) = update_order_event(my_keys, Status::Pending, &order).await {
+                let _ = order_updated.update(pool).await;
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.rumor.pubkey,
+                None,
+            )
+            .await;
         }
     }
 

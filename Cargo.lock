@@ -1977,6 +1977,7 @@ dependencies = [
  "bitcoin_hashes 0.15.0",
  "chrono",
  "nostr-sdk",
+ "rand",
  "serde",
  "serde_json",
  "sqlx",

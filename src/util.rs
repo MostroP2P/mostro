@@ -15,8 +15,8 @@ use crate::NOSTR_CLIENT;
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
 use mostro_core::error::CantDoReason;
+use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
-use mostro_core::error::{MostroError, MostroInternalErr};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -171,7 +171,7 @@ pub async fn publish_order(
     trade_pubkey: PublicKey,
     request_id: Option<u64>,
     trade_index: Option<i64>,
-) -> Result<()> {
+) -> Result<Order, MostroError> {
     // Prepare a new default order
     let new_order_db = match prepare_new_order(
         new_order,
@@ -182,28 +182,30 @@ pub async fn publish_order(
     )
     .await
     {
-        Some(order) => order,
-        None => {
-            return Ok(());
+        Ok(order) => order,
+        Err(e) => {
+            return Err(e);
         }
     };
 
     // CRUD order creation
-    let mut order = new_order_db.clone().create(pool).await?;
+    let mut order = new_order_db.clone().create(pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
-    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys).await?;
+    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys)
+        .await
+        .map_err(|e| e)?;
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags)?;
+    let event = new_event(keys, "", order_id.to_string(), tags).map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order with the new event_id
     order.event_id = event_id;
-    order.update(pool).await?;
+    order.update(pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let mut order = new_order_db.as_new_order();
     order.id = Some(order_id);
 
@@ -233,7 +235,7 @@ async fn prepare_new_order(
     trade_index: Option<i64>,
     identity_pubkey: PublicKey,
     trade_pubkey: PublicKey,
-) -> Option<Order> {
+) -> Result<Order, MostroError> {
     let mut fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
@@ -276,14 +278,7 @@ async fn prepare_new_order(
             new_order_db.trade_index_seller = trade_index;
         }
         None => {
-            send_cant_do_msg(
-                None,
-                None,
-                Some(CantDoReason::InvalidOrderKind),
-                &trade_pubkey,
-            )
-            .await;
-            return None;
+            return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
         }
     }
 
@@ -648,20 +643,17 @@ pub async fn settle_seller_hold_invoice(
     action: Action,
     is_admin: bool,
     order: &Order,
-    request_id: Option<u64>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
+    // Get seller pubkey
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?
+        .to_string();
+    // Get sender pubkey
+    let sender_pubkey = event.rumor.pubkey.to_string();
     // Check if the pubkey is right
-    if !is_admin
-        && event.rumor.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string()
-    {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPubkey),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Err(Error::msg("Not allowed"));
+    if !is_admin && sender_pubkey != seller_pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
     // Settling the hold invoice
@@ -669,14 +661,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidInvoice),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Err(Error::msg("No preimage"));
+        return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
     Ok(())
 }
@@ -709,7 +694,7 @@ pub async fn enqueue_cant_do_msg(
     destination_key: PublicKey,
 ) {
     // Send message to event creator
-    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
+    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(Some(reason))));
     MESSAGE_QUEUES
         .write()
         .await

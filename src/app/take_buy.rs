@@ -7,11 +7,10 @@ use mostro_core::error::ServiceError;
 
 use anyhow::Result;
 use mostro_core::message::Message;
-use mostro_core::order::{Order, Status};
+use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 
 pub async fn take_buy_action(
     msg: Message,
@@ -60,10 +59,9 @@ pub async fn take_buy_action(
 
     // Get seller and buyer public keys
     let seller_pubkey = event.rumor.pubkey;
-    let buyer_pubkey = match order.get_buyer_pubkey() {
-        Some(pk) => pk,
-        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
 
     // Add seller identity and trade index to the order
     order.master_seller_pubkey = Some(event.sender.to_string());
@@ -73,7 +71,7 @@ pub async fn take_buy_action(
     order.set_timestamp_now();
 
     // Show hold invoice and return success or error
-    if let Ok(()) = show_hold_invoice(
+    if let Err(cause) = show_hold_invoice(
         my_keys,
         None,
         &buyer_pubkey,
@@ -83,8 +81,7 @@ pub async fn take_buy_action(
     )
     .await
     {
-        Ok(())
-    } else {
-        Err(MostroInternalErr(ServiceError::HoldInvoiceError))
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(cause.to_string())));
     }
+    Ok(())
 }

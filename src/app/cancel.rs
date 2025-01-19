@@ -6,7 +6,7 @@ use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::{Kind as OrderKind, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

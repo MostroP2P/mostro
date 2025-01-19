@@ -57,7 +57,7 @@ pub async fn is_valid_invoice(
             return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
         }
 
-        let parsed = payment_request.parse::<SignedRawBolt11Invoice>()?;
+        let parsed = payment_request.parse::<SignedRawBolt11Invoice>().map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
 
         let (parsed_invoice, _, _) = parsed.into_parts();
 

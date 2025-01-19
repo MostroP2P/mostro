@@ -7,12 +7,44 @@ use anyhow::Result;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::{Action, Message, Payload};
-use mostro_core::order::SmallOrder;
 use mostro_core::order::Status;
+use mostro_core::order::{Order, SmallOrder};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+
+pub async fn check_order_status(
+    order: &mut Order,
+    pool: &Pool<Sqlite>,
+    msg: &Message,
+) -> Result<(), MostroError> {
+    // Buyer can add invoice orders with WaitingBuyerInvoice status
+    match order.get_order_status() {
+        Ok(Status::WaitingBuyerInvoice) => {}
+        Ok(Status::SettledHoldInvoice) => {
+            order.payment_attempts = 0;
+            order.clone().update(pool).await.map_err(|cause| {
+                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+            })?;
+            enqueue_order_msg(
+                msg.get_inner_message_kind().request_id,
+                Some(order.id),
+                Action::InvoiceUpdated,
+                None,
+                order
+                    .get_buyer_pubkey()
+                    .map_err(|cause| MostroInternalErr(cause))?,
+                None,
+            )
+            .await;
+        }
+        _ => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+    }
+    Ok(())
+}
 
 pub async fn add_invoice_action(
     msg: Message,
@@ -24,24 +56,23 @@ pub async fn add_invoice_action(
     let mut order = get_order(&msg, pool).await?;
 
     // Get order status
-    let order_status = match order.get_order_status() {
+    match order.get_order_status() {
         Ok(s) => s,
         Err(cause) => {
             return Err(MostroInternalErr(cause));
         }
     };
     // Get order kind
-    let order_kind = match order.get_order_kind() {
+    match order.get_order_kind() {
         Ok(k) => k,
         Err(cause) => {
             return Err(MostroInternalErr(cause));
         }
     };
 
-    let buyer_pubkey = match order.get_buyer_pubkey() {
-        Some(pk) => pk,
-        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
 
     // Only the buyer can add an invoice
     if buyer_pubkey != event.rumor.pubkey {
@@ -52,36 +83,12 @@ pub async fn add_invoice_action(
     order.buyer_invoice = validate_invoice(&msg, &order).await?;
 
     // Buyer can add invoice orders with WaitingBuyerInvoice status
-    match order_status {
-        Status::WaitingBuyerInvoice => {}
-        Status::SettledHoldInvoice => {
-            order.payment_attempts = 0;
-            order
-                .clone()
-                .update(pool)
-                .await
-                .map_err(|_| MostroInternalErr(ServiceError::DbAccessError));
-            enqueue_order_msg(
-                msg.get_inner_message_kind().request_id,
-                Some(order.id),
-                Action::InvoiceUpdated,
-                None,
-                buyer_pubkey,
-                None,
-            )
-            .await;
-            return Ok(());
-        }
-        _ => {
-            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-        }
-    }
+    check_order_status(&mut order, pool, &msg).await?;
 
     // Get seller pubkey
-    let seller_pubkey = match order.get_seller_pubkey() {
-        Some(pk) => pk,
-        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

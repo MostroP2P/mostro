@@ -26,7 +26,7 @@ async fn calculate_and_check_quote(
                 let quote = *fiat_amount as f64 / price;
                 (quote * 1E8) as i64
             }
-            Err(e) => {
+            Err(_) => {
                 return Err(MostroInternalErr(ServiceError::NoAPIResponse));
             }
         },

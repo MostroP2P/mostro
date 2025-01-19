@@ -44,7 +44,7 @@ use crate::Settings;
 use anyhow::Result;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::message::{Action, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -168,7 +168,9 @@ async fn handle_message_action(
 ) -> Result<()> {
     match action {
         // Order-related actions
-        Action::NewOrder => order_action(msg, event, my_keys, pool).await,
+        Action::NewOrder => order_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
         Action::TakeSell => take_sell_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
@@ -177,22 +179,44 @@ async fn handle_message_action(
             .map_err(|e| e.into()),
 
         // Payment-related actions
-        Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
-        Action::Release => release_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AddInvoice => add_invoice_action(msg, event, my_keys, pool).await,
+        Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::Release => release_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AddInvoice => add_invoice_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
 
         // Dispute and rating actions
-        Action::Dispute => dispute_action(msg, event, my_keys, pool).await,
-        Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool).await,
-        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client).await,
+        Action::Dispute => dispute_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
 
         // Admin actions
-        Action::AdminCancel => admin_cancel_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool).await,
-        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool).await,
-        Action::TradePubkey => trade_pubkey_action(msg, event, pool).await,
+        Action::AdminCancel => admin_cancel_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::TradePubkey => trade_pubkey_action(msg, event, pool)
+            .await
+            .map_err(|e| e.into()),
 
         _ => {
             tracing::info!("Received message with action {:?}", action);

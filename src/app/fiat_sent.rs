@@ -1,7 +1,7 @@
 use crate::util::{get_order, send_new_order_msg, update_order_event};
 
 use anyhow::Result;
-use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
+use mostro_core::error::{MostroError, MostroError::*, ServiceError};
 use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
@@ -25,7 +25,7 @@ pub async fn fiat_sent_action(
     }
 
     // Check if the pubkey is the buyer
-    if order.get_buyer_pubkey() != Some(event.rumor.pubkey) {
+    if order.get_buyer_pubkey().ok() != Some(event.rumor.pubkey) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
@@ -35,10 +35,9 @@ pub async fn fiat_sent_action(
         let _ = order_updated.update(pool).await;
     }
 
-    let seller_pubkey = match order.get_seller_pubkey() {
-        Some(pk) => pk,
-        None => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
 
     // Create peer
     let peer = Peer::new(event.rumor.pubkey.to_string());

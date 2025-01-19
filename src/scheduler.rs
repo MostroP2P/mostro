@@ -7,16 +7,11 @@ use crate::util::get_nostr_client;
 use crate::LN_STATUS;
 use crate::{db::*, MESSAGE_QUEUES};
 
-use crate::MessageQueues;
 use chrono::{TimeDelta, Utc};
-use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
-use nostr_sdk::prelude::PublicKey;
 use nostr_sdk::EventBuilder;
-use nostr_sdk::{Event, Kind as NostrKind, Tag};
+use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
 

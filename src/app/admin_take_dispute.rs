@@ -1,11 +1,10 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_cant_do_msg, send_dm};
+use crate::util::{get_nostr_client, get_order, send_dm};
 
-use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::message::{Action, CantDoReason, Message, Payload, Peer};
-use mostro_core::order::Order;
+use mostro_core::error::{MostroError::{self,*}, CantDoReason, ServiceError};
+use mostro_core::message::{Action, Message, Payload, Peer};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -41,7 +40,7 @@ pub async fn admin_take_dispute_action(
     msg: Message,
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
@@ -49,22 +48,14 @@ pub async fn admin_take_dispute_action(
     let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
         dispute_id
     } else {
-        return Err(Error::msg("No order id"));
+        return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
     };
 
     // Fetch dispute from db
     let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
         Some(dispute) => dispute,
         None => {
-            send_cant_do_msg(
-                request_id,
-                Some(dispute_id),
-                Some(CantDoReason::NotFound),
-                &event.rumor.pubkey,
-            )
-            .await;
-
-            return Ok(());
+            return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
         }
     };
 
@@ -72,23 +63,14 @@ pub async fn admin_take_dispute_action(
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
         if !pubkey_event_can_solve(pool, &event.rumor.pubkey, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(
-                request_id,
-                Some(dispute_id),
-                Some(CantDoReason::InvalidPubkey),
-                &event.rumor.pubkey,
-            )
-            .await;
-            return Ok(());
+            return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
     } else {
-        return Err(Error::msg("No dispute status"));
+        return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
     };
 
-    let order = match Order::by_id(pool, dispute.order_id).await? {
-        Some(o) => o,
-        None => return Err(Error::msg("No order id")),
-    };
+    // Get order from db
+    let order = get_order(&msg, pool).await?;
 
     let mut new_order = order.as_new_order();
     // Only in this case we use the trade pubkey fields to store the master pubkey

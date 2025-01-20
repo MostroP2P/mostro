@@ -13,7 +13,10 @@ use fedimint_tonic_lnd::invoicesrpc::{
 use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
-use mostro_core::error::{MostroError, MostroInternalErr, ServiceError};
+use mostro_core::error::{
+    MostroError::{self, *},
+    ServiceError,
+};
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use std::cmp::Ordering;
@@ -79,7 +82,7 @@ impl LndConnector {
 
         match holdinvoice {
             Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
-            Err(e) => Err(e),
+            Err(e) => Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string()))),
         }
     }
 
@@ -154,11 +157,11 @@ impl LndConnector {
             .invoices()
             .cancel_invoice(cancel_message)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
+            .map_err(|e| e.to_string())?;
 
         match cancel {
             Ok(cancel) => Ok(cancel.into_inner()),
-            Err(e) => Err(e),
+            Err(e) => Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string()))),
         }
     }
 

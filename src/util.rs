@@ -27,10 +27,8 @@ use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::fmt::Write;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
-use tokio::sync::Mutex;
 // use fedimint_tonic_lnd::Client;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use std::collections::HashMap;
@@ -108,22 +106,28 @@ pub async fn get_market_quote(
 
     // Case no answers from Yadio
     if no_answer_api {
-        return Err(MostroError::NoAPIResponse);
+        return Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse));
     }
 
     // No currency present
     if !req.1 {
-        return Err(MostroError::NoCurrency);
+        return Err(MostroError::MostroInternalErr(ServiceError::NoCurrency));
     }
 
     if req.0.is_none() {
-        return Err(MostroError::MalformedAPIRes);
+        return Err(MostroError::MostroInternalErr(
+            ServiceError::MalformedAPIRes,
+        ));
     }
 
     let quote = if let Some(q) = req.0 {
-        q.json::<Yadio>().await?
+        q.json::<Yadio>()
+            .await
+            .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?
     } else {
-        return Err(MostroError::MalformedAPIRes);
+        return Err(MostroError::MostroInternalErr(
+            ServiceError::MalformedAPIRes,
+        ));
     };
 
     let mut sats = quote.result * 100_000_000_f64;
@@ -218,12 +222,12 @@ pub async fn publish_order(
     order.id = Some(order_id);
 
     // Send message as ack with small order
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order_id),
         Action::NewOrder,
         Some(Payload::Order(order)),
-        &trade_pubkey,
+        trade_pubkey,
         trade_index,
     )
     .await;
@@ -292,7 +296,7 @@ async fn prepare_new_order(
 
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
-    Some(new_order_db)
+    Ok(new_order_db)
 }
 
 pub async fn send_dm(
@@ -321,7 +325,7 @@ pub async fn send_dm(
     }
     let tags = Tags::new(tags);
 
-    let event = EventBuilder::gift_wrap(&sender_keys, receiver_pubkey, rumor, tags).await?;
+    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags).await?;
     info!(
         "Sending DM, Event ID: {} with payload: {:#?}",
         event.id, payload
@@ -354,18 +358,14 @@ pub async fn update_user_rating_event(
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
     tags: Tags,
-    order_id: Uuid,
+    msg: &Message,
     keys: &Keys,
     pool: &SqlitePool,
 ) -> Result<()> {
-    // Get order from id
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
-        }
-    }; // nip33 kind with user as identifier
+    // Get order from msg
+    let mut order = get_order(msg, pool).await?;
+
+    // nip33 kind with user as identifier
     let event = new_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
@@ -378,7 +378,13 @@ pub async fn update_user_rating_event(
     order.update(pool).await?;
 
     // Add event message to global list
-    MESSAGE_QUEUES.write().await.queue_order_rate.push(event);
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_rate
+        .lock()
+        .await
+        .push(event);
     Ok(())
 }
 
@@ -481,7 +487,7 @@ pub async fn show_hold_invoice(
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::PayInvoice,
@@ -490,17 +496,17 @@ pub async fn show_hold_invoice(
             invoice_response.payment_request,
             None,
         )),
-        seller_pubkey,
+        *seller_pubkey,
         order.trade_index_seller,
     )
     .await;
     // We send a message to buyer to know that seller was requested to pay the invoice
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::WaitingSellerToPay,
         None,
-        buyer_pubkey,
+        *buyer_pubkey,
         order.trade_index_buyer,
     )
     .await;
@@ -520,7 +526,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> anyhow
             let _ = ln_client_invoices
                 .subscribe_invoice(hash, tx)
                 .await
-                .map_err(|e| MostroError::LnNodeError(e.to_string()));
+                .map_err(|e| e.to_string());
         }
     };
     tokio::spawn(invoice_task);
@@ -620,22 +626,22 @@ pub async fn rate_counterpart(
 ) -> Result<()> {
     // Send dm to counterparts
     // to buyer
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::Rate,
         None,
-        buyer_pubkey,
+        *buyer_pubkey,
         None,
     )
     .await;
     // to seller
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::Rate,
         None,
-        seller_pubkey,
+        *seller_pubkey,
         None,
     )
     .await;
@@ -681,20 +687,6 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
     })
 }
 
-pub async fn send_cant_do_msg(
-    request_id: Option<u64>,
-    order_id: Option<Uuid>,
-    reason: Option<CantDoReason>,
-    destination_key: PublicKey,
-) {
-    // Send message to event creator
-    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
-    if let Ok(message) = message.as_json() {
-        let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message, None).await;
-    }
-}
-
 pub async fn enqueue_cant_do_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
@@ -729,22 +721,6 @@ pub async fn enqueue_order_msg(
         .lock()
         .await
         .push((message, destination_key));
-}
-
-pub async fn send_new_order_msg(
-    request_id: Option<u64>,
-    order_id: Option<Uuid>,
-    action: Action,
-    payload: Option<Payload>,
-    destination_key: &PublicKey,
-    trade_index: Option<i64>,
-) {
-    // Send message to event creator
-    let message = Message::new_order(order_id, request_id, trade_index, action, payload);
-    if let Ok(message) = message.as_json() {
-        let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message, None).await;
-    }
 }
 
 pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {

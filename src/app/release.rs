@@ -3,11 +3,11 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    enqueue_order_msg, get_keys, get_order, rate_counterpart, send_cant_do_msg, send_new_order_msg,
+    enqueue_cant_do_msg, enqueue_order_msg, get_keys, get_order, rate_counterpart,
     settle_seller_hold_invoice, update_order_event,
 };
 use crate::NOSTR_CLIENT;
-use anyhow::Result;
+use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
@@ -44,12 +44,12 @@ pub async fn check_failure_retries(
         .get_buyer_pubkey()
         .map_err(|cause| MostroInternalErr(cause))?;
 
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::PaymentFailed,
         None,
-        &buyer_pubkey,
+        buyer_pubkey,
         None,
     )
     .await;
@@ -109,7 +109,7 @@ pub async fn release_action(
         Some(order.id),
         Action::HoldInvoicePaymentSettled,
         None,
-        seller_pubkey,
+        seller_pubkey?,
         None,
     )
     .await;
@@ -389,19 +389,19 @@ async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
             }
         };
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             None,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &buyer_pubkey,
+            CantDoReason::InvalidAmount,
+            buyer_pubkey,
         )
         .await;
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             request_id,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &seller_pubkey,
+            CantDoReason::InvalidAmount,
+            seller_pubkey,
         )
         .await;
     }

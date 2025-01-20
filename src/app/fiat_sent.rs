@@ -1,7 +1,10 @@
-use crate::util::{get_order, send_new_order_msg, update_order_event};
+use crate::util::{enqueue_order_msg, get_order, update_order_event};
 
 use anyhow::Result;
-use mostro_core::error::{MostroError, MostroError::*, ServiceError};
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+};
 use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
@@ -43,24 +46,24 @@ pub async fn fiat_sent_action(
     let peer = Peer::new(event.rumor.pubkey.to_string());
 
     // We a message to the seller
-    send_new_order_msg(
+    enqueue_order_msg(
         None,
         Some(order.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
-        &seller_pubkey,
+        seller_pubkey,
         None,
     )
     .await;
     // We send a message to buyer to wait
     let peer = Peer::new(seller_pubkey.to_string());
 
-    send_new_order_msg(
+    enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
-        &event.rumor.pubkey,
+        event.rumor.pubkey,
         None,
     )
     .await;

@@ -1,4 +1,4 @@
-use crate::util::send_new_order_msg;
+use crate::util::enqueue_order_msg;
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, Payload};
 use mostro_core::order::{Kind, SmallOrder, Status};
@@ -60,22 +60,22 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         status = Status::Active;
         order_data.status = Some(status);
         // We send a confirmation message to seller
-        send_new_order_msg(
+        enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::BuyerTookOrder,
             Some(Payload::Order(order_data.clone())),
-            &seller_pubkey,
+            seller_pubkey,
             None,
         )
         .await;
         // We send a message to buyer saying seller paid
-        send_new_order_msg(
+        enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
             Some(Payload::Order(order_data)),
-            &buyer_pubkey,
+            buyer_pubkey,
             None,
         )
         .await;
@@ -87,23 +87,23 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
         order_data.buyer_trade_pubkey = None;
         order_data.seller_trade_pubkey = None;
         // We ask to buyer for a new invoice
-        send_new_order_msg(
+        enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::AddInvoice,
             Some(Payload::Order(order_data)),
-            &buyer_pubkey,
+            buyer_pubkey,
             None,
         )
         .await;
 
         // We send a message to seller we are waiting for buyer invoice
-        send_new_order_msg(
+        enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::WaitingBuyerInvoice,
             None,
-            &seller_pubkey,
+            seller_pubkey,
             None,
         )
         .await;

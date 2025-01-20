@@ -1,4 +1,4 @@
-use crate::util::{get_order, send_new_order_msg, update_user_rating_event};
+use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use crate::NOSTR_CLIENT;
 
 use crate::db::{is_user_present, update_user_rating};
@@ -178,7 +178,7 @@ pub async fn update_user_reputation_action(
             update_buyer_rate,
             update_seller_rate,
             reputation_event,
-            order.id,
+            &msg,
             my_keys,
             pool,
         )
@@ -191,12 +191,12 @@ pub async fn update_user_reputation_action(
         })?;
 
         // Send confirmation message to user that rated
-        send_new_order_msg(
+        enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
             Some(order.id),
             Action::RateReceived,
             Some(Payload::RatingUser(new_rating)),
-            &event.rumor.pubkey,
+            event.rumor.pubkey,
             None,
         )
         .await;

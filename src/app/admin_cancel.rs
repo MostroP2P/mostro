@@ -4,9 +4,7 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{
-    enqueue_order_msg, get_nostr_client, get_order, send_cant_do_msg, send_dm, update_order_event,
-};
+use crate::util::{enqueue_order_msg, get_nostr_client, get_order, send_dm, update_order_event};
 
 use mostro_core::dispute::Status as DisputeStatus;
 use mostro_core::error::{
@@ -14,7 +12,7 @@ use mostro_core::error::{
     MostroError::{self, *},
     ServiceError,
 };
-use mostro_core::message::{Action, Message, MessageKind};
+use mostro_core::message::{Action, Message};
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -75,13 +73,15 @@ pub async fn admin_cancel_action(
     }
 
     // we check if there is a dispute
-    let dispute = find_dispute_by_order_id(pool, order_id).await;
+    let dispute = find_dispute_by_order_id(pool, order.id).await;
 
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded.to_string();
-        d.update(pool).await?;
+        d.update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // We create a tag to show status of the dispute
         let tags: Tags = Tags::new(vec![
             Tag::custom(
@@ -98,7 +98,8 @@ pub async fn admin_cancel_action(
             ),
         ]);
         // nip33 kind with dispute id as identifier
-        let event = new_event(my_keys, "", dispute_id.to_string(), tags)?;
+        let event = new_event(my_keys, "", dispute_id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         match get_nostr_client() {
             Ok(client) => {
@@ -112,32 +113,48 @@ pub async fn admin_cancel_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order).await?;
-    order_updated.update(pool).await?;
+    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // We create a Message for cancel
     let message = Message::new_order(
         Some(order.id),
         request_id,
-        inner_message.trade_index,
+        msg.get_inner_message_kind().trade_index,
         Action::AdminCanceled,
         None,
     );
-    let message = message.as_json()?;
+
+    let message = message
+        .as_json()
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Message to admin
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message.clone(), None).await?;
+    send_dm(event.rumor.pubkey, sender_keys, message.clone(), None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())?,
-            PublicKey::from_str(buyer.as_str())?,
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            PublicKey::from_str(buyer.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
         ),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&seller_pubkey, sender_keys.clone(), message.clone(), None).await?;
-    send_dm(&buyer_pubkey, sender_keys, message, None).await?;
+    send_dm(seller_pubkey, sender_keys.clone(), message.clone(), None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    send_dm(buyer_pubkey, sender_keys, message, None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     Ok(())
 }

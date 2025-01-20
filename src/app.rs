@@ -42,6 +42,7 @@ use crate::Settings;
 
 // External dependencies
 use anyhow::Result;
+use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
@@ -67,7 +68,11 @@ fn warning_msg(action: &Action, e: ServiceError) {
 /// * `pool` - The database connection pool used to query and update user data.
 /// * `event` - The unwrapped gift event containing the sender's information.
 /// * `msg` - The message containing action details and trade index information.
-async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Message) {
+async fn check_trade_index(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    msg: &Message,
+) -> Result<(), MostroError> {
     let message_kind = msg.get_inner_message_kind();
 
     // Only process actions related to trading
@@ -75,7 +80,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
         message_kind.action,
         Action::NewOrder | Action::TakeBuy | Action::TakeSell | Action::TradePubkey
     ) {
-        return;
+        return Err(MostroError::MostroCantDo(CantDoReason::InvalidAction));
     }
 
     // If user is present, we check the trade index and signature
@@ -90,7 +95,9 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Error deserializing content: {}", e);
-                        return;
+                        return Err(MostroError::MostroInternalErr(
+                            ServiceError::MessageSerializationError,
+                        ));
                     }
                 };
 
@@ -98,26 +105,12 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 
                 if index <= user.last_trade_index {
                     tracing::info!("Invalid trade index");
-                    enqueue_cant_do_msg(
-                        None,
-                        message_kind.id,
-                        Some(CantDoReason::InvalidTradeIndex),
-                        event.rumor.pubkey,
-                    )
-                    .await;
-                    return;
+                    return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
 
                 if !message_kind.verify_signature(event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
-                    enqueue_cant_do_msg(
-                        None,
-                        None,
-                        CantDoReason::InvalidSignature,
-                        event.rumor.pubkey,
-                    )
-                    .await;
-                    return;
+                    return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
 
                 if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
@@ -125,6 +118,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     tracing::error!("Error updating user trade index: {}", e);
                 }
             }
+            Ok(())
         }
         Err(_) => {
             if let (true, last_trade_index) = message_kind.has_trade_index() {
@@ -135,15 +129,10 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {
                     tracing::error!("Error creating new user: {}", e);
-                    enqueue_cant_do_msg(
-                        None,
-                        message_kind.id,
-                        CantDoReason::CantCreateUser,
-                        event.rumor.pubkey,
-                    )
-                    .await;
+                    return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
                 }
             }
+            Ok(())
         }
     }
 }

@@ -4,10 +4,16 @@ use std::str::FromStr;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
-use crate::util::{enqueue_order_msg, get_nostr_client, get_order, send_cant_do_msg, send_dm, update_order_event};
+use crate::util::{
+    enqueue_order_msg, get_nostr_client, get_order, send_cant_do_msg, send_dm, update_order_event,
+};
 
-use mostro_core::error::{MostroError::{self, *}, ServiceError, CantDoReason};
 use mostro_core::dispute::Status as DisputeStatus;
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
 use mostro_core::message::{Action, Message, MessageKind};
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
@@ -33,18 +39,26 @@ pub async fn admin_cancel_action(
             return Err(MostroCantDo(CantDoReason::IsNotYourDispute));
         }
         Err(e) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(e.to_string())));
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
         }
         _ => {}
     }
 
-
     // Was order cooperatively cancelled?
     if let Err(cause) = order.check_status(Status::CooperativelyCanceled) {
         return Err(MostroCantDo(cause));
-    }
-    else {
-        enqueue_order_msg(request_id, Some(order.id), Action::CooperativeCancelAccepted, None, event.rumor.pubkey, msg.get_inner_message_kind().trade_index).await;
+    } else {
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::CooperativeCancelAccepted,
+            None,
+            event.rumor.pubkey,
+            msg.get_inner_message_kind().trade_index,
+        )
+        .await;
     }
 
     // Was order in dispute?

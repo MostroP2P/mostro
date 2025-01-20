@@ -123,7 +123,11 @@ pub async fn take_sell_action(
         .await
         {
             Ok(_) => Ok(()),
-            Err(_) => return Err(MostroInternalErr(ServiceError::HoldInvoiceError)),
+            Err(e) => {
+                return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+                    e.to_string(),
+                )))
+            }
         }
     }
 }

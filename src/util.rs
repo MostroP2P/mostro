@@ -171,7 +171,7 @@ pub async fn publish_order(
     trade_pubkey: PublicKey,
     request_id: Option<u64>,
     trade_index: Option<i64>,
-) -> Result<Order, MostroError> {
+) -> Result<(), MostroError> {
     // Prepare a new default order
     let new_order_db = match prepare_new_order(
         new_order,
@@ -189,7 +189,11 @@ pub async fn publish_order(
     };
 
     // CRUD order creation
-    let mut order = new_order_db.clone().create(pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let mut order = new_order_db
+        .clone()
+        .create(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
@@ -199,13 +203,17 @@ pub async fn publish_order(
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags).map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = new_event(keys, "", order_id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order with the new event_id
     order.event_id = event_id;
-    order.update(pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    order
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let mut order = new_order_db.as_new_order();
     order.id = Some(order_id);
 
@@ -226,7 +234,7 @@ pub async fn publish_order(
         .send_event(event)
         .await
         .map(|_s| ())
-        .map_err(|err| err.into())
+        .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
 }
 
 async fn prepare_new_order(
@@ -783,7 +791,7 @@ pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, Most
         .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
     let order = Order::by_id(pool, order_id)
         .await
-        .map_err(|_| MostroInternalErr(ServiceError::DbAccessError))?;
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     if let Some(order) = order {
         Ok(order)
     } else {

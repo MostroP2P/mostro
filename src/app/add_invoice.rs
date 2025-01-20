@@ -56,18 +56,12 @@ pub async fn add_invoice_action(
     let mut order = get_order(&msg, pool).await?;
 
     // Get order status
-    match order.get_order_status() {
-        Ok(s) => s,
-        Err(cause) => {
-            return Err(MostroInternalErr(cause));
-        }
+    if let Err(cause) = order.get_order_status() {
+        return Err(MostroInternalErr(cause));
     };
     // Get order kind
-    match order.get_order_kind() {
-        Ok(k) => k,
-        Err(cause) => {
-            return Err(MostroInternalErr(cause));
-        }
+    if let Err(cause) = order.get_order_kind() {
+        return Err(MostroInternalErr(cause));
     };
 
     let buyer_pubkey = order

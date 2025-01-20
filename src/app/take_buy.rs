@@ -81,7 +81,9 @@ pub async fn take_buy_action(
     )
     .await
     {
-        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(cause.to_string())));
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+            cause.to_string(),
+        )));
     }
     Ok(())
 }

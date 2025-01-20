@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use mostro_core::error::{MostroError::{self,*}, ServiceError};
+use mostro_core::error::{
+    MostroError::{self, *},
+    ServiceError,
+};
 use serde_json::Value;
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
@@ -14,8 +17,12 @@ pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
     let status = res.status();
     if status.is_success() {
-        let body = res.text().await.map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
-        let body: Value = serde_json::from_str(&body).map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
+        let body = res
+            .text()
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
         let tag = body["tag"].as_str().unwrap_or("");
         if tag == "payRequest" {
             return Ok(());

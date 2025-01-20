@@ -3,7 +3,11 @@ use crate::nip33::new_event;
 use crate::util::{get_nostr_client, get_order, send_dm};
 
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::error::{MostroError::{self,*}, CantDoReason, ServiceError};
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
 use mostro_core::message::{Action, Message, Payload, Peer};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

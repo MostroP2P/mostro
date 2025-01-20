@@ -2,7 +2,10 @@ use crate::db::add_new_user;
 use crate::util::send_dm;
 
 use anyhow::Result;
-use mostro_core::error::{MostroError::{self,*}, ServiceError};
+use mostro_core::error::{
+    MostroError::{self, *},
+    ServiceError,
+};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
@@ -39,7 +42,8 @@ pub async fn admin_add_solver_action(
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     }
     let trade_index = inner_message.trade_index.unwrap_or(0);
-    let public_key = PublicKey::from_bech32(npubkey).map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+    let public_key = PublicKey::from_bech32(npubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
     let user = User::new(public_key, 0, 1, 0, 0, trade_index);
     // Use CRUD to create user
     match add_new_user(pool, user).await {
@@ -48,7 +52,9 @@ pub async fn admin_add_solver_action(
     }
     // We create a Message for admin
     let message = Message::new_dispute(None, request_id, None, Action::AdminAddSolver, None);
-    let message = message.as_json().map_err(|_| MostroInternalErr(ServiceError::er))?;
+    let message = message
+        .as_json()
+        .map_err(|_| MostroInternalErr(ServiceError::er))?;
     // Send the message
     let sender_keys = crate::util::get_keys().unwrap();
     send_dm(event.rumor.pubkey, sender_keys, message, None).await?;

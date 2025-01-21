@@ -186,21 +186,34 @@ pub async fn admin_take_dispute_action(
         ),
     ]);
     // nip33 kind with dispute id as identifier
-    let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;
+    let event = new_event(
+        &crate::util::get_keys()
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?,
+        "",
+        dispute_id.to_string(),
+        tags,
+    )
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Dispute event to be published: {event:#?}");
 
-    let client = get_nostr_client().map_err(|e| {
-        info!(
-            "Failed to get nostr client for dispute {}: {}",
-            dispute_id, e
-        );
-        e
-    }).map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let client = get_nostr_client()
+        .map_err(|e| {
+            info!(
+                "Failed to get nostr client for dispute {}: {}",
+                dispute_id, e
+            );
+            e
+        })
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    client.send_event(event).await.map_err(|e| {
-        info!("Failed to send dispute {} status event: {}", dispute_id, e);
-        e
-    }).map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    client
+        .send_event(event)
+        .await
+        .map_err(|e| {
+            info!("Failed to send dispute {} status event: {}", dispute_id, e);
+            e
+        })
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     Ok(())
 }

@@ -78,7 +78,7 @@ impl LndConnector {
             .invoices()
             .add_hold_invoice(invoice)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())));
 
         match holdinvoice {
             Ok(holdinvoice) => Ok((holdinvoice.into_inner(), preimage.to_vec(), hash.to_vec())),
@@ -109,7 +109,8 @@ impl LndConnector {
             .await
             .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
         {
-            let state = fedimint_tonic_lnd::lnrpc::invoice::InvoiceState::try_from(invoice.state)?;
+            let state = fedimint_tonic_lnd::lnrpc::invoice::InvoiceState::try_from(invoice.state)
+                .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
             {
                 let msg = InvoiceMessage {
                     hash: r_hash.clone(),
@@ -137,7 +138,7 @@ impl LndConnector {
             .invoices()
             .settle_invoice(preimage_message)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())));
 
         match settle {
             Ok(settle) => Ok(settle.into_inner()),
@@ -157,7 +158,7 @@ impl LndConnector {
             .invoices()
             .cancel_invoice(cancel_message)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
 
         match cancel {
             Ok(cancel) => Ok(cancel.into_inner()),
@@ -193,7 +194,7 @@ impl LndConnector {
             .router()
             .track_payment_v2(track_payment_req)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
+            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())));
 
         // We only send the payment if it wasn't attempted before
         if track.is_ok() {
@@ -236,7 +237,7 @@ impl LndConnector {
             .router()
             .send_payment_v2(request)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
+            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())));
 
         // We can safely unwrap here cause await was successful
         let mut stream = outer_stream
@@ -246,7 +247,7 @@ impl LndConnector {
         while let Ok(Some(payment)) = stream
             .message()
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?
+            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))
         {
             //   ("Failed paying invoice") {
             let msg = PaymentMessage { payment };

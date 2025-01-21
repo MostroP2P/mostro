@@ -32,9 +32,7 @@ pub async fn check_order_status(
                 Some(order.id),
                 Action::InvoiceUpdated,
                 None,
-                order
-                    .get_buyer_pubkey()
-                    .map_err(|cause| MostroInternalErr(cause))?,
+                order.get_buyer_pubkey().map_err(MostroInternalErr)?,
                 None,
             )
             .await;
@@ -113,21 +111,19 @@ pub async fn add_invoice_action(
             None,
         )
         .await;
-    } else {
-        if let Err(cause) = show_hold_invoice(
-            my_keys,
-            None,
-            &buyer_pubkey,
-            &seller_pubkey,
-            order,
-            msg.get_inner_message_kind().request_id,
-        )
-        .await
-        {
-            return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
-                cause.to_string(),
-            )));
-        }
+    } else if let Err(cause) = show_hold_invoice(
+        my_keys,
+        None,
+        &buyer_pubkey,
+        &seller_pubkey,
+        order,
+        msg.get_inner_message_kind().request_id,
+    )
+    .await
+    {
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+            cause.to_string(),
+        )));
     }
     Ok(())
 }

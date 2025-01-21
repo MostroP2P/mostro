@@ -186,7 +186,7 @@ pub async fn update_user_reputation_action(
         .map_err(|cause| {
             MostroInternalErr(ServiceError::DbAccessError(format!(
                 "Error updating user rating event : {}",
-                cause.to_string()
+                cause
             )))
         })?;
 

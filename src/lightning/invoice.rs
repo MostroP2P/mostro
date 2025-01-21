@@ -10,7 +10,8 @@ use std::str::FromStr;
 
 /// Decode a lightning invoice (bolt11)
 pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroError> {
-    let invoice = Bolt11Invoice::from_str(payment_request)?;
+    let invoice = Bolt11Invoice::from_str(payment_request)
+        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
 
     Ok(invoice)
 }

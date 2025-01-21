@@ -26,19 +26,15 @@ async fn update_order_status(
     match set_waiting_invoice_status(order, buyer_pubkey, request_id).await {
         Ok(_) => {
             // Update order status
-            match update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await {
+            match update_order_event(my_keys, Status::WaitingBuyerInvoice, order).await {
                 Ok(order_updated) => {
                     let _ = order_updated.update(pool).await;
-                    return Ok(());
+                    Ok(())
                 }
-                Err(_) => {
-                    return Err(MostroInternalErr(ServiceError::UpdateOrderStatusError));
-                }
+                Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
             }
         }
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::UpdateOrderStatusError));
-        }
+        Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
     }
 }
 
@@ -107,7 +103,7 @@ pub async fn take_sell_action(
     if payment_request.is_none() {
         match update_order_status(&mut order, my_keys, pool, request_id).await {
             Ok(_) => Ok(()),
-            Err(_) => return Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
+            Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
         }
     }
     // If payment request is present, show hold invoice
@@ -123,11 +119,9 @@ pub async fn take_sell_action(
         .await
         {
             Ok(_) => Ok(()),
-            Err(e) => {
-                return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
-                    e.to_string(),
-                )))
-            }
+            Err(e) => Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+                e.to_string(),
+            ))),
         }
     }
 }

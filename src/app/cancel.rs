@@ -110,10 +110,14 @@ pub async fn cancel_action(
                     }
                     order.status = Status::CooperativelyCanceled.to_string();
                     // update db
-                    let order = order.update(pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                    let order = order.update(pool).await.map_err(|e| {
+                        MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+                    })?;
                     // We publish a new replaceable kind nostr event with the status updated
                     // and update on local database the status and new event id
-                    update_order_event(my_keys, Status::CooperativelyCanceled, &order).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+                    update_order_event(my_keys, Status::CooperativelyCanceled, &order)
+                        .await
+                        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
                     // We create a Message for an accepted cooperative cancel and send it to both parties
                     enqueue_order_msg(
                         request_id,
@@ -188,7 +192,11 @@ pub async fn cancel_add_invoice(
     let user_pubkey = event.rumor.pubkey.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            buyer,
+        ),
         (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
@@ -201,7 +209,9 @@ pub async fn cancel_add_invoice(
     if &order.creator_pubkey == buyer_pubkey {
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        update_order_event(my_keys, Status::CooperativelyCanceled, order).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        update_order_event(my_keys, Status::CooperativelyCanceled, order)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
         // We create a Message for cancel
         enqueue_order_msg(
             request_id,
@@ -229,9 +239,15 @@ pub async fn cancel_add_invoice(
             order.amount = 0;
             order.fee = 0;
         }
-        edit_buyer_pubkey_order(pool, order.id, None).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        update_order_to_initial_state(pool, order.id, order.amount, order.fee).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        update_order_event(my_keys, Status::Pending, order).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        edit_buyer_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        update_order_to_initial_state(pool, order.id, order.amount, order.fee)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        update_order_event(my_keys, Status::Pending, order)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
         info!(
             "{}: Canceled order Id {} republishing order",
             buyer_pubkey, order.id
@@ -261,7 +277,11 @@ pub async fn cancel_pay_hold_invoice(
     let user_pubkey = event.rumor.pubkey.to_string();
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str()).map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?, buyer),
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            buyer,
+        ),
         (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };

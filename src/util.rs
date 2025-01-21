@@ -201,9 +201,7 @@ pub async fn publish_order(
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
-    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys)
-        .await
-        .map_err(|e| e)?;
+    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys).await?;
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
     // nip33 kind with order fields as tags and order id as identifier

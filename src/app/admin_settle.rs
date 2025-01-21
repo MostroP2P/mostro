@@ -46,7 +46,7 @@ pub async fn admin_settle_action(
     }
 
     // Was orde cooperatively cancelled?
-    if let Err(_) = order.check_status(Status::CooperativelyCanceled) {
+    if order.check_status(Status::CooperativelyCanceled).is_err() {
         return Err(MostroCantDo(
             mostro_core::error::CantDoReason::IsNotYourDispute,
         ));

@@ -1,13 +1,13 @@
 use crate::db::{
-    edit_buyer_pubkey_order, edit_seller_pubkey_order, find_order_by_id,
-    update_order_to_initial_state,
+    edit_buyer_pubkey_order, edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order,
+    edit_seller_pubkey_order, find_order_by_id, update_order_to_initial_state,
 };
 use crate::lightning::LndConnector;
 use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
 
 use anyhow::{Error, Result};
 use mostro_core::message::{Action, CantDoReason, Message};
-use mostro_core::order::{Kind as OrderKind, Order, Status};
+use mostro_core::order::{Kind as OrderKind, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -85,16 +85,127 @@ pub async fn cancel_action(
         return Ok(());
     }
 
-    if order.kind == OrderKind::Sell.to_string()
-        && order.status == Status::WaitingBuyerInvoice.to_string()
+    if order.status == Status::WaitingPayment.to_string()
+        || order.status == Status::WaitingBuyerInvoice.to_string()
     {
-        cancel_add_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
-    }
+        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+            (Some(seller), Some(buyer)) => (seller, buyer),
+            (None, _) => return Err(Error::msg("Missing seller pubkey")),
+            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        };
 
-    if order.kind == OrderKind::Buy.to_string()
-        && order.status == Status::WaitingPayment.to_string()
-    {
-        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
+        let taker_pubkey: String;
+        if seller_pubkey == &order.creator_pubkey {
+            taker_pubkey = buyer_pubkey.to_string();
+        } else {
+            taker_pubkey = seller_pubkey.to_string();
+        }
+
+        if user_pubkey == order.creator_pubkey {
+            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
+                let _ = order_updated.update(pool).await;
+            }
+
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("Order Id {}: Funds returned to seller", &order.id);
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.rumor.pubkey,
+                None,
+            )
+            .await;
+
+            let taker_pubkey = PublicKey::from_str(&taker_pubkey)?;
+            //We notify the taker that the order was cancelled
+            send_new_order_msg(
+                None,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &taker_pubkey,
+                None,
+            )
+            .await;
+        } else if user_pubkey == taker_pubkey {
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("Order Id {}: Funds returned to seller", &order.id);
+            }
+
+            let creator_pubkey = PublicKey::from_str(&order.creator_pubkey)?;
+            //We notify the creator that the order was cancelled only if the taker had already done his part before
+
+            if order.kind == OrderKind::Buy.to_string() {
+                if order.status == Status::WaitingBuyerInvoice.to_string() {
+                    send_new_order_msg(
+                        request_id,
+                        Some(order.id),
+                        Action::Canceled,
+                        None,
+                        &creator_pubkey,
+                        None,
+                    )
+                    .await;
+                }
+                if order.price_from_api {
+                    order.amount = 0;
+                    order.fee = 0;
+                }
+                edit_seller_pubkey_order(pool, order.id, None).await?;
+                edit_master_seller_pubkey_order(pool, order.id, None).await?;
+                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
+                update_order_event(my_keys, Status::Pending, &order).await?;
+                info!(
+                    "{}: Canceled order Id {} republishing order",
+                    buyer_pubkey, order.id
+                );
+            }
+
+            if order.kind == OrderKind::Sell.to_string() {
+                if order.status == Status::WaitingPayment.to_string() {
+                    send_new_order_msg(
+                        request_id,
+                        Some(order.id),
+                        Action::Canceled,
+                        None,
+                        &creator_pubkey,
+                        None,
+                    )
+                    .await;
+                }
+                if order.price_from_api {
+                    order.amount = 0;
+                    order.fee = 0;
+                }
+                edit_buyer_pubkey_order(pool, order.id, None).await?;
+                edit_master_buyer_pubkey_order(pool, order.id, None).await?;
+                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
+                update_order_event(my_keys, Status::Pending, &order).await?;
+                info!(
+                    "{}: Canceled order Id {} republishing order",
+                    buyer_pubkey, order.id
+                );
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.rumor.pubkey,
+                None,
+            )
+            .await;
+        } else {
+            send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+            return Ok(());
+        }
     }
 
     if order.status == Status::Active.to_string()
@@ -188,165 +299,4 @@ pub async fn cancel_action(
         }
     }
     Ok(())
-}
-
-pub async fn cancel_add_invoice(
-    ln_client: &mut LndConnector,
-    order: &mut Order,
-    event: &UnwrappedGift,
-    pool: &Pool<Sqlite>,
-    my_keys: &Keys,
-    request_id: Option<u64>,
-) -> Result<()> {
-    if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
-    }
-
-    let user_pubkey = event.rumor.pubkey.to_string();
-
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
-    };
-
-    if buyer_pubkey != &user_pubkey {
-        // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
-        return Ok(());
-    }
-
-    if &order.creator_pubkey == buyer_pubkey {
-        // We publish a new replaceable kind nostr event with the status updated
-        // and update on local database the status and new event id
-        update_order_event(my_keys, Status::CooperativelyCanceled, order).await?;
-        // We create a Message for cancel
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &event.rumor.pubkey,
-            None,
-        )
-        .await;
-        send_new_order_msg(
-            None,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &seller_pubkey,
-            None,
-        )
-        .await;
-        Ok(())
-    } else {
-        // We re-publish the event with Pending status
-        // and update on local database
-        if order.price_from_api {
-            order.amount = 0;
-            order.fee = 0;
-        }
-        edit_buyer_pubkey_order(pool, order.id, None).await?;
-        update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(my_keys, Status::Pending, order).await?;
-        info!(
-            "{}: Canceled order Id {} republishing order",
-            buyer_pubkey, order.id
-        );
-        // Confirmation message to buyer
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &event.rumor.pubkey,
-            None,
-        )
-        .await;
-        Ok(())
-    }
-}
-
-pub async fn cancel_pay_hold_invoice(
-    ln_client: &mut LndConnector,
-    order: &mut Order,
-    event: &UnwrappedGift,
-    pool: &Pool<Sqlite>,
-    my_keys: &Keys,
-    request_id: Option<u64>,
-) -> Result<()> {
-    let user_pubkey = event.rumor.pubkey.to_string();
-
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (PublicKey::from_str(seller.as_str())?, buyer),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
-    };
-
-    if seller_pubkey.to_string() != user_pubkey {
-        // We create a Message
-        send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
-        return Ok(());
-    }
-
-    if order.hash.is_some() {
-        // We cancel the hold invoice, if it was paid those funds return to seller
-        if let Some(hash) = order.hash.as_ref() {
-            ln_client.cancel_hold_invoice(hash).await?;
-            info!("Order Id {}: Hold invoice canceled", &order.id);
-        }
-    }
-
-    if order.creator_pubkey == seller_pubkey.to_string() {
-        // We publish a new replaceable kind nostr event with the status updated
-        // and update on local database the status and new event id
-        update_order_event(my_keys, Status::Canceled, order).await?;
-        // We create a Message for cancel
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &event.rumor.pubkey,
-            None,
-        )
-        .await;
-        send_new_order_msg(
-            None,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &seller_pubkey,
-            None,
-        )
-        .await;
-        Ok(())
-    } else {
-        // We re-publish the event with Pending status
-        // and update on local database
-        if order.price_from_api {
-            order.amount = 0;
-            order.fee = 0;
-        }
-        edit_seller_pubkey_order(pool, order.id, None).await?;
-        update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-        update_order_event(my_keys, Status::Pending, order).await?;
-        info!(
-            "{}: Canceled order Id {} republishing order",
-            buyer_pubkey, order.id
-        );
-        // Notify to seller the order was canceled
-        send_new_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            &event.rumor.pubkey,
-            None,
-        )
-        .await;
-        Ok(())
-    }
 }

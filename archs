@@ -1,7 +1,5 @@
-arm-unknown-linux-gnueabi
 x86_64-unknown-linux-musl
 aarch64-unknown-linux-musl
 armv7-unknown-linux-gnueabi
 x86_64-pc-windows-gnu
 x86_64-unknown-freebsd
-aarch64-linux-android

@@ -153,7 +153,6 @@ pub async fn admin_settle_action(
         )
         .await;
     }
-
     let _ = do_payment(order_updated, request_id).await;
 
     Ok(())

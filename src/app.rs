@@ -15,7 +15,6 @@ pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
-pub mod trade_pubkey; // Trade pubkey action
 
 // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
@@ -31,7 +30,6 @@ use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
-use crate::app::trade_pubkey::trade_pubkey_action;
 use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
@@ -78,7 +76,7 @@ async fn check_trade_index(
     // Only process actions related to trading
     if !matches!(
         message_kind.action,
-        Action::NewOrder | Action::TakeBuy | Action::TakeSell | Action::TradePubkey
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell
     ) {
         return Err(MostroError::MostroCantDo(CantDoReason::InvalidAction));
     }
@@ -263,10 +261,29 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
-                    let (message, sig): (Message, Signature) =
-                        serde_json::from_str(&event.rumor.content).unwrap();
+
+                    let (message, sig): (Message, Option<Signature>) =
+                        match serde_json::from_str(&event.rumor.content) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Error deserializing content: {}", e);
+                                continue;
+                            }
+                        };
                     let inner_message = message.get_inner_message_kind();
-                    if !inner_message.verify_signature(event.rumor.pubkey, sig) {
+
+                    let sender_matches_rumor = event.sender == event.rumor.pubkey;
+
+                    if let Some(sig) = sig {
+                        // Verify signature only if sender and rumor pubkey are different
+                        if !sender_matches_rumor
+                            && !inner_message.verify_signature(event.rumor.pubkey, sig)
+                        {
+                            tracing::warn!("Error in event verification");
+                            continue;
+                        }
+                    } else if !sender_matches_rumor {
+                        // If there is no signature and the sender does not match the rumor pubkey, there is also an error
                         tracing::warn!("Error in event verification");
                         continue;
                     }

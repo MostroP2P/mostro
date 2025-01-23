@@ -63,16 +63,167 @@ pub async fn cancel_action(
         return Ok(());
     }
 
-    if order.kind == OrderKind::Sell.to_string()
-        && order.status == Status::WaitingBuyerInvoice.to_string()
+    if order.status == Status::WaitingPayment.to_string()
+        || order.status == Status::WaitingBuyerInvoice.to_string()
     {
-        cancel_add_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
+        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+            (Some(seller), Some(buyer)) => (seller, buyer),
+            (None, _) => return Err(Error::msg("Missing seller pubkey")),
+            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        };
+
+        let taker_pubkey: String;
+        if seller_pubkey == &order.creator_pubkey {
+            taker_pubkey = buyer_pubkey.to_string();
+        } else {
+            taker_pubkey = seller_pubkey.to_string();
+        }
+
+        if user_pubkey == order.creator_pubkey {
+            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
+                let _ = order_updated.update(pool).await;
+            }
+
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("Order Id {}: Funds returned to seller", &order.id);
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                event.rumor.pubkey,
+                None,
+            )
+            .await;
+        }
+
+        return Ok(());
     }
 
-    if order.kind == OrderKind::Buy.to_string()
-        && order.status == Status::WaitingPayment.to_string()
+    if order.status == Status::WaitingPayment.to_string()
+        || order.status == Status::WaitingBuyerInvoice.to_string()
     {
-        cancel_pay_hold_invoice(ln_client, &mut order, event, pool, my_keys, request_id).await?;
+        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+            (Some(seller), Some(buyer)) => (seller, buyer),
+            (None, _) => return Err(Error::msg("Missing seller pubkey")),
+            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        };
+
+        let taker_pubkey: String;
+        if seller_pubkey == &order.creator_pubkey {
+            taker_pubkey = buyer_pubkey.to_string();
+        } else {
+            taker_pubkey = seller_pubkey.to_string();
+        }
+
+        if user_pubkey == order.creator_pubkey {
+            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
+                let _ = order_updated.update(pool).await;
+            }
+
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("Order Id {}: Funds returned to seller", &order.id);
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.rumor.pubkey,
+                None,
+            )
+            .await;
+
+            let taker_pubkey = PublicKey::from_str(&taker_pubkey)?;
+            //We notify the taker that the order was cancelled
+            send_new_order_msg(
+                None,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &taker_pubkey,
+                None,
+            )
+            .await;
+        } else if user_pubkey == taker_pubkey {
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("Order Id {}: Funds returned to seller", &order.id);
+            }
+
+            let creator_pubkey = PublicKey::from_str(&order.creator_pubkey)?;
+            //We notify the creator that the order was cancelled only if the taker had already done his part before
+
+            if order.kind == OrderKind::Buy.to_string() {
+                if order.status == Status::WaitingBuyerInvoice.to_string() {
+                    send_new_order_msg(
+                        request_id,
+                        Some(order.id),
+                        Action::Canceled,
+                        None,
+                        &creator_pubkey,
+                        None,
+                    )
+                    .await;
+                }
+                if order.price_from_api {
+                    order.amount = 0;
+                    order.fee = 0;
+                }
+                edit_seller_pubkey_order(pool, order.id, None).await?;
+                edit_master_seller_pubkey_order(pool, order.id, None).await?;
+                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
+                update_order_event(my_keys, Status::Pending, &order).await?;
+                info!(
+                    "{}: Canceled order Id {} republishing order",
+                    buyer_pubkey, order.id
+                );
+            }
+
+            if order.kind == OrderKind::Sell.to_string() {
+                if order.status == Status::WaitingPayment.to_string() {
+                    send_new_order_msg(
+                        request_id,
+                        Some(order.id),
+                        Action::Canceled,
+                        None,
+                        &creator_pubkey,
+                        None,
+                    )
+                    .await;
+                }
+                if order.price_from_api {
+                    order.amount = 0;
+                    order.fee = 0;
+                }
+                edit_buyer_pubkey_order(pool, order.id, None).await?;
+                edit_master_buyer_pubkey_order(pool, order.id, None).await?;
+                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
+                update_order_event(my_keys, Status::Pending, &order).await?;
+                info!(
+                    "{}: Canceled order Id {} republishing order",
+                    buyer_pubkey, order.id
+                );
+            }
+
+            send_new_order_msg(
+                request_id,
+                Some(order.id),
+                Action::Canceled,
+                None,
+                &event.rumor.pubkey,
+                None,
+            )
+            .await;
+        } else {
+            send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
+            return Ok(());
+        }
     }
 
     if order.status == Status::Active.to_string()

@@ -38,9 +38,9 @@ pub async fn cancel_action(
         return Err(MostroCantDo(CantDoReason::OrderAlreadyCanceled));
     }
 
-    if order.status == Status::Pending.to_string() {
+    if order.check_status(Status::Pending).is_ok() {
         // Validates if this user is the order creator
-        if user_pubkey != order.creator_pubkey {
+        if order.sent_from_maker(user_pubkey).is_err() {
             return Err(MostroCantDo(CantDoReason::IsNotYourOrder));
         } else {
             // We publish a new replaceable kind nostr event with the status updated

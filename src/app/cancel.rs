@@ -94,12 +94,11 @@ pub async fn cancel_action(
             (_, None) => return Err(Error::msg("Missing buyer pubkey")),
         };
 
-        let taker_pubkey: String;
-        if seller_pubkey == &order.creator_pubkey {
-            taker_pubkey = buyer_pubkey.to_string();
+        let taker_pubkey: String = if seller_pubkey == &order.creator_pubkey {
+            buyer_pubkey.to_string()
         } else {
-            taker_pubkey = seller_pubkey.to_string();
-        }
+            seller_pubkey.to_string()
+        };
 
         if user_pubkey == order.creator_pubkey {
             if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {

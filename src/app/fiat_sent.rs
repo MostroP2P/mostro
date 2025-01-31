@@ -1,9 +1,9 @@
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 
-use anyhow::Result;
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, *},
+    ServiceError,
 };
 use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Status;
@@ -31,15 +31,21 @@ pub async fn fiat_sent_action(
     if order.get_buyer_pubkey().ok() != Some(event.rumor.pubkey) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
-    let next_trade: Option<(String, u32)> = match &msg.get_inner_message_kind().payload {
-        Some(Payload::NextTrade(pubkey, index)) => Some((pubkey.clone(), *index)),
-        _ => None,
+
+    // Get next trade key
+    let next_trade = match msg.get_inner_message_kind().get_next_trade_key() {
+        Ok((pubkey, index)) => (pubkey, index),
+        Err(cause) => return Err(MostroInternalErr(cause)),
     };
+
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(order_updated) = update_order_event(my_keys, Status::FiatSent, &order).await {
-        let _ = order_updated.update(pool).await;
-    }
+    let mut order_updated = update_order_event(my_keys, Status::FiatSent, &order)
+        .await
+        .map_err(|e| MostroError::MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Update order
+    let _ = order_updated.update(pool).await;
 
     let seller_pubkey = order
         .get_seller_pubkey()
@@ -73,18 +79,17 @@ pub async fn fiat_sent_action(
 
     // Update next trade fields only when the buyer is the maker of a range order
     // These fields will be used to create the next child order in the range
-    if order_updated.creator_pubkey == event.rumor.pubkey.to_string() && next_trade.is_some() {
-        if let Some((pubkey, index)) = next_trade {
-            order_updated.next_trade_pubkey = Some(pubkey.clone());
-            order_updated.next_trade_index = Some(index as i64);
+    match order.sent_from_maker(event.rumor.pubkey) {
+        Ok(_) => {
+            order_updated.next_trade_pubkey = Some(next_trade.0);
+            order_updated.next_trade_index = Some(next_trade.1 as i64);
             if let Err(e) = order_updated.update(pool).await {
-                error!(
-                    "Failed to update next trade fields for order {}: {}",
-                    order_id, e
-                );
-                return Ok(());
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    e.to_string(),
+                )));
             }
         }
+        Err(cause) => return Err(MostroCantDo(cause)),
     }
 
     Ok(())

@@ -123,15 +123,7 @@ pub async fn release_action(
         return Ok(());
     }
 
-    settle_seller_hold_invoice(
-        event,
-        ln_client,
-        Action::Released,
-        false,
-        &order,
-        request_id,
-    )
-    .await?;
+    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
 
     // We send a message to buyer indicating seller released funds
     let buyer_pubkey = PublicKey::from_str(

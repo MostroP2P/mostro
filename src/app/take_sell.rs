@@ -60,7 +60,7 @@ pub async fn take_sell_action(
     }
 
     // Validate that the order was sent from the correct maker
-    if let Err(cause) = order.sent_from_maker(event.rumor.pubkey.to_hex()) {
+    if let Err(cause) = order.sent_from_maker(event.rumor.pubkey) {
         return Err(MostroCantDo(cause));
     }
 

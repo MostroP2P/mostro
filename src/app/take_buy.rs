@@ -59,9 +59,7 @@ pub async fn take_buy_action(
 
     // Get seller and buyer public keys
     let seller_pubkey = event.rumor.pubkey;
-    let buyer_pubkey = order
-        .get_buyer_pubkey()
-        .map_err(|cause| MostroInternalErr(cause))?;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Add seller identity and trade index to the order
     order.master_seller_pubkey = Some(event.sender.to_string());

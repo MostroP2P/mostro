@@ -40,16 +40,17 @@ pub async fn fiat_sent_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    let mut order_updated = update_order_event(my_keys, Status::FiatSent, &order)
+    let order_updated = update_order_event(my_keys, Status::FiatSent, &order)
         .await
         .map_err(|e| MostroError::MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Update order
-    let _ = order_updated.update(pool).await;
+    let mut order_updated = order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    let seller_pubkey = order
-        .get_seller_pubkey()
-        .map_err(|cause| MostroInternalErr(cause))?;
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
     // Create peer
     let peer = Peer::new(event.rumor.pubkey.to_string());

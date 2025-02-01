@@ -34,22 +34,22 @@ pub fn prepare_variables_for_vote(
     if message_sender == buyer {
         counterpart = order
             .get_master_seller_pubkey()
-            .map_err(|cause| MostroInternalErr(cause))?
+            .map_err(MostroInternalErr)?
             .to_string();
         buyer_rating = true;
         counterpart_trade_pubkey = order
             .get_buyer_pubkey()
-            .map_err(|cause| MostroInternalErr(cause))?
+            .map_err(MostroInternalErr)?
             .to_string();
     } else if message_sender == seller {
         counterpart = order
             .get_master_buyer_pubkey()
-            .map_err(|cause| MostroInternalErr(cause))?
+            .map_err(MostroInternalErr)?
             .to_string();
         seller_rating = true;
         counterpart_trade_pubkey = order
             .get_seller_pubkey()
-            .map_err(|cause| MostroInternalErr(cause))?
+            .map_err(MostroInternalErr)?
             .to_string();
     };
     // Add a check in case of no counterpart found
@@ -132,7 +132,7 @@ pub async fn update_user_reputation_action(
     let new_rating = msg
         .get_inner_message_kind()
         .get_rating()
-        .map_err(|cause| MostroInternalErr(cause))?;
+        .map_err(MostroInternalErr)?;
 
     // Get counter to vote from db
     let mut user_to_vote = is_user_present(pool, counterpart.clone())

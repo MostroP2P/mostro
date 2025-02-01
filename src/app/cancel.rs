@@ -12,7 +12,7 @@ use mostro_core::error::{
     ServiceError,
 };
 use mostro_core::message::{Action, Message};
-use mostro_core::order::{Kind as OrderKind, Order, Status};
+use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -64,19 +64,19 @@ pub async fn cancel_action(
     }
 
     // Get seller and buyer pubkey
-    let seller_pubkey = order
-        .get_seller_pubkey()
-        .map_err(|e| MostroInternalErr(e))?;
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(|e| MostroInternalErr(e))?;
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     if order.check_status(Status::WaitingPayment).is_ok()
         || order.check_status(Status::WaitingBuyerInvoice).is_ok()
     {
         // Get order taker pubkey
-        let taker_pubkey = match order.creator_pubkey {
-            seller_pubkey => buyer_pubkey,
-            buyer_pubkey => seller_pubkey,
-            _ => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+        let taker_pubkey = if order.creator_pubkey == seller_pubkey.to_string() {
+            buyer_pubkey
+        } else if order.creator_pubkey == buyer_pubkey.to_string() {
+            seller_pubkey
+        } else {
+            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
         };
 
         if order.sent_from_maker(event.rumor.pubkey).is_ok() {
@@ -125,7 +125,7 @@ pub async fn cancel_action(
                     Some(order.id),
                     Action::Canceled,
                     None,
-                    order.get_creator_pubkey()?,
+                    order.get_creator_pubkey().map_err(MostroInternalErr)?,
                     None,
                 )
                 .await;
@@ -147,8 +147,9 @@ pub async fn cancel_action(
                         })?;
                 }
                 if order.is_sell_order().is_ok() {
-                    edit_buyer_pubkey_order(pool, order.id, None).await
-                        - map_err(|e| {
+                    edit_buyer_pubkey_order(pool, order.id, None)
+                        .await
+                        .map_err(|e| {
                             MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
                         })?;
                     edit_master_buyer_pubkey_order(pool, order.id, None)
@@ -160,7 +161,9 @@ pub async fn cancel_action(
                 update_order_to_initial_state(pool, order.id, order.amount, order.fee)
                     .await
                     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-                update_order_event(my_keys, Status::Pending, &order).await?;
+                update_order_event(my_keys, Status::Pending, &order)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
                 info!(
                     "{}: Canceled order Id {} republishing order",
                     buyer_pubkey, order.id
@@ -196,7 +199,7 @@ pub async fn cancel_action(
 
         match order.cancel_initiator_pubkey {
             Some(ref initiator_pubkey) => {
-                if initiator_pubkey == event.rumor.pubkey {
+                if initiator_pubkey == &event.rumor.pubkey.to_string() {
                     // We create a Message
                     return Err(MostroCantDo(CantDoReason::InvalidPubkey));
                 } else {
@@ -243,7 +246,7 @@ pub async fn cancel_action(
                 }
             }
             None => {
-                order.cancel_initiator_pubkey = Some(event.rumor.pubkey.clone());
+                order.cancel_initiator_pubkey = Some(event.rumor.pubkey.to_string());
                 // update db
                 let order = order
                     .update(pool)

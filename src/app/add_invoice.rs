@@ -62,9 +62,7 @@ pub async fn add_invoice_action(
         return Err(MostroInternalErr(cause));
     };
 
-    let buyer_pubkey = order
-        .get_buyer_pubkey()
-        .map_err(|cause| MostroInternalErr(cause))?;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Only the buyer can add an invoice
     if buyer_pubkey != event.rumor.pubkey {
@@ -78,9 +76,7 @@ pub async fn add_invoice_action(
     check_order_status(&mut order, pool, &msg).await?;
 
     // Get seller pubkey
-    let seller_pubkey = order
-        .get_seller_pubkey()
-        .map_err(|cause| MostroInternalErr(cause))?;
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
     if order.preimage.is_some() {
         // We send this data related to the order to the parties

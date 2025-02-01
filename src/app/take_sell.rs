@@ -65,9 +65,7 @@ pub async fn take_sell_action(
     }
 
     // Get seller pubkey
-    let seller_pubkey = order
-        .get_seller_pubkey()
-        .map_err(|cause| MostroInternalErr(cause))?;
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
     // Validate invoice and get payment request if present
     let payment_request = validate_invoice(&msg, &order).await?;

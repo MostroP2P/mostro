@@ -40,7 +40,7 @@ async fn job_flush_messages_queue() {
         loop {
             // Send message to event creator
             for message in order_msg_list.lock().await.iter() {
-                info!("Flushing messages in queue");
+                info!("Flushing order messages in queue");
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
@@ -48,13 +48,17 @@ async fn job_flush_messages_queue() {
                 }
             }
             for message in cantdo_msg_list.lock().await.iter() {
-                info!("Flushing cantdo messages in queue");
+                info!("Flushing cant do messages in queue");
                 let destination_key = message.1;
                 if let Ok(message) = message.0.as_json() {
                     let sender_keys = crate::util::get_keys().unwrap();
                     let _ = send_dm(destination_key, sender_keys, message, None).await;
                 }
             }
+            // Clear the queues
+            cantdo_msg_list.lock().await.clear();
+            order_msg_list.lock().await.clear();
+
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     });

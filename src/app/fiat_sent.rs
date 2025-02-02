@@ -34,7 +34,8 @@ pub async fn fiat_sent_action(
 
     // Get next trade key
     let next_trade = match msg.get_inner_message_kind().get_next_trade_key() {
-        Ok((pubkey, index)) => (pubkey, index),
+        Ok(Some((pubkey, index))) => Some((pubkey, index)),
+        Ok(None) => None,
         Err(cause) => return Err(MostroInternalErr(cause)),
     };
 
@@ -82,8 +83,10 @@ pub async fn fiat_sent_action(
     // These fields will be used to create the next child order in the range
     match order.sent_from_maker(event.rumor.pubkey) {
         Ok(_) => {
-            order_updated.next_trade_pubkey = Some(next_trade.0);
-            order_updated.next_trade_index = Some(next_trade.1 as i64);
+            if let Some((pubkey, index)) = next_trade {
+                order_updated.next_trade_pubkey = Some(pubkey);
+                order_updated.next_trade_index = Some(index as i64);
+            }
             if let Err(e) = order_updated.update(pool).await {
                 return Err(MostroInternalErr(ServiceError::DbAccessError(
                     e.to_string(),

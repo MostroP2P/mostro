@@ -71,16 +71,13 @@ pub async fn release_action(
     // Get order
     let mut order = get_order(&msg, pool).await?;
     // Get seller pubkey hex
-    let seller_pubkey = order
-        .get_seller_pubkey()
-        .map_err(MostroInternalErr)
-        .and_then(|pk| {
-            if pk.to_string() == event.rumor.pubkey.to_string() {
-                Ok(pk)
-            } else {
-                Err(MostroCantDo(CantDoReason::InvalidPeer))
-            }
-        });
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
+    // We send a message to buyer indicating seller released funds
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+
+    if seller_pubkey != event.rumor.pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPeer));
+    }
 
     // Check if order is active, fiat sent or dispute
     if order.check_status(Status::Active).is_err()
@@ -90,19 +87,11 @@ pub async fn release_action(
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
-    // Get next trade key and index from event
-    let next_trade: Option<(String, u32)> = match event.rumor.pubkey.to_string() {
-        pubkey if pubkey == order.creator_pubkey => {
-            if let Some(Payload::NextTrade(pubkey, index)) = &msg.get_inner_message_kind().payload {
-                Some((pubkey.clone(), *index))
-            } else {
-                None
-            }
-        }
-        _ => match (order.next_trade_pubkey.as_ref(), order.next_trade_index) {
-            (Some(pubkey), Some(index)) => Some((pubkey.clone(), index as u32)),
-            _ => None,
-        },
+    // Get next trade key
+    let next_trade = match msg.get_inner_message_kind().get_next_trade_key() {
+        Ok(Some((pubkey, index))) => Some((pubkey, index)),
+        Ok(None) => None,
+        Err(cause) => return Err(MostroInternalErr(cause)),
     };
 
     // Check if order is active, fiat sent or dispute
@@ -114,9 +103,6 @@ pub async fn release_action(
     }
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
-
-    // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     enqueue_order_msg(
         None,
@@ -154,19 +140,18 @@ pub async fn release_action(
         Some(order.id),
         Action::HoldInvoicePaymentSettled,
         None,
-        seller_pubkey?,
+        seller_pubkey,
         None,
     )
     .await;
 
-    // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+    // We send a message to seller indicating seller released funds
     enqueue_order_msg(
         None,
         Some(order.id),
-        Action::Released,
+        Action::Rate,
         None,
-        buyer_pubkey,
+        seller_pubkey,
         None,
     )
     .await;

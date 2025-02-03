@@ -86,11 +86,11 @@ pub async fn fiat_sent_action(
             if let Some((pubkey, index)) = next_trade {
                 order_updated.next_trade_pubkey = Some(pubkey);
                 order_updated.next_trade_index = Some(index as i64);
-            }
-            if let Err(e) = order_updated.update(pool).await {
-                return Err(MostroInternalErr(ServiceError::DbAccessError(
-                    e.to_string(),
-                )));
+                if let Err(e) = order_updated.update(pool).await {
+                    return Err(MostroInternalErr(ServiceError::DbAccessError(
+                        e.to_string(),
+                    )));
+                }
             }
         }
         Err(cause) => return Err(MostroCantDo(cause)),

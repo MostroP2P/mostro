@@ -299,10 +299,7 @@ pub async fn send_dm(
         receiver_pubkey.to_hex()
     );
     let message = Message::from_json(&payload).unwrap();
-    // We sign the message
-    let sig = message.get_inner_message_kind().sign(&sender_keys);
-    // We compose the content
-    let content = (message, sig);
+    let content = (message, Option::<String>::None);
     let content = serde_json::to_string(&content).unwrap();
     // We create the rumor
     let rumor = EventBuilder::text_note(content).build(sender_keys.public_key());

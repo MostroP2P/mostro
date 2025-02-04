@@ -33,11 +33,10 @@ pub async fn fiat_sent_action(
     }
 
     // Get next trade key
-    let next_trade = match msg.get_inner_message_kind().get_next_trade_key() {
-        Ok(Some((pubkey, index))) => Some((pubkey, index)),
-        Ok(None) => None,
-        Err(cause) => return Err(MostroInternalErr(cause)),
-    };
+    let next_trade = msg
+        .get_inner_message_kind()
+        .get_next_trade_key()
+        .map_err(MostroInternalErr)?;
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id

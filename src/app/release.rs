@@ -88,11 +88,10 @@ pub async fn release_action(
     }
 
     // Get next trade key
-    let next_trade = match msg.get_inner_message_kind().get_next_trade_key() {
-        Ok(Some((pubkey, index))) => Some((pubkey, index)),
-        Ok(None) => None,
-        Err(cause) => return Err(MostroInternalErr(cause)),
-    };
+    let next_trade = msg
+        .get_inner_message_kind()
+        .get_next_trade_key()
+        .map_err(MostroInternalErr)?;
 
     // Check if order is active, fiat sent or dispute
     if order.check_status(Status::Active).is_err()

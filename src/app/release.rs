@@ -93,13 +93,6 @@ pub async fn release_action(
         .get_next_trade_key()
         .map_err(MostroInternalErr)?;
 
-    // Check if order is active, fiat sent or dispute
-    if order.check_status(Status::Active).is_err()
-        && order.check_status(Status::FiatSent).is_err()
-        && order.check_status(Status::Dispute).is_err()
-    {
-        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-    }
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
 

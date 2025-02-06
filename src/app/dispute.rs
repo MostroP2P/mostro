@@ -9,7 +9,6 @@ use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 
-use anyhow::Result;
 use mostro_core::dispute::Dispute;
 use mostro_core::error::{
     CantDoReason,
@@ -27,7 +26,7 @@ use sqlx_crud::traits::Crud;
 ///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details
 /// including status and application metadata.
-async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> {
+async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), MostroError> {
     // Create tags for the dispute event
     let tags = Tags::new(vec![
         // Status tag - indicates the current state of the dispute
@@ -66,12 +65,12 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> 
             }
             Err(e) => {
                 tracing::error!("Failed to send dispute event: {}", e);
-                Err(e.into())
+                Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
             }
         },
         Err(e) => {
             tracing::error!("Failed to get Nostr client: {}", e);
-            Err(e)
+            Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
         }
     }
 }

@@ -34,39 +34,63 @@ async fn job_flush_messages_queue() {
     // Clone for closure owning with Arc
     let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
     let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
+    let mut retries_messages = 0;
+    let mut retries_cantdo_messages = 0;
+    let sender_keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
 
     // Spawn a new task to flush the messages queue
     tokio::spawn(async move {
         loop {
-            // Send message to event creator
-            for message in order_msg_list.lock().await.iter() {
+            // Send order messages
+            if !order_msg_list.lock().await.is_empty(){
                 info!("Flushing order messages in queue");
-                let destination_key = message.1;
-                if let Ok(message) = message.0.as_json() {
-                    let sender_keys = crate::util::get_keys().unwrap();
-                    let _ = send_dm(destination_key, sender_keys, message, None).await;
+                let destination_key = order_msg_list.lock().await[0].1;
+                if let Ok(message) = order_msg_list.lock().await[0].0.as_json() {
+                    if retries_messages > 3 {
+                        order_msg_list.lock().await.remove(0);
+                        retries_messages = 0;
+                        } else {
+                            match send_dm(destination_key, sender_keys, message, None).await{
+                                Ok(_) => {order_msg_list.lock().await.remove(0); retries_messages = 0;},
+                                Err(e) => {error!("Failed to send order message: {}", e); retries_messages += 1;},
+                            }
+                        }
+                    }
                 }
             }
-            for message in cantdo_msg_list.lock().await.iter() {
+
+            // Send cant do messages
+            if !cantdo_msg_list.lock().await.is_empty() {
                 info!("Flushing cant do messages in queue");
-                let destination_key = message.1;
-                if let Ok(message) = message.0.as_json() {
-                    let sender_keys = crate::util::get_keys().unwrap();
-                    let _ = send_dm(destination_key, sender_keys, message, None).await;
+                let destination_key = cantdo_msg_list.lock().await[0].1;
+                if let Ok(message) = cantdo_msg_list.lock().await[0].0.as_json() {
+                    if retries_cantdo_messages > 3 {
+                        cantdo_msg_list.lock().await.remove(0);
+                        retries_cantdo_messages = 0;
+                    } else {
+                        match send_dm(destination_key, sender_keys, message, None).await{
+                            Ok(_) => {cantdo_msg_list.lock().await.remove(0); retries_cantdo_messages = 0;},
+                            Err(e) => {error!("Failed to send cant do message: {}", e); retries_cantdo_messages += 1;},
+                        }
+                    }
                 }
             }
-            // Clear the queues
-            cantdo_msg_list.lock().await.clear();
-            order_msg_list.lock().await.clear();
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+        
     });
 }
 
 async fn job_relay_list() {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+    let client = match get_nostr_client() {
+        Ok(client) => client,
         Err(e) => return error!("{e}"),
     };
 
@@ -87,9 +111,7 @@ async fn job_relay_list() {
                 if let Ok(relay_ev) =
                     EventBuilder::new(NostrKind::RelayList, "").sign_with_keys(&mostro_keys)
                 {
-                    if let Ok(client) = get_nostr_client() {
-                        let _ = client.send_event(relay_ev).await;
-                    }
+                    let _ = client.send_event(relay_ev).await;
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -100,6 +122,10 @@ async fn job_relay_list() {
 async fn job_info_event_send() {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+    let client = match get_nostr_client() {
+        Ok(client) => client,
         Err(e) => return error!("{e}"),
     };
     let interval = Settings::get_mostro().publish_mostro_info_interval as u64;
@@ -116,9 +142,7 @@ async fn job_info_event_send() {
                 Err(e) => return error!("{e}"),
             };
 
-            if let Ok(client) = get_nostr_client() {
                 let _ = client.send_event(info_ev).await;
-            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -161,6 +185,10 @@ async fn job_update_rate_events() {
     let queue_order_rate = MESSAGE_QUEUES.read().await.queue_order_rate.clone();
     let mostro_settings = Settings::get_mostro();
     let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
+    let client = match get_nostr_client() {
+        Ok(client) => client,
+        Err(e) => return error!("{e}"),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -170,17 +198,8 @@ async fn job_update_rate_events() {
             );
 
             for ev in queue_order_rate.lock().await.iter() {
-                // Send event to relay
-                if let Ok(client) = get_nostr_client() {
-                    match client.send_event(ev.clone()).await {
-                        Ok(id) => {
-                            info!("Updated rate event with id {:?}", id)
-                        }
-                        Err(e) => {
-                            info!("Error on updating rate event {:?}", e.to_string())
-                        }
-                    }
-                }
+                // Send event to relay  
+                let _ = client.send_event(ev.clone()).await;
             }
 
             // Clear list after send events
@@ -212,6 +231,7 @@ async fn job_cancel_orders() -> anyhow::Result<()> {
         Ok(keys) => keys,
         Err(e) => return Err(anyhow::Error::msg(e.to_string())),
     };
+
 
     let mut ln_client = LndConnector::new().await?;
     let mostro_settings = Settings::get_mostro();

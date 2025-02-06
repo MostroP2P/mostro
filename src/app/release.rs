@@ -230,7 +230,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
     }
 
     // Get Mostro keys
-    let my_keys = get_keys()?;
+    let my_keys = get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Get buyer and seller pubkeys
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;

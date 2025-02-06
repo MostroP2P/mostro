@@ -80,19 +80,16 @@ pub async fn fiat_sent_action(
 
     // Update next trade fields only when the buyer is the maker of a range order
     // These fields will be used to create the next child order in the range
-    match order.sent_from_maker(event.rumor.pubkey) {
-        Ok(_) => {
-            if let Some((pubkey, index)) = next_trade {
-                order_updated.next_trade_pubkey = Some(pubkey);
-                order_updated.next_trade_index = Some(index as i64);
-                if let Err(e) = order_updated.update(pool).await {
-                    return Err(MostroInternalErr(ServiceError::DbAccessError(
-                        e.to_string(),
-                    )));
-                }
-            }
+    order.sent_from_maker(event.rumor.pubkey).map_err(MostroCantDo)?;
+
+    if let Some((pubkey, index)) = next_trade {
+        order_updated.next_trade_pubkey = Some(pubkey);
+        order_updated.next_trade_index = Some(index as i64);
+        if let Err(e) = order_updated.update(pool).await {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
         }
-        Err(cause) => return Err(MostroCantDo(cause)),
     }
 
     Ok(())

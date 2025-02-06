@@ -12,7 +12,7 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::MESSAGE_QUEUES;
 use crate::NOSTR_CLIENT;
 
-use anyhow::{Context, Error, Result};
+use anyhow::Context;
 use chrono::Duration;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
@@ -302,18 +302,18 @@ pub async fn send_dm(
     sender_keys: Keys,
     payload: String,
     expiration: Option<Timestamp>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     info!(
         "sender key {} - receiver key {}",
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(&payload).unwrap();
+    let message = Message::from_json(&payload).map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We sign the message
     let sig = message.get_inner_message_kind().sign(&sender_keys);
     // We compose the content
     let content = (message, sig);
-    let content = serde_json::to_string(&content).unwrap();
+    let content = serde_json::to_string(&content).map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We create the rumor
     let rumor = EventBuilder::text_note(content).build(sender_keys.public_key());
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + usize::from(expiration.is_some()));
@@ -323,16 +323,14 @@ pub async fn send_dm(
     }
     let tags = Tags::new(tags);
 
-    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags).await?;
+    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
         "Sending DM, Event ID: {} with payload: {:#?}",
         event.id, payload
     );
 
     if let Ok(client) = get_nostr_client() {
-        if let Err(e) = client.send_event(event).await {
-            error!("Failed to send event: {}", e);
-        }
+        client.send_event(event).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     }
 
     Ok(())
@@ -386,14 +384,14 @@ pub async fn update_user_rating_event(
     Ok(())
 }
 
-pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> Result<Order> {
+pub async fn update_order_event(keys: &Keys, status: Status, order: &Order) -> Result<Order, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&order_updated, None);
     // nip33 kind with order id as identifier and order fields as tags
-    let event = new_event(keys, "", order.id.to_string(), tags)?;
+    let event = new_event(keys, "", order.id.to_string(), tags).map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     let order_id = order.id.to_string();
     info!("Sending replaceable event: {event:#?}");
     // We update the order with the new event_id
@@ -450,7 +448,7 @@ pub async fn show_hold_invoice(
     seller_pubkey: &PublicKey,
     mut order: Order,
     request_id: Option<u64>,
-) -> anyhow::Result<()> {
+) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Add fee of seller to hold invoice
     let new_amount = order.amount + order.fee;
@@ -462,10 +460,12 @@ pub async fn show_hold_invoice(
                 &order.id.to_string(),
                 &order.fiat_code,
                 &order.fiat_amount.to_string(),
-            )?,
+            )
+            .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?,
             new_amount,
         )
-        .await?;
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
     if let Some(invoice) = payment_request {
         order.buyer_invoice = Some(invoice);
     };
@@ -478,9 +478,9 @@ pub async fn show_hold_invoice(
     order.seller_pubkey = Some(seller_pubkey.to_string());
 
     // We need to publish a new event with the new status
-    let pool = db::connect().await?;
-    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order).await?;
-    order_updated.update(&pool).await?;
+    let pool = db::connect().await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order).await.map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    order_updated.update(&pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
@@ -741,11 +741,11 @@ pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
 }
 
 /// Getter function with error management for nostr Client
-pub fn get_nostr_client() -> Result<&'static Client> {
+pub fn get_nostr_client() -> Result<&'static Client, MostroError> {
     if let Some(client) = NOSTR_CLIENT.get() {
         Ok(client)
     } else {
-        Err(Error::msg("Client not initialized!"))
+        Err(MostroInternalErr(ServiceError::NostrError("Client not initialized!".to_string())))
     }
 }
 

@@ -1,38 +1,36 @@
 use crate::util::enqueue_order_msg;
-use anyhow::{Error, Result};
+use mostro_core::error::MostroError::{self, MostroInternalErr};
+use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Payload};
-use mostro_core::order::{Kind, SmallOrder, Status};
+use mostro_core::order::{SmallOrder, Status};
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
-use std::str::FromStr;
-use tracing::{error, info};
+use tracing::info;
 
-pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()> {
-    let pool = crate::db::connect().await?;
-    let order = crate::db::find_order_by_hash(&pool, hash).await?;
-    let my_keys = crate::util::get_keys()?;
+pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<(), MostroError> {
+    let pool = crate::db::connect()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let order = crate::db::find_order_by_hash(&pool, hash)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let my_keys = crate::util::get_keys()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())?,
-            PublicKey::from_str(buyer.as_str())?,
-        ),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
-    };
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     info!(
         "Order Id: {} - Seller paid invoice with hash: {hash}",
         order.id
     );
 
-    let order_kind = match Kind::from_str(&order.kind) {
-        Ok(k) => k,
-        Err(e) => {
-            error!("Order Id {} wrong kind: {:?}", order.id, e);
-            return Err(Error::msg("Order state is not valid"));
-        }
-    };
+    // Check if the order kind is valid
+    let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
 
     // We send this data related to the order to the parties
     let mut order_data = SmallOrder::new(
@@ -117,7 +115,8 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
 
     // Update the invoice_held_at field
     crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_u64() as i64)
-        .await?;
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }

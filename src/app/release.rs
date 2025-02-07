@@ -230,7 +230,8 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
     }
 
     // Get Mostro keys
-    let my_keys = get_keys()?;
+    let my_keys =
+        get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Get buyer and seller pubkeys
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
@@ -294,19 +295,23 @@ async fn payment_success(
     .await;
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let pool = db::connect().await?;
-        if let Ok(order) = order_updated.update(&pool).await {
-            // Send dm to buyer to rate counterpart
-            enqueue_order_msg(
-                request_id,
-                Some(order.id),
-                Action::Rate,
-                None,
-                buyer_pubkey,
-                None,
-            )
-            .await;
-        }
+        let pool = db::connect()
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let order = order_updated
+            .update(&pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Send dm to buyer to rate counterpart
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Rate,
+            None,
+            buyer_pubkey,
+            None,
+        )
+        .await;
     }
     Ok(())
 }

@@ -35,9 +35,9 @@ pub async fn take_buy_action(
     }
 
     // Validate that the order was sent from the correct maker
-    if let Err(cause) = order.sent_from_maker(event.rumor.pubkey) {
-        return Err(MostroCantDo(cause));
-    }
+    order
+        .sent_from_maker(event.rumor.pubkey)
+        .map_err(MostroCantDo)?;
 
     // Get the fiat amount requested by the user for range orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {

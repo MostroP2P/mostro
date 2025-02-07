@@ -32,7 +32,6 @@ use tokio::sync::mpsc::channel;
 // use fedimint_tonic_lnd::Client;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use std::collections::HashMap;
-use tracing::error;
 use tracing::info;
 use uuid::Uuid;
 
@@ -63,9 +62,9 @@ pub async fn retries_yadio_request(
     Ok((Some(res), fiat_list_check))
 }
 
-pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64> {
+pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
     BitcoinPriceManager::get_price(fiat_code)
-        .ok_or_else(|| anyhow::anyhow!("Failed to get Bitcoin price"))
+        .ok_or(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price

@@ -53,14 +53,14 @@ async fn job_flush_messages_queue() {
                         order_msg_list.lock().await.remove(0);
                         retries_messages = 0;
                         } else {
-                            match send_dm(destination_key, sender_keys, message, None).await{
+                            match send_dm(destination_key, sender_keys.clone(), message, None).await{
                                 Ok(_) => {order_msg_list.lock().await.remove(0); retries_messages = 0;},
                                 Err(e) => {error!("Failed to send order message: {}", e); retries_messages += 1;},
                             }
                         }
                     }
                 }
-            }
+            
 
             // Send cant do messages
             if !cantdo_msg_list.lock().await.is_empty() {
@@ -71,16 +71,15 @@ async fn job_flush_messages_queue() {
                         cantdo_msg_list.lock().await.remove(0);
                         retries_cantdo_messages = 0;
                     } else {
-                        match send_dm(destination_key, sender_keys, message, None).await{
+                        match send_dm(destination_key, sender_keys.clone(), message, None).await{
                             Ok(_) => {cantdo_msg_list.lock().await.remove(0); retries_cantdo_messages = 0;},
                             Err(e) => {error!("Failed to send cant do message: {}", e); retries_cantdo_messages += 1;},
                         }
                     }
                 }
             }
-
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        
+        }
     });
 }
 

@@ -294,8 +294,13 @@ async fn payment_success(
     .await;
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let pool = db::connect().await?;
-        if let Ok(order) = order_updated.update(&pool).await {
+        let pool = db::connect()
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let order = order_updated
+            .update(&pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
             // Send dm to buyer to rate counterpart
             enqueue_order_msg(
                 request_id,
@@ -307,7 +312,6 @@ async fn payment_success(
             )
             .await;
         }
-    }
     Ok(())
 }
 

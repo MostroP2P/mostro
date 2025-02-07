@@ -900,8 +900,9 @@ mod tests {
             None,
         ));
         let client = Client::default();
-        NOSTR_CLIENT.set(client).unwrap();
-
+        NOSTR_CLIENT.get_or_init(|| client);
+        let client_result = get_nostr_client();
+        assert!(client_result.is_ok());
         let payload = message.as_json().unwrap();
         let sender_keys = Keys::generate();
         let result = send_dm(receiver_pubkey, sender_keys, payload, None).await;

@@ -80,7 +80,9 @@ pub async fn fiat_sent_action(
 
     // Update next trade fields only when the buyer is the maker of a range order
     // These fields will be used to create the next child order in the range
-    order.sent_from_maker(event.rumor.pubkey).map_err(MostroCantDo)?;
+    order
+        .sent_from_maker(event.rumor.pubkey)
+        .map_err(MostroCantDo)?;
 
     if let Some((pubkey, index)) = next_trade {
         order_updated.next_trade_pubkey = Some(pubkey);

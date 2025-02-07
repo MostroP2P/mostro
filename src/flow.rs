@@ -8,12 +8,21 @@ use sqlx_crud::Crud;
 use tracing::info;
 
 pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<(), MostroError> {
-    let pool = crate::db::connect().await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let order = crate::db::find_order_by_hash(&pool, hash).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let my_keys = crate::util::get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let pool = crate::db::connect()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let order = crate::db::find_order_by_hash(&pool, hash)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let my_keys = crate::util::get_keys()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    let seller_pubkey = order.get_seller_pubkey().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     info!(
         "Order Id: {} - Seller paid invoice with hash: {hash}",
@@ -21,8 +30,8 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
     );
 
     // Check if the order kind is valid
-    let order_kind = order.get_order_kind().map_err( MostroInternalErr)?;
-    
+    let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
+
     // We send this data related to the order to the parties
     let mut order_data = SmallOrder::new(
         Some(order.id),
@@ -106,7 +115,8 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
 
     // Update the invoice_held_at field
     crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_u64() as i64)
-        .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }

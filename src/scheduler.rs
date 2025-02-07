@@ -45,22 +45,27 @@ async fn job_flush_messages_queue() {
     tokio::spawn(async move {
         loop {
             // Send order messages
-            if !order_msg_list.lock().await.is_empty(){
+            if !order_msg_list.lock().await.is_empty() {
                 info!("Flushing order messages in queue");
                 let destination_key = order_msg_list.lock().await[0].1;
                 if let Ok(message) = order_msg_list.lock().await[0].0.as_json() {
                     if retries_messages > 3 {
                         order_msg_list.lock().await.remove(0);
                         retries_messages = 0;
-                        } else {
-                            match send_dm(destination_key, sender_keys.clone(), message, None).await{
-                                Ok(_) => {order_msg_list.lock().await.remove(0); retries_messages = 0;},
-                                Err(e) => {error!("Failed to send order message: {}", e); retries_messages += 1;},
+                    } else {
+                        match send_dm(destination_key, sender_keys.clone(), message, None).await {
+                            Ok(_) => {
+                                order_msg_list.lock().await.remove(0);
+                                retries_messages = 0;
+                            }
+                            Err(e) => {
+                                error!("Failed to send order message: {}", e);
+                                retries_messages += 1;
                             }
                         }
                     }
                 }
-            
+            }
 
             // Send cant do messages
             if !cantdo_msg_list.lock().await.is_empty() {
@@ -71,9 +76,15 @@ async fn job_flush_messages_queue() {
                         cantdo_msg_list.lock().await.remove(0);
                         retries_cantdo_messages = 0;
                     } else {
-                        match send_dm(destination_key, sender_keys.clone(), message, None).await{
-                            Ok(_) => {cantdo_msg_list.lock().await.remove(0); retries_cantdo_messages = 0;},
-                            Err(e) => {error!("Failed to send cant do message: {}", e); retries_cantdo_messages += 1;},
+                        match send_dm(destination_key, sender_keys.clone(), message, None).await {
+                            Ok(_) => {
+                                cantdo_msg_list.lock().await.remove(0);
+                                retries_cantdo_messages = 0;
+                            }
+                            Err(e) => {
+                                error!("Failed to send cant do message: {}", e);
+                                retries_cantdo_messages += 1;
+                            }
                         }
                     }
                 }
@@ -141,7 +152,7 @@ async fn job_info_event_send() {
                 Err(e) => return error!("{e}"),
             };
 
-                let _ = client.send_event(info_ev).await;
+            let _ = client.send_event(info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -197,7 +208,7 @@ async fn job_update_rate_events() {
             );
 
             for ev in queue_order_rate.lock().await.iter() {
-                // Send event to relay  
+                // Send event to relay
                 let _ = client.send_event(ev.clone()).await;
             }
 
@@ -230,7 +241,6 @@ async fn job_cancel_orders() -> anyhow::Result<()> {
         Ok(keys) => keys,
         Err(e) => return Err(anyhow::Error::msg(e.to_string())),
     };
-
 
     let mut ln_client = LndConnector::new().await?;
     let mostro_settings = Settings::get_mostro();

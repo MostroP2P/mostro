@@ -77,7 +77,6 @@ pub async fn cancel_action(
             seller_pubkey
         } else {
             return Err(MostroInternalErr(ServiceError::InvalidPubkey));
-
         };
 
         if order.sent_from_maker(event.rumor.pubkey).is_ok() {

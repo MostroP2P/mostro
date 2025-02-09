@@ -324,9 +324,12 @@ pub async fn run(
                                             }
                                         };
                                     }
-                                    Err(_) => {
-                                        todo!()
-                                        // warning_msg(&action, e);
+                                    Err(e) => {
+                                        tracing::error!("Unexpected error type: {}", e);
+                                        warning_msg(
+                                            &action,
+                                            ServiceError::UnexpectedError(e.to_string()),
+                                        );
                                     }
                                 }
                             }

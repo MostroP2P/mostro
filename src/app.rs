@@ -79,7 +79,7 @@ async fn check_trade_index(
         message_kind.action,
         Action::NewOrder | Action::TakeBuy | Action::TakeSell
     ) {
-        return Ok(())
+        return Ok(());
     }
 
     // If user is present, we check the trade index and signature

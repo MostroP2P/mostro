@@ -52,32 +52,23 @@ pub async fn add_invoice_action(
 ) -> Result<(), MostroError> {
     // Get order
     let mut order = get_order(&msg, pool).await?;
-
-    // Get order status
-    if let Err(cause) = order.get_order_status() {
-        return Err(MostroInternalErr(cause));
-    };
-    // Get order kind
-    if let Err(cause) = order.get_order_kind() {
-        return Err(MostroInternalErr(cause));
-    };
-
+    // Check order status
+    order.get_order_status().map_err(MostroInternalErr)?;
+    // Check order kind
+    order.get_order_kind().map_err(MostroInternalErr)?;
+    // Get buyer pubkey
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
-
     // Only the buyer can add an invoice
     if buyer_pubkey != event.rumor.pubkey {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
-
     // We save the invoice on db
     order.buyer_invoice = validate_invoice(&msg, &order).await?;
-
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     check_order_status(&mut order, pool, &msg).await?;
-
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
-
+    // Check if the order has a preimage
     if order.preimage.is_some() {
         // We send this data related to the order to the parties
         let order_data = SmallOrder::from(order.clone());

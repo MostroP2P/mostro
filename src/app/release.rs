@@ -93,23 +93,12 @@ pub async fn release_action(
         .get_next_trade_key()
         .map_err(MostroInternalErr)?;
 
-    // Start transaction to ensure atomicity of operations on db
-    let tx = pool
-        .begin()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
-
     // Update order event with status SettledHoldInvoice
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
-    // Commit transaction in case of success
-    tx.commit()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     enqueue_order_msg(
         None,
@@ -310,17 +299,8 @@ async fn payment_success(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        // Start transaction to ensure atomicity of operations on db
-        let tx = pool
-            .begin()
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         let order = order_updated
             .update(&pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        // Commit transaction in case of success
-        tx.commit()
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // Send dm to buyer to rate counterpart

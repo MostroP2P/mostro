@@ -1984,7 +1984,7 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.6.25"
-source = "git+https://github.com/MostroP2P/mostro-core?rev=dc9134e64016627a713eba5a3500134b23a870e5#dc9134e64016627a713eba5a3500134b23a870e5"
+source = "git+https://github.com/MostroP2P/mostro-core?rev=9ee306330e479065c7b5e6d25c6d44bfce343241#9ee306330e479065c7b5e6d25c6d44bfce343241"
 dependencies = [
  "anyhow",
  "bitcoin",

@@ -79,7 +79,7 @@ async fn check_trade_index(
         message_kind.action,
         Action::NewOrder | Action::TakeBuy | Action::TakeSell
     ) {
-        return Err(MostroError::MostroCantDo(CantDoReason::InvalidAction));
+        return Ok(())
     }
 
     // If user is present, we check the trade index and signature
@@ -290,7 +290,10 @@ pub async fn run(
                     }
 
                     // Check if message is message with trade index
-                    let _ = check_trade_index(&pool, &event, &message).await;
+                    if let Err(e) = check_trade_index(&pool, &event, &message).await {
+                        tracing::error!("Error checking trade index: {}", e);
+                        continue;
+                    }
 
                     if inner_message.verify() {
                         if let Some(action) = message.inner_action() {

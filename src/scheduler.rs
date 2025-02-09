@@ -6,12 +6,16 @@ use crate::util;
 use crate::util::get_nostr_client;
 use crate::LN_STATUS;
 use crate::{db::*, MESSAGE_QUEUES};
+use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
+use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
 
@@ -34,61 +38,57 @@ async fn job_flush_messages_queue() {
     // Clone for closure owning with Arc
     let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
     let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
-    let mut retries_messages = 0;
-    let mut retries_cantdo_messages = 0;
     let sender_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
 
+    // Helper function to send messages
+    async fn send_messages(
+        msg_list: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+        sender_keys: Keys,
+        retries: &mut usize,
+    ) {
+        if !msg_list.lock().await.is_empty() {
+            let (message, destination_key) = msg_list.lock().await[0].clone();
+            match message.as_json() {
+                Ok(msg) => {
+                    if let Err(e) = send_dm(destination_key, sender_keys.clone(), msg, None).await {
+                        error!("Failed to send message: {}", e);
+                        *retries += 1;
+                    } else {
+                        *retries = 0;
+                        msg_list.lock().await.remove(0);
+                    }
+                }
+                Err(e) => error!("Failed to parse message: {}", e),
+            }
+            if *retries > 3 {
+                *retries = 0; // Reset retries after removing message
+                msg_list.lock().await.remove(0);
+            }
+        }
+    }
+
     // Spawn a new task to flush the messages queue
     tokio::spawn(async move {
-        loop {
-            // Send order messages
-            if !order_msg_list.lock().await.is_empty() {
-                info!("Flushing order messages in queue");
-                let destination_key = order_msg_list.lock().await[0].1;
-                if let Ok(message) = order_msg_list.lock().await[0].0.as_json() {
-                    if retries_messages > 3 {
-                        order_msg_list.lock().await.remove(0);
-                        retries_messages = 0;
-                    } else {
-                        match send_dm(destination_key, sender_keys.clone(), message, None).await {
-                            Ok(_) => {
-                                order_msg_list.lock().await.remove(0);
-                                retries_messages = 0;
-                            }
-                            Err(e) => {
-                                error!("Failed to send order message: {}", e);
-                                retries_messages += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        let mut retries_messages = 0;
+        let mut retries_cantdo_messages = 0;
 
-            // Send cant do messages
-            if !cantdo_msg_list.lock().await.is_empty() {
-                info!("Flushing cant do messages in queue");
-                let destination_key = cantdo_msg_list.lock().await[0].1;
-                if let Ok(message) = cantdo_msg_list.lock().await[0].0.as_json() {
-                    if retries_cantdo_messages > 3 {
-                        cantdo_msg_list.lock().await.remove(0);
-                        retries_cantdo_messages = 0;
-                    } else {
-                        match send_dm(destination_key, sender_keys.clone(), message, None).await {
-                            Ok(_) => {
-                                cantdo_msg_list.lock().await.remove(0);
-                                retries_cantdo_messages = 0;
-                            }
-                            Err(e) => {
-                                error!("Failed to send cant do message: {}", e);
-                                retries_cantdo_messages += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        loop {
+            send_messages(
+                order_msg_list.clone(),
+                sender_keys.clone(),
+                &mut retries_messages,
+            )
+            .await;
+            send_messages(
+                cantdo_msg_list.clone(),
+                sender_keys.clone(),
+                &mut retries_cantdo_messages,
+            )
+            .await;
+
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     });

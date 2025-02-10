@@ -89,7 +89,7 @@ async fn job_flush_messages_queue() {
             )
             .await;
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
         }
     });
 }

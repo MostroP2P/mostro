@@ -79,7 +79,7 @@ pub async fn cancel_action(
             return Err(MostroInternalErr(ServiceError::InvalidPubkey));
         };
 
-        if order.sent_from_maker(event.rumor.pubkey).is_ok() {
+        if order.sent_from_maker(event.rumor.pubkey).is_err() {
             if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
                 let _ = order_updated.update(pool).await;
             }
@@ -115,9 +115,9 @@ pub async fn cancel_action(
             }
 
             //We notify the creator that the order was cancelled only if the taker had already done his part before
-            if (order.is_buy_order().is_ok()
+            if (order.is_sell_order().is_ok()
                 && order.check_status(Status::WaitingBuyerInvoice).is_ok())
-                || (order.is_sell_order().is_ok()
+                || (order.is_buy_order().is_ok()
                     && order.check_status(Status::WaitingPayment).is_ok())
             {
                 enqueue_order_msg(

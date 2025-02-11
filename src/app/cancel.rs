@@ -97,8 +97,8 @@ pub async fn cancel_order_by_taker(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     //We notify the creator that the order was cancelled only if the taker had already done his part before
-    if (order.is_sell_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok())
-        || (order.is_buy_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok())
+    if (order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok())
+        || (order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok())
     {
         enqueue_order_msg(
             request_id,

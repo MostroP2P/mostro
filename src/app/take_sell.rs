@@ -4,7 +4,7 @@ use crate::util::{
 };
 
 use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
+use mostro_core::error::{CantDoReason, ServiceError};
 
 use anyhow::Result;
 use mostro_core::message::Message;
@@ -74,7 +74,7 @@ pub async fn take_sell_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        return Err(MostroInternalErr(ServiceError::WrongAmountError));
+        return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
     }
 
     // Add buyer pubkey to order
@@ -99,14 +99,11 @@ pub async fn take_sell_action(
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {
-        match update_order_status(&mut order, my_keys, pool, request_id).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
-        }
+        update_order_status(&mut order, my_keys, pool, request_id).await?;
     }
     // If payment request is present, show hold invoice
     else {
-        match show_hold_invoice(
+        show_hold_invoice(
             my_keys,
             payment_request,
             &event.rumor.pubkey,
@@ -114,12 +111,8 @@ pub async fn take_sell_action(
             order,
             request_id,
         )
-        .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => Err(MostroInternalErr(ServiceError::HoldInvoiceError(
-                e.to_string(),
-            ))),
-        }
+        .await?;
     }
+
+    Ok(())
 }

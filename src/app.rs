@@ -54,6 +54,27 @@ fn warning_msg(action: &Action, e: ServiceError) {
     tracing::warn!("Error in {} with context {}", action, e);
 }
 
+/// Function to manage errors and send appropriate messages
+async fn manage_errors(
+    e: MostroError,
+    inner_message: Message,
+    event: UnwrappedGift,
+    action: &Action,
+) {
+    match e {
+        MostroError::MostroCantDo(cause) => {
+            enqueue_cant_do_msg(
+                inner_message.get_inner_message_kind().request_id,
+                inner_message.get_inner_message_kind().id,
+                cause,
+                event.rumor.pubkey,
+            )
+            .await
+        }
+        MostroError::MostroInternalErr(e) => warning_msg(action, e),
+    }
+}
+
 /// Function to check if a user is present in the database and update or create their trade index.
 ///
 /// This function performs the following tasks:
@@ -104,6 +125,13 @@ async fn check_trade_index(
 
                 if index <= user.last_trade_index {
                     tracing::info!("Invalid trade index");
+                    manage_errors(
+                        MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex),
+                        msg.clone(),
+                        event.clone(),
+                        &message_kind.action,
+                    )
+                    .await;
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
 
@@ -309,20 +337,7 @@ pub async fn run(
                             {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
-                                        match err {
-                                            MostroError::MostroCantDo(cause) => {
-                                                enqueue_cant_do_msg(
-                                                    inner_message.request_id,
-                                                    inner_message.id,
-                                                    cause,
-                                                    event.rumor.pubkey,
-                                                )
-                                                .await
-                                            }
-                                            MostroError::MostroInternalErr(e) => {
-                                                warning_msg(&action, e)
-                                            }
-                                        };
+                                        manage_errors(err, message, event, &action).await;
                                     }
                                     Err(e) => {
                                         tracing::error!("Unexpected error type: {}", e);

@@ -39,7 +39,7 @@ uuid = { version = "1.8.0", features = [
 ] }
 reqwest = { version = "0.12.1", features = ["json"] }
 # mostro-core = { version = "0.6.25", features = ["sqlx"] }
-mostro-core = { git = "https://github.com/MostroP2P/mostro-core", rev = "9ee306330e479065c7b5e6d25c6d44bfce343241" , features = ["sqlx"] }
+mostro-core = { git = "https://github.com/MostroP2P/mostro-core", rev = "7e53875cc8370a8da4dcc80b243f9eae630ae345" , features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 config = "0.15.4"

@@ -61,7 +61,7 @@ pub async fn take_sell_action(
 
     // Validate that the order was sent from the correct maker
     order
-        .sent_from_maker(event.rumor.pubkey)
+        .not_sent_from_maker(event.rumor.pubkey)
         .map_err(MostroCantDo)?;
 
     // Get seller pubkey

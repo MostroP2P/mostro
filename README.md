@@ -68,7 +68,7 @@ To compile on Mac, then use brew:
 
 ```bash
 brew update
-brew install cmake pkg-config openssl sqlite3
+brew install cmake pkg-config openssl sqlite3 protobuf
 ```
 
 ## Install

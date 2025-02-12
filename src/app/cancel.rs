@@ -218,7 +218,7 @@ pub async fn cancel_action(
     if order.check_status(Status::Pending).is_ok() {
         // Validates if this user is the order creator
         order
-            .not_sent_from_maker(event.rumor.pubkey)
+            .sent_from_maker(event.rumor.pubkey)
             .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id

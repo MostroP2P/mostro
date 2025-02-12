@@ -165,7 +165,10 @@ pub async fn cancel_order_by_maker(
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
     if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, order).await {
-        let _ = order_updated.update(pool).await;
+        order_updated
+            .update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
 
     if let Some(hash) = &order.hash {

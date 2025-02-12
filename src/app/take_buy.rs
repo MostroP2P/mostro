@@ -5,13 +5,13 @@ use crate::util::{
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 
+use crate::db::update_user_trade_index;
 use anyhow::Result;
 use mostro_core::message::Message;
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use crate::db::update_user_trade_index;
 
 pub async fn take_buy_action(
     msg: Message,
@@ -69,11 +69,15 @@ pub async fn take_buy_action(
     // Timestamp the order take time
     order.set_timestamp_now();
 
-    if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), msg.get_inner_message_kind().trade_index.unwrap()).await
+    if let Err(e) = update_user_trade_index(
+        pool,
+        event.sender.to_string(),
+        msg.get_inner_message_kind().trade_index.unwrap(),
+    )
+    .await
     {
         tracing::error!("Error updating user trade index: {}", e);
     }
-
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

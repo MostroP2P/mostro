@@ -148,10 +148,9 @@ async fn check_trade_index(
             Ok(())
         }
         Err(_) => {
-            if let (true, last_trade_index) = message_kind.has_trade_index() {
+            if let (true, _) = message_kind.has_trade_index() {
                 let new_user: User = User {
                     pubkey: event.sender.to_string(),
-                    last_trade_index,
                     ..Default::default()
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {

@@ -6,6 +6,7 @@ use crate::util::{
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 
+use crate::db::update_user_trade_index;
 use anyhow::Result;
 use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
@@ -13,7 +14,6 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use crate::db::update_user_trade_index;
 
 async fn update_order_status(
     order: &mut Order,
@@ -98,7 +98,12 @@ pub async fn take_sell_action(
         };
     }
 
-    if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), msg.get_inner_message_kind().trade_index.unwrap()).await
+    if let Err(e) = update_user_trade_index(
+        pool,
+        event.sender.to_string(),
+        msg.get_inner_message_kind().trade_index.unwrap(),
+    )
+    .await
     {
         tracing::error!("Error updating user trade index: {}", e);
     }

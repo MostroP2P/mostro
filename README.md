@@ -102,6 +102,8 @@ Before running it you need to set `nsec_privkey` in the `[nostr]` section of the
 
 When you run mostro for first time it will create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
 
+Every time you make a change in the settings.toml file of the project, you need to update those changes in /home/user/.mostro/settings.toml file
+
 Finnaly run it:
 
 ```bash

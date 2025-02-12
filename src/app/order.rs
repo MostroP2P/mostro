@@ -1,6 +1,5 @@
 use crate::cli::settings::Settings;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
-use anyhow::Result;
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, *},
@@ -11,6 +10,7 @@ use mostro_core::order::{Order, SmallOrder};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
+use crate::db::update_user_trade_index;
 use sqlx::{Pool, Sqlite};
 
 async fn calculate_and_check_quote(
@@ -77,6 +77,12 @@ pub async fn order_action(
         for fiat_amount in amount_vec.iter() {
             calculate_and_check_quote(order, fiat_amount).await?;
         }
+
+        if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), msg.get_inner_message_kind().trade_index.unwrap()).await
+        {
+            tracing::error!("Error updating user trade index: {}", e);
+        }
+
 
         // Publish order
         publish_order(

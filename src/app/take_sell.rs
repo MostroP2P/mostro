@@ -13,6 +13,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use crate::db::update_user_trade_index;
 
 async fn update_order_status(
     order: &mut Order,
@@ -95,6 +96,11 @@ pub async fn take_sell_action(
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };
+    }
+
+    if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), msg.get_inner_message_kind().trade_index.unwrap()).await
+    {
+        tracing::error!("Error updating user trade index: {}", e);
     }
 
     // If payment request is not present, update order status to waiting buyer invoice

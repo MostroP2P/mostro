@@ -2,11 +2,10 @@ use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
 };
 
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
-
 use crate::db::update_user_trade_index;
 use anyhow::Result;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::Message;
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
@@ -44,7 +43,7 @@ pub async fn take_buy_action(
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        return Err(MostroInternalErr(ServiceError::WrongAmountError));
+        return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
     }
 
     // If the order amount is zero, calculate the market price in sats

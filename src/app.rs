@@ -31,7 +31,7 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
-use crate::db::update_user_trade_index;
+// use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
@@ -140,18 +140,17 @@ async fn check_trade_index(
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
 
-                if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
-                {
-                    tracing::error!("Error updating user trade index: {}", e);
-                }
+                // if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
+                // {
+                //     tracing::error!("Error updating user trade index: {}", e);
+                // }
             }
             Ok(())
         }
         Err(_) => {
-            if let (true, last_trade_index) = message_kind.has_trade_index() {
+            if let (true, _) = message_kind.has_trade_index() {
                 let new_user: User = User {
                     pubkey: event.sender.to_string(),
-                    last_trade_index,
                     ..Default::default()
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {

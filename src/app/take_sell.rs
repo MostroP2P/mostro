@@ -6,6 +6,7 @@ use crate::util::{
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 
+use crate::db::update_user_trade_index;
 use anyhow::Result;
 use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
@@ -95,6 +96,16 @@ pub async fn take_sell_action(
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };
+    }
+
+    if let Err(e) = update_user_trade_index(
+        pool,
+        event.sender.to_string(),
+        msg.get_inner_message_kind().trade_index.unwrap(),
+    )
+    .await
+    {
+        tracing::error!("Error updating user trade index: {}", e);
     }
 
     // If payment request is not present, update order status to waiting buyer invoice

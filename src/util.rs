@@ -810,7 +810,7 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
         .await
         .is_err()
         {
-            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+            return Err(MostroCantDo(CantDoReason::InvalidInvoice));
         }
         // if invoice is valid return it
         else {

@@ -19,6 +19,34 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
+fn reset_api_quotes(order: &mut Order) {
+    if order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+    }
+}
+
+async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<(), MostroError> {
+    if order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok()
+        || order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok()
+    {
+        // Get creator pubkey
+        let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
+
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            creator_pubkey,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
 pub async fn cancel_cooperative_execution(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
@@ -95,19 +123,9 @@ pub async fn cancel_order_by_taker(
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
-    // Get creator pubkey
-    let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
 
     //We notify the creator that the order was cancelled only if the taker had already done his part before
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Canceled,
-        None,
-        creator_pubkey,
-        None,
-    )
-    .await;
+    notify_creator(order, request_id).await?;
 
     //We notify the taker that the order is cancelled
     enqueue_order_msg(
@@ -120,10 +138,9 @@ pub async fn cancel_order_by_taker(
     )
     .await;
 
-    if order.price_from_api {
-        order.amount = 0;
-        order.fee = 0;
-    }
+    // Reset api quotes
+    reset_api_quotes(order);
+
     if order.is_buy_order().is_ok() {
         info!("Cancel seller data from db");
         edit_seller_pubkey_order(pool, order.id, None)

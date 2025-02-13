@@ -88,60 +88,28 @@ pub async fn cancel_order_by_taker(
     my_keys: &Keys,
     request_id: Option<u64>,
     ln_client: &mut LndConnector,
+    taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
+    // Cancel hold invoice is present
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
-
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+    // Get creator pubkey
+    let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
 
     //We notify the creator that the order was cancelled only if the taker had already done his part before
-    if (order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok())
-        || (order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok())
-    {
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            order.get_creator_pubkey().map_err(MostroInternalErr)?,
-            None,
-        )
-        .await;
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        creator_pubkey,
+        None,
+    )
+    .await;
 
-        if order.price_from_api {
-            order.amount = 0;
-            order.fee = 0;
-        }
-        if order.is_buy_order().is_ok() {
-            edit_seller_pubkey_order(pool, order.id, None)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-            edit_master_seller_pubkey_order(pool, order.id, None)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        }
-        if order.is_sell_order().is_ok() {
-            edit_buyer_pubkey_order(pool, order.id, None)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-            edit_master_buyer_pubkey_order(pool, order.id, None)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        }
-        update_order_to_initial_state(pool, order.id, order.amount, order.fee)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        update_order_event(my_keys, Status::Pending, order)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-        info!(
-            "{}: Canceled order Id {} republishing order",
-            buyer_pubkey, order.id
-        );
-    }
-
+    //We notify the taker that the order is cancelled
     enqueue_order_msg(
         request_id,
         Some(order.id),
@@ -151,6 +119,40 @@ pub async fn cancel_order_by_taker(
         None,
     )
     .await;
+
+    if order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+    }
+    if order.is_buy_order().is_ok() {
+        info!("Cancel seller data from db");
+        edit_seller_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        edit_master_seller_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+    if order.is_sell_order().is_ok() {
+        info!("Cancel buyer data from db");
+        edit_buyer_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        edit_master_buyer_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+    update_order_to_initial_state(pool, order.id, order.amount, order.fee)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    update_order_event(my_keys, Status::Pending, order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    info!(
+        "{}: Canceled order Id {} republishing order",
+        taker_pubkey, order.id
+    );
 
     Ok(())
 }
@@ -164,13 +166,14 @@ pub async fn cancel_order_by_maker(
     request_id: Option<u64>,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
+    // We publish a new replaceable kind nostr event with the status updated
     if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, order).await {
         order_updated
             .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
-
+    // Cancel hold invoice if present
     if let Some(hash) = &order.hash {
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
@@ -225,8 +228,18 @@ pub async fn cancel_action(
             .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
-            let _ = order_updated.update(pool).await;
+        match update_order_event(my_keys, Status::Canceled, &order).await {
+            Ok(order_updated) => {
+                order_updated
+                    .update(pool)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            }
+            Err(e) => {
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    e.to_string(),
+                )));
+            }
         }
         // We create a Message for cancel
         enqueue_order_msg(
@@ -269,7 +282,16 @@ pub async fn cancel_action(
             )
             .await?;
         } else if event.rumor.pubkey == taker_pubkey {
-            cancel_order_by_taker(pool, event, &mut order, my_keys, request_id, ln_client).await?;
+            cancel_order_by_taker(
+                pool,
+                event,
+                &mut order,
+                my_keys,
+                request_id,
+                ln_client,
+                taker_pubkey,
+            )
+            .await?;
         } else {
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }

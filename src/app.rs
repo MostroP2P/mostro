@@ -139,11 +139,6 @@ async fn check_trade_index(
                     tracing::info!("Invalid signature");
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
-
-                // if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
-                // {
-                //     tracing::error!("Error updating user trade index: {}", e);
-                // }
             }
             Ok(())
         }

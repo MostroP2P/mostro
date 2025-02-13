@@ -78,15 +78,14 @@ pub async fn order_action(
             calculate_and_check_quote(order, fiat_amount).await?;
         }
 
-        if let Err(e) = update_user_trade_index(
+        // Update trade index only after all checks are done
+        update_user_trade_index(
             pool,
             event.sender.to_string(),
             msg.get_inner_message_kind().trade_index.unwrap(),
         )
         .await
-        {
-            tracing::error!("Error updating user trade index: {}", e);
-        }
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         // Publish order
         publish_order(

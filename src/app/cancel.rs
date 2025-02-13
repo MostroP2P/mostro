@@ -19,6 +19,7 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
+/// Reset the api quotes
 fn reset_api_quotes(order: &mut Order) {
     if order.price_from_api {
         order.amount = 0;
@@ -26,6 +27,7 @@ fn reset_api_quotes(order: &mut Order) {
     }
 }
 
+/// Notify the creator that the order was cancelled
 async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<(), MostroError> {
     if order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok()
         || order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok()
@@ -47,6 +49,7 @@ async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<()
     Ok(())
 }
 
+/// Cancel a cooperative execution
 pub async fn cancel_cooperative_execution(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
@@ -56,59 +59,62 @@ pub async fn cancel_cooperative_execution(
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
+    // Validate if the initiator is the same as the event pubkey
     if let Some(initiator) = &order.cancel_initiator_pubkey {
         if *initiator == event.rumor.pubkey.to_string() {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
-    } else {
-        if let Some(hash) = &order.hash {
-            // We return funds to seller
-            ln_client.cancel_hold_invoice(hash).await?;
-            info!(
-                "Cooperative cancel: Order Id {}: Funds returned to seller",
-                &order.id
-            );
-        }
-        order.status = Status::CooperativelyCanceled.to_string();
-        // update db
-        let order = order
-            .clone()
-            .update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        // We publish a new replaceable kind nostr event with the status updated
-        // and update on local database the status and new event id
-        update_order_event(my_keys, Status::CooperativelyCanceled, &order)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-        // We create a Message for an accepted cooperative cancel and send it to both parties
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::CooperativeCancelAccepted,
-            None,
-            event.rumor.pubkey,
-            None,
-        )
-        .await;
-        let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
-            .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
-        enqueue_order_msg(
-            None,
-            Some(order.id),
-            Action::CooperativeCancelAccepted,
-            None,
-            counterparty_pubkey,
-            None,
-        )
-        .await;
-        info!("Cancel: Order Id {} canceled cooperatively!", order.id);
     }
+
+    // Cancel hold invoice if present
+    if let Some(hash) = &order.hash {
+        // We return funds to seller
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!(
+            "Cooperative cancel: Order Id {}: Funds returned to seller",
+            &order.id
+        );
+    }
+    order.status = Status::CooperativelyCanceled.to_string();
+    // update db
+    let order = order
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    update_order_event(my_keys, Status::CooperativelyCanceled, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // We create a Message for an accepted cooperative cancel and send it to both parties
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::CooperativeCancelAccepted,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::CooperativeCancelAccepted,
+        None,
+        counterparty_pubkey,
+        None,
+    )
+    .await;
+    info!("Cancel: Order Id {} canceled cooperatively!", order.id);
 
     Ok(())
 }
 
+/// Cancel an order by the taker
 pub async fn cancel_order_by_taker(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
@@ -174,6 +180,7 @@ pub async fn cancel_order_by_taker(
     Ok(())
 }
 
+/// Cancel an order by the maker
 pub async fn cancel_order_by_maker(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
@@ -219,6 +226,7 @@ pub async fn cancel_order_by_maker(
     Ok(())
 }
 
+/// Cancel an order
 pub async fn cancel_action(
     msg: Message,
     event: &UnwrappedGift,

@@ -1,39 +1,106 @@
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
-use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::util::get_nostr_client;
 use crate::LN_STATUS;
+use crate::{db::*, MESSAGE_QUEUES};
+use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
+use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
-use nostr_sdk::{Event, Kind as NostrKind, Tag};
+use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use util::{get_keys, get_nostr_relays, update_order_event};
+use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
 
-pub async fn start_scheduler(rate_list: Arc<Mutex<Vec<Event>>>) {
+pub async fn start_scheduler() {
     info!("Creating scheduler");
 
     job_expire_pending_older_orders().await;
-    job_update_rate_events(rate_list).await;
+    job_update_rate_events().await;
     let _ = job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_info_event_send().await;
     job_relay_list().await;
     job_update_bitcoin_prices().await;
+    job_flush_messages_queue().await;
 
     info!("Scheduler Started");
+}
+
+async fn job_flush_messages_queue() {
+    // Clone for closure owning with Arc
+    let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
+    let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
+    let sender_keys = match get_keys() {
+        Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+
+    // Helper function to send messages
+    async fn send_messages(
+        msg_list: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+        sender_keys: Keys,
+        retries: &mut usize,
+    ) {
+        if !msg_list.lock().await.is_empty() {
+            let (message, destination_key) = msg_list.lock().await[0].clone();
+            match message.as_json() {
+                Ok(msg) => {
+                    if let Err(e) = send_dm(destination_key, sender_keys.clone(), msg, None).await {
+                        error!("Failed to send message: {}", e);
+                        *retries += 1;
+                    } else {
+                        *retries = 0;
+                        msg_list.lock().await.remove(0);
+                    }
+                }
+                Err(e) => error!("Failed to parse message: {}", e),
+            }
+            if *retries > 3 {
+                *retries = 0; // Reset retries after removing message
+                msg_list.lock().await.remove(0);
+            }
+        }
+    }
+
+    // Spawn a new task to flush the messages queue
+    tokio::spawn(async move {
+        let mut retries_messages = 0;
+        let mut retries_cantdo_messages = 0;
+
+        loop {
+            send_messages(
+                order_msg_list.clone(),
+                sender_keys.clone(),
+                &mut retries_messages,
+            )
+            .await;
+            send_messages(
+                cantdo_msg_list.clone(),
+                sender_keys.clone(),
+                &mut retries_cantdo_messages,
+            )
+            .await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        }
+    });
 }
 
 async fn job_relay_list() {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+    let client = match get_nostr_client() {
+        Ok(client) => client,
         Err(e) => return error!("{e}"),
     };
 
@@ -54,9 +121,7 @@ async fn job_relay_list() {
                 if let Ok(relay_ev) =
                     EventBuilder::new(NostrKind::RelayList, "").sign_with_keys(&mostro_keys)
                 {
-                    if let Ok(client) = get_nostr_client() {
-                        let _ = client.send_event(relay_ev).await;
-                    }
+                    let _ = client.send_event(relay_ev).await;
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -67,6 +132,10 @@ async fn job_relay_list() {
 async fn job_info_event_send() {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
+        Err(e) => return error!("{e}"),
+    };
+    let client = match get_nostr_client() {
+        Ok(client) => client,
         Err(e) => return error!("{e}"),
     };
     let interval = Settings::get_mostro().publish_mostro_info_interval as u64;
@@ -83,9 +152,7 @@ async fn job_info_event_send() {
                 Err(e) => return error!("{e}"),
             };
 
-            if let Ok(client) = get_nostr_client() {
-                let _ = client.send_event(info_ev).await;
-            }
+            let _ = client.send_event(info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -123,11 +190,15 @@ async fn job_retry_failed_payments() {
     });
 }
 
-async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
+async fn job_update_rate_events() {
     // Clone for closure owning with Arc
-    let inner_list = rate_list.clone();
+    let queue_order_rate = MESSAGE_QUEUES.read().await.queue_order_rate.clone();
     let mostro_settings = Settings::get_mostro();
     let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
+    let client = match get_nostr_client() {
+        Ok(client) => client,
+        Err(e) => return error!("{e}"),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -136,22 +207,13 @@ async fn job_update_rate_events(rate_list: Arc<Mutex<Vec<Event>>>) {
                 interval
             );
 
-            for ev in inner_list.lock().await.iter() {
+            for ev in queue_order_rate.lock().await.iter() {
                 // Send event to relay
-                if let Ok(client) = get_nostr_client() {
-                    match client.send_event(ev.clone()).await {
-                        Ok(id) => {
-                            info!("Updated rate event with id {:?}", id)
-                        }
-                        Err(e) => {
-                            info!("Error on updating rate event {:?}", e.to_string())
-                        }
-                    }
-                }
+                let _ = client.send_event(ev.clone()).await;
             }
 
             // Clear list after send events
-            inner_list.lock().await.clear();
+            queue_order_rate.lock().await.clear();
 
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(

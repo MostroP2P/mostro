@@ -15,8 +15,8 @@ pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
-
-// Import action handlers from submodules
+pub mod trade_pubkey; // Trade pubkey action
+                      // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
@@ -30,25 +30,49 @@ use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
-use crate::db::update_user_trade_index;
+use crate::app::trade_pubkey::trade_pubkey_action;
+// use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
-use crate::util::send_cant_do_msg;
+use crate::util::enqueue_cant_do_msg;
 use crate::Settings;
 
 // External dependencies
 use anyhow::Result;
-use mostro_core::message::{Action, CantDoReason, Message};
+use mostro_core::error::CantDoReason;
+use mostro_core::error::MostroError;
+use mostro_core::error::ServiceError;
+use mostro_core::message::{Action, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+
 /// Helper function to log warning messages for action errors
-fn warning_msg(action: &Action, e: anyhow::Error) {
+fn warning_msg(action: &Action, e: ServiceError) {
     tracing::warn!("Error in {} with context {}", action, e);
+}
+
+/// Function to manage errors and send appropriate messages
+async fn manage_errors(
+    e: MostroError,
+    inner_message: Message,
+    event: UnwrappedGift,
+    action: &Action,
+) {
+    match e {
+        MostroError::MostroCantDo(cause) => {
+            enqueue_cant_do_msg(
+                inner_message.get_inner_message_kind().request_id,
+                inner_message.get_inner_message_kind().id,
+                cause,
+                event.rumor.pubkey,
+            )
+            .await
+        }
+        MostroError::MostroInternalErr(e) => warning_msg(action, e),
+    }
 }
 
 /// Function to check if a user is present in the database and update or create their trade index.
@@ -64,7 +88,11 @@ fn warning_msg(action: &Action, e: anyhow::Error) {
 /// * `pool` - The database connection pool used to query and update user data.
 /// * `event` - The unwrapped gift event containing the sender's information.
 /// * `msg` - The message containing action details and trade index information.
-async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Message) {
+async fn check_trade_index(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    msg: &Message,
+) -> Result<(), MostroError> {
     let message_kind = msg.get_inner_message_kind();
 
     // Only process actions related to trading
@@ -72,7 +100,7 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
         message_kind.action,
         Action::NewOrder | Action::TakeBuy | Action::TakeSell
     ) {
-        return;
+        return Ok(());
     }
 
     // If user is present, we check the trade index and signature
@@ -87,7 +115,9 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Error deserializing content: {}", e);
-                        return;
+                        return Err(MostroError::MostroInternalErr(
+                            ServiceError::MessageSerializationError,
+                        ));
                     }
                 };
 
@@ -95,52 +125,35 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 
                 if index <= user.last_trade_index {
                     tracing::info!("Invalid trade index");
-                    send_cant_do_msg(
-                        None,
-                        message_kind.id,
-                        Some(CantDoReason::InvalidTradeIndex),
-                        &event.rumor.pubkey,
+                    manage_errors(
+                        MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex),
+                        msg.clone(),
+                        event.clone(),
+                        &message_kind.action,
                     )
                     .await;
-                    return;
+                    return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
 
                 if !message_kind.verify_signature(event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
-                    send_cant_do_msg(
-                        None,
-                        message_kind.id,
-                        Some(CantDoReason::InvalidSignature),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
-                    return;
-                }
-
-                if let Err(e) = update_user_trade_index(pool, event.sender.to_string(), index).await
-                {
-                    tracing::error!("Error updating user trade index: {}", e);
+                    return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
             }
+            Ok(())
         }
         Err(_) => {
-            if let (true, last_trade_index) = message_kind.has_trade_index() {
+            if let (true, _) = message_kind.has_trade_index() {
                 let new_user: User = User {
                     pubkey: event.sender.to_string(),
-                    last_trade_index,
                     ..Default::default()
                 };
                 if let Err(e) = add_new_user(pool, new_user).await {
                     tracing::error!("Error creating new user: {}", e);
-                    send_cant_do_msg(
-                        None,
-                        msg.get_inner_message_kind().id,
-                        Some(CantDoReason::CantCreateUser),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
+                    return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
                 }
             }
+            Ok(())
         }
     }
 }
@@ -155,7 +168,6 @@ async fn check_trade_index(pool: &Pool<Sqlite>, event: &UnwrappedGift, msg: &Mes
 /// * `my_keys` - Node keypair for signing/verification
 /// * `pool` - Database connection pool
 /// * `ln_client` - Lightning network connector
-/// * `rate_list` - Shared list of rating events
 async fn handle_message_action(
     action: &Action,
     msg: Message,
@@ -163,32 +175,58 @@ async fn handle_message_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     match action {
         // Order-related actions
-        Action::NewOrder => order_action(msg, event, my_keys, pool).await,
-        Action::TakeSell => take_sell_action(msg, event, my_keys, pool).await,
-        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool).await,
+        Action::NewOrder => order_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::TakeSell => take_sell_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::TakeBuy => take_buy_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
 
         // Payment-related actions
-        Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool).await,
-        Action::Release => release_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AddInvoice => add_invoice_action(msg, event, my_keys, pool).await,
+        Action::FiatSent => fiat_sent_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::Release => release_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AddInvoice => add_invoice_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
 
         // Dispute and rating actions
-        Action::Dispute => dispute_action(msg, event, my_keys, pool).await,
-        Action::RateUser => {
-            update_user_reputation_action(msg, event, my_keys, pool, rate_list).await
-        }
-        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client).await,
+        Action::Dispute => dispute_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
 
         // Admin actions
-        Action::AdminCancel => admin_cancel_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client).await,
-        Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool).await,
-        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool).await,
+        Action::AdminCancel => admin_cancel_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminSettle => admin_settle_action(msg, event, my_keys, pool, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool)
+            .await
+            .map_err(|e| e.into()),
+        Action::TradePubkey => trade_pubkey_action(msg, event, pool)
+            .await
+            .map_err(|e| e.into()),
 
         _ => {
             tracing::info!("Received message with action {:?}", action);
@@ -211,7 +249,6 @@ pub async fn run(
     client: &Client,
     ln_client: &mut LndConnector,
     pool: Pool<Sqlite>,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
@@ -275,22 +312,35 @@ pub async fn run(
                     }
 
                     // Check if message is message with trade index
-                    check_trade_index(&pool, &event, &message).await;
+                    if let Err(e) = check_trade_index(&pool, &event, &message).await {
+                        tracing::error!("Error checking trade index: {}", e);
+                        continue;
+                    }
 
                     if inner_message.verify() {
                         if let Some(action) = message.inner_action() {
                             if let Err(e) = handle_message_action(
                                 &action,
-                                message,
+                                message.clone(),
                                 &event,
                                 &my_keys,
                                 &pool,
                                 ln_client,
-                                rate_list.clone(),
                             )
                             .await
                             {
-                                warning_msg(&action, e)
+                                match e.downcast::<MostroError>() {
+                                    Ok(err) => {
+                                        manage_errors(err, message, event, &action).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Unexpected error type: {}", e);
+                                        warning_msg(
+                                            &action,
+                                            ServiceError::UnexpectedError(e.to_string()),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

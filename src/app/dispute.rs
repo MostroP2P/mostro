@@ -7,24 +7,26 @@ use std::str::FromStr;
 
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_cant_do_msg, send_new_order_msg};
+use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 
-use anyhow::{Error, Result};
 use mostro_core::dispute::Dispute;
-use mostro_core::message::{Action, CantDoReason, Message, Payload};
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use rand::Rng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
-use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
 ///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details
 /// including status and application metadata.
-async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> {
+async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), MostroError> {
     // Create tags for the dispute event
     let tags = Tags::new(vec![
         // Status tag - indicates the current state of the dispute
@@ -47,7 +49,7 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> 
     // Create a new NIP-33 replaceable event
     // Empty content string as the information is in the tags
     let event = new_event(my_keys, "", dispute.id.to_string(), tags)
-        .map_err(|_| Error::msg("Failed to create dispute event"))?;
+        .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
 
     tracing::info!("Publishing dispute event: {:#?}", event);
 
@@ -63,12 +65,12 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> 
             }
             Err(e) => {
                 tracing::error!("Failed to send dispute event: {}", e);
-                Err(Error::msg("Failed to send dispute event"))
+                Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
             }
         },
         Err(e) => {
             tracing::error!("Failed to get Nostr client: {}", e);
-            Err(Error::msg("Failed to get Nostr client"))
+            Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
         }
     }
 }
@@ -78,14 +80,15 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<()> 
 /// Returns a tuple containing:
 /// - The counterparty's public key as a String
 /// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
-fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<(String, bool)> {
+fn get_counterpart_info(
+    sender: &str,
+    buyer: &str,
+    seller: &str,
+) -> Result<(String, bool), CantDoReason> {
     match sender {
         s if s == buyer => Ok((seller.to_string(), true)), // buyer is initiator
         s if s == seller => Ok((buyer.to_string(), false)), // seller is initiator
-        _ => {
-            tracing::error!("Message sender {sender} is neither buyer nor seller");
-            Err(Error::msg("Invalid message sender"))
-        }
+        _ => Err(CantDoReason::InvalidPubkey),
     }
 }
 
@@ -94,45 +97,15 @@ fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<(Stri
 /// Checks that:
 /// - The order exists
 /// - The order status allows disputes (Active or FiatSent)
-async fn get_valid_order(
-    pool: &Pool<Sqlite>,
-    order_id: Uuid,
-    event: &UnwrappedGift,
-    request_id: Option<u64>,
-) -> Result<Order> {
+async fn get_valid_order(pool: &Pool<Sqlite>, msg: &Message) -> Result<Order, MostroError> {
     // Try to fetch the order from the database
-    let order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            tracing::error!("Order Id {order_id} not found!");
-            return Err(Error::msg("Order not found"));
-        }
-    };
+    let order = get_order(msg, pool).await?;
 
-    // Parse and validate the order status
-    match Status::from_str(&order.status) {
-        Ok(status) => {
-            // Only allow disputes for Active or FiatSent orders
-            if !matches!(status, Status::Active | Status::FiatSent) {
-                // Notify the sender that the action is not allowed for this status
-                send_cant_do_msg(
-                    request_id,
-                    Some(order.id),
-                    Some(CantDoReason::NotAllowedByStatus),
-                    &event.rumor.pubkey,
-                )
-                .await;
-
-                return Err(Error::msg(format!(
-                    "Order {} with status {} does not allow disputes. Must be Active or FiatSent",
-                    order.id, order.status
-                )));
-            }
-        }
-        Err(_) => {
-            return Err(Error::msg("Invalid order status"));
-        }
-    };
+    // Check if the order status is Active or FiatSent
+    if order.check_status(Status::Active).is_err() && order.check_status(Status::FiatSent).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
 
     Ok(order)
 }
@@ -151,102 +124,66 @@ pub async fn dispute_action(
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
-    // Get request id
-    let request_id = msg.get_inner_message_kind().request_id;
-
+) -> Result<(), MostroError> {
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(Error::msg("No order id"));
+        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
     };
-
     // Check dispute for this order id is yet present.
     if find_dispute_by_order_id(pool, order_id).await.is_ok() {
-        return Err(Error::msg(format!(
-            "Dispute already exists for order {}",
-            order_id
-        )));
+        return Err(MostroInternalErr(ServiceError::DisputeAlreadyExists));
     }
-
     // Get and validate order
-    let mut order = get_valid_order(pool, order_id, event, request_id).await?;
-
+    let mut order = get_valid_order(pool, &msg).await?;
+    // Get seller and buyer pubkeys
     let (seller, buyer) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (seller.to_owned(), buyer.to_owned()),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
-
+    // Get message sender
     let message_sender = event.rumor.pubkey.to_string();
+    // Get counterpart info
     let (counterpart, is_buyer_dispute) =
         match get_counterpart_info(&message_sender, &buyer, &seller) {
             Ok((counterpart, is_buyer_dispute)) => (counterpart, is_buyer_dispute),
-            Err(_) => {
-                send_cant_do_msg(
-                    request_id,
-                    Some(order.id),
-                    Some(CantDoReason::InvalidPubkey),
-                    &event.rumor.pubkey,
-                )
-                .await;
-                return Ok(());
-            }
+            Err(cause) => return Err(MostroCantDo(cause)),
         };
 
-    // Get the opposite dispute status
-    let is_seller_dispute = !is_buyer_dispute;
-
-    // Update dispute flags based on who initiated
-    let mut update_seller_dispute = false;
-    let mut update_buyer_dispute = false;
-    if is_seller_dispute && !order.seller_dispute {
-        update_seller_dispute = true;
-        order.seller_dispute = update_seller_dispute;
-    } else if is_buyer_dispute && !order.buyer_dispute {
-        update_buyer_dispute = true;
-        order.buyer_dispute = update_buyer_dispute;
-    };
-    order.status = Status::Dispute.to_string();
-
-    // Update the database with dispute information
-    // Save the dispute to DB
-    if !update_buyer_dispute && !update_seller_dispute {
-        return Ok(());
-    } else {
-        // Need to update dispute status
-        order.update(pool).await?;
+    // Setup dispute
+    if order.setup_dispute(is_buyer_dispute).is_ok() {
+        order
+            .update(pool)
+            .await
+            .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     }
 
     // Create new dispute record and generate security tokens
     let mut dispute = Dispute::new(order_id);
-    let mut rng = rand::thread_rng();
-    dispute.buyer_token = Some(rng.gen_range(100..=999));
-    dispute.seller_token = Some(rng.gen_range(100..=999));
-
-    let (initiator_token, counterpart_token) = match is_seller_dispute {
-        true => (dispute.seller_token, dispute.buyer_token),
-        false => (dispute.buyer_token, dispute.seller_token),
-    };
+    // Create tokens
+    let (initiator_token, counterpart_token) = dispute.create_tokens(is_buyer_dispute);
 
     // Save dispute to database
-    let dispute = dispute.create(pool).await?;
+    let dispute = dispute
+        .create(pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
     // Send notification to dispute initiator
     let initiator_pubkey = match PublicKey::from_str(&message_sender) {
         Ok(pk) => pk,
-        Err(e) => {
-            tracing::error!("Error parsing initiator pubkey: {:#?}", e);
-            return Err(Error::msg("Failed to parse initiator public key"));
+        Err(_) => {
+            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
         }
     };
 
-    send_new_order_msg(
+    enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByYou,
         Some(Payload::Dispute(dispute.clone().id, initiator_token)),
-        &initiator_pubkey,
+        initiator_pubkey,
         None,
     )
     .await;
@@ -254,22 +191,23 @@ pub async fn dispute_action(
     // Send notification to counterparty
     let counterpart_pubkey = match PublicKey::from_str(&counterpart) {
         Ok(pk) => pk,
-        Err(e) => {
-            tracing::error!("Error parsing counterpart pubkey: {:#?}", e);
-            return Err(Error::msg("Failed to parse counterpart public key"));
+        Err(_) => {
+            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
         }
     };
-    send_new_order_msg(
+    enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByPeer,
         Some(Payload::Dispute(dispute.clone().id, counterpart_token)),
-        &counterpart_pubkey,
+        counterpart_pubkey,
         None,
     )
     .await;
 
     // Publish dispute event to network
-    publish_dispute_event(&dispute, my_keys).await?;
+    publish_dispute_event(&dispute, my_keys)
+        .await
+        .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
     Ok(())
 }

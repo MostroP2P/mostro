@@ -1,135 +1,93 @@
 use crate::cli::settings::Settings;
-use crate::lightning::invoice::is_valid_invoice;
-use crate::util::{get_bitcoin_price, publish_order, send_cant_do_msg};
-use anyhow::Result;
-use mostro_core::message::{CantDoReason, Message};
+use crate::db::update_user_trade_index;
+use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
+use mostro_core::message::Message;
+use mostro_core::order::{Order, SmallOrder};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
 use sqlx::{Pool, Sqlite};
-use tracing::error;
+
+async fn calculate_and_check_quote(
+    order: &SmallOrder,
+    fiat_amount: &i64,
+) -> Result<(), MostroError> {
+    // Get mostro settings
+    let mostro_settings = Settings::get_mostro();
+    // Calculate quote
+    let quote = match order.amount {
+        0 => match get_bitcoin_price(&order.fiat_code) {
+            Ok(price) => {
+                let quote = *fiat_amount as f64 / price;
+                (quote * 1E8) as i64
+            }
+            Err(_) => {
+                return Err(MostroInternalErr(ServiceError::NoAPIResponse));
+            }
+        },
+        _ => order.amount,
+    };
+
+    // Check amount is positive - extra safety check
+    if quote < 0 {
+        return Err(MostroCantDo(CantDoReason::InvalidAmount));
+    }
+
+    if quote > mostro_settings.max_order_amount as i64
+        || quote < mostro_settings.min_payment_amount as i64
+    {
+        return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
+    }
+
+    Ok(())
+}
 
 pub async fn order_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
     if let Some(order) = msg.get_inner_message_kind().get_order() {
-        let mostro_settings = Settings::get_mostro();
-
-        // Allows lightning address or invoice
-        // If user add a bolt11 invoice with a wrong amount the payment will fail later
-        if let Some(invoice) = msg.get_inner_message_kind().get_payment_request() {
-            // Verify if LN address is valid
-            match is_valid_invoice(invoice.clone(), None, None).await {
-                Ok(_) => (),
-                Err(_) => {
-                    send_cant_do_msg(
-                        request_id,
-                        order.id,
-                        Some(CantDoReason::InvalidAmount),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
-
-                    return Ok(());
-                }
-            }
-        }
+        // Validate invoice
+        let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
 
         // Default case single amount
         let mut amount_vec = vec![order.fiat_amount];
-
         // Get max and and min amount in case of range order
         // in case of single order do like usual
-        if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
-            if min >= max {
-                send_cant_do_msg(
-                    request_id,
-                    order.id,
-                    Some(CantDoReason::InvalidAmount),
-                    &event.rumor.pubkey,
-                )
-                .await;
-                return Ok(());
-            }
-            if order.amount != 0 {
-                send_cant_do_msg(
-                    request_id,
-                    None,
-                    Some(CantDoReason::InvalidAmount),
-                    &event.rumor.pubkey,
-                )
-                .await;
-
-                return Ok(());
-            }
-            amount_vec.clear();
-            amount_vec.push(min);
-            amount_vec.push(max);
+        if let Err(cause) = order.check_range_order_limits(&mut amount_vec) {
+            return Err(MostroCantDo(cause));
         }
 
-        let premium = (order.premium != 0).then_some(order.premium);
-        let fiat_amount = (order.fiat_amount != 0).then_some(order.fiat_amount);
-        let amount = (order.amount != 0).then_some(order.amount);
-
-        if premium.is_some() && fiat_amount.is_some() && amount.is_some() {
-            send_cant_do_msg(
-                request_id,
-                None,
-                Some(CantDoReason::InvalidParameters),
-                &event.rumor.pubkey,
-            )
-            .await;
-            return Ok(());
+        // Check if zero amount with premium
+        if let Err(cause) = order.check_zero_amount_with_premium() {
+            return Err(MostroCantDo(cause));
         }
 
+        // Check quote in sats for each amount
         for fiat_amount in amount_vec.iter() {
-            let quote = match order.amount {
-                0 => match get_bitcoin_price(&order.fiat_code) {
-                    Ok(price) => {
-                        let quote = *fiat_amount as f64 / price;
-                        (quote * 1E8) as i64
-                    }
-                    Err(e) => {
-                        error!("{:?}", e.to_string());
-                        return Ok(());
-                    }
-                },
-                _ => order.amount,
-            };
-
-            // Check amount is positive - extra safety check
-            if quote < 0 {
-                send_cant_do_msg(
-                    request_id,
-                    None,
-                    Some(CantDoReason::InvalidAmount),
-                    &event.rumor.pubkey,
-                )
-                .await;
-
-                return Ok(());
-            }
-
-            if quote > mostro_settings.max_order_amount as i64
-                || quote < mostro_settings.min_payment_amount as i64
-            {
-                send_cant_do_msg(
-                    request_id,
-                    None,
-                    Some(CantDoReason::OutOfRangeSatsAmount),
-                    &event.rumor.pubkey,
-                )
-                .await;
-                return Ok(());
-            }
+            calculate_and_check_quote(order, fiat_amount).await?;
         }
 
+        // Update trade index only after all checks are done
+        update_user_trade_index(
+            pool,
+            event.sender.to_string(),
+            msg.get_inner_message_kind().trade_index.unwrap(),
+        )
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Publish order
         publish_order(
             pool,
             my_keys,
@@ -140,7 +98,8 @@ pub async fn order_action(
             request_id,
             msg.get_inner_message_kind().trade_index,
         )
-        .await?;
+        .await
+        .map_err(|_| MostroError::MostroInternalErr(ServiceError::InvalidOrderId))?;
     }
     Ok(())
 }

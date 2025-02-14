@@ -1,117 +1,84 @@
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg, show_hold_invoice,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
 };
 
-use anyhow::{Error, Result};
-use mostro_core::message::{CantDoReason, Message};
-use mostro_core::order::{Kind, Order, Status};
+use crate::db::update_user_trade_index;
+use anyhow::Result;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::{CantDoReason, ServiceError};
+use mostro_core::message::Message;
+use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
-use std::str::FromStr;
-use tracing::error;
 
 pub async fn take_buy_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
+    // Extract order ID from the message, returning an error if not found
     // Safe unwrap as we verified the message
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(Error::msg("No order id"));
-    };
+    let mut order = get_order(&msg, pool).await?;
 
+    // Get the request ID from the message
     let request_id = msg.get_inner_message_kind().request_id;
 
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
-        }
+    // Check if the order is a buy order and if its status is active
+    if let Err(cause) = order.is_buy_order() {
+        return Err(MostroCantDo(cause));
     };
-
-    // Maker can't take own order
-    if order.kind != Kind::Buy.to_string() || order.creator_pubkey == event.rumor.pubkey.to_hex() {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPubkey),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
+    // Check if the order status is pending
+    if let Err(cause) = order.check_status(Status::Pending) {
+        return Err(MostroCantDo(cause));
     }
 
-    let order_status = match Status::from_str(&order.status) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Order Id {order_id} wrong status: {e:?}");
-            return Ok(());
-        }
-    };
-    let buyer_pubkey = match order.buyer_pubkey.as_ref() {
-        Some(pk) => PublicKey::from_str(pk)?,
-        None => {
-            error!("Buyer pubkey not found for order {}!", order.id);
-            return Ok(());
-        }
-    };
+    // Validate that the order was sent from the correct maker
+    order
+        .not_sent_from_maker(event.rumor.pubkey)
+        .map_err(MostroCantDo)?;
 
-    // We update the pubkey
-    let seller_pubkey = event.rumor.pubkey;
-    // Seller can take pending orders only
-    match order_status {
-        Status::Pending => {}
-        _ => {
-            send_cant_do_msg(
-                request_id,
-                Some(order.id),
-                Some(CantDoReason::NotAllowedByStatus),
-                &event.rumor.pubkey,
-            )
-            .await;
-
-            return Ok(());
-        }
-    }
-
-    // Get amount request if user requested one for range order - fiat amount will be used below
+    // Get the fiat amount requested by the user for range orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::OutOfRangeFiatAmount),
-            &event.rumor.pubkey,
-        )
-        .await;
-
-        return Ok(());
+        return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
     }
 
-    // Check market price value in sats - if order was with market price then calculate
-    if order.amount == 0 {
-        let (new_sats_amount, fee) =
-            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
-        // Update order with new sats value
-        order.amount = new_sats_amount;
-        order.fee = fee;
+    // If the order amount is zero, calculate the market price in sats
+    if order.has_no_amount() {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+            Ok(amount_fees) => {
+                order.amount = amount_fees.0;
+                order.fee = amount_fees.1
+            }
+            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
+        };
     }
 
-    // Add seller identity pubkey to order
+    // Get seller and buyer public keys
+    let seller_pubkey = event.rumor.pubkey;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+
+    // Add seller identity and trade index to the order
     order.master_seller_pubkey = Some(event.sender.to_string());
-    // Add seller trade index to order
     order.trade_index_seller = msg.get_inner_message_kind().trade_index;
-    // Timestamp order take time
-    order.taken_at = Timestamp::now().as_u64() as i64;
 
-    show_hold_invoice(
+    // Timestamp the order take time
+    order.set_timestamp_now();
+
+    // Update trade index only after all checks are done
+    update_user_trade_index(
+        pool,
+        event.sender.to_string(),
+        msg.get_inner_message_kind().trade_index.unwrap(),
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Show hold invoice and return success or error
+    if let Err(cause) = show_hold_invoice(
         my_keys,
         None,
         &buyer_pubkey,
@@ -119,6 +86,11 @@ pub async fn take_buy_action(
         order,
         request_id,
     )
-    .await?;
+    .await
+    {
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+            cause.to_string(),
+        )));
+    }
     Ok(())
 }

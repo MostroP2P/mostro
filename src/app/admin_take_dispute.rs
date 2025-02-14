@@ -1,11 +1,14 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, send_cant_do_msg, send_dm};
+use crate::util::{get_nostr_client, get_order, send_dm};
 
-use anyhow::{Error, Result};
 use mostro_core::dispute::{Dispute, Status};
-use mostro_core::message::{Action, CantDoReason, Message, Payload, Peer};
-use mostro_core::order::Order;
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
+use mostro_core::message::{Action, Message, Payload, Peer};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -41,7 +44,7 @@ pub async fn admin_take_dispute_action(
     msg: Message,
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
@@ -49,22 +52,17 @@ pub async fn admin_take_dispute_action(
     let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
         dispute_id
     } else {
-        return Err(Error::msg("No order id"));
+        return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
     };
 
     // Fetch dispute from db
-    let mut dispute = match Dispute::by_id(pool, dispute_id).await? {
+    let mut dispute = match Dispute::by_id(pool, dispute_id)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+    {
         Some(dispute) => dispute,
         None => {
-            send_cant_do_msg(
-                request_id,
-                Some(dispute_id),
-                Some(CantDoReason::NotFound),
-                &event.rumor.pubkey,
-            )
-            .await;
-
-            return Ok(());
+            return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
         }
     };
 
@@ -72,23 +70,14 @@ pub async fn admin_take_dispute_action(
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
         if !pubkey_event_can_solve(pool, &event.rumor.pubkey, dispute_status).await {
             // We create a Message
-            send_cant_do_msg(
-                request_id,
-                Some(dispute_id),
-                Some(CantDoReason::InvalidPubkey),
-                &event.rumor.pubkey,
-            )
-            .await;
-            return Ok(());
+            return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
     } else {
-        return Err(Error::msg("No dispute status"));
+        return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
     };
 
-    let order = match Order::by_id(pool, dispute.order_id).await? {
-        Some(o) => o,
-        None => return Err(Error::msg("No order id")),
-    };
+    // Get order from db
+    let order = get_order(&msg, pool).await?;
 
     let mut new_order = order.as_new_order();
     // Only in this case we use the trade pubkey fields to store the master pubkey
@@ -109,7 +98,10 @@ pub async fn admin_take_dispute_action(
     new_order.seller_token = dispute.seller_token;
     new_order.buyer_token = dispute.buyer_token;
     // Save it to DB
-    dispute.update(pool).await?;
+    dispute
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // We create a Message for admin
     let message = Message::new_dispute(
@@ -119,9 +111,13 @@ pub async fn admin_take_dispute_action(
         Action::AdminTookDispute,
         Some(Payload::Order(new_order)),
     );
-    let message = message.as_json()?;
+    let message = message
+        .as_json()
+        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     let sender_keys = crate::util::get_keys().unwrap();
-    send_dm(&event.rumor.pubkey, sender_keys, message, None).await?;
+    send_dm(event.rumor.pubkey, sender_keys, message, None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
     let solver_pubkey = Peer::new(event.rumor.pubkey.to_hex());
@@ -143,21 +139,37 @@ pub async fn admin_take_dispute_action(
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())?,
-            PublicKey::from_str(buyer.as_str())?,
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            PublicKey::from_str(buyer.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
         ),
-        (None, _) => return Err(Error::msg("Missing seller pubkey")),
-        (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
     let sender_keys = crate::util::get_keys().unwrap();
     send_dm(
-        &buyer_pubkey,
+        buyer_pubkey,
         sender_keys.clone(),
-        msg_to_buyer.as_json()?,
+        msg_to_buyer
+            .as_json()
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
         None,
     )
-    .await?;
-    send_dm(&seller_pubkey, sender_keys, msg_to_seller.as_json()?, None).await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Send message to seller
+    send_dm(
+        seller_pubkey,
+        sender_keys,
+        msg_to_seller
+            .as_json()
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
+        None,
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     // We create a tag to show status of the dispute
     let tags: Tags = Tags::new(vec![
         Tag::custom(
@@ -174,21 +186,34 @@ pub async fn admin_take_dispute_action(
         ),
     ]);
     // nip33 kind with dispute id as identifier
-    let event = new_event(&crate::util::get_keys()?, "", dispute_id.to_string(), tags)?;
+    let event = new_event(
+        &crate::util::get_keys()
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?,
+        "",
+        dispute_id.to_string(),
+        tags,
+    )
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Dispute event to be published: {event:#?}");
 
-    let client = get_nostr_client().map_err(|e| {
-        info!(
-            "Failed to get nostr client for dispute {}: {}",
-            dispute_id, e
-        );
-        e
-    })?;
+    let client = get_nostr_client()
+        .map_err(|e| {
+            info!(
+                "Failed to get nostr client for dispute {}: {}",
+                dispute_id, e
+            );
+            e
+        })
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    client.send_event(event).await.map_err(|e| {
-        info!("Failed to send dispute {} status event: {}", dispute_id, e);
-        e
-    })?;
+    client
+        .send_event(event)
+        .await
+        .map_err(|e| {
+            info!("Failed to send dispute {} status event: {}", dispute_id, e);
+            e
+        })
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     Ok(())
 }

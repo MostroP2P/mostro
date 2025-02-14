@@ -1,6 +1,6 @@
-use crate::app::rate_user::{MAX_RATING, MIN_RATING};
 use anyhow::Result;
 use mostro_core::dispute::Dispute;
+use mostro_core::message::{MAX_RATING, MIN_RATING};
 use mostro_core::order::Order;
 use mostro_core::order::Status;
 use mostro_core::user::User;

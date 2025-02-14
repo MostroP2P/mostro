@@ -1,28 +1,35 @@
-use crate::error::MostroError;
 use anyhow::{Context, Result};
+use mostro_core::error::{
+    MostroError::{self, *},
+    ServiceError,
+};
 use serde_json::Value;
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let (user, domain) = match address.split_once('@') {
         Some((user, domain)) => (user, domain),
-        None => return Err(MostroError::LnAddressParseError),
+        None => return Err(MostroInternalErr(ServiceError::LnAddressParseError)),
     };
 
     let url = format!("https://{domain}/.well-known/lnurlp/{user}");
     let res = reqwest::get(url)
         .await
-        .map_err(|_| MostroError::NoAPIResponse)?;
+        .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
     let status = res.status();
     if status.is_success() {
-        let body = res.text().await?;
-        let body: Value = serde_json::from_str(&body).map_err(|_| MostroError::MalformedAPIRes)?;
+        let body = res
+            .text()
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
         let tag = body["tag"].as_str().unwrap_or("");
         if tag == "payRequest" {
             return Ok(());
         }
-        Err(MostroError::LnAddressParseError)
+        Err(MostroInternalErr(ServiceError::LnAddressParseError))
     } else {
-        Err(MostroError::LnAddressParseError)
+        Err(MostroInternalErr(ServiceError::LnAddressParseError))
     }
 }
 

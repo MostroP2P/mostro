@@ -1,178 +1,128 @@
-use crate::lightning::invoice::is_valid_invoice;
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, send_cant_do_msg,
-    set_waiting_invoice_status, show_hold_invoice, update_order_event,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
+    show_hold_invoice, update_order_event, validate_invoice,
 };
 
-use anyhow::{Error, Result};
-use mostro_core::message::{CantDoReason, Message};
-use mostro_core::order::{Kind, Order, Status};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::{CantDoReason, ServiceError};
+
+use crate::db::update_user_trade_index;
+use anyhow::Result;
+use mostro_core::message::Message;
+use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::str::FromStr;
-use tracing::error;
+
+async fn update_order_status(
+    order: &mut Order,
+    my_keys: &Keys,
+    pool: &Pool<Sqlite>,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Get buyer pubkey
+    let buyer_pubkey = order.get_buyer_pubkey().unwrap();
+    // Set order status to waiting buyer invoice
+    match set_waiting_invoice_status(order, buyer_pubkey, request_id).await {
+        Ok(_) => {
+            // Update order status
+            match update_order_event(my_keys, Status::WaitingBuyerInvoice, order).await {
+                Ok(order_updated) => {
+                    let _ = order_updated.update(pool).await;
+                    Ok(())
+                }
+                Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
+            }
+        }
+        Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
+    }
+}
 
 pub async fn take_sell_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
+    // Get order
+    let mut order = get_order(&msg, pool).await?;
+
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
-    // Safe unwrap as we verified the message
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(Error::msg("No order id"));
+    // Check if the order is a sell order and if its status is active
+    if let Err(cause) = order.is_sell_order() {
+        return Err(MostroCantDo(cause));
     };
-
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            return Ok(());
-        }
-    };
-
-    // Maker can't take own order
-    if order.creator_pubkey == event.rumor.pubkey.to_hex() {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPubkey),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
+    // Check if the order status is pending
+    if let Err(cause) = order.check_status(Status::Pending) {
+        return Err(MostroCantDo(cause));
     }
 
-    if order.kind != Kind::Sell.to_string() {
-        return Ok(());
-    }
+    // Validate that the order was sent from the correct maker
+    order
+        .not_sent_from_maker(event.rumor.pubkey)
+        .map_err(MostroCantDo)?;
 
-    // Get trade pubkey of the buyer
-    let buyer_trade_pubkey = event.rumor.pubkey;
+    // Get seller pubkey
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
-    let seller_pubkey = match &order.seller_pubkey {
-        Some(seller) => PublicKey::from_str(seller.as_str())?,
-        _ => return Err(Error::msg("Missing seller pubkeys")),
-    };
-
-    let mut pr: Option<String> = None;
-    // If a buyer sent me a lightning invoice we look on db an order with
-    // that order id and save the buyer pubkey and invoice fields
-    if let Some(payment_request) = msg.get_inner_message_kind().get_payment_request() {
-        pr = {
-            // Verify if invoice is valid
-            match is_valid_invoice(
-                payment_request.clone(),
-                Some(order.amount as u64),
-                Some(order.fee as u64),
-            )
-            .await
-            {
-                Ok(_) => Some(payment_request),
-                Err(e) => {
-                    send_cant_do_msg(
-                        request_id,
-                        Some(order.id),
-                        Some(CantDoReason::InvalidInvoice),
-                        &event.rumor.pubkey,
-                    )
-                    .await;
-                    error!("{e}");
-                    return Ok(());
-                }
-            }
-        };
-    }
-
-    let order_status = match Status::from_str(&order.status) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Order Id {order_id} wrong status: {e:?}");
-            return Ok(());
-        }
-    };
-
-    // Buyer can take Pending orders only
-    match order_status {
-        Status::Pending => {}
-        _ => {
-            send_cant_do_msg(
-                request_id,
-                Some(order.id),
-                Some(CantDoReason::NotAllowedByStatus),
-                &buyer_trade_pubkey,
-            )
-            .await;
-
-            return Ok(());
-        }
-    }
+    // Validate invoice and get payment request if present
+    let payment_request = validate_invoice(&msg, &order).await?;
 
     // Get amount request if user requested one for range order - fiat amount will be used below
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::OutOfRangeFiatAmount),
-            &event.rumor.pubkey,
-        )
-        .await;
-
-        return Ok(());
+        return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
     }
 
     // Add buyer pubkey to order
-    order.buyer_pubkey = Some(buyer_trade_pubkey.to_string());
+    order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(event.sender.to_string());
     // Add buyer trade index to order
     order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
     // Timestamp take order time
-    order.taken_at = Timestamp::now().as_u64() as i64;
+    order.set_timestamp_now();
 
     // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
-    if order.amount == 0 {
-        let (new_sats_amount, fee) =
-            get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await?;
-        // Update order with new sats value
-        order.amount = new_sats_amount;
-        order.fee = fee;
+    if order.has_no_amount() {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+            Ok(amount_fees) => {
+                order.amount = amount_fees.0;
+                order.fee = amount_fees.1
+            }
+            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
+        };
     }
 
-    if pr.is_none() {
-        match set_waiting_invoice_status(&mut order, buyer_trade_pubkey, request_id).await {
-            Ok(_) => {
-                // Update order status
-                if let Ok(order_updated) =
-                    update_order_event(my_keys, Status::WaitingBuyerInvoice, &order).await
-                {
-                    let _ = order_updated.update(pool).await;
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                error!("Error setting market order sats amount: {:#?}", e);
-                return Ok(());
-            }
-        }
-    } else {
+    // Update trade index only after all checks are done
+    update_user_trade_index(
+        pool,
+        event.sender.to_string(),
+        msg.get_inner_message_kind().trade_index.unwrap(),
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // If payment request is not present, update order status to waiting buyer invoice
+    if payment_request.is_none() {
+        update_order_status(&mut order, my_keys, pool, request_id).await?;
+    }
+    // If payment request is present, show hold invoice
+    else {
         show_hold_invoice(
             my_keys,
-            pr,
-            &buyer_trade_pubkey,
+            payment_request,
+            &event.rumor.pubkey,
             &seller_pubkey,
             order,
             request_id,
         )
         .await?;
     }
+
     Ok(())
 }

@@ -1,224 +1,382 @@
 use crate::db::{
     edit_buyer_pubkey_order, edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order,
-    edit_seller_pubkey_order, find_order_by_id, update_order_to_initial_state,
+    edit_seller_pubkey_order, update_order_to_initial_state,
 };
 use crate::lightning::LndConnector;
-use crate::util::{send_cant_do_msg, send_new_order_msg, update_order_event};
+use crate::util::{enqueue_order_msg, get_order, update_order_event};
 
-use anyhow::{Error, Result};
-use mostro_core::message::{Action, CantDoReason, Message};
-use mostro_core::order::{Kind as OrderKind, Status};
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+    ServiceError,
+};
+use mostro_core::message::{Action, Message};
+use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
-use tracing::{error, info};
+use tracing::info;
 
+/// Reset the api quotes
+fn reset_api_quotes(order: &mut Order) {
+    if order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+    }
+}
+
+/// Notify the creator that the order was cancelled
+async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<(), MostroError> {
+    if order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok()
+        || order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok()
+    {
+        // Get creator pubkey
+        let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
+
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Canceled,
+            None,
+            creator_pubkey,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Cancel a cooperative execution
+async fn cancel_cooperative_execution_step_2(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    request_id: Option<u64>,
+    mut order: Order,
+    counterparty_pubkey: String,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    // Validate if the initiator is the same as the event pubkey
+    if let Some(initiator) = &order.cancel_initiator_pubkey {
+        if *initiator == event.rumor.pubkey.to_string() {
+            // We create a Message
+            return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+        }
+    }
+
+    // Cancel hold invoice if present
+    if let Some(hash) = &order.hash {
+        // We return funds to seller
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!(
+            "Cooperative cancel: Order Id {}: Funds returned to seller",
+            &order.id
+        );
+    }
+    order.status = Status::CooperativelyCanceled.to_string();
+    // update db
+    let order = order
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    update_order_event(my_keys, Status::CooperativelyCanceled, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // We create a Message for an accepted cooperative cancel and send it to both parties
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::CooperativeCancelAccepted,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::CooperativeCancelAccepted,
+        None,
+        counterparty_pubkey,
+        None,
+    )
+    .await;
+    info!("Cancel: Order Id {} canceled cooperatively!", order.id);
+
+    Ok(())
+}
+
+async fn cancel_cooperative_execution_step_1(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    mut order: Order,
+    counterparty_pubkey: String,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    order.cancel_initiator_pubkey = Some(event.rumor.pubkey.to_string());
+    // update db
+    let order = order
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // We create a Message to start a cooperative cancel and send it to both parties
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::CooperativeCancelInitiatedByYou,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::CooperativeCancelInitiatedByPeer,
+        None,
+        counterparty_pubkey,
+        None,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Cancel an order by the taker
+async fn cancel_order_by_taker(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    order: &mut Order,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+    ln_client: &mut LndConnector,
+    taker_pubkey: PublicKey,
+) -> Result<(), MostroError> {
+    // Cancel hold invoice is present
+    if let Some(hash) = &order.hash {
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!("Order Id {}: Funds returned to seller", &order.id);
+    }
+
+    //We notify the creator that the order was cancelled only if the taker had already done his part before
+    notify_creator(order, request_id).await?;
+
+    //We notify the taker that the order is cancelled
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+
+    // Reset api quotes
+    reset_api_quotes(order);
+
+    if order.is_buy_order().is_ok() {
+        info!("Cancel seller data from db");
+        edit_seller_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        edit_master_seller_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+    if order.is_sell_order().is_ok() {
+        info!("Cancel buyer data from db");
+        edit_buyer_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        edit_master_buyer_pubkey_order(pool, order.id, None)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+    update_order_to_initial_state(pool, order.id, order.amount, order.fee)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    update_order_event(my_keys, Status::Pending, order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    info!(
+        "{}: Canceled order Id {} republishing order",
+        taker_pubkey, order.id
+    );
+
+    Ok(())
+}
+
+/// Cancel an order by the maker
+async fn cancel_order_by_maker(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    order: &mut Order,
+    taker_pubkey: PublicKey,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    // We publish a new replaceable kind nostr event with the status updated
+    if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, order).await {
+        order_updated
+            .update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+    // Cancel hold invoice if present
+    if let Some(hash) = &order.hash {
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!("Order Id {}: Funds returned to seller", &order.id);
+    }
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    //We notify the taker that the order was cancelled
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        taker_pubkey,
+        None,
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn cancel_pending_order_from_maker(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    order: &mut Order,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Validates if this user is the order creator
+    order
+        .sent_from_maker(event.rumor.pubkey)
+        .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    match update_order_event(my_keys, Status::Canceled, order).await {
+        Ok(order_updated) => {
+            order_updated
+                .update(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        }
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
+        }
+    }
+    // We create a Message for cancel
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+/// Cancel an order
 pub async fn cancel_action(
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
+    // Get order id
+    let mut order = get_order(&msg, pool).await?;
 
-    let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
-        order_id
-    } else {
-        return Err(Error::msg("No order id"));
-    };
-    let user_pubkey = event.rumor.pubkey.to_string();
-
-    let mut order = match find_order_by_id(pool, order_id, &user_pubkey).await {
-        Ok(order) => order,
-        Err(_) => {
-            error!("Order Id {order_id} not found for user with pubkey: {user_pubkey}");
-            return Ok(());
-        }
-    };
-
-    if order.status == Status::Canceled.to_string()
-        || order.status == Status::CooperativelyCanceled.to_string()
-        || order.status == Status::CanceledByAdmin.to_string()
+    if order.check_status(Status::Canceled).is_ok()
+        || order.check_status(Status::CooperativelyCanceled).is_ok()
+        || order.check_status(Status::CanceledByAdmin).is_ok()
     {
-        send_cant_do_msg(
-            request_id,
-            Some(order_id),
-            Some(CantDoReason::OrderAlreadyCanceled),
-            &event.rumor.pubkey,
-        )
-        .await;
+        return Err(MostroCantDo(CantDoReason::OrderAlreadyCanceled));
+    }
+
+    if order.check_status(Status::Pending).is_ok() {
+        cancel_pending_order_from_maker(pool, event, &mut order, my_keys, request_id).await?;
         return Ok(());
     }
 
-    if order.status == Status::Pending.to_string() {
-        // Validates if this user is the order creator
-        if user_pubkey != order.creator_pubkey {
-            send_cant_do_msg(
-                request_id,
-                Some(order.id),
-                Some(CantDoReason::IsNotYourOrder),
-                &event.rumor.pubkey,
-            )
-            .await;
-        } else {
-            // We publish a new replaceable kind nostr event with the status updated
-            // and update on local database the status and new event id
-            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
-                let _ = order_updated.update(pool).await;
-            }
-            // We create a Message for cancel
-            send_new_order_msg(
-                request_id,
-                Some(order.id),
-                Action::Canceled,
-                None,
-                &event.rumor.pubkey,
-                None,
-            )
-            .await;
-        }
+    // Get seller and buyer pubkey
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-        return Ok(());
-    }
-
-    if order.status == Status::WaitingPayment.to_string()
-        || order.status == Status::WaitingBuyerInvoice.to_string()
+    if order.check_status(Status::WaitingPayment).is_ok()
+        || order.check_status(Status::WaitingBuyerInvoice).is_ok()
     {
-        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-            (Some(seller), Some(buyer)) => (seller, buyer),
-            (None, _) => return Err(Error::msg("Missing seller pubkey")),
-            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
+        // Get order taker pubkey
+        let taker_pubkey = if order.creator_pubkey == seller_pubkey.to_string() {
+            buyer_pubkey
+        } else if order.creator_pubkey == buyer_pubkey.to_string() {
+            seller_pubkey
+        } else {
+            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
         };
 
-        let taker_pubkey: String = if seller_pubkey == &order.creator_pubkey {
-            buyer_pubkey.to_string()
-        } else {
-            seller_pubkey.to_string()
-        };
-
-        if user_pubkey == order.creator_pubkey {
-            if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
-                let _ = order_updated.update(pool).await;
-            }
-
-            if let Some(hash) = &order.hash {
-                ln_client.cancel_hold_invoice(hash).await?;
-                info!("Order Id {}: Funds returned to seller", &order.id);
-            }
-
-            send_new_order_msg(
+        if order.sent_from_maker(event.rumor.pubkey).is_ok() {
+            cancel_order_by_maker(
+                pool,
+                event,
+                &mut order,
+                taker_pubkey,
+                my_keys,
                 request_id,
-                Some(order.id),
-                Action::Canceled,
-                None,
-                &event.rumor.pubkey,
-                None,
+                ln_client,
             )
-            .await;
-
-            let taker_pubkey = PublicKey::from_str(&taker_pubkey)?;
-            //We notify the taker that the order was cancelled
-            send_new_order_msg(
-                None,
-                Some(order.id),
-                Action::Canceled,
-                None,
-                &taker_pubkey,
-                None,
-            )
-            .await;
-        } else if user_pubkey == taker_pubkey {
-            if let Some(hash) = &order.hash {
-                ln_client.cancel_hold_invoice(hash).await?;
-                info!("Order Id {}: Funds returned to seller", &order.id);
-            }
-
-            let creator_pubkey = PublicKey::from_str(&order.creator_pubkey)?;
-            //We notify the creator that the order was cancelled only if the taker had already done his part before
-
-            if order.kind == OrderKind::Buy.to_string() {
-                if order.status == Status::WaitingBuyerInvoice.to_string() {
-                    send_new_order_msg(
-                        request_id,
-                        Some(order.id),
-                        Action::Canceled,
-                        None,
-                        &creator_pubkey,
-                        None,
-                    )
-                    .await;
-                }
-                if order.price_from_api {
-                    order.amount = 0;
-                    order.fee = 0;
-                }
-                edit_seller_pubkey_order(pool, order.id, None).await?;
-                edit_master_seller_pubkey_order(pool, order.id, None).await?;
-                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-                update_order_event(my_keys, Status::Pending, &order).await?;
-                info!(
-                    "{}: Canceled order Id {} republishing order",
-                    buyer_pubkey, order.id
-                );
-            }
-
-            if order.kind == OrderKind::Sell.to_string() {
-                if order.status == Status::WaitingPayment.to_string() {
-                    send_new_order_msg(
-                        request_id,
-                        Some(order.id),
-                        Action::Canceled,
-                        None,
-                        &creator_pubkey,
-                        None,
-                    )
-                    .await;
-                }
-                if order.price_from_api {
-                    order.amount = 0;
-                    order.fee = 0;
-                }
-                edit_buyer_pubkey_order(pool, order.id, None).await?;
-                edit_master_buyer_pubkey_order(pool, order.id, None).await?;
-                update_order_to_initial_state(pool, order.id, order.amount, order.fee).await?;
-                update_order_event(my_keys, Status::Pending, &order).await?;
-                info!(
-                    "{}: Canceled order Id {} republishing order",
-                    buyer_pubkey, order.id
-                );
-            }
-
-            send_new_order_msg(
+            .await?;
+        } else if event.rumor.pubkey == taker_pubkey {
+            cancel_order_by_taker(
+                pool,
+                event,
+                &mut order,
+                my_keys,
                 request_id,
-                Some(order.id),
-                Action::Canceled,
-                None,
-                &event.rumor.pubkey,
-                None,
+                ln_client,
+                taker_pubkey,
             )
-            .await;
+            .await?;
         } else {
-            send_cant_do_msg(request_id, Some(order.id), None, &event.rumor.pubkey).await;
-            return Ok(());
+            return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
     }
 
-    if order.status == Status::Active.to_string()
-        || order.status == Status::FiatSent.to_string()
-        || order.status == Status::Dispute.to_string()
+    if order.check_status(Status::Active).is_ok()
+        || order.check_status(Status::FiatSent).is_ok()
+        || order.check_status(Status::Dispute).is_ok()
     {
-        let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-            (Some(seller), Some(buyer)) => (seller, buyer),
-            (None, _) => return Err(Error::msg("Missing seller pubkey")),
-            (_, None) => return Err(Error::msg("Missing buyer pubkey")),
-        };
-
         let counterparty_pubkey: String;
-        if buyer_pubkey == &user_pubkey {
+        if buyer_pubkey == event.rumor.pubkey {
             order.buyer_cooperativecancel = true;
             counterparty_pubkey = seller_pubkey.to_string();
         } else {
@@ -227,73 +385,27 @@ pub async fn cancel_action(
         }
 
         match order.cancel_initiator_pubkey {
-            Some(ref initiator_pubkey) => {
-                if initiator_pubkey == &user_pubkey {
-                    // We create a Message
-                    send_cant_do_msg(request_id, Some(order_id), None, &event.rumor.pubkey).await;
-                    return Ok(());
-                } else {
-                    if let Some(hash) = &order.hash {
-                        // We return funds to seller
-                        ln_client.cancel_hold_invoice(hash).await?;
-                        info!(
-                            "Cooperative cancel: Order Id {}: Funds returned to seller",
-                            &order.id
-                        );
-                    }
-                    order.status = Status::CooperativelyCanceled.to_string();
-                    // update db
-                    let order = order.update(pool).await?;
-                    // We publish a new replaceable kind nostr event with the status updated
-                    // and update on local database the status and new event id
-                    update_order_event(my_keys, Status::CooperativelyCanceled, &order).await?;
-                    // We create a Message for an accepted cooperative cancel and send it to both parties
-                    send_new_order_msg(
-                        request_id,
-                        Some(order.id),
-                        Action::CooperativeCancelAccepted,
-                        None,
-                        &event.rumor.pubkey,
-                        None,
-                    )
-                    .await;
-                    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
-                    send_new_order_msg(
-                        None,
-                        Some(order.id),
-                        Action::CooperativeCancelAccepted,
-                        None,
-                        &counterparty_pubkey,
-                        None,
-                    )
-                    .await;
-                    info!("Cancel: Order Id {order_id} canceled cooperatively!");
-                }
+            Some(_) => {
+                cancel_cooperative_execution_step_2(
+                    pool,
+                    event,
+                    request_id,
+                    order,
+                    counterparty_pubkey,
+                    my_keys,
+                    ln_client,
+                )
+                .await?;
             }
             None => {
-                order.cancel_initiator_pubkey = Some(user_pubkey.clone());
-                // update db
-                let order = order.update(pool).await?;
-                // We create a Message to start a cooperative cancel and send it to both parties
-                send_new_order_msg(
+                cancel_cooperative_execution_step_1(
+                    pool,
+                    event,
+                    order,
+                    counterparty_pubkey,
                     request_id,
-                    Some(order.id),
-                    Action::CooperativeCancelInitiatedByYou,
-                    None,
-                    &event.rumor.pubkey,
-                    None,
                 )
-                .await;
-                let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)?;
-                send_new_order_msg(
-                    None,
-                    Some(order.id),
-                    Action::CooperativeCancelInitiatedByPeer,
-                    None,
-                    &counterparty_pubkey,
-                    None,
-                )
-                .await;
+                .await?;
             }
         }
     }

@@ -3,13 +3,14 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, get_nostr_client, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
-    update_order_event,
+    enqueue_cant_do_msg, enqueue_order_msg, get_keys, get_nostr_client, get_order,
+    settle_seller_hold_invoice, update_order_event,
 };
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, CantDoReason, Message, Payload};
+use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -20,40 +21,41 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Result<Order> {
+/// Check if order has failed payment retries
+pub async fn check_failure_retries(
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<Order, MostroError> {
     let mut order = order.clone();
 
     // Handle to db here
-    let pool = db::connect().await?;
+    let pool = db::connect()
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
+    // Count payment retries up to limit
+    order.count_failed_payment(retries_number);
 
-    // Mark payment as failed
-    if !order.failed_payment {
-        order.failed_payment = true;
-        order.payment_attempts = 0;
-    } else if order.payment_attempts < retries_number {
-        order.payment_attempts += 1;
-    }
-    let buyer_pubkey = match &order.buyer_pubkey {
-        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
-        None => return Err(Error::msg("Missing buyer pubkey")),
-    };
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::PaymentFailed,
         None,
-        &buyer_pubkey,
+        buyer_pubkey,
         None,
     )
     .await;
 
     // Update order
-    let result = order.update(&pool).await?;
+    let result = order
+        .update(&pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     Ok(result)
 }
 
@@ -63,98 +65,51 @@ pub async fn release_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
-    let order_id = msg
-        .get_inner_message_kind()
-        .id
-        .ok_or(Error::msg("Order ID is required but was not provided"))?;
-
-    let mut order = Order::by_id(pool, order_id)
-        .await?
-        .ok_or(Error::msg(format!(
-            "Order {} not found in database",
-            order_id
-        )))?;
-
-    let seller_pubkey_hex = order.seller_pubkey.as_ref().ok_or(Error::msg(format!(
-        "Seller public key not found for order {}",
-        order_id
-    )))?;
-
-    // Only seller can release funds
-    if &event.rumor.pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPeer),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
-    }
-
-    let next_trade: Option<(String, u32)> = match event.rumor.pubkey.to_string() {
-        pubkey if pubkey == order.creator_pubkey => {
-            if let Some(Payload::NextTrade(pubkey, index)) = &msg.get_inner_message_kind().payload {
-                Some((pubkey.clone(), *index))
-            } else {
-                None
-            }
-        }
-        _ => match (order.next_trade_pubkey.as_ref(), order.next_trade_index) {
-            (Some(pubkey), Some(index)) => Some((pubkey.clone(), index as u32)),
-            _ => None,
-        },
-    };
-
-    let current_status =
-        Status::from_str(&order.status).map_err(|_| Error::msg("Wrong order status"))?;
-
-    if !matches!(
-        current_status,
-        Status::Active | Status::FiatSent | Status::Dispute
-    ) {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::NotAllowedByStatus),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
-    }
-
-    settle_seller_hold_invoice(
-        event,
-        ln_client,
-        Action::Released,
-        false,
-        &order,
-        request_id,
-    )
-    .await?;
-
+    // Get order
+    let mut order = get_order(&msg, pool).await?;
+    // Get seller pubkey hex
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // We send a message to buyer indicating seller released funds
-    let buyer_pubkey = PublicKey::from_str(
-        order
-            .buyer_pubkey
-            .as_ref()
-            .ok_or(Error::msg("Missing buyer pubkey"))?
-            .as_str(),
-    )?;
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-    send_new_order_msg(
+    if seller_pubkey != event.rumor.pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPeer));
+    }
+
+    // Check if order is active, fiat sent or dispute
+    if order.check_status(Status::Active).is_err()
+        && order.check_status(Status::FiatSent).is_err()
+        && order.check_status(Status::Dispute).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
+    // Get next trade key
+    let next_trade = msg
+        .get_inner_message_kind()
+        .get_next_trade_key()
+        .map_err(MostroInternalErr)?;
+
+    // Settle seller hold invoice
+    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
+    // Update order event with status SettledHoldInvoice
+    order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    enqueue_order_msg(
         None,
-        Some(order_id),
+        Some(order.id),
         Action::Released,
         None,
-        &buyer_pubkey,
+        buyer_pubkey,
         None,
     )
     .await;
-    order = update_order_event(my_keys, Status::SettledHoldInvoice, &order).await?;
+
     // Handle child order for range orders
     if let Ok((Some(child_order), Some(event))) =
         get_child_order(order.clone(), request_id, my_keys).await
@@ -164,28 +119,30 @@ pub async fn release_action(
                 tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
             }
         }
-        handle_child_order(child_order, &order, next_trade, pool, request_id).await?;
+        handle_child_order(child_order, &order, next_trade, pool, request_id)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
-        Some(order_id),
+        Some(order.id),
         Action::HoldInvoicePaymentSettled,
         None,
-        &event.rumor.pubkey,
+        seller_pubkey,
         None,
     )
     .await;
 
-    // Send DM to seller to rate counterpart
-    send_new_order_msg(
-        request_id,
+    // We send a message to seller indicating seller released funds
+    enqueue_order_msg(
+        None,
         Some(order.id),
         Action::Rate,
         None,
-        &event.rumor.pubkey,
+        seller_pubkey,
         None,
     )
     .await;
@@ -230,12 +187,12 @@ async fn handle_child_order(
 
         let new_order = child_order.as_new_order();
         let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
-        send_new_order_msg(
+        enqueue_order_msg(
             request_id,
             new_order.id,
             Action::NewOrder,
             Some(Payload::Order(new_order)),
-            &next_trade_pubkey,
+            next_trade_pubkey,
             Some(next_trade_index as i64),
         )
         .await;
@@ -271,12 +228,12 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
         }
     }
 
-    let my_keys = get_keys()?;
+    // Get Mostro keys
+    let my_keys =
+        get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    let buyer_pubkey = match &order.buyer_pubkey {
-        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
-        None => return Err(Error::msg("Missing buyer pubkey")),
-    };
+    // Get buyer and seller pubkeys
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     let payment = {
         async move {
@@ -290,10 +247,8 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-
-                            let _ =
-                                payment_success(&mut order, &buyer_pubkey, &my_keys, request_id)
-                                    .await;
+                            let _ = payment_success(&mut order, buyer_pubkey, &my_keys, request_id)
+                                .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -323,12 +278,12 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
 
 async fn payment_success(
     order: &mut Order,
-    buyer_pubkey: &PublicKey,
+    buyer_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
     // Purchase completed message to buyer
-    send_new_order_msg(
+    enqueue_order_msg(
         None,
         Some(order.id),
         Action::PurchaseCompleted,
@@ -338,20 +293,26 @@ async fn payment_success(
     )
     .await;
 
+    // Get db connection
+    let pool = db::connect()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let pool = db::connect().await?;
-        if let Ok(order) = order_updated.update(&pool).await {
-            // Send dm to buyer to rate counterpart
-            send_new_order_msg(
-                request_id,
-                Some(order.id),
-                Action::Rate,
-                None,
-                buyer_pubkey,
-                None,
-            )
-            .await;
-        }
+        let order = order_updated
+            .update(&pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Send dm to buyer to rate counterpart
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Rate,
+            None,
+            buyer_pubkey,
+            None,
+        )
+        .await;
     }
     Ok(())
 }
@@ -471,19 +432,19 @@ async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
             }
         };
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             None,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &buyer_pubkey,
+            CantDoReason::InvalidAmount,
+            buyer_pubkey,
         )
         .await;
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             request_id,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &seller_pubkey,
+            CantDoReason::InvalidAmount,
+            seller_pubkey,
         )
         .await;
     }

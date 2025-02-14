@@ -50,11 +50,11 @@ async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<()
 }
 
 /// Cancel a cooperative execution
-pub async fn cancel_cooperative_execution(
+async fn cancel_cooperative_execution_step_2(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     request_id: Option<u64>,
-    order: &mut Order,
+    mut order: Order,
     counterparty_pubkey: String,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
@@ -114,8 +114,46 @@ pub async fn cancel_cooperative_execution(
     Ok(())
 }
 
+async fn cancel_cooperative_execution_step_1(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    mut order: Order,
+    counterparty_pubkey: String,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    order.cancel_initiator_pubkey = Some(event.rumor.pubkey.to_string());
+    // update db
+    let order = order
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // We create a Message to start a cooperative cancel and send it to both parties
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::CooperativeCancelInitiatedByYou,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::CooperativeCancelInitiatedByPeer,
+        None,
+        counterparty_pubkey,
+        None,
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Cancel an order by the taker
-pub async fn cancel_order_by_taker(
+async fn cancel_order_by_taker(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     order: &mut Order,
@@ -181,7 +219,7 @@ pub async fn cancel_order_by_taker(
 }
 
 /// Cancel an order by the maker
-pub async fn cancel_order_by_maker(
+async fn cancel_order_by_maker(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     order: &mut Order,
@@ -226,6 +264,45 @@ pub async fn cancel_order_by_maker(
     Ok(())
 }
 
+async fn cancel_pending_order_from_maker(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedGift,
+    order: &mut Order,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Validates if this user is the order creator
+    order
+        .sent_from_maker(event.rumor.pubkey)
+        .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
+    // We publish a new replaceable kind nostr event with the status updated
+    // and update on local database the status and new event id
+    match update_order_event(my_keys, Status::Canceled, order).await {
+        Ok(order_updated) => {
+            order_updated
+                .update(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        }
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
+        }
+    }
+    // We create a Message for cancel
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        event.rumor.pubkey,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
 /// Cancel an order
 pub async fn cancel_action(
     msg: Message,
@@ -247,35 +324,7 @@ pub async fn cancel_action(
     }
 
     if order.check_status(Status::Pending).is_ok() {
-        // Validates if this user is the order creator
-        order
-            .sent_from_maker(event.rumor.pubkey)
-            .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
-        // We publish a new replaceable kind nostr event with the status updated
-        // and update on local database the status and new event id
-        match update_order_event(my_keys, Status::Canceled, &order).await {
-            Ok(order_updated) => {
-                order_updated
-                    .update(pool)
-                    .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-            }
-            Err(e) => {
-                return Err(MostroInternalErr(ServiceError::DbAccessError(
-                    e.to_string(),
-                )));
-            }
-        }
-        // We create a Message for cancel
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            event.rumor.pubkey,
-            None,
-        )
-        .await;
+        cancel_pending_order_from_maker(pool, event, &mut order, my_keys, request_id).await?;
         return Ok(());
     }
 
@@ -337,11 +386,11 @@ pub async fn cancel_action(
 
         match order.cancel_initiator_pubkey {
             Some(_) => {
-                cancel_cooperative_execution(
+                cancel_cooperative_execution_step_2(
                     pool,
                     event,
                     request_id,
-                    &mut order,
+                    order,
                     counterparty_pubkey,
                     my_keys,
                     ln_client,
@@ -349,33 +398,14 @@ pub async fn cancel_action(
                 .await?;
             }
             None => {
-                order.cancel_initiator_pubkey = Some(event.rumor.pubkey.to_string());
-                // update db
-                let order = order
-                    .update(pool)
-                    .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-                // We create a Message to start a cooperative cancel and send it to both parties
-                enqueue_order_msg(
-                    request_id,
-                    Some(order.id),
-                    Action::CooperativeCancelInitiatedByYou,
-                    None,
-                    event.rumor.pubkey,
-                    None,
-                )
-                .await;
-                let counterparty_pubkey = PublicKey::from_str(&counterparty_pubkey)
-                    .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
-                enqueue_order_msg(
-                    None,
-                    Some(order.id),
-                    Action::CooperativeCancelInitiatedByPeer,
-                    None,
+                cancel_cooperative_execution_step_1(
+                    pool,
+                    event,
+                    order,
                     counterparty_pubkey,
-                    None,
+                    request_id,
                 )
-                .await;
+                .await?;
             }
         }
     }

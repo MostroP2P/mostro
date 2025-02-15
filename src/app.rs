@@ -137,13 +137,13 @@ async fn check_trade_index(
                 let msg = match msg.as_json() {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::error!("Error serializing message: {}", e);
+                        tracing::error!("Failed to serialize message for signature verification: {}", e);
                         return Err(MostroError::MostroInternalErr(
                             ServiceError::MessageSerializationError,
                         ));
                     }
                 };
-                if Message::verify_signature(msg, event.rumor.pubkey, sig) {
+                if !Message::verify_signature(msg, event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }

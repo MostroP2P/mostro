@@ -134,8 +134,16 @@ async fn check_trade_index(
                     .await;
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
-
-                if !message_kind.verify_signature(event.rumor.pubkey, sig) {
+                let msg = match msg.as_json() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to serialize message for signature verification: {}", e);
+                        return Err(MostroError::MostroInternalErr(
+                            ServiceError::MessageSerializationError,
+                        ));
+                    }
+                };
+                if !Message::verify_signature(msg, event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
@@ -285,24 +293,29 @@ pub async fn run(
                         continue;
                     }
 
-                    let (message, sig): (Message, Option<Signature>) =
+                    let (message, sig): (Value, Option<Signature>) =
                         match serde_json::from_str(&event.rumor.content) {
                             Ok(data) => data,
                             Err(e) => {
-                                tracing::error!("Error deserializing content: {}", e);
+                                tracing::warn!(
+                                    "Failed to parse message and signature from rumor content: {}",
+                                    e
+                                );
                                 continue;
                             }
                         };
-                    let inner_message = message.get_inner_message_kind();
-
                     let sender_matches_rumor = event.sender == event.rumor.pubkey;
-
+                    let message = message.to_string();
                     if let Some(sig) = sig {
                         // Verify signature only if sender and rumor pubkey are different
                         if !sender_matches_rumor
-                            && !inner_message.verify_signature(event.rumor.pubkey, sig)
+                            && !Message::verify_signature(message.clone(), event.rumor.pubkey, sig)
                         {
-                            tracing::warn!("Error in event verification");
+                            tracing::warn!(
+                                "Signature verification failed: sender {} does not match rumor pubkey {}",
+                                event.sender,
+                                event.rumor.pubkey
+                            );
                             continue;
                         }
                     } else if !sender_matches_rumor {
@@ -310,7 +323,14 @@ pub async fn run(
                         tracing::warn!("Error in event verification");
                         continue;
                     }
-
+                    let message: Message = match serde_json::from_str(&message) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize message '{}': {}", message, e);
+                            continue;
+                        }
+                    };
+                    let inner_message = message.get_inner_message_kind();
                     // Check if message is message with trade index
                     if let Err(e) = check_trade_index(&pool, &event, &message).await {
                         tracing::error!("Error checking trade index: {}", e);

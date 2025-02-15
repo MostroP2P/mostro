@@ -310,7 +310,7 @@ pub async fn send_dm(
     let message = Message::from_json(&payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We sign the message
-    let sig = message.get_inner_message_kind().sign(&sender_keys);
+    let sig = Message::sign(message.as_json().unwrap(), &sender_keys);
     // We compose the content
     let content = (message, sig);
     let content = serde_json::to_string(&content)

@@ -134,8 +134,15 @@ async fn check_trade_index(
                     .await;
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
+                let text_message = if let Ok(message) = message_kind.as_json() {
+                    message
+                } else {
+                    return Err(MostroError::MostroInternalErr(
+                        ServiceError::MessageSerializationError,
+                    ));
+                };
 
-                if !message_kind.verify_signature(event.rumor.pubkey, sig) {
+                if !Message::verify_signature(text_message, event.rumor.pubkey, sig) {
                     tracing::info!("Invalid signature");
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
@@ -297,10 +304,17 @@ pub async fn run(
 
                     let sender_matches_rumor = event.sender == event.rumor.pubkey;
 
+                    let text_message = if let Ok(message) = inner_message.as_json() {
+                        message
+                    } else {
+                        tracing::warn!("Error in event verification");
+                        continue;
+                    };
+
                     if let Some(sig) = sig {
                         // Verify signature only if sender and rumor pubkey are different
                         if !sender_matches_rumor
-                            && !inner_message.verify_signature(event.rumor.pubkey, sig)
+                            && !Message::verify_signature(text_message, event.rumor.pubkey, sig)
                         {
                             tracing::warn!("Error in event verification");
                             continue;

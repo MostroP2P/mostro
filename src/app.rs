@@ -297,7 +297,10 @@ pub async fn run(
                         match serde_json::from_str(&event.rumor.content) {
                             Ok(data) => data,
                             Err(e) => {
-                                tracing::warn!("Verification error: invalid signature {}", e);
+                                tracing::warn!(
+                                    "Failed to parse message and signature from rumor content: {}",
+                                    e
+                                );
                                 continue;
                             }
                         };
@@ -309,7 +312,9 @@ pub async fn run(
                             && !Message::verify_signature(message.clone(), event.rumor.pubkey, sig)
                         {
                             tracing::warn!(
-                                "Verification error: sender does not match the rumor pubkey"
+                                "Signature verification failed: sender {} does not match rumor pubkey {}",
+                                event.sender,
+                                event.rumor.pubkey
                             );
                             continue;
                         }
@@ -321,7 +326,7 @@ pub async fn run(
                     let message: Message = match serde_json::from_str(&message) {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!("Error deserializing message: {}", e);
+                            tracing::error!("Failed to deserialize message '{}': {}", message, e);
                             continue;
                         }
                     };

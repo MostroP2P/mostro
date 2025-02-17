@@ -309,10 +309,8 @@ pub async fn send_dm(
     );
     let message = Message::from_json(&payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We sign the message
-    let sig = Message::sign(payload.clone(), &sender_keys);
     // We compose the content
-    let content = (message, sig);
+    let content = (message, Option::<String>::None);
     let content = serde_json::to_string(&content)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We create the rumor

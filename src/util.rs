@@ -309,7 +309,8 @@ pub async fn send_dm(
     );
     let message = Message::from_json(&payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We compose the content
+    // We compose the content, as this is a message from Mostro
+    // and Mostro don't have trade key, we don't need to sign the payload
     let content = (message, Option::<String>::None);
     let content = serde_json::to_string(&content)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;

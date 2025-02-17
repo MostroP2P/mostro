@@ -68,7 +68,7 @@ To compile on Mac, then use brew:
 
 ```bash
 brew update
-brew install cmake pkg-config openssl sqlite3
+brew install cmake pkg-config openssl sqlite3 protobuf
 ```
 
 ## Install
@@ -101,6 +101,8 @@ This file is automatically created and initialized when you run the Mostro daemo
 Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
 
 When you run mostro for first time it will create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
+
+Every time you make a change in the settings.toml file of the project, you need to update those changes in /home/user/.mostro/settings.toml file
 
 Finnaly run it:
 

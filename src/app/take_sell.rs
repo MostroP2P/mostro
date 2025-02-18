@@ -6,7 +6,7 @@ use crate::util::{
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 
-use crate::db::update_user_trade_index;
+use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use anyhow::Result;
 use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
@@ -50,6 +50,10 @@ pub async fn take_sell_action(
 
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
+    // Check if the seller has a pending order
+    if buyer_has_pending_order(pool, event.sender.to_string()).await? {
+        return Err(MostroCantDo(CantDoReason::InvalidAction));
+    }
 
     // Check if the order is a sell order and if its status is active
     if let Err(cause) = order.is_sell_order() {

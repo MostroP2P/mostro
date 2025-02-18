@@ -78,14 +78,17 @@ pub async fn order_action(
             calculate_and_check_quote(order, fiat_amount).await?;
         }
 
+        let trade_index = match msg.get_inner_message_kind().trade_index {
+            Some(trade_index) => trade_index,
+            None => {
+                return Err(MostroInternalErr(ServiceError::InvalidPayload));
+            }
+        };
+
         // Update trade index only after all checks are done
-        update_user_trade_index(
-            pool,
-            event.sender.to_string(),
-            msg.get_inner_message_kind().trade_index.unwrap(),
-        )
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        update_user_trade_index(pool, event.sender.to_string(), trade_index)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         // Publish order
         publish_order(

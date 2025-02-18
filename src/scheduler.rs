@@ -117,9 +117,9 @@ async fn job_relay_list() {
                         relay_tags.push(Tag::relay_metadata(r.url().clone(), None))
                     }
                 }
-
-                if let Ok(relay_ev) =
-                    EventBuilder::new(NostrKind::RelayList, "").sign_with_keys(&mostro_keys)
+                if let Ok(relay_ev) = EventBuilder::new(NostrKind::RelayList, "")
+                    .tags(relay_tags)
+                    .sign_with_keys(&mostro_keys)
                 {
                     let _ = client.send_event(relay_ev).await;
                 }

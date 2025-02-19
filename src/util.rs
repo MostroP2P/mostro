@@ -200,11 +200,14 @@ pub async fn publish_order(
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
-    let user = is_user_present(pool, initiator_pubkey.to_string())
+    let user = is_user_present(pool, identity_pubkey.to_string())
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&new_order_db, Some(user.total_rating));
+    let tags = order_to_tags(
+        &new_order_db,
+        Some((user.total_rating, user.total_reviews, user.created_at)),
+    );
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

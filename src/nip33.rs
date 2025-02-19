@@ -36,12 +36,17 @@ pub fn new_event(
         .sign_with_keys(keys)
 }
 
-fn create_rating_string(rating: Option<f64>) -> String {
-    if let Some(rating) = rating {
-        rating.to_string()
-    } else {
-        "none".to_string()
-    }
+/// Calculate the operating days of a user
+///
+/// # Arguments
+///
+/// * `created_at` - The creation date of the user
+///
+/// # Returns
+fn calculate_operating_days(created_at: i64) -> i32 {
+    let now = Timestamp::now();
+    let days = (now.as_u64() - created_at as u64) / 86400;
+    days as i32
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
@@ -65,7 +70,7 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation: Option<f64>) -> Tags {
+pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
     let tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),
@@ -97,7 +102,15 @@ pub fn order_to_tags(order: &Order, reputation: Option<f64>) -> Tags {
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("rating")),
-            vec![create_rating_string(reputation)],
+            vec![reputation_data.map_or("0".to_string(), |data| data.0.to_string())],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("reviews")),
+            vec![reputation_data.map_or("0".to_string(), |data| data.1.to_string())],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("operating-days")),
+            vec![calculate_operating_days(reputation_data.map_or(0, |data| data.2)).to_string()],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),

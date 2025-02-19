@@ -2,7 +2,6 @@ use crate::lightning::LnStatus;
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
-use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -37,13 +36,9 @@ pub fn new_event(
         .sign_with_keys(keys)
 }
 
-fn create_rating_string(rating: Option<Rating>) -> String {
+fn create_rating_string(rating: Option<f64>) -> String {
     if let Some(rating) = rating {
-        if let Ok(rating_json) = rating.as_json() {
-            rating_json
-        } else {
-            "bad format value".to_string()
-        }
+        rating.to_string()
     } else {
         "none".to_string()
     }
@@ -70,7 +65,7 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Tags {
+pub fn order_to_tags(order: &Order, reputation: Option<f64>) -> Tags {
     let tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),

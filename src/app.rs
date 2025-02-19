@@ -106,7 +106,7 @@ async fn check_trade_index(
     // If user is present, we check the trade index and signature
     match is_user_present(pool, event.sender.to_string()).await {
         Ok(user) => {
-            if let (true, index) = message_kind.has_trade_index() {
+            if let index @ 1.. = message_kind.trade_index() {
                 let content: (Message, Signature) = match serde_json::from_str::<(
                     Message,
                     nostr_sdk::secp256k1::schnorr::Signature,
@@ -154,7 +154,7 @@ async fn check_trade_index(
             Ok(())
         }
         Err(_) => {
-            if let (true, _) = message_kind.has_trade_index() {
+            if message_kind.trade_index.is_some() && event.sender != event.rumor.pubkey {
                 let new_user: User = User {
                     pubkey: event.sender.to_string(),
                     ..Default::default()

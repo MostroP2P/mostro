@@ -63,19 +63,25 @@ pub async fn take_buy_action(
 
     // Add seller identity and trade index to the order
     order.master_seller_pubkey = Some(event.sender.to_string());
-    order.trade_index_seller = msg.get_inner_message_kind().trade_index;
+    let trade_index = match msg.get_inner_message_kind().trade_index {
+        Some(trade_index) => trade_index,
+        None => {
+            if event.sender == event.rumor.pubkey {
+                0
+            } else {
+                return Err(MostroInternalErr(ServiceError::InvalidPayload));
+            }
+        }
+    };
+    order.trade_index_seller = Some(trade_index);
 
     // Timestamp the order take time
     order.set_timestamp_now();
 
     // Update trade index only after all checks are done
-    update_user_trade_index(
-        pool,
-        event.sender.to_string(),
-        msg.get_inner_message_kind().trade_index.unwrap(),
-    )
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    update_user_trade_index(pool, event.sender.to_string(), trade_index)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

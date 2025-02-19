@@ -5,6 +5,7 @@ use mostro_core::order::{Order, Status};
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
+use serde_json::json;
 use std::borrow::Cow;
 use std::vec;
 
@@ -36,17 +37,22 @@ pub fn new_event(
         .sign_with_keys(keys)
 }
 
-/// Calculate the operating days of a user
+/// Create a rating tag
 ///
 /// # Arguments
 ///
-/// * `created_at` - The creation date of the user
+/// * `reputation_data` - The reputation data of the user
 ///
-/// # Returns
-fn calculate_operating_days(created_at: i64) -> i32 {
+/// # Returns a json string
+fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     let now = Timestamp::now();
-    let days = (now.as_u64() - created_at as u64) / 86400;
-    days as i32
+    let days = (now.as_u64() - reputation_data.map_or(0, |data| data.2) as u64) / 86400;
+
+    let json_data = json!([
+        "rating",
+        {"total_reviews": reputation_data.map_or(0, |data| data.1), "total_rating": reputation_data.map_or(0.0, |data| data.0), "days": days}
+    ]);
+    json_data.to_string()
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
@@ -102,15 +108,7 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("rating")),
-            vec![reputation_data.map_or("0".to_string(), |data| data.0.to_string())],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("reviews")),
-            vec![reputation_data.map_or("0".to_string(), |data| data.1.to_string())],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("operating-days")),
-            vec![calculate_operating_days(reputation_data.map_or(0, |data| data.2)).to_string()],
+            vec![create_rating_tag(reputation_data)],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),

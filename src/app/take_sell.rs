@@ -22,7 +22,7 @@ async fn update_order_status(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     // Get buyer pubkey
-    let buyer_pubkey = order.get_buyer_pubkey().unwrap();
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
     // Set order status to waiting buyer invoice
     match set_waiting_invoice_status(order, buyer_pubkey, request_id).await {
         Ok(_) => {

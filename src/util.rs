@@ -598,7 +598,8 @@ pub async fn set_waiting_invoice_status(
     buyer_pubkey: PublicKey,
     request_id: Option<u64>,
 ) -> Result<i64> {
-    let kind = OrderKind::from_str(&order.kind).unwrap();
+    let kind = OrderKind::from_str(&order.kind)
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
     let buyer_final_amount = order.amount - order.fee;

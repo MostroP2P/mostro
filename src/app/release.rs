@@ -165,28 +165,33 @@ pub async fn release_action(
 /// # Returns
 /// Result indicating success or failure of the operation
 async fn handle_child_order(
-    child_order: Order,
+    mut child_order: Order,
     order: &Order,
     next_trade: Option<(String, u32)>,
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
-        let mut child_order = child_order;
-        if &order.creator_pubkey == order.seller_pubkey.as_ref().unwrap() {
-            child_order.seller_pubkey = Some(next_trade_pubkey.clone());
-            child_order.creator_pubkey = next_trade_pubkey.clone();
-            child_order.trade_index_seller = Some(next_trade_index as i64);
-        } else if &order.creator_pubkey == order.buyer_pubkey.as_ref().unwrap() {
-            child_order.buyer_pubkey = Some(next_trade_pubkey.clone());
-            child_order.creator_pubkey = next_trade_pubkey.clone();
-            child_order.trade_index_buyer = order.next_trade_index;
+        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+
+        match order.creator_pubkey {
+            _ if order.seller_pubkey.as_ref() == Some(&order.creator_pubkey) => {
+                child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
+                child_order.trade_index_seller = Some(next_trade_index as i64);
+            }
+            _ if order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey) => {
+                child_order.buyer_pubkey = Some(next_trade_pubkey.to_string());
+                child_order.trade_index_buyer = order.next_trade_index;
+            }
+            _ => {}
         }
+
+        child_order.creator_pubkey = next_trade_pubkey.to_string();
         child_order.next_trade_index = None;
         child_order.next_trade_pubkey = None;
 
         let new_order = child_order.as_new_order();
-        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+
         enqueue_order_msg(
             request_id,
             new_order.id,
@@ -196,6 +201,7 @@ async fn handle_child_order(
             Some(next_trade_index as i64),
         )
         .await;
+
         child_order.create(pool).await?;
     }
     Ok(())

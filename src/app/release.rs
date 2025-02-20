@@ -3,8 +3,8 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    enqueue_cant_do_msg, enqueue_order_msg, get_keys, get_nostr_client, get_order,
-    settle_seller_hold_invoice, update_order_event,
+    enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
+    update_order_event,
 };
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::{error, info};
+use tracing::info;
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -111,9 +111,7 @@ pub async fn release_action(
     .await;
 
     // Handle child order for range orders
-    if let Ok((Some(child_order), Some(event))) =
-        get_child_order(order.clone(), request_id, my_keys).await
-    {
+    if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
         if let Ok(client) = get_nostr_client() {
             if client.send_event(event).await.is_err() {
                 tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
@@ -329,7 +327,6 @@ async fn payment_success(
 /// and update on local database the status and new event id
 pub async fn get_child_order(
     order: Order,
-    request_id: Option<u64>,
     my_keys: &Keys,
 ) -> Result<(Option<Order>, Option<Event>)> {
     let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
@@ -349,7 +346,6 @@ pub async fn get_child_order(
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Less => {
-                notify_invalid_amount(&order, request_id).await;
                 return Ok((None, None));
             }
         }
@@ -417,41 +413,4 @@ async fn order_for_greater(
     let event = create_order_event(new_order, my_keys)?;
 
     Ok((new_order.clone(), event))
-}
-
-async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
-    if let (Some(buyer_pubkey), Some(seller_pubkey)) =
-        (order.buyer_pubkey.as_ref(), order.seller_pubkey.as_ref())
-    {
-        let buyer_pubkey = match PublicKey::from_str(buyer_pubkey) {
-            Ok(pk) => pk,
-            Err(e) => {
-                error!("Failed to parse buyer pubkey: {:?}", e);
-                return;
-            }
-        };
-        let seller_pubkey = match PublicKey::from_str(seller_pubkey) {
-            Ok(pk) => pk,
-            Err(e) => {
-                error!("Failed to parse seller pubkey: {:?}", e);
-                return;
-            }
-        };
-
-        enqueue_cant_do_msg(
-            None,
-            Some(order.id),
-            CantDoReason::InvalidAmount,
-            buyer_pubkey,
-        )
-        .await;
-
-        enqueue_cant_do_msg(
-            request_id,
-            Some(order.id),
-            CantDoReason::InvalidAmount,
-            seller_pubkey,
-        )
-        .await;
-    }
 }

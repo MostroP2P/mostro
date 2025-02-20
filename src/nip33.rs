@@ -77,7 +77,7 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 /// * `order` - The order to transform
 ///
 pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
-    let tags: Vec<Tag> = vec![
+    let mut tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),
             vec![order.kind.to_string()],
@@ -107,10 +107,6 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
             vec![order.premium.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("rating")),
-            vec![create_rating_tag(reputation_data)],
-        ),
-        Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
             vec!["mainnet".to_string()],
         ),
@@ -131,6 +127,17 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
             vec!["order".to_string()],
         ),
     ];
+
+    // Add reputation data if available
+    if reputation_data.is_some() {
+        tags.insert(
+            7,
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("rating")),
+                vec![create_rating_tag(reputation_data)],
+            ),
+        );
+    }
 
     Tags::new(tags)
 }

@@ -6,7 +6,7 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
-use anyhow::{Error, Result};
+
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
@@ -205,16 +205,18 @@ async fn handle_child_order(
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()> {
+pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
-        _ => return Err(Error::msg("Missing payment request")),
+        _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
     };
 
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount).await?
+        resolv_ln_address(&addr.to_string(), amount)
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
     } else {
         payment_request
     };
@@ -379,13 +381,37 @@ fn create_base_order(order: &Order) -> Order {
     new_order
 }
 
-fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event> {
-    let tags = crate::nip33::order_to_tags(new_order, None);
-    let event =
-        crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags).map_err(|e| {
-            tracing::error!("Failed to create event for order {}: {}", new_order.id, e);
-            e
-        })?;
+async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
+    // Get db connection
+    let pool = match crate::db::connect().await {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
+    };
+
+    // Extract user for rating tag
+    let identity_pubkey = match new_order.is_sell_order() {
+        Ok(_) => new_order
+            .get_master_seller_pubkey()
+            .map_err(MostroInternalErr)?,
+        Err(_) => new_order
+            .get_master_buyer_pubkey()
+            .map_err(MostroInternalErr)?,
+    };
+
+    let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let tags = crate::nip33::order_to_tags(
+        new_order,
+        Some((user.total_rating, user.total_reviews, user.created_at)),
+    );
+    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     new_order.event_id = event.id.to_string();
     Ok(event)
 }
@@ -394,11 +420,11 @@ async fn order_for_equal(
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
-) -> Result<(Order, Event)> {
+) -> Result<(Order, Event), MostroError> {
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-    let event = create_order_event(new_order, my_keys)?;
+    let event = create_order_event(new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }
@@ -407,10 +433,10 @@ async fn order_for_greater(
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
-) -> Result<(Order, Event)> {
+) -> Result<(Order, Event), MostroError> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-    let event = create_order_event(new_order, my_keys)?;
+    let event = create_order_event(new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }

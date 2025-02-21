@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use mostro_core::error::{
     MostroError::{self, *},
     ServiceError,
@@ -33,7 +32,7 @@ pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     }
 }
 
-pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String> {
+pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String, MostroError> {
     let (user, domain) = match address.split_once('@') {
         Some((user, domain)) => (user, domain),
         None => return Ok("".to_string()),
@@ -43,11 +42,15 @@ pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String> {
     let url = format!("https://{domain}/.well-known/lnurlp/{user}");
     let res = reqwest::get(url)
         .await
-        .context("Something went wrong with API request, try again!")?;
+        .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
     let status = res.status();
     if status.is_success() {
-        let body = res.text().await?;
-        let body: Value = serde_json::from_str(&body)?;
+        let body = res
+            .text()
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
         let tag = body["tag"].as_str().unwrap_or("");
         if tag != "payRequest" {
             return Ok("".to_string());
@@ -61,11 +64,15 @@ pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String> {
         let callback = format!("{callback}?amount={amount_msat}");
         let res = reqwest::get(callback)
             .await
-            .context("Something went wrong with API request, try again!")?;
+            .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
         let status = res.status();
         if status.is_success() {
-            let body = res.text().await?;
-            let body: Value = serde_json::from_str(&body)?;
+            let body = res
+                .text()
+                .await
+                .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+            let body: Value = serde_json::from_str(&body)
+                .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
             let pr = body["pr"].as_str().unwrap_or("");
 
             return Ok(pr.to_string());

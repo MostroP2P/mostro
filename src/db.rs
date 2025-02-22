@@ -469,8 +469,8 @@ pub async fn seller_has_pending_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = sqlx::query(
         r#"
-            SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND (status = 'waiting-payment' OR status = 'waiting-buyer-invoice'))
-        "#,
+            SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
+        "#, 
     )
     .bind(pubkey)
     .map(|row: SqliteRow| row.get(0))
@@ -496,7 +496,7 @@ pub async fn buyer_has_pending_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = sqlx::query(
         r#"
-            SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND (status = 'waiting-payment' OR status = 'waiting-buyer-invoice'))
+            SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
         "#,
     )
     .bind(pubkey)

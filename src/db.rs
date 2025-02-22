@@ -453,7 +453,7 @@ pub async fn update_user_trade_index(
     Ok(rows_affected > 0)
 }
 
-/// Check if the seller has a pending order in the database with status waiting-payment or waiting-buyer-invoice
+/// Check if the seller has a pending order in the database with status waiting-payment
 pub async fn seller_has_pending_order(
     pool: &SqlitePool,
     pubkey: String,
@@ -480,7 +480,7 @@ pub async fn seller_has_pending_order(
     Ok(rows_affected)
 }
 
-/// Check if the buyer has a pending order in the database with status waiting-payment or waiting-buyer-invoice
+/// Check if the buyer has a pending order in the database with status waiting-buyer-invoice
 pub async fn buyer_has_pending_order(
     pool: &SqlitePool,
     pubkey: String,

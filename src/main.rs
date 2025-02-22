@@ -18,6 +18,7 @@ use crate::lightning::LnStatus;
 use anyhow::Result;
 use db::find_held_invoices;
 use lightning::LndConnector;
+use crate::lightning::get_ln_status;
 use mostro_core::message::Message;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
@@ -93,9 +94,11 @@ async fn main() -> Result<()> {
     // Client subscription
     client.subscribe(vec![subscription], None).await?;
 
+
+
     let mut ln_client = LndConnector::new().await?;
-    let ln_status = ln_client.get_node_info().await?;
-    let ln_status = LnStatus::from_get_info_response(ln_status);
+    let ln_status = get_ln_status().await?;
+
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
     };

@@ -76,7 +76,7 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
+pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>, ln_status: &LnStatus) -> Tags {
     let mut tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),
@@ -108,7 +108,7 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
-            vec!["mainnet".to_string()],
+            vec![ln_status.networks.join(",")],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("layer")),

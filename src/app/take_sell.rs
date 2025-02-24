@@ -52,7 +52,7 @@ pub async fn take_sell_action(
     let request_id = msg.get_inner_message_kind().request_id;
     // Check if the seller has a pending order
     if buyer_has_pending_order(pool, event.sender.to_string()).await? {
-        return Err(MostroCantDo(CantDoReason::InvalidAction));
+        return Err(MostroCantDo(CantDoReason::PendingOrderExists));
     }
 
     // Check if the order is a sell order and if its status is active

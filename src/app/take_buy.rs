@@ -27,7 +27,7 @@ pub async fn take_buy_action(
 
     // Check if the buyer has a pending order
     if seller_has_pending_order(pool, event.sender.to_string()).await? {
-        return Err(MostroCantDo(CantDoReason::InvalidAction));
+        return Err(MostroCantDo(CantDoReason::PendingOrderExists));
     }
 
     // Check if the order is a buy order and if its status is active

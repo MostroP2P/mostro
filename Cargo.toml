@@ -38,7 +38,7 @@ uuid = { version = "1.8.0", features = [
   "serde",
 ] }
 reqwest = { version = "0.12.1", features = ["json"] }
-mostro-core = { version = "0.6.26", features = ["sqlx"] }
+mostro-core = { version = "0.6.28", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 config = "0.15.8"

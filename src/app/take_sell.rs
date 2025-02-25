@@ -22,7 +22,7 @@ async fn update_order_status(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     // Get buyer pubkey
-    let buyer_pubkey = order.get_buyer_pubkey().unwrap();
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
     // Set order status to waiting buyer invoice
     match set_waiting_invoice_status(order, buyer_pubkey, request_id).await {
         Ok(_) => {
@@ -86,8 +86,18 @@ pub async fn take_sell_action(
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(event.sender.to_string());
+    let trade_index = match msg.get_inner_message_kind().trade_index {
+        Some(trade_index) => trade_index,
+        None => {
+            if event.sender == event.rumor.pubkey {
+                0
+            } else {
+                return Err(MostroInternalErr(ServiceError::InvalidPayload));
+            }
+        }
+    };
     // Add buyer trade index to order
-    order.trade_index_buyer = msg.get_inner_message_kind().trade_index;
+    order.trade_index_buyer = Some(trade_index);
     // Timestamp take order time
     order.set_timestamp_now();
 
@@ -103,13 +113,9 @@ pub async fn take_sell_action(
     }
 
     // Update trade index only after all checks are done
-    update_user_trade_index(
-        pool,
-        event.sender.to_string(),
-        msg.get_inner_message_kind().trade_index.unwrap(),
-    )
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    update_user_trade_index(pool, event.sender.to_string(), trade_index)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

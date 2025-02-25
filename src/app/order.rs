@@ -81,7 +81,11 @@ pub async fn order_action(
         let trade_index = match msg.get_inner_message_kind().trade_index {
             Some(trade_index) => trade_index,
             None => {
-                return Err(MostroInternalErr(ServiceError::InvalidPayload));
+                if event.sender == event.rumor.pubkey {
+                    0
+                } else {
+                    return Err(MostroInternalErr(ServiceError::InvalidPayload));
+                }
             }
         };
 

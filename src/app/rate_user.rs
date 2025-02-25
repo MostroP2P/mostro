@@ -1,5 +1,4 @@
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
-use crate::NOSTR_CLIENT;
 
 use crate::db::{is_user_present, update_user_rating};
 use anyhow::Result;
@@ -8,11 +7,9 @@ use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use mostro_core::rating::Rating;
-use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use std::time::Duration;
 
 pub fn prepare_variables_for_vote(
     message_sender: &str,
@@ -62,39 +59,6 @@ pub fn prepare_variables_for_vote(
         buyer_rating,
         seller_rating,
     ))
-}
-
-pub async fn get_user_reputation(
-    user: &str,
-    my_keys: &Keys,
-) -> Result<Option<Rating>, MostroError> {
-    // Request NIP33 of the counterparts
-    let filters = Filter::new()
-        .author(my_keys.public_key())
-        .kind(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND))
-        .custom_tag(SingleLetterTag::lowercase(Alphabet::Z), vec!["rating"])
-        .identifier(user.to_string());
-
-    let mut user_reputation_event = NOSTR_CLIENT
-        .get()
-        .unwrap()
-        .fetch_events(vec![filters], Duration::from_secs(10))
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?
-        .to_vec();
-
-    // Check if vector of answers is empty
-    if user_reputation_event.is_empty() {
-        return Ok(None);
-    };
-
-    // Sort events by time
-    user_reputation_event.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    let tags = user_reputation_event[0].tags.clone();
-    let reputation = Rating::from_tags(tags)
-        .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
-
-    Ok(Some(reputation))
 }
 
 pub async fn update_user_reputation_action(

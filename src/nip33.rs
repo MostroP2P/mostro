@@ -2,10 +2,10 @@ use crate::lightning::LnStatus;
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
-use mostro_core::rating::Rating;
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
+use serde_json::json;
 use std::borrow::Cow;
 use std::vec;
 
@@ -37,16 +37,22 @@ pub fn new_event(
         .sign_with_keys(keys)
 }
 
-fn create_rating_string(rating: Option<Rating>) -> String {
-    if let Some(rating) = rating {
-        if let Ok(rating_json) = rating.as_json() {
-            rating_json
-        } else {
-            "bad format value".to_string()
-        }
-    } else {
-        "none".to_string()
-    }
+/// Create a rating tag
+///
+/// # Arguments
+///
+/// * `reputation_data` - The reputation data of the user
+///
+/// # Returns a json string
+fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
+    let now = Timestamp::now();
+    let days = (now.as_u64() - reputation_data.map_or(0, |data| data.2) as u64) / 86400;
+
+    let json_data = json!([
+        "rating",
+        {"total_reviews": reputation_data.map_or(0, |data| data.1), "total_rating": reputation_data.map_or(0.0, |data| data.0), "days": days}
+    ]);
+    json_data.to_string()
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
@@ -70,8 +76,8 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Tags {
-    let tags: Vec<Tag> = vec![
+pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
+    let mut tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),
             vec![order.kind.to_string()],
@@ -101,10 +107,6 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Tags {
             vec![order.premium.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("rating")),
-            vec![create_rating_string(reputation)],
-        ),
-        Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
             vec!["mainnet".to_string()],
         ),
@@ -125,6 +127,17 @@ pub fn order_to_tags(order: &Order, reputation: Option<Rating>) -> Tags {
             vec!["order".to_string()],
         ),
     ];
+
+    // Add reputation data if available
+    if reputation_data.is_some() {
+        tags.insert(
+            7,
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("rating")),
+                vec![create_rating_tag(reputation_data)],
+            ),
+        );
+    }
 
     Tags::new(tags)
 }

@@ -133,7 +133,7 @@ pub async fn admin_cancel_action(
         .as_json()
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Message to admin
-    let sender_keys = crate::util::get_keys().unwrap();
+    let sender_keys = crate::util::get_keys()?;
     send_dm(event.rumor.pubkey, sender_keys, message.clone(), None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -148,7 +148,7 @@ pub async fn admin_cancel_action(
         (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
-    let sender_keys = crate::util::get_keys().unwrap();
+    let sender_keys = crate::util::get_keys()?;
     send_dm(seller_pubkey, sender_keys.clone(), message.clone(), None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

@@ -1,6 +1,7 @@
 use crate::cli::settings::Settings;
 use crate::db::{self};
 use crate::lightning::LndConnector;
+use crate::lightning::get_ln_status;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
@@ -406,9 +407,13 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Get node status
+    let ln_status = get_ln_status().await?;
+
     let tags = crate::nip33::order_to_tags(
         new_order,
         Some((user.total_rating, user.total_reviews, user.created_at)),
+        &ln_status,
     );
     let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

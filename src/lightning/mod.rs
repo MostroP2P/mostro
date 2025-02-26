@@ -271,6 +271,13 @@ impl LndConnector {
     }
 }
 
+pub async fn get_ln_status() -> Result<LnStatus, MostroError> {
+    let mut ln_client = LndConnector::new().await?;
+    let ln_status = ln_client.get_node_info().await?;
+    let ln_status = LnStatus::from_get_info_response(ln_status);
+    Ok(ln_status)
+}
+
 #[derive(Debug)]
 pub struct LnStatus {
     pub version: String,

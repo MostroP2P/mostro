@@ -1,6 +1,7 @@
 use crate::MOSTRO_CONFIG;
-use anyhow::{Error, Result};
 use config::{Config, ConfigError, Environment, File};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::io::Write;
@@ -46,9 +47,9 @@ pub struct Database {
 }
 
 impl TryFrom<Settings> for Database {
-    type Error = Error;
+    type Error = MostroError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroError> {
         Ok(MOSTRO_CONFIG.get().unwrap().database.clone())
     }
 }
@@ -66,9 +67,9 @@ pub struct Lightning {
 }
 
 impl TryFrom<Settings> for Lightning {
-    type Error = Error;
+    type Error = MostroError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroError> {
         Ok(MOSTRO_CONFIG.get().unwrap().lightning.clone())
     }
 }
@@ -80,9 +81,9 @@ pub struct Nostr {
 }
 
 impl TryFrom<Settings> for Nostr {
-    type Error = Error;
+    type Error = MostroError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroError> {
         Ok(MOSTRO_CONFIG.get().unwrap().nostr.clone())
     }
 }
@@ -103,9 +104,9 @@ pub struct Mostro {
 }
 
 impl TryFrom<Settings> for Mostro {
-    type Error = Error;
+    type Error = MostroError;
 
-    fn try_from(_: Settings) -> Result<Self, Error> {
+    fn try_from(_: Settings) -> Result<Self, MostroError> {
         Ok(MOSTRO_CONFIG.get().unwrap().mostro.clone())
     }
 }
@@ -169,7 +170,7 @@ impl Settings {
     }
 }
 
-pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
+pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroError> {
     // , final_path : &mut PathBuf) -> Result<()> {
     // Dir prefix
     let home_dir: OsString;
@@ -183,7 +184,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
         settings_dir_default.push(home_dir);
     } else {
         // Get $HOME from env
-        let tmp = std::env::var("HOME")?;
+        let tmp = std::env::var("HOME").map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
         // Os String
         home_dir = tmp.into();
         // Create default path with default .mostro value
@@ -199,10 +200,10 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf> {
         if std::fs::create_dir(settings_dir_default.clone()).is_ok() {
             tracing::info!("Created mostro default directory!");
             let mut config_file =
-                std::fs::File::create_new(settings_dir_default.join("settings.toml"))?;
+                std::fs::File::create_new(settings_dir_default.join("settings.toml")).map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
             let buf = include_bytes!("../../settings.tpl.toml");
-            config_file.write_all(buf)?;
-            config_file.flush()?;
+            config_file.write_all(buf).map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            config_file.flush().map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
         }
         tracing::info!(
             "Created settings file based on template and copied to {} directory",

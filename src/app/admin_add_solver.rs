@@ -1,7 +1,6 @@
 use crate::db::add_new_user;
 use crate::util::send_dm;
 
-use anyhow::Result;
 use mostro_core::error::{
     MostroError::{self, *},
     ServiceError,

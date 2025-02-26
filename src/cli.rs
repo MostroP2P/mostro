@@ -1,8 +1,7 @@
 pub mod settings;
 
 use crate::cli::settings::init_default_dir;
-
-use anyhow::Result;
+use mostro_core::error::MostroError;
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -30,12 +29,12 @@ pub struct Cli {
     dirsettings: Option<String>,
 }
 
-pub fn settings_init() -> Result<PathBuf> {
+pub fn settings_init() -> Result<PathBuf, MostroError> {
     let cli = Cli::parse();
 
     if let Some(path) = cli.dirsettings.as_deref() {
-        init_default_dir(Some(path.to_string()))
+        Ok(init_default_dir(Some(path.to_string()))?)
     } else {
-        init_default_dir(None)
+        Ok(init_default_dir(None)?)
     }
 }

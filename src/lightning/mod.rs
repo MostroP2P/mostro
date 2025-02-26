@@ -4,7 +4,6 @@ use crate::cli::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
 use crate::util::bytes_to_string;
 
-use anyhow::Result;
 use easy_hasher::easy_hasher::*;
 use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,

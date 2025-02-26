@@ -1,5 +1,3 @@
-use anyhow::Result;
-
 pub fn hold_invoice_description(
     order_id: &str,
     fiat_code: &str,

@@ -1,5 +1,10 @@
 use anyhow::Result;
 use mostro_core::dispute::Dispute;
+use mostro_core::error::ServiceError;
+use mostro_core::error::{
+    CantDoReason,
+    MostroError::{self, *},
+};
 use mostro_core::message::{MAX_RATING, MIN_RATING};
 use mostro_core::order::Order;
 use mostro_core::order::Status;
@@ -446,6 +451,60 @@ pub async fn update_user_trade_index(
     .rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+/// Check if the seller has a pending order in the database with status waiting-payment
+pub async fn seller_has_pending_order(
+    pool: &SqlitePool,
+    pubkey: String,
+) -> anyhow::Result<bool, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = sqlx::query(
+        r#"
+            SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
+        "#, 
+    )
+    .bind(pubkey)
+    .map(|row: SqliteRow| row.get(0))
+    .fetch_one(&mut conn)
+    .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(rows_affected)
+}
+
+/// Check if the buyer has a pending order in the database with status waiting-buyer-invoice
+pub async fn buyer_has_pending_order(
+    pool: &SqlitePool,
+    pubkey: String,
+) -> anyhow::Result<bool, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = sqlx::query(
+        r#"
+            SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
+        "#,
+    )
+    .bind(pubkey)
+    .map(|row: SqliteRow| row.get(0))
+    .fetch_one(&mut conn)
+    .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(rows_affected)
 }
 
 pub async fn update_user_rating(

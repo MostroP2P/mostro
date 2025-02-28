@@ -163,6 +163,33 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     }
     expire_date
 }
+/// Check if the order is full privacy or normal and return the tags accordingly
+pub async fn get_tags_for_new_order(
+    new_order_db: &Order,
+    pool: &SqlitePool,
+    identity_pubkey: &PublicKey,
+    trade_pubkey: &PublicKey,
+) -> Result<Tags, MostroError> {
+    let tags = match is_user_present(pool, identity_pubkey.to_string()).await {
+        Ok(user) => {
+            // We transform the order fields to tags to use in the event
+            order_to_tags(
+                new_order_db,
+                Some((user.total_rating, user.total_reviews, user.created_at)),
+            )
+        }
+        Err(_) => {
+            // We transform the order fields to tags to use in the event
+            if identity_pubkey == trade_pubkey {
+                order_to_tags(new_order_db, None)
+            } else {
+                return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+            }
+        }
+    };
+
+    Ok(tags)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_order(
@@ -199,18 +226,12 @@ pub async fn publish_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
-    // Get user reputation
-    let user = is_user_present(pool, identity_pubkey.to_string())
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(
-        &new_order_db,
-        Some((user.total_rating, user.total_reviews, user.created_at)),
-    );
+    // Get tags for new order in case of full privacy or normal order
+    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");

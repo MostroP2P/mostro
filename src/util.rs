@@ -226,8 +226,7 @@ pub async fn publish_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
-    // Get user reputation
-
+    // Get tags for new order in case of full privacy or normal order
     let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)

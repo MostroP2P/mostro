@@ -1,7 +1,7 @@
-use crate::app::rate_user::get_user_reputation;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
 use crate::db;
+use crate::db::is_user_present;
 use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
@@ -12,8 +12,8 @@ use crate::nip33::{new_event, order_to_tags};
 use crate::MESSAGE_QUEUES;
 use crate::NOSTR_CLIENT;
 
-use anyhow::Context;
 use chrono::Duration;
+use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -25,13 +25,11 @@ use sqlx::Pool;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
 use std::thread;
 use tokio::sync::mpsc::channel;
-// use fedimint_tonic_lnd::Client;
-use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
-use std::collections::HashMap;
 use tracing::info;
 use uuid::Uuid;
 
@@ -41,13 +39,15 @@ const MAX_RETRY: u16 = 4;
 pub async fn retries_yadio_request(
     req_string: &str,
     fiat_code: &str,
-) -> Result<(Option<reqwest::Response>, bool)> {
+) -> Result<(Option<reqwest::Response>, bool), MostroError> {
     // Get Fiat list and check if currency exchange is available
     let api_req_string = "https://api.yadio.io/currencies".to_string();
     let fiat_list_check = reqwest::get(api_req_string)
-        .await?
+        .await
+        .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?
         .json::<FiatNames>()
-        .await?
+        .await
+        .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?
         .contains_key(fiat_code);
 
     // Exit with error - no currency
@@ -57,7 +57,7 @@ pub async fn retries_yadio_request(
 
     let res = reqwest::get(req_string)
         .await
-        .context("Something went wrong with API request, try again!")?;
+        .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
 
     Ok((Some(res), fiat_list_check))
 }
@@ -163,6 +163,33 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     }
     expire_date
 }
+/// Check if the order is full privacy or normal and return the tags accordingly
+pub async fn get_tags_for_new_order(
+    new_order_db: &Order,
+    pool: &SqlitePool,
+    identity_pubkey: &PublicKey,
+    trade_pubkey: &PublicKey,
+) -> Result<Tags, MostroError> {
+    let tags = match is_user_present(pool, identity_pubkey.to_string()).await {
+        Ok(user) => {
+            // We transform the order fields to tags to use in the event
+            order_to_tags(
+                new_order_db,
+                Some((user.total_rating, user.total_reviews, user.created_at)),
+            )
+        }
+        Err(_) => {
+            // We transform the order fields to tags to use in the event
+            if identity_pubkey == trade_pubkey {
+                order_to_tags(new_order_db, None)
+            } else {
+                return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+            }
+        }
+    };
+
+    Ok(tags)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_order(
@@ -199,13 +226,12 @@ pub async fn publish_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
-    // Get user reputation
-    let reputation = get_user_reputation(&initiator_pubkey.to_string(), keys).await?;
-    // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&new_order_db, reputation);
+    // Get tags for new order in case of full privacy or normal order
+    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
@@ -598,7 +624,8 @@ pub async fn set_waiting_invoice_status(
     buyer_pubkey: PublicKey,
     request_id: Option<u64>,
 ) -> Result<i64> {
-    let kind = OrderKind::from_str(&order.kind).unwrap();
+    let kind = OrderKind::from_str(&order.kind)
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
     let buyer_final_amount = order.amount - order.fee;

@@ -114,7 +114,7 @@ pub async fn admin_take_dispute_action(
     let message = message
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    let sender_keys = crate::util::get_keys().unwrap();
+    let sender_keys = crate::util::get_keys()?;
     send_dm(event.rumor.pubkey, sender_keys, message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
@@ -147,7 +147,7 @@ pub async fn admin_take_dispute_action(
         (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
-    let sender_keys = crate::util::get_keys().unwrap();
+    let sender_keys = crate::util::get_keys()?;
     send_dm(
         buyer_pubkey,
         sender_keys.clone(),

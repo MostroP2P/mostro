@@ -16,7 +16,8 @@ pub mod release; // Release of held funds
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action
-                      // Import action handlers from submodules
+
+// Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
@@ -31,7 +32,6 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
-// use crate::db::update_user_trade_index;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
@@ -106,7 +106,7 @@ async fn check_trade_index(
     // If user is present, we check the trade index and signature
     match is_user_present(pool, event.sender.to_string()).await {
         Ok(user) => {
-            if let (true, index) = message_kind.has_trade_index() {
+            if let index @ 1.. = message_kind.trade_index() {
                 let content: (Message, Signature) = match serde_json::from_str::<(
                     Message,
                     nostr_sdk::secp256k1::schnorr::Signature,
@@ -154,7 +154,7 @@ async fn check_trade_index(
             Ok(())
         }
         Err(_) => {
-            if let (true, _) = message_kind.has_trade_index() {
+            if message_kind.trade_index.is_some() && event.sender != event.rumor.pubkey {
                 let new_user: User = User {
                     pubkey: event.sender.to_string(),
                     ..Default::default()

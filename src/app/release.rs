@@ -3,10 +3,10 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    enqueue_cant_do_msg, enqueue_order_msg, get_keys, get_nostr_client, get_order,
-    settle_seller_hold_invoice, update_order_event,
+    enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
+    update_order_event,
 };
-use anyhow::{Error, Result};
+
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::{error, info};
+use tracing::info;
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -111,9 +111,7 @@ pub async fn release_action(
     .await;
 
     // Handle child order for range orders
-    if let Ok((Some(child_order), Some(event))) =
-        get_child_order(order.clone(), request_id, my_keys).await
-    {
+    if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
         if let Ok(client) = get_nostr_client() {
             if client.send_event(event).await.is_err() {
                 tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
@@ -165,28 +163,33 @@ pub async fn release_action(
 /// # Returns
 /// Result indicating success or failure of the operation
 async fn handle_child_order(
-    child_order: Order,
+    mut child_order: Order,
     order: &Order,
     next_trade: Option<(String, u32)>,
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
-        let mut child_order = child_order;
-        if &order.creator_pubkey == order.seller_pubkey.as_ref().unwrap() {
-            child_order.seller_pubkey = Some(next_trade_pubkey.clone());
-            child_order.creator_pubkey = next_trade_pubkey.clone();
-            child_order.trade_index_seller = Some(next_trade_index as i64);
-        } else if &order.creator_pubkey == order.buyer_pubkey.as_ref().unwrap() {
-            child_order.buyer_pubkey = Some(next_trade_pubkey.clone());
-            child_order.creator_pubkey = next_trade_pubkey.clone();
-            child_order.trade_index_buyer = order.next_trade_index;
+        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+
+        match order.creator_pubkey {
+            _ if order.seller_pubkey.as_ref() == Some(&order.creator_pubkey) => {
+                child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
+                child_order.trade_index_seller = Some(next_trade_index as i64);
+            }
+            _ if order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey) => {
+                child_order.buyer_pubkey = Some(next_trade_pubkey.to_string());
+                child_order.trade_index_buyer = order.next_trade_index;
+            }
+            _ => {}
         }
+
+        child_order.creator_pubkey = next_trade_pubkey.to_string();
         child_order.next_trade_index = None;
         child_order.next_trade_pubkey = None;
 
         let new_order = child_order.as_new_order();
-        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+
         enqueue_order_msg(
             request_id,
             new_order.id,
@@ -196,21 +199,24 @@ async fn handle_child_order(
             Some(next_trade_index as i64),
         )
         .await;
+
         child_order.create(pool).await?;
     }
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()> {
+pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
-        _ => return Err(Error::msg("Missing payment request")),
+        _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
     };
 
     let ln_addr = LightningAddress::from_str(&payment_request);
     let amount = order.amount as u64 - order.fee as u64;
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount).await?
+        resolv_ln_address(&addr.to_string(), amount)
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
     } else {
         payment_request
     };
@@ -323,7 +329,6 @@ async fn payment_success(
 /// and update on local database the status and new event id
 pub async fn get_child_order(
     order: Order,
-    request_id: Option<u64>,
     my_keys: &Keys,
 ) -> Result<(Option<Order>, Option<Event>)> {
     let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
@@ -343,7 +348,6 @@ pub async fn get_child_order(
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Less => {
-                notify_invalid_amount(&order, request_id).await;
                 return Ok((None, None));
             }
         }
@@ -377,13 +381,37 @@ fn create_base_order(order: &Order) -> Order {
     new_order
 }
 
-fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event> {
-    let tags = crate::nip33::order_to_tags(new_order, None);
-    let event =
-        crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags).map_err(|e| {
-            tracing::error!("Failed to create event for order {}: {}", new_order.id, e);
-            e
-        })?;
+async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
+    // Get db connection
+    let pool = match crate::db::connect().await {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
+    };
+
+    // Extract user for rating tag
+    let identity_pubkey = match new_order.is_sell_order() {
+        Ok(_) => new_order
+            .get_master_seller_pubkey()
+            .map_err(MostroInternalErr)?,
+        Err(_) => new_order
+            .get_master_buyer_pubkey()
+            .map_err(MostroInternalErr)?,
+    };
+
+    let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let tags = crate::nip33::order_to_tags(
+        new_order,
+        Some((user.total_rating, user.total_reviews, user.created_at)),
+    );
+    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     new_order.event_id = event.id.to_string();
     Ok(event)
 }
@@ -392,11 +420,11 @@ async fn order_for_equal(
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
-) -> Result<(Order, Event)> {
+) -> Result<(Order, Event), MostroError> {
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-    let event = create_order_event(new_order, my_keys)?;
+    let event = create_order_event(new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }
@@ -405,47 +433,10 @@ async fn order_for_greater(
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
-) -> Result<(Order, Event)> {
+) -> Result<(Order, Event), MostroError> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-    let event = create_order_event(new_order, my_keys)?;
+    let event = create_order_event(new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
-}
-
-async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
-    if let (Some(buyer_pubkey), Some(seller_pubkey)) =
-        (order.buyer_pubkey.as_ref(), order.seller_pubkey.as_ref())
-    {
-        let buyer_pubkey = match PublicKey::from_str(buyer_pubkey) {
-            Ok(pk) => pk,
-            Err(e) => {
-                error!("Failed to parse buyer pubkey: {:?}", e);
-                return;
-            }
-        };
-        let seller_pubkey = match PublicKey::from_str(seller_pubkey) {
-            Ok(pk) => pk,
-            Err(e) => {
-                error!("Failed to parse seller pubkey: {:?}", e);
-                return;
-            }
-        };
-
-        enqueue_cant_do_msg(
-            None,
-            Some(order.id),
-            CantDoReason::InvalidAmount,
-            buyer_pubkey,
-        )
-        .await;
-
-        enqueue_cant_do_msg(
-            request_id,
-            Some(order.id),
-            CantDoReason::InvalidAmount,
-            seller_pubkey,
-        )
-        .await;
-    }
 }

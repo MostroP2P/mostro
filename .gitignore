@@ -11,7 +11,8 @@ mostro.log
 settings.toml
 
 book/book/
-bin/
 
 # Docker related config and data
 docker/config
+
+dist/

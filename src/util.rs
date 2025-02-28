@@ -164,7 +164,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     expire_date
 }
 /// Check if the order is full privacy or normal and return the tags accordingly
-pub async fn check_full_privacy_order(
+pub async fn get_tags_for_new_order(
     new_order_db: &Order,
     pool: &SqlitePool,
     identity_pubkey: &PublicKey,
@@ -228,8 +228,7 @@ pub async fn publish_order(
     info!("New order saved Id: {}", order_id);
     // Get user reputation
 
-    let tags =
-        check_full_privacy_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
+    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

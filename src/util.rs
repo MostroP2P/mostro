@@ -186,6 +186,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     }
     expire_date
 }
+
 /// Checks whether an order qualifies as a full privacy order and returns corresponding event tags.
 ///
 /// This asynchronous function verifies whether the user associated with the order exists in the database.
@@ -208,11 +209,11 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
 /// let identity_pubkey = PublicKey::from_str("02abcdef...").unwrap();
 /// let trade_pubkey = identity_pubkey.clone();
 ///
-/// let tags = check_full_privacy_order(&order, &pool, &identity_pubkey, &trade_pubkey).await?;
+/// let tags = get_tags_for_new_order(&order, &pool, &identity_pubkey, &trade_pubkey).await?;
 /// // Use `tags` for further event processing.
 /// # Ok(())
 /// # }
-/// ```pub async fn check_full_privacy_order(
+pub async fn get_tags_for_new_order(
     new_order_db: &Order,
     pool: &SqlitePool,
     identity_pubkey: &PublicKey,
@@ -307,10 +308,10 @@ pub async fn publish_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
-    // Get user reputation
 
-    let tags =
-        check_full_privacy_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
+    // Get tags for new order in case of full privacy or normal order
+    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
+
     // nip33 kind with order fields as tags and order id as identifier
     let event = new_event(keys, "", order_id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

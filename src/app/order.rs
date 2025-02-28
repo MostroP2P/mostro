@@ -47,6 +47,46 @@ async fn calculate_and_check_quote(
     Ok(())
 }
 
+/// Processes a trading order message by validating, updating, and publishing the order.
+///
+/// This asynchronous function inspects the provided message for an order and, if found, proceeds to:
+/// - Validate the associated invoice.
+/// - Check order constraints such as range limits and zero-amount premium conditions.
+/// - Calculate a valid quote (in satoshis) for each fiat amount in the order.
+/// - Determine the appropriate trade index, using a fallback when the sender matches the rumor's public key.
+/// - Update the user's trade index in the database and publish the order.
+///
+/// If the message does not contain an order, the function simply returns `Ok(())`.
+///
+/// # Parameters
+/// - `msg`: Trading message containing order details and a request ID.
+/// - `event`: Event data providing sender and rumor details required for determining the trade index.
+/// - `my_keys`: Local signing keys used during order publication.
+///
+/// # Errors
+/// Returns a `MostroError` if any validation, quote calculation, trade index update, or order publication fails.
+///
+/// # Examples
+///
+/// ```rust
+/// # async fn run_example() -> Result<(), MostroError> {
+/// # use your_crate::{order_action, Message, UnwrappedGift, Keys};
+/// # use sqlx::SqlitePool;
+/// // Initialize dummy instances; in a real application, replace these with actual values.
+/// let msg = Message::default();
+/// let event = UnwrappedGift::default();
+/// let my_keys = Keys::default();
+/// let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+///
+/// // Process the order if present in the message.
+/// order_action(msg, &event, &my_keys, &pool).await?;
+/// # Ok(())
+/// # }
+/// # #[tokio::main]
+/// # async fn main() {
+/// #     run_example().await.unwrap();
+/// # }
+/// ```
 pub async fn order_action(
     msg: Message,
     event: &UnwrappedGift,

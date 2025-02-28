@@ -146,6 +146,29 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+/// Calculates the expiration timestamp for an order.
+///
+/// This function computes the expiration time based on the current time and application settings.
+/// If an expiration timestamp is provided, it is clamped to a maximum allowed value (the current time plus
+/// a configured maximum number of days). If no timestamp is given, a default expiration is calculated as the
+/// current time plus a configured number of hours.
+///
+/// # Returns
+///
+/// The computed expiration timestamp as a Unix epoch in seconds.
+///
+/// # Examples
+///
+/// ```
+/// // Calculate a default expiration timestamp.
+/// let exp_default = get_expiration_date(None);
+/// println!("Default expiration: {}", exp_default);
+///
+/// // Provide a custom expiration timestamp. The returned value will be clamped
+/// // if it exceeds the maximum allowed expiration.
+/// let exp_custom = get_expiration_date(Some(exp_default + 10_000));
+/// println!("Custom expiration (clamped if necessary): {}", exp_custom);
+/// ```
 pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     let mostro_settings = Settings::get_mostro();
     // We calculate order expiration
@@ -163,8 +186,33 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     }
     expire_date
 }
-/// Check if the order is full privacy or normal and return the tags accordingly
-pub async fn check_full_privacy_order(
+/// Checks whether an order qualifies as a full privacy order and returns corresponding event tags.
+///
+/// This asynchronous function verifies whether the user associated with the order exists in the database.
+/// If the user is found, the order is converted to tags including user metadata (total rating, total reviews, and creation date).
+/// If not, the function checks that the identity and trade public keys match, and if so, converts the order without user data;
+/// otherwise, it returns an error indicating an invalid public key.
+///
+/// # Errors
+///
+/// Returns a `MostroInternalErr(ServiceError::InvalidPubkey)` if no user data is found and the identity public key does not match
+/// the trade public key.
+///
+/// # Examples
+///
+/// ```rust
+/// # async fn example() -> Result<(), MostroError> {
+/// // Assume proper initialization of the order, pool, and public keys.
+/// let order = Order { /* initialize order fields */ };
+/// let pool = SqlitePool::connect("sqlite://:memory:").await.unwrap();
+/// let identity_pubkey = PublicKey::from_str("02abcdef...").unwrap();
+/// let trade_pubkey = identity_pubkey.clone();
+///
+/// let tags = check_full_privacy_order(&order, &pool, &identity_pubkey, &trade_pubkey).await?;
+/// // Use `tags` for further event processing.
+/// # Ok(())
+/// # }
+/// ```pub async fn check_full_privacy_order(
     new_order_db: &Order,
     pool: &SqlitePool,
     identity_pubkey: &PublicKey,
@@ -192,6 +240,39 @@ pub async fn check_full_privacy_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Publishes a new order by preparing its details, saving it to the database, creating a corresponding Nostr event, and sending a confirmation message.
+/// 
+/// This asynchronous function performs the following steps:
+/// - Prepares a new order record from the provided order data and public keys.
+/// - Inserts the new order into the database.
+/// - Determines order tags based on privacy settings using `check_full_privacy_order`.
+/// - Constructs and publishes a Nostr event representing the order.
+/// - Updates the order record with the generated event ID.
+/// - Enqueues an acknowledgement message for the order.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// # async fn example() -> Result<(), MostroError> {
+/// # use sqlx::sqlite::SqlitePool;
+/// # use nostr::Keys;
+/// # use my_crate::{SmallOrder, publish_order};
+/// // Initialize the database pool and keys.
+/// let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+/// let keys = Keys::generate();
+/// 
+/// // Prepare a new order along with associated public keys.
+/// let new_order = SmallOrder::default();
+/// let initiator_pubkey = /* initiator public key */;
+/// let identity_pubkey = /* identity public key */;
+/// let trade_pubkey = /* trade public key */;
+/// let request_id = Some(100);
+/// let trade_index = Some(1);
+/// 
+/// publish_order(&pool, &keys, &new_order, initiator_pubkey, identity_pubkey, trade_pubkey, request_id, trade_index).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn publish_order(
     pool: &SqlitePool,
     keys: &Keys,

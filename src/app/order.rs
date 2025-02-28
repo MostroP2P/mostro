@@ -105,8 +105,7 @@ pub async fn order_action(
             request_id,
             msg.get_inner_message_kind().trade_index,
         )
-        .await
-        .map_err(|_| MostroError::MostroInternalErr(ServiceError::InvalidOrderId))?;
+        .await?
     }
     Ok(())
 }

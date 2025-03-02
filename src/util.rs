@@ -64,7 +64,6 @@ pub async fn retries_yadio_request(
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
     BitcoinPriceManager::get_price(fiat_code)
-        .ok_or(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price

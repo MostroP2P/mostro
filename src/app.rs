@@ -40,7 +40,6 @@ use crate::util::enqueue_cant_do_msg;
 use crate::Settings;
 
 // External dependencies
-use anyhow::Result;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
@@ -354,7 +353,7 @@ pub async fn run(
                             {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
-                                        manage_errors(err, message, event, &action).await;
+                                        manage_errors(*err, message, event, &action).await;
                                     }
                                     Err(e) => {
                                         tracing::error!("Unexpected error type: {}", e);

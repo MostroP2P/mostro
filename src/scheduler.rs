@@ -237,11 +237,19 @@ async fn job_cancel_orders() -> Result<(), MostroError> {
 
     let pool = match connect().await {
         Ok(p) => p,
-        Err(e) => return Err(MostroInternalErr(ServiceError::DbAccessError(e.to_string()))),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
     let keys = match get_keys() {
         Ok(keys) => keys,
-        Err(e) => return Err(MostroInternalErr(ServiceError::DbAccessError(e.to_string()))),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
 
     let mut ln_client = LndConnector::new().await?;

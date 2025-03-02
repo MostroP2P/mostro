@@ -1,7 +1,6 @@
-
-use once_cell::sync::Lazy;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -22,20 +21,32 @@ pub struct BitcoinPriceManager;
 
 impl BitcoinPriceManager {
     pub async fn update_prices() -> Result<(), MostroError> {
-        let response = reqwest::get(YADIO_API_URL).await.map_err(|e| MostroInternalErr(ServiceError::NoAPIResponse))?;
-        let yadio_response: YadioResponse = response.json().await.map_err(|e| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        let response = reqwest::get(YADIO_API_URL)
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
+        let yadio_response: YadioResponse = response
+            .json()
+            .await
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
         info!(
             "Bitcoin prices updated. Got BTC price in {} fiat currencies",
             yadio_response.btc.keys().collect::<Vec<&String>>().len()
         );
 
-        let mut prices_write = BITCOIN_PRICES.write().map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        let mut prices_write = BITCOIN_PRICES
+            .write()
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
         *prices_write = yadio_response.btc;
         Ok(())
     }
 
-    pub fn get_price(currency: &str) -> Option<f64> {
-        let prices_read = BITCOIN_PRICES.read().map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        prices_read.get(currency).cloned()
+    pub fn get_price(currency: &str) -> Result<f64, MostroError> {
+        let prices_read: std::sync::RwLockReadGuard<'_, HashMap<String, f64>> = BITCOIN_PRICES
+            .read()
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        prices_read
+            .get(currency)
+            .cloned()
+            .ok_or(MostroInternalErr(ServiceError::NoAPIResponse))
     }
 }

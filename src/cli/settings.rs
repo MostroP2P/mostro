@@ -184,7 +184,8 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
         settings_dir_default.push(home_dir);
     } else {
         // Get $HOME from env
-        let tmp = std::env::var("HOME").map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
+        let tmp = std::env::var("HOME")
+            .map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
         // Os String
         home_dir = tmp.into();
         // Create default path with default .mostro value
@@ -200,10 +201,15 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
         if std::fs::create_dir(settings_dir_default.clone()).is_ok() {
             tracing::info!("Created mostro default directory!");
             let mut config_file =
-                std::fs::File::create_new(settings_dir_default.join("settings.toml")).map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+                std::fs::File::create_new(settings_dir_default.join("settings.toml"))
+                    .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
             let buf = include_bytes!("../../settings.tpl.toml");
-            config_file.write_all(buf).map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-            config_file.flush().map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            config_file
+                .write_all(buf)
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            config_file
+                .flush()
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
         }
         tracing::info!(
             "Created settings file based on template and copied to {} directory",

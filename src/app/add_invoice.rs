@@ -2,8 +2,6 @@ use crate::util::{
     enqueue_order_msg, get_order, show_hold_invoice, update_order_event, validate_invoice,
 };
 
-use anyhow::Result;
-
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::{Action, Message, Payload};

@@ -9,6 +9,8 @@ use crate::{db::*, MESSAGE_QUEUES};
 use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
@@ -230,16 +232,24 @@ async fn job_update_rate_events() {
     });
 }
 
-async fn job_cancel_orders() -> anyhow::Result<()> {
+async fn job_cancel_orders() -> Result<(), MostroError> {
     info!("Create a pool to connect to db");
 
     let pool = match connect().await {
         Ok(p) => p,
-        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
     let keys = match get_keys() {
         Ok(keys) => keys,
-        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
 
     let mut ln_client = LndConnector::new().await?;

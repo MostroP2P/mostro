@@ -64,7 +64,6 @@ pub async fn retries_yadio_request(
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
     BitcoinPriceManager::get_price(fiat_code)
-        .ok_or(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price
@@ -645,7 +644,7 @@ pub async fn show_hold_invoice(
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> anyhow::Result<()> {
+pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result<(), MostroError> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 

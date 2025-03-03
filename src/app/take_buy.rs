@@ -3,7 +3,6 @@ use crate::util::{
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
-use anyhow::Result;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::Message;

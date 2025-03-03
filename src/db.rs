@@ -1,4 +1,3 @@
-use anyhow::Result;
 use mostro_core::dispute::Dispute;
 use mostro_core::error::ServiceError;
 use mostro_core::error::{
@@ -20,7 +19,7 @@ use uuid::Uuid;
 
 use crate::cli::settings::Settings;
 
-pub async fn connect() -> Result<Pool<Sqlite>> {
+pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url;
@@ -29,13 +28,8 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
     let conn = if !db_path.exists() {
-        let _file = std::fs::File::create_new(db_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create database file at {}: {}",
-                db_path.display(),
-                e
-            )
-        })?;
+        let _file = std::fs::File::create_new(db_path)
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
@@ -54,11 +48,9 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
                                 "Failed to create database connection"
                             );
                         }
-                        return Err(anyhow::anyhow!(
-                            "Failed to create database connection at {}: {}",
-                            db_path.display(),
-                            e
-                        ));
+                        return Err(MostroInternalErr(ServiceError::DbAccessError(
+                            e.to_string(),
+                        )));
                     }
                 }
                 pool
@@ -69,21 +61,15 @@ pub async fn connect() -> Result<Pool<Sqlite>> {
                     path = %db_path.display(),
                     "Failed to create database connection"
                 );
-                return Err(anyhow::anyhow!(
-                    "Failed to create database connection at {}: {}",
-                    db_path.display(),
-                    e
-                ));
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    e.to_string(),
+                )));
             }
         }
     } else {
-        SqlitePool::connect(&db_url).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to connect to existing database at {}: {}",
-                db_path.display(),
-                e
-            )
-        })?
+        SqlitePool::connect(&db_url)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
     };
     Ok(conn)
 }
@@ -92,9 +78,12 @@ pub async fn edit_buyer_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     buyer_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -105,8 +94,9 @@ pub async fn edit_buyer_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -115,9 +105,12 @@ pub async fn edit_seller_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     seller_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -128,13 +121,14 @@ pub async fn edit_seller_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result<Order> {
+pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -144,12 +138,13 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> anyhow::Result
     )
     .bind(hash)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
 
-pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let expire_time = Timestamp::now();
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -160,12 +155,13 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
     )
     .bind(expire_time.to_string())
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
 
-pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
     let expire_time = Timestamp::now() - exp_seconds;
@@ -178,7 +174,8 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
     )
     .bind(expire_time.to_string())
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
@@ -186,7 +183,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> anyhow::Result<Vec<Orde
 pub async fn find_dispute_by_order_id(
     pool: &SqlitePool,
     order_id: Uuid,
-) -> anyhow::Result<Dispute> {
+) -> Result<Dispute, MostroError> {
     let dispute = sqlx::query_as::<_, Dispute>(
         r#"
           SELECT *
@@ -196,7 +193,8 @@ pub async fn find_dispute_by_order_id(
     )
     .bind(order_id)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(dispute)
 }
@@ -206,12 +204,15 @@ pub async fn update_order_to_initial_state(
     order_id: Uuid,
     amount: i64,
     fee: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let status = Status::Pending.to_string();
     let hash: Option<String> = None;
     let preimage: Option<String> = None;
-    let rows_affected = sqlx::query!(
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -234,8 +235,9 @@ pub async fn update_order_to_initial_state(
         order_id,
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -244,9 +246,12 @@ pub async fn edit_master_buyer_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     master_buyer_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -257,8 +262,9 @@ pub async fn edit_master_buyer_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -267,9 +273,12 @@ pub async fn edit_master_seller_pubkey_order(
     pool: &SqlitePool,
     order_id: Uuid,
     master_seller_pubkey: Option<String>,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -280,17 +289,24 @@ pub async fn edit_master_seller_pubkey_order(
         order_id
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
+pub async fn reset_order_taken_at_time(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let taken_at = 0;
 
-    let rows_affected = sqlx::query!(
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -301,8 +317,9 @@ pub async fn reset_order_taken_at_time(pool: &SqlitePool, order_id: Uuid) -> any
         order_id,
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -311,9 +328,12 @@ pub async fn update_order_invoice_held_at_time(
     pool: &SqlitePool,
     order_id: Uuid,
     invoice_held_at: i64,
-) -> anyhow::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    let rows_affected = sqlx::query!(
+) -> Result<bool, MostroError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
@@ -324,13 +344,14 @@ pub async fn update_order_invoice_held_at_time(
         order_id,
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
 
-pub async fn find_held_invoices(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -339,12 +360,13 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> anyhow::Result<Vec<Order>>
         "#,
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
 
-pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>> {
+pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -353,12 +375,16 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> anyhow::Result<Vec<Order>
         "#,
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
 
-pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyhow::Result<User> {
+pub async fn find_solver_pubkey(
+    pool: &SqlitePool,
+    solver_npub: String,
+) -> Result<User, MostroError> {
     let user = sqlx::query_as::<_, User>(
         r#"
           SELECT *
@@ -369,12 +395,13 @@ pub async fn find_solver_pubkey(pool: &SqlitePool, solver_npub: String) -> anyho
     )
     .bind(solver_npub)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(user)
 }
 
-pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::Result<User> {
+pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
     let user = sqlx::query_as::<_, User>(
         r#"
             SELECT *
@@ -385,15 +412,16 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> anyhow::R
     )
     .bind(public_key)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(user)
 }
 
-pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> anyhow::Result<()> {
+pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<(), MostroError> {
     // Validate public key format (32-bytes hex)
     let created_at: Timestamp = Timestamp::now();
-    let result = sqlx::query(
+    let _result = sqlx::query(
         "
             INSERT INTO users (pubkey, is_admin, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at) 
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -412,34 +440,32 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> anyhow::Result<(
     .bind(new_user.min_rating)
     .bind(created_at.to_string())
     .execute(pool)
-    .await;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    match result {
-        Ok(_) => {
-            tracing::info!("New user created successfully");
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!("Error creating new user: {}", e)),
-    }
+    Ok(())
 }
 
 pub async fn update_user_trade_index(
     pool: &SqlitePool,
     public_key: String,
     trade_index: i64,
-) -> anyhow::Result<bool> {
+) -> Result<bool, MostroError> {
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
-        return Err(anyhow::anyhow!("Invalid public key format"));
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     // Validate trade_index
     if trade_index < 0 {
-        return Err(anyhow::anyhow!("Invalid trade_index: must be non-negative"));
+        return Err(MostroCantDo(CantDoReason::InvalidTradeIndex));
     }
 
-    let mut conn = pool.acquire().await?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    let rows_affected = sqlx::query!(
+    let result = sqlx::query!(
         r#"
             UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2
         "#,
@@ -447,8 +473,9 @@ pub async fn update_user_trade_index(
         public_key,
     )
     .execute(&mut conn)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -457,7 +484,7 @@ pub async fn update_user_trade_index(
 pub async fn seller_has_pending_order(
     pool: &SqlitePool,
     pubkey: String,
-) -> anyhow::Result<bool, MostroError> {
+) -> Result<bool, MostroError> {
     // Validate public key format (32-bytes hex)
     if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
@@ -484,7 +511,7 @@ pub async fn seller_has_pending_order(
 pub async fn buyer_has_pending_order(
     pool: &SqlitePool,
     pubkey: String,
-) -> anyhow::Result<bool, MostroError> {
+) -> Result<bool, MostroError> {
     // Validate public key format (32-bytes hex)
     if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
@@ -515,30 +542,28 @@ pub async fn update_user_rating(
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
-) -> anyhow::Result<bool> {
+) -> Result<bool, MostroError> {
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
-        return Err(anyhow::anyhow!("Invalid public key format"));
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     // Validate rating values
     if !(0..=5).contains(&last_rating) {
-        return Err(anyhow::anyhow!("Invalid rating value"));
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     if !(0..=5).contains(&min_rating) || !(0..=5).contains(&max_rating) {
-        return Err(anyhow::anyhow!("Invalid min/max rating values"));
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     if MIN_RATING as i64 > last_rating || last_rating > MAX_RATING as i64 {
-        return Err(anyhow::anyhow!(
-            "Rating values must satisfy: min_rating <= last_rating <= max_rating"
-        ));
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     if total_reviews < 0 {
-        return Err(anyhow::anyhow!("Invalid total reviews"));
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     if total_rating < 0.0 || total_rating > (total_reviews * 5) as f64 {
-        return Err(anyhow::anyhow!("Invalid total rating"));
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
-    let rows_affected = sqlx::query!(
+    let result = sqlx::query!(
         r#"
             UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
         "#,
@@ -550,8 +575,9 @@ pub async fn update_user_rating(
         public_key,
     )
     .execute(pool)
-    .await?
-    .rows_affected();
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
 }
@@ -560,7 +586,7 @@ pub async fn is_assigned_solver(
     pool: &SqlitePool,
     solver_pubkey: &str,
     order_id: Uuid,
-) -> anyhow::Result<bool> {
+) -> Result<bool, MostroError> {
     println!("solver_pubkey: {}", solver_pubkey);
     println!("order_id: {}", order_id);
     let result = sqlx::query(
@@ -570,7 +596,8 @@ pub async fn is_assigned_solver(
     .bind(order_id)
     .map(|row: SqliteRow| row.get(0))
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(result)
 }
@@ -579,7 +606,7 @@ pub async fn find_order_by_id(
     pool: &SqlitePool,
     order_id: Uuid,
     user_pubkey: &str,
-) -> anyhow::Result<Order> {
+) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -590,7 +617,8 @@ pub async fn find_order_by_id(
     .bind(order_id)
     .bind(user_pubkey)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }

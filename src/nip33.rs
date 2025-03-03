@@ -1,4 +1,5 @@
 use crate::lightning::LnStatus;
+use crate::LN_STATUS;
 use crate::Settings;
 use chrono::Duration;
 use mostro_core::order::{Order, Status};
@@ -76,7 +77,13 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>, ln_status: &LnStatus) -> Tags {
+pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
+
+    let ln_network = match LN_STATUS.get() {
+        Some(status) => status.networks.get(0).map_or("unknown".to_string(), |network| network.to_string()),
+        None => "unknown".to_string(),
+    };    
+
     let mut tags: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("k")),
@@ -108,7 +115,7 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>, ln
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
-            vec![ln_status.networks.join(",")],
+            vec![ln_network],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("layer")),

@@ -6,7 +6,6 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::lightning::LndConnector;
-use crate::lightning::get_ln_status;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
@@ -508,12 +507,8 @@ pub async fn update_order_event(
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
-    
-    // Get node status
-    let ln_status = get_ln_status().await?;
-
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order_updated, None, &ln_status);
+    let tags = order_to_tags(&order_updated, None);
     // nip33 kind with order id as identifier and order fields as tags
     let event = new_event(keys, "", order.id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

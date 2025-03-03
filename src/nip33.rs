@@ -80,9 +80,9 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
 
     let ln_network = match LN_STATUS.get() {
-        Some(status) => status.networks.get(0).map_or("unknown".to_string(), |network| network.to_string()),
+        Some(status) => status.networks.join(","),
         None => "unknown".to_string(),
-    };    
+    };
 
     let mut tags: Vec<Tag> = vec![
         Tag::custom(

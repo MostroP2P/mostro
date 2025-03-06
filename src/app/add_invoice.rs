@@ -12,33 +12,26 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 
-pub async fn check_order_status(
+pub async fn pay_new_invoice(
     order: &mut Order,
     pool: &Pool<Sqlite>,
     msg: &Message,
 ) -> Result<(), MostroError> {
-    // Buyer can add invoice orders with WaitingBuyerInvoice status
-    match order.get_order_status() {
-        Ok(Status::WaitingBuyerInvoice) => {}
-        Ok(Status::SettledHoldInvoice) => {
-            order.payment_attempts = 0;
-            order.clone().update(pool).await.map_err(|cause| {
-                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-            })?;
-            enqueue_order_msg(
-                msg.get_inner_message_kind().request_id,
-                Some(order.id),
-                Action::InvoiceUpdated,
-                None,
-                order.get_buyer_pubkey().map_err(MostroInternalErr)?,
-                None,
-            )
-            .await;
-        }
-        _ => {
-            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-        }
-    }
+    order.payment_attempts = 0;
+    order
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    enqueue_order_msg(
+        msg.get_inner_message_kind().request_id,
+        Some(order.id),
+        Action::InvoiceUpdated,
+        None,
+        order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+        None,
+    )
+    .await;
     Ok(())
 }
 
@@ -51,7 +44,7 @@ pub async fn add_invoice_action(
     // Get order
     let mut order = get_order(&msg, pool).await?;
     // Check order status
-    order.get_order_status().map_err(MostroInternalErr)?;
+    let ord_status = order.get_order_status().map_err(MostroInternalErr)?;
     // Check order kind
     order.get_order_kind().map_err(MostroInternalErr)?;
     // Get buyer pubkey
@@ -63,7 +56,16 @@ pub async fn add_invoice_action(
     // We save the invoice on db
     order.buyer_invoice = validate_invoice(&msg, &order).await?;
     // Buyer can add invoice orders with WaitingBuyerInvoice status
-    check_order_status(&mut order, pool, &msg).await?;
+    match ord_status {
+        Status::SettledHoldInvoice => {
+            pay_new_invoice(&mut order, pool, &msg).await?;
+            return Ok(());
+        }
+        Status::WaitingBuyerInvoice => {}
+        _ => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+    }
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // Check if the order has a preimage

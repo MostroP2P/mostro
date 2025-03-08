@@ -1,6 +1,6 @@
 use crate::db::find_solver_pubkey;
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, get_order, send_dm};
+use crate::util::{get_nostr_client, send_dm};
 
 use mostro_core::dispute::{Dispute, Status};
 use mostro_core::error::{
@@ -9,6 +9,7 @@ use mostro_core::error::{
     ServiceError,
 };
 use mostro_core::message::{Action, Message, Payload, Peer};
+use mostro_core::order::Order;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -23,6 +24,7 @@ pub async fn pubkey_event_can_solve(
 ) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
+        info!("admin pubkey {} -event pubkey {} ",my_keys.public_key.to_string(), ev_pubkey.to_string());
         if ev_pubkey.to_string() == my_keys.public_key().to_string()
             && matches!(status, Status::InProgress | Status::Initiated)
         {
@@ -68,7 +70,7 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.rumor.pubkey, dispute_status).await {
+        if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
@@ -76,8 +78,16 @@ pub async fn admin_take_dispute_action(
         return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
     };
 
-    // Get order from db
-    let order = get_order(&msg, pool).await?;
+    // Get order from db using the dispute order id
+    let order = match Order::by_id(pool, dispute.order_id).await{
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            return Err(MostroInternalErr(ServiceError::InvalidOrderId));
+        }
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(e.to_string())));
+        }
+    };
 
     let mut new_order = order.as_new_order();
     // Only in this case we use the trade pubkey fields to store the master pubkey
@@ -90,10 +100,10 @@ pub async fn admin_take_dispute_action(
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();
-    dispute.solver_pubkey = Some(event.rumor.pubkey.to_string());
+    dispute.solver_pubkey = Some(event.sender.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
 
-    info!("Dispute {} taken by {}", dispute_id, event.rumor.pubkey);
+    info!("Dispute {} taken by {}", dispute_id, event.sender);
     // Assign token for admin message
     new_order.seller_token = dispute.seller_token;
     new_order.buyer_token = dispute.buyer_token;
@@ -115,18 +125,18 @@ pub async fn admin_take_dispute_action(
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     let sender_keys = crate::util::get_keys()?;
-    send_dm(event.rumor.pubkey, sender_keys, message, None)
+    send_dm(event.sender, sender_keys, message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
-    let solver_pubkey = Peer::new(event.rumor.pubkey.to_hex());
+    let admin_pubkey = Peer::new(event.sender.to_hex());
     let msg_to_buyer = Message::new_order(
         Some(order.id),
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Peer(solver_pubkey.clone())),
+        Some(Payload::Peer(admin_pubkey.clone())),
     );
 
     let msg_to_seller = Message::new_order(
@@ -134,7 +144,7 @@ pub async fn admin_take_dispute_action(
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Peer(solver_pubkey)),
+        Some(Payload::Peer(admin_pubkey)),
     );
 
     let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {

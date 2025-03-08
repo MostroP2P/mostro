@@ -31,7 +31,7 @@ pub async fn admin_settle_action(
     // Get order
     let order = get_order(&msg, pool).await?;
 
-    match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order.id).await {
+    match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
         Ok(false) => {
             return Err(MostroCantDo(
                 mostro_core::error::CantDoReason::IsNotYourDispute,

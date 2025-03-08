@@ -24,7 +24,11 @@ pub async fn pubkey_event_can_solve(
 ) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
-        info!("admin pubkey {} -event pubkey {} ",my_keys.public_key.to_string(), ev_pubkey.to_string());
+        info!(
+            "admin pubkey {} -event pubkey {} ",
+            my_keys.public_key.to_string(),
+            ev_pubkey.to_string()
+        );
         if ev_pubkey.to_string() == my_keys.public_key().to_string()
             && matches!(status, Status::InProgress | Status::Initiated)
         {
@@ -79,13 +83,15 @@ pub async fn admin_take_dispute_action(
     };
 
     // Get order from db using the dispute order id
-    let order = match Order::by_id(pool, dispute.order_id).await{
+    let order = match Order::by_id(pool, dispute.order_id).await {
         Ok(Some(order)) => order,
         Ok(None) => {
             return Err(MostroInternalErr(ServiceError::InvalidOrderId));
         }
         Err(e) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(e.to_string())));
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
         }
     };
 

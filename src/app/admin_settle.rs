@@ -46,20 +46,18 @@ pub async fn admin_settle_action(
     }
 
     // Was orde cooperatively cancelled?
-    if order.check_status(Status::CooperativelyCanceled).is_err() {
-        return Err(MostroCantDo(
-            mostro_core::error::CantDoReason::IsNotYourDispute,
-        ));
-    } else {
+    if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::CooperativeCancelAccepted,
             None,
-            event.rumor.pubkey,
+            event.sender,
             msg.get_inner_message_kind().trade_index,
         )
         .await;
+
+        return Ok(());
     }
 
     if let Err(cause) = order.check_status(Status::Dispute) {

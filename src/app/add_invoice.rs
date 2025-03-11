@@ -68,20 +68,25 @@ pub async fn add_invoice_action(
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // Check if the order has a preimage
     if order.preimage.is_some() {
-        // We send this data related to the order to the parties
-        let order_data = SmallOrder::from(order.clone());
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        if let Ok(order_updated) = update_order_event(my_keys, Status::Active, &order).await {
-            let _ = order_updated.update(pool).await;
-        }
+        let active_order = match update_order_event(my_keys, Status::Active, &order).await {
+            Ok(updated_order) => {
+                // Update in database
+                updated_order.clone().update(pool).await.map_err(|cause| {
+                    MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                })?;
+                updated_order
+            },
+            Err(_) => order.clone(), // Fallback to original order if update fails
+        };
 
         // We send a confirmation message to seller
         enqueue_order_msg(
             None,
-            Some(order.clone().id),
+            Some(active_order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(order_data.clone())),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             seller_pubkey,
             None,
         )
@@ -89,9 +94,9 @@ pub async fn add_invoice_action(
         // We send a message to buyer saying seller paid
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
-            Some(order.clone().id),
+            Some(active_order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(order_data)),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             buyer_pubkey,
             None,
         )

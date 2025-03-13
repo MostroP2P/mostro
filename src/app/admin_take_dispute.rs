@@ -1,8 +1,8 @@
-use crate::db::find_solver_pubkey;
+use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{get_nostr_client, send_dm};
 
-use mostro_core::dispute::{Dispute, Status};
+use mostro_core::dispute::{Dispute, SolverDisputeInfo, Status};
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, *},
@@ -115,9 +115,55 @@ pub async fn admin_take_dispute_action(
     new_order.buyer_token = dispute.buyer_token;
     // Save it to DB
     dispute
+        .clone()
         .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Get pubkeys of initiator and counterpart
+    let (initiator_pubkey, counterpart_pubkey) = if order.buyer_dispute {
+        (
+            &order
+                .get_master_buyer_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_master_seller_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        )
+    } else {
+        (
+            &order
+                .get_master_seller_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_buyer_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        )
+    };
+
+    // Get users ratings
+    // Get counter to vote from db
+    let counterpart = is_user_present(pool, counterpart_pubkey.to_string())
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    let initiator = is_user_present(pool, initiator_pubkey.to_string())
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    // Calculate operating days of users
+    let now = Timestamp::now();
+    let initiator_operating_days = (now.as_u64() - initiator.created_at as u64) / 86400;
+    let couterpart_operating_days = (now.as_u64() - counterpart.created_at as u64) / 86400;
+
+    let dispute_info = SolverDisputeInfo::new(
+        &order,
+        &dispute,
+        initiator.total_rating,
+        counterpart.total_rating,
+        initiator_operating_days,
+        couterpart_operating_days,
+    );
 
     // We create a Message for admin
     let message = Message::new_dispute(
@@ -125,7 +171,7 @@ pub async fn admin_take_dispute_action(
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Order(new_order)),
+        Some(Payload::Dispute(dispute_id, None, Some(dispute_info))),
     );
     let message = message
         .as_json()

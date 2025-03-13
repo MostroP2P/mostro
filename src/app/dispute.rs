@@ -5,11 +5,11 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
-use crate::db::find_dispute_by_order_id;
+use crate::db::{find_dispute_by_order_id, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 
-use mostro_core::dispute::Dispute;
+use mostro_core::dispute::{Dispute, SolverDisputeInfo};
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, *},
@@ -154,6 +154,7 @@ pub async fn dispute_action(
     // Setup dispute
     if order.setup_dispute(is_buyer_dispute).is_ok() {
         order
+            .clone()
             .update(pool)
             .await
             .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
@@ -204,6 +205,30 @@ pub async fn dispute_action(
         None,
     )
     .await;
+
+    // Get users ratings
+    // Get counter to vote from db
+    let counterpart = is_user_present(pool, counterpart_pubkey.to_string().clone())
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    let initiator = is_user_present(pool, initiator_pubkey.to_string().clone())
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    // Calculate operating days of users
+    let now = Timestamp::now();
+    let initiator_operating_days = (now.as_u64() - initiator.created_at as u64) / 86400;
+    let couterpart_operating_days = (now.as_u64() - counterpart.created_at as u64) / 86400;
+
+    let dispute_info = SolverDisputeInfo::new(
+        &order,
+        &dispute,
+        initiator.total_rating,
+        counterpart.total_rating,
+        initiator_operating_days,
+        couterpart_operating_days,
+    );
 
     // Publish dispute event to network
     publish_dispute_event(&dispute, my_keys)

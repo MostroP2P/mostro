@@ -60,8 +60,8 @@ async fn prepare_solver_info_message(
     let couterpart_operating_days = (now.as_u64() - counterpart.created_at as u64) / 86400;
 
     let dispute_info = SolverDisputeInfo::new(
-        &order,
-        &dispute,
+        order,
+        dispute,
         &counterpart,
         &initiator,
         initiator_operating_days,

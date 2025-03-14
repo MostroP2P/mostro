@@ -103,6 +103,7 @@ pub async fn pubkey_event_can_solve(
 pub async fn admin_take_dispute_action(
     msg: Message,
     event: &UnwrappedGift,
+    mostro_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<(), MostroError> {
     // Get request id
@@ -171,40 +172,21 @@ pub async fn admin_take_dispute_action(
     send_dm(event.sender, sender_keys, message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
-    let admin_pubkey = Peer::new(event.sender.to_hex());
-    let msg_to_buyer = Message::new_order(
+    let msg_to_users = Message::new_order(
         Some(order.id),
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Peer(admin_pubkey.clone())),
+        Some(Payload::Peer(Peer::new(event.sender.to_hex()))),
     );
-
-    let msg_to_seller = Message::new_order(
-        Some(order.id),
-        request_id,
-        None,
-        Action::AdminTookDispute,
-        Some(Payload::Peer(admin_pubkey)),
-    );
-
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            PublicKey::from_str(buyer.as_str())
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-        ),
-        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
-    let sender_keys = crate::util::get_keys()?;
+    // Send to buyer
     send_dm(
-        buyer_pubkey,
-        sender_keys.clone(),
-        msg_to_buyer
+        order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+        mostro_keys.clone(),
+        msg_to_users
             .as_json()
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
         None,
@@ -214,15 +196,16 @@ pub async fn admin_take_dispute_action(
 
     // Send message to seller
     send_dm(
-        seller_pubkey,
-        sender_keys,
-        msg_to_seller
+        order.get_seller_pubkey().map_err(MostroInternalErr)?,
+        mostro_keys.clone(),
+        msg_to_users
             .as_json()
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
         None,
     )
     .await
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
     // We create a tag to show status of the dispute
     let tags: Tags = Tags::new(vec![
         Tag::custom(

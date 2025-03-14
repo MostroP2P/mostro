@@ -114,7 +114,7 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
+        if !pubkey_event_can_solve(pool, &event.rumor.pubkey, dispute_status).await {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }

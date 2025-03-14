@@ -159,8 +159,8 @@ pub async fn admin_take_dispute_action(
     let dispute_info = SolverDisputeInfo::new(
         &order,
         &dispute,
-        initiator.total_rating,
-        counterpart.total_rating,
+        &counterpart,
+        &initiator,
         initiator_operating_days,
         couterpart_operating_days,
     );

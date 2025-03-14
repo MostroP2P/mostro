@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use crate::db::{find_dispute_by_order_id};
+use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 
@@ -80,13 +80,9 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
 /// Returns a tuple containing:
 /// - The counterparty's public key as a String
 /// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
-fn get_counterpart_info(
-    sender: &str,
-    buyer: &str,
-    seller: &str,
-) -> Result<bool, CantDoReason> {
+fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<bool, CantDoReason> {
     match sender {
-        s if s == buyer => Ok(true), // buyer is initiator
+        s if s == buyer => Ok(true),   // buyer is initiator
         s if s == seller => Ok(false), // seller is initiator
         _ => Err(CantDoReason::InvalidPubkey),
     }
@@ -183,11 +179,10 @@ pub async fn dispute_action(
     // Get message sender
     let message_sender = event.rumor.pubkey.to_string();
     // Get counterpart info
-    let is_buyer_dispute =
-        match get_counterpart_info(&message_sender, &buyer, &seller) {
-            Ok(is_buyer_dispute) => is_buyer_dispute,
-            Err(cause) => return Err(MostroCantDo(cause)),
-        };
+    let is_buyer_dispute = match get_counterpart_info(&message_sender, &buyer, &seller) {
+        Ok(is_buyer_dispute) => is_buyer_dispute,
+        Err(cause) => return Err(MostroCantDo(cause)),
+    };
 
     // Setup dispute
     if order.setup_dispute(is_buyer_dispute).is_ok() {

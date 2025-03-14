@@ -1,6 +1,6 @@
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
-use crate::util::{get_nostr_client, get_order, send_dm};
+use crate::util::{get_dispute, get_nostr_client, get_order, send_dm};
 
 use mostro_core::dispute::{Dispute, SolverDisputeInfo, Status};
 use mostro_core::error::{
@@ -109,23 +109,8 @@ pub async fn admin_take_dispute_action(
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
-    // Find dipute id in the message
-    let dispute_id = if let Some(dispute_id) = msg.get_inner_message_kind().id {
-        dispute_id
-    } else {
-        return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
-    };
-
-    // Fetch dispute from db
-    let mut dispute = match Dispute::by_id(pool, dispute_id)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-    {
-        Some(dispute) => dispute,
-        None => {
-            return Err(MostroInternalErr(ServiceError::InvalidDisputeId));
-        }
-    };
+    // Get dispute
+    let mut dispute = get_dispute(&msg, pool).await?;
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = Status::from_str(&dispute.status) {
@@ -145,7 +130,7 @@ pub async fn admin_take_dispute_action(
     dispute.solver_pubkey = Some(event.sender.to_string());
     dispute.taken_at = Timestamp::now().as_u64() as i64;
 
-    info!("Dispute {} taken by {}", dispute_id, event.sender);
+    info!("Dispute {} taken by {}", dispute.id, event.sender);
 
     // Save it to DB
     dispute
@@ -159,11 +144,11 @@ pub async fn admin_take_dispute_action(
 
     // We create a Message for admin
     let message = Message::new_dispute(
-        Some(dispute_id),
+        Some(dispute.id),
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Dispute(dispute_id, None, Some(dispute_info))),
+        Some(Payload::Dispute(dispute.id, None, Some(dispute_info))),
     );
     let message = message
         .as_json()
@@ -172,7 +157,7 @@ pub async fn admin_take_dispute_action(
     send_dm(event.sender, sender_keys, message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    
+
     // Now we create a message to both parties of the order
     // to them know who will assist them on the dispute
     let msg_to_users = Message::new_order(
@@ -226,7 +211,7 @@ pub async fn admin_take_dispute_action(
         &crate::util::get_keys()
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?,
         "",
-        dispute_id.to_string(),
+        dispute.id.to_string(),
         tags,
     )
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
@@ -236,7 +221,7 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| {
             info!(
                 "Failed to get nostr client for dispute {}: {}",
-                dispute_id, e
+                dispute.id, e
             );
             e
         })
@@ -246,7 +231,7 @@ pub async fn admin_take_dispute_action(
         .send_event(event)
         .await
         .map_err(|e| {
-            info!("Failed to send dispute {} status event: {}", dispute_id, e);
+            info!("Failed to send dispute {} status event: {}", dispute.id, e);
             e
         })
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

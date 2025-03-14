@@ -14,6 +14,7 @@ use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
+use mostro_core::dispute::Dispute;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -887,6 +888,21 @@ pub async fn get_nostr_relays() -> Option<HashMap<RelayUrl, Relay>> {
         Some(client.relays().await)
     } else {
         None
+    }
+}
+
+pub async fn get_dispute(msg: &Message, pool: &Pool<Sqlite>) -> Result<Dispute, MostroError> {
+    let dispute_msg = msg.get_inner_message_kind();
+    let dispute_id = dispute_msg
+        .id
+        .ok_or(MostroInternalErr(ServiceError::InvalidDisputeId))?;
+    let dispute = Dispute::by_id(pool, dispute_id)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if let Some(dispute) = dispute {
+        Ok(dispute)
+    } else {
+        Err(MostroInternalErr(ServiceError::InvalidDisputeId))
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
-use crate::util::{get_dispute, get_nostr_client, get_order, send_dm};
+use crate::util::{get_dispute, get_nostr_client, send_dm};
 
 use mostro_core::dispute::{Dispute, SolverDisputeInfo, Status};
 use mostro_core::error::{
@@ -38,10 +38,15 @@ async fn prepare_solver_info_message(
                 .get_master_seller_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
             &order
-                .get_buyer_pubkey()
+                .get_master_buyer_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
         )
     };
+
+    info!(
+        "initiator pubkey: {} - counterpart pubkey: {}",
+        initiator_pubkey, counterpart_pubkey
+    );
 
     // Get users ratings
     // Get counter to vote from db
@@ -123,7 +128,14 @@ pub async fn admin_take_dispute_action(
     };
 
     // Get order from db using the dispute order id
-    let order = get_order(&msg, pool).await?;
+    let order = if let Some(order) = Order::by_id(pool, dispute.order_id)
+        .await
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidOrderId))?
+    {
+        order
+    } else {
+        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
+    };
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();

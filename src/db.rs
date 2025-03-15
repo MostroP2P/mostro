@@ -418,7 +418,7 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<Us
     Ok(user)
 }
 
-pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<(), MostroError> {
+pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {
     // Validate public key format (32-bytes hex)
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(
@@ -427,7 +427,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<(), Mostr
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
     )
-    .bind(new_user.pubkey)
+    .bind(new_user.pubkey.clone())
     .bind(new_user.is_admin)
     .bind(new_user.is_solver)
     .bind(new_user.is_banned)
@@ -443,7 +443,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<(), Mostr
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    Ok(())
+    Ok(new_user.pubkey)
 }
 
 pub async fn update_user_trade_index(

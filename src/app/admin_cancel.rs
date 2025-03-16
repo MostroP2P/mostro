@@ -60,7 +60,7 @@ pub async fn admin_cancel_action(
     }
 
     // Was order in dispute?
-    if order.check_status(Status::Dispute).is_ok() {
+    if order.check_status(Status::Dispute).is_err() {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 

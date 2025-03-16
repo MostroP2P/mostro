@@ -23,7 +23,7 @@ async fn prepare_solver_info_message(
     dispute: &Dispute,
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Get pubkeys of initiator and counterpart
-    let (initiator_pubkey, counterpart_pubkey) = if order.buyer_dispute {
+    let (initiator_idkey, counterpart_idkey, initiator_tradekey) = if order.buyer_dispute {
         (
             &order
                 .get_master_buyer_pubkey()
@@ -31,6 +31,10 @@ async fn prepare_solver_info_message(
             &order
                 .get_master_seller_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_buyer_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
+                .to_string(),
         )
     } else {
         (
@@ -40,22 +44,20 @@ async fn prepare_solver_info_message(
             &order
                 .get_master_buyer_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_seller_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
+                .to_string(),
         )
     };
 
-    info!(
-        "initiator pubkey: {} - counterpart pubkey: {}",
-        initiator_pubkey, counterpart_pubkey
-    );
-
     // Get users ratings
     // Get counter to vote from db
-
-    let counterpart = is_user_present(pool, counterpart_pubkey.to_string())
+    let counterpart = is_user_present(pool, counterpart_idkey.to_string())
         .await
         .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
-    let initiator = is_user_present(pool, initiator_pubkey.to_string())
+    let initiator = is_user_present(pool, initiator_idkey.to_string())
         .await
         .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
@@ -67,6 +69,7 @@ async fn prepare_solver_info_message(
     let dispute_info = SolverDisputeInfo::new(
         order,
         dispute,
+        initiator_tradekey.clone(),
         &counterpart,
         &initiator,
         initiator_operating_days,

@@ -10,6 +10,7 @@ use mostro_core::error::{
 };
 use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Order;
+use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -21,6 +22,7 @@ async fn prepare_solver_info_message(
     pool: &Pool<Sqlite>,
     order: &Order,
     dispute: &Dispute,
+    full_privacy: bool,
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Get pubkeys of initiator and counterpart
     let (initiator_idkey, counterpart_idkey, initiator_tradekey) = if order.buyer_dispute {
@@ -53,13 +55,18 @@ async fn prepare_solver_info_message(
 
     // Get users ratings
     // Get counter to vote from db
-    let counterpart = is_user_present(pool, counterpart_idkey.to_string())
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
-
-    let initiator = is_user_present(pool, initiator_idkey.to_string())
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    let (counterpart, initiator) = if !full_privacy {
+        (
+            is_user_present(pool, counterpart_idkey.to_string())
+                .await
+                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?,
+            is_user_present(pool, initiator_idkey.to_string())
+                .await
+                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?,
+        )
+    } else {
+        (User::default(), User::default())
+    };
 
     // Calculate operating days of users
     let now = Timestamp::now();
@@ -155,7 +162,7 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Prepare payload for solver information message
-    let dispute_info = prepare_solver_info_message(pool, &order, &dispute).await?;
+    let dispute_info = prepare_solver_info_message(pool, &order, &dispute, &event.sender == &event.rumor.pubkey).await?;
 
     // We create a Message for admin
     let message = Message::new_dispute(

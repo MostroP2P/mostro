@@ -18,54 +18,88 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
+pub fn check_full_privacy_order(order: &Order) -> (bool, bool) {
+    let (mut full_privacy_buyer, mut full_privacy_seller) = (false, false);
+
+    // Find full privacy users in this trade
+    if order.master_buyer_pubkey == order.buyer_pubkey {
+        full_privacy_buyer = true;
+    }
+    if order.master_seller_pubkey == order.seller_pubkey {
+        full_privacy_seller = true;
+    }
+
+    (full_privacy_buyer, full_privacy_seller)
+}
+
 async fn prepare_solver_info_message(
     pool: &Pool<Sqlite>,
     order: &Order,
     dispute: &Dispute,
-    full_privacy: bool,
 ) -> Result<SolverDisputeInfo, MostroError> {
+    // Check if one or both users are in full privacy mode
+    let (full_privacy_buyer, full_privacy_seller) = check_full_privacy_order(order);
+
+    // Get master pubkeys to get users data from db
+    let master_buyer_key = &order
+        .get_master_buyer_pubkey()
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+
+    let master_seller_key: &PublicKey = &order
+        .get_master_seller_pubkey()
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+
     // Get pubkeys of initiator and counterpart
-    let (initiator_idkey, counterpart_idkey, initiator_tradekey) = if order.buyer_dispute {
+    let (initiator_tradekey, initiator, counterpart) = if order.buyer_dispute {
         (
-            &order
-                .get_master_buyer_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            &order
-                .get_master_seller_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
             &order
                 .get_buyer_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
+            if !full_privacy_buyer {
+                is_user_present(pool, master_buyer_key.to_string())
+                    .await
+                    .map_err(|cause| {
+                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                    })?
+            } else {
+                User::default()
+            },
+            if !full_privacy_seller {
+                is_user_present(pool, master_seller_key.to_string())
+                    .await
+                    .map_err(|cause| {
+                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                    })?
+            } else {
+                User::default()
+            },
         )
     } else {
         (
-            &order
-                .get_master_seller_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            &order
-                .get_master_buyer_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
             &order
                 .get_seller_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
+            if !full_privacy_seller {
+                is_user_present(pool, master_seller_key.to_string())
+                    .await
+                    .map_err(|cause| {
+                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                    })?
+            } else {
+                User::default()
+            },
+            if !full_privacy_buyer {
+                is_user_present(pool, master_buyer_key.to_string())
+                    .await
+                    .map_err(|cause| {
+                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                    })?
+            } else {
+                User::default()
+            },
         )
-    };
-
-    // Get users ratings
-    // Get counter to vote from db
-    let (counterpart, initiator) = if !full_privacy {
-        (
-            is_user_present(pool, counterpart_idkey.to_string())
-                .await
-                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?,
-            is_user_present(pool, initiator_idkey.to_string())
-                .await
-                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?,
-        )
-    } else {
-        (User::default(), User::default())
     };
 
     // Calculate operating days of users
@@ -162,7 +196,7 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Prepare payload for solver information message
-    let dispute_info = prepare_solver_info_message(pool, &order, &dispute, &event.sender == &event.rumor.pubkey).await?;
+    let dispute_info = prepare_solver_info_message(pool, &order, &dispute).await?;
 
     // We create a Message for admin
     let message = Message::new_dispute(

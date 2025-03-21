@@ -231,7 +231,7 @@ async fn handle_message_action(
         Action::AdminAddSolver => admin_add_solver_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
-        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, pool)
+        Action::AdminTakeDispute => admin_take_dispute_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
         Action::TradePubkey => trade_pubkey_action(msg, event, pool)

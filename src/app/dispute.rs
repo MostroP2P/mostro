@@ -3,7 +3,6 @@
 //! and publish dispute events to the network.
 
 use std::borrow::Cow;
-use std::str::FromStr;
 
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::new_event;
@@ -21,6 +20,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
+use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
 ///
@@ -80,14 +80,10 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
 /// Returns a tuple containing:
 /// - The counterparty's public key as a String
 /// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
-fn get_counterpart_info(
-    sender: &str,
-    buyer: &str,
-    seller: &str,
-) -> Result<(String, bool), CantDoReason> {
+fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<bool, CantDoReason> {
     match sender {
-        s if s == buyer => Ok((seller.to_string(), true)), // buyer is initiator
-        s if s == seller => Ok((buyer.to_string(), false)), // seller is initiator
+        s if s == buyer => Ok(true),   // buyer is initiator
+        s if s == seller => Ok(false), // seller is initiator
         _ => Err(CantDoReason::InvalidPubkey),
     }
 }
@@ -108,6 +104,44 @@ async fn get_valid_order(pool: &Pool<Sqlite>, msg: &Message) -> Result<Order, Mo
     }
 
     Ok(order)
+}
+
+async fn notify_dispute_to_users(
+    dispute: &Dispute,
+    msg: &Message,
+    order_id: Uuid,
+    counterpart_token: Option<u16>,
+    initiator_token: Option<u16>,
+    counterpart_pubkey: PublicKey,
+    initiator_pubkey: PublicKey,
+) -> Result<(), MostroError> {
+    // Message to discounterpart
+    enqueue_order_msg(
+        msg.get_inner_message_kind().request_id,
+        Some(order_id),
+        Action::DisputeInitiatedByPeer,
+        Some(Payload::Dispute(
+            dispute.clone().id,
+            counterpart_token,
+            None,
+        )),
+        counterpart_pubkey,
+        None,
+    )
+    .await;
+
+    // Message to dispute initiator
+    enqueue_order_msg(
+        msg.get_inner_message_kind().request_id,
+        Some(order_id),
+        Action::DisputeInitiatedByYou,
+        Some(Payload::Dispute(dispute.clone().id, initiator_token, None)),
+        initiator_pubkey,
+        None,
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Main handler for dispute actions.
@@ -145,15 +179,15 @@ pub async fn dispute_action(
     // Get message sender
     let message_sender = event.rumor.pubkey.to_string();
     // Get counterpart info
-    let (counterpart, is_buyer_dispute) =
-        match get_counterpart_info(&message_sender, &buyer, &seller) {
-            Ok((counterpart, is_buyer_dispute)) => (counterpart, is_buyer_dispute),
-            Err(cause) => return Err(MostroCantDo(cause)),
-        };
+    let is_buyer_dispute = match get_counterpart_info(&message_sender, &buyer, &seller) {
+        Ok(is_buyer_dispute) => is_buyer_dispute,
+        Err(cause) => return Err(MostroCantDo(cause)),
+    };
 
     // Setup dispute
     if order.setup_dispute(is_buyer_dispute).is_ok() {
         order
+            .clone()
             .update(pool)
             .await
             .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
@@ -170,44 +204,42 @@ pub async fn dispute_action(
         .await
         .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
-    // Send notification to dispute initiator
-    let initiator_pubkey = match PublicKey::from_str(&message_sender) {
-        Ok(pk) => pk,
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
-        }
+    // Get pubkeys of initiator and counterpart
+    let (initiator_pubkey, counterpart_pubkey) = if is_buyer_dispute {
+        (
+            &order
+                .get_buyer_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_seller_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        )
+    } else {
+        (
+            &order
+                .get_seller_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            &order
+                .get_buyer_pubkey()
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        )
     };
 
-    enqueue_order_msg(
-        msg.get_inner_message_kind().request_id,
-        Some(order_id),
-        Action::DisputeInitiatedByYou,
-        Some(Payload::Dispute(dispute.clone().id, initiator_token)),
-        initiator_pubkey,
-        None,
+    notify_dispute_to_users(
+        &dispute,
+        &msg,
+        order_id,
+        counterpart_token,
+        initiator_token,
+        *counterpart_pubkey,
+        *initiator_pubkey,
     )
-    .await;
-
-    // Send notification to counterparty
-    let counterpart_pubkey = match PublicKey::from_str(&counterpart) {
-        Ok(pk) => pk,
-        Err(_) => {
-            return Err(MostroInternalErr(ServiceError::InvalidPubkey));
-        }
-    };
-    enqueue_order_msg(
-        msg.get_inner_message_kind().request_id,
-        Some(order_id),
-        Action::DisputeInitiatedByPeer,
-        Some(Payload::Dispute(dispute.clone().id, counterpart_token)),
-        counterpart_pubkey,
-        None,
-    )
-    .await;
+    .await?;
 
     // Publish dispute event to network
     publish_dispute_event(&dispute, my_keys)
         .await
         .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
+
     Ok(())
 }

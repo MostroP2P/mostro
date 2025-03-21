@@ -32,7 +32,7 @@ pub async fn admin_cancel_action(
     // Get order
     let order = get_order(&msg, pool).await?;
     // Check if the solver is assigned to the order
-    match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order.id).await {
+    match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
         Ok(false) => {
             return Err(MostroCantDo(CantDoReason::IsNotYourDispute));
         }
@@ -45,22 +45,22 @@ pub async fn admin_cancel_action(
     }
 
     // Was order cooperatively cancelled?
-    if let Err(cause) = order.check_status(Status::CooperativelyCanceled) {
-        return Err(MostroCantDo(cause));
-    } else {
+    if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::CooperativeCancelAccepted,
             None,
-            event.rumor.pubkey,
+            event.sender,
             msg.get_inner_message_kind().trade_index,
         )
         .await;
+
+        return Ok(());
     }
 
     // Was order in dispute?
-    if order.check_status(Status::Dispute).is_ok() {
+    if order.check_status(Status::Dispute).is_err() {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 

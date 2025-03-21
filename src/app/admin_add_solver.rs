@@ -36,7 +36,7 @@ pub async fn admin_add_solver_action(
     };
 
     // Check if the pubkey is Mostro
-    if event.rumor.pubkey.to_string() != my_keys.public_key().to_string() {
+    if event.sender.to_string() != my_keys.public_key().to_string() {
         // We create a Message
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     }

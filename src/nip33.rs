@@ -31,7 +31,7 @@ pub fn new_event(
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
     tags.extend(extra_tags);
-    let tags = Tags::new(tags);
+    let tags = Tags::from_list(tags);
 
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
         .tags(tags)
@@ -142,7 +142,7 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
         );
     }
 
-    Tags::new(tags)
+    Tags::from_list(tags)
 }
 
 /// Transform mostro info fields to tags
@@ -154,7 +154,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
-    let tags: Tags = Tags::new(vec![
+    let tags: Tags = Tags::from_list(vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("mostro_version")),
             vec![env!("CARGO_PKG_VERSION").to_string()],

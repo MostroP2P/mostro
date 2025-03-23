@@ -306,8 +306,12 @@ pub async fn run(
                                 continue;
                             }
                         };
+                    println!("event: {:?}", event);
+                    message.as_object()
                     let sender_matches_rumor = event.sender == event.rumor.pubkey;
                     let message = message.to_string();
+                    println!("message: {}", message);
+                    println!("message length: {}", message.len());
                     if let Some(sig) = sig {
                         // Verify signature only if sender and rumor pubkey are different
                         if !sender_matches_rumor

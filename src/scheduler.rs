@@ -123,7 +123,7 @@ async fn job_relay_list() {
                     .tags(relay_tags)
                     .sign_with_keys(&mostro_keys)
                 {
-                    let _ = client.send_event(relay_ev).await;
+                    let _ = client.send_event(&relay_ev).await;
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -154,7 +154,7 @@ async fn job_info_event_send() {
                 Err(e) => return error!("{e}"),
             };
 
-            let _ = client.send_event(info_ev).await;
+            let _ = client.send_event(&info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -211,7 +211,7 @@ async fn job_update_rate_events() {
 
             for ev in queue_order_rate.lock().await.iter() {
                 // Send event to relay
-                let _ = client.send_event(ev.clone()).await;
+                let _ = client.send_event(&ev.clone()).await;
             }
 
             // Clear list after send events

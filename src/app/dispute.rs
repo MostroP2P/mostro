@@ -28,7 +28,7 @@ use uuid::Uuid;
 /// including status and application metadata.
 async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), MostroError> {
     // Create tags for the dispute event
-    let tags = Tags::new(vec![
+    let tags = Tags::from_list(vec![
         // Status tag - indicates the current state of the dispute
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("s")),
@@ -55,7 +55,7 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
 
     // Get nostr client and publish the event
     match get_nostr_client() {
-        Ok(client) => match client.send_event(event).await {
+        Ok(client) => match client.send_event(&event).await {
             Ok(_) => {
                 tracing::info!(
                     "Successfully published dispute event for dispute ID: {}",

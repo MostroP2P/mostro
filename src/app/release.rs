@@ -113,7 +113,7 @@ pub async fn release_action(
     // Handle child order for range orders
     if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
         if let Ok(client) = get_nostr_client() {
-            if client.send_event(event).await.is_err() {
+            if client.send_event(&event).await.is_err() {
                 tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
             }
         }

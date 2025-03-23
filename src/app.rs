@@ -294,28 +294,31 @@ pub async fn run(
                     if event.rumor.created_at.as_u64() < since_time {
                         continue;
                     }
+                    // Parse message and signature from rumor content put message in Message struct
+                    let (message, sig) = match serde_json::from_str::<(Message, Option<Signature>)>(
+                        &event.rumor.content,
+                    ) {
+                        Ok((message, signature)) => (message, signature),
+                        Err(e) => {
+                            tracing::error!("Failed to parse message, inner message, and signature from rumor content: {}", e);
+                            continue;
+                        }
+                    };
 
-                    let (message, sig): (Value, Option<Signature>) =
-                        match serde_json::from_str(&event.rumor.content) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to parse message and signature from rumor content: {}",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                    println!("event: {:?}", event);
-                    message.as_object()
+                    // Serialize message to json
+                    let message_json = match message.clone().as_json() {
+                        Ok(message_json) => message_json,
+                        Err(e) => {
+                            tracing::error!("Failed to serialize message: {}", e);
+                            continue;
+                        }
+                    };
+                    // Check if sender and rumor pubkey are different
                     let sender_matches_rumor = event.sender == event.rumor.pubkey;
-                    let message = message.to_string();
-                    println!("message: {}", message);
-                    println!("message length: {}", message.len());
                     if let Some(sig) = sig {
                         // Verify signature only if sender and rumor pubkey are different
                         if !sender_matches_rumor
-                            && !Message::verify_signature(message.clone(), event.rumor.pubkey, sig)
+                            && !Message::verify_signature(message_json, event.rumor.pubkey, sig)
                         {
                             tracing::warn!(
                                 "Signature verification failed: sender {} does not match rumor pubkey {}",
@@ -329,13 +332,7 @@ pub async fn run(
                         tracing::warn!("Error in event verification");
                         continue;
                     }
-                    let message: Message = match serde_json::from_str(&message) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::error!("Failed to deserialize message '{}': {}", message, e);
-                            continue;
-                        }
-                    };
+                    // Get inner message kind
                     let inner_message = message.get_inner_message_kind();
                     // Check if message is message with trade index
                     if let Err(e) = check_trade_index(&pool, &event, &message).await {

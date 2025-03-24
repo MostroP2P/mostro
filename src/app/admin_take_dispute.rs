@@ -248,7 +248,7 @@ pub async fn admin_take_dispute_action(
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // We create a tag to show status of the dispute
-    let tags: Tags = Tags::new(vec![
+    let tags: Tags = Tags::from_list(vec![
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("s")),
             vec![Status::InProgress.to_string()],
@@ -284,7 +284,7 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     client
-        .send_event(event)
+        .send_event(&event)
         .await
         .map_err(|e| {
             info!("Failed to send dispute {} status event: {}", dispute.id, e);

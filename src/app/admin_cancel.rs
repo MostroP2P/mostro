@@ -83,7 +83,7 @@ pub async fn admin_cancel_action(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // We create a tag to show status of the dispute
-        let tags: Tags = Tags::new(vec![
+        let tags: Tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("s")),
                 vec![DisputeStatus::SellerRefunded.to_string()],
@@ -103,7 +103,7 @@ pub async fn admin_cancel_action(
 
         match get_nostr_client() {
             Ok(client) => {
-                if let Err(e) = client.send_event(event).await {
+                if let Err(e) = client.send_event(&event).await {
                     error!("Failed to send dispute status event: {}", e);
                 }
             }

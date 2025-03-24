@@ -342,7 +342,7 @@ pub async fn publish_order(
     NOSTR_CLIENT
         .get()
         .unwrap()
-        .send_event(event)
+        .send_event(&event)
         .await
         .map(|_s| ())
         .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
@@ -431,7 +431,7 @@ pub async fn send_dm(
     if let Some(timestamp) = expiration {
         tags.push(Tag::expiration(timestamp));
     }
-    let tags = Tags::new(tags);
+    let tags = Tags::from_list(tags);
 
     let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags)
         .await
@@ -443,7 +443,7 @@ pub async fn send_dm(
 
     if let Ok(client) = get_nostr_client() {
         client
-            .send_event(event)
+            .send_event(&event)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     }
@@ -524,7 +524,7 @@ pub async fn update_order_event(
     );
 
     if let Ok(client) = get_nostr_client() {
-        if client.send_event(event).await.is_err() {
+        if client.send_event(&event).await.is_err() {
             tracing::warn!("order id : {} is expired", order_updated.id)
         }
     }

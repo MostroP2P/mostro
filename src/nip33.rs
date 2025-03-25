@@ -71,6 +71,25 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
     }
 }
 
+///
+/// # Arguments
+///
+/// * `order` - the order struct
+///
+/// # Returns a json string with order status according to nip69
+/// Possible states for nostr event are pending, in-progress, success, canceled
+fn create_status_tag(order: &Order) -> String {
+    // Check if the order is pending/in-progress/success/canceled
+    if order.check_status(Status::Pending).is_err()
+        && order.check_status(Status::Success).is_err()
+        && order.check_status(Status::Canceled).is_err()
+    {
+        "in-progress".to_string()
+    } else {
+        order.status.to_string()
+    }
+}
+
 /// Transform an order fields to tags
 ///
 /// # Arguments
@@ -94,7 +113,7 @@ pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) ->
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("s")),
-            vec![order.status.to_string()],
+            vec![create_status_tag(order)],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("amt")),

@@ -84,14 +84,11 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
     let status = order.get_order_status().map_err(MostroInternalErr)?;
     match status {
         Status::WaitingBuyerInvoice | Status::WaitingPayment => Ok((true, Status::InProgress)),
-        Status::Pending
-        | Status::Success
-        | Status::Canceled
-        | Status::Expired
-        | Status::CanceledByAdmin
-        | Status::CompletedByAdmin
-        | Status::CooperativelyCanceled
-        | Status::Dispute => Ok((true, status)),
+        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled => {
+            Ok((true, Status::Canceled))
+        }
+        Status::Success | Status::CompletedByAdmin => Ok((true, status)),
+        Status::Pending => Ok((true, status)),
         _ => Ok((false, status)),
     }
 }

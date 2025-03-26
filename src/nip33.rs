@@ -82,8 +82,10 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
 fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
     // Check if the order is pending/in-progress/success/canceled
     let status = order.get_order_status().map_err(MostroInternalErr)?;
+
     match status {
-        Status::WaitingBuyerInvoice | Status::WaitingPayment => Ok((true, Status::InProgress)),
+        Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
+        Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
         Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled => {
             Ok((true, Status::Canceled))
         }

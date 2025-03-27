@@ -218,8 +218,8 @@ pub async fn get_tags_for_new_order(
     pool: &SqlitePool,
     identity_pubkey: &PublicKey,
     trade_pubkey: &PublicKey,
-) -> Result<Tags, MostroError> {
-    let tags = match is_user_present(pool, identity_pubkey.to_string()).await {
+) -> Result<Option<Tags>, MostroError> {
+    match is_user_present(pool, identity_pubkey.to_string()).await {
         Ok(user) => {
             // We transform the order fields to tags to use in the event
             order_to_tags(
@@ -232,12 +232,10 @@ pub async fn get_tags_for_new_order(
             if identity_pubkey == trade_pubkey {
                 order_to_tags(new_order_db, None)
             } else {
-                return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+                Err(MostroInternalErr(ServiceError::InvalidPubkey))
             }
         }
-    };
-
-    Ok(tags)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -310,11 +308,15 @@ pub async fn publish_order(
     info!("New order saved Id: {}", order_id);
 
     // Get tags for new order in case of full privacy or normal order
-    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
-
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = if let Some(tags) =
+        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?
+    {
+        new_event(keys, "", order_id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
+    } else {
+        return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+    };
 
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
@@ -508,26 +510,28 @@ pub async fn update_order_event(
     // update order.status with new status
     order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order_updated, None);
-    // nip33 kind with order id as identifier and order fields as tags
-    let event = new_event(keys, "", order.id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    let order_id = order.id.to_string();
-    info!("Sending replaceable event: {event:#?}");
-    // We update the order with the new event_id
-    order_updated.event_id = event.id.to_string();
+    if let Some(tags) = order_to_tags(&order_updated, None)? {
+        // nip33 kind with order id as identifier and order fields as tags
+        let event = new_event(keys, "", order.id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        info!("Sending replaceable event: {event:#?}");
+
+        // We update the order with the new event_id
+        order_updated.event_id = event.id.to_string();
+
+        if let Ok(client) = get_nostr_client() {
+            if client.send_event(&event).await.is_err() {
+                tracing::warn!("order id : {} is expired", order_updated.id)
+            }
+        }
+    };
 
     info!(
         "Order Id: {} updated Nostr new Status: {}",
-        order_id,
+        order.id,
         status.to_string()
     );
-
-    if let Ok(client) = get_nostr_client() {
-        if client.send_event(&event).await.is_err() {
-            tracing::warn!("order id : {} is expired", order_updated.id)
-        }
-    }
 
     println!(
         "Inside update_order_event order_updated status {:?} - order id {:?}",

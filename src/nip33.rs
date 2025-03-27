@@ -2,6 +2,7 @@ use crate::lightning::LnStatus;
 use crate::Settings;
 use crate::LN_STATUS;
 use chrono::Duration;
+use mostro_core::error::{MostroError, MostroError::MostroInternalErr};
 use mostro_core::order::{Order, Status};
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
@@ -71,78 +72,110 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
     }
 }
 
+///
+/// # Arguments
+///
+/// * `order` - the order struct
+///
+/// # Returns a json string with order status according to nip69
+/// Possible states for nostr event are pending, in-progress, success, canceled
+fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
+    // Check if the order is pending/in-progress/success/canceled
+    let status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    match status {
+        Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
+        Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
+        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled => {
+            Ok((true, Status::Canceled))
+        }
+        Status::Success | Status::CompletedByAdmin => Ok((true, status)),
+        Status::Pending => Ok((true, status)),
+        _ => Ok((false, status)),
+    }
+}
+
 /// Transform an order fields to tags
 ///
 /// # Arguments
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
-    let ln_network = match LN_STATUS.get() {
-        Some(status) => status.networks.join(","),
-        None => "unknown".to_string(),
-    };
+pub fn order_to_tags(
+    order: &Order,
+    reputation_data: Option<(f64, i64, i64)>,
+) -> Result<Option<Tags>, MostroError> {
+    // Check if the order is pending/in-progress/success/canceled
+    let (create_event, status) = create_status_tags(order)?;
+    // Send just in case the order is pending/in-progress/success/canceled
+    if create_event {
+        let ln_network = match LN_STATUS.get() {
+            Some(status) => status.networks.join(","),
+            None => "unknown".to_string(),
+        };
 
-    let mut tags: Vec<Tag> = vec![
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("k")),
-            vec![order.kind.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("f")),
-            vec![order.fiat_code.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("s")),
-            vec![order.status.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("amt")),
-            vec![order.amount.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fa")),
-            create_fiat_amt_array(order),
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pm")),
-            vec![order.payment_method.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("premium")),
-            vec![order.premium.to_string()],
-        ),
-        Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("layer")),
-            vec!["lightning".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration")),
-            vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["order".to_string()],
-        ),
-    ];
-
-    // Add reputation data if available
-    if reputation_data.is_some() {
-        tags.insert(
-            7,
+        let mut tags: Vec<Tag> = vec![
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("rating")),
-                vec![create_rating_tag(reputation_data)],
+                TagKind::Custom(Cow::Borrowed("k")),
+                vec![order.kind.to_string()],
             ),
-        );
-    }
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("f")),
+                vec![order.fiat_code.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("s")),
+                vec![status.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("amt")),
+                vec![order.amount.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("fa")),
+                create_fiat_amt_array(order),
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("pm")),
+                vec![order.payment_method.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("premium")),
+                vec![order.premium.to_string()],
+            ),
+            Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("layer")),
+                vec!["lightning".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("expiration")),
+                vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("y")),
+                vec!["mostro".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("z")),
+                vec!["order".to_string()],
+            ),
+        ];
 
-    Tags::from_list(tags)
+        // Add reputation data if available
+        if reputation_data.is_some() {
+            tags.insert(
+                7,
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("rating")),
+                    vec![create_rating_tag(reputation_data)],
+                ),
+            );
+        }
+        Ok(Some(Tags::from_list(tags)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Transform mostro info fields to tags

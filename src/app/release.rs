@@ -406,12 +406,16 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    let tags = crate::nip33::order_to_tags(
+    let event = if let Some(tags) = crate::nip33::order_to_tags(
         new_order,
         Some((user.total_rating, user.total_reviews, user.created_at)),
-    );
-    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    )? {
+        crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
+    } else {
+        return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+    };
+
     new_order.event_id = event.id.to_string();
     Ok(event)
 }

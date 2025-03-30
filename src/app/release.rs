@@ -2,6 +2,7 @@ use crate::cli::settings::Settings;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
+use crate::nip33::{new_event, order_to_tags};
 use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
@@ -402,18 +403,28 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             .map_err(MostroInternalErr)?,
     };
 
-    let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let (full_privacy_buyer, full_privacy_seller) = new_order.is_full_privacy_order();
 
-    let event = if let Some(tags) = crate::nip33::order_to_tags(
-        new_order,
-        Some((user.total_rating, user.total_reviews, user.created_at)),
-    )? {
-        crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
+    let tags = if !full_privacy_buyer && !full_privacy_seller {
+        let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        order_to_tags(
+            new_order,
+            Some((user.total_rating, user.total_reviews, user.created_at)),
+        )?
+    } else {
+        order_to_tags(new_order, None)?
+    };
+
+    let event = if let Some(tags) = tags {
+        new_event(my_keys, "", new_order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
-        return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(
+            "Error creating order event".to_string(),
+        )));
     };
 
     new_order.event_id = event.id.to_string();

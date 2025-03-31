@@ -10,7 +10,6 @@ use mostro_core::error::{
 };
 use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Order;
-use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -18,27 +17,13 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
-pub fn check_full_privacy_order(order: &Order) -> (bool, bool) {
-    let (mut full_privacy_buyer, mut full_privacy_seller) = (false, false);
-
-    // Find full privacy users in this trade
-    if order.master_buyer_pubkey == order.buyer_pubkey {
-        full_privacy_buyer = true;
-    }
-    if order.master_seller_pubkey == order.seller_pubkey {
-        full_privacy_seller = true;
-    }
-
-    (full_privacy_buyer, full_privacy_seller)
-}
-
 async fn prepare_solver_info_message(
     pool: &Pool<Sqlite>,
     order: &Order,
     dispute: &Dispute,
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Check if one or both users are in full privacy mode
-    let (full_privacy_buyer, full_privacy_seller) = check_full_privacy_order(order);
+    let (full_privacy_buyer, full_privacy_seller) = order.is_full_privacy_order();
 
     // Get master pubkeys to get users data from db
     let master_buyer_key = &order
@@ -49,7 +34,7 @@ async fn prepare_solver_info_message(
         .get_master_seller_pubkey()
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
-    // Get pubkeys of initiator and counterpart
+    // Get pubkeys of initiator and counterpart and users data if not in full privacy mode
     let (initiator_tradekey, initiator, counterpart) = if order.buyer_dispute {
         (
             &order
@@ -57,22 +42,26 @@ async fn prepare_solver_info_message(
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
             if !full_privacy_buyer {
-                is_user_present(pool, master_buyer_key.to_string())
-                    .await
-                    .map_err(|cause| {
-                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                    })?
+                Some(
+                    is_user_present(pool, master_buyer_key.to_string())
+                        .await
+                        .map_err(|cause| {
+                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                        })?,
+                )
             } else {
-                User::default()
+                None
             },
             if !full_privacy_seller {
-                is_user_present(pool, master_seller_key.to_string())
-                    .await
-                    .map_err(|cause| {
-                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                    })?
+                Some(
+                    is_user_present(pool, master_seller_key.to_string())
+                        .await
+                        .map_err(|cause| {
+                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                        })?,
+                )
             } else {
-                User::default()
+                None
             },
         )
     } else {
@@ -82,39 +71,37 @@ async fn prepare_solver_info_message(
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
             if !full_privacy_seller {
-                is_user_present(pool, master_seller_key.to_string())
-                    .await
-                    .map_err(|cause| {
-                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                    })?
+                Some(
+                    is_user_present(pool, master_seller_key.to_string())
+                        .await
+                        .map_err(|cause| {
+                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                        })?,
+                )
             } else {
-                User::default()
+                None
             },
             if !full_privacy_buyer {
-                is_user_present(pool, master_buyer_key.to_string())
-                    .await
-                    .map_err(|cause| {
-                        MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                    })?
+                Some(
+                    is_user_present(pool, master_buyer_key.to_string())
+                        .await
+                        .map_err(|cause| {
+                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                        })?,
+                )
             } else {
-                User::default()
+                None
             },
         )
     };
 
-    // Calculate operating days of users
-    let now = Timestamp::now();
-    let initiator_operating_days = (now.as_u64() - initiator.created_at as u64) / 86400;
-    let couterpart_operating_days = (now.as_u64() - counterpart.created_at as u64) / 86400;
-
+    // Prepare dispute info
     let dispute_info = SolverDisputeInfo::new(
         order,
         dispute,
         initiator_tradekey.clone(),
-        &counterpart,
-        &initiator,
-        initiator_operating_days,
-        couterpart_operating_days,
+        counterpart,
+        initiator,
     );
 
     Ok(dispute_info)

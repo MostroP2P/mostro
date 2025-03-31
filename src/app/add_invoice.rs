@@ -79,7 +79,7 @@ pub async fn add_invoice_action(
                     MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
                 })?;
                 updated_order
-            },
+            }
             Err(_) => order.clone(), // Fallback to original order if update fails
         };
 

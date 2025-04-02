@@ -53,7 +53,10 @@ pub async fn fiat_sent_action(
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
     // Create peer
-    let peer = Peer::new(event.rumor.pubkey.to_string());
+    let peer = Peer {
+        pubkey: event.rumor.pubkey.to_string(),
+        reputation: None,
+    };
 
     // We a message to the seller
     enqueue_order_msg(
@@ -66,7 +69,10 @@ pub async fn fiat_sent_action(
     )
     .await;
     // We send a message to buyer to wait
-    let peer = Peer::new(seller_pubkey.to_string());
+    let peer = Peer {
+        pubkey: seller_pubkey.to_string(),
+        reputation: None,
+    };
 
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,

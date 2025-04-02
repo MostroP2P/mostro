@@ -533,11 +533,6 @@ pub async fn update_order_event(
         status.to_string()
     );
 
-    println!(
-        "Inside update_order_event order_updated status {:?} - order id {:?}",
-        order_updated.status, order_updated.id,
-    );
-
     Ok(order_updated)
 }
 

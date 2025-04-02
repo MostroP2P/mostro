@@ -1,11 +1,13 @@
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
+    enqueue_order_msg, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
+    show_hold_invoice,
 };
 
-use crate::db::{seller_has_pending_order, update_user_trade_index};
+use crate::db::{is_user_present, seller_has_pending_order, update_user_trade_index};
+use mostro_core::dispute::UserDisputeInfo;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
-use mostro_core::message::Message;
+use mostro_core::message::{Action, Message, Payload, Peer};
 use mostro_core::order::Status;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -86,6 +88,34 @@ pub async fn take_buy_action(
     update_user_trade_index(pool, event.sender.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let reputation_data = if let Ok(user) = is_user_present(pool, event.sender.to_string()).await {
+        let now = Timestamp::now().as_u64();
+        UserDisputeInfo {
+            rating: user.total_rating,
+            reviews: user.total_reviews,
+            operating_days: (now - user.created_at as u64) / 86400,
+        }
+    } else {
+        UserDisputeInfo {
+            rating: 0.0,
+            reviews: 0,
+            operating_days: 0,
+        }
+    };
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::TakeBuy,
+        Some(Payload::Peer(Peer {
+            pubkey: event.sender.to_string(),
+            reputation: Some(reputation_data),
+        })),
+        buyer_pubkey,
+        None,
+    )
+    .await;
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

@@ -282,7 +282,7 @@ pub async fn run(
                     let event = match nip59::extract_rumor(&my_keys, &event).await {
                         Ok(u) => u,
                         Err(_) => {
-                            println!("Error unwrapping gift");
+                            tracing::warn!("Error unwrapping gift");
                             continue;
                         }
                     };

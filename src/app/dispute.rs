@@ -184,6 +184,9 @@ pub async fn dispute_action(
         Err(cause) => return Err(MostroCantDo(cause)),
     };
 
+    // Create new dispute record and generate security tokens
+    let mut dispute = Dispute::new(order_id, order.status.clone());
+
     // Setup dispute
     if order.setup_dispute(is_buyer_dispute).is_ok() {
         order
@@ -193,8 +196,6 @@ pub async fn dispute_action(
             .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     }
 
-    // Create new dispute record and generate security tokens
-    let mut dispute = Dispute::new(order_id);
     // Create tokens
     let (initiator_token, counterpart_token) = dispute.create_tokens(is_buyer_dispute);
 

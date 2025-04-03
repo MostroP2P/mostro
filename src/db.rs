@@ -587,8 +587,11 @@ pub async fn is_assigned_solver(
     solver_pubkey: &str,
     order_id: Uuid,
 ) -> Result<bool, MostroError> {
-    println!("solver_pubkey: {}", solver_pubkey);
-    println!("order_id: {}", order_id);
+    tracing::info!(
+        "Solver_pubkey: {} assigned to order {}",
+        solver_pubkey,
+        order_id
+    );
     let result = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM disputes WHERE solver_pubkey = ? AND order_id = ?)",
     )

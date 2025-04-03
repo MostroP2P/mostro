@@ -399,7 +399,11 @@ async fn job_expire_pending_older_orders() {
             info!("Check older orders and mark them Expired - check is done every minute");
             if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
                 for order in older_orders_list.iter() {
-                    println!("Uid {} - created at {}", order.id, order.created_at);
+                    tracing::info!(
+                        "Order id {} - created at {} is expired",
+                        order.id,
+                        order.created_at
+                    );
                     // We update the order id with the new event_id
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await

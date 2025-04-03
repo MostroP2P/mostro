@@ -230,7 +230,7 @@ pub async fn get_tags_for_new_order(
         Err(_) => {
             // We transform the order fields to tags to use in the event
             if identity_pubkey == trade_pubkey {
-                order_to_tags(new_order_db, None)
+                order_to_tags(new_order_db, Some((0.0, 0, 0)))
             } else {
                 Err(MostroInternalErr(ServiceError::InvalidPubkey))
             }

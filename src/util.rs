@@ -15,9 +15,11 @@ use crate::NOSTR_CLIENT;
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::dispute::Dispute;
+use mostro_core::dispute::UserDisputeInfo;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use mostro_core::message::Peer;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -942,6 +944,44 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
         }
     }
     Ok(payment_request)
+}
+
+pub async fn notify_taker_reputation(
+    pool: &Pool<Sqlite>,
+    destination_pubkey: PublicKey,
+    event: &UnwrappedGift,
+    request_id: Option<u64>,
+    order: &Order,
+) -> Result<(), MostroError> {
+    let reputation_data = match is_user_present(pool, event.sender.to_string()).await {
+        Ok(user) => {
+            let now = Timestamp::now().as_u64();
+            UserDisputeInfo {
+                rating: user.total_rating,
+                reviews: user.total_reviews,
+                operating_days: (now - user.created_at as u64) / 86400,
+            }
+        }
+        Err(_) => UserDisputeInfo {
+            rating: 0.0,
+            reviews: 0,
+            operating_days: 0,
+        },
+    };
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::TakeSell,
+        Some(Payload::Peer(Peer {
+            pubkey: event.sender.to_string(),
+            reputation: Some(reputation_data),
+        })),
+        destination_pubkey,
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 #[cfg(test)]

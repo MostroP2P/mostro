@@ -194,7 +194,7 @@ pub async fn dispute_action(
     }
 
     // Create new dispute record and generate security tokens
-    let mut dispute = Dispute::new(order_id);
+    let mut dispute = Dispute::new(order_id, order.status.to_string());
     // Create tokens
     let (initiator_token, counterpart_token) = dispute.create_tokens(is_buyer_dispute);
 

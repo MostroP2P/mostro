@@ -1,14 +1,13 @@
 use crate::util::{
-    enqueue_order_msg, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, notify_taker_reputation,
     set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
 };
 
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 
-use crate::db::{buyer_has_pending_order, is_user_present, update_user_trade_index};
-use mostro_core::dispute::UserDisputeInfo;
-use mostro_core::message::{Action, Message, Payload, Peer};
+use crate::db::{buyer_has_pending_order, update_user_trade_index};
+use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -117,33 +116,8 @@ pub async fn take_sell_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    let reputation_data = if let Ok(user) = is_user_present(pool, event.sender.to_string()).await {
-        let now = Timestamp::now().as_u64();
-        UserDisputeInfo {
-            rating: user.total_rating,
-            reviews: user.total_reviews,
-            operating_days: (now - user.created_at as u64) / 86400,
-        }
-    } else {
-        UserDisputeInfo {
-            rating: 0.0,
-            reviews: 0,
-            operating_days: 0,
-        }
-    };
-
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::TakeSell,
-        Some(Payload::Peer(Peer {
-            pubkey: event.sender.to_string(),
-            reputation: Some(reputation_data),
-        })),
-        seller_pubkey,
-        None,
-    )
-    .await;
+    // Notify taker reputation
+    notify_taker_reputation(pool, seller_pubkey, event, request_id, &order).await?;
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

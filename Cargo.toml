@@ -37,7 +37,7 @@ uuid = { version = "1.8.0", features = [
   "serde",
 ] }
 reqwest = { version = "0.12.1", features = ["json"] }
-mostro-core = { version = "0.6.35", features = ["sqlx"] }
+mostro-core = { version = "0.6.36", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 config = "0.15.8"
@@ -49,3 +49,6 @@ bitcoin = "0.32.5"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
+
+[patch.crates-io]
+mostro-core = { path = "../mostro-core" }

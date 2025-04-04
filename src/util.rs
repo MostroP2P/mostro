@@ -974,7 +974,7 @@ pub async fn notify_taker_reputation(
         Some(order.id),
         Action::TakeSell,
         Some(Payload::Peer(Peer {
-            pubkey: event.sender.to_string(),
+            pubkey: "".to_string(),
             reputation: Some(reputation_data),
         })),
         destination_pubkey,

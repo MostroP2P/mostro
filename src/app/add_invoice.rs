@@ -1,5 +1,6 @@
 use crate::util::{
-    enqueue_order_msg, get_order, show_hold_invoice, update_order_event, validate_invoice,
+    enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
+    validate_invoice,
 };
 
 use mostro_core::error::MostroError::{self, *};
@@ -66,6 +67,11 @@ pub async fn add_invoice_action(
             return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
         }
     }
+
+    // Notify taker reputation
+    tracing::info!("Notifying taker reputation to maker");
+    notify_taker_reputation(pool, &order).await?;
+
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // Check if the order has a preimage

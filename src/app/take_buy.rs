@@ -1,6 +1,5 @@
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, get_order, notify_taker_reputation,
-    show_hold_invoice,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -87,9 +86,6 @@ pub async fn take_buy_action(
     update_user_trade_index(pool, event.sender.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    // Notify taker reputation
-    notify_taker_reputation(pool, buyer_pubkey, event, request_id, &order).await?;
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

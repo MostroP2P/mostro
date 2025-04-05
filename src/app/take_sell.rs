@@ -1,6 +1,6 @@
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, get_order, notify_taker_reputation,
-    set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
+    get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
+    show_hold_invoice, update_order_event, validate_invoice,
 };
 
 use mostro_core::error::MostroError::{self, *};
@@ -115,9 +115,6 @@ pub async fn take_sell_action(
     update_user_trade_index(pool, event.sender.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    // Notify taker reputation
-    notify_taker_reputation(pool, seller_pubkey, event, request_id, &order).await?;
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

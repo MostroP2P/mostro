@@ -948,12 +948,18 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
 
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
-    destination_pubkey: PublicKey,
-    event: &UnwrappedGift,
-    request_id: Option<u64>,
     order: &Order,
 ) -> Result<(), MostroError> {
-    let reputation_data = match is_user_present(pool, event.sender.to_string()).await {
+    // Check if is buy or sell order we need this info to understand the user needed and the receiver of notification
+    let is_buy_order = order.is_buy_order().is_ok();
+    // Get user needed
+    let user = match is_buy_order {
+        true => order.get_seller_pubkey().map_err(MostroInternalErr)?,
+        false => order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+    };
+
+    // Get reputation data
+    let reputation_data = match is_user_present(pool, user.to_string()).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
             UserDisputeInfo {
@@ -969,15 +975,45 @@ pub async fn notify_taker_reputation(
         },
     };
 
+    // Get order status
+    let order_status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    // Get action for info message and receiver key
+    let (action, receiver) = match order_status {
+        Status::WaitingBuyerInvoice => {
+            if !is_buy_order {
+                (
+                    Action::PayInvoice,
+                    order.get_seller_pubkey().map_err(MostroInternalErr)?,
+                )
+            } else {
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+        }
+        Status::WaitingPayment => {
+            if is_buy_order {
+                (
+                    Action::AddInvoice,
+                    order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+                )
+            } else {
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+        }
+        _ => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+    };
+
     enqueue_order_msg(
-        request_id,
+        None,
         Some(order.id),
-        Action::TakeSell,
+        action,
         Some(Payload::Peer(Peer {
             pubkey: "".to_string(),
             reputation: Some(reputation_data),
         })),
-        destination_pubkey,
+        receiver,
         None,
     )
     .await;

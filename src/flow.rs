@@ -1,4 +1,4 @@
-use crate::util::enqueue_order_msg;
+use crate::util::{enqueue_order_msg, notify_taker_reputation};
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Payload};
@@ -105,6 +105,10 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
             None,
         )
         .await;
+
+        // Notify taker reputation to maker
+        tracing::info!("Notifying taker reputation to maker");
+        notify_taker_reputation(&pool, &order).await?;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id

@@ -15,7 +15,7 @@ use crate::NOSTR_CLIENT;
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::dispute::Dispute;
-use mostro_core::dispute::UserDisputeInfo;
+use mostro_core::user::UserInfo;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -962,13 +962,13 @@ pub async fn notify_taker_reputation(
     let reputation_data = match is_user_present(pool, user.to_string()).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
-            UserDisputeInfo {
+            UserInfo {
                 rating: user.total_rating,
                 reviews: user.total_reviews,
                 operating_days: (now - user.created_at as u64) / 86400,
             }
         }
-        Err(_) => UserDisputeInfo {
+        Err(_) => UserInfo {
             rating: 0.0,
             reviews: 0,
             operating_days: 0,

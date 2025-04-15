@@ -15,13 +15,13 @@ use crate::NOSTR_CLIENT;
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::dispute::Dispute;
-use mostro_core::user::UserInfo;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use mostro_core::message::Peer;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use mostro_core::user::UserInfo;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
@@ -954,8 +954,10 @@ pub async fn notify_taker_reputation(
     let is_buy_order = order.is_buy_order().is_ok();
     // Get user needed
     let user = match is_buy_order {
-        true => order.get_seller_pubkey().map_err(MostroInternalErr)?,
-        false => order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+        true => order
+            .get_master_seller_pubkey()
+            .map_err(MostroInternalErr)?,
+        false => order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
     };
 
     // Get reputation data

@@ -18,8 +18,10 @@ use mostro_core::dispute::Dispute;
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use mostro_core::message::Peer;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use mostro_core::user::UserInfo;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
@@ -533,11 +535,6 @@ pub async fn update_order_event(
         status.to_string()
     );
 
-    println!(
-        "Inside update_order_event order_updated status {:?} - order id {:?}",
-        order_updated.status, order_updated.id,
-    );
-
     Ok(order_updated)
 }
 
@@ -947,6 +944,82 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
         }
     }
     Ok(payment_request)
+}
+
+pub async fn notify_taker_reputation(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+) -> Result<(), MostroError> {
+    // Check if is buy or sell order we need this info to understand the user needed and the receiver of notification
+    let is_buy_order = order.is_buy_order().is_ok();
+    // Get user needed
+    let user = match is_buy_order {
+        true => order
+            .get_master_seller_pubkey()
+            .map_err(MostroInternalErr)?,
+        false => order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
+    };
+
+    // Get reputation data
+    let reputation_data = match is_user_present(pool, user.to_string()).await {
+        Ok(user) => {
+            let now = Timestamp::now().as_u64();
+            UserInfo {
+                rating: user.total_rating,
+                reviews: user.total_reviews,
+                operating_days: (now - user.created_at as u64) / 86400,
+            }
+        }
+        Err(_) => UserInfo {
+            rating: 0.0,
+            reviews: 0,
+            operating_days: 0,
+        },
+    };
+
+    // Get order status
+    let order_status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    // Get action for info message and receiver key
+    let (action, receiver) = match order_status {
+        Status::WaitingBuyerInvoice => {
+            if !is_buy_order {
+                (
+                    Action::PayInvoice,
+                    order.get_seller_pubkey().map_err(MostroInternalErr)?,
+                )
+            } else {
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+        }
+        Status::WaitingPayment => {
+            if is_buy_order {
+                (
+                    Action::AddInvoice,
+                    order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+                )
+            } else {
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+        }
+        _ => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+    };
+
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        action,
+        Some(Payload::Peer(Peer {
+            pubkey: "".to_string(),
+            reputation: Some(reputation_data),
+        })),
+        receiver,
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 #[cfg(test)]

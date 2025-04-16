@@ -208,7 +208,10 @@ pub async fn admin_take_dispute_action(
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Peer(Peer::new(event.sender.to_hex()))),
+        Some(Payload::Peer(Peer {
+            pubkey: event.sender.to_hex(),
+            reputation: None,
+        })),
     );
     // Send to buyer
     send_dm(

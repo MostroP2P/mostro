@@ -20,6 +20,7 @@ use crate::lightning::LndConnector;
 use mostro_core::message::Message;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use secrecy::SecretString;
 use std::env;
 use std::process::exit;
 use std::sync::OnceLock;
@@ -28,10 +29,10 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
-
 static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
+static MOSTRO_DB_PASSWORD: OnceLock<SecretString> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageQueues {
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
     init_global_settings(Settings::new(config_path)?);
 
     // Connect to database
+    // TODO: will move this to an ARC or something that can be shared between threads and avoid re-initing the database
     let pool = db::connect().await?;
 
     // Connect to relays

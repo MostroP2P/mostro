@@ -10,6 +10,7 @@ use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
 use crate::MESSAGE_QUEUES;
+use crate::MOSTRO_DB_PASSWORD;
 use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
@@ -20,10 +21,12 @@ use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use mostro_core::message::Peer;
 use mostro_core::message::{Action, Message, Payload};
+use mostro_core::order::store_encrypted;
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use mostro_core::user::UserInfo;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use secrecy::ExposeSecret;
 use sqlx::Pool;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
@@ -367,12 +370,19 @@ async fn prepare_new_order(
     // Get expiration time of the order
     let expiry_date = get_expiration_date(new_order.expires_at);
 
+    // let creator_pubkey = store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get()).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let password = MOSTRO_DB_PASSWORD.get().unwrap();
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
         kind: OrderKind::Sell.to_string(),
         status: Status::Pending.to_string(),
-        creator_pubkey: initiator_pubkey.to_string(),
+        creator_pubkey: store_encrypted(
+            &initiator_pubkey.to_string(),
+            Some(password.expose_secret()),
+        )
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
         fee,
@@ -391,13 +401,21 @@ async fn prepare_new_order(
         Some(OrderKind::Buy) => {
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_buyer_pubkey = Some(identity_pubkey.to_string());
+            new_order_db.master_buyer_pubkey = Some(
+                store_encrypted(&identity_pubkey.to_string(), Some(password.expose_secret()))
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+            );
             new_order_db.trade_index_buyer = trade_index;
         }
         Some(OrderKind::Sell) => {
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_seller_pubkey = Some(identity_pubkey.to_string());
+            new_order_db.master_seller_pubkey = Some(
+                store_encrypted(&identity_pubkey.to_string(), Some(password.expose_secret()))
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+            );
             new_order_db.trade_index_seller = trade_index;
         }
         None => {
@@ -533,6 +551,11 @@ pub async fn update_order_event(
         "Order Id: {} updated Nostr new Status: {}",
         order.id,
         status.to_string()
+    );
+
+    println!(
+        "Inside update_order_event order_updated status {:?} - order id {:?}",
+        order_updated.status, order_updated.id,
     );
 
     Ok(order_updated)
@@ -945,6 +968,7 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     }
     Ok(payment_request)
 }
+
 
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,

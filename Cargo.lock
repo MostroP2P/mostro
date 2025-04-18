@@ -155,7 +155,7 @@ dependencies = [
 name = "anyhow"
 version = "1.0.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
+checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
 name = "argon2"
@@ -1999,6 +1999,7 @@ dependencies = [
  "mostro-core",
  "nostr-sdk",
  "once_cell",
+ "openssl",
  "reqwest",
  "rpassword",
  "secrecy",
@@ -2015,12 +2016,13 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.6.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251ca03986e830d3e7e3ed8774d59f65c646c005a0034a53b88a064b1b1bf431"
 dependencies = [
  "anyhow",
+ "argon2",
+ "base64 0.21.7",
  "bitcoin",
  "bitcoin_hashes 0.16.0",
+ "chacha20poly1305",
  "chrono",
  "nostr-sdk",
  "rand 0.9.0",
@@ -2239,6 +2241,7 @@ checksum = "8288979acd84749c744a9014b4382d42b8f7b2592847b5afb2ed29e5d16ede07"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]

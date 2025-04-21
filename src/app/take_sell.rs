@@ -4,11 +4,9 @@ use crate::util::{
 };
 use crate::MOSTRO_DB_PASSWORD;
 
+use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
-use secrecy::ExposeSecret;
-
-use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use mostro_core::message::Message;
 use mostro_core::order::{store_encrypted, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
@@ -49,10 +47,6 @@ pub async fn take_sell_action(
     // Get order
     let mut order = get_order(&msg, pool).await?;
 
-    // if let Some(password) = MOSTRO_DB_PASSWORD.get() {
-    //     decrypt_data(order.get_master_buyer_pubkey().map_err(MostroInternalErr)?.as_bytes(), Some(password.expose_secret())).unwrap();
-    // }
-
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Check if the seller has a pending order
@@ -91,12 +85,9 @@ pub async fn take_sell_action(
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(
-        store_encrypted(
-            &event.sender.to_string(),
-            Some(MOSTRO_DB_PASSWORD.get().unwrap().expose_secret()),
-        )
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+        store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
     );
 
     let trade_index = match msg.get_inner_message_kind().trade_index {

@@ -1,5 +1,5 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, Salt, SaltString},
+    password_hash::{rand_core::OsRng, SaltString},
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
 };
 use mostro_core::error::ServiceError;
@@ -125,8 +125,13 @@ fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError
         .verify_password(password.as_bytes(), password_hash)
         .is_ok()
     {
-        MOSTRO_DB_PASSWORD.set(SecretString::from(password));
-        Ok(true)
+        if MOSTRO_DB_PASSWORD.set(SecretString::from(password)).is_ok() {
+            Ok(true)
+        } else {
+            Err(MostroInternalErr(ServiceError::DbAccessError(
+                "Failed to save password".to_string(),
+            )))
+        }
     } else {
         Err(MostroInternalErr(ServiceError::DbAccessError(
             "Invalid password".to_string(),
@@ -676,6 +681,11 @@ pub async fn find_solver_pubkey(
 }
 
 pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
+    //TODO: think about this - how to find quickly if user exists in the database 
+    // Decrypt public key if database is encrypted
+    let public_key =
+        decrypt_data(public_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
+
     let user = sqlx::query_as::<_, User>(
         r#"
             SELECT *
@@ -770,7 +780,7 @@ pub async fn seller_has_pending_order(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Check if database is encrypted
-    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+    if MOSTRO_DB_PASSWORD.get().is_some() {
         let orders_to_check = sqlx::query_as::<_, Order>(
             r#"
                 SELECT * FROM orders WHERE status = 'waiting-payment'
@@ -786,11 +796,9 @@ pub async fn seller_has_pending_order(
                 .get_master_seller_pubkey()
                 .map_err(MostroInternalErr)?;
             // Decrypt master buyer pubkey
-            let master_pubkey_decrypted = decrypt_data(
-                master_seller_pubkey.to_string(),
-                Some(password.expose_secret()),
-            )
-            .map_err(MostroInternalErr)?;
+            let master_pubkey_decrypted =
+                decrypt_data(master_seller_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
+                    .map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 // Foundd another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);
@@ -829,7 +837,7 @@ pub async fn buyer_has_pending_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Check if database is encrypted
-    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+    if MOSTRO_DB_PASSWORD.get().is_some() {
         let orders_to_check = sqlx::query_as::<_, Order>(
             r#"
                 SELECT * FROM orders WHERE status = 'waiting-buyer-invoice'
@@ -842,11 +850,9 @@ pub async fn buyer_has_pending_order(
         for order in orders_to_check {
             let master_buyer_pubkey = order.get_master_buyer_pubkey().map_err(MostroInternalErr)?;
             // Decrypt master buyer pubkey
-            let master_pubkey_decrypted = decrypt_data(
-                master_buyer_pubkey.to_string(),
-                Some(password.expose_secret()),
-            )
-            .map_err(MostroInternalErr)?;
+            let master_pubkey_decrypted =
+                decrypt_data(master_buyer_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
+                    .map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 // Foundd another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);

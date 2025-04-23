@@ -22,7 +22,7 @@ use mostro_core::error::ServiceError;
 use mostro_core::message::Peer;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::store_encrypted;
-use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
+use mostro_core::order::{decrypt_data, Kind as OrderKind, Order, SmallOrder, Status};
 use mostro_core::user::UserInfo;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -969,14 +969,18 @@ pub async fn notify_taker_reputation(
     let is_buy_order = order.is_buy_order().is_ok();
     // Get user needed
     let user = match is_buy_order {
-        true => order
-            .get_master_seller_pubkey()
-            .map_err(MostroInternalErr)?,
-        false => order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
+        true => order.master_seller_pubkey.clone(),
+        false => order.master_buyer_pubkey.clone(),
     };
 
-    // Get reputation data
-    let reputation_data = match is_user_present(pool, user.to_string()).await {
+    let user_decrypted_key = if let Some(user) = user {
+        // Get reputation data
+        decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
+    } else {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    };
+
+    let reputation_data = match is_user_present(pool, user_decrypted_key).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
             UserInfo {

@@ -394,7 +394,7 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_buyer_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
+                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get(), None)
                     .await
                     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );
@@ -404,7 +404,7 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_seller_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
+                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get(), None)
                     .await
                     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );

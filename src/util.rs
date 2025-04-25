@@ -989,7 +989,9 @@ pub async fn notify_taker_reputation(
                     order.get_seller_pubkey().map_err(MostroInternalErr)?,
                 )
             } else {
-                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+                //FIX for the case of a buy order and maker is adding invoice
+                // just return ok
+                return Ok(());
             }
         }
         Status::WaitingPayment => {

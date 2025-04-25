@@ -9,8 +9,6 @@ use crate::{db::*, MESSAGE_QUEUES};
 use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
 use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
@@ -206,7 +204,7 @@ async fn job_update_rate_events() {
         loop {
             info!(
                 "I run async every {} minutes - update rate event of users",
-                interval
+                interval / 60
             );
 
             for ev in queue_order_rate.lock().await.iter() {
@@ -232,27 +230,27 @@ async fn job_update_rate_events() {
     });
 }
 
-async fn job_cancel_orders() -> Result<(), MostroError> {
+async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
 
     let pool = match connect().await {
         Ok(p) => p,
         Err(e) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                e.to_string(),
-            )))
+            return error!("{e}");
         }
     };
     let keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                e.to_string(),
-            )))
+            return error!("{e}");
         }
     };
 
-    let mut ln_client = LndConnector::new().await?;
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client");
+    };
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds;
 
@@ -381,7 +379,6 @@ async fn job_cancel_orders() -> Result<(), MostroError> {
             tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
         }
     });
-    Ok(())
 }
 
 async fn job_expire_pending_older_orders() {

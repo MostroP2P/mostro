@@ -1008,7 +1008,7 @@ pub async fn notify_taker_reputation(
                     order.get_seller_pubkey().map_err(MostroInternalErr)?,
                 )
             } else {
-                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+                return Ok(());
             }
         }
         Status::WaitingPayment => {

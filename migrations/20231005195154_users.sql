@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS users (
   pubkey char(64) primary key not null,
   is_admin integer not null default 0,
+  admin_password char(64),
   is_solver integer not null default 0,
   is_banned integer not null default 0,
   category integer not null default 0,

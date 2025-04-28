@@ -3,10 +3,11 @@ use crate::util::{
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
+use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::Message;
-use mostro_core::order::Status;
+use mostro_core::order::{store_encrypted, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -66,7 +67,11 @@ pub async fn take_buy_action(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Add seller identity and trade index to the order
-    order.master_seller_pubkey = Some(event.sender.to_string());
+    order.master_seller_pubkey = Some(
+        store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+    );
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {

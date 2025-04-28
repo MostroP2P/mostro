@@ -2,13 +2,13 @@ use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
     show_hold_invoice, update_order_event, validate_invoice,
 };
-
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::{CantDoReason, ServiceError};
+use crate::MOSTRO_DB_PASSWORD;
 
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::Message;
-use mostro_core::order::{Order, Status};
+use mostro_core::order::{store_encrypted, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -84,7 +84,12 @@ pub async fn take_sell_action(
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
-    order.master_buyer_pubkey = Some(event.sender.to_string());
+    order.master_buyer_pubkey = Some(
+        store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+    );
+
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {

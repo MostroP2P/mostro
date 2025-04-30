@@ -1,6 +1,6 @@
 pub mod invoice;
 
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
 use crate::util::bytes_to_string;
 

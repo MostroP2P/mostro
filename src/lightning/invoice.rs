@@ -1,4 +1,4 @@
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 use crate::lnurl::ln_exists;
 
 use chrono::prelude::*;

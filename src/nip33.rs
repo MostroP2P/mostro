@@ -1,6 +1,8 @@
 use crate::lightning::LnStatus;
 use crate::Settings;
 use crate::LN_STATUS;
+use crate::Settings;
+use crate::LN_STATUS;
 use chrono::Duration;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr};
 use mostro_core::order::{Order, Status};

@@ -37,7 +37,7 @@ use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
-use crate::Settings;
+use crate::config::settings::Settings;
 
 // External dependencies
 use mostro_core::error::CantDoReason;

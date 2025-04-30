@@ -37,7 +37,7 @@ async fn prepare_solver_info_message(
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode
     let (initiator_tradekey, initiator, counterpart) = if order.buyer_dispute {
         (
-            &order
+            order
                 .get_buyer_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
@@ -66,7 +66,7 @@ async fn prepare_solver_info_message(
         )
     } else {
         (
-            &order
+            order
                 .get_seller_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),

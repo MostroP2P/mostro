@@ -14,6 +14,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
+use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -28,7 +29,10 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
     let conn = if !db_path.exists() {
-        let _file = std::fs::File::create_new(db_path)
+        let _file = OpenOptions::new()
+            .write(true)
+            .create_new(true) // fails if the file already exists
+            .open(db_path)
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
@@ -561,6 +565,9 @@ pub async fn update_user_rating(
         return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     if total_rating < 0.0 || total_rating > (total_reviews * 5) as f64 {
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
+    }
+    if !(min_rating <= last_rating && last_rating <= max_rating) {
         return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
     let result = sqlx::query!(

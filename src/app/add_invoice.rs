@@ -86,7 +86,7 @@ pub async fn add_invoice_action(
                 })?;
                 updated_order
             }
-            Err(_) => order.clone(), // Fallback to original order if update fails
+            Err(e) => return Err(e),
         };
 
         // We send a confirmation message to seller

@@ -64,7 +64,7 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
         ]);
         json_data.to_string()
     } else {
-        "No data in reputation tag".to_string()
+        "{}".to_string()
     }
 }
 

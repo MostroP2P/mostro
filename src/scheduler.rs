@@ -9,6 +9,8 @@ use crate::{db::*, MESSAGE_QUEUES};
 use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use mostro_core::message::Message;
 use mostro_core::order::{Kind, Status};
 use nostr_sdk::EventBuilder;
@@ -121,7 +123,7 @@ async fn job_relay_list() {
                     .tags(relay_tags)
                     .sign_with_keys(&mostro_keys)
                 {
-                    let _ = client.send_event(relay_ev).await;
+                    let _ = client.send_event(&relay_ev).await;
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -152,7 +154,7 @@ async fn job_info_event_send() {
                 Err(e) => return error!("{e}"),
             };
 
-            let _ = client.send_event(info_ev).await;
+            let _ = client.send_event(&info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
@@ -209,7 +211,7 @@ async fn job_update_rate_events() {
 
             for ev in queue_order_rate.lock().await.iter() {
                 // Send event to relay
-                let _ = client.send_event(ev.clone()).await;
+                let _ = client.send_event(&ev.clone()).await;
             }
 
             // Clear list after send events
@@ -230,16 +232,24 @@ async fn job_update_rate_events() {
     });
 }
 
-async fn job_cancel_orders() -> anyhow::Result<()> {
+async fn job_cancel_orders() -> Result<(), MostroError> {
     info!("Create a pool to connect to db");
 
     let pool = match connect().await {
         Ok(p) => p,
-        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
     let keys = match get_keys() {
         Ok(keys) => keys,
-        Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
     };
 
     let mut ln_client = LndConnector::new().await?;
@@ -389,7 +399,11 @@ async fn job_expire_pending_older_orders() {
             info!("Check older orders and mark them Expired - check is done every minute");
             if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
                 for order in older_orders_list.iter() {
-                    println!("Uid {} - created at {}", order.id, order.created_at);
+                    tracing::info!(
+                        "Order id {} - created at {} is expired",
+                        order.id,
+                        order.created_at
+                    );
                     // We update the order id with the new event_id
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await

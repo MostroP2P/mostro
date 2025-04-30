@@ -1,8 +1,7 @@
 use crate::util::{
-    enqueue_order_msg, get_order, show_hold_invoice, update_order_event, validate_invoice,
+    enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
+    validate_invoice,
 };
-
-use anyhow::Result;
 
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
@@ -14,33 +13,26 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 
-pub async fn check_order_status(
+pub async fn pay_new_invoice(
     order: &mut Order,
     pool: &Pool<Sqlite>,
     msg: &Message,
 ) -> Result<(), MostroError> {
-    // Buyer can add invoice orders with WaitingBuyerInvoice status
-    match order.get_order_status() {
-        Ok(Status::WaitingBuyerInvoice) => {}
-        Ok(Status::SettledHoldInvoice) => {
-            order.payment_attempts = 0;
-            order.clone().update(pool).await.map_err(|cause| {
-                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-            })?;
-            enqueue_order_msg(
-                msg.get_inner_message_kind().request_id,
-                Some(order.id),
-                Action::InvoiceUpdated,
-                None,
-                order.get_buyer_pubkey().map_err(MostroInternalErr)?,
-                None,
-            )
-            .await;
-        }
-        _ => {
-            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-        }
-    }
+    order.payment_attempts = 0;
+    order
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    enqueue_order_msg(
+        msg.get_inner_message_kind().request_id,
+        Some(order.id),
+        Action::InvoiceUpdated,
+        None,
+        order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+        None,
+    )
+    .await;
     Ok(())
 }
 
@@ -53,7 +45,7 @@ pub async fn add_invoice_action(
     // Get order
     let mut order = get_order(&msg, pool).await?;
     // Check order status
-    order.get_order_status().map_err(MostroInternalErr)?;
+    let ord_status = order.get_order_status().map_err(MostroInternalErr)?;
     // Check order kind
     order.get_order_kind().map_err(MostroInternalErr)?;
     // Get buyer pubkey
@@ -65,25 +57,44 @@ pub async fn add_invoice_action(
     // We save the invoice on db
     order.buyer_invoice = validate_invoice(&msg, &order).await?;
     // Buyer can add invoice orders with WaitingBuyerInvoice status
-    check_order_status(&mut order, pool, &msg).await?;
+    match ord_status {
+        Status::SettledHoldInvoice => {
+            pay_new_invoice(&mut order, pool, &msg).await?;
+            return Ok(());
+        }
+        Status::WaitingBuyerInvoice => {}
+        _ => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+    }
+
+    // Notify taker reputation
+    tracing::info!("Notifying taker reputation to maker");
+    notify_taker_reputation(pool, &order).await?;
+
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // Check if the order has a preimage
     if order.preimage.is_some() {
-        // We send this data related to the order to the parties
-        let order_data = SmallOrder::from(order.clone());
         // We publish a new replaceable kind nostr event with the status updated
         // and update on local database the status and new event id
-        if let Ok(order_updated) = update_order_event(my_keys, Status::Active, &order).await {
-            let _ = order_updated.update(pool).await;
-        }
+        let active_order = match update_order_event(my_keys, Status::Active, &order).await {
+            Ok(updated_order) => {
+                // Update in database
+                updated_order.clone().update(pool).await.map_err(|cause| {
+                    MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+                })?;
+                updated_order
+            }
+            Err(e) => return Err(e),
+        };
 
         // We send a confirmation message to seller
         enqueue_order_msg(
             None,
-            Some(order.clone().id),
+            Some(active_order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(order_data.clone())),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             seller_pubkey,
             None,
         )
@@ -91,9 +102,9 @@ pub async fn add_invoice_action(
         // We send a message to buyer saying seller paid
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
-            Some(order.clone().id),
+            Some(active_order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(order_data)),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             buyer_pubkey,
             None,
         )

@@ -1,7 +1,6 @@
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 
 use crate::db::{is_user_present, update_user_rating};
-use anyhow::Result;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 use mostro_core::message::{Action, Message, Payload};

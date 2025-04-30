@@ -1,6 +1,8 @@
 use crate::lightning::LnStatus;
 use crate::Settings;
+use crate::LN_STATUS;
 use chrono::Duration;
+use mostro_core::error::{MostroError, MostroError::MostroInternalErr};
 use mostro_core::order::{Order, Status};
 use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
 use nostr::event::builder::Error;
@@ -30,7 +32,7 @@ pub fn new_event(
     let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
     tags.extend(extra_tags);
-    let tags = Tags::new(tags);
+    let tags = Tags::from_list(tags);
 
     EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
         .tags(tags)
@@ -45,14 +47,25 @@ pub fn new_event(
 ///
 /// # Returns a json string
 fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
-    let now = Timestamp::now();
-    let days = (now.as_u64() - reputation_data.map_or(0, |data| data.2) as u64) / 86400;
+    if let Some(data) = reputation_data {
+        const SECONDS_IN_DAY: u64 = 86400;
+        // If operating day is 0, it means the user is new and we don't have a valid reputation data
+        let days = if data.2 != 0 {
+            let now = Timestamp::now();
+            (now.as_u64() - data.2 as u64) / SECONDS_IN_DAY
+        } else {
+            0
+        };
 
-    let json_data = json!([
+        // Create the json string
+        let json_data = json!([
         "rating",
-        {"total_reviews": reputation_data.map_or(0, |data| data.1), "total_rating": reputation_data.map_or(0.0, |data| data.0), "days": days}
-    ]);
-    json_data.to_string()
+            {"total_reviews": data.1, "total_rating": data.0, "days": days}
+        ]);
+        json_data.to_string()
+    } else {
+        "{}".to_string()
+    }
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
@@ -70,76 +83,112 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
     }
 }
 
+///
+/// # Arguments
+///
+/// * `order` - the order struct
+///
+/// # Returns a json string with order status according to nip69
+/// Possible states for nostr event are pending, in-progress, success, canceled
+fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
+    // Check if the order is pending/in-progress/success/canceled
+    let status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    match status {
+        Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
+        Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
+        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled => {
+            Ok((true, Status::Canceled))
+        }
+        Status::Success | Status::CompletedByAdmin => Ok((true, status)),
+        Status::Pending => Ok((true, status)),
+        _ => Ok((false, status)),
+    }
+}
+
 /// Transform an order fields to tags
 ///
 /// # Arguments
 ///
 /// * `order` - The order to transform
 ///
-pub fn order_to_tags(order: &Order, reputation_data: Option<(f64, i64, i64)>) -> Tags {
-    let mut tags: Vec<Tag> = vec![
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("k")),
-            vec![order.kind.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("f")),
-            vec![order.fiat_code.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("s")),
-            vec![order.status.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("amt")),
-            vec![order.amount.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fa")),
-            create_fiat_amt_array(order),
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pm")),
-            vec![order.payment_method.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("premium")),
-            vec![order.premium.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("network")),
-            vec!["mainnet".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("layer")),
-            vec!["lightning".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration")),
-            vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["order".to_string()],
-        ),
-    ];
+pub fn order_to_tags(
+    order: &Order,
+    reputation_data: Option<(f64, i64, i64)>,
+) -> Result<Option<Tags>, MostroError> {
+    // Po
+    const RATING_TAG_INDEX: usize = 7;
+    // Check if the order is pending/in-progress/success/canceled
+    let (create_event, status) = create_status_tags(order)?;
+    // Send just in case the order is pending/in-progress/success/canceled
+    if create_event {
+        let ln_network = match LN_STATUS.get() {
+            Some(status) => status.networks.join(","),
+            None => "unknown".to_string(),
+        };
 
-    // Add reputation data if available
-    if reputation_data.is_some() {
-        tags.insert(
-            7,
+        let mut tags: Vec<Tag> = vec![
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("rating")),
-                vec![create_rating_tag(reputation_data)],
+                TagKind::Custom(Cow::Borrowed("k")),
+                vec![order.kind.to_string()],
             ),
-        );
-    }
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("f")),
+                vec![order.fiat_code.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("s")),
+                vec![status.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("amt")),
+                vec![order.amount.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("fa")),
+                create_fiat_amt_array(order),
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("pm")),
+                vec![order.payment_method.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("premium")),
+                vec![order.premium.to_string()],
+            ),
+            Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("layer")),
+                vec!["lightning".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("expiration")),
+                vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("y")),
+                vec!["mostro".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("z")),
+                vec!["order".to_string()],
+            ),
+        ];
 
-    Tags::new(tags)
+        // Add reputation data if available
+        if reputation_data.is_some() {
+            tags.insert(
+                RATING_TAG_INDEX,
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("rating")),
+                    vec![create_rating_tag(reputation_data)],
+                ),
+            );
+        }
+        Ok(Some(Tags::from_list(tags)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Transform mostro info fields to tags
@@ -151,7 +200,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
-    let tags: Tags = Tags::new(vec![
+    let tags: Tags = Tags::from_list(vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("mostro_version")),
             vec![env!("CARGO_PKG_VERSION").to_string()],

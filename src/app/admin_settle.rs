@@ -31,7 +31,7 @@ pub async fn admin_settle_action(
     // Get order
     let order = get_order(&msg, pool).await?;
 
-    match is_assigned_solver(pool, &event.rumor.pubkey.to_string(), order.id).await {
+    match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
         Ok(false) => {
             return Err(MostroCantDo(
                 mostro_core::error::CantDoReason::IsNotYourDispute,
@@ -46,20 +46,18 @@ pub async fn admin_settle_action(
     }
 
     // Was orde cooperatively cancelled?
-    if order.check_status(Status::CooperativelyCanceled).is_err() {
-        return Err(MostroCantDo(
-            mostro_core::error::CantDoReason::IsNotYourDispute,
-        ));
-    } else {
+    if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::CooperativeCancelAccepted,
             None,
-            event.rumor.pubkey,
+            event.sender,
             msg.get_inner_message_kind().trade_index,
         )
         .await;
+
+        return Ok(());
     }
 
     if let Err(cause) = order.check_status(Status::Dispute) {
@@ -85,7 +83,7 @@ pub async fn admin_settle_action(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // We create a tag to show status of the dispute
-        let tags: Tags = Tags::new(vec![
+        let tags: Tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("s")),
                 vec![DisputeStatus::Settled.to_string()],
@@ -106,7 +104,7 @@ pub async fn admin_settle_action(
 
         match get_nostr_client() {
             Ok(client) => {
-                if let Err(e) = client.send_event(event).await {
+                if let Err(e) = client.send_event(&event).await {
                     error!("Failed to send dispute settlement event: {}", e);
                 }
             }

@@ -7,7 +7,6 @@ use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::{CantDoReason, ServiceError};
 
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
-use anyhow::Result;
 use mostro_core::message::Message;
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;

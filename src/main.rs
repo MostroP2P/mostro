@@ -14,10 +14,9 @@ pub mod util;
 use crate::app::run;
 use crate::cli::settings::{init_global_settings, Settings};
 use crate::cli::settings_init;
+use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
-use anyhow::Result;
-use db::find_held_invoices;
-use lightning::LndConnector;
+use crate::lightning::LndConnector;
 use mostro_core::message::Message;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
@@ -91,7 +90,7 @@ async fn main() -> Result<()> {
     };
 
     // Client subscription
-    client.subscribe(vec![subscription], None).await?;
+    client.subscribe(subscription, None).await?;
 
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;

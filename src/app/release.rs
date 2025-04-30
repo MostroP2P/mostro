@@ -2,6 +2,7 @@ use crate::cli::settings::Settings;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
+use crate::nip33::{new_event, order_to_tags};
 use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
@@ -113,7 +114,7 @@ pub async fn release_action(
     // Handle child order for range orders
     if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
         if let Ok(client) = get_nostr_client() {
-            if client.send_event(event).await.is_err() {
+            if client.send_event(&event).await.is_err() {
                 tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
             }
         }
@@ -402,16 +403,30 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             .map_err(MostroInternalErr)?,
     };
 
-    let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let (full_privacy_buyer, full_privacy_seller) = new_order.is_full_privacy_order();
 
-    let tags = crate::nip33::order_to_tags(
-        new_order,
-        Some((user.total_rating, user.total_reviews, user.created_at)),
-    );
-    let event = crate::nip33::new_event(my_keys, "", new_order.id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let tags = if !full_privacy_buyer && !full_privacy_seller {
+        let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        order_to_tags(
+            new_order,
+            Some((user.total_rating, user.total_reviews, user.created_at)),
+        )?
+    } else {
+        order_to_tags(new_order, None)?
+    };
+
+    let event = if let Some(tags) = tags {
+        new_event(my_keys, "", new_order.id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
+    } else {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(
+            "Error creating order event".to_string(),
+        )));
+    };
+
     new_order.event_id = event.id.to_string();
     Ok(event)
 }

@@ -81,12 +81,12 @@ pub async fn is_valid_invoice(
 
 #[cfg(test)]
 mod tests {
+    use super::{is_valid_invoice, Settings};
+    use crate::MOSTRO_CONFIG;
+    use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
     use std::env::set_var;
     use std::path::PathBuf;
 
-    use super::is_valid_invoice;
-    use crate::{cli::settings::Settings, MOSTRO_CONFIG};
-    use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
     fn init_settings_test() {
         let test_path = PathBuf::from("./");
         set_var("RUN_MODE", ".tpl");

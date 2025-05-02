@@ -1,5 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 use crate::db;
 use crate::db::is_user_present;
 use crate::flow;
@@ -512,20 +512,15 @@ pub async fn update_order_event(
     // update order.status with new status
     order_updated.status = status.to_string();
     // We transform the order fields to tags to use in the event
-    let tags = order_to_tags(&order_updated, None);
-    // nip33 kind with order id as identifier and order fields as tags
-    let event = new_event(keys, "", order.id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    let order_id = order.id.to_string();
-    info!("Sending replaceable event: {event:#?}");
-    // We update the order with the new event_id
-    order_updated.event_id = event.id.to_string();
+    if let Some(tags) = order_to_tags(&order_updated, None)? {
+        // nip33 kind with order id as identifier and order fields as tags
+        let event = new_event(keys, "", order.id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    info!(
-        "Order Id: {} updated Nostr new Status: {}",
-        order_id,
-        status.to_string()
-    );
+        info!("Sending replaceable event: {event:#?}");
+
+        // We update the order with the new event_id
+        order_updated.event_id = event.id.to_string();
 
         if let Ok(client) = get_nostr_client() {
             if client.send_event(&event).await.is_err() {

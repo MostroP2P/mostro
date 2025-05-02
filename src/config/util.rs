@@ -66,10 +66,11 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
         tracing::info!(
-            "Created settings file from template at {}",
+            "Created settings file from template at {} for mostro - Edit it to configure your Mostro instance",
             config_path.display()
         );
+        std::process::exit(0);
     }
-    
+
     Ok(settings_dir)
 }

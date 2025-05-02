@@ -1,14 +1,9 @@
+use crate::config::types::{Database, Lightning, Mostro, Nostr};
+use crate::config::util::{add_trailing_slash, has_trailing_slash};
 use crate::MOSTRO_CONFIG;
 use config::{Config, ConfigError, Environment, File};
-use crate::config::types::{Database, Lightning, Nostr, Mostro};
-use crate::config::util::{has_trailing_slash, add_trailing_slash};
 use serde::Deserialize;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-
 
 // / Mostro configuration settings struct
 #[derive(Debug, Deserialize, Clone)]
@@ -19,11 +14,10 @@ pub struct Settings {
     pub lightning: Lightning,
 }
 
-
+/// Initialize the global MOSTRO_CONFIG struct
 pub fn init_global_settings(s: Settings) {
     MOSTRO_CONFIG.set(s).unwrap()
 }
-
 
 impl Settings {
     pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
@@ -71,5 +65,3 @@ impl Settings {
         MOSTRO_CONFIG.get().unwrap().nostr.clone()
     }
 }
-
-

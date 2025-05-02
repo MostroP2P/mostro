@@ -64,4 +64,3 @@ impl_try_from_settings!(
     Nostr => nostr,
     Mostro => mostro
 );
-

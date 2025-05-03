@@ -2,9 +2,7 @@ use crate::lightning::LnStatus;
 use crate::Settings;
 use crate::LN_STATUS;
 use chrono::Duration;
-use mostro_core::error::{MostroError, MostroError::MostroInternalErr};
-use mostro_core::order::{Order, Status};
-use mostro_core::NOSTR_REPLACEABLE_EVENT_KIND;
+use mostro_core::prelude::*;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
 use serde_json::json;
@@ -34,7 +32,7 @@ pub fn new_event(
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 
-    EventBuilder::new(Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
+    EventBuilder::new(nostr::Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
         .tags(tags)
         .sign_with_keys(keys)
 }

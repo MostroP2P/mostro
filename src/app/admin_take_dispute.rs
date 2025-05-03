@@ -1,15 +1,7 @@
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
-
-use mostro_core::dispute::{Dispute, SolverDisputeInfo, Status};
-use mostro_core::error::{
-    CantDoReason,
-    MostroError::{self, *},
-    ServiceError,
-};
-use mostro_core::message::{Action, Message, Payload, Peer};
-use mostro_core::order::Order;
+use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -110,7 +102,7 @@ async fn prepare_solver_info_message(
 pub async fn pubkey_event_can_solve(
     pool: &Pool<Sqlite>,
     ev_pubkey: &PublicKey,
-    status: Status,
+    status: DisputeStatus,
 ) -> bool {
     if let Ok(my_keys) = crate::util::get_keys() {
         // Is mostro admin taking dispute?
@@ -120,7 +112,7 @@ pub async fn pubkey_event_can_solve(
             ev_pubkey.to_string()
         );
         if ev_pubkey.to_string() == my_keys.public_key().to_string()
-            && matches!(status, Status::InProgress | Status::Initiated)
+            && matches!(status, DisputeStatus::InProgress | DisputeStatus::Initiated)
         {
             return true;
         }
@@ -128,7 +120,7 @@ pub async fn pubkey_event_can_solve(
 
     // Is a solver taking a dispute
     if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
-        if solver.is_solver != 0_i64 && status == Status::Initiated {
+        if solver.is_solver != 0_i64 && status == DisputeStatus::Initiated {
             return true;
         }
     }
@@ -149,7 +141,7 @@ pub async fn admin_take_dispute_action(
     let mut dispute = get_dispute(&msg, pool).await?;
 
     // Check if the pubkey is a solver or admin
-    if let Ok(dispute_status) = Status::from_str(&dispute.status) {
+    if let Ok(dispute_status) = DisputeStatus::from_str(&dispute.status) {
         if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));

@@ -2,7 +2,7 @@ pub mod settings;
 
 use crate::cli::settings::init_default_dir;
 use clap::Parser;
-use mostro_core::error::MostroError;
+use mostro_core::prelude::*;
 use std::path::PathBuf;
 
 #[derive(Parser)]

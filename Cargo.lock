@@ -1977,7 +1977,6 @@ dependencies = [
  "mostro-core",
  "nostr-sdk",
  "once_cell",
- "openssl",
  "reqwest",
  "serde",
  "serde_json",
@@ -1992,8 +1991,6 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.6.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251ca03986e830d3e7e3ed8774d59f65c646c005a0034a53b88a064b1b1bf431"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -2200,15 +2197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
-name = "openssl-src"
-version = "300.4.2+3.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "168ce4e058f975fe43e89d9ccf78ca668601887ae736090aacc23ae353c298e2"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "openssl-sys"
 version = "0.9.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2216,7 +2204,6 @@ checksum = "8bb61ea9811cc39e3c2069f40b8b8e2e70d8569b361f879786cc7ed48b777cdd"
 dependencies = [
  "cc",
  "libc",
- "openssl-src",
  "pkg-config",
  "vcpkg",
 ]

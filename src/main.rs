@@ -1,7 +1,6 @@
 pub mod app;
 mod bitcoin_price;
 pub mod cli;
-pub mod config;
 pub mod db;
 pub mod flow;
 pub mod lightning;
@@ -13,8 +12,9 @@ pub mod scheduler;
 pub mod util;
 
 use crate::app::run;
+use crate::cli::settings::init_global_settings;
+use crate::cli::settings::Settings;
 use crate::cli::settings_init;
-use crate::config::settings::{init_global_settings, Settings};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;

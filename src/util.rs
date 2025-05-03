@@ -1,5 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::Settings;
+use crate::cli::settings::Settings;
 use crate::db;
 use crate::db::is_user_present;
 use crate::flow;

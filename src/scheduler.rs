@@ -1,6 +1,6 @@
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::Settings;
+use crate::cli::settings::Settings;
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::util::get_nostr_client;

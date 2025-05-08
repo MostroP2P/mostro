@@ -99,6 +99,7 @@ impl PasswordRequirements {
 
         // If password is empty, clear failures
         if password.is_empty() {
+            // Empty password is allowed to support optional encryption
             failures.clear();
         }
 
@@ -169,7 +170,7 @@ async fn get_user_password() -> Result<(), MostroError> {
     // New database - need password creation
     loop {
         // First password entry
-        print!("\nEnter new database password (Press enter to skip): ");
+        print!("\nEnter new database password (Press enter to skip encryption): ");
 
         // get a random delay to avoid timing attacks
         let random_delay = rand::random::<u16>() % 1000;

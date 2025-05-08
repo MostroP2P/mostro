@@ -355,10 +355,6 @@ pub async fn edit_buyer_pubkey_order(
     order_id: Uuid,
     buyer_pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -369,7 +365,7 @@ pub async fn edit_buyer_pubkey_order(
         buyer_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -382,10 +378,6 @@ pub async fn edit_seller_pubkey_order(
     order_id: Uuid,
     seller_pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -396,7 +388,7 @@ pub async fn edit_seller_pubkey_order(
         seller_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -481,10 +473,6 @@ pub async fn update_order_to_initial_state(
     amount: i64,
     fee: i64,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let status = Status::Pending.to_string();
     let hash: Option<String> = None;
     let preimage: Option<String> = None;
@@ -510,7 +498,7 @@ pub async fn update_order_to_initial_state(
         0,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -523,10 +511,6 @@ pub async fn edit_master_buyer_pubkey_order(
     order_id: Uuid,
     master_buyer_pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -537,7 +521,7 @@ pub async fn edit_master_buyer_pubkey_order(
         master_buyer_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -550,10 +534,6 @@ pub async fn edit_master_seller_pubkey_order(
     order_id: Uuid,
     master_seller_pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -564,7 +544,7 @@ pub async fn edit_master_seller_pubkey_order(
         master_seller_pubkey,
         order_id
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -576,12 +556,7 @@ pub async fn reset_order_taken_at_time(
     pool: &SqlitePool,
     order_id: Uuid,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let taken_at = 0;
-
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -592,7 +567,7 @@ pub async fn reset_order_taken_at_time(
         taken_at,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -605,10 +580,6 @@ pub async fn update_order_invoice_held_at_time(
     order_id: Uuid,
     invoice_held_at: i64,
 ) -> Result<bool, MostroError> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -619,7 +590,7 @@ pub async fn update_order_invoice_held_at_time(
         invoice_held_at,
         order_id,
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -759,11 +730,6 @@ pub async fn update_user_trade_index(
         return Err(MostroCantDo(CantDoReason::InvalidTradeIndex));
     }
 
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
     let result = sqlx::query!(
         r#"
             UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2
@@ -771,7 +737,7 @@ pub async fn update_user_trade_index(
         trade_index,
         public_key,
     )
-    .execute(&mut conn)
+    .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -789,10 +755,6 @@ pub async fn seller_has_pending_order(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Check if database is encrypted
     if MOSTRO_DB_PASSWORD.get().is_some() {
         let orders_to_check: Vec<String> = sqlx::query_scalar(
@@ -800,7 +762,7 @@ pub async fn seller_has_pending_order(
                 SELECT master_seller_pubkey FROM orders WHERE status = 'waiting-payment'
             "#,
         )
-        .fetch_all(&mut conn)
+        .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // search for a waiting-buyer-invoice order with the same pubkey
@@ -823,7 +785,7 @@ pub async fn seller_has_pending_order(
             "#,
         )
         .bind(pubkey)
-        .fetch_one(&mut conn)
+        .fetch_one(pool)
         .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         Ok(exists)
     }
@@ -838,11 +800,6 @@ pub async fn buyer_has_pending_order(
     if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
-    // Get connection to database
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Check if database is encrypted
     if MOSTRO_DB_PASSWORD.get().is_some() {
@@ -851,7 +808,7 @@ pub async fn buyer_has_pending_order(
                 SELECT master_buyer_pubkey FROM orders WHERE status = 'waiting-buyer-invoice'
             "#,
         )
-        .fetch_all(&mut conn)
+        .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // search for a waiting-buyer-invoice order with the same pubkey
@@ -860,7 +817,7 @@ pub async fn buyer_has_pending_order(
             let master_pubkey_decrypted =
                 decrypt_data(master_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
-                // Foundd another waiting-buyer-invoice order with the same pubkey
+                // Found another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);
             }
         }
@@ -874,7 +831,7 @@ pub async fn buyer_has_pending_order(
             "#,
         )
         .bind(pubkey)
-        .fetch_one(&mut conn)
+        .fetch_one(pool)
         .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         Ok(exists)
     }

@@ -3,8 +3,7 @@
 // / It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 // / It also includes functions to add a trailing slash to a path if it doesn't already have one.
 
-use std::ffi::OsString;
-
+use std::path::MAIN_SEPARATOR;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -26,22 +25,10 @@ pub fn has_trailing_slash(p: &Path) -> bool {
 }
 
 pub fn add_trailing_slash(p: &mut PathBuf) {
-    let fname = p.file_name();
-    let dirname = if let Some(fname) = fname {
-        let mut s = OsString::with_capacity(fname.len() + 1);
-        s.push(fname);
-        if cfg!(windows) {
-            s.push("\\");
-        } else {
-            s.push("/");
-        }
-        s
-    } else {
-        OsString::new()
-    };
-
-    if p.pop() {
-        p.push(dirname);
+    if !has_trailing_slash(p) {
+        let mut s = p.as_os_str().to_os_string();
+        s.push(format!("{MAIN_SEPARATOR}"));
+        *p = PathBuf::from(s);
     }
 }
 

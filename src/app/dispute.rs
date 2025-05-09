@@ -37,7 +37,7 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
         // Application identifier tag
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostrop2p".to_string()],
+            vec!["mostro".to_string()],
         ),
         // Event type tag
         Tag::custom(

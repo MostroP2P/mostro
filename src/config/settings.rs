@@ -18,7 +18,7 @@ pub struct Settings {
 pub fn init_global_settings(s: Settings) {
     MOSTRO_CONFIG.set(s).unwrap()
 }
-
+/// This function initializes the global MOSTRO_CONFIG struct with the provided Settings instance.
 impl Settings {
     pub fn new(mut config_path: PathBuf) -> Result<Self, ConfigError> {
         use std::env;
@@ -49,18 +49,22 @@ impl Settings {
         s.try_deserialize()
     }
 
+    /// This function retrieves the Lightning configuration from the global MOSTRO_CONFIG struct.
     pub fn get_ln() -> Lightning {
         MOSTRO_CONFIG.get().unwrap().lightning.clone()
     }
 
+    /// This function retrieves the Mostro configuration from the global MOSTRO_CONFIG struct.
     pub fn get_mostro() -> Mostro {
         MOSTRO_CONFIG.get().unwrap().mostro.clone()
     }
 
+    /// This function retrieves the Database configuration from the global MOSTRO_CONFIG struct.
     pub fn get_db() -> Database {
         MOSTRO_CONFIG.get().unwrap().database.clone()
     }
 
+    /// This function retrieves the Nostr configuration from the global MOSTRO_CONFIG struct.
     pub fn get_nostr() -> Nostr {
         MOSTRO_CONFIG.get().unwrap().nostr.clone()
     }

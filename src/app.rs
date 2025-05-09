@@ -33,11 +33,11 @@ use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
 // Core functionality imports
+use crate::config::settings::Settings;
 use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
-use crate::Settings;
 
 // External dependencies
 use mostro_core::error::CantDoReason;

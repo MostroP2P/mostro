@@ -18,7 +18,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 
 pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings

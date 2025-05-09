@@ -1,4 +1,4 @@
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::error::{

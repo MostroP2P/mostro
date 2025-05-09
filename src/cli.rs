@@ -1,6 +1,8 @@
-pub mod settings;
+// / CLI for Mostro
+// / Initialize the default directory for the settings file
+//! CLI
 
-use crate::cli::settings::init_default_dir;
+use crate::config::util::init_default_dir;
 use clap::Parser;
 use mostro_core::error::MostroError;
 use std::path::PathBuf;

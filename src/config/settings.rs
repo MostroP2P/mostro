@@ -3,7 +3,7 @@ use crate::config::util::{add_trailing_slash, has_trailing_slash};
 use crate::MOSTRO_CONFIG;
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // / Mostro configuration settings struct
 #[derive(Debug, Deserialize, Clone)]
@@ -33,6 +33,18 @@ impl Settings {
                 format!("{}settings{}", config_path.display(), run_mode)
             }
         };
+        // If the settings file does not exist but the directory exists, create it from the template
+        if !Path::new(&file_name).exists() {
+            println!("Settings file not found - creating default settings file");
+            std::fs::write(&file_name, include_bytes!("../../settings.tpl.toml"))
+                .map_err(|e| ConfigError::Message(e.to_string()))?;
+            // Print a message to the user
+            println!(
+                "Created settings file from template at {} for mostro - Edit it to configure your Mostro instance",
+                config_path.display()
+            );
+            std::process::exit(0);
+        }
 
         let s = Config::builder()
             .add_source(File::with_name(&file_name).required(true))

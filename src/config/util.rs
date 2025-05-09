@@ -65,7 +65,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
         std::fs::write(&config_path, include_bytes!("../../settings.tpl.toml"))
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-        tracing::info!(
+        println!(
             "Created settings file from template at {} for mostro - Edit it to configure your Mostro instance",
             config_path.display()
         );

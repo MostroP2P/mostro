@@ -12,7 +12,8 @@ pub mod scheduler;
 pub mod util;
 
 use crate::app::run;
-use crate::cli::settings::{init_global_settings, Settings};
+use crate::cli::settings::init_global_settings;
+use crate::cli::settings::Settings;
 use crate::cli::settings_init;
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;

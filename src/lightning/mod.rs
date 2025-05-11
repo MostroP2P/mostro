@@ -43,9 +43,9 @@ impl LndConnector {
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
         let client = fedimint_tonic_lnd::connect(
-            ln_settings.lnd_grpc_host,
-            ln_settings.lnd_cert_file,
-            ln_settings.lnd_macaroon_file,
+            ln_settings.lnd_grpc_host.clone(),
+            ln_settings.lnd_cert_file.clone(),
+            ln_settings.lnd_macaroon_file.clone(),
         )
         .await
         .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;

@@ -1,8 +1,7 @@
-// / Utility functions for the config module
-// / This module provides utility functions for the config module.
-// / It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
-// / It also includes functions to add a trailing slash to a path if it doesn't already have one.
-
+/// Utility functions for the config module
+/// This module provides utility functions for the config module.
+/// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
+/// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use std::path::MAIN_SEPARATOR;
 use std::path::{Path, PathBuf};
 

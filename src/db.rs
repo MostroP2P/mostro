@@ -23,7 +23,7 @@ use crate::config::settings::Settings;
 pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
-    let mut db_url = db_settings.url;
+    let mut db_url = db_settings.url.to_string();
     db_url.push_str("mostro.db");
     // Remove sqlite:// from db_url
     let tmp = db_url.replace("sqlite://", "");

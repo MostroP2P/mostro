@@ -7,5 +7,5 @@ pub mod util;
 
 // Re-export for convenience
 pub use settings::{init_global_settings, Settings};
-pub use types::{Database, Lightning, Mostro, Nostr};
+pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
 pub use util::init_default_dir;

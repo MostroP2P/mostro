@@ -2,10 +2,8 @@
 // / Initialize the default directory for the settings file
 //! CLI
 
-use crate::config::util::init_default_dir;
+use crate::config::{init_global_settings, util::init_default_dir, Settings};
 use clap::Parser;
-use mostro_core::error::MostroError;
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -31,12 +29,21 @@ pub struct Cli {
     dirsettings: Option<String>,
 }
 
-pub fn settings_init() -> Result<PathBuf, MostroError> {
+/// Initialize the settings file and create the global config variable for Mostro settings
+/// Default folder is HOME but user can specify a custom folder with dirsettings (-d ) parameter from CLI
+/// Example: mostro p2p -d /user_folder/mostro
+pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse CLI arguments
     let cli = Cli::parse();
 
-    if let Some(path) = cli.dirsettings.as_deref() {
-        Ok(init_default_dir(Some(path.to_string()))?)
+    // Select config file from CLI or default to HOME/.mostro
+    let config_path = if let Some(path) = cli.dirsettings.as_deref() {
+        init_default_dir(Some(path.to_string()))?
     } else {
-        Ok(init_default_dir(None)?)
-    }
+        init_default_dir(None)?
+    };
+
+    // Create config global Mostro settings structure
+    init_global_settings(Settings::new(config_path)?);
+    Ok(())
 }

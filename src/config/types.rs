@@ -1,6 +1,5 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
-
 use serde::Deserialize;
 
 // / Implement the TryFrom trait for each of the structs in Settings
@@ -20,13 +19,13 @@ macro_rules! impl_try_from_settings {
 }
 /// Database configuration settings
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct Database {
+pub struct DatabaseSettings {
     /// Database connection URL (e.g., "postgres://user:pass@localhost/dbname")  
     pub url: String,
 }
 /// Lightning configuration settings
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct Lightning {
+pub struct LightningSettings {
     /// LND certificate file path
     pub lnd_cert_file: String,
     /// LND macaroon file path
@@ -46,7 +45,7 @@ pub struct Lightning {
 }
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct Nostr {
+pub struct NostrSettings {
     /// Nostr private key
     pub nsec_privkey: String,
     /// Nostr relays list
@@ -55,7 +54,7 @@ pub struct Nostr {
 /// Mostro configuration settings
 
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct Mostro {
+pub struct MostroSettings {
     /// Fee percentage for the Mostro
     pub fee: f64,
     /// Maximum routing fee percentage
@@ -82,8 +81,8 @@ pub struct Mostro {
 
 // Macro call here to implement the TryFrom trait for each of the structs in Settings
 impl_try_from_settings!(
-    Database => database,
-    Lightning => lightning,
-    Nostr => nostr,
-    Mostro => mostro
+    DatabaseSettings => database,
+    LightningSettings => lightning,
+    NostrSettings => nostr,
+    MostroSettings => mostro
 );

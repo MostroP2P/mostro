@@ -32,7 +32,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
         println!(
-            "Created settings file from template at {} for mostro - Edit it to configure your Mostro instance",
+            "Created settings file from template at {} for Mostro - Edit it to configure your Mostro instance",
             config_file_path.display()
         );
         std::process::exit(0);
@@ -50,10 +50,6 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
     // Initialize the global settings variable
     init_mostro_settings(settings);
-
-    // Print the global settings variable
-    let mostro_settings = Settings::get_mostro();
-    println!("mostro_settings: {:?}", mostro_settings);
 
     tracing::info!("Settings correctly loaded!");
 

@@ -53,7 +53,7 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
         let home = std::env::var("HOME")
             .map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
         let package_name = std::env::var("CARGO_PKG_NAME")
-            .map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
+            .unwrap_or_else(|_| ".mostro".to_string());
         PathBuf::from(home).join(package_name)
     };
 

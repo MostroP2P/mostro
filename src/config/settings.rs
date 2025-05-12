@@ -1,8 +1,6 @@
 use crate::config::types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
-use crate::config::util::create_template_file;
 use crate::MOSTRO_CONFIG;
 use serde::Deserialize;
-use std::path::PathBuf;
 
 // Mostro configuration settings struct
 #[derive(Debug, Deserialize, Clone)]
@@ -14,23 +12,13 @@ pub struct Settings {
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
-pub fn init_global_settings(s: Settings) {
+pub fn init_mostro_settings(s: Settings) {
     MOSTRO_CONFIG
         .set(s)
         .expect("Failed to set Mostro global settings");
 }
 
 impl Settings {
-    pub fn new(config_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        // Get the file name from the config path
-        let file_name = config_path.display().to_string();
-
-        // If the settings file does not exist but the directory exists, create it from the template
-        let settings = create_template_file(&file_name, &config_path)?;
-
-        Ok(settings)
-    }
-
     /// This function retrieves the Lightning configuration from the global MOSTRO_CONFIG struct.
     pub fn get_ln() -> &'static LightningSettings {
         &MOSTRO_CONFIG

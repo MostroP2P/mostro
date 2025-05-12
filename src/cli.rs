@@ -2,7 +2,7 @@
 // / Initialize the default directory for the settings file
 //! CLI
 
-use crate::config::{init_global_settings, util::init_default_dir, Settings};
+use crate::config::util::init_configuration_file;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -37,13 +37,13 @@ pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Select config file from CLI or default to HOME/.mostro
-    let config_path = if let Some(path) = cli.dirsettings.as_deref() {
-        init_default_dir(Some(path.to_string()))?
+    // create config file if it doesn't exist
+    if let Some(path) = cli.dirsettings.as_deref() {
+        init_configuration_file(Some(path.to_string()))?
     } else {
-        init_default_dir(None)?
+        init_configuration_file(None)?
     };
 
-    // Create config global Mostro settings structure
-    init_global_settings(Settings::new(config_path)?);
+    // Mostro settings are initialized
     Ok(())
 }

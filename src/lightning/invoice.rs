@@ -84,13 +84,15 @@ mod tests {
     use super::{is_valid_invoice, Settings};
     use crate::MOSTRO_CONFIG;
     use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
-    use std::env::set_var;
-    use std::path::PathBuf;
+    use toml;
 
     fn init_settings_test() {
-        let test_path = PathBuf::from("./");
-        set_var("RUN_MODE", ".tpl");
-        MOSTRO_CONFIG.get_or_init(|| Settings::new(test_path).unwrap());
+        let config_tpl = include_bytes!("../../settings.tpl.toml");
+        let config_tpl =
+            std::str::from_utf8(config_tpl).expect("Invalid UTF-8 in template config file");
+        let test_settings: Settings =
+            toml::from_str(config_tpl).expect("Failed to parse template config file");
+        MOSTRO_CONFIG.get_or_init(|| test_settings);
     }
 
     #[tokio::test]

@@ -2,32 +2,44 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use std::path::MAIN_SEPARATOR;
-use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-
+use crate::config::Settings;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-pub fn has_trailing_slash(p: &Path) -> bool {
-    let last = p.as_os_str().encode_wide().last();
-    last == Some(b'\\' as u16) || last == Some(b'/' as u16)
-}
-#[cfg(unix)]
-pub fn has_trailing_slash(p: &Path) -> bool {
-    p.as_os_str().as_bytes().last() == Some(&b'/')
-}
+/// This function creates a Mostro settings template file if it does not exist.
+/// User will be prompted to edit the file with the correct settings.
+pub fn create_template_file(
+    file_name: &str,
+    config_path: &Path,
+) -> Result<Settings, Box<dyn std::error::Error>> {
+    // If the settings file does not exist, create it from the template
+    if !Path::new(file_name).exists() {
+        println!("Settings file not found - creating default settings file");
+        std::fs::write(file_name, include_bytes!("../../settings.tpl.toml"))
+            .expect("Failed to write template file");
+        // Print a message to the user
+        println!(
+            "Created settings file from template at {} for Mostro",
+            config_path.display()
+        );
+        println!("Please edit the settings file with  your settings and run Mostro again");
+        std::process::exit(0);
+    }
+    // If the settings file exists, read it and return the settings
+    else {
+        println!("Settings file found at {}", config_path.display());
+        let config_file_path = config_path.join("settings.toml");
+        // Read the file content
+        let contents = fs::read_to_string(&config_file_path)?;
 
-pub fn add_trailing_slash(p: &mut PathBuf) {
-    if !has_trailing_slash(p) {
-        let mut s = p.as_os_str().to_os_string();
-        s.push(format!("{MAIN_SEPARATOR}"));
-        *p = PathBuf::from(s);
+        // Parse TOML content
+        let mut settings: Settings = toml::from_str(&contents)?;
+
+        // Override database URL
+        settings.database.url = format!("sqlite://{}", config_path.join("mostro.db").display());
+        Ok(settings)
     }
 }
 
@@ -40,7 +52,9 @@ pub fn init_default_dir(config_path: Option<String>) -> Result<PathBuf, MostroEr
     } else {
         let home = std::env::var("HOME")
             .map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
-        PathBuf::from(home).join(".mostro")
+        let package_name = std::env::var("CARGO_PKG_NAME")
+            .map_err(|e| MostroInternalErr(ServiceError::EnvVarError(e.to_string())))?;
+        PathBuf::from(home).join(package_name)
     };
 
     if !settings_dir.exists() {

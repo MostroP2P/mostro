@@ -8,6 +8,8 @@ use mostro_core::error::ServiceError;
 use std::fs;
 use std::path::PathBuf;
 
+const DB_FILENAME: &str = "mostro.db";
+
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
@@ -47,7 +49,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     // Override database URL
-    settings.database.url = format!("sqlite://{}", settings_dir.join("mostro.db").display());
+    settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());
 
     // Initialize the global settings variable
     init_mostro_settings(settings);

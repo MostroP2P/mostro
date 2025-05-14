@@ -4,16 +4,16 @@
 
 We are committed to maintaining the security of this project. Only the latest stable release is actively supported with security updates. Older versions may not receive patches or updates. Please ensure you are using the latest version to benefit from the most recent security fixes.
 
-| Version        | Supported          |
-| -------------- | ----------------- |
-| Latest (main)  | :white_check_mark:|
-| Older releases | :x:               |
+| Version        | Supported |
+| -------------- | ---------- |
+| Latest (main)  | ✔️         |
+| Older releases | ❌         |
 
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contact:** [https://t.me/MostroP2P](https://t.me/MostroP2P)
+- **Contact:** [https://t.me/MostroP2P](https://t.me/MostroP2P), or by email at security@mostrop2p.io.
 - **Do not** disclose vulnerabilities publicly until they have been addressed.
 - Provide as much detail as possible to help us reproduce and resolve the issue quickly.
 - We appreciate responsible disclosure and will acknowledge your contribution.
@@ -41,7 +41,7 @@ If you discover a security vulnerability, please report it as soon as possible. 
 
 ## Dependencies and Third-Party Components
 
-- We monitor dependencies for vulnerabilities and update them regularly.
+- We monitor dependencies for vulnerabilities and update them regularly, using tools such as OWASP Dependency-Check and GitHub Dependabot to automate this process.
 - If you notice a vulnerability in a dependency, please report it as described above.
 
 ## Commitment to Timely Response

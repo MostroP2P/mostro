@@ -1,6 +1,7 @@
 pub mod app;
 mod bitcoin_price;
 pub mod cli;
+pub mod config;
 pub mod db;
 pub mod flow;
 pub mod lightning;
@@ -12,8 +13,8 @@ pub mod scheduler;
 pub mod util;
 
 use crate::app::run;
-use crate::cli::settings::{init_global_settings, Settings};
 use crate::cli::settings_init;
+use crate::config::settings::Settings;
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
@@ -60,10 +61,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Init path from cli
-    let config_path = settings_init()?;
-
-    // Create config global var
-    init_global_settings(Settings::new(config_path)?);
+    settings_init()?;
 
     // Connect to database
     let pool = db::connect().await?;

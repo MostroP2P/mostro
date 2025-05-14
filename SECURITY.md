@@ -13,7 +13,7 @@ We are committed to maintaining the security of this project. Only the latest st
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contact:** [https://t.me/MostroP2P](https://t.me/MostroP2P), or by email at security@mostrop2p.io.
+- **Contact:** [Telegram: MostroP2P](https://t.me/MostroP2P), or by email at [security@mostrop2p.io](mailto:security@mostrop2p.io).
 - **Do not** disclose vulnerabilities publicly until they have been addressed.
 - Provide as much detail as possible to help us reproduce and resolve the issue quickly.
 - We appreciate responsible disclosure and will acknowledge your contribution.

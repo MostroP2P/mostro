@@ -13,7 +13,7 @@ We are committed to maintaining the security of this project. Only the latest st
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contacto:** [https://t.me/MostroP2P](https://t.me/MostroP2P)
+- **Contact:** [https://t.me/MostroP2P](https://t.me/MostroP2P)
 - **Do not** disclose vulnerabilities publicly until they have been addressed.
 - Provide as much detail as possible to help us reproduce and resolve the issue quickly.
 - We appreciate responsible disclosure and will acknowledge your contribution.

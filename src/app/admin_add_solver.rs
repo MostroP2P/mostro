@@ -1,11 +1,6 @@
 use crate::db::add_new_user;
 use crate::util::send_dm;
-
-use mostro_core::error::{
-    MostroError::{self, *},
-    ServiceError,
-};
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::prelude::*;
 use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

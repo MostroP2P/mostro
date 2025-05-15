@@ -15,16 +15,19 @@ This document outlines how security is managed in this project, including suppor
 
 We are committed to maintaining the security of this project. Only the latest stable release is actively supported with security updates. Older versions may not receive patches or updates. Please ensure you are using the latest version to benefit from the most recent security fixes.
 
-| Version           | Supported |
-| ----------------- | ---------- |
-| v2.x and above    | ✔️         |
-| v1.x and earlier  | ❌         |
 
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contact:** [Telegram: MostroP2P](https://t.me/MostroP2P), or by email at [security@mostrop2p.io](mailto:security@mostrop2p.io).
+- **Contact:** [Telegram: Mostro_dev]([https://t.me/mostro_dev), or by email using the pgp key:
+  (mQINBGOKeIwBEAC6vt3dVYg73Cs3OTqDp/UFQIdpax9wXNghiuZ2KHTulr+TYPnf
+gNVmAnJp6C8Td2UMqKYKqEwWVYuDAGQ3k15vDY/MmozZGmA+BtRV+aAaeC4Iw+ka
+mPNtldBdGbiG5JJud5KPLMKweoxWsqbqUzPYZhIu8OEX+SML9vKlwn0T8Mrs7B8T
+GKtug14rdA1FPh4vOzWj2eHmiuKatv55WM+T4Yh9gH+x9pb/btkR+ZfXYMCRAIfF
+aMmtspIJDVWLCS93X4pcdNFjfD+sbjJ5khU4/o94DftoBp//4t03ccxJ0Q8rBHaX)
+
+at [security@mostrop2p.io](calderon@mostro.network).
 - **Do not** disclose vulnerabilities publicly until they have been addressed.
 - Provide as much detail as possible to help us reproduce and resolve the issue quickly.
 - We appreciate responsible disclosure and will acknowledge your contribution.
@@ -47,7 +50,6 @@ If you discover a security vulnerability, please report it as soon as possible. 
 - Do not introduce dependencies with known vulnerabilities.
 - Avoid using deprecated or insecure APIs.
 - Review code for potential security issues before submitting pull requests.
-- Use code analysis tools to detect security flaws (e.g., [Bandit](https://bandit.readthedocs.io/en/latest/) for Python, [ESLint security plugins](https://github.com/nodesecurity/eslint-plugin-security) for JavaScript).
 - Ensure all secrets, keys, and credentials are kept out of the codebase.
 
 ## Dependencies and Third-Party Components

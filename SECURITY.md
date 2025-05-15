@@ -1,5 +1,14 @@
 # Security Policy
 
+## Table of Contents
+- [Supported Versions](#supported-versions)
+- [Reporting a Vulnerability](#reporting-a-vulnerability)
+- [Responsible Disclosure Policy](#responsible-disclosure-policy)
+- [Security Best Practices](#security-best-practices)
+- [Dependencies and Third-Party Components](#dependencies-and-third-party-components)
+- [Commitment to Timely Response](#commitment-to-timely-response)
+- [Legal Notice and Disclaimer](#legal-notice-and-disclaimer)
+
 This document outlines how security is managed in this project, including supported versions, how to report vulnerabilities, and best practices for contributors and users. Please review each section to understand your responsibilities and how to keep the project secure.
 
 ## Supported Versions
@@ -15,8 +24,7 @@ We are committed to maintaining the security of this project. Only the latest st
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contact:** [https://t.me/MostroP2P](https://t.me/MostroP2P), or by email at security@mostrop2p.io.
-- For sensitive disclosures, you may encrypt your report using our public PGP key: [PGP Key](https://example.com/pgp-key.txt).
+- **Contact:** [Telegram: MostroP2P](https://t.me/MostroP2P), or by email at [security@mostrop2p.io](mailto:security@mostrop2p.io).
 - **Do not** disclose vulnerabilities publicly until they have been addressed.
 - Provide as much detail as possible to help us reproduce and resolve the issue quickly.
 - We appreciate responsible disclosure and will acknowledge your contribution.

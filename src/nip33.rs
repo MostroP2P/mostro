@@ -1,5 +1,5 @@
+use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
-use crate::Settings;
 use crate::LN_STATUS;
 use chrono::Duration;
 use mostro_core::prelude::*;
@@ -273,7 +273,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostrop2p".to_string()],
+            vec!["mostro".to_string()],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("z")),

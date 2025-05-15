@@ -1,4 +1,4 @@
-use crate::cli::settings::Settings;
+use crate::config::settings::Settings;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;

@@ -20,12 +20,7 @@ We are committed to maintaining the security of this project. Only the latest st
 
 If you discover a security vulnerability, please report it as soon as possible. We take security issues seriously and will respond promptly to all reports.
 
-- **Contact:** [Telegram: Mostro_dev]([https://t.me/mostro_dev), or by email using the pgp key:
-  (mQINBGOKeIwBEAC6vt3dVYg73Cs3OTqDp/UFQIdpax9wXNghiuZ2KHTulr+TYPnf
-gNVmAnJp6C8Td2UMqKYKqEwWVYuDAGQ3k15vDY/MmozZGmA+BtRV+aAaeC4Iw+ka
-mPNtldBdGbiG5JJud5KPLMKweoxWsqbqUzPYZhIu8OEX+SML9vKlwn0T8Mrs7B8T
-GKtug14rdA1FPh4vOzWj2eHmiuKatv55WM+T4Yh9gH+x9pb/btkR+ZfXYMCRAIfF
-aMmtspIJDVWLCS93X4pcdNFjfD+sbjJ5khU4/o94DftoBp//4t03ccxJ0Q8rBHaX)
+- **Contact:** [Telegram: Mostro_dev]([https://t.me/mostro_dev), or by email using the pgp key that be can found on: /keys
 
 at [security@mostrop2p.io](calderon@mostro.network).
 - **Do not** disclose vulnerabilities publicly until they have been addressed.

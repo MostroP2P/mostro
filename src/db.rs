@@ -12,12 +12,12 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
+#[cfg(unix)]
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
 use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
-use std::collections::HashSet;
 
 use crate::cli::settings::Settings;
 use crate::MOSTRO_DB_PASSWORD;
@@ -674,48 +674,23 @@ pub async fn find_solver_pubkey(
 }
 
 pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
-    // Fetch all encrypted public keys from the database
-    let users: Vec<User> = sqlx::query_as::<_, User>(
+    let user = sqlx::query_as::<_, User>(
         r#"
             SELECT *
             FROM users
-        "#
+            WHERE pubkey == ?1
+            LIMIT 1
+        "#,
     )
-    .fetch_all(pool)
+    .bind(public_key)
+    .fetch_one(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Decrypt the public keys and store them in a HashSet
-    let decrypted_keys: HashSet<String> = users.iter()
-        .filter_map(|user| {
-            decrypt_data(user.pubkey.clone(), MOSTRO_DB_PASSWORD.get()).ok()
-        })
-        .collect();
-
-    // Check if the provided public key exists in the decrypted keys
-    if decrypted_keys.contains(&public_key) {
-        let user = sqlx::query_as::<_, User>(
-            r#"
-                SELECT *
-                FROM users
-                WHERE pubkey == ?1
-                LIMIT 1
-            "#,
-        )
-        .bind(public_key)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        Ok(user)
-    } else {
-        Err(MostroInternalErr(ServiceError::DbAccessError(
-            "User not found".to_string(),
-        )))
-    }
+    Ok(user)
 }
 
 pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {
-    // Validate public key format (32-bytes hex)
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(
         "
@@ -740,6 +715,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Return the public key not encrypted
     Ok(new_user.pubkey)
 }
 
@@ -850,20 +826,19 @@ pub async fn buyer_has_pending_order(
 
     // Check if database is encrypted
     if MOSTRO_DB_PASSWORD.get().is_some() {
-        let orders_to_check = sqlx::query_as::<_, Order>(
+        let orders_to_check : Vec<String> = sqlx::query_scalar(
             r#"
-                SELECT * FROM orders WHERE status = 'waiting-buyer-invoice'
+                SELECT master_buyer_key FROM orders WHERE status = 'waiting-buyer-invoice'
             "#,
         )
         .fetch_all(&mut conn)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // search for a waiting-buyer-invoice order with the same pubkey
-        for order in orders_to_check {
-            let master_buyer_pubkey = order.get_master_buyer_pubkey().map_err(MostroInternalErr)?;
+        for master_key in orders_to_check {
             // Decrypt master buyer pubkey
             let master_pubkey_decrypted =
-                decrypt_data(master_buyer_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
+                decrypt_data(master_key, MOSTRO_DB_PASSWORD.get())
                     .map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 // Foundd another waiting-buyer-invoice order with the same pubkey
@@ -981,3 +956,119 @@ pub async fn find_order_by_id(
 
     Ok(order)
 }
+
+
+
+// Add this cfg attribute if the code is *only* for testing
+#[cfg(test)]
+mod tests {
+    use argon2::Params;
+    use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+    use sqlx::Error;
+    use tokio::time::Instant; // Use sqlx::Error for the Result return type
+    use std::collections::HashSet; // Import HashSet for the test
+    use mostro_core::order::{store_encrypted, decrypt_data};
+    use secrecy::{SecretString,ExposeSecret};
+    
+
+    const TEST_DB_URL: &str = "sqlite::memory:"; // In-memory database for tests
+    const SECRET_PASSWORD: &str = "test_password"; // Example password for encryption
+
+    // Helper function to set up the database and pool
+    async fn setup_db() -> Result<SqlitePool, Error> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1) // Usually fine for simple tests
+            .connect(TEST_DB_URL)
+            .await?;
+
+        // Create the table
+        sqlx::query(
+            r#"
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(pool)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_string_column_scalar() -> Result<(), Error> {
+        // 1. Setup: Create in-memory DB and table
+        let pool = setup_db().await?;
+        println!("In-memory database and table created for test.");
+
+        // 2. Populate: Insert 100 entries
+        let total_entries = 5;
+        let interval = Instant::now(); // Start the timer
+
+        // Use a SecretString for the password
+        let password = SecretString::from(SECRET_PASSWORD);
+
+
+        println!("Inserting {} entries...", total_entries);
+        for i in 0..total_entries {
+            let value_string = format!("Entry {}", i);
+            let value_string = store_encrypted(
+                &value_string,
+                Some(&password),
+            )
+            .await.unwrap(); // Encrypt the string
+            // Note: id is INTEGER PRIMARY KEY, so it will auto-increment if we don't specify it,
+            // or we can specify it like this. Let's specify for clarity.
+            sqlx::query("INSERT INTO items (id, value) VALUES (?, ?)")
+                .bind(i as i64) // Bind the numeric ID (SQLite INTEGER is i64)
+                .bind(&value_string) // Bind the string value
+                .execute(&pool)
+                .await?;
+        }
+        println!("Entries inserted.");
+        println!("Time to inject {} entries: {:?} ms", total_entries, interval.elapsed().as_millis());
+
+        // 3. Fetch: Get the 'value' column using query_scalar
+        println!("Fetching 'value' column...");
+        let sql = "SELECT value FROM items ORDER BY id"; // Order to make assertion predictable
+
+        let fetched_values: Vec<String> = sqlx::query_scalar(sql)
+            .fetch_all(&pool) // Fetch all results into Vec<String>
+            .await?;
+
+        println!("Fetched {} values.", fetched_values.len());
+
+        println!("Time taken to fetch: {:?} ms", interval.elapsed().as_millis()); // Print elapsed time
+
+        // 4. Assert: Check if the correct data was retrieved
+        assert_eq!(
+            fetched_values.len(),
+            total_entries,
+            "Should have fetched {} entries",
+            total_entries
+        );
+
+        // Optional: Check specific values for correctness
+        assert_eq!(
+            fetched_values[0],
+            "Entry 0",
+            "First entry should be 'Entry 0'"
+        );
+        assert_eq!(
+            fetched_values[total_entries - 1],
+            format!("Entry {}", total_entries - 1),
+            "Last entry should match"
+        );
+
+        println!("Test passed!");
+        Ok(()) // Return Ok to indicate test success
+    }
+}
+
+// Add a dummy main function if this is in src/main.rs
+#[cfg(not(test))]
+fn main() {
+    println!("This is not the test runner. Run tests with `cargo test`");
+}
+

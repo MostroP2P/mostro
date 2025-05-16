@@ -26,7 +26,6 @@ use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use mostro_core::user::UserInfo;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use secrecy::ExposeSecret;
 use sqlx::Pool;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
@@ -370,8 +369,6 @@ async fn prepare_new_order(
     // Get expiration time of the order
     let expiry_date = get_expiration_date(new_order.expires_at);
 
-    // let creator_pubkey = store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get()).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let password = MOSTRO_DB_PASSWORD.get().unwrap();
     // Prepare a new default order
     let mut new_order_db = Order {
         id: Uuid::new_v4(),
@@ -397,7 +394,7 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_buyer_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), Some(password.expose_secret()))
+                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
                     .await
                     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );
@@ -407,7 +404,7 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_seller_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), Some(password.expose_secret()))
+                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
                     .await
                     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );

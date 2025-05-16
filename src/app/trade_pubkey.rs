@@ -1,4 +1,5 @@
 use crate::util::{enqueue_order_msg, get_order};
+use crate::MOSTRO_DB_PASSWORD;
 
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -21,10 +22,30 @@ pub async fn trade_pubkey_action(
         return Err(MostroCantDo(cause));
     }
 
-    match (
-        order.master_buyer_pubkey.as_ref(),
-        order.master_seller_pubkey.as_ref(),
-    ) {
+    // Get master keys decrypted
+    let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
+        let master_buyer_key = decrypt_data(
+            order
+                .get_master_buyer_pubkey()
+                .map_err(MostroInternalErr)?
+                .to_string(),
+            MOSTRO_DB_PASSWORD.get(),
+        )
+        .map_err(MostroInternalErr)?;
+        (Some(master_buyer_key), None)
+    } else {
+        let master_seller_key = decrypt_data(
+            order
+                .get_master_seller_pubkey()
+                .map_err(MostroInternalErr)?
+                .to_string(),
+            MOSTRO_DB_PASSWORD.get(),
+        )
+        .map_err(MostroInternalErr)?;
+        (None, Some(master_seller_key))
+    };
+
+    match (master_buyer_key.as_ref(), master_seller_key.as_ref()) {
         (Some(master_buyer_pubkey), _) if master_buyer_pubkey == &event.sender.to_string() => {
             order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
         }

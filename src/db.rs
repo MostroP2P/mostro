@@ -306,11 +306,7 @@ async fn store_password_hash(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         .to_string();
 
-    // Create a key suitable for ChaCha20Poly1305
-    let key = PasswordHash::new(&key)
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        .to_string();
-
+    // Get mostro keys
     let my_keys = crate::util::get_keys()
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 

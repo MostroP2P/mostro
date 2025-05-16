@@ -1,8 +1,5 @@
 use mostro_core::prelude::*;
-use argon2::{
-    password_hash::{rand_core::OsRng, SaltString},
-    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
-};
+use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use nostr_sdk::prelude::*;
 use rpassword::read_password;
 use secrecy::zeroize::Zeroize;
@@ -313,14 +310,19 @@ async fn store_password_hash(
     pool: &SqlitePool,
 ) -> Result<(), MostroError> {
     // Generate a random salt
-    let salt = SaltString::generate(&mut OsRng);
+    let salt_base = b"1H/aaYsf8&asduA";
+    let mut salt_vec: Vec<SaltString> = Vec::new();
+    for i in 0..50 {
+        let salt = format!("{}{}", String::from_utf8_lossy(salt_base), i % 5);
+        salt_vec.push(SaltString::encode_b64(salt.as_bytes()).unwrap());
+    }
 
     // Configure Argon2 parameters
     let argon2 = Argon2::default();
 
     // Derive the key
     let key = argon2
-        .hash_password(password.expose_secret().as_bytes(), &salt)
+        .hash_password(password.expose_secret().as_bytes(), &salt_vec[0])
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         .to_string();
 
@@ -928,6 +930,7 @@ pub async fn find_order_by_id(
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
+    use argon2::password_hash::SaltString;
     use mostro_core::order::{decrypt_data, store_encrypted};
     use secrecy::SecretString;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -961,38 +964,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_string_column_scalar() -> Result<(), Error> {
+    async fn test_fetch_string_column_scalar() {
         // 1. Setup: Create in-memory DB and table
-        let pool = setup_db().await?;
+        let pool = setup_db().await.unwrap();
         println!("In-memory database and table created for test.");
 
         // 2. Populate: Insert 100 entries
-        let total_entries = 10;
+        let total_entries = 20;
 
         // Use a SecretString for the password
         let password = SecretString::from(SECRET_PASSWORD);
+        let mut salt_vec: Vec<SaltString> = vec![];
+        let salt_base = b"1H/aaYsf8&asduA";
+        for i in 0..total_entries {
+            let salt = format!("{}{}", String::from_utf8_lossy(salt_base), i % 5);
+            salt_vec.push(SaltString::encode_b64(salt.as_bytes()).unwrap());
+        }
 
         println!("Inserting {} entries...", total_entries);
+        // Prepare batch values
+        let mut query_builder = String::from("INSERT INTO items (id, value) VALUES ");
+        let mut params = Vec::new();
+
         for i in 0..total_entries {
             let value_string = format!("Entry {}", i % 5);
-            println!("Inserting value {}", value_string);
-            let value_string = if i % 3 == 1 {
-                store_encrypted(&value_string, Some(&password))
-                    .await
-                    .unwrap() // Encrypt the string
-                              // Note: id is INTEGER PRIMARY KEY, so it will auto-increment if we don't specify it,
-                              // or we can specify it like this. Let's specify for clarity.
-            } else {
-                store_encrypted(&value_string, Some(&password))
-                    .await
-                    .unwrap() // Encrypt the string
-            };
-            sqlx::query("INSERT INTO items (id, value) VALUES (?, ?)")
-                .bind(i as i64) // Bind the numeric ID (SQLite INTEGER is i64)
-                .bind(&value_string) // Bind the string value
-                .execute(&pool)
-                .await?;
+            println!("Inserting value : {:?}", value_string);
+            let salt = salt_vec[i % 5].clone();
+            let encrypted_value =
+                store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
+
+            if i > 0 {
+                query_builder.push_str(", ");
+            }
+            query_builder.push_str(&format!("({}, ?)", i));
+            params.push(encrypted_value);
         }
+
+        // Execute batch insert
+        let mut query = sqlx::query(&query_builder);
+        for param in params {
+            query = query.bind(param);
+        }
+        query.execute(&pool).await.unwrap();
         println!("Entries inserted.");
 
         // 3. Fetch: Get the 'value' column using query_scalar
@@ -1001,7 +1014,8 @@ mod tests {
 
         let fetched_values: Vec<String> = sqlx::query_scalar(sql)
             .fetch_all(&pool) // Fetch all results into Vec<String>
-            .await?;
+            .await
+            .unwrap();
 
         let mut hash_set_values: HashSet<String> = HashSet::new();
         for value in fetched_values {
@@ -1014,13 +1028,30 @@ mod tests {
             hash_set_values.insert(value_decrypted);
         }
 
-        if hash_set_values.contains("Entry 0") {
-            println!("Entry 0 found in the hash set.");
-        } else {
-            println!("Entry 0 not found in the hash set.");
-        }
-
-        println!("Test passed!");
-        Ok(()) // Return Ok to indicate test success
+        assert!(
+            hash_set_values.contains("Entry 0"),
+            "Should contain Entry 0"
+        );
+        assert!(
+            hash_set_values.contains("Entry 1"),
+            "Should contain Entry 1"
+        );
+        assert!(
+            hash_set_values.contains("Entry 2"),
+            "Should contain Entry 2"
+        );
+        assert!(
+            hash_set_values.contains("Entry 3"),
+            "Should contain Entry 3"
+        );
+        assert!(
+            hash_set_values.contains("Entry 4"),
+            "Should contain Entry 4"
+        );
+        assert_eq!(
+            hash_set_values.len(),
+            5,
+            "Should have exactly 5 unique entries"
+        );
     }
 }

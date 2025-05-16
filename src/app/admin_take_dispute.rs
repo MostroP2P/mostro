@@ -54,7 +54,7 @@ async fn prepare_solver_info_message(
         None
     };
 
-    let (initiator_tradekey, counterpart, initiator) = if order.is_buy_order().is_ok() {
+    let (order_creator_tradekey, counterpart, initiator) = if order.is_buy_order().is_ok() {
         (
             order
                 .get_buyer_pubkey()
@@ -78,7 +78,7 @@ async fn prepare_solver_info_message(
     let dispute_info = SolverDisputeInfo::new(
         order,
         dispute,
-        initiator_tradekey.clone(),
+        order_creator_tradekey,
         counterpart,
         initiator,
     );

@@ -996,20 +996,19 @@ mod tests {
 
         // Use a SecretString for the password
         let password = SecretString::from(SECRET_PASSWORD);
-        let salt = "1H/aaYsf8&asduA0";
 
         println!("Inserting {} entries...", total_entries);
         for i in 0..total_entries {
             let value_string = format!("Entry {}", i % 5);
             println!("Inserting value {}", value_string);
             let value_string = if i % 3 == 1 {
-                store_encrypted(&value_string, Some(&password), Some(salt))
+                store_encrypted(&value_string, Some(&password))
                     .await
                     .unwrap() // Encrypt the string
                               // Note: id is INTEGER PRIMARY KEY, so it will auto-increment if we don't specify it,
                               // or we can specify it like this. Let's specify for clarity.
             } else {
-                store_encrypted(&value_string, Some(&password), None)
+                store_encrypted(&value_string, Some(&password))
                     .await
                     .unwrap() // Encrypt the string
             };

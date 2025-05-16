@@ -242,7 +242,7 @@ pub async fn get_tags_for_new_order(
 
 #[allow(clippy::too_many_arguments)]
 /// Publishes a new order by preparing its details, saving it to the database, creating a corresponding Nostr event, and sending a confirmation message.
-/// 
+///
 /// This asynchronous function performs the following steps:
 /// - Prepares a new order record from the provided order data and public keys.
 /// - Inserts the new order into the database.
@@ -250,9 +250,9 @@ pub async fn get_tags_for_new_order(
 /// - Constructs and publishes a Nostr event representing the order.
 /// - Updates the order record with the generated event ID.
 /// - Enqueues an acknowledgement message for the order.
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```rust
 /// # async fn example() -> Result<(), MostroError> {
 /// # use sqlx::sqlite::SqlitePool;
@@ -261,7 +261,7 @@ pub async fn get_tags_for_new_order(
 /// // Initialize the database pool and keys.
 /// let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 /// let keys = Keys::generate();
-/// 
+///
 /// // Prepare a new order along with associated public keys.
 /// let new_order = SmallOrder::default();
 /// let initiator_pubkey = /* initiator public key */;
@@ -269,7 +269,7 @@ pub async fn get_tags_for_new_order(
 /// let trade_pubkey = /* trade public key */;
 /// let request_id = Some(100);
 /// let trade_index = Some(1);
-/// 
+///
 /// publish_order(&pool, &keys, &new_order, initiator_pubkey, identity_pubkey, trade_pubkey, request_id, trade_index).await?;
 /// # Ok(())
 /// # }

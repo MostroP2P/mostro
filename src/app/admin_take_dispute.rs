@@ -10,52 +10,58 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
+/// Prepares the solver information message for a dispute.
+///
+/// This asynchronous function checks the privacy status of the buyer and seller involved in a dispute,
+/// retrieves their public keys if they are not in full privacy mode, and constructs a `SolverDisputeInfo`
+/// object containing the necessary information for the solver to assist in the dispute resolution.
+///
+/// # Parameters
+///
+/// - `pool`: A reference to the database connection pool used to query user information.
+/// - `order`: A reference to the `Order` object associated with the dispute, which contains details about the transaction.
+/// - `dispute`: A reference to the `Dispute` object that holds the current state of the dispute.
+///
+/// # Returns
+///
+/// Returns a `Result<SolverDisputeInfo, MostroError>`. On success, it returns the constructed `SolverDisputeInfo`
+/// object. On failure, it returns a `MostroError` indicating the reason for the failure, such as invalid public keys
+/// or issues accessing the database.
+///
+/// # Errors
+///
+/// This function may return errors related to invalid public keys or database access issues, which are handled
+/// by mapping them to `MostroError`.
 async fn prepare_solver_info_message(
     pool: &Pool<Sqlite>,
     order: &Order,
     dispute: &Dispute,
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Check if one or both users are in full privacy mode
-    let (full_privacy_buyer, full_privacy_seller) = order.is_full_privacy_order();
-
-    // Get master pubkeys to get users data from db
-    let master_buyer_key = order
-        .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
-        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
-
-    let master_seller_key = order
-        .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
+    let (full_privacy_buyer, full_privacy_seller) = order
+        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode
-    let (initiator_tradekey, initiator, counterpart) = if order.buyer_dispute {
+    let buyer = if let Some(master_buyer_key) = full_privacy_buyer {
+        Some(is_user_present(pool, master_buyer_key).await?)
+    } else {
+        None
+    };
+    let seller = if let Some(master_seller_key) = full_privacy_seller {
+        Some(is_user_present(pool, master_seller_key).await?)
+    } else {
+        None
+    };
+
+    let (initiator_tradekey, counterpart, initiator) = if order.is_buy_order().is_ok() {
         (
             order
                 .get_buyer_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
-            if !full_privacy_buyer {
-                Some(
-                    is_user_present(pool, master_buyer_key)
-                        .await
-                        .map_err(|cause| {
-                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                        })?,
-                )
-            } else {
-                None
-            },
-            if !full_privacy_seller {
-                Some(
-                    is_user_present(pool, master_seller_key)
-                        .await
-                        .map_err(|cause| {
-                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                        })?,
-                )
-            } else {
-                None
-            },
+            seller,
+            buyer,
         )
     } else {
         (
@@ -63,28 +69,8 @@ async fn prepare_solver_info_message(
                 .get_seller_pubkey()
                 .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
                 .to_string(),
-            if !full_privacy_seller {
-                Some(
-                    is_user_present(pool, master_seller_key)
-                        .await
-                        .map_err(|cause| {
-                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                        })?,
-                )
-            } else {
-                None
-            },
-            if !full_privacy_buyer {
-                Some(
-                    is_user_present(pool, master_buyer_key)
-                        .await
-                        .map_err(|cause| {
-                            MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-                        })?,
-                )
-            } else {
-                None
-            },
+            buyer,
+            seller,
         )
     };
 

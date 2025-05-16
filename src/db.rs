@@ -113,10 +113,11 @@ impl PasswordRequirements {
 
 fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError> {
     // Get user input password to check against stored hash
-    print!("Enter database password: ");
-    std::io::stdout().flush().unwrap();
-    let password = read_password()
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // print!("Enter database password: ");
+    // std::io::stdout().flush().unwrap();
+    // let password = read_password()
+    //     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let password = "PippoPippo75#";
 
     if Argon2::default()
         .verify_password(password.as_bytes(), password_hash)

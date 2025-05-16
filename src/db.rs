@@ -959,9 +959,8 @@ pub async fn find_order_by_id(
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
-    use argon2::Params;
     use mostro_core::order::{decrypt_data, store_encrypted};
-    use secrecy::{ExposeSecret, SecretString};
+    use secrecy::SecretString;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use sqlx::Error;
     use std::collections::HashSet; // Import HashSet for the test
@@ -1003,7 +1002,7 @@ mod tests {
 
         // Use a SecretString for the password
         let password = SecretString::from(SECRET_PASSWORD);
-        let salt = "saltNPeppaPeppa1";
+        let salt = "1H/aaYsf8&asduA0";
 
         println!("Inserting {} entries...", total_entries);
         for i in 0..total_entries {

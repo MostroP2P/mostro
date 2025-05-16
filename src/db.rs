@@ -1009,20 +1009,27 @@ mod tests {
         println!("In-memory database and table created for test.");
 
         // 2. Populate: Insert 100 entries
-        let total_entries = 5;
-        let interval = Instant::now(); // Start the timer
+        let total_entries = 10;
 
         // Use a SecretString for the password
         let password = SecretString::from(SECRET_PASSWORD);
+        let salt = "saltNPeppaPeppa1";
 
         println!("Inserting {} entries...", total_entries);
         for i in 0..total_entries {
-            let value_string = format!("Entry {}", i);
-            let value_string = store_encrypted(&value_string, Some(&password))
-                .await
-                .unwrap(); // Encrypt the string
-                           // Note: id is INTEGER PRIMARY KEY, so it will auto-increment if we don't specify it,
-                           // or we can specify it like this. Let's specify for clarity.
+            let value_string = format!("Entry {}", i % 5);
+            println!("Inserting value {}", value_string);
+            let value_string = if i % 3 == 1 {
+                store_encrypted(&value_string, Some(&password), Some(salt))
+                    .await
+                    .unwrap() // Encrypt the string
+                              // Note: id is INTEGER PRIMARY KEY, so it will auto-increment if we don't specify it,
+                              // or we can specify it like this. Let's specify for clarity.
+            } else {
+                store_encrypted(&value_string, Some(&password), None)
+                    .await
+                    .unwrap() // Encrypt the string
+            };
             sqlx::query("INSERT INTO items (id, value) VALUES (?, ?)")
                 .bind(i as i64) // Bind the numeric ID (SQLite INTEGER is i64)
                 .bind(&value_string) // Bind the string value
@@ -1030,11 +1037,6 @@ mod tests {
                 .await?;
         }
         println!("Entries inserted.");
-        println!(
-            "Time to inject {} entries: {:?} ms",
-            total_entries,
-            interval.elapsed().as_millis()
-        );
 
         // 3. Fetch: Get the 'value' column using query_scalar
         println!("Fetching 'value' column...");
@@ -1044,47 +1046,22 @@ mod tests {
             .fetch_all(&pool) // Fetch all results into Vec<String>
             .await?;
 
-        println!(
-            "Time taken to fetch: {:?} ms",
-            interval.elapsed().as_millis()
-        ); // Print elapsed time
-        let interval_2 = Instant::now();
-
         let mut hash_set_values: HashSet<String> = HashSet::new();
         for value in fetched_values {
+            let interval = Instant::now();
             let value_decrypted = decrypt_data(value, Some(&password)).unwrap();
+            println!(
+                "Time taken to decrypt: {:?} ms",
+                interval.elapsed().as_millis()
+            ); // Print elapsed time
             hash_set_values.insert(value_decrypted);
         }
 
-        println!(
-            "Time taken to decrypt: {:?} ms",
-            interval_2.elapsed().as_millis()
-        ); // Print elapsed time
         if hash_set_values.contains("Entry 0") {
             println!("Entry 0 found in the hash set.");
         } else {
             println!("Entry 0 not found in the hash set.");
         }
-
-        // // 4. Assert: Check if the correct data was retrieved
-        // assert_eq!(
-        //     fetched_values.len(),
-        //     total_entries,
-        //     "Should have fetched {} entries",
-        //     total_entries
-        // );
-
-        // Optional: Check specific values for correctness
-        // assert_eq!(
-        //     fetched_values[0],
-        //     "Entry 0",
-        //     "First entry should be 'Entry 0'"
-        // );
-        // assert_eq!(
-        //     fetched_values[total_entries - 1],
-        //     format!("Entry {}", total_entries - 1),
-        //     "Last entry should match"
-        // );
 
         println!("Test passed!");
         Ok(()) // Return Ok to indicate test success

@@ -310,11 +310,15 @@ pub async fn publish_order(
     info!("New order saved Id: {}", order_id);
 
     // Get tags for new order in case of full privacy or normal order
-    let tags = get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?;
-
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = if let Some(tags) =
+        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?
+    {
+        new_event(keys, "", order_id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
+    } else {
+        return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+    };
 
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();

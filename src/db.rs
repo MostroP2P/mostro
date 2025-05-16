@@ -212,8 +212,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
         restrict_file_permissions(db_path)
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        get_user_password().await?;
-
         // Create new database connection
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
@@ -223,6 +221,8 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
                             "Successfully created database file at {}",
                             db_path.display(),
                         );
+                        // Get user password
+                        get_user_password().await?;
                         // Save admin password hash securely
                         if let Some(password) = MOSTRO_DB_PASSWORD.get() {
                             store_password_hash(password, &pool).await.map_err(|e| {
@@ -267,28 +267,18 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
         let mut attempts = 0;
 
         if MOSTRO_DB_PASSWORD.get().is_none() {
-            loop {
+            while let Some(argon2_hash) = get_admin_password(&conn).await? {
                 // Database already exists - and yet opened
-                match get_admin_password(&conn).await? {
-                    Some(argon2_hash) => {
-                        let parsed_hash = PasswordHash::new(&argon2_hash).map_err(|e| {
-                            MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
-                        })?;
-                        if check_password_hash(&parsed_hash).is_ok() {
-                            break;
-                        } else {
-                            attempts += 1;
-                            if attempts >= max_attempts {
-                                return Err(MostroInternalErr(ServiceError::DbAccessError(
-                                    "Maximum password attempts exceeded".to_string(),
-                                )));
-                            }
-                        }
-                    }
-                    None => {
-                        return Err(MostroInternalErr(ServiceError::DbAccessError(
-                            "Admin password hash not found".to_string(),
-                        )));
+                let parsed_hash = PasswordHash::new(&argon2_hash)
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                if check_password_hash(&parsed_hash).is_ok() {
+                    break;
+                } else {
+                    attempts += 1;
+                    println!("Wrong password, attempts: {}", attempts);
+                    if attempts >= max_attempts {
+                        println!("Maximum password attempts exceeded!!");
+                        std::process::exit(1);
                     }
                 }
             }
@@ -296,7 +286,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
 
         conn
     };
-
     Ok(conn)
 }
 
@@ -648,7 +637,7 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
 }
 
 pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, MostroError> {
-    let user = sqlx::query_as::<_, User>(
+    if let Some(user) = sqlx::query_as::<_, User>(
         r#"
           SELECT *
           FROM users
@@ -656,11 +645,17 @@ pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, Mos
           LIMIT 1
         "#,
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    Ok(user.admin_password)
+    .map_err(|_| {
+        MostroInternalErr(ServiceError::DbAccessError(
+            "Failed to get admin password".to_string(),
+        ))
+    })? {
+        Ok(user.admin_password)
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn find_solver_pubkey(
@@ -779,24 +774,19 @@ pub async fn seller_has_pending_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Check if database is encrypted
     if MOSTRO_DB_PASSWORD.get().is_some() {
-        let orders_to_check = sqlx::query_as::<_, Order>(
+        let orders_to_check: Vec<String> = sqlx::query_scalar(
             r#"
-                SELECT * FROM orders WHERE status = 'waiting-payment'
+                SELECT master_seller_pubkey FROM orders WHERE status = 'waiting-payment'
             "#,
         )
         .fetch_all(&mut conn)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // search for a waiting-buyer-invoice order with the same pubkey
-        for order in orders_to_check {
-            // Get master seller pubkey
-            let master_seller_pubkey = order
-                .get_master_seller_pubkey()
-                .map_err(MostroInternalErr)?;
+        for master_key in orders_to_check {
             // Decrypt master buyer pubkey
             let master_pubkey_decrypted =
-                decrypt_data(master_seller_pubkey.to_string(), MOSTRO_DB_PASSWORD.get())
-                    .map_err(MostroInternalErr)?;
+                decrypt_data(master_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 // Foundd another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);

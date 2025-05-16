@@ -47,6 +47,9 @@ static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> =
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Clear screen
+    clearscreen::clear().expect("Failed to clear screen");
+
     if cfg!(debug_assertions) {
         // Debug, show all error + mostro logs
         env::set_var("RUST_LOG", "error,mostro=info");
@@ -60,6 +63,8 @@ async fn main() -> Result<()> {
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
+
+    tracing::info!("Starting Mostro!");
 
     // Init path from cli
     settings_init()?;

@@ -405,7 +405,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             .map_err(MostroInternalErr)?,
     };
 
-    let (full_privacy_buyer, full_privacy_seller) = new_order
+    let (normal_buyer_idkey, normal_seller_idkey) = new_order
         .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
         .map_err(|_| {
             MostroInternalErr(ServiceError::UnexpectedError(
@@ -413,7 +413,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             ))
         })?;
 
-    let tags = if full_privacy_buyer.is_none() && full_privacy_seller.is_none() {
+    let tags = if normal_buyer_idkey.is_some() && normal_seller_idkey.is_some() {
         let user = crate::db::is_user_present(&pool, identity_pubkey)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

@@ -330,13 +330,13 @@ async fn payment_success(
 pub async fn get_child_order(
     order: Order,
     my_keys: &Keys,
-) -> Result<(Option<Order>, Option<Event>)> {
+) -> Result<(Option<Order>, Option<Event>), MostroError> {
     let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
         return Ok((None, None));
     };
 
     if let Some(new_max) = max_amount.checked_sub(order.fiat_amount) {
-        let mut new_order = create_base_order(&order);
+        let mut new_order = create_base_order(&order)?;
 
         match new_max.cmp(&min_amount) {
             Ordering::Equal => {
@@ -356,7 +356,7 @@ pub async fn get_child_order(
     Ok((None, None))
 }
 
-fn create_base_order(order: &Order) -> Order {
+fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     let mut new_order = order.clone();
     new_order.id = uuid::Uuid::new_v4();
     new_order.status = Status::Pending.to_string();
@@ -368,17 +368,20 @@ fn create_base_order(order: &Order) -> Order {
     new_order.invoice_held_at = 0;
     new_order.range_parent_id = Some(order.id);
 
-    if new_order.kind == "sell" {
-        new_order.buyer_pubkey = None;
-        new_order.master_buyer_pubkey = None;
-        new_order.trade_index_buyer = None;
-    } else {
-        new_order.seller_pubkey = None;
-        new_order.master_seller_pubkey = None;
-        new_order.trade_index_seller = None;
+    match new_order.get_order_kind().map_err(MostroInternalErr)? {
+        Kind::Sell => {
+            new_order.buyer_pubkey = None;
+            new_order.master_buyer_pubkey = None;
+            new_order.trade_index_buyer = None;
+        }
+        Kind::Buy => {
+            new_order.seller_pubkey = None;
+            new_order.master_seller_pubkey = None;
+            new_order.trade_index_seller = None;
+        }
     }
 
-    new_order
+    Ok(new_order)
 }
 
 async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {

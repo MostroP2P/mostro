@@ -53,6 +53,3 @@ dirs = "6.0.0"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
-
-[patch.crates-io]
-mostro-core ={ path = "../mostro-core" }

@@ -10,7 +10,7 @@ use mostro_core::prelude::*;
 use secrecy::ExposeSecret;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use mostro_core::message::Message;
-use mostro_core::order::{decrypt_data, Order, Status};
+use mostro_core::order::{store_encrypted, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -90,7 +90,15 @@ pub async fn take_sell_action(
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
-    order.master_buyer_pubkey = Some(event.sender.to_string());
+    order.master_buyer_pubkey = Some(
+        store_encrypted(
+            &event.sender.to_string(),
+            Some(MOSTRO_DB_PASSWORD.get().unwrap().expose_secret()),
+        )
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+    );
+
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {

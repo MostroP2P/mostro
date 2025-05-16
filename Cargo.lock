@@ -4376,7 +4376,3 @@ dependencies = [
  "quote",
  "syn 2.0.101",
 ]
-
-[[patch.unused]]
-name = "mostro-core"
-version = "0.6.38"

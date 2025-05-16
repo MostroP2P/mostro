@@ -80,7 +80,7 @@ impl PasswordRequirements {
             failures.push("Password must contain at least one lowercase letter".to_string());
         }
 
-        if self.requires_digit && !password.chars().any(|c| c.is_digit(10)) {
+        if self.requires_digit && !password.chars().any(|c| c.is_ascii_digit()) {
             failures.push("Password must contain at least one number".to_string());
         }
 
@@ -109,19 +109,20 @@ fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError
     // Get user input password to check against stored hash
     print!("Enter database password: ");
     std::io::stdout().flush().unwrap();
-    let password = read_password()
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // let password = read_password()
+    //     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    let password = "PippoPippo75#";
     if Argon2::default()
         .verify_password(password.as_bytes(), password_hash)
         .is_ok()
     {
         MOSTRO_DB_PASSWORD.set(SecretString::from(password));
-        return Ok(true);
+        Ok(true)
     } else {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
+        Err(MostroInternalErr(ServiceError::DbAccessError(
             "Invalid password".to_string(),
-        )));
+        )))
     }
 }
 
@@ -246,7 +247,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
         let max_attempts = 3;
         let mut attempts = 0;
 
-
         if MOSTRO_DB_PASSWORD.get().is_none() {
             println!("MOSTRO_DB_PASSWORD: {:?}", MOSTRO_DB_PASSWORD.get());
 
@@ -322,11 +322,6 @@ async fn store_password_hash(
     }
 
     Ok(())
-}
-
-fn verify_password_hash(password: &SecretString) -> Result<bool, MostroError> {
-    // Implementation to verify the password against stored hash
-    todo!()
 }
 
 pub async fn edit_buyer_pubkey_order(
@@ -766,17 +761,48 @@ pub async fn seller_has_pending_order(
         .acquire()
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = sqlx::query(
-        r#"
-            SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
-        "#, 
-    )
-    .bind(pubkey)
-    .map(|row: SqliteRow| row.get(0))
-    .fetch_one(&mut conn)
-    .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    Ok(rows_affected)
+    // Check if database is encrypted
+    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+        let orders_to_check = sqlx::query_as::<_, Order>(
+            r#"
+                SELECT * FROM orders WHERE status = 'waiting-payment'
+            "#,
+        )
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // search for a waiting-buyer-invoice order with the same pubkey
+        for order in orders_to_check {
+            // Get master seller pubkey
+            let master_seller_pubkey = order
+                .get_master_seller_pubkey()
+                .map_err(MostroInternalErr)?;
+            // Decrypt master buyer pubkey
+            let master_pubkey_decrypted = decrypt_data(
+                master_seller_pubkey.to_string(),
+                Some(password.expose_secret()),
+            )
+            .map_err(MostroInternalErr)?;
+            if master_pubkey_decrypted == pubkey {
+                // Foundd another waiting-buyer-invoice order with the same pubkey
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    // if not encrypted, use the default search
+    else {
+        let rows_affected = sqlx::query(
+            r#"
+                SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
+            "#,
+        )
+        .bind(pubkey)
+        .map(|row: SqliteRow| row.get(0))
+        .fetch_one(&mut conn)
+        .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        Ok(rows_affected)
+    }
 }
 
 /// Check if the buyer has a pending order in the database with status waiting-buyer-invoice
@@ -788,27 +814,50 @@ pub async fn buyer_has_pending_order(
     if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
-
-    // Check if database is encrypted
-    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
-        decrypt_data(password.expose_secret().as_bytes(), Some(password.expose_secret())).unwrap();
-    }
-
+    // Get connection to database
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = sqlx::query(
-        r#"
-            SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
-        "#,
-    )
-    .bind(pubkey)
-    .map(|row: SqliteRow| row.get(0))
-    .fetch_one(&mut conn)
-    .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    Ok(rows_affected)
+    // Check if database is encrypted
+    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+        let orders_to_check = sqlx::query_as::<_, Order>(
+            r#"
+                SELECT * FROM orders WHERE status = 'waiting-buyer-invoice'
+            "#,
+        )
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // search for a waiting-buyer-invoice order with the same pubkey
+        for order in orders_to_check {
+            // Decrypt master buyer pubkey
+            let master_pubkey_decrypted = decrypt_data(
+                order.master_buyer_pubkey.unwrap(),
+                Some(password.expose_secret()),
+            )
+            .unwrap();
+            if master_pubkey_decrypted == pubkey {
+                // Foundd another waiting-buyer-invoice order with the same pubkey
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    // if not encrypted, use the default search
+    else {
+        let rows_affected = sqlx::query(
+            r#"
+                SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
+            "#,
+        )
+        .bind(pubkey)
+        .map(|row: SqliteRow| row.get(0))
+        .fetch_one(&mut conn)
+        .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        Ok(rows_affected)
+    }
 }
 
 pub async fn update_user_rating(

@@ -377,12 +377,7 @@ async fn prepare_new_order(
         id: Uuid::new_v4(),
         kind: OrderKind::Sell.to_string(),
         status: Status::Pending.to_string(),
-        creator_pubkey: store_encrypted(
-            &initiator_pubkey.to_string(),
-            Some(password.expose_secret()),
-        )
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+        creator_pubkey: initiator_pubkey.to_string(),
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
         fee,
@@ -968,7 +963,6 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     }
     Ok(payment_request)
 }
-
 
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,

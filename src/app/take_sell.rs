@@ -88,7 +88,6 @@ pub async fn take_sell_action(
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(
         store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get())
-            .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
     );
 

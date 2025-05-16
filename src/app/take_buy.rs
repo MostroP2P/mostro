@@ -66,7 +66,6 @@ pub async fn take_buy_action(
     // Add seller identity and trade index to the order
     order.master_seller_pubkey = Some(
         store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get())
-            .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
     );
     let trade_index = match msg.get_inner_message_kind().trade_index {

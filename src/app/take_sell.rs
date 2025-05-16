@@ -3,8 +3,14 @@ use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
     show_hold_invoice, update_order_event, validate_invoice,
 };
+use crate::MOSTRO_DB_PASSWORD;
 
 use mostro_core::prelude::*;
+
+use secrecy::ExposeSecret;
+use crate::db::{buyer_has_pending_order, update_user_trade_index};
+use mostro_core::message::Message;
+use mostro_core::order::{decrypt_data, Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -42,6 +48,10 @@ pub async fn take_sell_action(
 ) -> Result<(), MostroError> {
     // Get order
     let mut order = get_order(&msg, pool).await?;
+
+    // if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+    //     decrypt_data(order.get_master_buyer_pubkey().map_err(MostroInternalErr)?.as_bytes(), Some(password.expose_secret())).unwrap();
+    // }
 
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;

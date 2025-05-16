@@ -1,5 +1,4 @@
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
+use mostro_core::prelude::*;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;

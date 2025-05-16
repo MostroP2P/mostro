@@ -1,7 +1,4 @@
-use mostro_core::error::{
-    MostroError::{self, *},
-    ServiceError,
-};
+use mostro_core::prelude::*;
 use serde_json::Value;
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {

@@ -796,16 +796,15 @@ pub async fn seller_has_pending_order(
     }
     // if not encrypted, use the default search
     else {
-        let rows_affected = sqlx::query(
+        let exists = sqlx::query_scalar::<_, bool>(
             r#"
                 SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
             "#,
         )
         .bind(pubkey)
-        .map(|row: SqliteRow| row.get(0))
         .fetch_one(&mut conn)
         .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        Ok(rows_affected)
+        Ok(exists)
     }
 }
 
@@ -848,16 +847,15 @@ pub async fn buyer_has_pending_order(
     }
     // if not encrypted, use the default search
     else {
-        let rows_affected = sqlx::query(
+        let exists = sqlx::query_scalar::<_, bool>(
             r#"
                 SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
             "#,
         )
         .bind(pubkey)
-        .map(|row: SqliteRow| row.get(0))
         .fetch_one(&mut conn)
         .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        Ok(rows_affected)
+        Ok(exists)
     }
 }
 

@@ -396,7 +396,7 @@ async fn prepare_new_order(
             new_order_db.master_buyer_pubkey = Some(
                 store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get(), None)
                     .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+                    .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
             );
             new_order_db.trade_index_buyer = trade_index;
         }

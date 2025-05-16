@@ -832,12 +832,13 @@ pub async fn buyer_has_pending_order(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // search for a waiting-buyer-invoice order with the same pubkey
         for order in orders_to_check {
+            let master_buyer_pubkey = order.get_master_buyer_pubkey().map_err(MostroInternalErr)?;
             // Decrypt master buyer pubkey
             let master_pubkey_decrypted = decrypt_data(
-                order.master_buyer_pubkey.unwrap(),
+                master_buyer_pubkey.to_string(),
                 Some(password.expose_secret()),
             )
-            .unwrap();
+            .map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 // Foundd another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);

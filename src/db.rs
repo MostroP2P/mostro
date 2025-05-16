@@ -178,15 +178,16 @@ async fn get_user_password() -> Result<(), MostroError> {
             continue;
         }
         if password.is_empty() {
-            println!("Press enter to skip password");
+            print!("Press enter to skip password");
         } else {
             // Confirm password
             print!("Confirm database password: ");
         }
 
         std::io::stdout().flush().unwrap();
-        let mut confirm_password = read_password()
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let mut confirm_password = read_password().map_err(|_| {
+            MostroInternalErr(ServiceError::IOError("Failed to read password".to_string()))
+        })?;
 
         if password == confirm_password {
             // zeroize confirm password in ram
@@ -237,7 +238,21 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
                             db_path.display(),
                         );
                         // Get user password
-                        get_user_password().await?;
+                        match get_user_password().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!("Failed to set up database password: {}", e);
+                                println!("Failed to set up database password. Continuing without encryption.");
+                                if let Err(cleanup_err) = std::fs::remove_file(db_path) {
+                                    tracing::error!(
+                                        error = %cleanup_err,
+                                        path = %db_path.display(),
+                                        "Failed to clean up database file"
+                                    );
+                                }
+                                std::process::exit(1);
+                            }
+                        }
                         // Save admin password hash securely
                         if let Some(password) = MOSTRO_DB_PASSWORD.get() {
                             store_password_hash(password, &pool).await.map_err(|e| {
@@ -740,57 +755,27 @@ pub async fn update_user_trade_index(
     Ok(rows_affected > 0)
 }
 
-/// Check if the seller has a pending order in the database with status waiting-payment
-pub async fn seller_has_pending_order(
-    pool: &SqlitePool,
-    pubkey: String,
-) -> Result<bool, MostroError> {
-    // Validate public key format (32-bytes hex)
-    if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
-    }
-
-    // Check if database is encrypted
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        let orders_to_check: Vec<String> = sqlx::query_scalar(
-            r#"
-                SELECT master_seller_pubkey FROM orders WHERE status = 'waiting-payment'
-            "#,
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        // search for a waiting-buyer-invoice order with the same pubkey
-        for master_key in orders_to_check {
-            // Decrypt master buyer pubkey
-            let master_pubkey_decrypted =
-                decrypt_data(master_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
-            if master_pubkey_decrypted == pubkey {
-                // Foundd another waiting-buyer-invoice order with the same pubkey
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-    // if not encrypted, use the default search
-    else {
-        let exists = sqlx::query_scalar::<_, bool>(
-            r#"
-                SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ?1 AND status = 'waiting-payment')
-            "#,
-        )
-        .bind(pubkey)
-        .fetch_one(pool)
-        .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        Ok(exists)
-    }
-}
-
-/// Check if the buyer has a pending order in the database with status waiting-buyer-invoice
 pub async fn buyer_has_pending_order(
     pool: &SqlitePool,
     pubkey: String,
 ) -> Result<bool, MostroError> {
+    has_pending_order_with_status(pool, pubkey, "master_buyer_pubkey", "waiting-buyer-invoice")
+        .await
+}
+
+pub async fn seller_has_pending_order(
+    pool: &SqlitePool,
+    pubkey: String,
+) -> Result<bool, MostroError> {
+    has_pending_order_with_status(pool, pubkey, "master_seller_pubkey", "waiting-payment").await
+}
+
+async fn has_pending_order_with_status(
+    pool: &SqlitePool,
+    pubkey: String,
+    master_key_field: &str,
+    status: &str,
+) -> Result<bool, MostroError> {
     // Validate public key format (32-bytes hex)
     if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) || pubkey.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
@@ -798,21 +783,21 @@ pub async fn buyer_has_pending_order(
 
     // Check if database is encrypted
     if MOSTRO_DB_PASSWORD.get().is_some() {
-        let orders_to_check: Vec<String> = sqlx::query_scalar(
-            r#"
-                SELECT master_buyer_pubkey FROM orders WHERE status = 'waiting-buyer-invoice'
-            "#,
-        )
+        let orders_to_check: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM orders WHERE status = ?",
+            master_key_field
+        ))
+        .bind(status)
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        // search for a waiting-buyer-invoice order with the same pubkey
+
+        // search for orders with the same pubkey
         for master_key in orders_to_check {
-            // Decrypt master buyer pubkey
+            // Decrypt master pubkey
             let master_pubkey_decrypted =
                 decrypt_data(master_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
-                // Found another waiting-buyer-invoice order with the same pubkey
                 return Ok(true);
             }
         }
@@ -820,14 +805,15 @@ pub async fn buyer_has_pending_order(
     }
     // if not encrypted, use the default search
     else {
-        let exists = sqlx::query_scalar::<_, bool>(
-            r#"
-                SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ?1 AND status = 'waiting-buyer-invoice')
-            "#,
-        )
+        let exists = sqlx::query_scalar::<_, bool>(&format!(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE {} = ? AND status = ?)",
+            master_key_field
+        ))
         .bind(pubkey)
+        .bind(status)
         .fetch_one(pool)
-        .await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         Ok(exists)
     }
 }

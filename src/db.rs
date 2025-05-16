@@ -1,5 +1,6 @@
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use secrecy::zeroize::Zeroize;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -10,8 +11,32 @@ use std::path::Path;
 use uuid::Uuid;
 use rpassword::read_password;
 use std::io::Write;
+use argon2::{
+    password_hash::{rand_core::OsRng, Salt, SaltString}, Argon2, PasswordHash, PasswordHasher, PasswordVerifier
+};
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::cli::settings::Settings;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+
+fn restrict_file_permissions(path: &str) -> Result<(), MostroError> {
+    #[cfg(unix)]
+    {
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms)
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+
+    #[cfg(windows)]
+    {
+        // Optional: could integrate with `winapi` or use a placeholder
+        println!("⚠️ Skipping permission change on Windows. Set it manually if needed.");
+    }
+
+    Ok(())
+}
 
 /// Password strength requirements struct
 struct PasswordRequirements {
@@ -86,6 +111,11 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     let password_requirements = PasswordRequirements::default();
 
     let conn = if !db_path.exists() {
+        //Create new database file
+        let _file = std::fs::File::create_new(db_path)
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+
         // Print password requirements
         println!("\nHey Mostro admin insert a password to encrypt the database:");
         println!("- At least {} characters long", password_requirements.min_length);
@@ -97,14 +127,12 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
         // New database - need password confirmation
         let password = loop {
             // First password entry
-            
             print!("\nEnter new database password: ");
             std::io::stdout().flush().unwrap();
             let password = read_password()
                 .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
             // Check password strength
-            
             if !password_requirements.is_strong_password(&password) {
                 continue;
             }
@@ -112,20 +140,19 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
             // Confirm password
             print!("Confirm database password: ");
             std::io::stdout().flush().unwrap();
-            let confirm_password = read_password()
+            let mut confirm_password = read_password()
                 .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
             if password == confirm_password {
-                // Store the password hash securely for future validation
-                // You might want to store this in a separate configuration or credentials file
-                store_password_hash(&password)?;
-                break password;
+                // zeroize confirm password in ram
+                confirm_password.zeroize();
+                break SecretString::from(password);
             } else {
                 println!("Passwords do not match. Please try again.");
             }
         };
 
-        tracing::info!("Password: {}", password);
+        // tracing::info!("Password: {}", password);
 
         // Create new database connection
         match SqlitePool::connect(&db_url).await {
@@ -136,6 +163,8 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
                             "Successfully created database file at {}",
                             db_path.display(),
                         );
+                        // Save admin password hash securely
+                        store_password_hash(password, &pool).await.map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
                         pool
                     }
                     Err(e) => {
@@ -197,10 +226,34 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
 }
 
 // You'll need to implement these functions to store and verify the password hash
-fn store_password_hash(password: &str) -> Result<(), MostroError> {
-    // Implementation depends on where you want to store the hash
-    // Could be in a config file, environment variable, or separate database
-    todo!()
+async fn store_password_hash(password: SecretString, pool: &SqlitePool) -> Result<(), MostroError> {
+     // Generate a random salt
+     let salt = SaltString::generate(&mut OsRng);
+
+     // Configure Argon2 parameters
+     let argon2 = Argon2::default();
+
+     // Derive the key
+     let key = argon2
+         .hash_password(password.expose_secret().as_bytes(), &salt)
+         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+         .to_string();
+
+     // Create a key suitable for ChaCha20Poly1305
+     let key = PasswordHash::new(&key).map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?.to_string();
+
+    // Store the key and salt securely (e.g., in a file or database)
+    let new_user: User = User {
+        is_admin: 1,
+        admin_password: key,
+        ..Default::default()
+    };
+    if let Err(e) = add_new_user(pool, new_user).await {
+        tracing::error!("Error creating new user: {}", e);
+        return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
+    }
+
+    Ok(())
 }
 
 fn verify_password_hash(password: &str) -> Result<bool, MostroError> {

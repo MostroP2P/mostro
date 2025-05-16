@@ -17,6 +17,7 @@ use std::io::Write;
 use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
+use std::collections::HashSet;
 
 use crate::cli::settings::Settings;
 use crate::MOSTRO_DB_PASSWORD;
@@ -673,25 +674,44 @@ pub async fn find_solver_pubkey(
 }
 
 pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
-    //TODO: think about this - how to find quickly if user exists in the database 
-    // Decrypt public key if database is encrypted
-    let public_key =
-        decrypt_data(public_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
-
-    let user = sqlx::query_as::<_, User>(
+    // Fetch all encrypted public keys from the database
+    let users: Vec<User> = sqlx::query_as::<_, User>(
         r#"
             SELECT *
             FROM users
-            WHERE pubkey == ?1
-            LIMIT 1
-        "#,
+        "#
     )
-    .bind(public_key)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    Ok(user)
+    // Decrypt the public keys and store them in a HashSet
+    let decrypted_keys: HashSet<String> = users.iter()
+        .filter_map(|user| {
+            decrypt_data(user.pubkey.clone(), MOSTRO_DB_PASSWORD.get()).ok()
+        })
+        .collect();
+
+    // Check if the provided public key exists in the decrypted keys
+    if decrypted_keys.contains(&public_key) {
+        let user = sqlx::query_as::<_, User>(
+            r#"
+                SELECT *
+                FROM users
+                WHERE pubkey == ?1
+                LIMIT 1
+            "#,
+        )
+        .bind(public_key)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        Ok(user)
+    } else {
+        Err(MostroInternalErr(ServiceError::DbAccessError(
+            "User not found".to_string(),
+        )))
+    }
 }
 
 pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {

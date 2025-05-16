@@ -7,6 +7,7 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
+use crate::MOSTRO_DB_PASSWORD;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -394,17 +395,17 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey()
+            .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey()
+            .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?,
     };
 
     let (full_privacy_buyer, full_privacy_seller) = new_order.is_full_privacy_order();
 
     let tags = if !full_privacy_buyer && !full_privacy_seller {
-        let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
+        let user = crate::db::is_user_present(&pool, identity_pubkey)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

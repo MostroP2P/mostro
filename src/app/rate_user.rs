@@ -1,6 +1,7 @@
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 
 use crate::db::{is_user_present, update_user_rating};
+use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -25,7 +26,7 @@ pub fn prepare_variables_for_vote(
     // Find the counterpart public key
     if message_sender == buyer {
         counterpart = order
-            .get_master_seller_pubkey()
+            .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?
             .to_string();
         buyer_rating = true;
@@ -35,7 +36,7 @@ pub fn prepare_variables_for_vote(
             .to_string();
     } else if message_sender == seller {
         counterpart = order
-            .get_master_buyer_pubkey()
+            .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?
             .to_string();
         seller_rating = true;
@@ -94,7 +95,7 @@ pub async fn update_user_reputation_action(
         .map_err(MostroInternalErr)?;
 
     // Get counter to vote from db
-    let mut user_to_vote = is_user_present(pool, counterpart.clone())
+    let mut user_to_vote = is_user_present(pool, counterpart)
         .await
         .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 

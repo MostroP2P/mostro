@@ -26,7 +26,7 @@ pub async fn trade_pubkey_action(
     let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
         let master_buyer_key = decrypt_data(
             order
-                .get_master_buyer_pubkey()
+                .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
                 .map_err(MostroInternalErr)?
                 .to_string(),
             MOSTRO_DB_PASSWORD.get(),
@@ -36,7 +36,7 @@ pub async fn trade_pubkey_action(
     } else {
         let master_seller_key = decrypt_data(
             order
-                .get_master_seller_pubkey()
+                .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
                 .map_err(MostroInternalErr)?
                 .to_string(),
             MOSTRO_DB_PASSWORD.get(),
@@ -45,11 +45,11 @@ pub async fn trade_pubkey_action(
         (None, Some(master_seller_key))
     };
 
-    match (master_buyer_key.as_ref(), master_seller_key.as_ref()) {
-        (Some(master_buyer_pubkey), _) if master_buyer_pubkey == &event.sender.to_string() => {
+    match (master_buyer_key, master_seller_key) {
+        (Some(master_buyer_pubkey), _) if master_buyer_pubkey == event.sender.to_string() => {
             order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
         }
-        (_, Some(master_seller_pubkey)) if master_seller_pubkey == &event.sender.to_string() => {
+        (_, Some(master_seller_pubkey)) if master_seller_pubkey == event.sender.to_string() => {
             order.seller_pubkey = Some(event.rumor.pubkey.to_string());
         }
         _ => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),

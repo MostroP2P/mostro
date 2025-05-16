@@ -1,6 +1,7 @@
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
+use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -18,12 +19,12 @@ async fn prepare_solver_info_message(
     let (full_privacy_buyer, full_privacy_seller) = order.is_full_privacy_order();
 
     // Get master pubkeys to get users data from db
-    let master_buyer_key = &order
-        .get_master_buyer_pubkey()
+    let master_buyer_key = order
+        .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
-    let master_seller_key: &PublicKey = &order
-        .get_master_seller_pubkey()
+    let master_seller_key = order
+        .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode
@@ -35,7 +36,7 @@ async fn prepare_solver_info_message(
                 .to_string(),
             if !full_privacy_buyer {
                 Some(
-                    is_user_present(pool, master_buyer_key.to_string())
+                    is_user_present(pool, master_buyer_key)
                         .await
                         .map_err(|cause| {
                             MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
@@ -46,7 +47,7 @@ async fn prepare_solver_info_message(
             },
             if !full_privacy_seller {
                 Some(
-                    is_user_present(pool, master_seller_key.to_string())
+                    is_user_present(pool, master_seller_key)
                         .await
                         .map_err(|cause| {
                             MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
@@ -64,7 +65,7 @@ async fn prepare_solver_info_message(
                 .to_string(),
             if !full_privacy_seller {
                 Some(
-                    is_user_present(pool, master_seller_key.to_string())
+                    is_user_present(pool, master_seller_key)
                         .await
                         .map_err(|cause| {
                             MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
@@ -75,7 +76,7 @@ async fn prepare_solver_info_message(
             },
             if !full_privacy_buyer {
                 Some(
-                    is_user_present(pool, master_buyer_key.to_string())
+                    is_user_present(pool, master_buyer_key)
                         .await
                         .map_err(|cause| {
                             MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))

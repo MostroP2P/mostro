@@ -8,39 +8,142 @@ use sqlx::SqlitePool;
 use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
+use rpassword::read_password;
+use std::io::Write;
 
-use crate::config::settings::Settings;
+use crate::cli::settings::Settings;
+
+/// Password strength requirements struct
+struct PasswordRequirements {
+    min_length: usize,
+    requires_uppercase: bool,
+    requires_lowercase: bool,
+    requires_digit: bool,
+    requires_special: bool,
+}
+
+impl Default for PasswordRequirements {
+    fn default() -> Self {
+        Self {
+            min_length: 12,        // Recommended minimum length
+            requires_uppercase: true,
+            requires_lowercase: true,
+            requires_digit: true,
+            requires_special: true,
+        }
+    }
+}
+
+impl PasswordRequirements {
+    fn validate(&self, password: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        
+        if password.len() < self.min_length {
+            failures.push(format!("Password must be at least {} characters long", self.min_length));
+        }
+        
+        if self.requires_uppercase && !password.chars().any(|c| c.is_uppercase()) {
+            failures.push("Password must contain at least one uppercase letter".to_string());
+        }
+        
+        if self.requires_lowercase && !password.chars().any(|c| c.is_lowercase()) {
+            failures.push("Password must contain at least one lowercase letter".to_string());
+        }
+        
+        if self.requires_digit && !password.chars().any(|c| c.is_digit(10)) {
+            failures.push("Password must contain at least one number".to_string());
+        }
+        
+        if self.requires_special && !password.chars().any(|c| !c.is_alphanumeric()) {
+            failures.push("Password must contain at least one special character".to_string());
+        }
+        
+        failures
+    }
+
+    fn is_strong_password(&self, password: &str) -> bool {
+        match self.validate(password).is_empty(){
+            true => true,
+            false => {
+                println!("\nPassword is not strong enough:");
+                for failure in self.validate(password) {
+                    println!("- {}", failure);
+                }
+                false
+            }
+        }
+    }
+}
 
 pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url.to_string();
     db_url.push_str("mostro.db");
-    // Remove sqlite:// from db_url
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
+
+    let password_requirements = PasswordRequirements::default();
+
     let conn = if !db_path.exists() {
-        let _file = OpenOptions::new()
-            .write(true)
-            .create_new(true) // fails if the file already exists
-            .open(db_path)
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Print password requirements
+        println!("\nHey Mostro admin insert a password to encrypt the database:");
+        println!("- At least {} characters long", password_requirements.min_length);
+        println!("- At least one uppercase letter");
+        println!("- At least one lowercase letter");
+        println!("- At least one number");
+        println!("- At least one special character");
+
+        // New database - need password confirmation
+        let password = loop {
+            // First password entry
+            
+            print!("\nEnter new database password: ");
+            std::io::stdout().flush().unwrap();
+            let password = read_password()
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+            // Check password strength
+            
+            if !password_requirements.is_strong_password(&password) {
+                continue;
+            }
+
+            // Confirm password
+            print!("Confirm database password: ");
+            std::io::stdout().flush().unwrap();
+            let confirm_password = read_password()
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+            if password == confirm_password {
+                // Store the password hash securely for future validation
+                // You might want to store this in a separate configuration or credentials file
+                store_password_hash(&password)?;
+                break password;
+            } else {
+                println!("Passwords do not match. Please try again.");
+            }
+        };
+
+        tracing::info!("Password: {}", password);
+
+        // Create new database connection
         match SqlitePool::connect(&db_url).await {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => {
                         tracing::info!(
-                            "Successfully created Mostro database file at {}",
+                            "Successfully created database file at {}",
                             db_path.display(),
                         );
+                        pool
                     }
                     Err(e) => {
-                        // Clean up the created file on migration failure
                         if let Err(cleanup_err) = std::fs::remove_file(db_path) {
                             tracing::error!(
                                 error = %cleanup_err,
                                 path = %db_path.display(),
-                                "Failed to create database connection"
+                                "Failed to clean up database file"
                             );
                         }
                         return Err(MostroInternalErr(ServiceError::DbAccessError(
@@ -48,7 +151,6 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
                         )));
                     }
                 }
-                pool
             }
             Err(e) => {
                 tracing::error!(
@@ -62,11 +164,48 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
             }
         }
     } else {
-        SqlitePool::connect(&db_url)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        // Opening existing database - allow maximum 3 attempts
+        let max_attempts = 3;
+        let mut attempts = 0;
+
+        loop {
+            print!("Enter database password: ");
+            std::io::stdout().flush().unwrap();
+            let password = read_password()
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+            attempts += 1;
+
+            // Verify password against stored hash
+            if verify_password_hash(&password)? {
+                return SqlitePool::connect(&db_url)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())));
+            } else {
+                if attempts >= max_attempts {
+                    return Err(MostroInternalErr(ServiceError::DbAccessError(
+                        "Maximum password attempts exceeded".to_string(),
+                    )));
+                }
+                println!("Invalid password. {} attempts remaining.", max_attempts - attempts);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
     };
+
     Ok(conn)
+}
+
+// You'll need to implement these functions to store and verify the password hash
+fn store_password_hash(password: &str) -> Result<(), MostroError> {
+    // Implementation depends on where you want to store the hash
+    // Could be in a config file, environment variable, or separate database
+    todo!()
+}
+
+fn verify_password_hash(password: &str) -> Result<bool, MostroError> {
+    // Implementation to verify the password against stored hash
+    todo!()
 }
 
 pub async fn edit_buyer_pubkey_order(

@@ -369,12 +369,12 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     new_order.range_parent_id = Some(order.id);
 
     match new_order.get_order_kind().map_err(MostroInternalErr)? {
-        Kind::Sell => {
+        mostro_core::order::Kind::Sell => {
             new_order.buyer_pubkey = None;
             new_order.master_buyer_pubkey = None;
             new_order.trade_index_buyer = None;
         }
-        Kind::Buy => {
+        mostro_core::order::Kind::Buy => {
             new_order.seller_pubkey = None;
             new_order.master_seller_pubkey = None;
             new_order.trade_index_seller = None;

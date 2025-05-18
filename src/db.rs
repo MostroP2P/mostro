@@ -1,3 +1,5 @@
+use crate::MOSTRO_DB_PASSWORD;
+use crate::config::settings::Settings;
 use mostro_core::prelude::*;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use nostr_sdk::prelude::*;
@@ -6,18 +8,12 @@ use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
-use sqlx::Sqlite;
-use sqlx::SqlitePool;
-#[cfg(unix)]
+use sqlx::{Sqlite, SqlitePool, Row};
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
-use std::fs::OpenOptions;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::cli::settings::Settings;
-use crate::MOSTRO_DB_PASSWORD;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -213,7 +209,7 @@ async fn get_user_password() -> Result<(), MostroError> {
 pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
-    let mut db_url = db_settings.url;
+    let mut db_url = db_settings.url.clone();
     db_url.push_str("mostro.db");
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);

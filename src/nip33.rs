@@ -1,6 +1,5 @@
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
-use crate::Settings;
 use crate::LN_STATUS;
 use chrono::Duration;
 use mostro_core::prelude::*;

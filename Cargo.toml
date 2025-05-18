@@ -16,7 +16,7 @@ path = "src/main.rs"
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
 lightning-invoice = { version = "0.33.1", features = ["std"] }
-nostr-sdk = { version = "0.40.0", features = ["nip59"] }
+nostr-sdk = { version = "0.41.0", features = ["nip59"] }
 serde = { version = "1.0.210" }
 toml = "0.8.22"
 serde_json = "1.0.128"
@@ -38,7 +38,7 @@ uuid = { version = "1.8.0", features = [
   "serde",
 ] }
 reqwest = { version = "0.12.1", features = ["json"] }
-mostro-core = { version = "0.6.38", features = ["sqlx"] }
+mostro-core = { version = "0.6.39", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 clap = { version = "4.5.29", features = ["derive"] }
@@ -54,3 +54,6 @@ clearscreen = "4.0.1"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
+
+[patch.crates-io]
+mostro-core = { path = "../mostro-core" }

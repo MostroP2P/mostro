@@ -9,7 +9,6 @@ use secrecy::{ExposeSecret, SecretString};
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
-#[cfg(unix)]
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
 use std::path::Path;
@@ -210,8 +209,7 @@ async fn get_user_password() -> Result<(), MostroError> {
 pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
-    let mut db_url = db_settings.url.clone();
-    db_url.push_str("mostro.db");
+    let db_url = &db_settings.url;
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
 
@@ -226,7 +224,7 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         // Create new database connection
-        match SqlitePool::connect(&db_url).await {
+        match SqlitePool::connect(db_url).await {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => {
@@ -285,7 +283,7 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
         }
     } else {
         // Connect to existing database
-        let conn = SqlitePool::connect(&db_url)
+        let conn = SqlitePool::connect(db_url)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -915,7 +913,7 @@ pub async fn find_order_by_id(
 #[cfg(test)]
 mod tests {
     use argon2::password_hash::SaltString;
-    use mostro_core::crypto::CryptoUtils;
+    use mostro_core::order::{decrypt_data, store_encrypted};
     use secrecy::SecretString;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use sqlx::Error;
@@ -975,7 +973,7 @@ mod tests {
             println!("Inserting value : {:?}", value_string);
             let salt = salt_vec[i % 5].clone();
             let encrypted_value =
-                CryptoUtils::store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
+                store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
 
             if i > 0 {
                 query_builder.push_str(", ");
@@ -1004,7 +1002,7 @@ mod tests {
         let mut hash_set_values: HashSet<String> = HashSet::new();
         for value in fetched_values {
             let interval = Instant::now();
-            let value_decrypted = CryptoUtils::decrypt_data(value, Some(&password)).unwrap();
+            let value_decrypted = decrypt_data(value, Some(&password)).unwrap();
             println!(
                 "Time taken to decrypt: {:?} ms",
                 interval.elapsed().as_millis()

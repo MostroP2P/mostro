@@ -170,6 +170,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -488,6 +494,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3888aaa89e4b2a40fca9848e400f6a658a5a3978de7be858e209cafa8be9a4a0"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -693,6 +712,12 @@ name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b63caa9aa9397e2d9480a9b13673856c78d8ac123288526c37d7839f2a86990"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "core-foundation"
@@ -1953,7 +1978,7 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "mostro-core",
- "nostr-sdk 0.41.0",
+ "nostr-sdk",
  "once_cell",
  "openssl",
  "reqwest",
@@ -1973,20 +1998,25 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.6.39"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c572a059c39a07403f14396204ad1747cb89d3636b9cef36aee3e7b6b7d48d60"
+source = "git+https://github.com/MostroP2P/mostro-core.git?branch=database-encrypt#491ad5bab388c994a1f683ef4b6ab76bcd65ac0c"
 dependencies = [
+ "argon2",
+ "base64 0.22.1",
  "bitcoin",
  "bitcoin_hashes 0.16.0",
+ "blake3",
+ "chacha20poly1305",
  "chrono",
- "nostr-sdk 0.40.0",
+ "nostr-sdk",
  "rand 0.9.1",
+ "secrecy",
  "serde",
  "serde_json",
  "sqlx",
  "sqlx-crud",
  "uuid",
  "wasm-bindgen",
+ "zeroize",
 ]
 
 [[package]]
@@ -2048,30 +2078,6 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f900ddcdc28395759fcd44b18a03255e7deee8858551bfe5d5d5a07311d82ea"
-dependencies = [
- "base64 0.22.1",
- "bech32",
- "bip39",
- "bitcoin_hashes 0.14.0",
- "cbc",
- "chacha20",
- "chacha20poly1305",
- "getrandom 0.2.15",
- "instant",
- "regex",
- "scrypt",
- "secp256k1",
- "serde",
- "serde_json",
- "unicode-normalization",
- "url",
-]
-
-[[package]]
-name = "nostr"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95d3f2f0d564cce3ebe09bb1343af67d88c60108cedc518a307dfdf6e3f503b6"
@@ -2096,42 +2102,13 @@ dependencies = [
 
 [[package]]
 name = "nostr-database"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714512e4653f4e7c4f4abb50a0ac82257541b22087dee780b9e3d787276e88d4"
-dependencies = [
- "lru",
- "nostr 0.40.0",
- "tokio",
-]
-
-[[package]]
-name = "nostr-database"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de6dc456a11d26f99a932b6531d94c20cb2e274ada6eab1d2438e2fb9c944af5"
 dependencies = [
  "lru",
- "nostr 0.41.0",
+ "nostr",
  "tokio",
-]
-
-[[package]]
-name = "nostr-relay-pool"
-version = "0.40.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bde07a729e0a1b306c9a07da81a0d1d55d0487316017090906f3b6660741b8d"
-dependencies = [
- "async-utility",
- "async-wsocket",
- "atomic-destructor",
- "lru",
- "negentropy 0.3.1",
- "negentropy 0.5.0",
- "nostr 0.40.0",
- "nostr-database 0.40.0",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2146,22 +2123,8 @@ dependencies = [
  "lru",
  "negentropy 0.3.1",
  "negentropy 0.5.0",
- "nostr 0.41.0",
- "nostr-database 0.41.0",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nostr-sdk"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26238eee805d7dc3abcc8d570068c81cb4285b08e9db4d7999e54e20748c472e"
-dependencies = [
- "async-utility",
- "nostr 0.40.0",
- "nostr-database 0.40.0",
- "nostr-relay-pool 0.40.1",
+ "nostr",
+ "nostr-database",
  "tokio",
  "tracing",
 ]
@@ -2173,9 +2136,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58d201c49818ef560a67f9c26c415007da38b007943e7d1644ac55aa98c55a42"
 dependencies = [
  "async-utility",
- "nostr 0.41.0",
- "nostr-database 0.41.0",
- "nostr-relay-pool 0.41.0",
+ "nostr",
+ "nostr-database",
+ "nostr-relay-pool",
  "tokio",
  "tracing",
 ]

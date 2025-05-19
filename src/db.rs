@@ -913,7 +913,7 @@ pub async fn find_order_by_id(
 #[cfg(test)]
 mod tests {
     use argon2::password_hash::SaltString;
-    use mostro_core::order::{decrypt_data, store_encrypted};
+    use mostro_core::prelude::*;
     use secrecy::SecretString;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use sqlx::Error;
@@ -972,8 +972,7 @@ mod tests {
             let value_string = format!("Entry {}", i % 5);
             println!("Inserting value : {:?}", value_string);
             let salt = salt_vec[i % 5].clone();
-            let encrypted_value =
-                store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
+            let encrypted_value = CryptoUtils::store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
 
             if i > 0 {
                 query_builder.push_str(", ");
@@ -1002,7 +1001,7 @@ mod tests {
         let mut hash_set_values: HashSet<String> = HashSet::new();
         for value in fetched_values {
             let interval = Instant::now();
-            let value_decrypted = decrypt_data(value, Some(&password)).unwrap();
+            let value_decrypted = CryptoUtils::decrypt_data(value, Some(&password)).unwrap();
             println!(
                 "Time taken to decrypt: {:?} ms",
                 interval.elapsed().as_millis()

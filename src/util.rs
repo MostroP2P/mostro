@@ -15,15 +15,7 @@ use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
-use mostro_core::dispute::Dispute;
-use mostro_core::error::CantDoReason;
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
-use mostro_core::message::Peer;
-use mostro_core::message::{Action, Message, Payload};
-use mostro_core::order::store_encrypted;
-use mostro_core::order::{decrypt_data, Kind as OrderKind, Order, SmallOrder, Status};
-use mostro_core::user::UserInfo;
+use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
@@ -40,6 +32,9 @@ use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 const MAX_RETRY: u16 = 4;
+
+// Redefined for convenience
+type OrderKind = mostro_core::order::Kind;
 
 pub async fn retries_yadio_request(
     req_string: &str,
@@ -394,8 +389,12 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_buyer_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get(), None)
-                    .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
+                CryptoUtils::store_encrypted(
+                    &identity_pubkey.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                    None,
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
             );
             new_order_db.trade_index_buyer = trade_index;
         }
@@ -403,8 +402,12 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_seller_pubkey = Some(
-                store_encrypted(&identity_pubkey.to_string(), MOSTRO_DB_PASSWORD.get(), None)
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+                CryptoUtils::store_encrypted(
+                    &identity_pubkey.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                    None,
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );
             new_order_db.trade_index_seller = trade_index;
         }
@@ -973,7 +976,7 @@ pub async fn notify_taker_reputation(
 
     let user_decrypted_key = if let Some(user) = user {
         // Get reputation data
-        decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
+        CryptoUtils::decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     };

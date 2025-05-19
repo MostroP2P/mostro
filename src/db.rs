@@ -1,14 +1,15 @@
-use crate::MOSTRO_DB_PASSWORD;
 use crate::config::settings::Settings;
-use mostro_core::prelude::*;
+use crate::MOSTRO_DB_PASSWORD;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use rpassword::read_password;
 use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Sqlite, SqlitePool, Row};
+use sqlx::{Row, Sqlite, SqlitePool};
+#[cfg(unix)]
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
 use std::path::Path;
@@ -792,7 +793,8 @@ async fn has_pending_order_with_status(
         for master_key in orders_to_check {
             // Decrypt master pubkey
             let master_pubkey_decrypted =
-                decrypt_data(master_key, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?;
+                CryptoUtils::decrypt_data(master_key, MOSTRO_DB_PASSWORD.get())
+                    .map_err(MostroInternalErr)?;
             if master_pubkey_decrypted == pubkey {
                 return Ok(true);
             }

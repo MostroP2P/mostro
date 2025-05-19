@@ -24,7 +24,7 @@ pub async fn trade_pubkey_action(
 
     // Get master keys decrypted
     let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
-        let master_buyer_key = decrypt_data(
+        let master_buyer_key = CryptoUtils::decrypt_data(
             order
                 .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
                 .map_err(MostroInternalErr)?
@@ -34,7 +34,7 @@ pub async fn trade_pubkey_action(
         .map_err(MostroInternalErr)?;
         (Some(master_buyer_key), None)
     } else {
-        let master_seller_key = decrypt_data(
+        let master_seller_key = CryptoUtils::decrypt_data(
             order
                 .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
                 .map_err(MostroInternalErr)?

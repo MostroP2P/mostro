@@ -1997,8 +1997,9 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.6.39"
-source = "git+https://github.com/MostroP2P/mostro-core.git?branch=database-encrypt#491ad5bab388c994a1f683ef4b6ab76bcd65ac0c"
+version = "0.6.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e4f00613761cd385d337943da90de5ac5dd4a58ecb7cb2385710edc4347fde5"
 dependencies = [
  "argon2",
  "base64 0.22.1",

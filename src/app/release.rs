@@ -171,15 +171,29 @@ async fn handle_child_order(
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
         let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+        // Get if users are in full privacy mode to use correct master keys in child order
+        let (normal_buyer_idkey, normal_seller_idkey) = order
+            .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+            .map_err(|_| {
+                MostroInternalErr(ServiceError::UnexpectedError(
+                    "Error creating order event".to_string(),
+                ))
+            })?;
 
         match order.creator_pubkey {
             _ if order.seller_pubkey.as_ref() == Some(&order.creator_pubkey) => {
                 child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
                 child_order.trade_index_seller = Some(next_trade_index as i64);
+                if normal_seller_idkey.is_none() {
+                    child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+                }
             }
             _ if order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey) => {
                 child_order.buyer_pubkey = Some(next_trade_pubkey.to_string());
-                child_order.trade_index_buyer = order.next_trade_index;
+                child_order.trade_index_buyer = Some(next_trade_index as i64);
+                if normal_buyer_idkey.is_none() {
+                    child_order.master_buyer_pubkey = Some(next_trade_pubkey.to_string());
+                }
             }
             _ => {}
         }

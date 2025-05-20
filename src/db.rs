@@ -1,5 +1,6 @@
 use crate::config::settings::Settings;
 use crate::MOSTRO_DB_PASSWORD;
+use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -107,18 +108,18 @@ impl PasswordRequirements {
 
 fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError> {
     // Get user input password to check against stored hash
-    print!("Enter database password: ");
-    std::io::stdout().flush().unwrap();
-
+    // print!("Enter database password: ");
+    // std::io::stdout().flush().unwrap();
+    let password = "PippoPippo#75";
     // Simulate a delay in password input to avoid timing attacks
-    let random_delay = rand::random::<u16>() % 1000;
-    let password = read_password()
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // let random_delay = rand::random::<u16>() % 1000;
+    // let password = read_password()
+    //     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Simulate a delay in password input to avoid timing attacks
-    std::thread::sleep(std::time::Duration::from_millis(
-        100_u64 + random_delay as u64,
-    ));
+    // // Simulate a delay in password input to avoid timing attacks
+    // std::thread::sleep(std::time::Duration::from_millis(
+    //     100_u64 + random_delay as u64,
+    // ));
 
     if Argon2::default()
         .verify_password(password.as_bytes(), password_hash)
@@ -320,19 +321,14 @@ async fn store_password_hash(
     pool: &SqlitePool,
 ) -> Result<(), MostroError> {
     // Generate a random salt
-    let salt_base = b"1H/aaYsf8&asduA";
-    let mut salt_vec: Vec<SaltString> = Vec::new();
-    for i in 0..50 {
-        let salt = format!("{}{}", String::from_utf8_lossy(salt_base), i % 5);
-        salt_vec.push(SaltString::encode_b64(salt.as_bytes()).unwrap());
-    }
+    let salt = SaltString::generate(&mut OsRng);
 
     // Configure Argon2 parameters
     let argon2 = Argon2::default();
 
     // Derive the key
     let key = argon2
-        .hash_password(password.expose_secret().as_bytes(), &salt_vec[0])
+        .hash_password(password.expose_secret().as_bytes(), &salt)
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         .to_string();
 
@@ -972,7 +968,8 @@ mod tests {
             let value_string = format!("Entry {}", i % 5);
             println!("Inserting value : {:?}", value_string);
             let salt = salt_vec[i % 5].clone();
-            let encrypted_value = CryptoUtils::store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
+            let encrypted_value =
+                CryptoUtils::store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
 
             if i > 0 {
                 query_builder.push_str(", ");

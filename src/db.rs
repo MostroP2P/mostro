@@ -108,18 +108,17 @@ impl PasswordRequirements {
 
 fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError> {
     // Get user input password to check against stored hash
-    // print!("Enter database password: ");
-    // std::io::stdout().flush().unwrap();
-    let password = "PippoPippo#75";
+    print!("Enter database password: ");
+    std::io::stdout().flush().unwrap();
     // Simulate a delay in password input to avoid timing attacks
-    // let random_delay = rand::random::<u16>() % 1000;
-    // let password = read_password()
-    //     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let random_delay = rand::random::<u16>() % 1000;
+    let password = read_password()
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // // Simulate a delay in password input to avoid timing attacks
-    // std::thread::sleep(std::time::Duration::from_millis(
-    //     100_u64 + random_delay as u64,
-    // ));
+    // Simulate a delay in password input to avoid timing attacks
+    std::thread::sleep(std::time::Duration::from_millis(
+        100_u64 + random_delay as u64,
+    ));
 
     if Argon2::default()
         .verify_password(password.as_bytes(), password_hash)

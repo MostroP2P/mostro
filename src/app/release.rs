@@ -419,27 +419,17 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             .map_err(MostroInternalErr)?,
     };
 
-    let (normal_buyer_idkey, normal_seller_idkey) = new_order
-        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
-        .map_err(|_| {
-            MostroInternalErr(ServiceError::UnexpectedError(
-                "Error creating order event".to_string(),
-            ))
-        })?;
-
-    let tags = if normal_buyer_idkey.is_some() && normal_seller_idkey.is_some() {
-        let user = crate::db::is_user_present(&pool, identity_pubkey)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        order_to_tags(
+    // If user has sent the order with his identity key means that he wants to be rate so we can just
+    // check if we have identity key in db - if present we have to send reputation tags otherwise no.
+    let tags = match crate::db::is_user_present(&pool, identity_pubkey).await {
+        Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),
-        )?
-    } else {
-        order_to_tags(new_order, None)?
+        )?,
+        Err(_) => order_to_tags(new_order, None)?,
     };
 
+    // Prepare new child order event for sending
     let event = if let Some(tags) = tags {
         new_event(my_keys, "", new_order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?

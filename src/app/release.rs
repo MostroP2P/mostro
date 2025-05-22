@@ -426,7 +426,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),
         )?,
-        Err(_) => order_to_tags(new_order, None)?,
+        Err(_) => order_to_tags(new_order, Some((0.0, 0, 0)))?,
     };
 
     // Prepare new child order event for sending

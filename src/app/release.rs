@@ -185,14 +185,36 @@ async fn handle_child_order(
                 child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
                 child_order.trade_index_seller = Some(next_trade_index as i64);
                 if normal_seller_idkey.is_none() {
-                    child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+                    child_order.master_seller_pubkey = Some(
+                        CryptoUtils::store_encrypted(
+                            &next_trade_pubkey.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                            None,
+                        )
+                        .map_err(|_| {
+                            MostroInternalErr(ServiceError::EncryptionError(
+                                "Error storing encrypted master seller pubkey".to_string(),
+                            ))
+                        })?,
+                    );
                 }
             }
             _ if order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey) => {
                 child_order.buyer_pubkey = Some(next_trade_pubkey.to_string());
                 child_order.trade_index_buyer = Some(next_trade_index as i64);
                 if normal_buyer_idkey.is_none() {
-                    child_order.master_buyer_pubkey = Some(next_trade_pubkey.to_string());
+                    child_order.master_buyer_pubkey = Some(
+                        CryptoUtils::store_encrypted(
+                            &next_trade_pubkey.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                            None,
+                        )
+                        .map_err(|_| {
+                            MostroInternalErr(ServiceError::EncryptionError(
+                                "Error storing encrypted master buyer pubkey".to_string(),
+                            ))
+                        })?,
+                    );
                 }
             }
             _ => {}

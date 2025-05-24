@@ -17,8 +17,11 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     let settings_dir = if let Some(user_path) = config_path {
         PathBuf::from(user_path)
     } else {
-        let home_dir = dirs::home_dir()
-            .ok_or_else(|| MostroInternalErr(ServiceError::IOError("Could not find home directory".to_string())))?;
+        let home_dir = dirs::home_dir().ok_or_else(|| {
+            MostroInternalErr(ServiceError::IOError(
+                "Could not find home directory".to_string(),
+            ))
+        })?;
         let package_name = env!("CARGO_PKG_NAME");
         home_dir.join(format!(".{}", package_name))
     };

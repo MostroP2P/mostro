@@ -3,6 +3,7 @@ use crate::util::{
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
+use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -63,7 +64,10 @@ pub async fn take_buy_action(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Add seller identity and trade index to the order
-    order.master_seller_pubkey = Some(event.sender.to_string());
+    order.master_seller_pubkey = Some(
+        CryptoUtils::store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get(), None)
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+    );
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {

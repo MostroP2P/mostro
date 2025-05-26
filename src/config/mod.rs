@@ -10,7 +10,8 @@ pub mod util;
 use crate::lightning::LnStatus;
 
 // Synchronization primitives for thread safety -used for different global variables
-use std::sync::{OnceLock,Arc,RwLock,Mutex,LazyLock};
+use std::sync::{OnceLock,Arc,Mutex,LazyLock};
+use tokio::sync::RwLock;
 
 // Re-export for convenience
 pub use settings::{init_mostro_settings, Settings, get_db_pool};

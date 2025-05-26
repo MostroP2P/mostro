@@ -1,6 +1,6 @@
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::settings::get_db_pool;
-use crate::config::settings::Settings;
+use crate::config::settings::{get_db_pool,Settings};
+use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
 use crate::flow;

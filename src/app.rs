@@ -32,6 +32,7 @@ use crate::app::release::release_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
+use crate::config::settings::get_db_pool;
 // Core functionality imports
 use crate::config::settings::Settings;
 use crate::db::add_new_user;
@@ -258,11 +259,12 @@ pub async fn run(
     my_keys: Keys,
     client: &Client,
     ln_client: &mut LndConnector,
-    pool: Pool<Sqlite>,
 ) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
 
+        // Arc clone of db pool for main loop
+        let pool = get_db_pool().clone();
         // Get pow from config
         let pow = Settings::get_mostro().pow;
         while let Ok(notification) = notifications.recv().await {

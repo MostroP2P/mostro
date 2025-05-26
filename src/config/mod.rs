@@ -5,9 +5,37 @@ pub mod settings;
 pub mod types;
 pub mod util;
 
+// Mostro configuration module
+// This module provides global configuration settings for the Mostro lightining configuration.
+use crate::lightning::LnStatus;
+
+// Synchronization primitives for thread safety -used for different global variables
+use std::sync::{OnceLock,Arc,RwLock,Mutex,LazyLock};
+
 // Re-export for convenience
-pub use settings::{init_mostro_settings, Settings};
+pub use settings::{init_mostro_settings, Settings, get_db_pool};
 pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
+use nostr_sdk::prelude::*;
+use mostro_core::prelude::*;
+
+// Global variables for Mostro configuration, Nostr client, Lightning status, and database pool
+// almost all of them are initialized with OnceLock to ensure they are set only once
+// They are shared across the application using Arc and Mutex/RwLock for thread safety
+pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
+pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
+pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
+pub static DB_POOL : OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
+
+///
+#[derive(Debug, Clone, Default)]
+pub struct MessageQueues {
+    pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+    pub queue_order_cantdo: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+    pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
+}
+
+pub static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> =
+    LazyLock::new(|| RwLock::new(MessageQueues::default()));
 
 #[cfg(test)]
 mod tests {

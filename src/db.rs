@@ -7,11 +7,12 @@ use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::config::settings::Settings;
 
-pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
+pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
     let mut db_url = db_settings.url.to_string();
@@ -66,7 +67,7 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
     };
-    Ok(conn)
+    Ok(Arc::new(conn))
 }
 
 pub async fn edit_buyer_pubkey_order(

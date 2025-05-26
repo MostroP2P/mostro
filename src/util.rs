@@ -1,4 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
+use crate::config::settings::get_db_pool;
 use crate::config::settings::Settings;
 use crate::db;
 use crate::db::is_user_present;
@@ -9,7 +10,6 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
-use crate::MESSAGE_QUEUES;
 use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
@@ -659,6 +659,10 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
         }
     };
     tokio::spawn(invoice_task);
+
+    // Arc clone db pool to safe use across threads
+    let pool = get_db_pool().clone();
+
     let subs = {
         async move {
             // Receiving msgs from the invoice subscription.
@@ -666,19 +670,19 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id).await {
+                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool).await {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");
                     }
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    if let Err(e) = flow::hold_invoice_settlement(&hash).await {
+                    if let Err(e) = flow::hold_invoice_settlement(&hash, &pool).await {
                         info!("Invoice flow error {e}");
                     }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    if let Err(e) = flow::hold_invoice_canceled(&hash).await {
+                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool).await {
                         info!("Invoice flow error {e}");
                     }
                 } else {

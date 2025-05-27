@@ -41,14 +41,14 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
+    // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
+    settings_init()?;
+
     // Connect to database
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
         exit(1);
     };
-
-    // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    settings_init()?;
 
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {

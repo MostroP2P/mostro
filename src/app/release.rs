@@ -29,7 +29,7 @@ pub async fn check_failure_retries(
     let mut order = order.clone();
 
     // Arc clone of db pool to use across threads
-    let pool = get_db_pool().clone();
+    let pool = get_db_pool();
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -381,7 +381,7 @@ fn create_base_order(order: &Order) -> Order {
 
 async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
     // Arc clone db pool to safe use across threads
-    let pool = get_db_pool().clone();
+    let pool = get_db_pool();
 
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {

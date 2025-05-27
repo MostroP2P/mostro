@@ -255,16 +255,12 @@ async fn handle_message_action(
 /// * `ln_client` - Lightning network connector
 /// * `pool` - SQLite connection pool
 /// * `rate_list` - Shared list of rating events
-pub async fn run(
-    my_keys: Keys,
-    client: &Client,
-    ln_client: &mut LndConnector,
-) -> Result<()> {
+pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
 
         // Arc clone of db pool for main loop
-        let pool = get_db_pool().clone();
+        let pool = get_db_pool();
         // Get pow from config
         let pow = Settings::get_mostro().pow;
         while let Ok(notification) = notifications.recv().await {

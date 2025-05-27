@@ -5,7 +5,11 @@ use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use tracing::info;
 
-pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>, pool: &SqlitePool) -> Result<(), MostroError> {
+pub async fn hold_invoice_paid(
+    hash: &str,
+    request_id: Option<u64>,
+    pool: &SqlitePool,
+) -> Result<(), MostroError> {
     let order = crate::db::find_order_by_hash(pool, hash)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -103,17 +107,17 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>, pool: &Sqlit
 
         // Notify taker reputation to maker
         tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(&pool, &order).await?;
+        notify_taker_reputation(pool, &order).await?;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     if let Ok(updated_order) = crate::util::update_order_event(&my_keys, status, &order).await {
         // Update order on db
-        let _ = updated_order.update(&pool).await;
+        let _ = updated_order.update(pool).await;
     }
 
     // Update the invoice_held_at field
-    crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_u64() as i64)
+    crate::db::update_order_invoice_held_at_time(pool, order.id, Timestamp::now().as_u64() as i64)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

@@ -10,14 +10,14 @@ pub mod util;
 use crate::lightning::LnStatus;
 
 // Synchronization primitives for thread safety -used for different global variables
-use std::sync::{OnceLock,Arc,Mutex,LazyLock};
-use tokio::sync::RwLock;
+use std::sync::{Arc, LazyLock, OnceLock};
+use tokio::sync::{Mutex, RwLock};
 
 // Re-export for convenience
-pub use settings::{init_mostro_settings, Settings, get_db_pool};
-pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
-use nostr_sdk::prelude::*;
 use mostro_core::prelude::*;
+use nostr_sdk::prelude::*;
+pub use settings::{get_db_pool, init_mostro_settings, Settings};
+pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool
 // almost all of them are initialized with OnceLock to ensure they are set only once
@@ -25,9 +25,15 @@ use mostro_core::prelude::*;
 pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
-pub static DB_POOL : OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
+pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
 
+/// Global message queues for Mostro
+/// This struct holds three queues:
+/// - `queue_order_msg`: Holds messages related to orders.
+/// - `queue_order_cantdo`: Holds messages that cannot be processed.
+/// - `queue_order_rate`: Holds events related to user rates.
 ///
+/// Each queue is wrapped in an `Arc<Mutex<>>` to allow safe concurrent access across threads.
 #[derive(Debug, Clone, Default)]
 pub struct MessageQueues {
     pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,

@@ -1,5 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::settings::{get_db_pool,Settings};
+use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
@@ -661,7 +661,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
     tokio::spawn(invoice_task);
 
     // Arc clone db pool to safe use across threads
-    let pool = get_db_pool().clone();
+    let pool = get_db_pool();
 
     let subs = {
         async move {

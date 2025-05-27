@@ -1,11 +1,11 @@
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
+use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
 use crate::util::get_nostr_client;
 use crate::LN_STATUS;
-use crate::db::*;
 use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
@@ -36,9 +36,9 @@ pub async fn start_scheduler() {
 
 async fn job_flush_messages_queue() {
     // Clone for closure owning with Arc
-    let order_msg_list = MESSAGE_QUEUES.read()?.queue_order_msg.clone();
-    // Clone for closure owning with Arc    
-    let cantdo_msg_list = MESSAGE_QUEUES.read().unwrap().queue_order_cantdo.clone();
+    let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
+    // Clone for closure owning with Arc
+    let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
     let sender_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
@@ -166,7 +166,7 @@ async fn job_retry_failed_payments() {
     let interval = ln_settings.payment_retries_interval as u64;
 
     // Arc clone db pool to safe use across threads
-    let pool = get_db_pool().clone();
+    let pool = get_db_pool();
 
     tokio::spawn(async move {
         loop {
@@ -232,8 +232,8 @@ async fn job_update_rate_events() {
 async fn job_cancel_orders() -> Result<(), MostroError> {
     info!("Create a pool to connect to db");
 
-     // Arc clone db pool to safe use across threads
-    let pool = get_db_pool().clone();
+    // Arc clone db pool to safe use across threads
+    let pool = get_db_pool();
 
     let keys = match get_keys() {
         Ok(keys) => keys,

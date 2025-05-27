@@ -14,18 +14,16 @@ pub mod util;
 
 use crate::app::run;
 use crate::cli::settings_init;
+use crate::config::*;
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
-use crate::config::*;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
 use std::process::exit;
-use tracing;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,7 +45,7 @@ async fn main() -> Result<()> {
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
         exit(1);
-    }
+    };
 
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
     settings_init()?;
@@ -82,7 +80,7 @@ async fn main() -> Result<()> {
         panic!("No connection to LND node - shutting down Mostro!");
     };
 
-    if let Ok(held_invoices) = find_held_invoices(&pool).await {
+    if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
                 tracing::info!("Resubscribing order id - {}", invoice.id);

@@ -14,7 +14,7 @@ pub mod util;
 
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::*;
+use crate::config::{get_db_pool, Settings, DB_POOL, NOSTR_CLIENT, LN_STATUS};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;

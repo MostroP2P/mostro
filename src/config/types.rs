@@ -1,5 +1,6 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
+use crate::config::MOSTRO_CONFIG;
 use serde::Deserialize;
 
 // / Implement the TryFrom trait for each of the structs in Settings
@@ -11,7 +12,7 @@ macro_rules! impl_try_from_settings {
                 type Error = mostro_core::error::MostroError;
 
                 fn try_from(_: super::Settings) -> Result<Self, Self::Error> {
-                    Ok(crate::MOSTRO_CONFIG.get().unwrap().$field.clone())
+                    Ok(MOSTRO_CONFIG.get().unwrap().$field.clone())
                 }
             }
         )*

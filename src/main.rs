@@ -14,7 +14,7 @@ pub mod util;
 
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::{get_db_pool, Settings, DB_POOL, NOSTR_CLIENT, LN_STATUS};
+use crate::config::{get_db_pool, DB_POOL, LN_STATUS, NOSTR_CLIENT};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
         tracing::error!("No connection to nostr relay - closing Mostro!");
+        exit(1);
     };
 
     let my_keys = util::get_keys()?;

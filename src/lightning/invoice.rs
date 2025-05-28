@@ -82,7 +82,7 @@ pub async fn is_valid_invoice(
 #[cfg(test)]
 mod tests {
     use super::{is_valid_invoice, Settings};
-    use crate::MOSTRO_CONFIG;
+    use crate::config::MOSTRO_CONFIG;
     use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
     use toml;
 

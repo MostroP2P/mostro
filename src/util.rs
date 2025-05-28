@@ -412,8 +412,8 @@ async fn prepare_new_order(
 
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
-    sender_keys: Keys,
-    payload: String,
+    sender_keys: &Keys,
+    payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
     info!(
@@ -421,7 +421,7 @@ pub async fn send_dm(
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(&payload)
+    let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We compose the content, as this is a message from Mostro
     // and Mostro don't have trade key, we don't need to sign the payload
@@ -437,7 +437,7 @@ pub async fn send_dm(
     }
     let tags = Tags::from_list(tags);
 
-    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags)
+    let event = EventBuilder::gift_wrap(sender_keys, &receiver_pubkey, rumor, tags)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
@@ -1111,7 +1111,7 @@ mod tests {
         let sender_keys = Keys::generate();
         // Now error is well manager this call will fail now, previously test was ok becuse error was not managed
         // now just make it ok and then will make a better test
-        let result = send_dm(receiver_pubkey, sender_keys, payload, None).await;
+        let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
         assert!(result.is_err());
     }
 

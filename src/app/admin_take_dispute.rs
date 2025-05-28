@@ -188,8 +188,8 @@ pub async fn admin_take_dispute_action(
     let message = message
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    let sender_keys = crate::util::get_keys()?;
-    send_dm(event.sender, sender_keys, message, None)
+    // Send the message to admin
+    send_dm(event.sender, mostro_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
@@ -204,14 +204,15 @@ pub async fn admin_take_dispute_action(
             pubkey: event.sender.to_hex(),
             reputation: None,
         })),
-    );
+    )
+    .as_json()
+    .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
     // Send to buyer
     send_dm(
         order.get_buyer_pubkey().map_err(MostroInternalErr)?,
-        mostro_keys.clone(),
-        msg_to_users
-            .as_json()
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
+        mostro_keys,
+        &msg_to_users,
         None,
     )
     .await
@@ -220,10 +221,8 @@ pub async fn admin_take_dispute_action(
     // Send message to seller
     send_dm(
         order.get_seller_pubkey().map_err(MostroInternalErr)?,
-        mostro_keys.clone(),
-        msg_to_users
-            .as_json()
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
+        mostro_keys,
+        &msg_to_users,
         None,
     )
     .await

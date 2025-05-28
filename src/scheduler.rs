@@ -54,7 +54,7 @@ async fn job_flush_messages_queue() {
             let (message, destination_key) = msg_list.lock().await[0].clone();
             match message.as_json() {
                 Ok(msg) => {
-                    if let Err(e) = send_dm(destination_key, sender_keys.clone(), msg, None).await {
+                    if let Err(e) = send_dm(destination_key, &sender_keys, &msg, None).await {
                         error!("Failed to send message: {}", e);
                         *retries += 1;
                     } else {

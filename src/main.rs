@@ -56,9 +56,11 @@ async fn main() -> Result<()> {
         exit(1);
     };
 
-    let my_keys = util::get_keys()?;
+    // Get mostro keys
+    let mostro_keys = util::get_keys()?;
+
     let subscription = Filter::new()
-        .pubkey(my_keys.public_key())
+        .pubkey(mostro_keys.public_key())
         .kind(Kind::GiftWrap)
         .limit(0);
 
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
     start_scheduler().await;
 
     // Run the Mostro and be happy!!
-    run(my_keys, client, &mut ln_client).await
+    run(mostro_keys, client, &mut ln_client).await
 }
 
 #[cfg(test)]

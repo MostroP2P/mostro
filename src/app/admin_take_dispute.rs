@@ -245,8 +245,7 @@ pub async fn admin_take_dispute_action(
     ]);
     // nip33 kind with dispute id as identifier
     let event = new_event(
-        &crate::util::get_keys()
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?,
+        mostro_keys,
         "",
         dispute.id.to_string(),
         tags,

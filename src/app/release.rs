@@ -7,6 +7,7 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
+use crate::MOSTRO_DB_PASSWORD;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -170,15 +171,51 @@ async fn handle_child_order(
 ) -> Result<()> {
     if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
         let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
+        // Get if users are in full privacy mode to use correct master keys in child order
+        let (normal_buyer_idkey, normal_seller_idkey) = order
+            .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+            .map_err(|_| {
+                MostroInternalErr(ServiceError::UnexpectedError(
+                    "Error creating order event".to_string(),
+                ))
+            })?;
 
         match order.creator_pubkey {
             _ if order.seller_pubkey.as_ref() == Some(&order.creator_pubkey) => {
                 child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
                 child_order.trade_index_seller = Some(next_trade_index as i64);
+                if normal_seller_idkey.is_none() {
+                    child_order.master_seller_pubkey = Some(
+                        CryptoUtils::store_encrypted(
+                            &next_trade_pubkey.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                            None,
+                        )
+                        .map_err(|_| {
+                            MostroInternalErr(ServiceError::EncryptionError(
+                                "Error storing encrypted master seller pubkey".to_string(),
+                            ))
+                        })?,
+                    );
+                }
             }
             _ if order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey) => {
                 child_order.buyer_pubkey = Some(next_trade_pubkey.to_string());
-                child_order.trade_index_buyer = order.next_trade_index;
+                child_order.trade_index_buyer = Some(next_trade_index as i64);
+                if normal_buyer_idkey.is_none() {
+                    child_order.master_buyer_pubkey = Some(
+                        CryptoUtils::store_encrypted(
+                            &next_trade_pubkey.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                            None,
+                        )
+                        .map_err(|_| {
+                            MostroInternalErr(ServiceError::EncryptionError(
+                                "Error storing encrypted master buyer pubkey".to_string(),
+                            ))
+                        })?,
+                    );
+                }
             }
             _ => {}
         }
@@ -329,13 +366,13 @@ async fn payment_success(
 pub async fn get_child_order(
     order: Order,
     my_keys: &Keys,
-) -> Result<(Option<Order>, Option<Event>)> {
+) -> Result<(Option<Order>, Option<Event>), MostroError> {
     let (Some(max_amount), Some(min_amount)) = (order.max_amount, order.min_amount) else {
         return Ok((None, None));
     };
 
     if let Some(new_max) = max_amount.checked_sub(order.fiat_amount) {
-        let mut new_order = create_base_order(&order);
+        let mut new_order = create_base_order(&order)?;
 
         match new_max.cmp(&min_amount) {
             Ordering::Equal => {
@@ -355,7 +392,7 @@ pub async fn get_child_order(
     Ok((None, None))
 }
 
-fn create_base_order(order: &Order) -> Order {
+fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     let mut new_order = order.clone();
     new_order.id = uuid::Uuid::new_v4();
     new_order.status = Status::Pending.to_string();
@@ -367,17 +404,20 @@ fn create_base_order(order: &Order) -> Order {
     new_order.invoice_held_at = 0;
     new_order.range_parent_id = Some(order.id);
 
-    if new_order.kind == "sell" {
-        new_order.buyer_pubkey = None;
-        new_order.master_buyer_pubkey = None;
-        new_order.trade_index_buyer = None;
-    } else {
-        new_order.seller_pubkey = None;
-        new_order.master_seller_pubkey = None;
-        new_order.trade_index_seller = None;
+    match new_order.get_order_kind().map_err(MostroInternalErr)? {
+        mostro_core::order::Kind::Sell => {
+            new_order.buyer_pubkey = None;
+            new_order.master_buyer_pubkey = None;
+            new_order.trade_index_buyer = None;
+        }
+        mostro_core::order::Kind::Buy => {
+            new_order.seller_pubkey = None;
+            new_order.master_seller_pubkey = None;
+            new_order.trade_index_seller = None;
+        }
     }
 
-    new_order
+    Ok(new_order)
 }
 
 async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
@@ -394,28 +434,24 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey()
+            .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey()
+            .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
             .map_err(MostroInternalErr)?,
     };
 
-    let (full_privacy_buyer, full_privacy_seller) = new_order.is_full_privacy_order();
-
-    let tags = if !full_privacy_buyer && !full_privacy_seller {
-        let user = crate::db::is_user_present(&pool, identity_pubkey.to_string())
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        order_to_tags(
+    // If user has sent the order with his identity key means that he wants to be rate so we can just
+    // check if we have identity key in db - if present we have to send reputation tags otherwise no.
+    let tags = match crate::db::is_user_present(&pool, identity_pubkey).await {
+        Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),
-        )?
-    } else {
-        order_to_tags(new_order, None)?
+        )?,
+        Err(_) => order_to_tags(new_order, Some((0.0, 0, 0)))?,
     };
 
+    // Prepare new child order event for sending
     let event = if let Some(tags) = tags {
         new_event(my_keys, "", new_order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?

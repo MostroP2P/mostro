@@ -14,14 +14,7 @@ use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
-use mostro_core::dispute::Dispute;
-use mostro_core::error::CantDoReason;
-use mostro_core::error::MostroError::{self, *};
-use mostro_core::error::ServiceError;
-use mostro_core::message::Peer;
-use mostro_core::message::{Action, Message, Payload};
-use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
-use mostro_core::user::UserInfo;
+use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
@@ -38,6 +31,9 @@ use uuid::Uuid;
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 const MAX_RETRY: u16 = 4;
+
+// Redefined for convenience
+type OrderKind = mostro_core::order::Kind;
 
 pub async fn retries_yadio_request(
     req_string: &str,
@@ -391,13 +387,27 @@ async fn prepare_new_order(
         Some(OrderKind::Buy) => {
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_buyer_pubkey = Some(identity_pubkey.to_string());
+            new_order_db.master_buyer_pubkey = Some(
+                CryptoUtils::store_encrypted(
+                    &identity_pubkey.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                    None,
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
+            );
             new_order_db.trade_index_buyer = trade_index;
         }
         Some(OrderKind::Sell) => {
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_seller_pubkey = Some(identity_pubkey.to_string());
+            new_order_db.master_seller_pubkey = Some(
+                CryptoUtils::store_encrypted(
+                    &identity_pubkey.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                    None,
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+            );
             new_order_db.trade_index_seller = trade_index;
         }
         None => {
@@ -533,6 +543,11 @@ pub async fn update_order_event(
         "Order Id: {} updated Nostr new Status: {}",
         order.id,
         status.to_string()
+    );
+
+    println!(
+        "Inside update_order_event order_updated status {:?} - order id {:?}",
+        order_updated.status, order_updated.id,
     );
 
     Ok(order_updated)
@@ -958,14 +973,18 @@ pub async fn notify_taker_reputation(
     let is_buy_order = order.is_buy_order().is_ok();
     // Get user needed
     let user = match is_buy_order {
-        true => order
-            .get_master_seller_pubkey()
-            .map_err(MostroInternalErr)?,
-        false => order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
+        true => order.master_seller_pubkey.clone(),
+        false => order.master_buyer_pubkey.clone(),
     };
 
-    // Get reputation data
-    let reputation_data = match is_user_present(pool, user.to_string()).await {
+    let user_decrypted_key = if let Some(user) = user {
+        // Get reputation data
+        CryptoUtils::decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
+    } else {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    };
+
+    let reputation_data = match is_user_present(pool, user_decrypted_key).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
             UserInfo {

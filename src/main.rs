@@ -20,6 +20,7 @@ use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
+use secrecy::SecretString;
 use std::env;
 use std::process::exit;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -27,6 +28,9 @@ use util::{get_nostr_client, invoice_subscribe};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Clear screen
+    clearscreen::clear().expect("Failed to clear screen");
+
     if cfg!(debug_assertions) {
         // Debug, show all error + mostro logs
         env::set_var("RUST_LOG", "error,mostro=info");

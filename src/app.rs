@@ -50,8 +50,27 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
 /// Helper function to log warning messages for action errors
-fn warning_msg(action: &Action, e: ServiceError) {
-    tracing::warn!("Error in {} with context {}", action, e);
+fn warning_msg(action: &Action, err: ServiceError) {
+    let message = match &err {
+        ServiceError::EnvVarError(message) => message.to_string(),
+        ServiceError::EncryptionError(message) => message.to_string(),
+        ServiceError::DecryptionError(message) => message.to_string(),
+        ServiceError::IOError(message) => message.to_string(),
+        ServiceError::UnexpectedError(message) => message.to_string(),
+        ServiceError::LnNodeError(message) => message.to_string(),
+        ServiceError::LnPaymentError(message) => message.to_string(),
+        ServiceError::DbAccessError(message) => message.to_string(),
+        ServiceError::NostrError(message) => message.to_string(),
+        ServiceError::HoldInvoiceError(message) => message.to_string(),
+        _ => "No message".to_string(),
+    };
+
+    tracing::warn!(
+        "Error in {} with context {} - inner message {}",
+        action,
+        err,
+        message
+    );
 }
 
 /// Function to manage errors and send appropriate messages

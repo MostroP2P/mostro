@@ -6,12 +6,12 @@ pub mod types;
 pub mod util;
 
 // Mostro configuration module
-// This module provides global configuration settings for the Mostro lightining configuration.
+// This module provides global configuration settings for the Mostro lightning configuration.
 use crate::lightning::LnStatus;
 
 // Synchronization primitives for thread safety -used for different global variables
 use std::sync::{Arc, LazyLock, OnceLock};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 // Re-export for convenience
 use mostro_core::prelude::*;
@@ -38,13 +38,12 @@ pub static MOSTRO_DB_PASSWORD: OnceLock<SecretString> = OnceLock::new();
 /// Each queue is wrapped in an `Arc<Mutex<>>` to allow safe concurrent access across threads.
 #[derive(Debug, Clone, Default)]
 pub struct MessageQueues {
-    pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_cantdo: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
+    pub queue_order_msg: Arc<RwLock<Vec<(Message, PublicKey)>>>,
+    pub queue_order_cantdo: Arc<RwLock<Vec<(Message, PublicKey)>>>,
+    pub queue_order_rate: Arc<RwLock<Vec<Event>>>,
 }
 
-pub static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> =
-    LazyLock::new(|| RwLock::new(MessageQueues::default()));
+pub static MESSAGE_QUEUES: LazyLock<MessageQueues> = LazyLock::new(MessageQueues::default);
 
 #[cfg(test)]
 mod tests {

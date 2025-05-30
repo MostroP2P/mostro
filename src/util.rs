@@ -503,13 +503,7 @@ pub async fn update_user_rating_event(
     order.update(pool).await?;
 
     // Add event message to global list
-    MESSAGE_QUEUES
-        .write()
-        .await
-        .queue_order_rate
-        .lock()
-        .await
-        .push(event);
+    MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
     Ok(())
 }
 
@@ -845,10 +839,8 @@ pub async fn enqueue_cant_do_msg(
     // Send message to event creator
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(Some(reason))));
     MESSAGE_QUEUES
-        .write()
-        .await
         .queue_order_cantdo
-        .lock()
+        .write()
         .await
         .push((message, destination_key));
 }
@@ -864,10 +856,8 @@ pub async fn enqueue_order_msg(
     // Send message to event creator
     let message = Message::new_order(order_id, request_id, trade_index, action, payload);
     MESSAGE_QUEUES
-        .write()
-        .await
         .queue_order_msg
-        .lock()
+        .write()
         .await
         .push((message, destination_key));
 }

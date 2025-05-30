@@ -15,7 +15,7 @@ use nostr_sdk::EventBuilder;
 use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{error, info};
 use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
 
@@ -36,9 +36,9 @@ pub async fn start_scheduler() {
 
 async fn job_flush_messages_queue() {
     // Clone for closure owning with Arc
-    let order_msg_list = MESSAGE_QUEUES.read().await.queue_order_msg.clone();
+    let order_msg_list = MESSAGE_QUEUES.queue_order_msg.clone();
     // Clone for closure owning with Arc
-    let cantdo_msg_list = MESSAGE_QUEUES.read().await.queue_order_cantdo.clone();
+    let cantdo_msg_list = MESSAGE_QUEUES.queue_order_cantdo.clone();
     let sender_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
@@ -46,12 +46,12 @@ async fn job_flush_messages_queue() {
 
     // Helper function to send messages
     async fn send_messages(
-        msg_list: Arc<Mutex<Vec<(Message, PublicKey)>>>,
+        msg_list: Arc<RwLock<Vec<(Message, PublicKey)>>>,
         sender_keys: Keys,
         retries: &mut usize,
     ) {
-        if !msg_list.lock().await.is_empty() {
-            let (message, destination_key) = msg_list.lock().await[0].clone();
+        if !msg_list.read().await.is_empty() {
+            let (message, destination_key) = msg_list.read().await[0].clone();
             match message.as_json() {
                 Ok(msg) => {
                     if let Err(e) = send_dm(destination_key, &sender_keys, &msg, None).await {
@@ -59,14 +59,14 @@ async fn job_flush_messages_queue() {
                         *retries += 1;
                     } else {
                         *retries = 0;
-                        msg_list.lock().await.remove(0);
+                        msg_list.write().await.remove(0);
                     }
                 }
                 Err(e) => error!("Failed to parse message: {}", e),
             }
             if *retries > 3 {
                 *retries = 0; // Reset retries after removing message
-                msg_list.lock().await.remove(0);
+                msg_list.write().await.remove(0);
             }
         }
     }
@@ -191,7 +191,7 @@ async fn job_retry_failed_payments() {
 
 async fn job_update_rate_events() {
     // Clone for closure owning with Arc
-    let queue_order_rate = MESSAGE_QUEUES.read().await.queue_order_rate.clone();
+    let queue_order_rate = MESSAGE_QUEUES.queue_order_rate.clone();
     let mostro_settings = Settings::get_mostro();
     let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
     let client = match get_nostr_client() {
@@ -206,13 +206,13 @@ async fn job_update_rate_events() {
                 interval / 60
             );
 
-            for ev in queue_order_rate.lock().await.iter() {
+            for ev in queue_order_rate.read().await.iter() {
                 // Send event to relay
                 let _ = client.send_event(&ev.clone()).await;
             }
 
             // Clear list after send events
-            queue_order_rate.lock().await.clear();
+            queue_order_rate.write().await.clear();
 
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(

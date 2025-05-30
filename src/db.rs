@@ -1,5 +1,5 @@
 use crate::config::settings::Settings;
-use crate::MOSTRO_DB_PASSWORD;
+use crate::config::MOSTRO_DB_PASSWORD;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use mostro_core::prelude::*;

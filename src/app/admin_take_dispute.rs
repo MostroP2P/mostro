@@ -1,7 +1,7 @@
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
-use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -231,13 +231,8 @@ pub async fn admin_take_dispute_action(
         ),
     ]);
     // nip33 kind with dispute id as identifier
-    let event = new_event(
-        mostro_keys,
-        "",
-        dispute.id.to_string(),
-        tags,
-    )
-    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = new_event(mostro_keys, "", dispute.id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Dispute event to be published: {event:#?}");
 
     let client = get_nostr_client()

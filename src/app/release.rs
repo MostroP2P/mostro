@@ -1,4 +1,5 @@
 use crate::config;
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -7,7 +8,6 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
-use crate::MOSTRO_DB_PASSWORD;
 
 use config::settings::*;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;

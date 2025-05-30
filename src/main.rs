@@ -20,7 +20,6 @@ use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
-use secrecy::SecretString;
 use std::env;
 use std::process::exit;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};

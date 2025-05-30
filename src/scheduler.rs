@@ -24,7 +24,7 @@ pub async fn start_scheduler() {
 
     job_expire_pending_older_orders().await;
     job_update_rate_events().await;
-    let _ = job_cancel_orders().await;
+    job_cancel_orders().await;
     job_retry_failed_payments().await;
     job_info_event_send().await;
     job_relay_list().await;
@@ -231,7 +231,6 @@ async fn job_update_rate_events() {
 
 async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
-
 
     // Arc clone db pool to safe use across threads
     let pool = get_db_pool();

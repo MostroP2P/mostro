@@ -1,9 +1,9 @@
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
     show_hold_invoice, update_order_event, validate_invoice,
 };
-use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

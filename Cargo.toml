@@ -29,7 +29,7 @@ sqlx = { version = "0.6.2", features = [
   "offline",
 ] }
 sqlx-crud = { version = "0.4.0", features = ["runtime-tokio-rustls"] }
-tokio = { version = "1.45.1", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }
 fedimint-tonic-lnd = "0.2.0"
 uuid = { version = "1.17.0", features = [
   "v4",
@@ -37,7 +37,7 @@ uuid = { version = "1.17.0", features = [
   "macro-diagnostics",
   "serde",
 ] }
-reqwest = { version = "0.12.18", features = ["json"] }
+reqwest = { version = "0.12.1", features = ["json"] }
 mostro-core = { version = "0.6.40", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -53,4 +53,4 @@ dirs = "6.0.0"
 clearscreen = "4.0.1"
 
 [dev-dependencies]
-tokio = { version = "1.45.1", features = ["full", "test-util", "macros"] }
+tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }

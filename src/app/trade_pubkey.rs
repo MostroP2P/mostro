@@ -1,5 +1,5 @@
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::util::{enqueue_order_msg, get_order};
-use crate::MOSTRO_DB_PASSWORD;
 
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;

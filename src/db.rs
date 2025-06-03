@@ -1,5 +1,5 @@
 use crate::config::settings::Settings;
-use crate::MOSTRO_DB_PASSWORD;
+use crate::config::MOSTRO_DB_PASSWORD;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use mostro_core::prelude::*;
@@ -13,6 +13,7 @@ use sqlx::{Row, Sqlite, SqlitePool};
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -206,7 +207,7 @@ async fn get_user_password() -> Result<(), MostroError> {
     Ok(())
 }
 
-pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
+pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
     let db_url = &db_settings.url;
@@ -311,7 +312,7 @@ pub async fn connect() -> Result<Pool<Sqlite>, MostroError> {
 
         conn
     };
-    Ok(conn)
+    Ok(Arc::new(conn))
 }
 
 // You'll need to implement these functions to store and verify the password hash

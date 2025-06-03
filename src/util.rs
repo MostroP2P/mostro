@@ -1,5 +1,6 @@
 use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::settings::Settings;
+use crate::config::settings::{get_db_pool, Settings};
+use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
 use crate::flow;
@@ -9,8 +10,6 @@ use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
-use crate::MESSAGE_QUEUES;
-use crate::MOSTRO_DB_PASSWORD;
 use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
@@ -423,8 +422,8 @@ async fn prepare_new_order(
 
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
-    sender_keys: Keys,
-    payload: String,
+    sender_keys: &Keys,
+    payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
     info!(
@@ -432,7 +431,7 @@ pub async fn send_dm(
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(&payload)
+    let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // We compose the content, as this is a message from Mostro
     // and Mostro don't have trade key, we don't need to sign the payload
@@ -448,7 +447,7 @@ pub async fn send_dm(
     }
     let tags = Tags::from_list(tags);
 
-    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags)
+    let event = EventBuilder::gift_wrap(sender_keys, &receiver_pubkey, rumor, tags)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
@@ -504,13 +503,7 @@ pub async fn update_user_rating_event(
     order.update(pool).await?;
 
     // Add event message to global list
-    MESSAGE_QUEUES
-        .write()
-        .await
-        .queue_order_rate
-        .lock()
-        .await
-        .push(event);
+    MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
     Ok(())
 }
 
@@ -675,6 +668,10 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
         }
     };
     tokio::spawn(invoice_task);
+
+    // Arc clone db pool to safe use across threads
+    let pool = get_db_pool();
+
     let subs = {
         async move {
             // Receiving msgs from the invoice subscription.
@@ -682,19 +679,19 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id).await {
+                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool).await {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");
                     }
                 } else if msg.state == InvoiceState::Settled {
                     // If the payment was settled
-                    if let Err(e) = flow::hold_invoice_settlement(&hash).await {
+                    if let Err(e) = flow::hold_invoice_settlement(&hash, &pool).await {
                         info!("Invoice flow error {e}");
                     }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    if let Err(e) = flow::hold_invoice_canceled(&hash).await {
+                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool).await {
                         info!("Invoice flow error {e}");
                     }
                 } else {
@@ -842,10 +839,8 @@ pub async fn enqueue_cant_do_msg(
     // Send message to event creator
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(Some(reason))));
     MESSAGE_QUEUES
-        .write()
-        .await
         .queue_order_cantdo
-        .lock()
+        .write()
         .await
         .push((message, destination_key));
 }
@@ -861,10 +856,8 @@ pub async fn enqueue_order_msg(
     // Send message to event creator
     let message = Message::new_order(order_id, request_id, trade_index, action, payload);
     MESSAGE_QUEUES
-        .write()
-        .await
         .queue_order_msg
-        .lock()
+        .write()
         .await
         .push((message, destination_key));
 }
@@ -1127,7 +1120,7 @@ mod tests {
         let sender_keys = Keys::generate();
         // Now error is well manager this call will fail now, previously test was ok becuse error was not managed
         // now just make it ok and then will make a better test
-        let result = send_dm(receiver_pubkey, sender_keys, payload, None).await;
+        let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
         assert!(result.is_err());
     }
 

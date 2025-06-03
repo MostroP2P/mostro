@@ -1,7 +1,6 @@
-use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
-
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{is_user_present, update_user_rating};
-use crate::MOSTRO_DB_PASSWORD;
+use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;

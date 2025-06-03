@@ -1,14 +1,16 @@
 use crate::util::{enqueue_order_msg, notify_taker_reputation};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use tracing::info;
 
-pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<(), MostroError> {
-    let pool = crate::db::connect()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let order = crate::db::find_order_by_hash(&pool, hash)
+pub async fn hold_invoice_paid(
+    hash: &str,
+    request_id: Option<u64>,
+    pool: &SqlitePool,
+) -> Result<(), MostroError> {
+    let order = crate::db::find_order_by_hash(pool, hash)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let my_keys = crate::util::get_keys()
@@ -105,26 +107,25 @@ pub async fn hold_invoice_paid(hash: &str, request_id: Option<u64>) -> Result<()
 
         // Notify taker reputation to maker
         tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(&pool, &order).await?;
+        notify_taker_reputation(pool, &order).await?;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     if let Ok(updated_order) = crate::util::update_order_event(&my_keys, status, &order).await {
         // Update order on db
-        let _ = updated_order.update(&pool).await;
+        let _ = updated_order.update(pool).await;
     }
 
     // Update the invoice_held_at field
-    crate::db::update_order_invoice_held_at_time(&pool, order.id, Timestamp::now().as_u64() as i64)
+    crate::db::update_order_invoice_held_at_time(pool, order.id, Timestamp::now().as_u64() as i64)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }
 
-pub async fn hold_invoice_settlement(hash: &str) -> Result<()> {
-    let pool = crate::db::connect().await?;
-    let order = crate::db::find_order_by_hash(&pool, hash).await?;
+pub async fn hold_invoice_settlement(hash: &str, pool: &SqlitePool) -> Result<()> {
+    let order = crate::db::find_order_by_hash(pool, hash).await?;
     info!(
         "Order Id: {} - Invoice with hash: {} was settled!",
         order.id, hash
@@ -132,9 +133,8 @@ pub async fn hold_invoice_settlement(hash: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn hold_invoice_canceled(hash: &str) -> Result<()> {
-    let pool = crate::db::connect().await?;
-    let order = crate::db::find_order_by_hash(&pool, hash).await?;
+pub async fn hold_invoice_canceled(hash: &str, pool: &SqlitePool) -> Result<()> {
+    let order = crate::db::find_order_by_hash(pool, hash).await?;
     info!(
         "Order Id: {} - Invoice with hash: {} was canceled!",
         order.id, hash

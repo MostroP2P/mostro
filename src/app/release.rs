@@ -1,4 +1,5 @@
-use crate::config::settings::Settings;
+use crate::config;
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -7,8 +8,8 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
-use crate::MOSTRO_DB_PASSWORD;
 
+use config::settings::*;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
@@ -28,10 +29,8 @@ pub async fn check_failure_retries(
 ) -> Result<Order, MostroError> {
     let mut order = order.clone();
 
-    // Handle to db here
-    let pool = db::connect()
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    // Arc clone of db pool to use across threads
+    let pool = get_db_pool();
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
@@ -421,15 +420,8 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
 }
 
 async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
-    // Get db connection
-    let pool = match crate::db::connect().await {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                e.to_string(),
-            )))
-        }
-    };
+    // Arc clone db pool to safe use across threads
+    let pool = get_db_pool();
 
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {

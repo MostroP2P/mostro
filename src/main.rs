@@ -14,36 +14,16 @@ pub mod util;
 
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::settings::Settings;
+use crate::config::{get_db_pool, DB_POOL, LN_STATUS, NOSTR_CLIENT};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
-use mostro_core::message::Message;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
-use secrecy::SecretString;
 use std::env;
 use std::process::exit;
-use std::sync::OnceLock;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
-static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
-static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
-static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
-static MOSTRO_DB_PASSWORD: OnceLock<SecretString> = OnceLock::new();
-
-#[derive(Debug, Clone, Default)]
-pub struct MessageQueues {
-    pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_cantdo: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
-}
-
-static MESSAGE_QUEUES: LazyLock<RwLock<MessageQueues>> =
-    LazyLock::new(|| RwLock::new(MessageQueues::default()));
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,24 +44,26 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("Starting Mostro!");
-
-    // Init path from cli
+    // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
     settings_init()?;
 
     // Connect to database
-    // TODO: will move this to an ARC or something that can be shared between threads and avoid re-initing the database
-    let pool = db::connect().await?;
-
-    // Connect to relays
-    // from now unwrap is safe - oncelock inited
-    if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
-        error!("No connection to nostr relay - closing Mostro!");
+    if DB_POOL.set(db::connect().await?).is_err() {
+        tracing::error!("No connection to database - closing Mostro!");
+        exit(1);
     };
 
-    let my_keys = util::get_keys()?;
+    // Connect to relays
+    if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
+        tracing::error!("No connection to nostr relay - closing Mostro!");
+        exit(1);
+    };
+
+    // Get mostro keys
+    let mostro_keys = util::get_keys()?;
+
     let subscription = Filter::new()
-        .pubkey(my_keys.public_key())
+        .pubkey(mostro_keys.public_key())
         .kind(Kind::GiftWrap)
         .limit(0);
 
@@ -104,10 +86,10 @@ async fn main() -> Result<()> {
         panic!("No connection to LND node - shutting down Mostro!");
     };
 
-    if let Ok(held_invoices) = find_held_invoices(&pool).await {
+    if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
-                info!("Resubscribing order id - {}", invoice.id);
+                tracing::info!("Resubscribing order id - {}", invoice.id);
                 if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None).await {
                     tracing::error!("Ln node error {e}")
                 }
@@ -118,7 +100,8 @@ async fn main() -> Result<()> {
     // Start scheduler for tasks
     start_scheduler().await;
 
-    run(my_keys, client, &mut ln_client, pool).await
+    // Run the Mostro and be happy!!
+    run(mostro_keys, client, &mut ln_client).await
 }
 
 #[cfg(test)]

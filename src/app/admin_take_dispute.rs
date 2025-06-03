@@ -1,7 +1,7 @@
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
-use crate::MOSTRO_DB_PASSWORD;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -175,8 +175,8 @@ pub async fn admin_take_dispute_action(
     let message = message
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    let sender_keys = crate::util::get_keys()?;
-    send_dm(event.sender, sender_keys, message, None)
+    // Send the message to admin
+    send_dm(event.sender, mostro_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
@@ -191,14 +191,15 @@ pub async fn admin_take_dispute_action(
             pubkey: event.sender.to_hex(),
             reputation: None,
         })),
-    );
+    )
+    .as_json()
+    .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
     // Send to buyer
     send_dm(
         order.get_buyer_pubkey().map_err(MostroInternalErr)?,
-        mostro_keys.clone(),
-        msg_to_users
-            .as_json()
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
+        mostro_keys,
+        &msg_to_users,
         None,
     )
     .await
@@ -207,10 +208,8 @@ pub async fn admin_take_dispute_action(
     // Send message to seller
     send_dm(
         order.get_seller_pubkey().map_err(MostroInternalErr)?,
-        mostro_keys.clone(),
-        msg_to_users
-            .as_json()
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?,
+        mostro_keys,
+        &msg_to_users,
         None,
     )
     .await
@@ -232,14 +231,8 @@ pub async fn admin_take_dispute_action(
         ),
     ]);
     // nip33 kind with dispute id as identifier
-    let event = new_event(
-        &crate::util::get_keys()
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?,
-        "",
-        dispute.id.to_string(),
-        tags,
-    )
-    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = new_event(mostro_keys, "", dispute.id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Dispute event to be published: {event:#?}");
 
     let client = get_nostr_client()

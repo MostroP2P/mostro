@@ -124,7 +124,12 @@ pub fn order_to_tags(
             Some(status) => status.networks.join(","),
             None => "unknown".to_string(),
         };
-
+        let payment_method: Vec<String> = order
+            .payment_method
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         let mut tags: Vec<Tag> = vec![
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("k")),
@@ -146,10 +151,7 @@ pub fn order_to_tags(
                 TagKind::Custom(Cow::Borrowed("fa")),
                 create_fiat_amt_array(order),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("pm")),
-                vec![order.payment_method.to_string()],
-            ),
+            Tag::custom(TagKind::Custom(Cow::Borrowed("pm")), payment_method),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("premium")),
                 vec![order.premium.to_string()],

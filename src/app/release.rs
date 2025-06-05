@@ -219,6 +219,9 @@ async fn handle_child_order(
             _ => {}
         }
 
+        let destination_key = child_order
+            .get_creator_pubkey()
+            .map_err(MostroInternalErr)?;
         child_order.creator_pubkey = next_trade_pubkey.to_string();
         child_order.next_trade_index = None;
         child_order.next_trade_pubkey = None;
@@ -230,7 +233,7 @@ async fn handle_child_order(
             new_order.id,
             Action::NewOrder,
             Some(Payload::Order(new_order)),
-            next_trade_pubkey,
+            destination_key,
             Some(next_trade_index as i64),
         )
         .await;

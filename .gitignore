@@ -15,3 +15,6 @@ bin/
 
 # Docker related config and data
 docker/config
+
+# AI
+CLAUDE.md

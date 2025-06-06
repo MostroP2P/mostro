@@ -74,6 +74,7 @@ pub async fn release_action(
     // We send a message to buyer indicating seller released funds
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
+    // Check if the pubkey is the seller pubkey - Only the seller can release funds
     if seller_pubkey != event.rumor.pubkey {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
@@ -167,42 +168,59 @@ async fn handle_child_order(
     next_trade: Option<(String, u32)>,
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
-) -> Result<()> {
-    if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
-        let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)?;
-        // Get if users are in full privacy mode to use correct master keys in child order
-        let (normal_buyer_idkey, normal_seller_idkey) = order
-            .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
-            .map_err(|_| {
-                MostroInternalErr(ServiceError::UnexpectedError(
-                    "Error creating order event".to_string(),
-                ))
-            })?;
+) -> Result<(), MostroError> {
+    // Check if users are in rating mode or full privacy mode - in case get the user id keys for rate
+    let (normal_buyer_idkey, normal_seller_idkey) = order
+        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+        .map_err(|_| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "Error creating order event".to_string(),
+            ))
+        })?;
 
-        if order.is_buy_order().is_ok()
-            && order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey)
-        {
-            child_order.buyer_pubkey = order.next_trade_pubkey.clone();
-            child_order.trade_index_buyer = order.next_trade_index;
-            child_order.creator_pubkey = order.next_trade_pubkey.clone().unwrap();
+    // if it's a buy order use the next trade pubkey and index created when buyer sends fiat to seller
+    let (notification_pubkey, new_trade_index) = if order.is_buy_order().is_ok()
+        && order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey)
+    {
+        child_order.buyer_pubkey = order.next_trade_pubkey.clone();
+        child_order.trade_index_buyer = order.next_trade_index;
+        let next_buyer_pubkey = if let Some(next_trade_pubkey) = order.next_trade_pubkey.clone() {
+            next_trade_pubkey
+        } else {
+            return Err(MostroInternalErr(ServiceError::UnexpectedError(
+                "Next trade buyer pubkey is missing".to_string(),
+            )));
+        };
 
-            if normal_buyer_idkey.is_none() {
-                child_order.master_buyer_pubkey = Some(
-                    CryptoUtils::store_encrypted(
-                        &next_trade_pubkey.to_string(),
-                        MOSTRO_DB_PASSWORD.get(),
-                        None,
-                    )
+        child_order.creator_pubkey = next_buyer_pubkey.clone();
+
+        if normal_buyer_idkey.is_none() {
+            child_order.master_buyer_pubkey = Some(
+                CryptoUtils::store_encrypted(&next_buyer_pubkey, MOSTRO_DB_PASSWORD.get(), None)
                     .map_err(|_| {
                         MostroInternalErr(ServiceError::EncryptionError(
                             "Error storing encrypted master buyer pubkey".to_string(),
                         ))
                     })?,
-                );
-            }
-        } else if order.is_sell_order().is_ok()
-            && order.seller_pubkey.as_ref() == Some(&order.creator_pubkey)
-        {
+            );
+        }
+
+        // Clear next trade fields - just in case of buy order because they were added when buyer do fiat sent command
+        child_order.next_trade_index = None;
+        child_order.next_trade_pubkey = None;
+
+        (
+            child_order.buyer_pubkey.clone(),
+            child_order.trade_index_buyer,
+        )
+    } else if order.is_sell_order().is_ok()
+        && order.seller_pubkey.as_ref() == Some(&order.creator_pubkey)
+    {
+        if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
+            let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+            // Get if users are in full privacy mode to use correct master keys in child order
+
             child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
             child_order.trade_index_seller = Some(next_trade_index as i64);
             child_order.creator_pubkey = next_trade_pubkey.to_string();
@@ -221,25 +239,46 @@ async fn handle_child_order(
                     })?,
                 );
             }
-        };
+        }
 
-        child_order.next_trade_index = None;
-        child_order.next_trade_pubkey = None;
+        (
+            child_order.seller_pubkey.clone(),
+            child_order.trade_index_seller,
+        )
+    } else {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(
+            "Next trade seller pubkey is missing".to_string(),
+        )));
+    };
 
-        let new_order = child_order.as_new_order();
+    // Prepare new pending child order
+    let new_order = child_order.as_new_order();
 
+    if let (Some(destination_pubkey), new_trade_index) = (notification_pubkey, new_trade_index) {
+        // If we have next trade pubkey and index we can set them in child order
         enqueue_order_msg(
             request_id,
             new_order.id,
             Action::NewOrder,
             Some(Payload::Order(new_order)),
-            next_trade_pubkey,
-            Some(next_trade_index as i64),
+            PublicKey::from_str(&destination_pubkey).map_err(|_| {
+                MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string()))
+            })?,
+            new_trade_index,
         )
         .await;
-
-        child_order.create(pool).await?;
+    } else {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(
+            "Next trade indecx or pubkey is missing - user cannot be notified".to_string(),
+        )));
     }
+
+    // Evertyhing is ok, we can create the child order event
+    child_order
+        .create(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     Ok(())
 }
 

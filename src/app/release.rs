@@ -269,7 +269,7 @@ async fn handle_child_order(
         .await;
     } else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(
-            "Next trade indecx or pubkey is missing - user cannot be notified".to_string(),
+            "Next trade index or pubkey is missing - user cannot be notified".to_string(),
         )));
     }
 

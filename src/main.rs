@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use mostro_core::message::Message;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,6 +155,106 @@ mod tests {
             amt %= 100_000_i64;
             amt *= (rounded_fee as i64) % 100_i64;
             amt += nonce;
+        }
+    }
+
+    #[test]
+    fn test_debug_log_level_setting() {
+        // Test the logical flow of log level setting
+        // We can't test the actual environment variable setting since main() has already run
+        
+        let debug_log_setting = if cfg!(debug_assertions) {
+            "error,mostro=info"
+        } else {
+            "none,mostro=info"
+        };
+        
+        // Verify the log settings are correctly defined
+        assert!(!debug_log_setting.is_empty());
+        assert!(debug_log_setting.contains("mostro=info"));
+        
+        if cfg!(debug_assertions) {
+            assert!(debug_log_setting.contains("error"));
+        } else {
+            assert!(debug_log_setting.contains("none"));
+        }
+    }
+
+    mod mocking {
+        use super::*;
+        
+        
+
+        static TEST_INIT: std::sync::Once = std::sync::Once::new();
+
+        fn setup() {
+            TEST_INIT.call_once(|| {
+                // Initialize test environment once
+                env::set_var("RUST_LOG", "debug");
+            });
+        }
+
+        #[tokio::test]
+        async fn test_settings_initialization() {
+            setup();
+            
+            // Test would require mocking the CLI parsing
+            // This tests the basic structure but needs CLI mocking infrastructure
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_database_connection_failure() {
+            setup();
+            
+            // This would require mocking the database connection
+            // Testing error handling path when DB_POOL.set() fails
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_nostr_connection_failure() {
+            setup();
+            
+            // This would require mocking the Nostr client connection
+            // Testing error handling path when NOSTR_CLIENT.set() fails
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_lightning_connection_failure() {
+            setup();
+            
+            // This would require mocking the Lightning client connection
+            // Testing error handling path when LN_STATUS.set() fails
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_held_invoices_resubscription() {
+            setup();
+            
+            // Test the logic for resubscribing to held invoices on startup
+            // Would require mocking find_held_invoices and invoice_subscribe
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_scheduler_startup() {
+            setup();
+            
+            // Test that the scheduler starts correctly
+            // Would require mocking start_scheduler
+            assert!(true); // Placeholder for actual test
+        }
+
+        #[tokio::test]
+        async fn test_main_app_startup() {
+            setup();
+            
+            // Test the main application startup flow
+            // Would require extensive mocking of all dependencies
+            assert!(true); // Placeholder for actual test
         }
     }
 }

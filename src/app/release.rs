@@ -9,12 +9,15 @@ use crate::util::{
     update_order_event,
 };
 
+use argon2::password_hash::SaltString;
 use config::settings::*;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use rand;
+use rand::rngs::OsRng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
@@ -151,6 +154,87 @@ pub async fn release_action(
     Ok(())
 }
 
+/// Helper function to store encrypted pubkey with optional salt
+fn store_encrypted_pubkey(pubkey: &str, salt: Option<SaltString>) -> Result<String, MostroError> {
+    CryptoUtils::store_encrypted(pubkey, MOSTRO_DB_PASSWORD.get(), salt).map_err(|_| {
+        MostroInternalErr(ServiceError::EncryptionError(
+            "Error storing encrypted pubkey".to_string(),
+        ))
+    })
+}
+
+/// Helper function to handle buy order case in child order creation
+fn handle_buy_child_order(
+    child_order: &mut Order,
+    order: &Order,
+    normal_buyer_idkey: Option<String>,
+) -> Result<(Option<String>, Option<i64>), MostroError> {
+    let next_buyer_pubkey = order.next_trade_pubkey.clone().ok_or_else(|| {
+        MostroInternalErr(ServiceError::UnexpectedError(
+            "Next trade buyer pubkey is missing".to_string(),
+        ))
+    })?;
+
+    child_order.buyer_pubkey = Some(next_buyer_pubkey.clone());
+    child_order.trade_index_buyer = order.next_trade_index;
+    child_order.creator_pubkey = next_buyer_pubkey.clone();
+
+    // Generate random salt if normal_buyer_idkey is Some
+    let salt = if normal_buyer_idkey.is_some() {
+        Some(SaltString::generate(&mut OsRng))
+    } else {
+        None
+    };
+
+    child_order.master_buyer_pubkey = Some(store_encrypted_pubkey(&next_buyer_pubkey, salt)?);
+
+    // Clear next trade fields for buy order
+    child_order.next_trade_index = None;
+    child_order.next_trade_pubkey = None;
+
+    Ok((
+        child_order.buyer_pubkey.clone(),
+        child_order.trade_index_buyer,
+    ))
+}
+
+/// Helper function to handle sell order case in child order creation
+fn handle_sell_child_order(
+    child_order: &mut Order,
+    next_trade: Option<(String, u32)>,
+    normal_seller_idkey: Option<String>,
+) -> Result<(Option<String>, Option<i64>), MostroError> {
+    let (next_trade_pubkey, next_trade_index) = next_trade.ok_or_else(|| {
+        MostroInternalErr(ServiceError::UnexpectedError(
+            "Next trade seller pubkey is missing".to_string(),
+        ))
+    })?;
+
+    let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+
+    child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
+    child_order.trade_index_seller = Some(next_trade_index as i64);
+    child_order.creator_pubkey = next_trade_pubkey.to_string();
+
+    // Generate random salt if normal_seller_idkey is Some
+    let salt = if normal_seller_idkey.is_some() {
+        Some(SaltString::generate(&mut OsRng))
+    } else {
+        None
+    };
+
+    child_order.master_seller_pubkey = Some(store_encrypted_pubkey(
+        &next_trade_pubkey.to_string(),
+        salt,
+    )?);
+
+    Ok((
+        child_order.seller_pubkey.clone(),
+        child_order.trade_index_seller,
+    ))
+}
+
 /// Manages the creation and update of child orders in a range order sequence
 ///
 /// # Arguments
@@ -169,7 +253,7 @@ async fn handle_child_order(
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    // Check if users are in rating mode or full privacy mode - in case get the user id keys for rate
+    // Check if users are in rating mode or full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
         .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
         .map_err(|_| {
@@ -178,76 +262,17 @@ async fn handle_child_order(
             ))
         })?;
 
-    // if it's a buy order use the next trade pubkey and index created when buyer sends fiat to seller
     let (notification_pubkey, new_trade_index) = if order.is_buy_order().is_ok()
         && order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey)
     {
-        child_order.buyer_pubkey = order.next_trade_pubkey.clone();
-        child_order.trade_index_buyer = order.next_trade_index;
-        let next_buyer_pubkey = if let Some(next_trade_pubkey) = order.next_trade_pubkey.clone() {
-            next_trade_pubkey
-        } else {
-            return Err(MostroInternalErr(ServiceError::UnexpectedError(
-                "Next trade buyer pubkey is missing".to_string(),
-            )));
-        };
-
-        child_order.creator_pubkey = next_buyer_pubkey.clone();
-
-        if normal_buyer_idkey.is_none() {
-            child_order.master_buyer_pubkey = Some(
-                CryptoUtils::store_encrypted(&next_buyer_pubkey, MOSTRO_DB_PASSWORD.get(), None)
-                    .map_err(|_| {
-                        MostroInternalErr(ServiceError::EncryptionError(
-                            "Error storing encrypted master buyer pubkey".to_string(),
-                        ))
-                    })?,
-            );
-        }
-
-        // Clear next trade fields - just in case of buy order because they were added when buyer do fiat sent command
-        child_order.next_trade_index = None;
-        child_order.next_trade_pubkey = None;
-
-        (
-            child_order.buyer_pubkey.clone(),
-            child_order.trade_index_buyer,
-        )
+        handle_buy_child_order(&mut child_order, order, normal_buyer_idkey)?
     } else if order.is_sell_order().is_ok()
         && order.seller_pubkey.as_ref() == Some(&order.creator_pubkey)
     {
-        if let Some((next_trade_pubkey, next_trade_index)) = next_trade {
-            let next_trade_pubkey = PublicKey::from_str(&next_trade_pubkey)
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
-            // Get if users are in full privacy mode to use correct master keys in child order
-
-            child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
-            child_order.trade_index_seller = Some(next_trade_index as i64);
-            child_order.creator_pubkey = next_trade_pubkey.to_string();
-
-            if normal_seller_idkey.is_none() {
-                child_order.master_seller_pubkey = Some(
-                    CryptoUtils::store_encrypted(
-                        &next_trade_pubkey.to_string(),
-                        MOSTRO_DB_PASSWORD.get(),
-                        None,
-                    )
-                    .map_err(|_| {
-                        MostroInternalErr(ServiceError::EncryptionError(
-                            "Error storing encrypted master seller pubkey".to_string(),
-                        ))
-                    })?,
-                );
-            }
-        }
-
-        (
-            child_order.seller_pubkey.clone(),
-            child_order.trade_index_seller,
-        )
+        handle_sell_child_order(&mut child_order, next_trade, normal_seller_idkey)?
     } else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(
-            "Next trade seller pubkey is missing".to_string(),
+            "Invalid order type or creator".to_string(),
         )));
     };
 
@@ -273,7 +298,7 @@ async fn handle_child_order(
         )));
     }
 
-    // Evertyhing is ok, we can create the child order event
+    // Create the child order in database
     child_order
         .create(pool)
         .await

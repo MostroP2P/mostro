@@ -61,6 +61,61 @@ pub async fn check_failure_retries(
     Ok(result)
 }
 
+/// Handles the release action for an order, managing the release of funds and subsequent order flow.
+///
+/// This function is responsible for processing the release of funds in a trade, which is a critical
+/// step in the order lifecycle. It verifies the seller's identity, manages the settlement of hold
+/// invoices, and coordinates the creation of child orders for range orders. The function also
+/// handles notifications to both buyer and seller about the release status.
+///
+/// # Arguments
+///
+/// * `msg` - The message containing the release request and associated metadata
+/// * `event` - The unwrapped gift event containing the seller's signature and verification data
+/// * `my_keys` - The Mostro node's keys used for signing events and messages
+/// * `pool` - Database connection pool for order updates
+/// * `ln_client` - Lightning network client for invoice settlement
+///
+/// # Returns
+///
+/// Returns a `Result<(), MostroError>` where:
+/// * `Ok(())` indicates successful release of funds and order processing
+/// * `Err(MostroError)` indicates an error occurred during the process
+///
+/// # Flow
+///
+/// 1. Validates the request:
+///    - Verifies the seller's identity matches the order
+///    - Checks if the order status allows for release
+///
+/// 2. Processes the release:
+///    - Settles the seller's hold invoice
+///    - Updates the order status to SettledHoldInvoice
+///    - Notifies the buyer about the release
+///
+/// 3. Handles child orders (for range orders):
+///    - Creates and processes child orders if applicable
+///    - Sends notifications to next traders in the sequence
+///
+/// 4. Sends notifications:
+///    - Notifies seller about hold invoice settlement
+///    - Requests rating from seller
+///    - Initiates payment to buyer
+///
+/// # Errors
+///
+/// This function may return the following errors:
+/// * `MostroCantDo(CantDoReason::InvalidPeer)` - If the seller's identity doesn't match
+/// * `MostroCantDo(CantDoReason::NotAllowedByStatus)` - If the order status doesn't allow release
+/// * `MostroInternalErr(ServiceError::DbAccessError)` - If database operations fail
+/// * `MostroInternalErr(ServiceError::NostrError)` - If there are issues with Nostr operations
+/// * `MostroInternalErr(ServiceError::InvoiceInvalidError)` - If there are issues with the invoice
+///
+/// # Security Considerations
+///
+/// * Only the seller can release funds for their order
+/// * The seller's identity is verified through the event signature
+/// * Hold invoices are settled only after proper verification
 pub async fn release_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -235,17 +290,45 @@ fn handle_sell_child_order(
     ))
 }
 
-/// Manages the creation and update of child orders in a range order sequence
+/// Manages the creation and update of child orders in a range order sequence.
+///
+/// This function handles the creation and setup of child orders for range orders, which are orders
+/// that can be split into multiple smaller orders. It manages the encryption of pubkeys, sets up
+/// trade indices, and handles notifications to the next trader in the sequence.
 ///
 /// # Arguments
-/// * `child_order` - The child order to be created/updated
-/// * `order` - The parent order
-/// * `next_trade` - Optional tuple of (pubkey, index) for the next trade
-/// * `pool` - Database connection pool
-/// * `request_id` - Optional request ID for messaging
+///
+/// * `child_order` - The child order to be created/updated. This is a new order derived from the parent order.
+/// * `order` - The parent order from which the child order is derived. Contains the original order details.
+/// * `next_trade` - Optional tuple containing the next trader's information:
+///   - First element: The public key of the next trader
+///   - Second element: The trade index for the next trade
+/// * `pool` - Database connection pool for storing the child order
+/// * `request_id` - Optional request ID used for message queuing and tracking
 ///
 /// # Returns
-/// Result indicating success or failure of the operation
+///
+/// Returns a `Result<(), MostroError>` where:
+/// * `Ok(())` indicates successful creation and setup of the child order
+/// * `Err(MostroError)` indicates an error occurred during the process
+///
+/// # Flow
+///
+/// 1. Determines if users are in rating mode or full privacy mode
+/// 2. Based on order type (buy/sell):
+///    - For buy orders: Sets up buyer-specific fields and encrypts buyer pubkey
+///    - For sell orders: Sets up seller-specific fields and encrypts seller pubkey
+/// 3. Creates a new pending child order
+/// 4. If next trade information is available:
+///    - Enqueues a notification message to the next trader
+/// 5. Stores the child order in the database
+///
+/// # Errors
+///
+/// This function may return the following errors:
+/// * `MostroInternalErr(ServiceError::UnexpectedError)` - If the order type or creator is invalid
+/// * `MostroInternalErr(ServiceError::DbAccessError)` - If database operations fail
+/// * `MostroInternalErr(ServiceError::NostrError)` - If there are issues with Nostr operations
 async fn handle_child_order(
     mut child_order: Order,
     order: &Order,

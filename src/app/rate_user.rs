@@ -71,7 +71,7 @@ pub async fn update_user_reputation_action(
     }
 
     // Prepare variables for vote
-    let (counterpart, counterpart_trade_pubkey, buyer_rating, seller_rating) =
+    let (_counterpart, counterpart_trade_pubkey, buyer_rating, seller_rating) =
         prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
 
     // Check if the order is not rated by the message sender
@@ -93,10 +93,29 @@ pub async fn update_user_reputation_action(
         .get_rating()
         .map_err(MostroInternalErr)?;
 
-    // Get counter to vote from db
-    let mut user_to_vote = is_user_present(pool, counterpart)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    // Check if users are in full privacy mode
+    let (normal_buyer_idkey, normal_seller_idkey) = order
+        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+
+    // Get counter to vote from db, but only if they're not in privacy mode
+    let mut user_to_vote = if buyer_rating {
+        // If buyer is rating seller, check if seller is in privacy mode
+        if let Some(seller_key) = normal_seller_idkey {
+            is_user_present(pool, seller_key).await
+                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?
+        } else {
+            return Ok(());
+        }
+    } else {
+        // If seller is rating buyer, check if buyer is in privacy mode
+        if let Some(buyer_key) = normal_buyer_idkey {
+            is_user_present(pool, buyer_key).await
+                .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?
+        } else {
+            return Ok(());
+        }
+    };
 
     // Calculate new rating
     user_to_vote.update_rating(new_rating);

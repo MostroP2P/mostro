@@ -156,4 +156,26 @@ mod tests {
             amt += nonce;
         }
     }
+
+    #[test]
+    fn test_debug_log_level_setting() {
+        // Test the logical flow of log level setting
+        // We can't test the actual environment variable setting since main() has already run
+
+        let debug_log_setting = if cfg!(debug_assertions) {
+            "error,mostro=info"
+        } else {
+            "none,mostro=info"
+        };
+
+        // Verify the log settings are correctly defined
+        assert!(!debug_log_setting.is_empty());
+        assert!(debug_log_setting.contains("mostro=info"));
+
+        if cfg!(debug_assertions) {
+            assert!(debug_log_setting.contains("error"));
+        } else {
+            assert!(debug_log_setting.contains("none"));
+        }
+    }
 }

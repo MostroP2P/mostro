@@ -79,7 +79,8 @@ mod tests {
                                             user_rates_sent_interval_seconds = 3600
                                             publish_relays_interval = 60
                                             pow = 0
-                                            publish_mostro_info_interval = 300"#;
+                                            publish_mostro_info_interval = 300
+                                            bitcoin_price_api_url = "https://api.yadio.io""#;
 
     // Stub structures for the test
     #[derive(Debug, Deserialize)]
@@ -168,5 +169,6 @@ mod tests {
         assert_eq!(mostro_settings.mostro.publish_relays_interval, 60);
         assert_eq!(mostro_settings.mostro.pow, 0);
         assert_eq!(mostro_settings.mostro.publish_mostro_info_interval, 300);
+        assert_eq!(mostro_settings.mostro.bitcoin_price_api_url, "https://api.yadio.io");
     }
 }

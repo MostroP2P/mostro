@@ -45,6 +45,8 @@ publish_relays_interval = 60
 pow = 0
 # Publish mostro info interval
 publish_mostro_info_interval = 300
+# Bitcoin price API base URL
+bitcoin_price_api_url = "https://api.yadio.io"
 
 [database]
 url = "sqlite://mostro.db"

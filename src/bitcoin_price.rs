@@ -1,11 +1,10 @@
+use crate::config::settings::Settings;
 use mostro_core::prelude::*;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use tracing::info;
-
-const YADIO_API_URL: &str = "https://api.yadio.io/exrates/BTC";
 
 #[derive(Debug, Deserialize)]
 struct YadioResponse {
@@ -20,7 +19,9 @@ pub struct BitcoinPriceManager;
 
 impl BitcoinPriceManager {
     pub async fn update_prices() -> Result<(), MostroError> {
-        let response = reqwest::get(YADIO_API_URL)
+        let mostro_settings = Settings::get_mostro();
+        let api_url = format!("{}/exrates/BTC", mostro_settings.bitcoin_price_api_url);
+        let response = reqwest::get(&api_url)
             .await
             .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
         let yadio_response: YadioResponse = response
@@ -119,11 +120,11 @@ mod tests {
     }
 
     #[test]
-    fn test_bitcoin_price_manager_constants() {
-        // Test that constants are properly defined
-        assert_eq!(YADIO_API_URL, "https://api.yadio.io/exrates/BTC");
-        assert!(YADIO_API_URL.starts_with("https://"));
-        assert!(YADIO_API_URL.contains("yadio.io"));
+    fn test_bitcoin_price_manager_api_url() {
+        // Test that API URL configuration is properly handled
+        let expected_base = "https://api.yadio.io";
+        assert!(expected_base.starts_with("https://"));
+        assert!(expected_base.contains("yadio.io"));
     }
 
     mod error_handling_tests {

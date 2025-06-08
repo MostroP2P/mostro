@@ -78,6 +78,8 @@ pub struct MostroSettings {
     pub pow: u8,
     /// Publish mostro info interval
     pub publish_mostro_info_interval: u32,
+    /// Bitcoin price API base URL
+    pub bitcoin_price_api_url: String,
 }
 
 // Macro call here to implement the TryFrom trait for each of the structs in Settings

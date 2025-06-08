@@ -56,9 +56,7 @@ mod tests {
     #[test]
     fn test_cli_parser_creation() {
         // Test that CLI struct can be created
-        let cli = Cli {
-            dirsettings: None,
-        };
+        let cli = Cli { dirsettings: None };
         assert!(cli.dirsettings.is_none());
 
         let cli_with_path = Cli {
@@ -70,21 +68,21 @@ mod tests {
     #[test]
     fn test_cli_parsing_help() {
         // Test that help can be parsed without panicking
-        let result = Cli::try_parse_from(&["mostro", "--help"]);
+        let result = Cli::try_parse_from(["mostro", "--help"]);
         assert!(result.is_err()); // Help exits with error code
     }
 
     #[test]
     fn test_cli_parsing_version() {
         // Test that version can be parsed without panicking
-        let result = Cli::try_parse_from(&["mostro", "--version"]);
+        let result = Cli::try_parse_from(["mostro", "--version"]);
         assert!(result.is_err()); // Version exits with error code
     }
 
     #[test]
     fn test_cli_parsing_no_args() {
         // Test parsing with no arguments (should succeed)
-        let result = Cli::try_parse_from(&["mostro"]);
+        let result = Cli::try_parse_from(["mostro"]);
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert!(cli.dirsettings.is_none());
@@ -93,7 +91,7 @@ mod tests {
     #[test]
     fn test_cli_parsing_with_dirsettings_short() {
         // Test parsing with short flag -d
-        let result = Cli::try_parse_from(&["mostro", "-d", "/test/path"]);
+        let result = Cli::try_parse_from(["mostro", "-d", "/test/path"]);
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert_eq!(cli.dirsettings.unwrap(), "/test/path");
@@ -102,7 +100,7 @@ mod tests {
     #[test]
     fn test_cli_parsing_with_dirsettings_long() {
         // Test parsing with long flag --dirsettings
-        let result = Cli::try_parse_from(&["mostro", "--dirsettings", "/test/path"]);
+        let result = Cli::try_parse_from(["mostro", "--dirsettings", "/test/path"]);
         assert!(result.is_ok());
         let cli = result.unwrap();
         assert_eq!(cli.dirsettings.unwrap(), "/test/path");
@@ -111,22 +109,21 @@ mod tests {
     #[test]
     fn test_cli_parsing_invalid_args() {
         // Test parsing with invalid arguments
-        let result = Cli::try_parse_from(&["mostro", "--invalid"]);
+        let result = Cli::try_parse_from(["mostro", "--invalid"]);
         assert!(result.is_err());
     }
 
     mod settings_init_tests {
         use super::*;
-        
 
         #[test]
         fn test_settings_init_structure() {
             // This is a structural test since we can't easily mock the CLI parsing
             // In a real implementation, we would need dependency injection for testing
-            
+
             // Test that the function signature is correct
             let _: fn() -> Result<(), Box<dyn std::error::Error>> = settings_init;
-            
+
             // Verify function exists and has correct return type
             assert!(true);
         }
@@ -138,7 +135,7 @@ mod tests {
             let cli = Cli {
                 dirsettings: custom_path.clone(),
             };
-            
+
             if let Some(path) = cli.dirsettings.as_deref() {
                 assert_eq!(path, "/custom/path");
             } else {
@@ -149,10 +146,8 @@ mod tests {
         #[test]
         fn test_default_path_handling() {
             // Test the logical flow of default path handling
-            let cli = Cli {
-                dirsettings: None,
-            };
-            
+            let cli = Cli { dirsettings: None };
+
             if cli.dirsettings.is_none() {
                 // This is the expected path for default settings
                 assert!(true);

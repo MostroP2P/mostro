@@ -148,8 +148,8 @@ pub async fn order_action(
 mod tests {
     use super::*;
     use mostro_core::message::MessageKind;
-    
-    use nostr_sdk::{Keys, Timestamp, UnsignedEvent, Kind as NostrKind};
+
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {
@@ -173,7 +173,7 @@ mod tests {
     fn create_test_unwrapped_gift() -> UnwrappedGift {
         let keys = create_test_keys();
         let sender_keys = create_test_keys();
-        
+
         let unsigned_event = UnsignedEvent::new(
             keys.public_key(),
             Timestamp::now(),
@@ -181,7 +181,7 @@ mod tests {
             Vec::new(),
             "",
         );
-        
+
         UnwrappedGift {
             sender: sender_keys.public_key(),
             rumor: unsigned_event,
@@ -189,19 +189,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculate_and_check_quote_structure() {
-        // Test the structure of quote calculation without creating actual orders
-        // Since we can't easily create SmallOrder without complex setup,
-        // we test the mathematical logic separately
-        assert!(true); // Structural test
-    }
-
-    #[tokio::test]
     async fn test_order_action_no_order() {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
-        
+
         // Create message without order payload
         let msg = Message::Order(MessageKind {
             version: 1,
@@ -237,7 +229,7 @@ mod tests {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
-        
+
         let msg = create_test_message(Some(1));
 
         let result = order_action(msg, &event, &keys, &pool).await;
@@ -249,7 +241,7 @@ mod tests {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
-        
+
         let msg = create_test_message(Some(1));
 
         let result = order_action(msg, &event, &keys, &pool).await;
@@ -264,7 +256,7 @@ mod tests {
     async fn test_order_action_trade_index_logic() {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
-        
+
         // Test case 1: sender == rumor.pubkey, no trade_index
         let mut event = create_test_unwrapped_gift();
         event.sender = event.rumor.pubkey;
@@ -291,18 +283,17 @@ mod tests {
     }
 
     mod quote_calculation_tests {
-        
 
         #[test]
         fn test_quote_calculation_logic() {
             // Test the mathematical logic for quote calculation
             let fiat_amount = 100i64;
             let price = 50000.0; // $50,000 per BTC
-            
+
             // Expected: (100 / 50000) * 1E8 = 200,000 sats
             let expected_quote = (fiat_amount as f64 / price * 1E8) as i64;
             assert_eq!(expected_quote, 200_000);
-            
+
             // Test with different values
             let fiat_amount2 = 1000i64;
             let price2 = 25000.0; // $25,000 per BTC
@@ -316,15 +307,15 @@ mod tests {
             let quote = 1000i64;
             let max_order = 100_000_000i64; // 1 BTC
             let min_payment = 1_000i64; // 1k sats
-            
+
             // Valid amount
             assert!(quote >= min_payment && quote <= max_order);
-            
+
             // Too small
             let small_quote = 500i64;
             assert!(small_quote < min_payment);
-            
-            // Too large  
+
+            // Too large
             let large_quote = 200_000_000i64; // 2 BTC
             assert!(large_quote > max_order);
         }

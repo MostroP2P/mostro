@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package mostro.admin.v1;
+
+// Admin service for direct communication with Mostro daemon
+service AdminService {
+  // Cancel an order as admin
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  
+  // Settle a disputed order as admin
+  rpc SettleOrder(SettleOrderRequest) returns (SettleOrderResponse);
+  
+  // Add a new dispute solver
+  rpc AddSolver(AddSolverRequest) returns (AddSolverResponse);
+  
+  // Take a dispute for resolution
+  rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
+}
+
+// Request to cancel an order
+message CancelOrderRequest {
+  string order_id = 1;
+  optional string request_id = 2;
+}
+
+// Response for order cancellation
+message CancelOrderResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+// Request to settle a disputed order
+message SettleOrderRequest {
+  string order_id = 1;
+  optional string request_id = 2;
+}
+
+// Response for order settlement
+message SettleOrderResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+// Request to add a new solver
+message AddSolverRequest {
+  string solver_pubkey = 1;
+  optional string request_id = 2;
+}
+
+// Response for adding a solver
+message AddSolverResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+// Request to take a dispute
+message TakeDisputeRequest {
+  string dispute_id = 1;
+  optional string request_id = 2;
+}
+
+// Response for taking a dispute
+message TakeDisputeResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}

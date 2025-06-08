@@ -52,6 +52,27 @@ pub struct NostrSettings {
     /// Nostr relays list
     pub relays: Vec<String>,
 }
+/// RPC configuration settings
+#[derive(Debug, Deserialize, Clone)]
+pub struct RpcSettings {
+    /// Enable RPC server
+    pub enabled: bool,
+    /// RPC server listen address
+    pub listen_address: String,
+    /// RPC server port
+    pub port: u16,
+}
+
+impl Default for RpcSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1".to_string(),
+            port: 50051,
+        }
+    }
+}
+
 /// Mostro configuration settings
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -87,5 +108,6 @@ impl_try_from_settings!(
     DatabaseSettings => database,
     LightningSettings => lightning,
     NostrSettings => nostr,
-    MostroSettings => mostro
+    MostroSettings => mostro,
+    RpcSettings => rpc
 );

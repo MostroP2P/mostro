@@ -51,6 +51,11 @@ argon2 = "0.5"
 secrecy = "0.10.0"
 dirs = "6.0.0"
 clearscreen = "4.0.1"
+tonic = "0.11"
+prost = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
+
+[build-dependencies]
+tonic-build = "0.11"

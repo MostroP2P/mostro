@@ -125,7 +125,7 @@ impl AdminServiceImpl {
 
         let msg = Message::new_dispute(
             None,
-            request_id.map(|id| id.parse().unwrap_or(1)),
+            request_id.and_then(|id| id.parse::<u64>().ok()),
             None,
             Action::AdminAddSolver,
             Some(Payload::TextMessage(solver_pubkey)),

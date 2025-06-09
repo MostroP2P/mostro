@@ -9,8 +9,7 @@ use sqlx::{Pool, Sqlite};
 pub fn prepare_variables_for_vote(
     message_sender: &str,
     order: &Order,
-) -> Result<(String, String, bool, bool), MostroError> {
-    let mut counterpart: String = String::new();
+) -> Result<(String, bool, bool), MostroError> {
     let mut counterpart_trade_pubkey: String = String::new();
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
@@ -24,38 +23,52 @@ pub fn prepare_variables_for_vote(
 
     // Find the counterpart public key
     if message_sender == buyer {
-        counterpart = order
-            .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
-            .map_err(MostroInternalErr)?
-            .to_string();
         buyer_rating = true;
         counterpart_trade_pubkey = order
             .get_buyer_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
     } else if message_sender == seller {
-        counterpart = order
-            .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
-            .map_err(MostroInternalErr)?
-            .to_string();
         seller_rating = true;
         counterpart_trade_pubkey = order
             .get_seller_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
     };
-    // Add a check in case of no counterpart found
-    if counterpart.is_empty() {
-        return Err(MostroCantDo(CantDoReason::InvalidPeer));
-    };
-    Ok((
-        counterpart,
-        counterpart_trade_pubkey,
-        buyer_rating,
-        seller_rating,
-    ))
+
+    Ok((counterpart_trade_pubkey, buyer_rating, seller_rating))
 }
 
+/// Updates a user's reputation based on a rating received from a trade counterpart.
+///
+/// This function handles the reputation update process for users after a successful trade.
+/// It processes ratings from either the buyer or seller of a completed order and updates
+/// the recipient's reputation metrics accordingly. The function also handles privacy mode
+/// checks and ensures users can only rate their trade counterpart once.
+///
+/// # Arguments
+///
+/// * `msg` - The message containing the rating information
+/// * `event` - The unwrapped gift event containing the sender's information
+/// * `my_keys` - The keys used for signing events
+/// * `pool` - The database connection pool
+///
+/// # Returns
+///
+/// * `Result<(), MostroError>` - Returns `Ok(())` if the reputation update was successful,
+///   or an appropriate error if something went wrong during the process.
+///
+/// # Process Flow
+///
+/// 1. Retrieves the order information from the database
+/// 2. Verifies the order status is "Success"
+/// 3. Determines if the rating is from buyer or seller
+/// 4. Checks if the user has already rated their counterpart
+/// 5. Validates privacy mode settings
+/// 6. Updates the recipient's rating metrics
+/// 7. Creates and saves a new rating event
+/// 8. Updates the database with the new rating information
+/// 9. Sends a confirmation message to the rating user
 pub async fn update_user_reputation_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -71,7 +84,7 @@ pub async fn update_user_reputation_action(
     }
 
     // Prepare variables for vote
-    let (counterpart, counterpart_trade_pubkey, buyer_rating, seller_rating) =
+    let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
         prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
 
     // Check if the order is not rated by the message sender
@@ -93,10 +106,31 @@ pub async fn update_user_reputation_action(
         .get_rating()
         .map_err(MostroInternalErr)?;
 
-    // Get counter to vote from db
-    let mut user_to_vote = is_user_present(pool, counterpart)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    // Check if users are in full privacy mode
+    let (normal_buyer_idkey, normal_seller_idkey) = order
+        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+        .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
+
+    // Get counter to vote from db, but only if they're not in privacy mode
+    let mut user_to_vote = if buyer_rating {
+        // If buyer is rating seller, check if seller is in privacy mode
+        if let Some(seller_key) = normal_seller_idkey {
+            is_user_present(pool, seller_key).await.map_err(|cause| {
+                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+            })?
+        } else {
+            return Ok(());
+        }
+    } else {
+        // If seller is rating buyer, check if buyer is in privacy mode
+        if let Some(buyer_key) = normal_buyer_idkey {
+            is_user_present(pool, buyer_key).await.map_err(|cause| {
+                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
+            })?
+        } else {
+            return Ok(());
+        }
+    };
 
     // Calculate new rating
     user_to_vote.update_rating(new_rating);

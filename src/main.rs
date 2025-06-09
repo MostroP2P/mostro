@@ -104,16 +104,15 @@ async fn main() -> Result<()> {
     if RpcServer::is_enabled() {
         let rpc_server = RpcServer::new();
         let rpc_keys = mostro_keys.clone();
-        let rpc_pool = Arc::new(get_db_pool().as_ref().clone());
-        let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(LndConnector::new().await?));
+        let rpc_pool = get_db_pool();
+        let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
 
         tokio::spawn(async move {
-            if let Err(e) = rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
-                tracing::error!("RPC server failed to start: {}", e);
+            match rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
+                Ok(_) => tracing::info!("RPC server started successfully"),
+                Err(e) => tracing::error!("RPC server failed to start: {}", e),
             }
         });
-
-        tracing::info!("RPC server started successfully");
     }
 
     // Start scheduler for tasks

@@ -9,6 +9,7 @@ pub mod lnurl;
 pub mod messages;
 pub mod models;
 pub mod nip33;
+pub mod rpc;
 pub mod scheduler;
 pub mod util;
 
@@ -18,10 +19,12 @@ use crate::config::{get_db_pool, DB_POOL, LN_STATUS, NOSTR_CLIENT};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
+use crate::rpc::RpcServer;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
 use std::process::exit;
+use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
 
@@ -95,6 +98,21 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+
+    // Start RPC server if enabled
+    if RpcServer::is_enabled() {
+        let rpc_server = RpcServer::new();
+        let rpc_keys = mostro_keys.clone();
+        let rpc_pool = get_db_pool();
+        let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
+
+        tokio::spawn(async move {
+            match rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
+                Ok(_) => tracing::info!("RPC server started successfully"),
+                Err(e) => tracing::error!("RPC server failed to start: {}", e),
+            }
+        });
     }
 
     // Start scheduler for tasks

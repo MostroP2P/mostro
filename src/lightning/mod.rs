@@ -18,8 +18,9 @@ use std::cmp::Ordering;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
 
+#[derive(Clone)]
 pub struct LndConnector {
-    client: Client,
+    pub client: Client,
 }
 
 #[derive(Debug, Clone)]

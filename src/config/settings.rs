@@ -1,5 +1,5 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
-use crate::config::types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
+use crate::config::types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
@@ -27,6 +27,8 @@ pub struct Settings {
     pub mostro: MostroSettings,
     /// Lightning configuration settings
     pub lightning: LightningSettings,
+    /// RPC configuration settings
+    pub rpc: RpcSettings,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -69,5 +71,10 @@ impl Settings {
     /// This function retrieves the Nostr configuration from the global MOSTRO_CONFIG struct.
     pub fn get_nostr() -> &'static NostrSettings {
         &MOSTRO_CONFIG.get().expect("No Nostr settings found").nostr
+    }
+
+    /// This function retrieves the RPC configuration from the global MOSTRO_CONFIG struct.
+    pub fn get_rpc() -> &'static RpcSettings {
+        &MOSTRO_CONFIG.get().expect("No RPC settings found").rpc
     }
 }

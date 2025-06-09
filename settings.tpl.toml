@@ -50,3 +50,11 @@ bitcoin_price_api_url = "https://api.yadio.io"
 
 [database]
 url = "sqlite://mostro.db"
+
+[rpc]
+# Enable RPC server for direct admin communication
+enabled = false
+# RPC server listen address
+listen_address = "127.0.0.1"
+# RPC server port
+port = 50051

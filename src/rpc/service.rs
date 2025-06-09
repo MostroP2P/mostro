@@ -163,7 +163,7 @@ impl AdminServiceImpl {
 
         let msg = Message::new_dispute(
             Some(Uuid::parse_str(&dispute_id)?),
-            request_id.map(|id| id.parse().unwrap_or(1)),
+            request_id.and_then(|id| id.parse::<u64>().ok()),
             None,
             Action::AdminTakeDispute,
             None,

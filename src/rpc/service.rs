@@ -6,7 +6,7 @@ use crate::rpc::admin::{
     CancelOrderResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
     TakeDisputeResponse,
 };
-use nostr_sdk::{Keys, nips::nip59::UnwrappedGift};
+use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -68,7 +68,7 @@ impl AdminServiceImpl {
         };
 
         let mut ln_client = self.ln_client.lock().await;
-        admin_cancel_action(msg, &event, &self.keys, &self.pool, &mut *ln_client)
+        admin_cancel_action(msg, &event, &self.keys, &self.pool, &mut ln_client)
             .await
             .map_err(|e| format!("Admin cancel failed: {}", e))?;
 
@@ -241,7 +241,10 @@ impl AdminService for AdminServiceImpl {
         request: Request<AddSolverRequest>,
     ) -> Result<Response<AddSolverResponse>, Status> {
         let req = request.into_inner();
-        info!("Received add solver request for pubkey: {}", req.solver_pubkey);
+        info!(
+            "Received add solver request for pubkey: {}",
+            req.solver_pubkey
+        );
 
         match self
             .call_admin_add_solver(req.solver_pubkey, req.request_id)
@@ -266,7 +269,10 @@ impl AdminService for AdminServiceImpl {
         request: Request<TakeDisputeRequest>,
     ) -> Result<Response<TakeDisputeResponse>, Status> {
         let req = request.into_inner();
-        info!("Received take dispute request for dispute: {}", req.dispute_id);
+        info!(
+            "Received take dispute request for dispute: {}",
+            req.dispute_id
+        );
 
         match self
             .call_admin_take_dispute(req.dispute_id, req.request_id)
@@ -302,7 +308,7 @@ mod tests {
             order_id: "test-order-id".to_string(),
             request_id: Some("test-request-id".to_string()),
         };
-        
+
         let cancel_resp = CancelOrderResponse {
             success: true,
             error_message: None,

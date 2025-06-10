@@ -20,7 +20,8 @@ pub async fn fiat_sent_action(
         return Err(MostroCantDo(cause));
     }
 
-    // Check if the pubkey is the buyer
+    // Check if the pubkey is the buyer pubkey - Only the buyer can send fiat
+    // if someone else tries to send fiat, we return an error
     if order.get_buyer_pubkey().ok() != Some(event.rumor.pubkey) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
@@ -33,15 +34,9 @@ pub async fn fiat_sent_action(
 
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    let order_updated = update_order_event(my_keys, Status::FiatSent, &order)
+    let mut order_updated = update_order_event(my_keys, Status::FiatSent, &order)
         .await
         .map_err(|e| MostroError::MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
-    // Update order
-    let mut order_updated = order_updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
@@ -51,7 +46,7 @@ pub async fn fiat_sent_action(
         reputation: None,
     };
 
-    // We a message to the seller
+    // Notify seller that fiat was sent
     enqueue_order_msg(
         None,
         Some(order_updated.id),
@@ -67,6 +62,7 @@ pub async fn fiat_sent_action(
         reputation: None,
     };
 
+    // Notify buyer that fiat was sent
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order_updated.id),
@@ -77,21 +73,21 @@ pub async fn fiat_sent_action(
     )
     .await;
 
-    // Update next trade fields only when the buyer is the maker of a range order
-    // These fields will be used to create the next child order in the range
-    order
-        .not_sent_from_maker(event.rumor.pubkey)
-        .map_err(MostroCantDo)?;
-
-    if let Some((pubkey, index)) = next_trade {
-        order_updated.next_trade_pubkey = Some(pubkey);
-        order_updated.next_trade_index = Some(index as i64);
-        if let Err(e) = order_updated.update(pool).await {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                e.to_string(),
-            )));
+    // If this is a range order, we need to update next trade fields
+    if order.is_range_order() {
+        // Update next trade fields only when the buyer is the maker of a range order
+        // These fields will be used to create the next child order in the range
+        if let Some((pubkey, index)) = next_trade {
+            order_updated.next_trade_pubkey = Some(pubkey);
+            order_updated.next_trade_index = Some(index as i64);
         }
     }
+
+    // Update order
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }

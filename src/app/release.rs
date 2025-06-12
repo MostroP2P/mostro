@@ -137,9 +137,8 @@ pub async fn release_action(
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
 
-    // Check if order is active, fiat sent or dispute
-    if order.check_status(Status::Active).is_err()
-        && order.check_status(Status::FiatSent).is_err()
+    // Check if order is in status fiat sent or dispute
+    if order.check_status(Status::FiatSent).is_err()
         && order.check_status(Status::Dispute).is_err()
     {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));

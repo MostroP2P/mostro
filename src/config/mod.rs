@@ -169,6 +169,9 @@ mod tests {
         assert_eq!(mostro_settings.mostro.publish_relays_interval, 60);
         assert_eq!(mostro_settings.mostro.pow, 0);
         assert_eq!(mostro_settings.mostro.publish_mostro_info_interval, 300);
-        assert_eq!(mostro_settings.mostro.bitcoin_price_api_url, "https://api.yadio.io");
+        assert_eq!(
+            mostro_settings.mostro.bitcoin_price_api_url,
+            "https://api.yadio.io"
+        );
     }
 }

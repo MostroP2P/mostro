@@ -10,7 +10,37 @@ use mostro_core::prelude::*;
 use serde_json;
 use std::str::FromStr;
 
-/// Decode a lightning invoice (bolt11)
+use once_cell::sync::Lazy;
+use reqwest::Client;
+
+static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .user_agent("mostro lnurl validator")
+        .build()
+        .expect("valid reqwest Client")
+});
+
+/// Decodes a BOLT11 Lightning invoice from its string representation.
+///
+/// This function parses a Lightning Network payment request string and returns
+/// a structured `Bolt11Invoice` object that can be used to extract invoice details
+/// such as amount, description, expiration time, and payment hash.
+///
+/// # Arguments
+///
+/// * `payment_request` - A string slice containing the BOLT11 invoice to decode
+///
+/// # Returns
+///
+/// * `Ok(Bolt11Invoice)` - Successfully decoded invoice
+/// * `Err(MostroError)` - If the invoice string is malformed or invalid
+///
+/// # Examples
+///
+/// ```ignore
+/// let invoice_str = "lnbc1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypq...";
+/// let invoice = decode_invoice(invoice_str)?;
+/// ```
 pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroError> {
     let invoice = Bolt11Invoice::from_str(payment_request)
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
@@ -18,7 +48,25 @@ pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroErro
     Ok(invoice)
 }
 
-/// Validate Lightning address
+/// Validates a Lightning Address by checking if it exists and is reachable.
+///
+/// Lightning Addresses are human-readable identifiers (similar to email addresses)
+/// that resolve to Lightning payment endpoints. This function verifies that the
+/// address is properly formatted and that the underlying service is accessible.
+///
+/// # Arguments
+///
+/// * `payment_request` - A string slice containing the Lightning Address (e.g., "user@domain.com")
+///
+/// # Returns
+///
+/// * `Ok(())` - If the Lightning Address is valid and reachable
+/// * `Err(MostroError)` - If the address is invalid, malformed, or unreachable
+///
+/// # Notes
+///
+/// This function performs a network request to validate the address, so it may
+/// fail due to network issues even if the address format is correct.
 async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroError> {
     if ln_exists(payment_request).await.is_err() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
@@ -26,23 +74,48 @@ async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroE
     Ok(())
 }
 
-/// Validate LNURL
+/// Validates an LNURL-pay request and optionally checks amount constraints.
+///
+/// LNURL-pay is a protocol that allows for flexible Lightning payments through
+/// HTTP endpoints. This function fetches the LNURL metadata and validates that
+/// it supports payments, optionally checking that a specified amount falls
+/// within the service's acceptable range.
+///
+/// # Arguments
+///
+/// * `lnurl` - The parsed LNURL object containing the service endpoint
+/// * `amount` - Optional amount in satoshis to validate against service limits
+///
+/// # Returns
+///
+/// * `Ok(())` - If the LNURL is valid and amount (if provided) is within limits
+/// * `Err(MostroError)` - If the LNURL is invalid, unreachable, or amount is out of range
+///
+/// # Notes
+///
+/// This function makes HTTP requests to the LNURL service and validates:
+/// - Service responds successfully
+/// - Response indicates "payRequest" capability
+/// - Amount falls within minSendable/maxSendable limits (if amount provided)
 async fn validate_lnurl(lnurl: LnUrl, amount: Option<u64>) -> Result<(), MostroError> {
-    let res = reqwest::get(&lnurl.url)
+    let res = HTTP_CLIENT
+        .get(&lnurl.url)
+        .send()
         .await
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
 
     if !res.status().is_success() {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
     }
 
-    let body = res
-        .text()
+    let body: serde_json::Value = res
+        .json()
         .await
-        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
+        .map_err(|_| MostroInternalErr(ServiceError::ParsingInvoiceError))?;
 
-    let body: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
+    if body["status"] == "ERROR" || body["tag"] != "payRequest" {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+    }
 
     let tag = body["tag"].as_str().unwrap_or("");
     if tag != "payRequest" {
@@ -63,7 +136,36 @@ async fn validate_lnurl(lnurl: LnUrl, amount: Option<u64>) -> Result<(), MostroE
     Ok(())
 }
 
-/// Validate BOLT11 invoice
+/// Validates a BOLT11 Lightning invoice with comprehensive checks.
+///
+/// This function performs thorough validation of a BOLT11 invoice including:
+/// - Amount verification against expected values and fees
+/// - Minimum payment amount enforcement
+/// - Expiration time validation
+/// - Invoice expiration window compliance
+///
+/// # Arguments
+///
+/// * `payment_request` - The BOLT11 invoice string to validate
+/// * `amount` - Optional expected amount in satoshis (before fees)
+/// * `fee` - Optional fee amount in satoshis to subtract from expected amount
+///
+/// # Returns
+///
+/// * `Ok(())` - If all validation checks pass
+/// * `Err(MostroError)` - If any validation check fails
+///
+/// # Validation Rules
+///
+/// - If `amount` is provided, the invoice amount must match `amount - fee`
+/// - Invoice amount must meet minimum payment threshold (if non-zero)
+/// - Invoice must not be expired
+/// - Invoice expiration must be within acceptable time window
+///
+/// # Notes
+///
+/// Zero-amount invoices are allowed but still subject to expiration checks.
+/// The function uses configuration settings for minimum amounts and time windows.
 async fn validate_bolt11_invoice(
     payment_request: &str,
     amount: Option<u64>,
@@ -119,8 +221,36 @@ async fn validate_bolt11_invoice(
     Ok(())
 }
 
-/// Verify if a buyer invoice is valid,
-/// if the invoice have amount we check if the amount minus fee is the same
+/// Validates a payment request, automatically detecting and handling different formats.
+///
+/// This is the main validation function that accepts various Lightning payment formats
+/// and routes them to the appropriate validation logic. It supports:
+/// - Lightning Addresses (user@domain.com format)
+/// - LNURL-pay requests (lnurl1... format)
+/// - BOLT11 invoices (lnbc... format)
+///
+/// # Arguments
+///
+/// * `payment_request` - The payment request string in any supported format
+/// * `amount` - Optional expected amount in satoshis for validation
+/// * `fee` - Optional fee amount in satoshis (only used for BOLT11 invoices)
+///
+/// # Returns
+///
+/// * `Ok(())` - If the payment request is valid and passes all checks
+/// * `Err(MostroError)` - If validation fails for any reason
+///
+/// # Format Detection
+///
+/// The function tries to parse the payment request in the following order:
+/// 1. Lightning Address - if it matches email-like format
+/// 2. LNURL - if it can be parsed as a valid LNURL
+/// 3. BOLT11 - falls back to BOLT11 invoice validation
+///
+/// # Usage
+///
+/// This function is typically used to validate buyer invoices in trading contexts
+/// where the exact payment format may vary depending on user preference.
 pub async fn is_valid_invoice(
     payment_request: String,
     amount: Option<u64>,
@@ -199,7 +329,7 @@ mod tests {
         // but demonstrates the structure for LNURL validation
         let result = is_valid_invoice(lnurl_payment_request, None, None).await;
         // In a real test environment with a working LNURL service, this should be Ok(())
-        assert!(result.is_err() || result.is_ok());
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -210,6 +340,6 @@ mod tests {
 
         // This test would fail in practice without a real Lightning address service
         let result = is_valid_invoice(lightning_address, None, None).await;
-        assert!(result.is_err() || result.is_ok());
+        assert!(result.is_err());
     }
 }

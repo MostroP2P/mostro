@@ -139,11 +139,10 @@ pub async fn take_sell_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use mostro_core::order::{Kind as OrderKind, Status};
-    use nostr_sdk::{Keys, Timestamp, UnsignedEvent, Kind as NostrKind};
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
     use sqlx::SqlitePool;
-    
 
     async fn create_test_pool() -> SqlitePool {
         SqlitePool::connect(":memory:").await.unwrap()
@@ -168,7 +167,7 @@ mod tests {
     fn create_test_unwrapped_gift() -> UnwrappedGift {
         let keys = create_test_keys();
         let sender_keys = create_test_keys();
-        
+
         let unsigned_event = UnsignedEvent::new(
             keys.public_key(),
             Timestamp::now(),
@@ -176,7 +175,7 @@ mod tests {
             Vec::new(),
             "",
         );
-        
+
         UnwrappedGift {
             sender: sender_keys.public_key(),
             rumor: unsigned_event,
@@ -224,7 +223,7 @@ mod tests {
     async fn test_take_sell_action_trade_index_logic() {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
-        
+
         // Test case 1: sender == rumor.pubkey, no trade_index
         let mut event = create_test_unwrapped_gift();
         event.sender = event.rumor.pubkey;
@@ -271,7 +270,7 @@ mod tests {
         let pool = create_test_pool().await;
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
-        
+
         // Test with no payment request (should update order status)
         let msg1 = create_test_message(Some(1));
         let result1 = take_sell_action(msg1, &event, &keys, &pool).await;
@@ -289,15 +288,15 @@ mod tests {
         #[test]
         fn test_order_validation_logic() {
             // Test the logical flow of order validation
-            
+
             // Test sell order validation
             let order_kind = OrderKind::Sell;
             assert!(matches!(order_kind, OrderKind::Sell));
-            
+
             // Test order status validation
             let order_status = Status::Pending;
             assert!(matches!(order_status, Status::Pending));
-            
+
             // Test non-maker validation logic
             let maker_pubkey = create_test_keys().public_key();
             let taker_pubkey = create_test_keys().public_key();
@@ -309,7 +308,7 @@ mod tests {
             // Test the structure of encryption logic
             let test_pubkey = create_test_keys().public_key().to_string();
             let test_password = "test_password";
-            
+
             // In a real test, we would test CryptoUtils::store_encrypted
             // For now, we test the logic structure
             assert!(!test_pubkey.is_empty());
@@ -322,10 +321,10 @@ mod tests {
             let requested_amount = 100i64;
             let min_amount = 50i64;
             let max_amount = 200i64;
-            
+
             // Valid range
             assert!(requested_amount >= min_amount && requested_amount <= max_amount);
-            
+
             // Out of range cases
             let too_small = 25i64;
             let too_large = 300i64;
@@ -335,20 +334,19 @@ mod tests {
     }
 
     mod market_price_tests {
-        
 
         #[test]
         fn test_market_price_calculation_logic() {
             // Test the logical flow of market price calculation
             let fiat_amount = 100i64;
             let premium = 5;
-            
+
             // Mock calculation: amount = (fiat_amount / btc_price) * (1 + premium/100)
             let mock_btc_price = 50000.0;
             let base_amount = (fiat_amount as f64 / mock_btc_price) * 1e8;
             let premium_multiplier = 1.0 + (premium as f64 / 100.0);
             let final_amount = (base_amount * premium_multiplier) as i64;
-            
+
             assert!(final_amount > 0);
             assert!(final_amount > base_amount as i64); // Should be higher due to premium
         }
@@ -359,7 +357,7 @@ mod tests {
             let amount = 1_000_000i64; // 0.01 BTC
             let fee_rate = 0.005; // 0.5%
             let expected_fee = (amount as f64 * fee_rate) as i64;
-            
+
             assert_eq!(expected_fee, 5_000); // 5000 sats
             assert!(expected_fee < amount); // Fee should be less than amount
         }

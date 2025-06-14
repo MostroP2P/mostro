@@ -7,18 +7,7 @@ use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
 use mostro_core::prelude::*;
-use serde_json;
 use std::str::FromStr;
-
-use once_cell::sync::Lazy;
-use reqwest::Client;
-
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .user_agent("mostro lnurl validator")
-        .build()
-        .expect("valid reqwest Client")
-});
 
 /// Decodes a BOLT11 Lightning invoice from its string representation.
 ///
@@ -71,68 +60,6 @@ async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroE
     if ln_exists(payment_request).await.is_err() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
-    Ok(())
-}
-
-/// Validates an LNURL-pay request and optionally checks amount constraints.
-///
-/// LNURL-pay is a protocol that allows for flexible Lightning payments through
-/// HTTP endpoints. This function fetches the LNURL metadata and validates that
-/// it supports payments, optionally checking that a specified amount falls
-/// within the service's acceptable range.
-///
-/// # Arguments
-///
-/// * `lnurl` - The parsed LNURL object containing the service endpoint
-/// * `amount` - Optional amount in satoshis to validate against service limits
-///
-/// # Returns
-///
-/// * `Ok(())` - If the LNURL is valid and amount (if provided) is within limits
-/// * `Err(MostroError)` - If the LNURL is invalid, unreachable, or amount is out of range
-///
-/// # Notes
-///
-/// This function makes HTTP requests to the LNURL service and validates:
-/// - Service responds successfully
-/// - Response indicates "payRequest" capability
-/// - Amount falls within minSendable/maxSendable limits (if amount provided)
-async fn validate_lnurl(lnurl: LnUrl, amount: Option<u64>) -> Result<(), MostroError> {
-    let res = HTTP_CLIENT
-        .get(&lnurl.url)
-        .send()
-        .await
-        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
-
-    if !res.status().is_success() {
-        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
-    }
-
-    let body: serde_json::Value = res
-        .json()
-        .await
-        .map_err(|_| MostroInternalErr(ServiceError::ParsingInvoiceError))?;
-
-    if body["status"] == "ERROR" || body["tag"] != "payRequest" {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-    }
-
-    let tag = body["tag"].as_str().unwrap_or("");
-    if tag != "payRequest" {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-    }
-
-    // Validate amount limits if provided
-    if let Some(amt) = amount {
-        let amt_msat = amt * 1000;
-        let min_sendable = body["minSendable"].as_u64().unwrap_or(0);
-        let max_sendable = body["maxSendable"].as_u64().unwrap_or(u64::MAX);
-
-        if amt_msat < min_sendable || amt_msat > max_sendable {
-            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-        }
-    }
-
     Ok(())
 }
 
@@ -256,14 +183,11 @@ pub async fn is_valid_invoice(
     amount: Option<u64>,
     fee: Option<u64>,
 ) -> Result<(), MostroError> {
-    // Try Lightning address first
-    if LightningAddress::from_str(&payment_request).is_ok() {
+    // Try Lightning address or LNURL first
+    if LightningAddress::from_str(&payment_request).is_ok()
+        || LnUrl::from_str(&payment_request).is_ok()
+    {
         return validate_lightning_address(&payment_request).await;
-    }
-
-    // Try LNURL
-    if let Ok(lnurl) = LnUrl::from_str(&payment_request) {
-        return validate_lnurl(lnurl, amount).await;
     }
 
     // Fall back to BOLT11 invoice
@@ -272,9 +196,13 @@ pub async fn is_valid_invoice(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_invoice, Settings};
+    use super::*;
     use crate::config::MOSTRO_CONFIG;
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use bech32::{encode, ToBase32};
     use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
+    use serde_json::json;
+    use tokio::net::TcpListener;
     use toml;
 
     fn init_settings_test() {
@@ -286,10 +214,53 @@ mod tests {
         MOSTRO_CONFIG.get_or_init(|| test_settings);
     }
 
+    async fn handle_request() -> (StatusCode, Json<serde_json::Value>) {
+        let response = json!({
+            "status": "OK",
+            "tag": "payRequest",
+            "callback": "http://localhost:8080/callback",
+            "minSendable": 1000,
+            "maxSendable": 10000000,
+            "metadata": "[[\"text/plain\",\"Test payment\"]]",
+            "pr": "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4sdqqcqzpgxqyz5vqsp5a3axmz77s5vafmheq56uh49rmy59r9a3d0dm0220l8lzdp5jrtxs9qyyssqu0ft47j0r4lu997zuqgf92y8mppatwgzhrl0hzte7mzmwrqzf2238ylch82ehhv7pfcq6qcyu070dg85vu55het2edyljuezvcw5pzgqfncf3d"
+        });
+
+        (StatusCode::OK, Json(response))
+    }
+
+    // Helper function to start test server
+    async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/.well-known/lnurlp/MostroP2P", get(handle_request))
+            .route(
+                "/.well-known/lnurlp/MostroP2Ptestlnurl",
+                get(handle_request),
+            )
+            .layer(tower_http::cors::CorsLayer::permissive());
+
+        let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let server = axum::serve(listener, app);
+        let handle = tokio::spawn(async move {
+            server.await.unwrap();
+        });
+
+        // Build the LNURL for this port and encode it
+        let url = format!(
+            "http://localhost:{}/.well-known/lnurlp/MostroP2Ptestlnurl",
+            port
+        );
+        let lnurl = encode("lnurl", url.as_bytes().to_base32(), bech32::Variant::Bech32).unwrap();
+
+        (lnurl, handle)
+    }
+
     #[tokio::test]
     async fn test_wrong_amount_invoice() {
         init_settings_test();
-        let payment_request = "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4sdqqcqzpgxqyz5vqsp5a3axmz77s5vafmheq56uh49rmy59r9a3d0dm0220l8lzdp5jrtxs9qyyssqu0ft47j0r4lu997zuqgf92y8mppatwgzhrl0hzte7mzmwrqzf2238ylch82ehhv7pfcq6qcyu070dg85vu55het2edyljuezvcw5pzgqfncf3d".to_string();
+        let payment_request = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n".to_string();
         let wrong_amount_err = is_valid_invoice(payment_request, Some(23), None);
         assert_eq!(
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
@@ -320,26 +291,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lnurl_validation() {
+    async fn test_lnurl_validation_with_test_server() {
         init_settings_test();
-        // Test with a mock LNURL string (this would need a real LNURL service to test properly)
-        let lnurl_payment_request = "lnurl1dp68gurn8ghj7um9wfmxjcm99e3k7mf0v9cxj0m385ekvcenxc6r2c35xvukxefcv5mkvv34x5ekzd3ev56nyc".to_string();
 
-        // This test would fail in practice without a real LNURL service
-        // but demonstrates the structure for LNURL validation
-        let result = is_valid_invoice(lnurl_payment_request, None, None).await;
-        // In a real test environment with a working LNURL service, this should be Ok(())
-        assert!(result.is_err());
-    }
+        // Start test server
+        let (lnurl, server_handle) = start_test_server().await;
 
-    #[tokio::test]
-    async fn test_lightning_address_validation() {
-        init_settings_test();
-        // Test with a mock Lightning address
-        let lightning_address = "user@example.com".to_string();
+        // Test basic LNURL validation
+        let result = is_valid_invoice(lnurl.clone(), None, None).await;
+        assert!(result.is_ok(), "Basic LNURL validation should succeed");
 
-        // This test would fail in practice without a real Lightning address service
-        let result = is_valid_invoice(lightning_address, None, None).await;
-        assert!(result.is_err());
+        // Test LNURL validation with amount
+        let result = is_valid_invoice(lnurl.clone(), Some(5000), None).await;
+        assert!(
+            result.is_ok(),
+            "LNURL validation with valid amount should succeed"
+        );
+
+        // Lightning address validation
+        // Test with a valid Lightning address that matches our test server
+        let valid_address = "MostroP2P@localhost".to_string();
+        let result = is_valid_invoice(valid_address, None, None).await;
+        assert!(
+            result.is_ok(),
+            "Valid Lightning address should pass validation"
+        );
+
+        // Test with an invalid Lightning address
+        let invalid_address = "nonexistent@localhost".to_string();
+        let result = is_valid_invoice(invalid_address, None, None).await;
+        assert!(
+            result.is_err(),
+            "Invalid Lightning address should fail validation"
+        );
+
+        // Cleanup
+        server_handle.abort();
     }
 }

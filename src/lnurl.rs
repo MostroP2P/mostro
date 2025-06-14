@@ -4,9 +4,13 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde_json::Value;
 
-pub static HTTP_CLIENT: Lazy<Client> =
-    Lazy::new(|| Client::builder().build().expect("valid reqwest Client"));
-
+pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("mostro/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("valid reqwest Client")
+});
 /// Extracts the LNURL from a given address.
 /// The address can be in the form of a Lightning Address (user@domain.com format)
 /// or a LNURL (lnurl1... format).

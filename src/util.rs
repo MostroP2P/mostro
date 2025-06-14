@@ -7,6 +7,7 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::lightning::LndConnector;
+use crate::lnurl::HTTP_CLIENT;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
@@ -42,7 +43,9 @@ pub async fn retries_yadio_request(
     // Get Fiat list and check if currency exchange is available
     let mostro_settings = Settings::get_mostro();
     let api_req_string = format!("{}/currencies", mostro_settings.bitcoin_price_api_url);
-    let fiat_list_check = reqwest::get(api_req_string)
+    let fiat_list_check = HTTP_CLIENT
+        .get(api_req_string)
+        .send()
         .await
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?
         .json::<FiatNames>()
@@ -55,7 +58,9 @@ pub async fn retries_yadio_request(
         return Ok((None, fiat_list_check));
     }
 
-    let res = reqwest::get(req_string)
+    let res = HTTP_CLIENT
+        .get(req_string)
+        .send()
         .await
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
 

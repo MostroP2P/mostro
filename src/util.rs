@@ -1,5 +1,6 @@
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config::settings::{get_db_pool, Settings};
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
@@ -517,8 +518,42 @@ pub async fn update_order_event(
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
+
+    // Include rating tag for pending orders
+    let reputation_data = if status == Status::Pending {
+        let pool = get_db_pool();
+        let identity_pubkey = match order_updated.is_sell_order() {
+            Ok(_) => order_updated
+                .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
+                .map_err(MostroInternalErr)?,
+            Err(_) => order_updated
+                .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
+                .map_err(MostroInternalErr)?,
+        };
+
+        let trade_pubkey = match order_updated.is_sell_order() {
+            Ok(_) => order_updated.get_seller_pubkey().map_err(MostroInternalErr)?,
+            Err(_) => order_updated.get_buyer_pubkey().map_err(MostroInternalErr)?,
+        };
+
+        match is_user_present(&pool, identity_pubkey.clone()).await {
+            Ok(user) => {
+                Some((user.total_rating, user.total_reviews, user.created_at))
+            }
+            Err(_) => {
+                if identity_pubkey == trade_pubkey.to_string() {
+                    Some((0.0, 0, 0))
+                } else {
+                    return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // We transform the order fields to tags to use in the event
-    if let Some(tags) = order_to_tags(&order_updated, None)? {
+    if let Some(tags) = order_to_tags(&order_updated, reputation_data)? {
         // nip33 kind with order id as identifier and order fields as tags
         let event = new_event(keys, "", order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

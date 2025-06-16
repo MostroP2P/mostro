@@ -536,7 +536,7 @@ pub async fn update_order_event(
             Err(_) => order_updated.get_buyer_pubkey().map_err(MostroInternalErr)?,
         };
 
-        match is_user_present(pool, identity_pubkey.clone()).await {
+        match is_user_present(&pool, identity_pubkey.clone()).await {
             Ok(user) => {
                 Some((user.total_rating, user.total_reviews, user.created_at))
             }

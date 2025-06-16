@@ -1,5 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
-use crate::config::types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings};
+use crate::config::types::{
+    DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;

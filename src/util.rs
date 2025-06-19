@@ -510,18 +510,11 @@ pub async fn update_user_rating_event(
     Ok(())
 }
 
-pub async fn update_order_event(
-    keys: &Keys,
+async fn get_ratings_for_pending_order(
+    order_updated: &Order,
     status: Status,
-    order: &Order,
-) -> Result<Order, MostroError> {
-    let mut order_updated = order.clone();
-    // update order.status with new status
-    order_updated.status = status.to_string();
-
-    // Include rating tag for pending orders
-    let reputation_data = if status == Status::Pending {
-        let pool = get_db_pool();
+) -> Result<Option<(f64, i64, i64)>, MostroError> {
+    if status == Status::Pending {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
                 .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
@@ -532,25 +525,44 @@ pub async fn update_order_event(
         };
 
         let trade_pubkey = match order_updated.is_sell_order() {
-            Ok(_) => order_updated.get_seller_pubkey().map_err(MostroInternalErr)?,
-            Err(_) => order_updated.get_buyer_pubkey().map_err(MostroInternalErr)?,
+            Ok(_) => order_updated
+                .get_seller_pubkey()
+                .map_err(MostroInternalErr)?,
+            Err(_) => order_updated
+                .get_buyer_pubkey()
+                .map_err(MostroInternalErr)?,
         };
 
-        match is_user_present(&pool, identity_pubkey.clone()).await {
-            Ok(user) => {
-                Some((user.total_rating, user.total_reviews, user.created_at))
-            }
+        match is_user_present(&get_db_pool(), identity_pubkey.clone()).await {
+            Ok(user) => Ok(Some((
+                user.total_rating,
+                user.total_reviews,
+                user.created_at,
+            ))),
             Err(_) => {
                 if identity_pubkey == trade_pubkey.to_string() {
-                    Some((0.0, 0, 0))
+                    Ok(Some((0.0, 0, 0)))
                 } else {
-                    return Err(MostroInternalErr(ServiceError::InvalidPubkey));
+                    Err(MostroInternalErr(ServiceError::InvalidPubkey))
                 }
             }
         }
     } else {
-        None
-    };
+        Ok(None)
+    }
+}
+
+pub async fn update_order_event(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+) -> Result<Order, MostroError> {
+    let mut order_updated = order.clone();
+    // update order.status with new status
+    order_updated.status = status.to_string();
+
+    // Include rating tag for pending orders
+    let reputation_data = get_ratings_for_pending_order(&order_updated, status).await?;
 
     // We transform the order fields to tags to use in the event
     if let Some(tags) = order_to_tags(&order_updated, reputation_data)? {

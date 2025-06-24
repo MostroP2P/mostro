@@ -38,20 +38,42 @@ pub async fn check_failure_retries(
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
+
+    let is_first_failure = !order.failed_payment;
+
     // Count payment retries up to limit
     order.count_failed_payment(retries_number);
 
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::PaymentFailed,
-        None,
-        buyer_pubkey,
-        None,
-    )
-    .await;
+    // Only send notification on first failure
+    if is_first_failure {
+        // Create payment failed payload with retry configuration
+        let payment_failed_info = PaymentFailedInfo {
+            payment_attempts: ln_settings.payment_attempts,
+            payment_retries_interval: ln_settings.payment_retries_interval,
+        };
+
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::PaymentFailed,
+            Some(Payload::PaymentFailed(payment_failed_info)),
+            buyer_pubkey,
+            None,
+        )
+        .await;
+    } else if order.payment_attempts >= retries_number {
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::AddInvoice,
+            Some(Payload::Order(SmallOrder::from(order.clone()))),
+            buyer_pubkey,
+            None,
+        )
+        .await;
+    }
 
     // Update order
     let result = order

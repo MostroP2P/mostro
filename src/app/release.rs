@@ -39,7 +39,7 @@ pub async fn check_failure_retries(
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
 
-    let is_first_failure = !order.failed_payment;
+    let is_first_failure = order.payment_attempts == 0;
 
     // Count payment retries up to limit
     order.count_failed_payment(retries_number);
@@ -50,7 +50,7 @@ pub async fn check_failure_retries(
     if is_first_failure {
         // Create payment failed payload with retry configuration
         let payment_failed_info = PaymentFailedInfo {
-            payment_attempts: ln_settings.payment_attempts,
+            payment_attempts: ln_settings.payment_attempts.saturating_sub(1),
             payment_retries_interval: ln_settings.payment_retries_interval,
         };
 

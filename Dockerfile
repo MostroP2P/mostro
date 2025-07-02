@@ -24,25 +24,14 @@ FROM alpine:latest
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates sqlite-libs openssl
 
-# Add a non-root user and create home directory
-RUN adduser -D -h /home/mostrouser mostrouser
-
-WORKDIR /home/mostrouser
+# Set working directory
+WORKDIR /home/.mostro
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
 
-# Copy settings and empty database
-COPY ./docker/settings.docker.toml ./docker/empty.mostro.db ./
+# Copy empty database
+COPY ./mostro.db ./
 
-# Copy start script
-COPY ./scripts/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
-
-RUN chown -R mostrouser:mostrouser /home/mostrouser
-
-# Switch to non-root user
-USER mostrouser
-
-# Start mostro (copy settings and database if it's not created yet)
-CMD ["./entrypoint.sh"]
+# Start mostro
+CMD ["mostrod"]

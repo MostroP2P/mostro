@@ -15,6 +15,9 @@ service AdminService {
   
   // Take a dispute for resolution
   rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
+
+  // Get Mostro version
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
 }
 
 // Request to cancel an order
@@ -63,4 +66,11 @@ message TakeDisputeRequest {
 message TakeDisputeResponse {
   bool success = 1;
   optional string error_message = 2;
+}
+
+// Get Mostro version
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string version = 1;
 }

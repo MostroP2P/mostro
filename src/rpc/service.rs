@@ -291,6 +291,16 @@ impl AdminService for AdminServiceImpl {
             }
         }
     }
+
+    async fn get_version(
+        &self,
+        _request: Request<crate::rpc::admin::GetVersionRequest>,
+    ) -> Result<Response<crate::rpc::admin::GetVersionResponse>, Status> {
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        Ok(Response::new(crate::rpc::admin::GetVersionResponse {
+            version,
+        }))
+    }
 }
 
 #[cfg(test)]

@@ -61,7 +61,7 @@ To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/
 
 ```bash
 sudo apt update
-sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
+sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler
 ```
 
 To compile on Mac, then use brew:

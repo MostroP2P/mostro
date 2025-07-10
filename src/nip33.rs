@@ -1,7 +1,6 @@
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
 use crate::LN_STATUS;
-use chrono::Duration;
 use mostro_core::prelude::*;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -163,7 +162,7 @@ pub fn order_to_tags(
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("expiration")),
-                vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+                vec![order.expires_at.to_string()],
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),

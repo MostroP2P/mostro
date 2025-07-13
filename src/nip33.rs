@@ -1,6 +1,5 @@
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
-use crate::util::get_keys;
 use crate::LN_STATUS;
 use chrono::Duration;
 use mostro_core::prelude::*;
@@ -104,60 +103,46 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
         _ => Ok((false, status)),
     }
 }
-
-/// Create a NIP-19 coordinate source tag for pending orders
+/// Create a custom source reference for pending orders
 ///
-/// This function generates a source tag containing a NIP-19 coordinate (naddr) that references
-/// the order's replaceable event. The source tag allows clients to easily find and reference
-/// the original order event on the Nostr network.
+/// This function generates a source tag containing a custom reference format that allows
+/// clients to find and reference the original order event. The source tag is only created
+/// for pending orders that need to be discoverable by potential takers.
 ///
 /// # Arguments
 ///
 /// * `order` - The order to create a source tag for
-/// * `mostro_keys` - The Mostro node's keypair (public key used in the coordinate)
 /// * `mostro_relays` - List of relay URLs where the order event can be found
 ///
 /// # Returns
 ///
-/// * `Ok(Some(String))` - If the order is pending, returns the bech32-encoded naddr string
+/// * `Ok(Some(String))` - If the order is pending, returns a custom reference string
 /// * `Ok(None)` - If the order is not pending (source tags only apply to pending orders)
-/// * `Err(MostroError)` - If there was an error creating the NIP-19 coordinate
+/// * `Err(MostroError)` - If there was an error creating the reference
 ///
 /// # Behavior
 ///
 /// The function only creates source tags for pending orders, as these are the orders that
-/// need to be discoverable and referenceable by potential takers. The generated coordinate
+/// need to be discoverable and referenceable by potential takers. The generated reference
 /// includes:
-/// - Event kind: Custom replaceable event (NIP-33)
-/// - Public key: Mostro node's public key
-/// - Identifier: Order ID
-/// - Relays: List of relays where the event can be found
+/// - Order ID
+/// - List of relays where the event can be found
 ///
-/// The resulting naddr can be used by clients to directly reference and fetch the order event.
+/// The resulting reference uses a custom format: `mostro:{order_id}?{relay1,relay2,...}`
 ///
 fn create_source_tag(
     order: &Order,
-    mostro_keys: &Keys,
-    mostro_relays: &Vec<String>,
+    mostro_relays: &[String],
 ) -> Result<Option<String>, MostroError> {
     if order.status == Status::Pending.to_string() {
-        let coordinate = Coordinate::new(
-            nostr::Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND),
-            mostro_keys.public_key,
-        )
-        .identifier(order.id.to_string());
-        let nip19_coordinate = Nip19Coordinate::new(coordinate, mostro_relays).map_err(|_| {
-            MostroInternalErr(ServiceError::NostrError(
-                "Invalid nip19 coordinate".to_string(),
-            ))
-        })?;
-        let naddr = Nip19::Coordinate(nip19_coordinate);
-        let naddr_bech32 = naddr.to_bech32().map_err(|_| {
-            MostroInternalErr(ServiceError::NostrError(
-                "Invalid nip19 coordinate".to_string(),
-            ))
-        })?;
-        Ok(Some(naddr_bech32))
+        // Create a custom format that doesn't claim to be NIP-19
+        let custom_ref = format!(
+            "mostro:{}?{}",
+            order.id,
+            mostro_relays.join(",")
+        );
+
+        Ok(Some(custom_ref))
     } else {
         Ok(None)
     }
@@ -206,15 +191,14 @@ pub fn order_to_tags(
     order: &Order,
     reputation_data: Option<(f64, i64, i64)>,
 ) -> Result<Option<Tags>, MostroError> {
-    // Po
+    // Position of the tags in the list
     const RATING_TAG_INDEX: usize = 7;
     const SOURCE_TAG_INDEX: usize = 8;
 
     // Check if the order is pending/in-progress/success/canceled
     let (create_event, status) = create_status_tags(order)?;
     // Create nip19 coordinate in case of pending order creation
-    let nip19_coordinate_string =
-        create_source_tag(order, &get_keys()?, &Settings::get_nostr().relays.clone())?;
+    let nip19_coordinate_string = create_source_tag(order, &Settings::get_nostr().relays)?;
 
     // Send just in case the order is pending/in-progress/success/canceled
     if create_event {
@@ -289,7 +273,7 @@ pub fn order_to_tags(
                 SOURCE_TAG_INDEX,
                 Tag::custom(
                     TagKind::Custom(Cow::Borrowed("source")),
-                    vec!["nostr:".to_string() + &source],
+                    vec![source],
                 ),
             );
         }

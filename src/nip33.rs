@@ -137,7 +137,7 @@ fn create_source_tag(
     if order.status == Status::Pending.to_string() {
         // Create a custom format that doesn't claim to be NIP-19
         let custom_ref = format!(
-            "mostro:{}?{}",
+            "[mostro:{}?{}]",
             order.id,
             mostro_relays.join(",")
         );

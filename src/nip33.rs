@@ -135,12 +135,8 @@ fn create_source_tag(
     mostro_relays: &[String],
 ) -> Result<Option<String>, MostroError> {
     if order.status == Status::Pending.to_string() {
-        // Create a custom format that doesn't claim to be NIP-19
-        let custom_ref = format!(
-            "mostro:{}?relays={}",
-            order.id,
-            mostro_relays.join(",")
-        );
+        // Create a mostro: custom source reference for pending orders
+        let custom_ref = format!("mostro:{}?relays={}", order.id, mostro_relays.join(","));
 
         Ok(Some(custom_ref))
     } else {
@@ -185,7 +181,7 @@ fn create_source_tag(
 /// - `y`: Always "mostro" (marketplace identifier)
 /// - `z`: Always "order" (event type)
 /// - `rating`: User reputation data (if available)
-/// - `source`: NIP-19 coordinate for pending orders (naddr format)
+/// - `source`: mostro: scheme link to pending orders (`mostro:{order_id}?{relay1,relay2,...}`)
 ///
 pub fn order_to_tags(
     order: &Order,
@@ -197,8 +193,8 @@ pub fn order_to_tags(
 
     // Check if the order is pending/in-progress/success/canceled
     let (create_event, status) = create_status_tags(order)?;
-    // Create nip19 coordinate in case of pending order creation
-    let nip19_coordinate_string = create_source_tag(order, &Settings::get_nostr().relays)?;
+    // Create mostro: scheme link in case of pending order creation
+    let mostro_link = create_source_tag(order, &Settings::get_nostr().relays)?;
 
     // Send just in case the order is pending/in-progress/success/canceled
     if create_event {
@@ -268,13 +264,10 @@ pub fn order_to_tags(
             );
         }
         // Add source tag if available
-        if let Some(source) = nip19_coordinate_string {
+        if let Some(source) = mostro_link {
             tags.insert(
                 SOURCE_TAG_INDEX,
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("source")),
-                    vec![source],
-                ),
+                Tag::custom(TagKind::Custom(Cow::Borrowed("source")), vec![source]),
             );
         }
         Ok(Some(Tags::from_list(tags)))

@@ -372,7 +372,7 @@ async fn job_cancel_orders() {
                     next_tick.format("%a %b %e %T %Y")
                 );
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(exp_seconds as u64)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
 }

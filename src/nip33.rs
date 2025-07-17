@@ -95,7 +95,7 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
     match status {
         Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
         Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
-        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled => {
+        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled | Status::Expired=> {
             Ok((true, Status::Canceled))
         }
         Status::Success | Status::CompletedByAdmin => Ok((true, status)),

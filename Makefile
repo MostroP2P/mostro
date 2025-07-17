@@ -43,3 +43,33 @@ docker-down:
 	@set -o pipefail; \
 	cd docker && \
 	docker compose down
+
+VERSION := $(shell yq e .version manifest.yaml)
+ID := $(shell yq e .id manifest.yaml)
+
+.PHONY: all
+all: x86 arm
+
+.PHONY: x86
+x86:
+	start-sdk pack --arch=x86_64
+
+.PHONY: arm
+arm:
+	start-sdk pack --arch=aarch64
+
+.PHONY: install
+install:
+	start-cli package install $(ID).s9pk
+
+.PHONY: uninstall
+uninstall:
+	start-cli package uninstall $(ID)
+
+.PHONY: logs
+logs:
+	start-cli package logs $(ID)
+
+.PHONY: clean
+clean:
+	rm -f $(ID).s9pk

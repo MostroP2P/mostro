@@ -2098,6 +2098,7 @@ version = "0.14.0"
 dependencies = [
  "argon2",
  "axum 0.7.9",
+ "bech32",
  "bitcoin",
  "chrono",
  "clap",

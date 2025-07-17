@@ -199,7 +199,7 @@ mod tests {
     use super::*;
     use crate::config::MOSTRO_CONFIG;
     use axum::{http::StatusCode, routing::get, Json, Router};
-    use bech32::{encode, ToBase32};
+
     use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -252,7 +252,10 @@ mod tests {
             "http://localhost:{}/.well-known/lnurlp/MostroP2Ptestlnurl",
             port
         );
-        let lnurl = encode("lnurl", url.as_bytes().to_base32(), bech32::Variant::Bech32).unwrap();
+
+        // Create LnUrl from URL and encode to string
+        let lnurl_obj = LnUrl { url: url.clone() };
+        let lnurl = lnurl_obj.encode();
 
         (lnurl, handle)
     }
@@ -284,10 +287,7 @@ mod tests {
         init_settings_test();
         let payment_request = "lnbc1p583aqqpp5gc52tl8ycp96jwurmnxwhz537vlancxxaxk92r9fl6f77z3r8q7qdq5g9kxy7fqd9h8vmmfvdjscqzzsxqyz5vqsp5657mdpk04phuuasjntxwl2t5cgcyv0pa574anx5svdfudf0ueydq9qxpqysgq2cxal5k00nlypltvcl94kkr50vkech6uvnnavqalnl9c8fkc2zpk3ed2j9vwyxg6kg4gcnyms0fafuc3au4f6s3ugaqa8r6d7yq2gggpzqwtnf".to_string();
         let zero_amount_err = is_valid_invoice(payment_request, Some(100), None);
-        assert_eq!(
-            Ok(()),
-            zero_amount_err.await
-        );
+        assert_eq!(Ok(()), zero_amount_err.await);
     }
 
     #[tokio::test]

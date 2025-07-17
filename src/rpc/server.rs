@@ -86,7 +86,7 @@ mod tests {
             listen_address: "localhost".to_string(),
             port: 8080,
         };
-        
+
         assert_eq!(server.listen_address, "localhost");
         assert_eq!(server.port, 8080);
     }
@@ -97,7 +97,7 @@ mod tests {
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
         };
-        
+
         let expected_addr = format!("{}:{}", server.listen_address, server.port);
         assert_eq!(expected_addr, "127.0.0.1:50051");
     }
@@ -105,10 +105,16 @@ mod tests {
     #[test]
     fn test_default_rpc_settings() {
         let default_settings = RpcSettings::default();
-        
+
         // Test that defaults are sensible
-        assert!(!default_settings.enabled, "RPC should be disabled by default");
-        assert!(!default_settings.listen_address.is_empty(), "Listen address should not be empty");
+        assert!(
+            !default_settings.enabled,
+            "RPC should be disabled by default"
+        );
+        assert!(
+            !default_settings.listen_address.is_empty(),
+            "Listen address should not be empty"
+        );
         assert!(default_settings.port > 0, "Port should be positive");
         // Note: u16 max is 65535, so any u16 is valid by definition
     }

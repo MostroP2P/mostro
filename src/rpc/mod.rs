@@ -1,5 +1,5 @@
 //! RPC server module for direct admin communication
-//! 
+//!
 //! This module provides a gRPC server that allows direct communication with Mostro
 //! for admin operations without going through the Nostr protocol. This is useful
 //! for local development and admin applications that need low-latency access.

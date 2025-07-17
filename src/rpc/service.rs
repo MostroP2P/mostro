@@ -107,7 +107,7 @@ impl AdminServiceImpl {
         };
 
         let mut ln_client = self.ln_client.lock().await;
-        admin_settle_action(msg, &event, &self.keys, &self.pool, &mut *ln_client)
+        admin_settle_action(msg, &event, &self.keys, &self.pool, &mut ln_client)
             .await
             .map_err(|e| format!("Admin settle failed: {}", e))?;
 

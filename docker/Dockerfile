@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.82 AS builder
+FROM rust:1.86 AS builder
 
 # Install build dependencies
 RUN apt-get update && \

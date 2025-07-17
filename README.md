@@ -52,7 +52,7 @@ Users will be able to rate Mostros and Mostros will compete to obtain more users
 
 ## Requirements
 
-0. You need Rust version 1.82 or higher to compile.
+0. You need Rust version 1.86 or higher to compile.
 1. You will need a lightning network node.
 
 ## Install dependencies
@@ -61,7 +61,7 @@ To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/
 
 ```bash
 sudo apt update
-sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev
+sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler
 ```
 
 To compile on Mac, then use brew:

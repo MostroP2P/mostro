@@ -58,7 +58,7 @@ bech32 = "0.9"
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
 axum = "0.7.4"
-tower-http = { version = "0.5.1", features = ["cors"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
 
 [build-dependencies]
 tonic-build = "0.13.1"

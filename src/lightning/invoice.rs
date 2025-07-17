@@ -107,8 +107,8 @@ async fn validate_bolt11_invoice(
 
     // Validate amount if provided
     if let Some(amt) = amount {
-        if let Some(res) = amt.checked_sub(fee) {
-            if amount_sat != res && amount_sat != 0 {
+        if let Some(expected_sats_amount) = amt.checked_sub(fee) {
+            if amount_sat != expected_sats_amount && amount_sat != 0 {
                 return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
             }
         } else {
@@ -276,6 +276,17 @@ mod tests {
         assert_eq!(
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
             expired_err.await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_amount_invoice() {
+        init_settings_test();
+        let payment_request = "lnbc1p583aqqpp5gc52tl8ycp96jwurmnxwhz537vlancxxaxk92r9fl6f77z3r8q7qdq5g9kxy7fqd9h8vmmfvdjscqzzsxqyz5vqsp5657mdpk04phuuasjntxwl2t5cgcyv0pa574anx5svdfudf0ueydq9qxpqysgq2cxal5k00nlypltvcl94kkr50vkech6uvnnavqalnl9c8fkc2zpk3ed2j9vwyxg6kg4gcnyms0fafuc3au4f6s3ugaqa8r6d7yq2gggpzqwtnf".to_string();
+        let zero_amount_err = is_valid_invoice(payment_request, Some(100), None);
+        assert_eq!(
+            Ok(()),
+            zero_amount_err.await
         );
     }
 

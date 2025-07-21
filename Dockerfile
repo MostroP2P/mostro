@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.82-alpine AS builder
+FROM rust:1.86-alpine AS builder
 
 # Install build dependencies
 RUN apk update && \
@@ -24,14 +24,15 @@ FROM alpine:latest
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates sqlite-libs openssl
 
-# Set working directory
-WORKDIR /home/.mostro
+# Create the mostro data directory
+RUN mkdir -p /mostro
+
+# Set working directory to /mostro for persistent data
+WORKDIR /mostro
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
 
-# Copy empty database
+# Copy empty database to the mostro directory
 COPY ./mostro.db ./
 
-# Start mostro
-CMD ["mostrod"]

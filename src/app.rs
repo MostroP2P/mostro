@@ -394,10 +394,9 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
 mod tests {
     use super::*;
     use mostro_core::message::Action;
-    
+
     use nostr_sdk::secp256k1::schnorr::Signature;
     use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
-    
 
     // Helper function to create test keys
     fn create_test_keys() -> Keys {
@@ -419,7 +418,7 @@ mod tests {
     fn create_test_unwrapped_gift() -> UnwrappedGift {
         let keys = create_test_keys();
         let sender_keys = create_test_keys();
-        
+
         let unsigned_event = UnsignedEvent::new(
             keys.public_key(),
             Timestamp::now(),
@@ -427,7 +426,7 @@ mod tests {
             Vec::new(),
             "",
         );
-        
+
         UnwrappedGift {
             sender: sender_keys.public_key(),
             rumor: unsigned_event,
@@ -440,16 +439,37 @@ mod tests {
 
         // Test all ServiceError variants
         warning_msg(&action, ServiceError::EnvVarError("env error".to_string()));
-        warning_msg(&action, ServiceError::EncryptionError("encryption error".to_string()));
-        warning_msg(&action, ServiceError::DecryptionError("decryption error".to_string()));
+        warning_msg(
+            &action,
+            ServiceError::EncryptionError("encryption error".to_string()),
+        );
+        warning_msg(
+            &action,
+            ServiceError::DecryptionError("decryption error".to_string()),
+        );
         warning_msg(&action, ServiceError::IOError("io error".to_string()));
-        warning_msg(&action, ServiceError::UnexpectedError("unexpected error".to_string()));
-        warning_msg(&action, ServiceError::LnNodeError("ln node error".to_string()));
-        warning_msg(&action, ServiceError::LnPaymentError("ln payment error".to_string()));
-        warning_msg(&action, ServiceError::DbAccessError("db access error".to_string()));
+        warning_msg(
+            &action,
+            ServiceError::UnexpectedError("unexpected error".to_string()),
+        );
+        warning_msg(
+            &action,
+            ServiceError::LnNodeError("ln node error".to_string()),
+        );
+        warning_msg(
+            &action,
+            ServiceError::LnPaymentError("ln payment error".to_string()),
+        );
+        warning_msg(
+            &action,
+            ServiceError::DbAccessError("db access error".to_string()),
+        );
         warning_msg(&action, ServiceError::NostrError("nostr error".to_string()));
-        warning_msg(&action, ServiceError::HoldInvoiceError("hold invoice error".to_string()));
-        
+        warning_msg(
+            &action,
+            ServiceError::HoldInvoiceError("hold invoice error".to_string()),
+        );
+
         // Test default case
         warning_msg(&action, ServiceError::MessageSerializationError);
     }
@@ -462,7 +482,7 @@ mod tests {
 
         let error = MostroError::MostroCantDo(CantDoReason::InvalidSignature);
         manage_errors(error, message, event, &action).await;
-        
+
         // Test passes if no panic occurs
         assert!(true);
     }
@@ -473,9 +493,10 @@ mod tests {
         let event = create_test_unwrapped_gift();
         let action = Action::NewOrder;
 
-        let error = MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string()));
+        let error =
+            MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string()));
         manage_errors(error, message, event, &action).await;
-        
+
         // Test passes if no panic occurs
         assert!(true);
     }
@@ -558,11 +579,20 @@ mod tests {
                 // In a real test, we would verify each action is properly routed
                 // This test ensures we don't forget to handle new actions
                 match action {
-                    Action::NewOrder | Action::TakeSell | Action::TakeBuy |
-                    Action::FiatSent | Action::Release | Action::AddInvoice |
-                    Action::Dispute | Action::RateUser | Action::Cancel |
-                    Action::AdminCancel | Action::AdminSettle | Action::AdminAddSolver |
-                    Action::AdminTakeDispute | Action::TradePubkey => {
+                    Action::NewOrder
+                    | Action::TakeSell
+                    | Action::TakeBuy
+                    | Action::FiatSent
+                    | Action::Release
+                    | Action::AddInvoice
+                    | Action::Dispute
+                    | Action::RateUser
+                    | Action::Cancel
+                    | Action::AdminCancel
+                    | Action::AdminSettle
+                    | Action::AdminAddSolver
+                    | Action::AdminTakeDispute
+                    | Action::TradePubkey => {
                         assert!(true); // Action is handled
                     }
                     Action::PayInvoice => {
@@ -585,11 +615,11 @@ mod tests {
         fn test_signature_verification_logic() {
             let keys = create_test_keys();
             let sender_keys = create_test_keys();
-            
+
             // Test sender matches rumor pubkey case
             let sender_matches_rumor = keys.public_key() == keys.public_key();
             assert!(sender_matches_rumor);
-            
+
             // Test sender doesn't match rumor pubkey case
             let sender_differs = sender_keys.public_key() != keys.public_key();
             assert!(sender_differs);
@@ -600,15 +630,15 @@ mod tests {
             let current_time = chrono::Utc::now().timestamp() as u64;
             let old_time = current_time - 20; // 20 seconds ago
             let recent_time = current_time - 5; // 5 seconds ago
-            
+
             let since_time = chrono::Utc::now()
                 .checked_sub_signed(chrono::Duration::seconds(10))
                 .unwrap()
                 .timestamp() as u64;
-            
+
             // Old event should be rejected
             assert!(old_time < since_time);
-            
+
             // Recent event should be accepted
             assert!(recent_time >= since_time);
         }
@@ -620,7 +650,7 @@ mod tests {
             // This tests the logical flow
             let meets_pow = true; // Mock result
             let fails_pow = false; // Mock result
-            
+
             assert!(meets_pow);
             assert!(!fails_pow);
         }
@@ -633,7 +663,7 @@ mod tests {
         fn test_gift_wrap_processing_structure() {
             // Test the structure of gift wrap event processing
             let kind = NostrKind::GiftWrap;
-            
+
             match kind {
                 NostrKind::GiftWrap => {
                     // This is the expected path for gift wrap events
@@ -650,7 +680,7 @@ mod tests {
         fn test_message_parsing_structure() {
             // Test message parsing logic structure
             let test_content = r#"[{"order":{"version":1,"request_id":1,"trade_index":null,"id":"550e8400-e29b-41d4-a716-446655440000","action":"new-order","payload":null}}, null]"#;
-            
+
             let result = serde_json::from_str::<(Message, Option<Signature>)>(test_content);
             match result {
                 Ok((message, signature)) => {
@@ -658,7 +688,7 @@ mod tests {
                     // Note: message.verify() may fail without proper payload setup
                     // We're testing the parsing structure, not the validation logic
                     assert!(signature.is_none());
-                    
+
                     // Test that we got a message of some kind
                     match message {
                         Message::Order(_) => assert!(true),

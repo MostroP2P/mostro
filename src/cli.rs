@@ -2,8 +2,9 @@
 // / Initialize the default directory for the settings file
 //! CLI
 
-use crate::config::util::init_configuration_file;
+use crate::config::{util::init_configuration_file, MOSTRO_DB_PASSWORD};
 use clap::Parser;
+use secrecy::SecretString;
 
 #[derive(Parser)]
 #[command(
@@ -27,6 +28,12 @@ pub struct Cli {
     /// Set folder for Mostro settings file - default is HOME/.mostro
     #[arg(short, long)]
     dirsettings: Option<String>,
+    /// Set password for db encryption
+    #[arg(short, long)]
+    password: Option<String>,
+    /// Set cleartext password for db encryption
+    #[arg(short, long, default_value = "false")]
+    pub cleartext: Option<bool>,
 }
 
 /// Initialize the settings file and create the global config variable for Mostro settings
@@ -43,6 +50,10 @@ pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         init_configuration_file(None)?
     };
+
+    if let Some(password) = cli.password.as_deref() {
+        let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password.to_string()));
+    }
 
     // Mostro settings are initialized
     Ok(())

@@ -138,8 +138,7 @@ pub async fn release_action(
     }
 
     // Check if order is in status fiat sent or dispute
-    if order.check_status(Status::FiatSent).is_err()
-        && order.check_status(Status::Dispute).is_err()
+    if order.check_status(Status::FiatSent).is_err() && order.check_status(Status::Dispute).is_err()
     {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }

@@ -1,7 +1,9 @@
+use crate::cli::Cli;
 use crate::config::settings::Settings;
 use crate::config::MOSTRO_DB_PASSWORD;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use clap::Parser;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use rpassword::read_password;
@@ -139,9 +141,7 @@ fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError
     }
 }
 
-async fn get_user_password() -> Result<(), MostroError> {
-    // Password requirements settings
-    let password_requirements = PasswordRequirements::default();
+fn password_instructions(password_requirements: &PasswordRequirements) {
     // Print password requirements
     println!("\nHey Mostro admin insert a password to encrypt the database:");
     println!(
@@ -152,6 +152,36 @@ async fn get_user_password() -> Result<(), MostroError> {
     println!("- At least one lowercase letter");
     println!("- At least one number");
     println!("- At least one special character");
+}
+
+async fn get_user_password() -> Result<(), MostroError> {
+    // Password requirements settings
+    let password_requirements = PasswordRequirements::default();
+    // If password is already set, check if it's strong enough
+    // If not, prompt user to enter a new password
+    // password here is set from command line argument --password
+    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
+        if password_requirements.is_strong_password(password.expose_secret()) {
+            println!("Database password already set");
+            return Ok(());
+        } else {
+            println!("Database password is not strong enough");
+            password_instructions(&password_requirements);
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                "Database password is not strong enough".to_string(),
+            )));
+        }
+    } else {
+        password_instructions(&password_requirements);
+    }
+
+    let cli = Cli::parse();
+    if let Some(cleartext) = cli.cleartext {
+        if cleartext {
+            println!("No password encryption will be used for database");
+            return Ok(());
+        }
+    }
 
     // New database - need password creation
     loop {
@@ -238,7 +268,9 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::error!("Failed to set up database password: {}", e);
-                                println!("Failed to set up database password. Continuing without encryption.");
+                                println!(
+                                    "Failed to set up database password. Removing database file."
+                                );
                                 if let Err(cleanup_err) = std::fs::remove_file(db_path) {
                                     tracing::error!(
                                         error = %cleanup_err,

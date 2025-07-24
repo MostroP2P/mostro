@@ -16,7 +16,7 @@ RUN cargo fetch
 COPY . .
 
 # Build the project in release mode
-RUN cargo build --release
+RUN cargo build --release --features startos
 
 # Production stage
 FROM alpine:latest

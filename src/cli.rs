@@ -2,8 +2,11 @@
 // / Initialize the default directory for the settings file
 //! CLI
 
-use crate::config::{util::init_configuration_file, MOSTRO_DB_PASSWORD};
+use crate::config::util::init_configuration_file;
+#[cfg(feature = "startos")]
+use crate::config::MOSTRO_DB_PASSWORD;
 use clap::Parser;
+#[cfg(feature = "startos")]
 use secrecy::SecretString;
 
 #[derive(Parser)]
@@ -29,11 +32,13 @@ pub struct Cli {
     #[arg(short, long)]
     dirsettings: Option<String>,
     /// Set password for db encryption
+    #[cfg(feature = "startos")]
     #[arg(short, long)]
     password: Option<String>,
-    /// Set cleartext password for db encryption
-    #[arg(short, long, default_value = "false")]
-    pub cleartext: Option<bool>,
+    /// Set cleartext password for db encryption (no password required)
+    #[cfg(feature = "startos")]
+    #[arg(short, long, action = clap::ArgAction::SetTrue)]
+    pub cleartext: bool,
 }
 
 /// Initialize the settings file and create the global config variable for Mostro settings
@@ -51,6 +56,7 @@ pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
         init_configuration_file(None)?
     };
 
+    #[cfg(feature = "startos")]
     if let Some(password) = cli.password.as_deref() {
         let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password.to_string()));
     }
@@ -67,9 +73,23 @@ mod tests {
     #[test]
     fn test_cli_parser_creation() {
         // Test that CLI struct can be created
+        #[cfg(feature = "startos")]
+        let cli = Cli {
+            dirsettings: None,
+            password: None,
+            cleartext: false,
+        };
+        #[cfg(not(feature = "startos"))]
         let cli = Cli { dirsettings: None };
         assert!(cli.dirsettings.is_none());
 
+        #[cfg(feature = "startos")]
+        let cli_with_path = Cli {
+            dirsettings: Some("/custom/path".to_string()),
+            password: None,
+            cleartext: false,
+        };
+        #[cfg(not(feature = "startos"))]
         let cli_with_path = Cli {
             dirsettings: Some("/custom/path".to_string()),
         };
@@ -124,6 +144,28 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    #[cfg(feature = "startos")]
+    fn test_cli_parsing_cleartext_flag() {
+        // Test parsing with cleartext flag (no value required)
+        let result = Cli::try_parse_from(["mostro", "-c"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert!(cli.cleartext);
+
+        // Test parsing with long cleartext flag
+        let result = Cli::try_parse_from(["mostro", "--cleartext"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert!(cli.cleartext);
+
+        // Test parsing without cleartext flag (should default to false)
+        let result = Cli::try_parse_from(["mostro"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert!(!cli.cleartext);
+    }
+
     mod settings_init_tests {
         use super::*;
 
@@ -143,6 +185,13 @@ mod tests {
         fn test_custom_path_handling() {
             // Test the logical flow of custom path handling
             let custom_path = Some("/custom/path".to_string());
+            #[cfg(feature = "startos")]
+            let cli = Cli {
+                dirsettings: custom_path.clone(),
+                password: None,
+                cleartext: false,
+            };
+            #[cfg(not(feature = "startos"))]
             let cli = Cli {
                 dirsettings: custom_path.clone(),
             };
@@ -157,6 +206,13 @@ mod tests {
         #[test]
         fn test_default_path_handling() {
             // Test the logical flow of default path handling
+            #[cfg(feature = "startos")]
+            let cli = Cli {
+                dirsettings: None,
+                password: None,
+                cleartext: false,
+            };
+            #[cfg(not(feature = "startos"))]
             let cli = Cli { dirsettings: None };
 
             if cli.dirsettings.is_none() {

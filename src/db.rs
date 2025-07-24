@@ -1,8 +1,10 @@
+#[cfg(feature = "startos")]
 use crate::cli::Cli;
 use crate::config::settings::Settings;
 use crate::config::MOSTRO_DB_PASSWORD;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+#[cfg(feature = "startos")]
 use clap::Parser;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -171,14 +173,13 @@ async fn get_user_password() -> Result<(), MostroError> {
                 "Database password is not strong enough".to_string(),
             )));
         }
-    } else {
-        password_instructions(&password_requirements);
     }
 
-    let cli = Cli::parse();
-    if let Some(cleartext) = cli.cleartext {
-        if cleartext {
-            println!("No password encryption will be used for database");
+    #[cfg(feature = "startos")]
+    {
+        let cli = Cli::parse();
+        if cli.cleartext {
+            tracing::info!("No password encryption will be used for database");
             return Ok(());
         }
     }

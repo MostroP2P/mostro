@@ -95,9 +95,10 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
     match status {
         Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
         Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
-        Status::Canceled | Status::CanceledByAdmin | Status::CooperativelyCanceled | Status::Expired=> {
-            Ok((true, Status::Canceled))
-        }
+        Status::Canceled
+        | Status::CanceledByAdmin
+        | Status::CooperativelyCanceled
+        | Status::Expired => Ok((true, Status::Canceled)),
         Status::Success | Status::CompletedByAdmin => Ok((true, status)),
         Status::Pending => Ok((true, status)),
         _ => Ok((false, status)),
@@ -241,7 +242,7 @@ pub fn order_to_tags(
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("expiration")),
-                vec![(order.expires_at + Duration::hours(12).num_seconds()).to_string()],
+                vec![(order.expires_at + Duration::hours(24).num_seconds()).to_string()],
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),

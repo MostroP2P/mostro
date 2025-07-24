@@ -692,7 +692,8 @@ pub async fn show_hold_invoice(
         order.trade_index_seller,
     )
     .await;
-    // We send a message to buyer to know that seller was requested to pay the invoice
+
+    // We notify the buyer (maker) that their order was taken and seller must pay the hold invoice
     enqueue_order_msg(
         request_id,
         Some(order.id),
@@ -770,7 +771,7 @@ pub async fn get_market_amount_and_fee(
     Ok((new_sats_amount, fee))
 }
 
-/// Set order sats amount, this used when a buyer take a sell order
+/// Set order sats amount, this used when a buyer takes a sell order
 pub async fn set_waiting_invoice_status(
     order: &mut Order,
     buyer_pubkey: PublicKey,
@@ -811,6 +812,19 @@ pub async fn set_waiting_invoice_status(
         order.trade_index_buyer,
     )
     .await;
+
+    // We notify the seller (maker) that their order was taken and buyer must add invoice
+    let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingBuyerInvoice,
+        None,
+        seller_pubkey,
+        order.trade_index_seller,
+    )
+    .await;
+
     Ok(order.amount)
 }
 

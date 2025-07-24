@@ -1,4 +1,5 @@
 use crate::config::settings::Settings;
+use crate::lnurl::HTTP_CLIENT;
 use mostro_core::prelude::*;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -21,7 +22,9 @@ impl BitcoinPriceManager {
     pub async fn update_prices() -> Result<(), MostroError> {
         let mostro_settings = Settings::get_mostro();
         let api_url = format!("{}/exrates/BTC", mostro_settings.bitcoin_price_api_url);
-        let response = reqwest::get(&api_url)
+        let response = HTTP_CLIENT
+            .get(&api_url)
+            .send()
             .await
             .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
         let yadio_response: YadioResponse = response

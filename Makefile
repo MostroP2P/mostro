@@ -1,4 +1,5 @@
 SHELL := $(shell which bash)
+
 docker-build:
 	@set -o pipefail; \
 	cd docker && \
@@ -55,8 +56,8 @@ docker-build-startos:
 	cd docker && \
 	docker compose build mostro-startos
 
-VERSION := $(shell yq e .version manifest.yaml)
-ID := $(shell yq e .id manifest.yaml)
+VERSION := $(shell grep "^version = " Cargo.toml | sed "s/version = \"\(.*\)\"/\1/")
+ID := mostro
 
 .PHONY: all
 all: x86 arm
@@ -84,3 +85,7 @@ logs:
 .PHONY: clean
 clean:
 	rm -f $(ID).s9pk
+
+.PHONY: test
+test:
+	@echo "No tests defined."

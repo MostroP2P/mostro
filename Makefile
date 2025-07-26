@@ -44,6 +44,17 @@ docker-down:
 	cd docker && \
 	docker compose down
 
+docker-startos:
+	@set -o pipefail; \
+	VERSION=$$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/'); \
+	echo "Building and pushing arkanoider/mostro:$$VERSION to Docker Hub"; \
+	docker buildx build -f docker/dockerfile-startos --tag arkanoider/mostro:$$VERSION --platform=linux/amd64 --push .
+
+docker-build-startos:
+	@set -o pipefail; \
+	cd docker && \
+	docker compose build mostro-startos
+
 VERSION := $(shell yq e .version manifest.yaml)
 ID := $(shell yq e .id manifest.yaml)
 

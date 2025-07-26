@@ -21,18 +21,25 @@ RUN cargo build --release --features startos
 # Production stage
 FROM alpine:latest
 
+# Create non-root user for security
+RUN addgroup -g 1001 -S mostro && \
+    adduser -u 1001 -S mostro -G mostro
+
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates sqlite-libs openssl
 
 # Create the mostro data directory
-RUN mkdir -p /mostro
+RUN mkdir -p /mostro && chown mostro:mostro /mostro
 
 # Set working directory to /mostro for persistent data
 WORKDIR /mostro
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
+RUN chmod +x /usr/local/bin/mostrod
 
 # Copy empty database to the mostro directory
-COPY ./mostro.db ./
+COPY --chown=mostro:mostro ./mostro.db ./
 
+# Switch to non-root user
+USER mostro 

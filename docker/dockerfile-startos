@@ -30,6 +30,8 @@ RUN mkdir -p /mostro
 
 # Set working directory to /mostro for persistent data
 WORKDIR /mostro
+# Copy proto files from build stage for grpcurl health checks
+COPY --from=builder /mostro/proto /proto
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod

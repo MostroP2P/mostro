@@ -12,7 +12,8 @@ You need to have a LND node running locally. We recommend using [Polar](https://
 
 The `compose.yml` sets up the following services:
 
-- `mostro`: the MostroP2P service
+- `mostro`: the MostroP2P service (standard build using `docker/Dockerfile`)
+- `mostro-startos`: the MostroP2P service with StartOS features (using `docker/dockerfile-startos`)
 - `nostr-relay`: the Nostr relay
 
 ## Building and Running the Docker Container
@@ -62,6 +63,45 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-up
    ```
 
+## Building and Running with StartOS Features
+
+For StartOS-specific builds with enhanced features:
+
+### Local Development (StartOS)
+
+1. Build the StartOS version locally:
+
+   ```sh
+   make docker-build-startos
+   ```
+
+2. Run the StartOS service:
+
+   ```sh
+   cd docker && docker compose up mostro-startos
+   ```
+
+### Production Deployment (Docker Hub)
+
+To build and push the StartOS version to Docker Hub:
+
+```sh
+make docker-startos
+```
+
+This command will:
+
+- Extract the version from `Cargo.toml` (currently 0.14.0)
+- Build using `docker/dockerfile-startos` with `--features startos`
+- Tag as `arkanoider/mostro:VERSION`
+- Push directly to Docker Hub with `linux/amd64` platform
+
+**Note**: Make sure you're logged in to Docker Hub first:
+
+```sh
+docker login
+```
+
 ## Stopping the Docker Container
 
 To stop the Docker container, run:
@@ -69,6 +109,20 @@ To stop the Docker container, run:
 ```sh
 make docker-down
 ```
+
+## Available Make Commands
+
+### Standard Build Commands
+
+- `make docker-build` - Build the standard mostro service
+- `make docker-up` - Start all services (mostro + nostr-relay)
+- `make docker-down` - Stop all services
+- `make docker-relay-up` - Start only the Nostr relay
+
+### StartOS Build Commands
+
+- `make docker-build-startos` - Build the StartOS version locally
+- `make docker-startos` - Build and push StartOS version to Docker Hub
 
 ## Steps for running just the Nostr relay
 

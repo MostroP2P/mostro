@@ -9,6 +9,14 @@ services:
     networks:
       - default
 
+  mostro-startos:
+    build:
+      context: ..
+      dockerfile: docker/dockerfile-startos
+    platform: linux/amd64
+    networks:
+      - default
+
   nostr-relay:
     image: scsibug/nostr-rs-relay
     container_name: nostr-relay

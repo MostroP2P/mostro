@@ -49,8 +49,8 @@ docker-down:
 docker-startos:
 	@set -o pipefail; \
 	VERSION=$$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/'); \
-	echo "Building and pushing arkanoider/mostro:$$VERSION to Docker Hub"; \
-	docker buildx build -f docker/dockerfile-startos --tag arkanoider/mostro:$$VERSION --platform=linux/amd64,linux/arm64 --push .
+	echo "Building and pushing mostrop2p/mostro:$$VERSION to Docker Hub"; \
+	docker buildx build -f docker/dockerfile-startos --tag mostrop2p/mostro:$$VERSION --platform=linux/amd64,linux/arm64 --push .
 
 docker-build-startos:
 	@set -o pipefail; \

@@ -93,7 +93,7 @@ This command will:
 
 - Extract the version from `Cargo.toml` (currently 0.14.0)
 - Build using `docker/dockerfile-startos` with `--features startos`
-- Tag as `arkanoider/mostro:VERSION`
+- Tag as `mostrop2p/mostro:VERSION`
 - Push directly to Docker Hub with `linux/amd64` platform
 
 **Note**: Make sure you're logged in to Docker Hub first:

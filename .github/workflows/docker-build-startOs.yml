@@ -12,6 +12,9 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+    
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
       
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -36,7 +39,8 @@ jobs:
     - name: Build and push Docker images
       uses: docker/build-push-action@v5
       with:
-        context: ./docker/dockerfile-startOs
+        context: .
+        file: ./docker/dockerfile-startos
         platforms: linux/amd64,linux/arm64
         push: true
         tags: ${{ steps.meta.outputs.tags }}

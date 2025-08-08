@@ -35,6 +35,3 @@ COPY --from=builder /mostro/proto /proto
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
-
-# Copy empty database to the mostro directory
-COPY ./mostro.db ./

@@ -285,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_amount_invoice() {
         init_settings_test();
-        let payment_request = "lnbcrt1p5gy6c6pp50h04eqruzmztz3a7x97cwea85cywsz4dl5sghzx2dkttv572e6esdqqcqzzsxqyz5vqsp5gttvmhu2mvgtnhxfvqy4t4v4vyp33n3jv23767xlcs9em2zfsq2s9qxpqysgqmhm6nhg6zrftdt8xd9yfq9zf38t65k0ff345thj5339sqnn3qqw8z63qrqdck7q5c48mmdy793u5usmx5tfc7jcydv2pmm8j2e2c3fqqpdezyf".to_string();
+        let payment_request = "lnbc1p5fr5rppp57geae89p9quvwgedaul0x3gpedhrmnh9uwxdwdtja5t9dteaqphqcqzyssp5aftk78kzcnej33f7eydgta9x5wup3v6m26hu4upgvr7709fg0mxq9q7sqqqqqqqqqqqqqqqqqqqsqqqqqysgqdqqmqz9gxqyjw5qrzjqwryaup9lh50kkranzgcdnn2fgvx390wgj5jd07rwr3vxeje0glclludlw6z8nzdzcqqqqlgqqqqqeqqjqsatwvdm6hcwgmxx5pjz0wl6m6s9f8rrupeh97vesnt54exasemxk7a4knjgc6xhy9qrc3e78y70yxenaymykyw0crkwgerhf3y7zpfqqd8wnvl".to_string();
         let zero_amount_err = is_valid_invoice(payment_request, Some(100), None);
         assert_eq!(Ok(()), zero_amount_err.await);
     }

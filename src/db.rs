@@ -143,6 +143,36 @@ fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError
     }
 }
 
+/// Verify the provided password against the stored admin hash and set it in memory on success.
+/// This is a non-interactive variant used by RPC.
+pub async fn verify_and_set_db_password(
+    pool: &SqlitePool,
+    password: String,
+) -> Result<(), MostroError> {
+    // Fetch stored admin password hash
+    let Some(argon2_hash) = get_admin_password(pool).await? else {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "Database encryption not enabled".to_string(),
+        )));
+    };
+
+    let parsed_hash = PasswordHash::new(&argon2_hash)
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
+    {
+        // Save the password in memory if not set. If already set, keep the existing value.
+        let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password));
+        Ok(())
+    } else {
+        Err(MostroInternalErr(ServiceError::DbAccessError(
+            "Invalid password".to_string(),
+        )))
+    }
+}
+
 fn password_instructions(password_requirements: &PasswordRequirements) {
     // Print password requirements
     println!("\nHey Mostro admin insert a password to encrypt the database:");

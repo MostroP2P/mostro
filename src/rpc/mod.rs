@@ -61,6 +61,10 @@ mod tests {
             request_id: Some("req3".to_string()),
         };
 
+        let _validate_password_req = ValidateDbPasswordRequest {
+            password: "test-pass".to_string(),
+        };
+
         // Test passes if all types can be instantiated
         assert!(true);
     }
@@ -86,6 +90,11 @@ mod tests {
         let _take_dispute_resp = TakeDisputeResponse {
             success: false,
             error_message: Some("Dispute not found".to_string()),
+        };
+
+        let _validate_password_resp = ValidateDbPasswordResponse {
+            success: true,
+            error_message: None,
         };
 
         // Test passes if all types can be instantiated

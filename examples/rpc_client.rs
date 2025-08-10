@@ -8,7 +8,10 @@ pub mod admin {
     tonic::include_proto!("mostro.admin.v1");
 }
 
-use admin::{admin_service_client::AdminServiceClient, AddSolverRequest, CancelOrderRequest};
+use admin::{
+    admin_service_client::AdminServiceClient, AddSolverRequest, CancelOrderRequest,
+    ValidateDbPasswordRequest,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,6 +21,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let mut client = AdminServiceClient::new(channel);
+    // Example 0: Validate database password
+    println!("Attempting to validate database password...");
+    let validate_request = tonic::Request::new(ValidateDbPasswordRequest {
+        password: std::env::var("MOSTRO_DB_TEST_PASSWORD").unwrap_or_default(),
+    });
+
+    match client.validate_db_password(validate_request).await {
+        Ok(response) => {
+            let resp = response.get_ref();
+            if resp.success {
+                println!("✅ Database password validated successfully");
+            } else {
+                println!(
+                    "❌ Failed to validate DB password: {:?}",
+                    resp.error_message
+                );
+            }
+        }
+        Err(e) => {
+            println!("❌ RPC Error: {}", e);
+        }
+    }
 
     // Example 1: Cancel an order
     println!("Attempting to cancel order...");

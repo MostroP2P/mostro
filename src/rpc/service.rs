@@ -1,10 +1,11 @@
 //! RPC service implementation for admin operations
 
+use crate::db::verify_and_set_db_password;
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
     CancelOrderResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
-    TakeDisputeResponse,
+    TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
 use sqlx::{Pool, Sqlite};
@@ -300,6 +301,28 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(crate::rpc::admin::GetVersionResponse {
             version,
         }))
+    }
+
+    async fn validate_db_password(
+        &self,
+        request: Request<ValidateDbPasswordRequest>,
+    ) -> Result<Response<ValidateDbPasswordResponse>, Status> {
+        let req = request.into_inner();
+        info!("Received ValidateDbPassword request");
+
+        match verify_and_set_db_password(&self.pool, req.password).await {
+            Ok(()) => Ok(Response::new(ValidateDbPasswordResponse {
+                success: true,
+                error_message: None,
+            })),
+            Err(e) => {
+                error!("ValidateDbPassword failed: {}", e);
+                Ok(Response::new(ValidateDbPasswordResponse {
+                    success: false,
+                    error_message: Some(e.to_string()),
+                }))
+            }
+        }
     }
 }
 

@@ -15,6 +15,12 @@ service AdminService {
   
   // Take a dispute for resolution
   rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
+
+  // Validate database password (when encryption is enabled)
+  rpc ValidateDbPassword(ValidateDbPasswordRequest) returns (ValidateDbPasswordResponse);
+
+  // Get Mostro version
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
 }
 
 // Request to cancel an order
@@ -63,4 +69,21 @@ message TakeDisputeRequest {
 message TakeDisputeResponse {
   bool success = 1;
   optional string error_message = 2;
+}
+
+// Validate database password
+message ValidateDbPasswordRequest {
+  string password = 1;
+}
+
+message ValidateDbPasswordResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+// Get Mostro version
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string version = 1;
 }

@@ -78,14 +78,16 @@ pub async fn update_user_reputation_action(
     // Get order
     let order = get_order(&msg, pool).await?;
 
-    // Check if order is success
-    if order.check_status(Status::Success).is_err() {
-        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
-    }
-
     // Prepare variables for vote
     let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
         prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
+
+    // Check if order is success, but sellers can rate in status settled-hold-invoice
+    if !(order.check_status(Status::Success).is_ok()
+        || (order.check_status(Status::SettledHoldInvoice).is_ok() && seller_rating))
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+    }
 
     // Check if the order is not rated by the message sender
     // Check what rate status needs update

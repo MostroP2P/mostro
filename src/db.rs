@@ -1225,10 +1225,9 @@ impl RestoreSessionManager {
         let sender = self.sender.clone();
 
         // Use spawn_blocking for CPU-intensive decryption work
+        let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            // Run the async restore work to completion on this blocking thread
-            let rt = tokio::runtime::Handle::current();
-            match rt.block_on(process_restore_session_work(pool, master_key)) {
+            match handle.block_on(process_restore_session_work(pool, master_key)) {
                 Ok(restore_data) => {
                     // No need for an async context just to send; this is a blocking thread.
                     let _ = sender.blocking_send(restore_data);

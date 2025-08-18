@@ -1,4 +1,3 @@
-use crate::util::enqueue_order_msg;
 use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -104,15 +103,7 @@ async fn send_restore_session_timeout(master_key: &str) -> Result<(), MostroErro
         PublicKey::from_hex(master_key).map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?;
 
     // Send timeout message without payload since Text doesn't exist
-    enqueue_order_msg(
-        None,
-        None,
-        Action::RestoreSession,
-        None,
-        master_pubkey,
-        None,
-    )
-    .await;
+    enqueue_restore_session_msg(None, master_pubkey).await;
 
     tracing::warn!("Restore session timed out for user: {}", master_key);
 

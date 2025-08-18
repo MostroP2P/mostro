@@ -20,6 +20,10 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
+// Constants for excluded statuses used across restore session functions
+const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+const EXCLUDED_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -970,6 +974,7 @@ pub async fn find_order_by_id(
 
 /// Find all orders for a user by their master key (for restore session)
 /// This function efficiently handles both encrypted and non-encrypted databases
+/// Uses constants for excluded statuses to maintain consistency across queries
 pub async fn find_user_orders_by_master_key(
     pool: &SqlitePool,
     master_key: &str,
@@ -1033,22 +1038,24 @@ pub async fn find_user_orders_by_master_key(
         Ok(matching_orders)
     } else {
         // For non-encrypted databases, use direct SQL queries
-        let orders = sqlx::query_as::<_, RestoredOrdersInfo>(
+        let sql_query = format!(
             r#"
             SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
             WHERE (master_buyer_pubkey = ?)
-            AND status NOT IN ('expired', 'success', 'canceled', 'dispute','canceledbyadmin', 'completedbyadmin', 'settledbyadmin', 'cooperativelycanceled')
+            AND status NOT IN ({})
             UNION ALL
             SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
             WHERE (master_seller_pubkey = ?)
-            AND status NOT IN ('expired', 'success', 'canceled', 'dispute','canceledbyadmin', 'completedbyadmin', 'settledbyadmin', 'cooperativelycanceled')
+            AND status NOT IN ({})
             "#,
-        )
-        .bind(master_key)
-        .bind(master_key)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
+        );
+        let orders = sqlx::query_as::<_, RestoredOrdersInfo>(&sql_query)
+            .bind(master_key)
+            .bind(master_key)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         Ok(orders)
     }
@@ -1070,15 +1077,17 @@ pub async fn find_user_disputes_by_master_key(
         let mut matching_disputes = Vec::new();
 
         // First get all disputes
-        let all_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(
+        let sql_query = format!(
             r#"
             SELECT * FROM disputes 
-            WHERE status == 'initiated' OR status == 'in-progress'
+            WHERE status NOT IN ({})
             "#,
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            EXCLUDED_DISPUTE_STATUSES
+        );
+        let all_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(&sql_query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         for dispute in all_disputes {
             // Get the associated order to check master keys
@@ -1124,19 +1133,21 @@ pub async fn find_user_disputes_by_master_key(
     } else {
         // For non-encrypted databases, we can use a more efficient approach
         // by joining with orders table
-        let disputes = sqlx::query_as::<_, Dispute>(
+        let sql_query = format!(
             r#"
             SELECT d.* FROM disputes d
             JOIN orders o ON d.order_id = o.id
             WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
-            AND (d.status == 'initiated' OR d.status == 'in-progress')
+            AND (d.status NOT IN ({}))
             "#,
-        )
-        .bind(master_key)
-        .bind(master_key)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            EXCLUDED_DISPUTE_STATUSES
+        );
+        let disputes = sqlx::query_as::<_, Dispute>(&sql_query)
+            .bind(master_key)
+            .bind(master_key)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         // Convert Dispute objects to RestoredDisputesInfo
         let mut restore_disputes = Vec::new();
@@ -1215,17 +1226,17 @@ impl RestoreSessionManager {
 
         // Use spawn_blocking for CPU-intensive decryption work
         tokio::task::spawn_blocking(move || {
-            // This runs in a blocking thread for CPU-intensive decryption
-            tokio::runtime::Handle::current().block_on(async {
-                match process_restore_session_work(pool, master_key).await {
-                    Ok(restore_data) => {
-                        let _ = sender.send(restore_data).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to process restore session work: {}", e);
-                    }
+            // Run the async restore work to completion on this blocking thread
+            let rt = tokio::runtime::Handle::current();
+            match rt.block_on(process_restore_session_work(pool, master_key)) {
+                Ok(restore_data) => {
+                    // No need for an async context just to send; this is a blocking thread.
+                    let _ = sender.blocking_send(restore_data);
                 }
-            })
+                Err(e) => {
+                    tracing::error!("Failed to process restore session work: {}", e);
+                }
+            }
         });
 
         Ok(())

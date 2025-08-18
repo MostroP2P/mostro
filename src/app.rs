@@ -13,7 +13,7 @@ pub mod fiat_sent; // Fiat payment confirmation
 pub mod order; // Order creation and management
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
-pub mod restore_session;
+pub mod restore_session; // Restore session action
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Restore session action

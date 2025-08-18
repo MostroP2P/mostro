@@ -36,7 +36,7 @@ pub static MOSTRO_DB_PASSWORD: OnceLock<SecretString> = OnceLock::new();
 /// - `queue_order_rate`: Holds events related to user rates.
 /// - `queue_restore_session_msg`: Holds messages related to restore session.
 ///
-/// Each queue is wrapped in an `Arc<Mutex<>>` to allow safe concurrent access across threads.
+/// Each queue is wrapped in an `Arc<RwLock<>>` to allow safe concurrent access across tasks.
 #[derive(Debug, Clone, Default)]
 pub struct MessageQueues {
     pub queue_order_msg: Arc<RwLock<Vec<(Message, PublicKey)>>>,

@@ -16,7 +16,7 @@ pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
-pub mod trade_pubkey; // Trade pubkey action // Restore session action
+pub mod trade_pubkey; // Trade pubkey action
 
 // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;

@@ -22,8 +22,7 @@ use uuid::Uuid;
 
 // Constants for excluded statuses used across restore session functions
 const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
-const EXCLUDED_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
-
+const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 

@@ -968,6 +968,280 @@ pub async fn find_order_by_id(
     Ok(order)
 }
 
+/// Find all orders for a user by their master key (for restore session)
+/// This function efficiently handles both encrypted and non-encrypted databases
+pub async fn find_user_orders_by_master_key(
+    pool: &SqlitePool,
+    master_key: &str,
+) -> Result<Vec<RestoredOrdersInfo>, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    // Check if database is encrypted
+    if MOSTRO_DB_PASSWORD.get().is_some() {
+        // For encrypted databases, we need to fetch and decrypt
+        // But we can optimize by filtering out completed/success orders first
+        let active_orders = sqlx::query_as::<_, Order>(
+            r#"
+            SELECT * FROM orders 
+            WHERE status NOT IN ('expired', 'success', 'canceled', 'dispute','canceledbyadmin', 'completedbyadmin', 'settledbyadmin', 'cooperativelycanceled')
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Filter orders that match the master key
+        let mut matching_orders = Vec::new();
+        for order in active_orders {
+            // Check master_buyer_pubkey
+            if let Some(encrypted_buyer_key) = &order.master_buyer_pubkey {
+                if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
+                    encrypted_buyer_key.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                ) {
+                    if decrypted_key == master_key {
+                        matching_orders.push(RestoredOrdersInfo {
+                            order_id: order.id,
+                            trade_index: order.trade_index_buyer.unwrap_or(0),
+                            status: order.status,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Check master_seller_pubkey
+            if let Some(encrypted_seller_key) = &order.master_seller_pubkey {
+                if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
+                    encrypted_seller_key.to_string(),
+                    MOSTRO_DB_PASSWORD.get(),
+                ) {
+                    if decrypted_key == master_key {
+                        matching_orders.push(RestoredOrdersInfo {
+                            order_id: order.id,
+                            trade_index: order.trade_index_seller.unwrap_or(0),
+                            status: order.status,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(matching_orders)
+    } else {
+        // For non-encrypted databases, use direct SQL queries
+        let orders = sqlx::query_as::<_, RestoredOrdersInfo>(
+            r#"
+            SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
+            WHERE (master_buyer_pubkey = ?)
+            AND status NOT IN ('expired', 'success', 'canceled', 'dispute','canceledbyadmin', 'completedbyadmin', 'settledbyadmin', 'cooperativelycanceled')
+            UNION ALL
+            SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
+            WHERE (master_seller_pubkey = ?)
+            AND status NOT IN ('expired', 'success', 'canceled', 'dispute','canceledbyadmin', 'completedbyadmin', 'settledbyadmin', 'cooperativelycanceled')
+            "#,
+        )
+        .bind(master_key)
+        .bind(master_key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        Ok(orders)
+    }
+}
+
+/// Find all disputes for a user by their master key (for restore session)
+pub async fn find_user_disputes_by_master_key(
+    pool: &SqlitePool,
+    master_key: &str,
+) -> Result<Vec<RestoredDisputesInfo>, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    // Check if database is encrypted
+    if MOSTRO_DB_PASSWORD.get().is_some() {
+        // For encrypted databases, we need to check each dispute's associated order
+        let mut matching_disputes = Vec::new();
+
+        // First get all disputes
+        let all_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(
+            r#"
+            SELECT * FROM disputes 
+            WHERE status == 'initiated' OR status == 'in-progress'
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        for dispute in all_disputes {
+            // Get the associated order to check master keys
+            if let Ok(order) = find_order_by_id(pool, dispute.order_id, "").await {
+                // Check if the user is involved in this order
+                let is_involved =
+                    if let Some(encrypted_buyer_key) = &order.master_buyer_pubkey {
+                        if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
+                            encrypted_buyer_key.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                        ) {
+                            decrypted_key == master_key
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    } || if let Some(encrypted_seller_key) = &order.master_seller_pubkey {
+                        if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
+                            encrypted_seller_key.to_string(),
+                            MOSTRO_DB_PASSWORD.get(),
+                        ) {
+                            decrypted_key == master_key
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                if is_involved {
+                    matching_disputes.push(RestoredDisputesInfo {
+                        dispute_id: dispute.dispute_id,
+                        order_id: dispute.order_id,
+                        trade_index: dispute.trade_index,
+                        status: dispute.status,
+                    });
+                }
+            }
+        }
+
+        Ok(matching_disputes)
+    } else {
+        // For non-encrypted databases, we can use a more efficient approach
+        // by joining with orders table
+        let disputes = sqlx::query_as::<_, Dispute>(
+            r#"
+            SELECT d.* FROM disputes d
+            JOIN orders o ON d.order_id = o.id
+            WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
+            AND (d.status == 'initiated' OR d.status == 'in-progress')
+            "#,
+        )
+        .bind(master_key)
+        .bind(master_key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Convert Dispute objects to RestoredDisputesInfo
+        let mut restore_disputes = Vec::new();
+        for dispute in disputes {
+            // Get the associated order to get the trade index
+            let trade_index = if let Ok(order) = find_order_by_id(pool, dispute.order_id, "").await
+            {
+                // Use buyer trade index as default, fallback to seller if buyer is None
+                order
+                    .trade_index_buyer
+                    .unwrap_or_else(|| order.trade_index_seller.unwrap_or(0))
+            } else {
+                0 // Default if order not found
+            };
+
+            restore_disputes.push(RestoredDisputesInfo {
+                dispute_id: dispute.id,
+                order_id: dispute.order_id,
+                trade_index,
+                status: dispute.status,
+            });
+        }
+
+        Ok(restore_disputes)
+    }
+}
+
+/// The actual work function that does the heavy decryption
+async fn process_restore_session_work(
+    pool: SqlitePool,
+    master_key: String,
+) -> Result<RestoreSessionInfo, MostroError> {
+    // Find all active orders for this user
+    let restore_orders = find_user_orders_by_master_key(&pool, &master_key).await?;
+    // Find all active disputes for this user
+    let restore_disputes = find_user_disputes_by_master_key(&pool, &master_key).await?;
+
+    tracing::info!(
+        "Background restore session completed for {}: {} orders, {} disputes",
+        master_key,
+        restore_orders.len(),
+        restore_disputes.len()
+    );
+
+    Ok(RestoreSessionInfo {
+        restore_orders,
+        restore_disputes,
+    })
+}
+
+/// Background task manager for restore sessions
+pub struct RestoreSessionManager {
+    sender: tokio::sync::mpsc::Sender<RestoreSessionInfo>,
+    receiver: tokio::sync::mpsc::Receiver<RestoreSessionInfo>,
+}
+
+impl Default for RestoreSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RestoreSessionManager {
+    pub fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+        Self { sender, receiver }
+    }
+
+    /// Start a restore session background task
+    pub async fn start_restore_session(
+        &self,
+        pool: SqlitePool,
+        master_key: String,
+    ) -> Result<(), MostroError> {
+        let sender = self.sender.clone();
+
+        // Use spawn_blocking for CPU-intensive decryption work
+        tokio::task::spawn_blocking(move || {
+            // This runs in a blocking thread for CPU-intensive decryption
+            tokio::runtime::Handle::current().block_on(async {
+                match process_restore_session_work(pool, master_key).await {
+                    Ok(restore_data) => {
+                        let _ = sender.send(restore_data).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to process restore session work: {}", e);
+                    }
+                }
+            })
+        });
+
+        Ok(())
+    }
+
+    /// Check for completed restore session results
+    pub async fn check_results(&mut self) -> Option<RestoreSessionInfo> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// Wait for the next restore session result
+    pub async fn wait_for_result(&mut self) -> Option<RestoreSessionInfo> {
+        self.receiver.recv().await
+    }
+}
+
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {

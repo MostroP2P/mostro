@@ -609,7 +609,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     // So we increase the limits for those events
     limits.messages.max_size = Some(6_000);
     limits.events.max_size = Some(6_500);
-    let opts = Options::new().relay_limits(limits);
+    let opts = ClientOptions::new().relay_limits(limits);
 
     // Create new client
     let client = ClientBuilder::default().opts(opts).build();
@@ -908,6 +908,16 @@ pub async fn enqueue_cant_do_msg(
     let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(Some(reason))));
     MESSAGE_QUEUES
         .queue_order_cantdo
+        .write()
+        .await
+        .push((message, destination_key));
+}
+
+pub async fn enqueue_restore_session_msg(payload: Option<Payload>, destination_key: PublicKey) {
+    // Send message to event creator
+    let message = Message::new_restore(payload);
+    MESSAGE_QUEUES
+        .queue_restore_session_msg
         .write()
         .await
         .push((message, destination_key));

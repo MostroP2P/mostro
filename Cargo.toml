@@ -64,7 +64,7 @@ uuid = { version = "1.17.0", features = [
   "serde",
 ] }
 reqwest = { version = "0.12.23", features = ["json"] }
-mostro-core = { version = "0.6.46", features = ["sqlx"] }
+mostro-core = { version = "0.6.47", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 clap = { version = "4.5.45", features = ["derive"] }
@@ -89,6 +89,3 @@ bech32 = "0.11.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14.1"
-
-[patch.crates-io]
-mostro-core = { path = "../mostro-core" }

@@ -983,11 +983,15 @@ pub async fn find_user_orders_by_master_key(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+        tracing::info!("Total orders possibly matching: {}", active_orders.len());
         // Filter orders that match the master key
         let mut matching_orders = Vec::new();
+        let total_time = Instant::now();
+
         for order in active_orders {
             // Check master_buyer_pubkey
             // Decrypt both keys upfront
+            let timer = Instant::now();
             let decrypted_master_seller_key = order.master_seller_pubkey.as_ref().and_then(|enc| {
                 CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
             });
@@ -1008,6 +1012,8 @@ pub async fn find_user_orders_by_master_key(
                     status: order.status,
                 });
             }
+            tracing::info!("Time taken to process order: {:?}", timer.elapsed());
+            tracing::info!("Total time taken: {:?}", total_time.elapsed());
         }
 
         Ok(matching_orders)
@@ -1074,9 +1080,15 @@ pub async fn find_user_disputes_by_master_key(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+        tracing::info!(
+            "Total disputes possibly matching: {}",
+            dispute_order_rows.len()
+        );
+        let total_time = Instant::now();
         // Process all rows in memory (no more DB calls!)
         for dispute in dispute_order_rows {
             // Decrypt both keys upfront
+            let timer = Instant::now();
             let decrypted_master_seller_key =
                 dispute.master_seller_pubkey.as_ref().and_then(|enc| {
                     CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
@@ -1102,6 +1114,8 @@ pub async fn find_user_disputes_by_master_key(
                     status: dispute.dispute_status,
                 });
             }
+            tracing::info!("Time taken to process dispute: {:?}", timer.elapsed());
+            tracing::info!("Total time taken: {:?}", total_time.elapsed());
         }
         Ok(matching_disputes)
     } else {

@@ -952,27 +952,6 @@ pub async fn is_assigned_solver(
     Ok(result)
 }
 
-pub async fn find_order_by_id(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    user_pubkey: &str,
-) -> Result<Order, MostroError> {
-    let order = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE id = ?1 AND (buyer_pubkey = ?2 OR seller_pubkey = ?2)
-        "#,
-    )
-    .bind(order_id)
-    .bind(user_pubkey)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    Ok(order)
-}
-
 /// Find all orders for a user by their master key (for restore session)
 /// This function efficiently handles both encrypted and non-encrypted databases
 /// Uses constants for excluded statuses to maintain consistency across queries
@@ -991,11 +970,13 @@ pub async fn find_user_orders_by_master_key(
         // But we can optimize by filtering out completed/success orders first
         let sql_query = format!(
             r#"
-            SELECT * FROM orders 
+            SELECT *
+            FROM orders 
             WHERE status NOT IN ({})
             "#,
             EXCLUDED_ORDER_STATUSES
         );
+
         let active_orders = sqlx::query_as::<_, Order>(&sql_query)
             .fetch_all(pool)
             .await
@@ -1098,29 +1079,33 @@ pub async fn find_user_disputes_by_master_key(
                 .await
                 .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
             {
+                // Decrypt master keys
+                let decrypted_master_seller_key = CryptoUtils::decrypt_data(
+                    order.master_seller_pubkey.unwrap_or_default(),
+                    MOSTRO_DB_PASSWORD.get(),
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                let decrypted_master_buyer_key = CryptoUtils::decrypt_data(
+                    order.master_buyer_pubkey.unwrap_or_default(),
+                    MOSTRO_DB_PASSWORD.get(),
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
                 // Check if the user is involved in this order
-                let is_involved = {
-                    let check_key = |encrypted_key: &Option<String>| {
-                        encrypted_key
-                            .as_ref()
-                            .and_then(|key| {
-                                CryptoUtils::decrypt_data(key.to_string(), MOSTRO_DB_PASSWORD.get())
-                                    .ok()
-                            })
-                            .map(|decrypted_key| decrypted_key == master_key)
-                            .unwrap_or(false)
-                    };
-
-                    check_key(&order.master_buyer_pubkey) || check_key(&order.master_seller_pubkey)
-                };
-
-                if is_involved {
+                if let Some(involved_key) = match master_key.to_string() {
+                    key if key == decrypted_master_seller_key => order.trade_index_seller,
+                    key if key == decrypted_master_buyer_key => order.trade_index_buyer,
+                    _ => None,
+                } {
                     matching_disputes.push(RestoredDisputesInfo {
                         dispute_id: dispute.id,
                         order_id: dispute.order_id,
-                        trade_index: order.trade_index_buyer.unwrap_or(0),
+                        trade_index: involved_key,
                         status: dispute.status,
                     });
+                } else {
+                    tracing::info!("No trade index found for dispute: {}", dispute.id);
+                    continue;
                 }
             }
         }
@@ -1134,7 +1119,7 @@ pub async fn find_user_disputes_by_master_key(
             SELECT d.* FROM disputes d
             JOIN orders o ON d.order_id = o.id
             WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
-            AND (d.status NOT IN ({}))
+            AND (d.status IN ({}))
             "#,
             ACTIVE_DISPUTE_STATUSES
         );
@@ -1149,7 +1134,9 @@ pub async fn find_user_disputes_by_master_key(
         let mut restore_disputes = Vec::new();
         for dispute in disputes {
             // Get the associated order to get the trade index
-            let trade_index = if let Ok(order) = find_order_by_id(pool, dispute.order_id, "").await
+            let trade_index = if let Some(order) = Order::by_id(pool, dispute.order_id)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
             {
                 // Use buyer trade index as default, fallback to seller if buyer is None
                 order
@@ -1182,8 +1169,7 @@ async fn process_restore_session_work(
     let restore_disputes = find_user_disputes_by_master_key(&pool, &master_key).await?;
 
     tracing::info!(
-        "Background restore session completed for {}: {} orders, {} disputes",
-        master_key,
+        "Background restore session completed with {} orders, {} disputes",
         restore_orders.len(),
         restore_disputes.len()
     );

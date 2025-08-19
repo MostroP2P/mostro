@@ -14,14 +14,13 @@ use secrecy::{ExposeSecret, SecretString};
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
-use sqlx_crud::Crud;
 use std::fs::{set_permissions, Permissions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// Constants for excluded statuses used across restore session functions
+// Constants for status filtering used across restore session functions
 const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
 const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 
@@ -970,14 +969,16 @@ pub async fn find_user_orders_by_master_key(
         // But we can optimize by filtering out completed/success orders first
         let sql_query = format!(
             r#"
-            SELECT *
+            SELECT id, status, master_buyer_pubkey, master_seller_pubkey, 
+                trade_index_buyer, trade_index_seller
             FROM orders 
             WHERE status NOT IN ({})
+              AND (master_buyer_pubkey IS NOT NULL OR master_seller_pubkey IS NOT NULL)
             "#,
             EXCLUDED_ORDER_STATUSES
         );
 
-        let active_orders = sqlx::query_as::<_, Order>(&sql_query)
+        let active_orders = sqlx::query_as::<_, RestoredOrderHelper>(&sql_query)
             .fetch_all(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -986,36 +987,28 @@ pub async fn find_user_orders_by_master_key(
         let mut matching_orders = Vec::new();
         for order in active_orders {
             // Check master_buyer_pubkey
-            if let Some(encrypted_buyer_key) = &order.master_buyer_pubkey {
-                if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
-                    encrypted_buyer_key.to_string(),
-                    MOSTRO_DB_PASSWORD.get(),
-                ) {
-                    if decrypted_key == master_key {
-                        matching_orders.push(RestoredOrdersInfo {
-                            order_id: order.id,
-                            trade_index: order.trade_index_buyer.unwrap_or(0),
-                            status: order.status,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            // Check master_seller_pubkey
-            if let Some(encrypted_seller_key) = &order.master_seller_pubkey {
-                if let Ok(decrypted_key) = CryptoUtils::decrypt_data(
-                    encrypted_seller_key.to_string(),
-                    MOSTRO_DB_PASSWORD.get(),
-                ) {
-                    if decrypted_key == master_key {
-                        matching_orders.push(RestoredOrdersInfo {
-                            order_id: order.id,
-                            trade_index: order.trade_index_seller.unwrap_or(0),
-                            status: order.status,
-                        });
-                    }
-                }
+            // Decrypt both keys upfront
+            let decrypted_master_seller_key = order.master_seller_pubkey.as_ref().and_then(|enc| {
+                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+            });
+            let decrypted_master_buyer_key = order.master_buyer_pubkey.as_ref().and_then(|enc| {
+                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+            });
+            let involved_key = if decrypted_master_seller_key.as_deref() == Some(master_key) {
+                order.trade_index_seller
+            } else if decrypted_master_buyer_key.as_deref() == Some(master_key) {
+                order.trade_index_buyer
+            } else {
+                None
+            };
+            if let Some(involved_key) = involved_key {
+                matching_orders.push(RestoredOrdersInfo {
+                    order_id: order.id,
+                    trade_index: involved_key,
+                    status: order.status,
+                });
+            } else {
+                tracing::info!("No trade index found for order: {}", order.id);
             }
         }
 
@@ -1060,53 +1053,58 @@ pub async fn find_user_disputes_by_master_key(
         // For encrypted databases, we need to check each dispute's associated order
         let mut matching_disputes = Vec::new();
 
-        // First get all disputes
+        // Single JOIN query - adapted from your non-encrypted approach
         let sql_query = format!(
             r#"
-            SELECT * FROM disputes 
-            WHERE status IN ({})
+            SELECT 
+                d.id AS dispute_id,
+                d.order_id AS order_id,
+                d.status AS dispute_status,
+                o.master_buyer_pubkey,
+                o.master_seller_pubkey,
+                o.trade_index_buyer,
+                o.trade_index_seller
+            FROM disputes d
+            JOIN orders o ON d.order_id = o.id
+            WHERE d.status IN ({})
             "#,
             ACTIVE_DISPUTE_STATUSES
         );
-        let all_disputes = sqlx::query_as::<_, Dispute>(&sql_query)
+
+        let dispute_order_rows = sqlx::query_as::<_, RestoredDisputeHelper>(&sql_query)
             .fetch_all(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        for dispute in all_disputes {
-            // Get the associated order to check master keys
-            if let Some(order) = Order::by_id(pool, dispute.order_id)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-            {
-                let decrypted_master_seller_key =
-                    order.master_seller_pubkey.as_ref().and_then(|enc| {
-                        CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-                    });
-                let decrypted_master_buyer_key =
-                    order.master_buyer_pubkey.as_ref().and_then(|enc| {
-                        CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-                    });
+        // Process all rows in memory (no more DB calls!)
+        for dispute in dispute_order_rows {
+            // Decrypt both keys upfront
+            let decrypted_master_seller_key =
+                dispute.master_seller_pubkey.as_ref().and_then(|enc| {
+                    CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+                });
+            let decrypted_master_buyer_key = dispute.master_buyer_pubkey.as_ref().and_then(|enc| {
+                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+            });
 
-                // Check if the user is involved in this order
-                let involved_key = if decrypted_master_seller_key == Some(master_key.to_string()) {
-                    order.trade_index_seller
-                } else if decrypted_master_buyer_key == Some(master_key.to_string()) {
-                    order.trade_index_buyer
-                } else {
-                    None
-                };
-                if let Some(involved_key) = involved_key {
-                    matching_disputes.push(RestoredDisputesInfo {
-                        dispute_id: dispute.id,
-                        order_id: dispute.order_id,
-                        trade_index: involved_key,
-                        status: dispute.status,
-                    });
-                } else {
-                    tracing::info!("No trade index found for dispute: {}", dispute.id);
-                    continue;
-                }
+            // Check if user is involved and get trade_index (same logic as before)
+            let involved_key = if decrypted_master_seller_key.as_deref() == Some(master_key) {
+                dispute.trade_index_seller
+            } else if decrypted_master_buyer_key.as_deref() == Some(master_key) {
+                dispute.trade_index_buyer
+            } else {
+                None
+            };
+
+            if let Some(involved_key) = involved_key {
+                matching_disputes.push(RestoredDisputesInfo {
+                    dispute_id: dispute.dispute_id,
+                    order_id: dispute.order_id,
+                    trade_index: involved_key,
+                    status: dispute.dispute_status,
+                });
+            } else {
+                tracing::info!("No trade index found for dispute: {}", dispute.dispute_id);
             }
         }
         Ok(matching_disputes)

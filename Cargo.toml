@@ -89,3 +89,6 @@ bech32 = "0.11.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14.1"
+
+[patch.crates-io]
+mostro-core = { path = "../mostro-core" }

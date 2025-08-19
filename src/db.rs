@@ -1116,43 +1116,34 @@ pub async fn find_user_disputes_by_master_key(
         // by joining with orders table
         let sql_query = format!(
             r#"
-            SELECT d.* FROM disputes d
+            SELECT 
+                d.id AS dispute_id,
+                d.order_id AS order_id,
+                COALESCE(
+                    CASE 
+                        WHEN o.master_buyer_pubkey = ? THEN o.trade_index_buyer
+                        WHEN o.master_seller_pubkey = ? THEN o.trade_index_seller
+                        ELSE 0
+                    END, 0
+                ) AS trade_index,
+                d.status AS status
+            FROM disputes d
             JOIN orders o ON d.order_id = o.id
             WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
-            AND (d.status IN ({}))
+                AND d.status IN ({})
             "#,
             ACTIVE_DISPUTE_STATUSES
         );
-        let disputes = sqlx::query_as::<_, Dispute>(&sql_query)
+        let restore_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(&sql_query)
+            //CASE
+            .bind(master_key)
+            .bind(master_key)
+            //WHERE
             .bind(master_key)
             .bind(master_key)
             .fetch_all(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        // Convert Dispute objects to RestoredDisputesInfo
-        let mut restore_disputes = Vec::new();
-        for dispute in disputes {
-            // Get the associated order to get the trade index
-            let trade_index = if let Some(order) = Order::by_id(pool, dispute.order_id)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-            {
-                // Use buyer trade index as default, fallback to seller if buyer is None
-                order
-                    .trade_index_buyer
-                    .unwrap_or_else(|| order.trade_index_seller.unwrap_or(0))
-            } else {
-                0 // Default if order not found
-            };
-
-            restore_disputes.push(RestoredDisputesInfo {
-                dispute_id: dispute.id,
-                order_id: dispute.order_id,
-                trade_index,
-                status: dispute.status,
-            });
-        }
 
         Ok(restore_disputes)
     }

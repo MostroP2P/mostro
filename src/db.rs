@@ -1007,8 +1007,6 @@ pub async fn find_user_orders_by_master_key(
                     trade_index: involved_key,
                     status: order.status,
                 });
-            } else {
-                tracing::info!("No trade index found for order: {}", order.id);
             }
         }
 
@@ -1103,8 +1101,6 @@ pub async fn find_user_disputes_by_master_key(
                     trade_index: involved_key,
                     status: dispute.dispute_status,
                 });
-            } else {
-                tracing::info!("No trade index found for dispute: {}", dispute.dispute_id);
             }
         }
         Ok(matching_disputes)

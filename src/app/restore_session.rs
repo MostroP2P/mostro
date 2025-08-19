@@ -44,7 +44,7 @@ pub async fn restore_session_action(
 /// Handle restore session results in the background
 async fn handle_restore_session_results(mut manager: RestoreSessionManager, master_key: String) {
     // Wait for the result with a timeout
-    let timeout = tokio::time::Duration::from_secs(60); // 60 second timeout
+    let timeout = tokio::time::Duration::from_secs(60 * 10); // 10 minute timeout
 
     match tokio::time::timeout(timeout, manager.wait_for_result()).await {
         Ok(Some(result)) => {
@@ -63,7 +63,7 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, mast
             tracing::error!("Restore session result channel closed unexpectedly");
         }
         Err(_) => {
-            tracing::error!("Restore session timed out after 60 seconds");
+            tracing::error!("Restore session timed out after 10 minutes");
             // Send timeout message to user
             if let Err(e) = send_restore_session_timeout(&master_key).await {
                 tracing::error!("Failed to send timeout message: {}", e);

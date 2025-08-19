@@ -1200,7 +1200,12 @@ impl RestoreSessionManager {
             match handle.block_on(process_restore_session_work(pool, master_key)) {
                 Ok(restore_data) => {
                     // No need for an async context just to send; this is a blocking thread.
-                    let _ = sender.blocking_send(restore_data);
+                    if let Err(e) = sender.blocking_send(restore_data) {
+                        tracing::warn!(
+                            "RestoreSessionManager: receiver dropped before sending result: {}",
+                            e
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to process restore session work: {}", e);

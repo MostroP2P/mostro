@@ -39,6 +39,8 @@ async fn job_flush_messages_queue() {
     let order_msg_list = MESSAGE_QUEUES.queue_order_msg.clone();
     // Clone for closure owning with Arc
     let cantdo_msg_list = MESSAGE_QUEUES.queue_order_cantdo.clone();
+    // Clone for closure owning with Arc
+    let restore_session_msg_list = MESSAGE_QUEUES.queue_restore_session_msg.clone();
     let sender_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
@@ -75,6 +77,7 @@ async fn job_flush_messages_queue() {
     tokio::spawn(async move {
         let mut retries_messages = 0;
         let mut retries_cantdo_messages = 0;
+        let mut retries_restore_session_messages = 0;
 
         loop {
             send_messages(
@@ -87,6 +90,12 @@ async fn job_flush_messages_queue() {
                 cantdo_msg_list.clone(),
                 sender_keys.clone(),
                 &mut retries_cantdo_messages,
+            )
+            .await;
+            send_messages(
+                restore_session_msg_list.clone(),
+                sender_keys.clone(),
+                &mut retries_restore_session_messages,
             )
             .await;
 

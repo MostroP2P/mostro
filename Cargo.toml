@@ -33,16 +33,18 @@ sign-tag = true
 allow-branch = ["main"]
 # Git cliff to generate the changelog
 pre-release-hook = [
-  "sh", "-c", "git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}} && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi"
+  "sh",
+  "-c",
+  "git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}} && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi",
 ]
 
 [dependencies]
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
 lightning-invoice = { version = "0.33.1", features = ["std"] }
-nostr-sdk = { version = "0.41.0", features = ["nip59"] }
+nostr-sdk = { version = "0.43.0", features = ["nip59"] }
 serde = { version = "1.0.210" }
-toml = "0.8.22"
+toml = "0.9.5"
 serde_json = "1.0.128"
 sqlx = { version = "0.6.2", features = [
   "runtime-tokio-rustls",
@@ -53,19 +55,19 @@ sqlx = { version = "0.6.2", features = [
   "offline",
 ] }
 sqlx-crud = { version = "0.4.0", features = ["runtime-tokio-rustls"] }
-tokio = { version = "1.40.0", features = ["full"] }
-fedimint-tonic-lnd = "0.2.0"
+tokio = { version = "1.47.1", features = ["full"] }
+fedimint-tonic-lnd = "0.3.0"
 uuid = { version = "1.17.0", features = [
   "v4",
   "fast-rng",
   "macro-diagnostics",
   "serde",
 ] }
-reqwest = { version = "0.12.1", features = ["json"] }
-mostro-core = { version = "0.6.45", features = ["sqlx"] }
+reqwest = { version = "0.12.23", features = ["json"] }
+mostro-core = { version = "0.6.47", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-clap = { version = "4.5.39", features = ["derive"] }
+clap = { version = "4.5.45", features = ["derive"] }
 lnurl-rs = "0.9.0"
 openssl = { version = "0.10.66", features = ["vendored"] }
 once_cell = "1.20.2"
@@ -75,14 +77,15 @@ argon2 = "0.5"
 secrecy = "0.10.0"
 dirs = "6.0.0"
 clearscreen = "4.0.1"
-tonic = "0.13.1"
-prost = "0.13.5"
+tonic = "0.14.1"
+prost = "0.14.1"
+tonic-prost = "0.14.1"
 
 [dev-dependencies]
-tokio = { version = "1.40.0", features = ["full", "test-util", "macros"] }
-axum = "0.7.4"
+tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }
+axum = "0.8.4"
 tower-http = { version = "0.6.6", features = ["cors"] }
 bech32 = "0.11.0"
 
 [build-dependencies]
-tonic-build = "0.13.1"
+tonic-prost-build = "0.14.1"

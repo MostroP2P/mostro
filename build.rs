@@ -1,7 +1,7 @@
 use std::process::Command;
 fn main() {
     // Compile protobuf definitions
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(&["proto/admin.proto"], &["proto"])
         .unwrap_or_else(|e| panic!("Failed to compile protos {:?}", e));

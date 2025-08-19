@@ -1079,24 +1079,24 @@ pub async fn find_user_disputes_by_master_key(
                 .await
                 .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
             {
-                // Decrypt master keys
-                let decrypted_master_seller_key = CryptoUtils::decrypt_data(
-                    order.master_seller_pubkey.unwrap_or_default(),
-                    MOSTRO_DB_PASSWORD.get(),
-                )
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-                let decrypted_master_buyer_key = CryptoUtils::decrypt_data(
-                    order.master_buyer_pubkey.unwrap_or_default(),
-                    MOSTRO_DB_PASSWORD.get(),
-                )
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                let decrypted_master_seller_key =
+                    order.master_seller_pubkey.as_ref().and_then(|enc| {
+                        CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+                    });
+                let decrypted_master_buyer_key =
+                    order.master_buyer_pubkey.as_ref().and_then(|enc| {
+                        CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
+                    });
 
                 // Check if the user is involved in this order
-                if let Some(involved_key) = match master_key.to_string() {
-                    key if key == decrypted_master_seller_key => order.trade_index_seller,
-                    key if key == decrypted_master_buyer_key => order.trade_index_buyer,
-                    _ => None,
-                } {
+                let involved_key = if decrypted_master_seller_key == Some(master_key.to_string()) {
+                    order.trade_index_seller
+                } else if decrypted_master_buyer_key == Some(master_key.to_string()) {
+                    order.trade_index_buyer
+                } else {
+                    None
+                };
+                if let Some(involved_key) = involved_key {
                     matching_disputes.push(RestoredDisputesInfo {
                         dispute_id: dispute.id,
                         order_id: dispute.order_id,
@@ -1109,7 +1109,6 @@ pub async fn find_user_disputes_by_master_key(
                 }
             }
         }
-
         Ok(matching_disputes)
     } else {
         // For non-encrypted databases, we can use a more efficient approach

@@ -75,6 +75,7 @@ mod tests {
                                             min_payment_amount = 100
                                             expiration_hours = 24
                                             max_expiration_days = 15
+                                            nip40_expiration_days = 15
                                             expiration_seconds = 900
                                             user_rates_sent_interval_seconds = 3600
                                             publish_relays_interval = 60
@@ -161,6 +162,7 @@ mod tests {
         assert_eq!(mostro_settings.mostro.min_payment_amount, 100);
         assert_eq!(mostro_settings.mostro.expiration_hours, 24);
         assert_eq!(mostro_settings.mostro.max_expiration_days, 15);
+        assert_eq!(mostro_settings.mostro.nip40_expiration_days, 15);
         assert_eq!(mostro_settings.mostro.expiration_seconds, 900);
         assert_eq!(
             mostro_settings.mostro.user_rates_sent_interval_seconds,

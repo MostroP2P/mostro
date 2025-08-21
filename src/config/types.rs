@@ -93,6 +93,8 @@ pub struct MostroSettings {
     pub user_rates_sent_interval_seconds: u32,
     /// Maximum expiration days
     pub max_expiration_days: u32,
+    /// Nip40 expiration days
+    pub nip40_expiration_days: u32,
     /// Publish relays interval
     pub publish_relays_interval: u32,
     /// Proof of work required

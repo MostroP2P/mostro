@@ -196,6 +196,8 @@ pub fn order_to_tags(
     let (create_event, status) = create_status_tags(order)?;
     // Create mostro: scheme link in case of pending order creation
     let mostro_link = create_source_tag(order, &Settings::get_nostr().relays)?;
+    // Get mostro settings
+    let mostro_settings = Settings::get_mostro();
 
     // Send just in case the order is pending/in-progress/success/canceled
     if create_event {
@@ -242,7 +244,9 @@ pub fn order_to_tags(
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("expiration")),
-                vec![(order.expires_at + Duration::hours(24).num_seconds()).to_string()],
+                vec![(order.expires_at
+                    + Duration::days(mostro_settings.nip40_expiration_days as i64).num_seconds())
+                .to_string()],
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),

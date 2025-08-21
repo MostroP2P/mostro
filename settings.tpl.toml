@@ -35,6 +35,8 @@ min_payment_amount = 100
 expiration_hours = 24
 # Max expiration days for an order
 max_expiration_days = 15
+# Nip40 expiration days
+nip40_expiration_days = 15
 # Expiration of pending orders
 expiration_seconds = 900
 # User rate events scheduled time interval

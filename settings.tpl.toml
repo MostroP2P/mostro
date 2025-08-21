@@ -35,7 +35,9 @@ min_payment_amount = 100
 expiration_hours = 24
 # Max expiration days for an order
 max_expiration_days = 15
-# Nip40 expiration days
+# NIP-40 expiration grace in days (added to `order.expires_at` when generating the expiration tag).
+# This controls how long the event remains on relays after the order itself expires.
+# Set to 0 to disable any extra grace period.
 nip40_expiration_days = 15
 # Expiration of pending orders
 expiration_seconds = 900

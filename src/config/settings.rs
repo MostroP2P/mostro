@@ -2,21 +2,8 @@ use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
-use mostro_core::prelude::*;
-use nostr_sdk::prelude::*;
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
-
-/// Message queues for Mostro:
-/// - `queue_order_msg`: Holds messages related to orders.
-/// - `queue_order_cantdo`: Holds messages that cannot be processed.
-/// - `queue_order_rate`: Holds events related to user rates.
-#[derive(Debug, Clone, Default)]
-pub struct MessageQueues {
-    pub queue_order_msg: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_cantdo: Arc<Mutex<Vec<(Message, PublicKey)>>>,
-    pub queue_order_rate: Arc<Mutex<Vec<Event>>>,
-}
+use std::sync::Arc;
 
 // Mostro configuration settings struct
 #[derive(Debug, Deserialize, Clone)]

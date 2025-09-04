@@ -68,9 +68,10 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
 
 /// Gets information about the counterparty in a dispute.
 ///
-/// Returns a tuple containing:
-/// - The counterparty's public key as a String
-/// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
+/// Returns:
+/// - Ok(true) if the dispute was initiated by the buyer
+/// - Ok(false) if initiated by the seller
+/// - Err(CantDoReason::InvalidPubkey) if the sender matches neither party
 fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<bool, CantDoReason> {
     match sender {
         s if s == buyer => Ok(true),   // buyer is initiator
@@ -101,21 +102,15 @@ async fn notify_dispute_to_users(
     dispute: &Dispute,
     msg: &Message,
     order_id: Uuid,
-    counterpart_token: Option<u16>,
-    initiator_token: Option<u16>,
     counterpart_pubkey: PublicKey,
     initiator_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
-    // Message to discounterpart
+    // Message to counterpart
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByPeer,
-        Some(Payload::Dispute(
-            dispute.clone().id,
-            counterpart_token,
-            None,
-        )),
+        Some(Payload::Dispute(dispute.clone().id, None)),
         counterpart_pubkey,
         None,
     )
@@ -126,7 +121,7 @@ async fn notify_dispute_to_users(
         msg.get_inner_message_kind().request_id,
         Some(order_id),
         Action::DisputeInitiatedByYou,
-        Some(Payload::Dispute(dispute.clone().id, initiator_token, None)),
+        Some(Payload::Dispute(dispute.clone().id, None)),
         initiator_pubkey,
         None,
     )
@@ -141,9 +136,8 @@ async fn notify_dispute_to_users(
 /// 1. Validates the order and dispute status
 /// 2. Updates the order status
 /// 3. Creates a new dispute record
-/// 4. Generates security tokens for both parties
-/// 5. Notifies both parties
-/// 6. Publishes the dispute event to the network
+/// 4. Notifies both parties
+/// 5. Publishes the dispute event to the network
 pub async fn dispute_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -175,8 +169,8 @@ pub async fn dispute_action(
         Err(cause) => return Err(MostroCantDo(cause)),
     };
 
-    // Create new dispute record and generate security tokens
-    let mut dispute = Dispute::new(order_id, order.status.clone());
+    // Create new dispute record
+    let dispute = Dispute::new(order_id, order.status.clone());
 
     // Setup dispute
     if order.setup_dispute(is_buyer_dispute).is_ok() {
@@ -186,9 +180,6 @@ pub async fn dispute_action(
             .await
             .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     }
-
-    // Create tokens
-    let (initiator_token, counterpart_token) = dispute.create_tokens(is_buyer_dispute);
 
     // Save dispute to database
     let dispute = dispute
@@ -221,8 +212,6 @@ pub async fn dispute_action(
         &dispute,
         &msg,
         order_id,
-        counterpart_token,
-        initiator_token,
         *counterpart_pubkey,
         *initiator_pubkey,
     )

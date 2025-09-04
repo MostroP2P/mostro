@@ -63,8 +63,8 @@ uuid = { version = "1.17.0", features = [
   "macro-diagnostics",
   "serde",
 ] }
-reqwest = { version = "0.12.23", features = ["json"] }
-mostro-core = { version = "0.6.47", features = ["sqlx"] }
+reqwest = { version = "0.12.1", features = ["json"] }
+mostro-core = { version = "0.6.49", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 clap = { version = "4.5.45", features = ["derive"] }

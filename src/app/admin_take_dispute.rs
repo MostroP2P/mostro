@@ -170,7 +170,7 @@ pub async fn admin_take_dispute_action(
         request_id,
         None,
         Action::AdminTookDispute,
-        Some(Payload::Dispute(dispute.id, None, Some(dispute_info))),
+        Some(Payload::Dispute(dispute.id, Some(dispute_info))),
     );
     let message = message
         .as_json()

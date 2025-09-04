@@ -272,6 +272,65 @@ async fn get_user_password() -> Result<(), MostroError> {
     Ok(())
 }
 
+/// Migrates legacy disputes table by removing deprecated buyer_token and seller_token columns if present.
+///
+/// This function checks if the deprecated token columns exist in the disputes table
+/// and removes them to maintain compatibility with the updated mostro-core.
+/// The function handles both cases where columns exist (legacy databases) and don't exist (newer databases).
+async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroError> {
+    // Check if buyer_token column exists
+    let buyer_token_exists = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT COUNT(*) 
+        FROM pragma_table_info('disputes') 
+        WHERE name = 'buyer_token'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        > 0;
+
+    // Check if seller_token column exists
+    let seller_token_exists = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT COUNT(*) 
+        FROM pragma_table_info('disputes') 
+        WHERE name = 'seller_token'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        > 0;
+
+    // Remove buyer_token column if it exists
+    if buyer_token_exists {
+        tracing::info!("Removing deprecated buyer_token column from disputes table");
+        sqlx::query("ALTER TABLE disputes DROP COLUMN buyer_token")
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        tracing::info!("Successfully removed buyer_token column");
+    }
+
+    // Remove seller_token column if it exists
+    if seller_token_exists {
+        tracing::info!("Removing deprecated seller_token column from disputes table");
+        sqlx::query("ALTER TABLE disputes DROP COLUMN seller_token")
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        tracing::info!("Successfully removed seller_token column");
+    }
+
+    if !buyer_token_exists && !seller_token_exists {
+        tracing::debug!("No deprecated token columns found in disputes table - migration not needed");
+    }
+
+    Ok(())
+}
+
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
@@ -298,6 +357,20 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
                             "Successfully created database file at {}",
                             db_path.display(),
                         );
+                        
+                        // Run legacy column migration
+                        if let Err(e) = migrate_remove_token_columns(&pool).await {
+                            tracing::error!("Failed to migrate token columns: {}", e);
+                            if let Err(cleanup_err) = std::fs::remove_file(db_path) {
+                                tracing::error!(
+                                    error = %cleanup_err,
+                                    path = %db_path.display(),
+                                    "Failed to clean up database file"
+                                );
+                            }
+                            return Err(e);
+                        }
+                        
                         // Get user password
                         match get_user_password().await {
                             Ok(_) => {}
@@ -375,6 +448,12 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
                     }
                 }
             }
+        }
+
+        // Run legacy column migration for existing databases
+        if let Err(e) = migrate_remove_token_columns(&conn).await {
+            tracing::error!("Failed to migrate token columns on existing database: {}", e);
+            return Err(e);
         }
 
         conn

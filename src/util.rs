@@ -459,8 +459,10 @@ pub async fn send_dm(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
-        "Sending DM, Event ID: {} with payload: {:#?}",
-        event.id, payload
+        "Sending DM, Event ID: {} to {} with payload: {:#?}",
+        event.id,
+        receiver_pubkey.to_hex(),
+        payload
     );
 
     if let Ok(client) = get_nostr_client() {
@@ -794,8 +796,6 @@ pub async fn set_waiting_invoice_status(
         order.fiat_amount,
         order.payment_method.clone(),
         order.premium,
-        None,
-        None,
         None,
         None,
         None,

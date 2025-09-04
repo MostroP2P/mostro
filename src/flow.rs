@@ -48,8 +48,6 @@ pub async fn hold_invoice_paid(
         None,
         Some(order.created_at),
         Some(order.expires_at),
-        None,
-        None,
     );
     let status;
 
@@ -257,8 +255,6 @@ mod tests {
                 None,
                 Some(created_at),
                 Some(expires_at),
-                None,
-                None,
             );
 
             // Verify the order data is constructed correctly
@@ -370,8 +366,6 @@ mod tests {
                 None,
                 Some(Timestamp::now().as_u64() as i64),
                 Some(Timestamp::now().as_u64() as i64 + 3600),
-                None,
-                None,
             );
 
             // Test payload with order data

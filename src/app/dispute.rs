@@ -68,9 +68,10 @@ async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), 
 
 /// Gets information about the counterparty in a dispute.
 ///
-/// Returns a tuple containing:
-/// - The counterparty's public key as a String
-/// - A boolean indicating if the dispute was initiated by the buyer (true) or seller (false)
+/// Returns:
+/// - Ok(true) if the dispute was initiated by the buyer
+/// - Ok(false) if initiated by the seller
+/// - Err(CantDoReason::InvalidPubkey) if the sender matches neither party
 fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<bool, CantDoReason> {
     match sender {
         s if s == buyer => Ok(true),   // buyer is initiator
@@ -104,7 +105,7 @@ async fn notify_dispute_to_users(
     counterpart_pubkey: PublicKey,
     initiator_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
-    // Message to discounterpart
+    // Message to counterpart
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order_id),

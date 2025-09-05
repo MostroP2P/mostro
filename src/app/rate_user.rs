@@ -61,7 +61,7 @@ pub fn prepare_variables_for_vote(
 /// # Process Flow
 ///
 /// 1. Retrieves the order information from the database
-/// 2. Verifies the order status is "Success"
+/// 2. Verifies the order status is "Success", or "SettledHoldInvoice" for seller-initiated ratings
 /// 3. Determines if the rating is from buyer or seller
 /// 4. Checks if the user has already rated their counterpart
 /// 5. Validates privacy mode settings
@@ -78,14 +78,16 @@ pub async fn update_user_reputation_action(
     // Get order
     let order = get_order(&msg, pool).await?;
 
-    // Check if order is success
-    if order.check_status(Status::Success).is_err() {
-        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
-    }
-
     // Prepare variables for vote
     let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
         prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
+
+    // Check if order is success, but sellers can rate in status settled-hold-invoice
+    if !(order.check_status(Status::Success).is_ok()
+        || (order.check_status(Status::SettledHoldInvoice).is_ok() && seller_rating))
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+    }
 
     // Check if the order is not rated by the message sender
     // Check what rate status needs update
@@ -196,4 +198,122 @@ pub async fn update_user_reputation_action(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mostro_core::order::Order;
+    use nostr_sdk::Keys;
+    use uuid::Uuid;
+
+    fn create_test_keys() -> Keys {
+        Keys::generate()
+    }
+
+    fn create_test_order(status: Status, seller_pubkey: PublicKey, buyer_pubkey: PublicKey) -> Order {
+        Order {
+            id: Uuid::new_v4(),
+            status: status.to_string(),
+            seller_pubkey: Some(seller_pubkey.to_string()),
+            buyer_pubkey: Some(buyer_pubkey.to_string()),
+            seller_sent_rate: false,
+            buyer_sent_rate: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_prepare_variables_for_vote_buyer() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::Success, seller_keys.public_key(), buyer_keys.public_key());
+        
+        let result = prepare_variables_for_vote(&buyer_keys.public_key().to_string(), &order);
+        
+        assert!(result.is_ok());
+        let (_, buyer_rating, seller_rating) = result.unwrap();
+        assert!(buyer_rating);
+        assert!(!seller_rating);
+    }
+
+    #[test]
+    fn test_prepare_variables_for_vote_seller() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::Success, seller_keys.public_key(), buyer_keys.public_key());
+        
+        let result = prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order);
+        
+        assert!(result.is_ok());
+        let (_, buyer_rating, seller_rating) = result.unwrap();
+        assert!(!buyer_rating);
+        assert!(seller_rating);
+    }
+
+    #[test]
+    fn test_rating_validation_success_status() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::Success, seller_keys.public_key(), buyer_keys.public_key());
+        
+        // Both buyer and seller should be able to rate in Success status
+        assert!(order.check_status(Status::Success).is_ok());
+        
+        // Test seller rating validation
+        let (_, _, seller_rating) = prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order).unwrap();
+        let can_rate_seller = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && seller_rating);
+        assert!(can_rate_seller);
+        
+        // Test buyer rating validation
+        let (_, buyer_rating, _) = prepare_variables_for_vote(&buyer_keys.public_key().to_string(), &order).unwrap();
+        let can_rate_buyer = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
+        assert!(can_rate_buyer);
+    }
+
+    #[test]
+    fn test_rating_validation_settled_hold_invoice_seller() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::SettledHoldInvoice, seller_keys.public_key(), buyer_keys.public_key());
+        
+        // Seller should be able to rate in SettledHoldInvoice status
+        let (_, _, seller_rating) = prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order).unwrap();
+        let can_rate_seller = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && seller_rating);
+        assert!(can_rate_seller);
+    }
+
+    #[test]
+    fn test_rating_validation_settled_hold_invoice_buyer_denied() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::SettledHoldInvoice, seller_keys.public_key(), buyer_keys.public_key());
+        
+        // Buyer should NOT be able to rate in SettledHoldInvoice status
+        let (_, buyer_rating, _) = prepare_variables_for_vote(&buyer_keys.public_key().to_string(), &order).unwrap();
+        let can_rate_buyer = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
+        assert!(!can_rate_buyer);
+    }
+
+    #[test]
+    fn test_rating_validation_invalid_status() {
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(Status::Pending, seller_keys.public_key(), buyer_keys.public_key());
+        
+        // Neither buyer nor seller should be able to rate in Pending status
+        let (_, buyer_rating, seller_rating) = prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order).unwrap();
+        
+        let can_rate_seller = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && seller_rating);
+        assert!(!can_rate_seller);
+        
+        let can_rate_buyer = order.check_status(Status::Success).is_ok()
+            || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
+        assert!(!can_rate_buyer);
+    }
 }

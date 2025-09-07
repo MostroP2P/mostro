@@ -322,7 +322,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                     ) {
                         Ok((message, signature)) => (message, signature),
                         Err(e) => {
-                            tracing::error!("Failed to parse message, inner message, and signature from rumor content: {}", e);
+                            tracing::warn!("Failed to parse message, inner message, and signature from rumor content: {}", e);
                             continue;
                         }
                     };
@@ -331,7 +331,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                     let message_json = match message.clone().as_json() {
                         Ok(message_json) => message_json,
                         Err(e) => {
-                            tracing::error!("Failed to serialize message: {}", e);
+                            tracing::warn!("Failed to serialize message: {}", e);
                             continue;
                         }
                     };
@@ -358,7 +358,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                     let inner_message = message.get_inner_message_kind();
                     // Check if message is message with trade index
                     if let Err(e) = check_trade_index(&pool, &event, &message).await {
-                        tracing::error!("Error checking trade index: {}", e);
+                        tracing::warn!("Error checking trade index: {}", e);
                         continue;
                     }
 

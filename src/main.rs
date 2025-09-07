@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_wrong_message_should_fail() {
-        let sample_message = r#"{"order":{"version":1,"request_id":1,"action":"take-sell","payload":{"order":{"kind":"sell","status":"pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"SEPA","premium":1,"payment_request":null,"created_at":1640839235}}}}"#;
+        let sample_message = r#"{"order":{"version":1,"request_id":1,"action":"take-sell","payload":{"order":{"kind":"sell","status":"pending","amount":100,"fiat_code":"XXX","fiat_amount":10,"payment_method":"SEPA","premium":1,"buyer_invoice":null,"created_at":1640839235}}}}"#;
         let message = Message::from_json(sample_message).unwrap();
         assert!(!message.verify());
     }

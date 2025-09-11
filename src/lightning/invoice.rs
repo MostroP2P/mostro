@@ -285,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_amount_invoice() {
         init_settings_test();
-        let payment_request = "lnbc1p5tmmdspp5k37c7l45d97axrq0zrazzrhhyfd5mp338urg08txfp03vjx8evpqdq5g9kxy7fqd9h8vmmfvdjscqzzsxqyz5vqsp5tejy26f4wr7d0gcmrc3ndyzg0md6m7kxj3xrnl7rc4e96hhq7nqq9qxpqysgq48ww59a8w5kszspu9jpuv66smgkwjxedj69c6nrry0zwzn46d38x5g022lr95d4np39cfh6pne59vcrpymxwyrnl379cyymer907etqp2497a8".to_string();
+        let payment_request = "lnbcrt1110n1p5vxrz9pp5u6a50wxvtlj4myskjemx40dd37rf62wcrq9z5p8dm6y556yqr7lqdqqcqzzsxqyz5vqsp56j4gadenkvr49jp3uyffphkwyv2ngnzn2ajsz0nlr6qrfgn48xzq9qxpqysgqtgcamzcnfxa4ahls9tk05854snq8djdhv50adjra7r44qm0mr00ycjq7rz8f5rlpyt4t8t8tvkwvncdqcuhw2v4t48j6vxcg9uyc63gqeyn9jc".to_string();
         let is_valid = is_valid_invoice(payment_request, None, None);
         assert_eq!(Ok(()), is_valid.await);
     }

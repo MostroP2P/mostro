@@ -75,6 +75,12 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
+      - name: Generate checksums manifest
+        run: |
+          set -euo pipefail
+          sha256sum mostro-linux/mostrod*  > manifest.txt
+          sha256sum mostro-windows/mostrod* >> manifest.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -84,6 +90,7 @@ jobs:
           files: |
             mostro-linux/mostrod*
             mostro-windows/mostrod*
+            manifest.txt
           draft: false
           prerelease: false
         env:

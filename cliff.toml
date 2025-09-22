@@ -10,20 +10,25 @@ repo = "mostro"
 # See https://keats.github.io/tera/docs/#introduction
 body = """
 ## Verifying the Release
-In order to verify the release, you'll need to have gpg or gpg2 installed on your system. Once you've obtained a copy (and hopefully verified that as well), you'll first need to import the keys that have signed this release if you haven't done so already:
-```bash
-curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
-```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig and manifest.txt are in the current directory) with:
-```bash
-gpg --verify manifest.txt.sig manifest.txt
+Use the published SHA256 checksums to verify your download.
 
-gpg: Firmado el jue 03 ago 2023 15:07:05 -03
-gpg:                usando RSA clave 1E41631D137BA2ADE55344F73852B843679AD6F0
-gpg: Firma correcta de "Francisco Calderón <fjcalderon@gmail.com>" [absoluta]
+1. Download the release artifact and its checksum file (e.g. `SHA256SUMS` or `checksums.txt`) from the release page.
+2. Re-compute the SHA256 of your downloaded file and compare it to the value listed for the same filename in the checksum file.
 
+Linux / macOS:
+```bash
+# macOS (shasum) or Linux (sha256sum)
+shasum -a 256 mostro-vX.Y.Z-<target>.tar.gz
+# or
+sha256sum mostro-vX.Y.Z-<target>.tar.gz
 ```
-That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
+
+Windows (PowerShell):
+```powershell
+Get-FileHash .\mostro-vX.Y.Z-<target>.zip -Algorithm SHA256
+```
+
+Ensure the computed hash matches exactly the one provided in the checksum file for that artifact name.
 
 ## What's Changed{%- if version %} in {{ version }}{%- endif -%}
 {% for group, commits in commits | group_by(attribute="group") %}

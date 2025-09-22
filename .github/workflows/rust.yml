@@ -82,8 +82,8 @@ jobs:
           name: Release ${{ github.ref_name }}
           body: ${{ needs.changelog.outputs.content }}
           files: |
-            mostro-linux/mostrod
-            mostro-windows/mostrod.exe
+            mostro-linux/mostrod*
+            mostro-windows/mostrod*
           draft: false
           prerelease: false
         env:

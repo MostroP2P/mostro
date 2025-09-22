@@ -1,8 +1,9 @@
-name: Release on Tag
+name: Build and Test for all targets
 
 on:
   push:
-    tags: ['v*']          # run only when a tag like v1.2.3 is pushed
+    tags: ['v*.*.*']          # run only when a tag like v1.2.3 is pushed
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,38 +33,84 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF: ${{ github.ref }}
 
-  # Build binaries for multiple platforms
-  build:
-    runs-on: ${{ matrix.os }}
+  # Test the code
+  test:
+    runs-on: ubuntu-latest
     needs: changelog
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+      - name: cargo test
+        run: cargo test --locked
+
+  # Prepare matrix of targets from archs file
+  matrix:
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      targets: ${{ steps.set-matrix.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: set-matrix
+        name: Read targets from archs
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=$(grep -v '^\s*$' archs | jq -R -s -c 'split("\n") | map(select(length>0))')
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  # Build binaries for all targets using cross
+  build:
+    runs-on: ubuntu-latest
+    needs: matrix
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: mostro-linux
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: mostro-windows
+        target: ${{ fromJSON(needs.matrix.outputs.targets) }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Run tests
-        run: cargo test --locked
+      - name: Cache cross binary
+        id: cache-cross
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-${{ runner.os }}-0.2.5
+
+      - name: Install cross ( pinned version for reproducibility )
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo install cross --version 0.2.5
 
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Prepare conventional artifact name
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="artifacts"
+          mkdir -p "$outdir"
+          case "${{ matrix.target }}" in
+            *-pc-windows-*) src="target/${{ matrix.target }}/release/mostrod.exe"; dst="$outdir/mostrod-${{ matrix.target }}.exe";;
+            *)              src="target/${{ matrix.target }}/release/mostrod";     dst="$outdir/mostrod-${{ matrix.target }}";;
+          esac
+          cp "$src" "$dst"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/mostro-cli*
+          name: artifact-${{ matrix.target }}
+          path: artifacts/*
 
   # Create release with all artifacts
   release:
@@ -76,10 +123,15 @@ jobs:
         uses: actions/download-artifact@v4
 
       - name: Generate checksums manifest
+        shell: bash
         run: |
           set -euo pipefail
-          sha256sum mostro-linux/mostrod*  > manifest.txt
-          sha256sum mostro-windows/mostrod* >> manifest.txt
+          shopt -s globstar nullglob
+          # Compute SHA256 for all produced binaries
+          : > manifest.txt
+          for f in $(ls -1 artifact-*/mostrod* | sort); do
+            sha256sum "$f" >> manifest.txt
+          done
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -88,8 +140,7 @@ jobs:
           name: Release ${{ github.ref_name }}
           body: ${{ needs.changelog.outputs.content }}
           files: |
-            mostro-linux/mostrod*
-            mostro-windows/mostrod*
+            artifact-*/mostrod*
             manifest.txt
           draft: false
           prerelease: false

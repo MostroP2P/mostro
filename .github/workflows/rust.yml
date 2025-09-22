@@ -63,10 +63,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Run tests
+      - name: Run tests (once on primary target)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked
 
       - name: Build release
@@ -88,7 +92,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: artifact-${{ matrix.target }}
-          path: artifacts
+          path: artifacts/*
 
   # Create release with all artifacts
   release:
@@ -107,7 +111,7 @@ jobs:
           shopt -s globstar nullglob
           # Compute SHA256 for all produced binaries
           : > manifest.txt
-          for f in artifact-*/mostrod*; do
+          for f in $(ls -1 artifact-*/mostrod* | sort); do
             sha256sum "$f" >> manifest.txt
           done
 

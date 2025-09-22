@@ -1,8 +1,8 @@
-name: Release on Tag
+name: Build and Test for all targets
 
 on:
   push:
-    tags: ['v*']          # run only when a tag like v1.2.3 is pushed
+    tags: ['v*.*.*']          # run only when a tag like v1.2.3 is pushed
 
 env:
   CARGO_TERM_COLOR: always

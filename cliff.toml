@@ -125,6 +125,6 @@ sort_commits = "newest"
 # Enable link parsing for PR references and user mentions
 link_parsers = [
   { pattern = "Merge pull request #([0-9]+)", href = "https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/pull/$1" },
-  { pattern = "#([0-9]+)", href = "https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/pull/$1" },
+  { pattern = "#([0-9]+)", href = "https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/issues/$1" },
   { pattern = "@([a-zA-Z0-9_-]+(?:\\[[^\\]]+\\])?)", href = "https://github.com/$1" },
 ]

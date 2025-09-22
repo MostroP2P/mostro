@@ -1,30 +1,98 @@
-name: Rust
+name: Release on Tag
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+    tags: ['v*']          # run only when a tag like v1.2.3 is pushed
 
 env:
   CARGO_TERM_COLOR: always
-  SQLX_OFFLINE: true
-  MIN_PAYMENT_AMT: 100
-  INVOICE_EXPIRATION_WINDOW: 3600
 
 jobs:
-  tests:
+  # Generate changelog (runs once)
+  changelog:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
+    outputs:
+      content: ${{ steps.changelog.outputs.content }}
     steps:
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@v4
         with:
-          version: 23.x
-          include-pre-releases: false
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-    
-      - uses: actions/checkout@v3
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          config: cliff.toml
+          args: --latest --strip header --output CHANGELOG.md
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF: ${{ github.ref }}
+
+      - name: Commit updated changelog
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore: update changelog for ${{ github.ref_name }}"
+          git push origin HEAD:main
+
+  # Build binaries for multiple platforms
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: changelog
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: mostro-cli-linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: mostro-cli-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/mostro-cli*
+
+  # Create release with all artifacts
+  release:
+    runs-on: ubuntu-latest
+    needs: [changelog, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: ${{ needs.changelog.outputs.content }}
+          files: |
+            mostro-cli-linux/mostrod
+            mostro-cli-windows.exe/mostrod.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

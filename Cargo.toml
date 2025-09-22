@@ -16,6 +16,7 @@ path = "src/main.rs"
 default = []
 startos = []
 
+# cargo release configuration
 [package.metadata.release]
 # (Default: true) Set to false to prevent automatically running `cargo publish`.
 publish = true
@@ -31,12 +32,6 @@ sign-commit = true
 sign-tag = true
 # Use 'allow-branch' if you release from other branches. Check defaults if needed.
 allow-branch = ["main"]
-# Git cliff to generate the changelog
-pre-release-hook = [
-  "sh",
-  "-c",
-  "git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}} && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi",
-]
 
 [dependencies]
 chrono = "0.4.35"

@@ -49,10 +49,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: mostro-cli-linux
+            artifact_name: mostro-linux
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: mostro-cli-windows.exe
+            artifact_name: mostro-windows
     steps:
       - uses: actions/checkout@v4
         with:

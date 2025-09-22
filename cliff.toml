@@ -3,7 +3,7 @@
 
 [remote.github]
 owner = "MostroP2P"
-repo = "mostro-cli"
+repo = "mostro"
 
 [changelog]
 # A Tera template to be rendered for each release in the changelog.

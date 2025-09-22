@@ -32,10 +32,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF: ${{ github.ref }}
 
+  # Test the code
+  test:
+    runs-on: ubuntu-latest
+    needs: changelog
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+      - name: cargo test
+        run: cargo test --locked
+
   # Prepare matrix of targets from archs file
   matrix:
     runs-on: ubuntu-latest
-    needs: changelog
+    needs: test
     outputs:
       targets: ${{ steps.set-matrix.outputs.targets }}
     steps:
@@ -66,12 +79,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Cache cross binary
+        id: cache-cross
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-${{ runner.os }}-0.2.5
 
-      - name: Run tests (once on primary target)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --locked
+      - name: Install cross ( pinned version for reproducibility )
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo install cross --version 0.2.5
 
       - name: Build release
         run: cross build --release --locked --target ${{ matrix.target }}

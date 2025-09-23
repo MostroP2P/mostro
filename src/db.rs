@@ -1151,6 +1151,34 @@ pub async fn is_assigned_solver(
     Ok(result)
 }
 
+/// Check if a dispute has been taken over by admin (Mostro daemon)
+/// This helps provide better error messages when solver tries to act on admin-taken disputes
+pub async fn is_dispute_taken_by_admin(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> Result<bool, MostroError> {
+    // Get the dispute for this order
+    let dispute = sqlx::query(
+        "SELECT solver_pubkey FROM disputes WHERE order_id = ? AND status = 'in-progress'",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if let Some(row) = dispute {
+        if let Some(solver_pubkey) = row.try_get::<Option<String>, _>("solver_pubkey")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))? {
+            // Check if the current solver is the admin (mostro daemon)
+            if let Ok(my_keys) = crate::util::get_keys() {
+                return Ok(solver_pubkey == my_keys.public_key().to_string());
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Find all orders for a user by their master key (for restore session)
 /// This function efficiently handles both encrypted and non-encrypted databases
 /// Uses constants for excluded statuses to maintain consistency across queries

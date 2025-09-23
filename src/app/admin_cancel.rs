@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
-use crate::db::{find_dispute_by_order_id, is_assigned_solver};
+use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
 use crate::nip33::new_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order, send_dm, update_order_event};
@@ -26,7 +26,12 @@ pub async fn admin_cancel_action(
     // Check if the solver is assigned to the order
     match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
         Ok(false) => {
-            return Err(MostroCantDo(CantDoReason::IsNotYourDispute));
+            // Check if admin has taken over the dispute
+            if is_dispute_taken_by_admin(pool, order.id).await? {
+                return Err(MostroCantDo(CantDoReason::DisputeTakenByAdmin));
+            } else {
+                return Err(MostroCantDo(CantDoReason::IsNotYourDispute));
+            }
         }
         Err(e) => {
             return Err(MostroInternalErr(ServiceError::DbAccessError(

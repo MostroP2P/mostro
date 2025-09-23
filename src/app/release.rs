@@ -64,11 +64,34 @@ pub async fn check_failure_retries(
         )
         .await;
     } else if order.payment_attempts >= retries_number {
+        let buyer_final_amount = order.amount - order.fee;
+        let kind = mostro_core::order::Kind::from_str(&order.kind)
+            .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
+        let status = order.get_order_status().map_err(MostroInternalErr)?;
+
+        let order_data = SmallOrder::new(
+            Some(order.id),
+            Some(kind),
+            Some(status),
+            buyer_final_amount,
+            order.fiat_code.clone(),
+            order.min_amount,
+            order.max_amount,
+            order.fiat_amount,
+            order.payment_method.clone(),
+            order.premium,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::AddInvoice,
-            Some(Payload::Order(SmallOrder::from(order.clone()))),
+            Some(Payload::Order(order_data)),
             buyer_pubkey,
             None,
         )

@@ -64,7 +64,7 @@ pub async fn check_failure_retries(
         )
         .await;
     } else if order.payment_attempts >= retries_number {
-        let buyer_final_amount = order.amount - order.fee;
+        let buyer_final_amount = order.amount.saturating_sub(order.fee);
         let kind = mostro_core::order::Kind::from_str(&order.kind)
             .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
         let status = order.get_order_status().map_err(MostroInternalErr)?;

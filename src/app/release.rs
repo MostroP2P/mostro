@@ -64,34 +64,30 @@ pub async fn check_failure_retries(
         )
         .await;
     } else if order.payment_attempts >= retries_number {
-        let buyer_final_amount = order.amount.saturating_sub(order.fee);
-        let kind = mostro_core::order::Kind::from_str(&order.kind)
-            .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
-        let status = order.get_order_status().map_err(MostroInternalErr)?;
+        // Clone order
+        let mut order_payment_failed = order.clone();
+        // Update amount notified to the buyer
+        order_payment_failed.amount = order_payment_failed.amount.saturating_sub(order.fee);
+        if order_payment_failed.amount <= 0 || order_payment_failed.amount >= i64::MAX {
+            return Err(MostroCantDo(CantDoReason::InvalidAmount));
+        }
+        // Check errors
+        if mostro_core::order::Kind::from_str(&order.kind).is_err() {
+            return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
+        }
+        // Check status
+        if order_payment_failed.get_order_status().is_err() {
+            return Err(MostroInternalErr(ServiceError::InvalidOrderStatus));
+        }
 
-        let order_data = SmallOrder::new(
-            Some(order.id),
-            Some(kind),
-            Some(status),
-            buyer_final_amount,
-            order.fiat_code.clone(),
-            order.min_amount,
-            order.max_amount,
-            order.fiat_amount,
-            order.payment_method.clone(),
-            order.premium,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
+        // Send message to buyer indicating payment failed
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::AddInvoice,
-            Some(Payload::Order(order_data)),
+            Some(Payload::Order(SmallOrder::from(
+                order_payment_failed.clone(),
+            ))),
             buyer_pubkey,
             None,
         )

@@ -66,7 +66,6 @@ mod tests {
         };
 
         // Test passes if all types can be instantiated
-        assert!(true);
     }
 
     #[test]
@@ -98,6 +97,5 @@ mod tests {
         };
 
         // Test passes if all types can be instantiated
-        assert!(true);
     }
 }

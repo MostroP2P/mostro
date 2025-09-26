@@ -178,7 +178,6 @@ mod tests {
             let _: fn() -> Result<(), Box<dyn std::error::Error>> = settings_init;
 
             // Verify function exists and has correct return type
-            assert!(true);
         }
 
         #[test]
@@ -217,7 +216,6 @@ mod tests {
 
             if cli.dirsettings.is_none() {
                 // This is the expected path for default settings
-                assert!(true);
             } else {
                 panic!("Default path should be None");
             }

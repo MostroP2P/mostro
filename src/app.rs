@@ -489,7 +489,6 @@ mod tests {
         manage_errors(error, message, event, &action).await;
 
         // Test passes if no panic occurs
-        assert!(true);
     }
 
     #[tokio::test]
@@ -503,7 +502,6 @@ mod tests {
         manage_errors(error, message, event, &action).await;
 
         // Test passes if no panic occurs
-        assert!(true);
     }
 
     mod check_trade_index_tests {
@@ -555,7 +553,6 @@ mod tests {
         async fn test_handle_message_action_unknown() {
             // Test the structure of action handling without creating unused variables
             // This test verifies that the action routing logic exists and compiles
-            assert!(true);
         }
 
         #[test]
@@ -598,15 +595,13 @@ mod tests {
                     | Action::AdminAddSolver
                     | Action::AdminTakeDispute
                     | Action::TradePubkey => {
-                        assert!(true); // Action is handled
+                        // Action is handled
                     }
                     Action::PayInvoice => {
                         // This action is marked as todo!()
-                        assert!(true);
                     }
                     _ => {
                         // Any unhandled actions should be caught here
-                        assert!(true);
                     }
                 }
             }
@@ -672,11 +667,10 @@ mod tests {
             match kind {
                 NostrKind::GiftWrap => {
                     // This is the expected path for gift wrap events
-                    assert!(true);
                 }
                 _ => {
                     // Other event types are ignored
-                    assert!(false);
+                    panic!("Unexpected event type");
                 }
             }
         }
@@ -696,13 +690,12 @@ mod tests {
 
                     // Test that we got a message of some kind
                     match message {
-                        Message::Order(_) => assert!(true),
-                        _ => assert!(true), // Any message type is fine for structure test
+                        Message::Order(_) => {},
+                        _ => {}, // Any message type is fine for structure test
                     }
                 }
                 Err(_) => {
                     // Parsing error is handled gracefully
-                    assert!(true);
                 }
             }
         }

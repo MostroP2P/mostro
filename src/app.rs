@@ -690,8 +690,8 @@ mod tests {
 
                     // Test that we got a message of some kind
                     match message {
-                        Message::Order(_) => {},
-                        _ => {}, // Any message type is fine for structure test
+                        Message::Order(_) => {}
+                        _ => {} // Any message type is fine for structure test
                     }
                 }
                 Err(_) => {

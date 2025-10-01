@@ -94,6 +94,12 @@ pub async fn order_action(
         // Validate invoice
         let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
 
+        // Check if fiat currency is accepted
+        let mostro_settings = Settings::get_mostro();
+        if !mostro_settings.fiat_currencies_accepted.contains(&order.fiat_code) && !mostro_settings.fiat_currencies_accepted.is_empty() {
+            return Err(MostroCantDo(CantDoReason::InvalidAction));
+        }
+
         // Default case single amount
         let mut amount_vec = vec![order.fiat_amount];
         // Get max and and min amount in case of range order

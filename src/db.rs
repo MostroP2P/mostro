@@ -1194,8 +1194,10 @@ pub async fn is_dispute_taken_by_admin(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if let Some(row) = dispute {
-        if let Some(solver_pubkey) = row.try_get::<Option<String>, _>("solver_pubkey")
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))? {
+        if let Some(solver_pubkey) = row
+            .try_get::<Option<String>, _>("solver_pubkey")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        {
             // Check if the current solver is the admin (mostro daemon)
             if let Ok(my_keys) = crate::util::get_keys() {
                 return Ok(solver_pubkey == my_keys.public_key().to_string());

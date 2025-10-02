@@ -645,20 +645,24 @@ async fn store_password_hash(
     Ok(())
 }
 
-pub async fn edit_buyer_pubkey_order(
+pub async fn edit_pubkeys_order(
     pool: &SqlitePool,
+    buyer_or_seller: &str,
     order_id: Uuid,
     buyer_pubkey: Option<String>,
+    master_buyer_pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
     let result = sqlx::query!(
         r#"
             UPDATE orders
             SET
-            buyer_pubkey = ?1
-            WHERE id = ?2
+            #{buyer_or_seller}_pubkey = ?1
+            #{buyer_or_seller}_master_pubkey = ?2
+            WHERE id = ?3
         "#,
-        buyer_pubkey,
-        order_id
+        #{buyer_or_seller}_pubkey,
+        #{buyer_or_seller}_master_pubkey,
+        order_id,
     )
     .execute(pool)
     .await
@@ -668,28 +672,6 @@ pub async fn edit_buyer_pubkey_order(
     Ok(rows_affected > 0)
 }
 
-pub async fn edit_seller_pubkey_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    seller_pubkey: Option<String>,
-) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            seller_pubkey = ?1
-            WHERE id = ?2
-        "#,
-        seller_pubkey,
-        order_id
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
-
-    Ok(rows_affected > 0)
-}
 
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(
@@ -1194,8 +1176,10 @@ pub async fn is_dispute_taken_by_admin(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if let Some(row) = dispute {
-        if let Some(solver_pubkey) = row.try_get::<Option<String>, _>("solver_pubkey")
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))? {
+        if let Some(solver_pubkey) = row
+            .try_get::<Option<String>, _>("solver_pubkey")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        {
             // Check if the current solver is the admin (mostro daemon)
             if let Ok(my_keys) = crate::util::get_keys() {
                 return Ok(solver_pubkey == my_keys.public_key().to_string());

@@ -17,7 +17,7 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
-use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
+use util::{get_keys, get_nostr_relays, send_dm, update_order_event, enqueue_order_msg};
 
 pub async fn start_scheduler() {
     info!("Creating scheduler");
@@ -289,63 +289,32 @@ async fn job_cancel_orders() {
                         // Initialize reset status to pending, change in case of specifici needs of order
                         let mut new_status = Status::Pending;
 
-                        if order.status == Status::WaitingBuyerInvoice.to_string() {
-                            if order.kind == Kind::Sell.to_string() {
-                                // Reset buyer pubkey to none
-                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
+                        // Get order status and kind
+                        let (order_status, order_kind) = match (order.get_order_status(), order.get_order_kind()) {
+                            (Ok(status), Ok(kind)) => (status, kind),
+                            _ => {
+                                tracing::warn!("Error getting order status or kind in order {} cancel", order.id);
+                                continue;
                             }
-                            if order.kind == Kind::Buy.to_string() {
-                                if let Err(e) =
-                                    edit_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                new_status = Status::Canceled;
-                            };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
                         };
 
-                        if order.status == Status::WaitingPayment.to_string() {
-                            if order.kind == Kind::Sell.to_string() {
-                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
+                        match (order_status, order_kind) {    
+                            (Status::WaitingBuyerInvoice | Status::WaitingPayment, Kind::Sell) => {
+                                // Reset buyer pubkey to none
+                                if let Err(e) = edit_pubkeys_order(&pool, "buyer", order.id, None, None).await {
+                                    tracing::warn!("{e}");
                                 }
-                                if let Err(e) =
-                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
+                            },
+                            (Status::WaitingBuyerInvoice | Status::WaitingPayment, Kind::Buy) => {
+                                if let Err(e) = edit_pubkeys_order(&pool, "seller", order.id, None, None).await {
+                                    tracing::warn!("{e}");
                                 }
                                 new_status = Status::Canceled;
-                            };
-
-                            if order.kind == Kind::Buy.to_string() {
-                                if let Err(e) =
-                                    edit_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                            };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                                tracing::info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
+                            },
+                            _ => tracing::info!("Order Id {} not available for cancel", &order.id),
                         }
+
                         if new_status == Status::Pending {
                             let _ = update_order_to_initial_state(
                                 &pool,
@@ -369,6 +338,18 @@ async fn job_cancel_orders() {
                         {
                             let _ = order_updated.update(&pool).await;
                         }
+
+
+                        // Send message as ack with small order
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            Action::Canceled,
+                            None,
+                            order.get_creator_pubkey().map_err(MostroInternalErr)?,
+                            order.trade_index_seller,
+                        )
+                        .await;
                     }
                 }
             }

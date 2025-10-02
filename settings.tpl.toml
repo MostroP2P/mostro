@@ -48,7 +48,7 @@ publish_mostro_info_interval = 300
 # Bitcoin price API base URL
 bitcoin_price_api_url = "https://api.yadio.io"
 # Fiat currencies accepted for orders - leave empty ['] to accept all fiat currencies
-fiat_currencies_accepted = ['USD', 'EUR']
+fiat_currencies_accepted = ['USD', 'EUR', 'ARS','CUP']
 
 [database]
 url = "sqlite://mostro.db"

@@ -45,6 +45,7 @@ async fn calculate_and_check_quote(
 ///
 /// This asynchronous function inspects the provided message for an order and, if found, proceeds to:
 /// - Validate the associated invoice.
+/// - Check if fiat currency is accepted by mostro instance
 /// - Check order constraints such as range limits and zero-amount premium conditions.
 /// - Calculate a valid quote (in satoshis) for each fiat amount in the order.
 /// - Determine the appropriate trade index, using a fallback when the sender matches the rumor's public key.
@@ -96,8 +97,8 @@ pub async fn order_action(
 
         // Check if fiat currency is accepted
         let mostro_settings = Settings::get_mostro();
-        if !mostro_settings.fiat_currencies_accepted.contains(&order.fiat_code) && !mostro_settings.fiat_currencies_accepted.is_empty() {
-            return Err(MostroCantDo(CantDoReason::InvalidAction));
+        if let Err(cause) = order.check_fiat_currency(&mostro_settings.fiat_currencies_accepted) {
+            return Err(MostroCantDo(cause));
         }
 
         // Default case single amount

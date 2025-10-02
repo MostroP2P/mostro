@@ -101,7 +101,7 @@ pub struct MostroSettings {
     pub publish_mostro_info_interval: u32,
     /// Bitcoin price API base URL
     pub bitcoin_price_api_url: String,
-    /// Fiat currencies accepted for orders
+    /// Fiat currencies accepted for orders (empty list accepts all)
     pub fiat_currencies_accepted: Vec<String>,
 }
 

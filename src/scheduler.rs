@@ -17,7 +17,7 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
-use util::{get_keys, get_nostr_relays, send_dm, update_order_event, enqueue_order_msg};
+use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler() {
     info!("Creating scheduler");
@@ -238,6 +238,61 @@ async fn job_update_rate_events() {
     });
 }
 
+async fn notify_users_canceled_order(order: &Order, maker_action: Action) {
+    // Taker pubkey
+    let taker_pubkey = if let Ok(kind) = order.get_order_kind() {
+        match kind {
+            Kind::Buy => order.get_seller_pubkey().map_err(MostroInternalErr),
+            Kind::Sell => order.get_buyer_pubkey().map_err(MostroInternalErr),
+        }
+    } else {
+        tracing::warn!("Error getting order kind in order {} cancel", order.id);
+        return;
+    };
+
+    // get maker and taker pubkey
+    let (maker_pubkey, taker_pubkey) = match (order.get_creator_pubkey(), taker_pubkey) {
+        (Ok(maker_pubkey), Ok(taker_pubkey)) => (maker_pubkey, taker_pubkey),
+        (Err(_), _) | (_, Err(_)) => {
+            tracing::warn!(
+                "Error getting maker and taker pubkey in order {} cancel",
+                order.id
+            );
+            return;
+        }
+    };
+
+    // get payload
+    // if maker action is NewOrder, we send the order to the maker
+    let payload = if maker_action == Action::NewOrder {
+        Some(Payload::Order(SmallOrder::from(order.clone())))
+    } else {
+        None
+    };
+
+    // notify maker that taker that the maker did not proceed with the order
+    let _ = enqueue_order_msg(
+        None,
+        Some(order.id),
+        maker_action,
+        payload,
+        maker_pubkey,
+        None,
+    )
+    .await;
+
+    // notify taker that maker did not proceed with the order
+    let _ = enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        taker_pubkey,
+        None,
+    )
+    .await;
+}
+
 async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
 
@@ -290,28 +345,42 @@ async fn job_cancel_orders() {
                         let mut new_status = Status::Pending;
 
                         // Get order status and kind
-                        let (order_status, order_kind) = match (order.get_order_status(), order.get_order_kind()) {
-                            (Ok(status), Ok(kind)) => (status, kind),
-                            _ => {
-                                tracing::warn!("Error getting order status or kind in order {} cancel", order.id);
-                                continue;
-                            }
-                        };
+                        let (order_status, order_kind) =
+                            match (order.get_order_status(), order.get_order_kind()) {
+                                (Ok(status), Ok(kind)) => (status, kind),
+                                _ => {
+                                    tracing::warn!(
+                                        "Error getting order status or kind in order {} cancel",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                            };
 
-                        match (order_status, order_kind) {    
+                        match (order_status, order_kind) {
                             (Status::WaitingBuyerInvoice | Status::WaitingPayment, Kind::Sell) => {
                                 // Reset buyer pubkey to none
-                                if let Err(e) = edit_pubkeys_order(&pool, "buyer", order.id, None, None).await {
+                                if let Err(e) =
+                                    edit_pubkeys_order(&pool, "buyer_pubkey", order.id, None).await
+                                {
                                     tracing::warn!("{e}");
                                 }
-                            },
+                                notify_users_canceled_order(&order, Action::NewOrder).await;
+                            }
                             (Status::WaitingBuyerInvoice | Status::WaitingPayment, Kind::Buy) => {
-                                if let Err(e) = edit_pubkeys_order(&pool, "seller", order.id, None, None).await {
+                                if let Err(e) =
+                                    edit_pubkeys_order(&pool, "seller_pubkey", order.id, None).await
+                                {
                                     tracing::warn!("{e}");
                                 }
                                 new_status = Status::Canceled;
-                                tracing::info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                            },
+                                tracing::info!(
+                                    "Order Id {}: Reset to status {:?}",
+                                    &order.id,
+                                    new_status
+                                );
+                                notify_users_canceled_order(&order, Action::Canceled).await;
+                            }
                             _ => tracing::info!("Order Id {} not available for cancel", &order.id),
                         }
 
@@ -338,18 +407,6 @@ async fn job_cancel_orders() {
                         {
                             let _ = order_updated.update(&pool).await;
                         }
-
-
-                        // Send message as ack with small order
-                        enqueue_order_msg(
-                            None,
-                            Some(order.id),
-                            Action::Canceled,
-                            None,
-                            order.get_creator_pubkey().map_err(MostroInternalErr)?,
-                            order.trade_index_seller,
-                        )
-                        .await;
                     }
                 }
             }

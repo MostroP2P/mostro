@@ -649,29 +649,21 @@ pub async fn edit_pubkeys_order(
     pool: &SqlitePool,
     buyer_or_seller: &str,
     order_id: Uuid,
-    buyer_pubkey: Option<String>,
-    master_buyer_pubkey: Option<String>,
+    pubkey: Option<String>,
 ) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            #{buyer_or_seller}_pubkey = ?1
-            #{buyer_or_seller}_master_pubkey = ?2
-            WHERE id = ?3
-        "#,
-        #{buyer_or_seller}_pubkey,
-        #{buyer_or_seller}_master_pubkey,
-        order_id,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
+    // Build the SQL query dynamically
+    let sql = format!("UPDATE orders SET {} = ?1 WHERE id = ?2", buyer_or_seller);
 
+    let result = sqlx::query(&sql)
+        .bind(pubkey)
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let rows_affected = result.rows_affected();
     Ok(rows_affected > 0)
 }
-
 
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(

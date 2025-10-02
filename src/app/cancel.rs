@@ -1,6 +1,6 @@
 use crate::db::{
-    edit_buyer_pubkey_order, edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order,
-    edit_seller_pubkey_order, update_order_to_initial_state,
+    edit_master_buyer_pubkey_order, edit_master_seller_pubkey_order, edit_pubkeys_order,
+    update_order_to_initial_state,
 };
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
@@ -180,7 +180,7 @@ async fn cancel_order_by_taker(
 
     if order.is_buy_order().is_ok() {
         info!("Cancel seller data from db");
-        edit_seller_pubkey_order(pool, order.id, None)
+        edit_pubkeys_order(pool, "seller_pubkey", order.id, None)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         edit_master_seller_pubkey_order(pool, order.id, None)
@@ -189,7 +189,7 @@ async fn cancel_order_by_taker(
     }
     if order.is_sell_order().is_ok() {
         info!("Cancel buyer data from db");
-        edit_buyer_pubkey_order(pool, order.id, None)
+        edit_pubkeys_order(pool, "buyer_pubkey", order.id, None)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         edit_master_buyer_pubkey_order(pool, order.id, None)

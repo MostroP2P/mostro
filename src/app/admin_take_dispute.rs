@@ -54,31 +54,27 @@ async fn prepare_solver_info_message(
         None
     };
 
-    let (order_creator_tradekey, counterpart, initiator) = if order.is_buy_order().is_ok() {
-        (
-            order
-                .get_buyer_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
-                .to_string(),
-            seller,
-            buyer,
-        )
-    } else {
-        (
-            order
-                .get_seller_pubkey()
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
-                .to_string(),
-            buyer,
-            seller,
-        )
-    };
+    // Get disputes infos
+    let (dispute_initiator, counterpart, initiator) =
+        match (order.seller_dispute, order.buyer_dispute) {
+            (true, false) => (
+                order.get_seller_pubkey().map_err(MostroInternalErr)?,
+                buyer,
+                seller,
+            ),
+            (false, true) => (
+                order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+                seller,
+                buyer,
+            ),
+            (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+        };
 
     // Prepare dispute info
     let dispute_info = SolverDisputeInfo::new(
         order,
         dispute,
-        order_creator_tradekey,
+        dispute_initiator.to_string(),
         counterpart,
         initiator,
     );

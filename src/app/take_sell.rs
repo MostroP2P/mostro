@@ -186,7 +186,7 @@ mod tests {
     async fn test_update_order_status_structure() {
         // Test the structure of update_order_status function
         // This would require mocking Order, Keys, and database operations
-        assert!(true); // Structural test
+        // Structural test - function structure is valid
     }
 
     #[tokio::test]
@@ -241,8 +241,8 @@ mod tests {
         let result2 = take_sell_action(msg2, &event2, &keys, &pool).await;
         // Should fail with InvalidPayload when sender != rumor.pubkey and no trade_index
         match result2 {
-            Err(MostroInternalErr(ServiceError::InvalidPayload)) => assert!(true),
-            _ => assert!(true), // May fail for other reasons without DB setup
+            Err(MostroInternalErr(ServiceError::InvalidPayload)) => {} // Expected error
+            _ => {} // May fail for other reasons without DB setup
         }
 
         // Test case 3: with trade_index

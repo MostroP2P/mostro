@@ -247,8 +247,8 @@ mod tests {
         let result = order_action(msg, &event, &keys, &pool).await;
         // Should fail due to zero amount with premium
         match result {
-            Err(MostroCantDo(_)) => assert!(true),
-            _ => assert!(true), // May pass depending on validation logic
+            Err(MostroCantDo(_)) => {} // Expected error for zero amount with premium
+            _ => {}                    // May pass depending on validation logic
         }
     }
 
@@ -272,8 +272,8 @@ mod tests {
 
         let result2 = order_action(msg2, &event2, &keys, &pool).await;
         match result2 {
-            Err(MostroInternalErr(ServiceError::InvalidPayload)) => assert!(true),
-            _ => assert!(true), // May fail for other reasons
+            Err(MostroInternalErr(ServiceError::InvalidPayload)) => {} // Expected error
+            _ => {}                                                    // May fail for other reasons
         }
 
         // Test case 3: with trade_index

@@ -178,6 +178,7 @@ mod tests {
             let _: fn() -> Result<(), Box<dyn std::error::Error>> = settings_init;
 
             // Verify function exists and has correct return type
+            // No-op: type check above is sufficient
         }
 
         #[test]
@@ -216,6 +217,7 @@ mod tests {
 
             if cli.dirsettings.is_none() {
                 // This is the expected path for default settings
+                // No-op: branch reached is the assertion
             } else {
                 panic!("Default path should be None");
             }

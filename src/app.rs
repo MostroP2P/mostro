@@ -488,7 +488,7 @@ mod tests {
         let error = MostroError::MostroCantDo(CantDoReason::InvalidSignature);
         manage_errors(error, message, event, &action).await;
 
-        // Test passes if no panic occurs
+        // No-op: ensure no panic
     }
 
     #[tokio::test]
@@ -501,7 +501,7 @@ mod tests {
             MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string()));
         manage_errors(error, message, event, &action).await;
 
-        // Test passes if no panic occurs
+        // No-op: ensure no panic
     }
 
     mod check_trade_index_tests {
@@ -553,6 +553,7 @@ mod tests {
         async fn test_handle_message_action_unknown() {
             // Test the structure of action handling without creating unused variables
             // This test verifies that the action routing logic exists and compiles
+            // No-op: structural test
         }
 
         #[test]
@@ -594,14 +595,14 @@ mod tests {
                     | Action::AdminSettle
                     | Action::AdminAddSolver
                     | Action::AdminTakeDispute
-                    | Action::TradePubkey => {
-                        // Action is handled
-                    }
+                    | Action::TradePubkey => {}
                     Action::PayInvoice => {
                         // This action is marked as todo!()
+                        // No-op
                     }
                     _ => {
                         // Any unhandled actions should be caught here
+                        // No-op
                     }
                 }
             }
@@ -667,11 +668,9 @@ mod tests {
             match kind {
                 NostrKind::GiftWrap => {
                     // This is the expected path for gift wrap events
+                    // No-op
                 }
-                _ => {
-                    // Other event types are ignored
-                    panic!("Unexpected event type");
-                }
+                _ => unreachable!("Only GiftWrap events are considered in this test scope"),
             }
         }
 
@@ -689,13 +688,11 @@ mod tests {
                     assert!(signature.is_none());
 
                     // Test that we got a message of some kind
-                    match message {
-                        Message::Order(_) => {}
-                        _ => {} // Any message type is fine for structure test
-                    }
+                    if let Message::Order(_) = message {}
                 }
                 Err(_) => {
                     // Parsing error is handled gracefully
+                    // No-op
                 }
             }
         }

@@ -177,13 +177,13 @@ async fn cancel_order_by_taker(
 
     if order.is_buy_order().is_ok() {
         info!("Cancel seller data from db");
-        edit_pubkeys_order(pool, "seller_pubkey", order.id)
+        edit_pubkeys_order(pool, order)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
     if order.is_sell_order().is_ok() {
         info!("Cancel buyer data from db");
-        edit_pubkeys_order(pool, "buyer_pubkey", order.id)
+        edit_pubkeys_order(pool, order)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }

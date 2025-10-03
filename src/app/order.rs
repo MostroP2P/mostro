@@ -245,11 +245,8 @@ mod tests {
         let msg = create_test_message(Some(1));
 
         let result = order_action(msg, &event, &keys, &pool).await;
-        // Should fail due to zero amount with premium
-        match result {
-            Err(MostroCantDo(_)) => assert!(true),
-            _ => assert!(true), // May pass depending on validation logic
-        }
+        // Structural check: ensure call does not panic
+        let _ = result.is_ok() || result.is_err();
     }
 
     #[tokio::test]
@@ -271,10 +268,8 @@ mod tests {
         let msg2 = create_test_message(None);
 
         let result2 = order_action(msg2, &event2, &keys, &pool).await;
-        match result2 {
-            Err(MostroInternalErr(ServiceError::InvalidPayload)) => assert!(true),
-            _ => assert!(true), // May fail for other reasons
-        }
+        // Structural check: ensure call returns a Result without panicking
+        let _ = result2.is_ok() || result2.is_err();
 
         // Test case 3: with trade_index
         let msg3 = create_test_message(Some(1));

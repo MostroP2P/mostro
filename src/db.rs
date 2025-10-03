@@ -6,6 +6,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 #[cfg(feature = "startos")]
 use clap::Parser;
+use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use rpassword::read_password;
@@ -645,16 +646,22 @@ async fn store_password_hash(
     Ok(())
 }
 
-pub async fn edit_pubkeys_order(
-    pool: &SqlitePool,
-    buyer_or_seller: &str,
-    order_id: Uuid,
-) -> Result<Order, MostroError> {
+pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Order, MostroError> {
     let null_key = None::<String>;
+    let column_name = if let Ok(order_kind) = order.get_order_kind() {
+        match order_kind {
+            OrderKind::Buy => "seller_pubkey",
+            OrderKind::Sell => "buyer_pubkey",
+        }
+    } else {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "Order kind not found".to_string(),
+        )));
+    };
 
     // Build the SQL query dynamically updating both regular and master pubkey
     // Determine corresponding master key column name
-    let master_key_column = if buyer_or_seller.contains("buyer") {
+    let master_key_column = if column_name.contains("buyer") {
         "master_buyer_pubkey"
     } else {
         "master_seller_pubkey"
@@ -662,13 +669,13 @@ pub async fn edit_pubkeys_order(
 
     let sql = format!(
         "UPDATE orders SET {} = ?1, {} = ?2 WHERE id = ?3",
-        buyer_or_seller, master_key_column
+        column_name, master_key_column
     );
 
     let result = sqlx::query(&sql)
         .bind(null_key.clone())
         .bind(null_key)
-        .bind(order_id)
+        .bind(order.id)
         .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -687,7 +694,7 @@ pub async fn edit_pubkeys_order(
           WHERE id = ?1
         "#,
     )
-    .bind(order_id)
+    .bind(order.id)
     .fetch_one(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

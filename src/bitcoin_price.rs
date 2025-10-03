@@ -112,13 +112,13 @@ mod tests {
         // Test valid currencies (should not panic)
         for currency in valid_currencies {
             let _result = BitcoinPriceManager::get_price(currency);
-            assert!(true); // Function should handle any string input
+            // No assertion needed; this ensures no panic for valid input
         }
 
         // Test invalid currencies (should not panic)
         for currency in invalid_currencies {
             let _result = BitcoinPriceManager::get_price(currency);
-            assert!(true); // Function should handle any string input gracefully
+            // No assertion needed; this ensures no panic for invalid input
         }
     }
 

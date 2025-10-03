@@ -488,8 +488,7 @@ mod tests {
         let error = MostroError::MostroCantDo(CantDoReason::InvalidSignature);
         manage_errors(error, message, event, &action).await;
 
-        // Test passes if no panic occurs
-        assert!(true);
+        // No-op: ensure no panic
     }
 
     #[tokio::test]
@@ -502,8 +501,7 @@ mod tests {
             MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string()));
         manage_errors(error, message, event, &action).await;
 
-        // Test passes if no panic occurs
-        assert!(true);
+        // No-op: ensure no panic
     }
 
     mod check_trade_index_tests {
@@ -555,7 +553,7 @@ mod tests {
         async fn test_handle_message_action_unknown() {
             // Test the structure of action handling without creating unused variables
             // This test verifies that the action routing logic exists and compiles
-            assert!(true);
+            // No-op: structural test
         }
 
         #[test]
@@ -597,16 +595,14 @@ mod tests {
                     | Action::AdminSettle
                     | Action::AdminAddSolver
                     | Action::AdminTakeDispute
-                    | Action::TradePubkey => {
-                        assert!(true); // Action is handled
-                    }
+                    | Action::TradePubkey => {}
                     Action::PayInvoice => {
                         // This action is marked as todo!()
-                        assert!(true);
+                        // No-op
                     }
                     _ => {
                         // Any unhandled actions should be caught here
-                        assert!(true);
+                        // No-op
                     }
                 }
             }
@@ -672,12 +668,9 @@ mod tests {
             match kind {
                 NostrKind::GiftWrap => {
                     // This is the expected path for gift wrap events
-                    assert!(true);
+                    // No-op
                 }
-                _ => {
-                    // Other event types are ignored
-                    assert!(false);
-                }
+                _ => unreachable!("Only GiftWrap events are considered in this test scope"),
             }
         }
 
@@ -695,14 +688,11 @@ mod tests {
                     assert!(signature.is_none());
 
                     // Test that we got a message of some kind
-                    match message {
-                        Message::Order(_) => assert!(true),
-                        _ => assert!(true), // Any message type is fine for structure test
-                    }
+                    if let Message::Order(_) = message {}
                 }
                 Err(_) => {
                     // Parsing error is handled gracefully
-                    assert!(true);
+                    // No-op
                 }
             }
         }

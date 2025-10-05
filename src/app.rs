@@ -14,9 +14,10 @@ pub mod order; // Order creation and management
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action
+pub mod synch_user_trade_index;
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
-pub mod trade_pubkey; // Trade pubkey action
+pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
 
 // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
@@ -31,6 +32,7 @@ use crate::app::order::order_action;
 use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::restore_session::restore_session_action;
+use crate::app::synch_user_trade_index::synch_user_trade_index_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
@@ -231,6 +233,9 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
+        Action::SynchUserTradeIndex => synch_user_trade_index_action(msg, event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
 
         // Dispute and rating actions
         Action::Dispute => dispute_action(msg, event, my_keys, pool)

@@ -308,8 +308,8 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
 
                     let event = match nip59::extract_rumor(&my_keys, &event).await {
                         Ok(u) => u,
-                        Err(_) => {
-                            tracing::warn!("Error unwrapping gift");
+                        Err(e) => {
+                            tracing::warn!("Error unwrapping gift: {}", e);
                             continue;
                         }
                     };

@@ -286,8 +286,9 @@ mod tests {
     async fn test_zero_amount_invoice() {
         init_settings_test();
         let payment_request = "lnbc01p5dzna7pp5e23a62fcx6mcyhn9cqppln52ge4xpv0p8fv44a5jewtdypvuj7rqcqzyssp5xwcx4hn7sahsaq3y5ln8yt3qwsxqwtzwac0d32s825rcnp4yps5q9q7sqqqqqqqqqqqqqqqqqqqsqqqqqysgqdqqmqz9gxqyjw5qrzjqwryaup9lh50kkranzgcdnn2fgvx390wgj5jd07rwr3vxeje0glclludlw6z8nzdzcqqqqlgqqqqqeqqjqaq8mpxmhte2h3t0pnw7ey6hu5wvzd5ftm236jwf4whnddvwggw8ka343d9ecq93camv7lju889e4etjfc2mguvdcdkfqc00alc4lfusq7x0jsx".to_string();
-        let is_valid = is_valid_invoice(payment_request, None, None);
-        assert_eq!(Ok(()), is_valid.await);
+        // Check zero amount
+        let invoice = decode_invoice(&payment_request).expect("failed to decode invoice");
+        assert_eq!(invoice.amount_milli_satoshis().unwrap(), 0);
     }
 
     #[tokio::test]

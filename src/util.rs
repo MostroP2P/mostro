@@ -1004,6 +1004,50 @@ pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, Most
     }
 }
 
+/// Efficiently retrieves multiple orders by their IDs for a specific user
+/// 
+/// # Arguments
+/// * `pool` - Database connection pool
+/// * `orders` - Vector of order IDs as UUIDs
+/// * `user_pubkey` - Public key of the user requesting the orders
+/// 
+/// # Returns
+/// * `Result<Vec<Order>, MostroError>` - Vector of found orders that belong to the user, empty if no orders found or input is empty
+/// 
+/// # Behavior
+/// - Returns empty vector if input `orders` is empty
+/// - Returns only the orders that exist in the database AND belong to the user (as buyer or seller)
+/// - Uses a single SQL query with IN clause and user validation for efficiency
+/// - Validates that the user has access to the requested orders
+pub async fn get_user_orders_by_id(pool: &Pool<Sqlite>, orders: &Vec<Uuid>, user_pubkey: &str) -> Result<Vec<Order>, MostroError> {
+    // Return empty vector if no orders requested
+    if orders.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Create placeholders for the IN clause
+    let placeholders = orders.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT * FROM orders WHERE id IN ({}) AND (buyer_pubkey = ? OR seller_pubkey = ?)",
+        placeholders
+    );
+
+    // Execute the query
+    let mut query_builder = sqlx::query_as::<_, Order>(&query);
+    for uuid in orders {
+        query_builder = query_builder.bind(uuid);
+    }
+    // Bind the user_pubkey twice (once for buyer_pubkey, once for seller_pubkey)
+    query_builder = query_builder.bind(user_pubkey).bind(user_pubkey);
+
+    let found_orders = query_builder
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(found_orders)
+}
+
 pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<String>, MostroError> {
     // init payment request to None
     let mut payment_request = None;

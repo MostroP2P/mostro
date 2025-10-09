@@ -5,7 +5,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-// Handle synch_user_trade_index action
+// Handle last_trade_index action
 pub async fn last_trade_index(
     event: &UnwrappedGift,
     my_keys: &Keys,

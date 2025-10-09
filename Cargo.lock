@@ -1909,9 +1909,9 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.6.51"
+version = "0.6.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c464a262d01ca5c7bf905d6036652b620be73efda3ac30dc3eee297974521c"
+checksum = "10d9108f750c13c52c13c8cc1c447022f404222fa7cd06e576f398c38624bb55"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2132,9 +2132,9 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-src"
-version = "300.5.2+3.5.2"
+version = "300.5.3+3.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d270b79e2926f5150189d475bc7e9d2c69f9c4697b185fa917d5a32b792d21b4"
+checksum = "dc6bad8cd0233b63971e232cc9c5e83039375b8586d2312f31fda85db8f888c2"
 dependencies = [
  "cc",
 ]

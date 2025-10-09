@@ -778,7 +778,7 @@ pub async fn set_waiting_invoice_status(
         .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
-    let buyer_final_amount = order.amount - order.fee;
+    let buyer_final_amount = order.amount.saturating_sub(order.fee);
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),

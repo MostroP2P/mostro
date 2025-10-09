@@ -10,13 +10,14 @@ pub mod admin_take_dispute; // Admin dispute handling
 pub mod cancel; // User order cancellation
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
+pub mod last_trade_index;
 pub mod order; // Order creation and management
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
-pub mod trade_pubkey; // Trade pubkey action
+pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
 
 // Import action handlers from submodules
 use crate::app::add_invoice::add_invoice_action;
@@ -27,6 +28,7 @@ use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::cancel::cancel_action;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
+use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
 use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
@@ -231,6 +233,9 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
+        Action::LastTradeIndex => last_trade_index(event, my_keys, pool)
+            .await
+            .map_err(|e| e.into()),
 
         // Dispute and rating actions
         Action::Dispute => dispute_action(msg, event, my_keys, pool)
@@ -303,8 +308,8 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
 
                     let event = match nip59::extract_rumor(&my_keys, &event).await {
                         Ok(u) => u,
-                        Err(_) => {
-                            tracing::warn!("Error unwrapping gift");
+                        Err(e) => {
+                            tracing::warn!("Error unwrapping gift: {}", e);
                             continue;
                         }
                     };

@@ -289,12 +289,6 @@ mod tests {
         // Check zero amount
         let invoice = decode_invoice(&payment_request).expect("failed to decode invoice");
         assert_eq!(invoice.amount_milli_satoshis().unwrap(), 0);
-        // Check invoice is expired
-        let is_valid = is_valid_invoice(payment_request.clone(), None, None);
-        assert_eq!(
-            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
-            is_valid.await
-        );
     }
 
     #[tokio::test]

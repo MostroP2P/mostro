@@ -10,11 +10,11 @@ pub mod admin_take_dispute; // Admin dispute handling
 pub mod cancel; // User order cancellation
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
+pub mod last_trade_index;
 pub mod order; // Order creation and management
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action
-pub mod synch_trade_index;
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
@@ -28,11 +28,11 @@ use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::cancel::cancel_action;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
+use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
 use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::restore_session::restore_session_action;
-use crate::app::synch_trade_index::synch_last_trade_index;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
@@ -233,7 +233,7 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
-        Action::LastTradeIndex => synch_last_trade_index(event, my_keys, pool)
+        Action::LastTradeIndex => last_trade_index(event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
 

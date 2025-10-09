@@ -17,7 +17,7 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
-use util::{get_keys, get_nostr_relays, send_dm, update_order_event};
+use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler() {
     info!("Creating scheduler");
@@ -238,6 +238,75 @@ async fn job_update_rate_events() {
     });
 }
 
+async fn notify_users_canceled_order(
+    updated_order: &Order,
+    old_order: &Order,
+    maker_action: Option<Action>,
+) {
+    // Taker pubkey
+    let taker_pubkey = if let Ok(kind) = old_order.get_order_kind() {
+        match kind {
+            Kind::Buy => old_order.get_seller_pubkey().map_err(MostroInternalErr),
+            Kind::Sell => old_order.get_buyer_pubkey().map_err(MostroInternalErr),
+        }
+    } else {
+        tracing::warn!("Error getting order kind in order {} cancel", old_order.id);
+        return;
+    };
+
+    // get maker and taker pubkey
+    let (maker_pubkey, taker_pubkey) = match (old_order.get_creator_pubkey(), taker_pubkey) {
+        (Ok(maker_pubkey), Ok(taker_pubkey)) => (maker_pubkey, taker_pubkey),
+        (Err(_), _) | (_, Err(_)) => {
+            tracing::warn!(
+                "Error getting maker and taker pubkey in order {} cancel",
+                old_order.id
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        "Notifying maker {} that taker {} canceled the order {}",
+        maker_pubkey.to_string(),
+        taker_pubkey.to_string(),
+        old_order.id
+    );
+
+    // get payload
+    // if maker action is NewOrder, we send the order to the maker
+    let (payload, maker_action) = if maker_action == Some(Action::NewOrder) {
+        (
+            Some(Payload::Order(SmallOrder::from(updated_order.clone()))),
+            Action::NewOrder,
+        )
+    } else {
+        (None, Action::Canceled) // if maker action is Canceled, payload is None
+    };
+
+    // notify maker that taker that the maker did not proceed with the order
+    let _ = enqueue_order_msg(
+        None,
+        Some(updated_order.id),
+        maker_action,
+        payload,
+        maker_pubkey,
+        None,
+    )
+    .await;
+
+    // notify taker that maker did not proceed with the order
+    let _ = enqueue_order_msg(
+        None,
+        Some(updated_order.id),
+        Action::Canceled,
+        None,
+        taker_pubkey,
+        None,
+    )
+    .await;
+}
+
 async fn job_cancel_orders() {
     info!("Create a pool to connect to db");
 
@@ -286,87 +355,85 @@ async fn job_cancel_orders() {
                             order.fee = 0;
                         }
 
-                        // Initialize reset status to pending, change in case of specifici needs of order
-                        let mut new_status = Status::Pending;
-
-                        if order.status == Status::WaitingBuyerInvoice.to_string() {
-                            if order.kind == Kind::Sell.to_string() {
-                                // Reset buyer pubkey to none
-                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                            }
-                            if order.kind == Kind::Buy.to_string() {
-                                if let Err(e) =
-                                    edit_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                new_status = Status::Canceled;
-                            };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                        };
-
-                        if order.status == Status::WaitingPayment.to_string() {
-                            if order.kind == Kind::Sell.to_string() {
-                                if let Err(e) = edit_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_buyer_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                new_status = Status::Canceled;
-                            };
-
-                            if order.kind == Kind::Buy.to_string() {
-                                if let Err(e) =
-                                    edit_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
-                                }
-                                if let Err(e) =
-                                    edit_master_seller_pubkey_order(&pool, order.id, None).await
-                                {
-                                    error!("{e}");
+                        // Get order status and kind
+                        let (order_status, order_kind) =
+                            match (order.get_order_status(), order.get_order_kind()) {
+                                (Ok(status), Ok(kind)) => (status, kind),
+                                _ => {
+                                    tracing::warn!(
+                                        "Error getting order status or kind in order {} cancel",
+                                        order.id
+                                    );
+                                    continue;
                                 }
                             };
-                            info!("Order Id {}: Reset to status {:?}", &order.id, new_status);
-                        }
-                        if new_status == Status::Pending {
-                            let _ = update_order_to_initial_state(
-                                &pool,
-                                order.id,
-                                order.amount,
-                                order.fee,
-                            )
-                            .await;
-                            info!(
+
+                        let (maker_action, new_status, edited_order) =
+                            match (order_status, order_kind) {
+                                (Status::WaitingBuyerInvoice, Kind::Sell)
+                                | (Status::WaitingPayment, Kind::Buy) => {
+                                    // Update order status
+                                    let _ = update_order_to_initial_state(
+                                        &pool,
+                                        order.id,
+                                        order.amount,
+                                        order.fee,
+                                    )
+                                    .await;
+                                    info!(
                                 "Republishing order Id {}, not received regular invoice in time",
                                 order.id
                             );
+                                    (
+                                        Some(Action::NewOrder),
+                                        Status::Pending,
+                                        edit_pubkeys_order(&pool, &order).await,
+                                    )
+                                }
+                                (Status::WaitingBuyerInvoice, Kind::Buy)
+                                | (Status::WaitingPayment, Kind::Sell) => {
+                                    // Update order status
+                                    info!(
+                                    "Canceled order Id {}, not received regular invoice in time",
+                                    order.id
+                                );
+                                    (
+                                        Some(Action::Canceled),
+                                        Status::Canceled,
+                                        edit_pubkeys_order(&pool, &order).await,
+                                    )
+                                }
+                                _ => {
+                                    tracing::info!(
+                                        "Order Id {} not available for cancel",
+                                        &order.id
+                                    );
+                                    continue;
+                                }
+                            };
+
+                        // Get edited order to use for update_order_event
+                        let edited_order = if let Ok(edited_order) = edited_order {
+                            println!("Edited order: {:?}", edited_order);
+                            edited_order
                         } else {
-                            info!(
-                                "Canceled order Id {}, not received regular invoice in time",
-                                order.id
-                            );
-                        }
+                            tracing::warn!("Error editing pubkeys in order {} cancel", order.id);
+                            continue;
+                        };
+
+                        // Update order status
                         if let Ok(order_updated) =
-                            update_order_event(&keys, new_status, &order).await
+                            update_order_event(&keys, new_status, &edited_order).await
                         {
+                            // Notify users about order status changes - here order is updated
+                            notify_users_canceled_order(&order_updated, &order, maker_action).await;
+                            // trace new status
+                            tracing::info!(
+                                "Order Id {}: Reset to status {:?}",
+                                &order_updated.id,
+                                new_status
+                            );
+                            // update order on db
                             let _ = order_updated.update(&pool).await;
                         }
                     }

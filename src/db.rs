@@ -6,6 +6,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 #[cfg(feature = "startos")]
 use clap::Parser;
+use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use rpassword::read_password;
@@ -645,50 +646,60 @@ async fn store_password_hash(
     Ok(())
 }
 
-pub async fn edit_buyer_pubkey_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    buyer_pubkey: Option<String>,
-) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
+pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Order, MostroError> {
+    let null_key = None::<String>;
+    let column_name = if let Ok(order_kind) = order.get_order_kind() {
+        match order_kind {
+            OrderKind::Buy => "seller_pubkey",
+            OrderKind::Sell => "buyer_pubkey",
+        }
+    } else {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "Order kind not found".to_string(),
+        )));
+    };
+
+    // Build the SQL query dynamically updating both regular and master pubkey
+    // Determine corresponding master key column name
+    let master_key_column = if column_name.contains("buyer") {
+        "master_buyer_pubkey"
+    } else {
+        "master_seller_pubkey"
+    };
+
+    let sql = format!(
+        "UPDATE orders SET {} = ?1, {} = ?2 WHERE id = ?3",
+        column_name, master_key_column
+    );
+
+    let result = sqlx::query(&sql)
+        .bind(null_key.clone())
+        .bind(null_key)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "No order updated".to_string(),
+        )));
+    }
+
+    // Return the updated order
+    let order = sqlx::query_as::<_, Order>(
         r#"
-            UPDATE orders
-            SET
-            buyer_pubkey = ?1
-            WHERE id = ?2
+          SELECT *
+          FROM orders
+          WHERE id = ?1
         "#,
-        buyer_pubkey,
-        order_id
     )
-    .execute(pool)
+    .bind(order.id)
+    .fetch_one(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
 
-    Ok(rows_affected > 0)
-}
-
-pub async fn edit_seller_pubkey_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    seller_pubkey: Option<String>,
-) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            seller_pubkey = ?1
-            WHERE id = ?2
-        "#,
-        seller_pubkey,
-        order_id
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
-
-    Ok(rows_affected > 0)
+    Ok(order)
 }
 
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
@@ -792,52 +803,6 @@ pub async fn update_order_to_initial_state(
         0,
         0,
         order_id,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn edit_master_buyer_pubkey_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    master_buyer_pubkey: Option<String>,
-) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            master_buyer_pubkey = ?1
-            WHERE id = ?2
-        "#,
-        master_buyer_pubkey,
-        order_id
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let rows_affected = result.rows_affected();
-
-    Ok(rows_affected > 0)
-}
-
-pub async fn edit_master_seller_pubkey_order(
-    pool: &SqlitePool,
-    order_id: Uuid,
-    master_seller_pubkey: Option<String>,
-) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
-        r#"
-            UPDATE orders
-            SET
-            master_seller_pubkey = ?1
-            WHERE id = ?2
-        "#,
-        master_seller_pubkey,
-        order_id
     )
     .execute(pool)
     .await

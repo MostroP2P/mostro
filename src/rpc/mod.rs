@@ -65,7 +65,7 @@ mod tests {
             password: "test-pass".to_string(),
         };
 
-        // Test passes if all types can be instantiated
+        // Test passes if all types can be instantiated (no panic)
     }
 
     #[test]
@@ -96,6 +96,6 @@ mod tests {
             error_message: None,
         };
 
-        // Test passes if all types can be instantiated
+        // Test passes if all types can be instantiated (no panic)
     }
 }

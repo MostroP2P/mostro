@@ -269,9 +269,7 @@ async fn handle_message_action(
         Action::RestoreSession => restore_session_action(event, pool)
             .await
             .map_err(|e| e.into()),
-        Action::Orders => orders_action(msg, event, pool)
-            .await
-            .map_err(|e| e.into()),
+        Action::Orders => orders_action(msg, event, pool).await.map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())

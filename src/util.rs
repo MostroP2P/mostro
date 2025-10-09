@@ -20,6 +20,7 @@ use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
+use sqlx::QueryBuilder;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
@@ -1005,42 +1006,58 @@ pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, Most
 }
 
 /// Efficiently retrieves multiple orders by their IDs for a specific user
-/// 
+///
 /// # Arguments
 /// * `pool` - Database connection pool
 /// * `orders` - Vector of order IDs as UUIDs
 /// * `user_pubkey` - Public key of the user requesting the orders
-/// 
+///
 /// # Returns
 /// * `Result<Vec<Order>, MostroError>` - Vector of found orders that belong to the user, empty if no orders found or input is empty
-/// 
+///
 /// # Behavior
 /// - Returns empty vector if input `orders` is empty
 /// - Returns only the orders that exist in the database AND belong to the user (as buyer or seller)
 /// - Uses a single SQL query with IN clause and user validation for efficiency
 /// - Validates that the user has access to the requested orders
-pub async fn get_user_orders_by_id(pool: &Pool<Sqlite>, orders: &Vec<Uuid>, user_pubkey: &str) -> Result<Vec<Order>, MostroError> {
+pub async fn get_user_orders_by_id(
+    pool: &Pool<Sqlite>,
+    orders: &[Uuid],
+    user_pubkey: &str,
+) -> Result<Vec<Order>, MostroError> {
     // Return empty vector if no orders requested
     if orders.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Create placeholders for the IN clause
-    let placeholders = orders.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let query = format!(
-        "SELECT * FROM orders WHERE id IN ({}) AND (buyer_pubkey = ? OR seller_pubkey = ?)",
-        placeholders
-    );
+    let mut query_builder = QueryBuilder::new("SELECT * FROM orders WHERE id IN (");
 
-    // Execute the query
-    let mut query_builder = sqlx::query_as::<_, Order>(&query);
-    for uuid in orders {
-        query_builder = query_builder.bind(uuid);
+    {
+        let mut separated = query_builder.separated(", ");
+        for order_id in orders {
+            separated.push_bind(order_id);
+        }
     }
-    // Bind the user_pubkey twice (once for buyer_pubkey, once for seller_pubkey)
-    query_builder = query_builder.bind(user_pubkey).bind(user_pubkey);
+
+    query_builder.push(") AND (");
+    query_builder.push("buyer_pubkey = ");
+    query_builder.push_bind(user_pubkey);
+    query_builder.push(" OR seller_pubkey = ");
+    query_builder.push_bind(user_pubkey);
+    query_builder.push(")");
+
+    // Preserve the caller requested order sequence so that response payload matches
+    query_builder.push(" ORDER BY CASE id");
+    for (index, order_id) in orders.iter().enumerate() {
+        query_builder.push(" WHEN ");
+        query_builder.push_bind(order_id);
+        query_builder.push(" THEN ");
+        query_builder.push_bind(index as i64);
+    }
+    query_builder.push(" END");
 
     let found_orders = query_builder
+        .build_query_as::<Order>()
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1159,8 +1176,10 @@ mod tests {
     use super::*;
     use mostro_core::message::{Message, MessageKind};
     use mostro_core::order::Order;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::SqlitePool;
     use std::sync::Once;
-    use uuid::uuid;
+    use uuid::{uuid, Uuid};
     // Setup function to initialize common settings or data before tests
     static INIT: Once = Once::new();
 
@@ -1168,6 +1187,67 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    async fn setup_orders_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(include_str!("../migrations/20221222153301_orders.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        pool
+    }
+
+    async fn insert_order(
+        pool: &SqlitePool,
+        id: Uuid,
+        buyer_pubkey: Option<&str>,
+        seller_pubkey: Option<&str>,
+        creator_pubkey: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (
+                id,
+                kind,
+                event_id,
+                creator_pubkey,
+                status,
+                premium,
+                payment_method,
+                amount,
+                fiat_code,
+                fiat_amount,
+                created_at,
+                expires_at,
+                buyer_pubkey,
+                seller_pubkey
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        )
+        .bind(id)
+        .bind("buy")
+        .bind(id.simple().to_string())
+        .bind(creator_pubkey)
+        .bind("active")
+        .bind(0_i64)
+        .bind("ln")
+        .bind(1_000_i64)
+        .bind("USD")
+        .bind(1_000_i64)
+        .bind(1_000_i64)
+        .bind(2_000_i64)
+        .bind(buyer_pubkey)
+        .bind(seller_pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1261,5 +1341,65 @@ mod tests {
         ));
         let amount = get_fiat_amount_requested(&order, &message);
         assert_eq!(amount, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn test_get_user_orders_by_id_filters_and_preserves_order() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let user_pubkey = "a".repeat(64);
+        let other_pubkey = "b".repeat(64);
+
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let third_id = Uuid::new_v4();
+
+        insert_order(
+            &pool,
+            first_id,
+            Some(&user_pubkey),
+            Some(&other_pubkey),
+            &user_pubkey,
+        )
+        .await;
+        insert_order(
+            &pool,
+            second_id,
+            Some(&other_pubkey),
+            Some(&user_pubkey),
+            &user_pubkey,
+        )
+        .await;
+        insert_order(
+            &pool,
+            third_id,
+            Some(&other_pubkey),
+            Some(&other_pubkey),
+            &other_pubkey,
+        )
+        .await;
+
+        let requested = vec![second_id, first_id, third_id];
+
+        let orders = get_user_orders_by_id(&pool, &requested, &user_pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].id, second_id);
+        assert_eq!(orders[1].id, first_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_orders_by_id_empty_input() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let user_pubkey = "a".repeat(64);
+
+        let orders = get_user_orders_by_id(&pool, &[], &user_pubkey)
+            .await
+            .unwrap();
+
+        assert!(orders.is_empty());
     }
 }

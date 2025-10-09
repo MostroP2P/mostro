@@ -227,8 +227,7 @@ mod tests {
         // 2. Setting up database tables
         // 3. Mocking publish_order
         // For now, we test the structure
-        let result = order_action(msg, &event, &keys, &pool).await;
-        assert!(result.is_ok() || result.is_err());
+        let _ = order_action(msg, &event, &keys, &pool).await;
     }
 
     #[tokio::test]
@@ -239,8 +238,7 @@ mod tests {
 
         let msg = create_test_message(Some(1));
 
-        let result = order_action(msg, &event, &keys, &pool).await;
-        assert!(result.is_ok() || result.is_err());
+        let _ = order_action(msg, &event, &keys, &pool).await;
     }
 
     #[tokio::test]
@@ -250,10 +248,8 @@ mod tests {
         let event = create_test_unwrapped_gift();
 
         let msg = create_test_message(Some(1));
-
-        let result = order_action(msg, &event, &keys, &pool).await;
         // Structural check: ensure call does not panic
-        let _ = result.is_ok() || result.is_err();
+        let _ = order_action(msg, &event, &keys, &pool).await;
     }
 
     #[tokio::test]
@@ -266,22 +262,19 @@ mod tests {
         event.sender = event.rumor.pubkey;
         let msg = create_test_message(None);
 
-        let result = order_action(msg, &event, &keys, &pool).await;
-        assert!(result.is_ok() || result.is_err());
+        let _ = order_action(msg, &event, &keys, &pool).await;
 
         // Test case 2: sender != rumor.pubkey, no trade_index
         let event2 = create_test_unwrapped_gift();
         // sender and rumor.pubkey are already different by default
         let msg2 = create_test_message(None);
 
-        let result2 = order_action(msg2, &event2, &keys, &pool).await;
         // Structural check: ensure call returns a Result without panicking
-        let _ = result2.is_ok() || result2.is_err();
+        let _ = order_action(msg2, &event2, &keys, &pool).await;
 
         // Test case 3: with trade_index
         let msg3 = create_test_message(Some(1));
-        let result3 = order_action(msg3, &event2, &keys, &pool).await;
-        assert!(result3.is_ok() || result3.is_err());
+        let _ = order_action(msg3, &event2, &keys, &pool).await;
     }
 
     mod quote_calculation_tests {

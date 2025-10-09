@@ -554,13 +554,6 @@ mod tests {
     mod handle_message_action_tests {
         use super::*;
 
-        #[tokio::test]
-        async fn test_handle_message_action_unknown() {
-            // Test the structure of action handling without creating unused variables
-            // This test verifies that the action routing logic exists and compiles
-            // No-op: structural test
-        }
-
         #[test]
         fn test_action_routing_logic() {
             // Test that all action types are handled in the match statement

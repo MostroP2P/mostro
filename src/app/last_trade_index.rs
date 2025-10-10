@@ -18,15 +18,17 @@ pub async fn last_trade_index(
     let user = is_user_present(pool, requester_pubkey).await?;
 
     // Build response message embedding the last_trade_index in the trade_index field
-    let last_trade_idx_message = MessageKind::new(
+    let kind = MessageKind::new(
         None,
         None,
         Some(user.last_trade_index),
         Action::LastTradeIndex,
         None,
-    )
-    .as_json()
-    .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
+    );
+    let last_trade_index_message = Message::Restore(kind);
+    let message_json = last_trade_index_message
+        .as_json()
+        .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
 
     // Print the last trade index message
     tracing::info!(
@@ -36,7 +38,7 @@ pub async fn last_trade_index(
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
     // Send DM back to the requester
-    if let Err(e) = send_dm(event.sender, my_keys, &last_trade_idx_message, None).await {
+    if let Err(e) = send_dm(event.sender, my_keys, &message_json, None).await {
         tracing::error!("Error sending DM with last trade index: {:?}", e);
     }
 

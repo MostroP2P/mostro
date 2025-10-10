@@ -23,7 +23,7 @@ pub async fn orders_action(
     }
 
     // Get orders
-    let orders = get_user_orders_by_id(pool, &ids, &event.rumor.pubkey.to_string()).await?;
+    let orders = get_user_orders_by_id(pool, ids, &event.rumor.pubkey.to_string()).await?;
     if orders.is_empty() {
         return Err(MostroCantDo(CantDoReason::NotFound));
     }

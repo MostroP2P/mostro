@@ -13,14 +13,20 @@ body = """
 In order to verify the release, you'll need to have gpg or gpg2 installed on your system. Once you've obtained a copy (and hopefully verified that as well), you'll first need to import the keys that have signed this release if you haven't done so already:
 ```bash
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
+curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/arkanoider.asc | gpg --import
 ```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig and manifest.txt are in the current directory) with:
+Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider and manifest.txt are in the current directory) with:
 ```bash
-gpg --verify manifest.txt.sig manifest.txt
+gpg --verify manifest.txt.sig.negrunch manifest.txt
+gpg --verify manifest.txt.sig.arkanoider manifest.txt
 
-gpg: Firmado el jue 03 ago 2023 15:07:05 -03
-gpg:                usando RSA clave 1E41631D137BA2ADE55344F73852B843679AD6F0
-gpg: Firma correcta de "Francisco Calderón <fjcalderon@gmail.com>" [absoluta]
+gpg: Signature made fri 10 oct 2025 11:28:03 -03
+gpg:                using RSA key 1E41631D137BA2ADE55344F73852B843679AD6F0
+gpg: Good signature from "Francisco Calderón <fjcalderon@gmail.com>" [ultimate]
+
+gpg: Signature made fri 10 oct 2025 11:28:03 -03
+gpg:                using RSA key 2E986CA1C5E7EA1635CD059C4989CC7415A43AEC
+gpg: Good signature from "Arkanoider <github.913zc@simplelogin.com>" [ultimate]
 
 ```
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.

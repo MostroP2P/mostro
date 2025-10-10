@@ -192,6 +192,9 @@ mod tests {
             }
             other => panic!("Expected orders payload, got {other:?}"),
         }
+
+        // Clean up the queue for other tests
+        clear_order_queue().await;
     }
 
     #[tokio::test]
@@ -224,6 +227,9 @@ mod tests {
 
         let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
         assert!(queue.is_empty());
+
+        // Clean up the queue for other tests
+        clear_order_queue().await;
     }
 
     #[tokio::test]
@@ -270,5 +276,8 @@ mod tests {
 
         let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
         assert!(queue.is_empty());
+
+        // Clean up the queue for other tests
+        clear_order_queue().await;
     }
 }

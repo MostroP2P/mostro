@@ -155,7 +155,7 @@ mod tests {
 
         // Verify it's the right kind of error (user not found)
         match result {
-            Err(MostroError::MostroInternalErr(ServiceError::DbAccessError(_))) => {
+            Err(MostroError::MostroCantDo(CantDoReason::NotFound)) => {
                 // Expected error type for user not found
             }
             Err(e) => {

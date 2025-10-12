@@ -14,8 +14,14 @@ pub async fn last_trade_index(
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
 
-    // Fetch user to read last_trade_index
-    let user = is_user_present(pool, requester_pubkey).await?;
+    // Check if user is present in the database
+    // If not, return a not found error
+    let user = match is_user_present(pool, requester_pubkey).await {
+        Ok(user) => user,
+        Err(_) => {
+            return Err(MostroCantDo(CantDoReason::NotFound));
+        }
+    };
 
     // Build response message embedding the last_trade_index in the trade_index field
     let kind = MessageKind::new(

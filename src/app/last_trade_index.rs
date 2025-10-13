@@ -14,19 +14,27 @@ pub async fn last_trade_index(
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
 
-    // Fetch user to read last_trade_index
-    let user = is_user_present(pool, requester_pubkey).await?;
+    // Check if user is present in the database
+    // If not, return a not found error
+    let user = match is_user_present(pool, requester_pubkey).await {
+        Ok(user) => user,
+        Err(_) => {
+            return Err(MostroCantDo(CantDoReason::NotFound));
+        }
+    };
 
     // Build response message embedding the last_trade_index in the trade_index field
-    let last_trade_idx_message = MessageKind::new(
+    let kind = MessageKind::new(
         None,
         None,
         Some(user.last_trade_index),
         Action::LastTradeIndex,
         None,
-    )
-    .as_json()
-    .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
+    );
+    let last_trade_index_message = Message::Restore(kind);
+    let message_json = last_trade_index_message
+        .as_json()
+        .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
 
     // Print the last trade index message
     tracing::info!(
@@ -36,7 +44,7 @@ pub async fn last_trade_index(
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
     // Send DM back to the requester
-    if let Err(e) = send_dm(event.sender, my_keys, &last_trade_idx_message, None).await {
+    if let Err(e) = send_dm(event.sender, my_keys, &message_json, None).await {
         tracing::error!("Error sending DM with last trade index: {:?}", e);
     }
 
@@ -147,7 +155,7 @@ mod tests {
 
         // Verify it's the right kind of error (user not found)
         match result {
-            Err(MostroError::MostroInternalErr(ServiceError::DbAccessError(_))) => {
+            Err(MostroError::MostroCantDo(CantDoReason::NotFound)) => {
                 // Expected error type for user not found
             }
             Err(e) => {

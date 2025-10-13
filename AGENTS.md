@@ -1,19 +1,23 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Mostro is a Rust daemon; the `src/` directory holds the runtime modules (`app/` for order flows, `lightning/` for LND integration, `rpc/` for the gRPC server, and `config/` for settings helpers). SQL migrations live in `migrations/`, prepared query metadata in `sqlx-data.json`, and reusable assets under `static/`. Packaging and deployment resources are in `docker/`, while `archs` records supported cross-compilation targets.
+Mostro is a Rust daemon; runtime code lives under `src/`, with `app/` for order flows, `lightning/` for LND bindings, `rpc/` for the gRPC surface, and `config/` for settings helpers. Database migrations reside in `migrations/`, reusable assets in `static/`, and SQLx offline metadata in `sqlx-data.json`. Docker assets inside `docker/` drive local infrastructure; cross-compilation targets are tracked in `archs/`.
 
 ## Build, Test, and Development Commands
-Use `cargo build` for a debug build and `cargo run` to start the daemon with the current `settings.toml`. Execute `cargo test` before opening a pull request; it covers the module-level `#[cfg(test)]` suites. `cargo fmt` enforces the Rustfmt profile, and `cargo clippy --all-targets --all-features` catches lints. For local relay + services, run `make docker-up`; tear it down with `make docker-down`. When modifying SQLx queries, regenerate offline data with `cargo sqlx prepare -- --bin mostrod` so `sqlx-data.json` stays in sync.
+- `cargo build` compiles the daemon in debug mode.
+- `cargo run` launches Mostro using the current `settings.toml`.
+- `cargo test` exercises module-level suites; run it before pushing.
+- `cargo fmt` enforces the Rustfmt profile; `cargo clippy --all-targets --all-features` must be clean.
+- `make docker-up` boots the relay stack; shut it down with `make docker-down` when finished.
 
 ## Coding Style & Naming Conventions
-Follow Rust 2021 defaults: four-space indentation, `snake_case` modules/functions, `PascalCase` types, and screaming snake constants. Keep public APIs documented with `///` comments when behavior is non-obvious, and prefer `tracing` spans for new instrumentation. Always stage formatting and lint fixes via `cargo fmt && cargo clippy` before committing.
+Use Rust 2021 defaults: four-space indentation, `snake_case` functions, `PascalCase` types, and screaming snake constants. Document non-obvious public APIs with `///`. Favor `tracing` spans over ad-hoc logging, and keep configuration templates in `settings.tpl.toml`.
 
 ## Testing Guidelines
-Co-locate new tests inside the module they exercise, using `mod tests` and descriptive function names (e.g., `handles_expired_hold_invoice`). Mimic existing fixtures in `src/app/*` when mocking order flows. Update `sqlx-data.json` whenever a query signature or schema changes to keep CI from failing.
+Co-locate tests within their modules inside `mod tests`. Name cases descriptively (e.g., `handles_expired_hold_invoice`) and mirror fixtures already present under `src/app/`. After changing SQLx queries or schema, regenerate offline data with `cargo sqlx prepare -- --bin mostrod` so `sqlx-data.json` stays valid.
 
 ## Commit & Pull Request Guidelines
-Base work on `main` and keep branches focused. Commits should use imperative, ≤50-character subjects, contain a wrapped body explaining rationale, and be GPG-signed (`git commit -S`). Squash fixups before review; avoid merge commits. Pull requests must link the motivating issue, list manual test output (e.g., `cargo test`), and call out config or schema migrations so reviewers can test upgrades.
+Base work on `main`, keep topics scoped, and write imperative commit subjects ≤50 characters. Sign commits with `git commit -S` and squash fixups before review. Pull requests should link the motivating issue, list manual test output (e.g., `cargo test`), and call out schema or config changes to ease verification.
 
 ## Security & Configuration Tips
-Do not commit populated `settings.toml`; use `settings.tpl.toml` as the template and keep private keys outside version control. Running `cargo run` copies the config into `~/.mostro`; mirror manual edits there. Protect LND credentials before invoking `make docker-build`, and scrub any logs that might reveal invoices or nostr keys prior to sharing.
+Never commit populated `settings.toml`; copy from `settings.tpl.toml` into `~/.mostro/settings.toml` when running locally. Protect LND credentials before `make docker-build`, and scrub logs that might leak invoices or nostr keys. Rotate secrets promptly if accidents happen.

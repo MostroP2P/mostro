@@ -316,6 +316,10 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
             vec![mostro_settings.fiat_currencies_accepted.join(",")],
         ),
         Tag::custom(
+            TagKind::Custom(Cow::Borrowed("max_orders_per_response")),
+            vec![mostro_settings.max_orders_per_response.to_string()],
+        ),
+        Tag::custom(
             TagKind::Custom(Cow::Borrowed("fee")),
             vec![mostro_settings.fee.to_string()],
         ),

@@ -1,4 +1,5 @@
 use crate::util::{enqueue_order_msg, get_user_orders_by_id};
+use crate::config::settings::Settings;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -22,6 +23,11 @@ pub async fn orders_action(
         return Err(MostroCantDo(CantDoReason::InvalidParameters));
     }
 
+    let mostro_settings = Settings::get_mostro();
+    if ids.len() > mostro_settings.max_orders_per_response as usize {
+        return Err(MostroCantDo(CantDoReason::TooManyRequests));
+    }
+
     // Get orders
     let orders = get_user_orders_by_id(pool, ids, &event.rumor.pubkey.to_string()).await?;
     if orders.is_empty() {
@@ -32,6 +38,7 @@ pub async fn orders_action(
         .map(SmallOrder::from)
         .collect::<Vec<SmallOrder>>();
     let response_payload = Payload::Orders(small_orders);
+    // Enqueue response message
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         None,
@@ -278,6 +285,37 @@ mod tests {
         assert!(queue.is_empty());
 
         // Clean up the queue for other tests
+        clear_order_queue().await;
+    }
+
+    #[tokio::test]
+    async fn test_orders_action_rejects_empty_ids() {
+        let pool = setup_orders_pool().await;
+        clear_order_queue().await;
+
+        let user_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let user_pubkey = user_keys.public_key();
+
+        let msg = Message::Order(MessageKind::new(
+            Some(Uuid::new_v4()),
+            Some(99),
+            None,
+            Action::Orders,
+            Some(Payload::Ids(vec![])),
+        ));
+
+        let event = build_event(user_pubkey, sender_keys.public_key());
+
+        let err = orders_action(msg, &event, &pool)
+            .await
+            .expect_err("orders_action should fail with empty ids");
+
+        match err {
+            MostroCantDo(reason) => assert_eq!(reason, CantDoReason::InvalidParameters),
+            other => panic!("Unexpected error: {other:?}"),
+        }
+
         clear_order_queue().await;
     }
 }

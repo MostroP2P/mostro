@@ -49,6 +49,8 @@ publish_mostro_info_interval = 300
 bitcoin_price_api_url = "https://api.yadio.io"
 # Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
+# Maximum orders per response in orders action
+max_orders_per_response = 10
 
 [database]
 url = "sqlite://mostro.db"

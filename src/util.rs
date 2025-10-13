@@ -1040,9 +1040,9 @@ pub async fn get_user_orders_by_id(
     }
 
     query_builder.push(") AND (");
-    query_builder.push("buyer_pubkey = ");
+    query_builder.push("master_buyer_pubkey = ");
     query_builder.push_bind(user_pubkey);
-    query_builder.push(" OR seller_pubkey = ");
+    query_builder.push(" OR master_seller_pubkey = ");
     query_builder.push_bind(user_pubkey);
     query_builder.push(")");
 

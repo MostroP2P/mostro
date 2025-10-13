@@ -29,7 +29,7 @@ pub async fn orders_action(
     }
 
     // Get orders
-    let orders = get_user_orders_by_id(pool, ids, &event.rumor.pubkey.to_string()).await?;
+    let orders = get_user_orders_by_id(pool, &ids, &event.sender.to_string()).await?;
     if orders.is_empty() {
         return Err(MostroCantDo(CantDoReason::NotFound));
     }
@@ -142,8 +142,21 @@ mod tests {
         MESSAGE_QUEUES.queue_order_msg.write().await.clear();
     }
 
+    fn initialize_test_settings() {
+        use crate::config::settings::Settings;
+        use crate::config::MOSTRO_CONFIG;
+
+        let config_tpl = include_bytes!("../../settings.tpl.toml");
+        let config_tpl =
+            std::str::from_utf8(config_tpl).expect("Invalid UTF-8 in template config file");
+        let test_settings: Settings =
+            toml::from_str(config_tpl).expect("Failed to parse template config file");
+        MOSTRO_CONFIG.get_or_init(|| test_settings);
+    }
+
     #[tokio::test]
     async fn test_orders_action_returns_matching_orders() {
+        initialize_test_settings();
         let pool = setup_orders_pool().await;
         clear_order_queue().await;
 
@@ -206,6 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_orders_action_rejects_invalid_payload() {
+        initialize_test_settings();
         let pool = setup_orders_pool().await;
         clear_order_queue().await;
 
@@ -241,6 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_orders_action_returns_not_found_for_missing_orders() {
+        initialize_test_settings();
         let pool = setup_orders_pool().await;
         clear_order_queue().await;
 
@@ -290,6 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_orders_action_rejects_empty_ids() {
+        initialize_test_settings();
         let pool = setup_orders_pool().await;
         clear_order_queue().await;
 

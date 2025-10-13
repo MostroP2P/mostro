@@ -1,5 +1,5 @@
-use crate::util::{enqueue_order_msg, get_user_orders_by_id};
 use crate::config::settings::Settings;
+use crate::util::{enqueue_order_msg, get_user_orders_by_id};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};

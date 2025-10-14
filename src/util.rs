@@ -1207,8 +1207,8 @@ mod tests {
     async fn insert_order(
         pool: &SqlitePool,
         id: Uuid,
-        buyer_pubkey: Option<&str>,
-        seller_pubkey: Option<&str>,
+        identity_buyer_pubkey: Option<&str>,
+        identity_seller_pubkey: Option<&str>,
         creator_pubkey: &str,
     ) {
         sqlx::query(
@@ -1226,8 +1226,8 @@ mod tests {
                 fiat_amount,
                 created_at,
                 expires_at,
-                buyer_pubkey,
-                seller_pubkey
+                master_buyer_pubkey,
+                master_seller_pubkey
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         )
@@ -1243,8 +1243,8 @@ mod tests {
         .bind(1_000_i64)
         .bind(1_000_i64)
         .bind(2_000_i64)
-        .bind(buyer_pubkey)
-        .bind(seller_pubkey)
+        .bind(identity_buyer_pubkey)
+        .bind(identity_seller_pubkey)
         .execute(pool)
         .await
         .unwrap();

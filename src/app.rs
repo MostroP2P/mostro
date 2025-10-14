@@ -12,6 +12,7 @@ pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
 pub mod order; // Order creation and management
+pub mod orders; // Orders action
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action
@@ -30,6 +31,7 @@ use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
 use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
+use crate::app::orders::orders_action;
 use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::restore_session::restore_session_action;
@@ -267,7 +269,7 @@ async fn handle_message_action(
         Action::RestoreSession => restore_session_action(event, pool)
             .await
             .map_err(|e| e.into()),
-
+        Action::Orders => orders_action(msg, event, pool).await.map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())

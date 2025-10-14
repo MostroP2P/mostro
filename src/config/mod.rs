@@ -83,7 +83,8 @@ mod tests {
                                             pow = 0
                                             publish_mostro_info_interval = 300
                                             bitcoin_price_api_url = "https://api.yadio.io"
-                                            fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']"#;
+                                            fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
+                                            max_orders_per_response = 10"#;
 
     // Stub structures for the test
     #[derive(Debug, Deserialize)]
@@ -180,5 +181,6 @@ mod tests {
             mostro_settings.mostro.fiat_currencies_accepted,
             vec!["USD", "EUR", "ARS", "CUP"]
         );
+        assert_eq!(mostro_settings.mostro.max_orders_per_response, 10);
     }
 }

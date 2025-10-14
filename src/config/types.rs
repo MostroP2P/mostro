@@ -103,6 +103,8 @@ pub struct MostroSettings {
     pub bitcoin_price_api_url: String,
     /// Fiat currencies accepted for orders (empty list accepts all)
     pub fiat_currencies_accepted: Vec<String>,
+    /// Maximum orders per response in orders action
+    pub max_orders_per_response: u8,
 }
 
 // Macro call here to implement the TryFrom trait for each of the structs in Settings

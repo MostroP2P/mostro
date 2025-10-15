@@ -19,22 +19,18 @@ fn reset_api_quotes(order: &mut Order) {
 
 /// Notify the creator that the order was cancelled
 async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<(), MostroError> {
-    if order.is_buy_order().is_ok() && order.check_status(Status::WaitingBuyerInvoice).is_ok()
-        || order.is_sell_order().is_ok() && order.check_status(Status::WaitingPayment).is_ok()
-    {
-        // Get creator pubkey
-        let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
+    // Get creator pubkey
+    let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;
 
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Canceled,
-            None,
-            creator_pubkey,
-            None,
-        )
-        .await;
-    }
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::NewOrder,
+        Some(Payload::Order(SmallOrder::from(order.clone()))),
+        creator_pubkey,
+        None,
+    )
+    .await;
 
     Ok(())
 }
@@ -158,9 +154,6 @@ async fn cancel_order_by_taker(
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
 
-    //We notify the creator that the order was cancelled only if the taker had already done his part before
-    notify_creator(order, request_id).await?;
-
     //We notify the taker that the order is cancelled
     enqueue_order_msg(
         request_id,
@@ -191,6 +184,8 @@ async fn cancel_order_by_taker(
         "{}: Canceled order Id {} republishing order",
         taker_pubkey, order.id
     );
+    //We notify the creator that the order was cancelled only if the taker had already done his part before
+    notify_creator(order, request_id).await?;
 
     Ok(())
 }

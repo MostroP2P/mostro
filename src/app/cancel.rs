@@ -17,7 +17,7 @@ fn reset_api_quotes(order: &mut Order) {
     }
 }
 
-/// Notify the creator that the order was cancelled
+/// Notify the creator that the order has been republished with updated state
 async fn notify_creator(order: &mut Order, request_id: Option<u64>) -> Result<(), MostroError> {
     // Get creator pubkey
     let creator_pubkey = order.get_creator_pubkey().map_err(MostroInternalErr)?;

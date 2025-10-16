@@ -191,15 +191,17 @@ async fn cancel_order_by_taker(
     // Reset api quotes
     reset_api_quotes(&mut order);
 
+    // Update order to initial state and save it to the database
+    update_order_to_initial_state(pool, order.id, order.amount, order.fee)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     // Clean stored pubkeys for this order; republish will set them anew.
     let order = edit_pubkeys_order(pool, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    update_order_to_initial_state(pool, order.id, order.amount, order.fee)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    update_order_event(my_keys, Status::Pending, &order)
+    let order_updated = update_order_event(my_keys, Status::Pending, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
@@ -209,7 +211,7 @@ async fn cancel_order_by_taker(
     );
 
     // Notify the creator about the republished order after the taker-side cancellation flow completes
-    notify_creator(&order, request_id).await?;
+    notify_creator(&order_updated, request_id).await?;
 
     Ok(())
 }

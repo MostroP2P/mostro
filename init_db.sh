@@ -6,7 +6,7 @@ if ls sqlx-data.json 1> /dev/null 2>&1; then
 fi
 
 echo "Reading database URL from settings.toml..."
-DATABASE_URL=$(awk -F'"' '/url *= */ {print $2}' settings.tpl.toml)
+DATABASE_URL=$(grep -A 10 '^\[database\]' settings.tpl.toml | grep '^url =' | cut -d'"' -f2)
 export DATABASE_URL
 echo "Database URL is: $DATABASE_URL"
 if ls mostro.db* 1> /dev/null 2>&1; then

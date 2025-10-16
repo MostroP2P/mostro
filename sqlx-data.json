@@ -1,15 +1,5 @@
 {
   "db": "SQLite",
-  "0000b9b802fb5639a06762bf8c041dd0a942d54b503c801e2f1d1cb788789a44": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 2
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            master_seller_pubkey = ?1\n            WHERE id = ?2\n        "
-  },
   "071917afd7e1d00e2ae860779a1471d281f7aa45da61f7a7bdbd4625a3966a5d": {
     "describe": {
       "columns": [],
@@ -20,25 +10,15 @@
     },
     "query": "\n            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6\n        "
   },
-  "77ea98f6af16fa6e5a7d604965593700c563f88d88cb10b348bdc4200c87ad1d": {
+  "6c883d45be83424710f9d5e065c4cf4efc08928c85070a6a0095b24da00611e1": {
     "describe": {
       "columns": [],
       "nullable": [],
       "parameters": {
-        "Right": 2
+        "Right": 9
       }
     },
-    "query": "\n            UPDATE orders\n            SET\n            buyer_pubkey = ?1\n            WHERE id = ?2\n        "
-  },
-  "97414183485e04346f420960beed77912ebe76089f58d30f0f526e232ce4be25": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 8
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            taken_at = ?6,\n            invoice_held_at = ?7\n            WHERE id = ?8\n        "
+    "query": "\n            UPDATE orders\n            SET\n            status = ?1,\n            amount = ?2,\n            fee = ?3,\n            hash = ?4,\n            preimage = ?5,\n            buyer_invoice = ?6,\n            taken_at = ?7,\n            invoice_held_at = ?8\n            WHERE id = ?9\n        "
   },
   "b047209f67b1c1fad80c1d812c0ad0fa4116d16175fa2569962cd13c0ca05ac3": {
     "describe": {
@@ -59,26 +39,6 @@
       }
     },
     "query": "\n            UPDATE orders\n            SET\n            taken_at = ?1\n            WHERE id = ?2\n        "
-  },
-  "c5bc1af1d462bfdbda706928ee4f8c6ea73fed4d84154f3f7975f96aa515ef3b": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 2
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            master_buyer_pubkey = ?1\n            WHERE id = ?2\n        "
-  },
-  "da72f298a426b1c65f7c67bf44436ba0b0878e52694cbd4cbca8585afcc665df": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Right": 2
-      }
-    },
-    "query": "\n            UPDATE orders\n            SET\n            seller_pubkey = ?1\n            WHERE id = ?2\n        "
   },
   "fb8c9a8f42f6fc3c70e734db9db4af88c9602143afdbfcf57562f3fecb80b3a7": {
     "describe": {

@@ -782,6 +782,8 @@ pub async fn update_order_to_initial_state(
     let status = Status::Pending.to_string();
     let hash: Option<String> = None;
     let preimage: Option<String> = None;
+    let buyer_invoice: Option<String> = None;
+
     let result = sqlx::query!(
         r#"
             UPDATE orders
@@ -791,15 +793,17 @@ pub async fn update_order_to_initial_state(
             fee = ?3,
             hash = ?4,
             preimage = ?5,
-            taken_at = ?6,
-            invoice_held_at = ?7
-            WHERE id = ?8
+            buyer_invoice = ?6,
+            taken_at = ?7,
+            invoice_held_at = ?8
+            WHERE id = ?9
         "#,
         status,
         amount,
         fee,
         hash,
         preimage,
+        buyer_invoice,
         0,
         0,
         order_id,

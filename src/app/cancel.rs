@@ -192,7 +192,7 @@ async fn cancel_order_by_taker(
     reset_api_quotes(&mut order);
 
     // Clean stored pubkeys for this order; republish will set them anew.
-    let _ = edit_pubkeys_order(pool, &order)
+    let order = edit_pubkeys_order(pool, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

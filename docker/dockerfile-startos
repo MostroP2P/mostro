@@ -3,7 +3,7 @@ FROM rust:1.86-alpine AS builder
 
 # Install build dependencies
 RUN apk update && \
-    apk add --no-cache cmake build-base sqlite-dev pkgconfig openssl-dev protoc perl git
+    apk add --no-cache cmake build-base sqlite-dev pkgconfig protoc perl git
 
 # Set working directory
 WORKDIR /mostro
@@ -22,7 +22,7 @@ RUN cargo build --release --features startos
 FROM alpine:latest
 
 # Install runtime dependencies
-RUN apk add --no-cache ca-certificates sqlite-libs openssl && \
+RUN apk add --no-cache ca-certificates sqlite-libs && \
     apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing grpcurl
 
 # Create the mostro data directory

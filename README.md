@@ -61,14 +61,14 @@ To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/
 
 ```bash
 sudo apt update
-sudo apt install -y cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler
+sudo apt install -y cmake build-essential libsqlite3-dev pkg-config protobuf-compiler
 ```
 
 To compile on Mac, then use brew:
 
 ```bash
 brew update
-brew install cmake pkg-config openssl sqlite3 protobuf
+brew install cmake pkg-config sqlite3 protobuf
 ```
 
 ## Install

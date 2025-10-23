@@ -13,6 +13,7 @@ pub async fn restore_session_action(
 ) -> Result<(), MostroError> {
     // Get user master key from the event sender
     let master_key = event.sender.to_string();
+    let trade_key = event.rumor.pubkey.to_string();
 
     // Validate the master key format
     if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
@@ -35,14 +36,14 @@ pub async fn restore_session_action(
 
     // Start a background task to handle the results
     tokio::spawn(async move {
-        handle_restore_session_results(manager, master_key).await;
+        handle_restore_session_results(manager, trade_key).await;
     });
 
     Ok(())
 }
 
 /// Handle restore session results in the background
-async fn handle_restore_session_results(mut manager: RestoreSessionManager, master_key: String) {
+async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
     // Wait for the result with a timeout
     let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
 
@@ -50,7 +51,7 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, mast
         Ok(Some(result)) => {
             // Send the restore session response
             if let Err(e) = send_restore_session_response(
-                &master_key,
+                &trade_key,
                 result.restore_orders,
                 result.restore_disputes,
             )
@@ -65,7 +66,7 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, mast
         Err(_) => {
             tracing::error!("Restore session timed out after 1 hour");
             // Send timeout message to user
-            if let Err(e) = send_restore_session_timeout(&master_key).await {
+            if let Err(e) = send_restore_session_timeout(&trade_key).await {
                 tracing::error!("Failed to send timeout message: {}", e);
             }
         }

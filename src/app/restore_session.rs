@@ -13,10 +13,16 @@ pub async fn restore_session_action(
 ) -> Result<(), MostroError> {
     // Get user master key from the event sender
     let master_key = event.sender.to_string();
+    // Get trade key from the event rumor
     let trade_key = event.rumor.pubkey.to_string();
 
     // Validate the master key format
     if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    // Validate the trade key format
+    if !trade_key.chars().all(|c| c.is_ascii_hexdigit()) || trade_key.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
@@ -75,13 +81,13 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
 
 /// Send restore session response to the user
 async fn send_restore_session_response(
-    master_key: &str,
+    trade_key: &str,
     orders: Vec<RestoredOrdersInfo>,
     disputes: Vec<RestoredDisputesInfo>,
 ) -> Result<(), MostroError> {
-    // Convert master_key string to PublicKey
-    let master_pubkey =
-        PublicKey::from_hex(master_key).map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?;
+    // Convert trade_key string to PublicKey
+    let trade_pubkey =
+        PublicKey::from_hex(trade_key).map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?;
 
     // Send the order data using the flat structure
     enqueue_restore_session_msg(
@@ -89,24 +95,24 @@ async fn send_restore_session_response(
             restore_orders: orders,
             restore_disputes: disputes,
         })),
-        master_pubkey,
+        trade_pubkey,
     )
     .await;
 
-    tracing::info!("Restore session response sent to user {}", master_key,);
+    tracing::info!("Restore session response sent to user {}", trade_key,);
 
     Ok(())
 }
 
 /// Send timeout message to user
-async fn send_restore_session_timeout(master_key: &str) -> Result<(), MostroError> {
-    let master_pubkey =
-        PublicKey::from_hex(master_key).map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?;
+async fn send_restore_session_timeout(trade_key: &str) -> Result<(), MostroError> {
+    let trade_pubkey =
+        PublicKey::from_hex(trade_key).map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?;
 
     // Send timeout message without payload since Text doesn't exist
-    enqueue_restore_session_msg(None, master_pubkey).await;
+    enqueue_restore_session_msg(None, trade_pubkey).await;
 
-    tracing::warn!("Restore session timed out for user: {}", master_key);
+    tracing::warn!("Restore session timed out for user: {}", trade_key);
 
     Ok(())
 }

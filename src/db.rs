@@ -1418,7 +1418,7 @@ impl Default for RestoreSessionManager {
 
 impl RestoreSessionManager {
     pub fn new() -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+        let (sender, receiver) = tokio::sync::mpsc::channel(10);
         Self { sender, receiver }
     }
 

@@ -1827,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "mostro"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "argon2",
  "axum",

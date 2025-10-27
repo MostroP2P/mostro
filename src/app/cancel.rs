@@ -34,7 +34,7 @@ async fn notify_creator(order: &Order, request_id: Option<u64>) -> Result<(), Mo
         request_id,
         Some(order.id),
         Action::NewOrder,
-        Some(Payload::Order(SmallOrder::from(order.clone()))),
+        Some(Payload::Order(SmallOrder::from(order.clone()), None)),
         creator_pubkey,
         None,
     )

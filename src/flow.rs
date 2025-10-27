@@ -59,7 +59,7 @@ pub async fn hold_invoice_paid(
             request_id,
             Some(order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(order_data.clone())),
+            Some(Payload::Order(order_data.clone(), None)),
             seller_pubkey,
             None,
         )
@@ -69,7 +69,7 @@ pub async fn hold_invoice_paid(
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(order_data)),
+            Some(Payload::Order(order_data, None)),
             buyer_pubkey,
             None,
         )
@@ -81,17 +81,6 @@ pub async fn hold_invoice_paid(
         order_data.status = Some(status);
         order_data.buyer_trade_pubkey = None;
         order_data.seller_trade_pubkey = None;
-        // We ask to buyer for a new invoice
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::AddInvoice,
-            Some(Payload::Order(order_data)),
-            buyer_pubkey,
-            None,
-        )
-        .await;
-
         // We send a message to seller we are waiting for buyer invoice
         enqueue_order_msg(
             request_id,
@@ -105,7 +94,7 @@ pub async fn hold_invoice_paid(
 
         // Notify taker reputation to maker
         tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(pool, &order).await?;
+        notify_taker_reputation(pool, &order, request_id, &order_data).await?;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
@@ -369,7 +358,7 @@ mod tests {
             );
 
             // Test payload with order data
-            let payload_with_order = Some(Payload::Order(order_data.clone()));
+            let payload_with_order = Some(Payload::Order(order_data.clone(), None));
             assert!(payload_with_order.is_some());
 
             // Test payload without order data (None)
@@ -377,7 +366,7 @@ mod tests {
             assert!(payload_none.is_none());
 
             // Verify payload contains the order data
-            if let Some(Payload::Order(order)) = payload_with_order {
+            if let Some(Payload::Order(order, _)) = payload_with_order {
                 assert_eq!(order.amount, 1000);
                 assert_eq!(order.fiat_code, "USD");
                 assert_eq!(order.status, Some(Status::Active));

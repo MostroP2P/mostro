@@ -342,7 +342,7 @@ pub async fn publish_order(
         request_id,
         Some(order_id),
         Action::NewOrder,
-        Some(Payload::Order(order)),
+        Some(Payload::Order(order, None)),
         trade_pubkey,
         trade_index,
     )
@@ -803,7 +803,7 @@ pub async fn set_waiting_invoice_status(
         request_id,
         Some(order.id),
         Action::AddInvoice,
-        Some(Payload::Order(order_data)),
+        Some(Payload::Order(order_data, None)),
         buyer_pubkey,
         order.trade_index_buyer,
     )
@@ -1092,6 +1092,8 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
     order: &Order,
+    request_id: Option<u64>,
+    order_data: &SmallOrder,
 ) -> Result<(), MostroError> {
     // Check if is buy or sell order we need this info to understand the user needed and the receiver of notification
     let is_buy_order = order.is_buy_order().is_ok();
@@ -1156,18 +1158,17 @@ pub async fn notify_taker_reputation(
         }
     };
 
+    // We ask to buyer for a new invoice
     enqueue_order_msg(
-        None,
+        request_id,
         Some(order.id),
         action,
-        Some(Payload::Peer(Peer {
-            pubkey: "".to_string(),
-            reputation: Some(reputation_data),
-        })),
+        Some(Payload::Order(order_data.clone(), Some(reputation_data))),
         receiver,
         None,
     )
     .await;
+
     Ok(())
 }
 

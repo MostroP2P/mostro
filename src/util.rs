@@ -342,7 +342,7 @@ pub async fn publish_order(
         request_id,
         Some(order_id),
         Action::NewOrder,
-        Some(Payload::Order(order)),
+        Some(Payload::Order(order, None)),
         trade_pubkey,
         trade_index,
     )
@@ -674,22 +674,21 @@ pub async fn show_hold_invoice(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Create a smallorder structure with the order and the fee
     let mut new_order = order.as_new_order();
+    // Set order status to waiting payment
     new_order.status = Some(Status::WaitingPayment);
-    // We create a Message to send the hold invoice to seller
-    enqueue_order_msg(
+
+    // Notify taker reputation
+    tracing::info!("Notifying taker reputation to maker");
+    notify_taker_reputation(
+        &pool,
+        &order,
         request_id,
-        Some(order.id),
-        Action::PayInvoice,
-        Some(Payload::PaymentRequest(
-            Some(new_order),
-            invoice_response.payment_request,
-            None,
-        )),
-        *seller_pubkey,
-        order.trade_index_seller,
+        Some(invoice_response.payment_request.clone()),
+        None,
     )
-    .await;
+    .await?;
 
     // We notify the buyer (maker) that their order was taken and seller must pay the hold invoice
     enqueue_order_msg(
@@ -803,7 +802,7 @@ pub async fn set_waiting_invoice_status(
         request_id,
         Some(order.id),
         Action::AddInvoice,
-        Some(Payload::Order(order_data)),
+        Some(Payload::Order(order_data, None)),
         buyer_pubkey,
         order.trade_index_buyer,
     )
@@ -1092,15 +1091,20 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
     order: &Order,
+    request_id: Option<u64>,
+    hold_invoice: Option<String>,
+    order_with_fee: Option<SmallOrder>,
 ) -> Result<(), MostroError> {
     // Check if is buy or sell order we need this info to understand the user needed and the receiver of notification
     let is_buy_order = order.is_buy_order().is_ok();
+
     // Get user needed
     let user = match is_buy_order {
         true => order.master_seller_pubkey.clone(),
         false => order.master_buyer_pubkey.clone(),
     };
 
+    // Decrypt user key if needed
     let user_decrypted_key = if let Some(user) = user {
         // Get reputation data
         CryptoUtils::decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
@@ -1108,6 +1112,7 @@ pub async fn notify_taker_reputation(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     };
 
+    // Get user reputation data if present in db
     let reputation_data = match is_user_present(pool, user_decrypted_key).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
@@ -1124,16 +1129,32 @@ pub async fn notify_taker_reputation(
         },
     };
 
-    // Get order status
+    // Get order status to know what action to take and receiver key
     let order_status = order.get_order_status().map_err(MostroInternalErr)?;
 
     // Get action for info message and receiver key
-    let (action, receiver) = match order_status {
+    let (action, receiver, payload) = match order_status {
+        // Sell order case:
+        // - Maker creates a sell order
+        // - Taker takes the sell order
+        // - Taker adds an invoice
+        // - Maker pays the invoice <-- WE ARE HERE!
         Status::WaitingBuyerInvoice => {
             if !is_buy_order {
                 (
                     Action::PayInvoice,
                     order.get_seller_pubkey().map_err(MostroInternalErr)?,
+                    if let Some(hold_invoice) = hold_invoice {
+                        Payload::PaymentRequest(
+                            Some(SmallOrder::from(order.clone())),
+                            hold_invoice,
+                            None,
+                            Some(reputation_data),
+                        )
+                    } else {
+                        //Error in case of a sell order with missing invoice
+                        return Err(MostroCantDo(CantDoReason::InvalidInvoice));
+                    },
                 )
             } else {
                 //FIX for the case of a buy order and maker is adding invoice
@@ -1141,13 +1162,24 @@ pub async fn notify_taker_reputation(
                 return Ok(());
             }
         }
+        // Buy order case:
+        // - Maker creates a buy order
+        // - Taker takes the buy order
+        // - Taker pays the hold invoice <-- WE ARE HERE!
         Status::WaitingPayment => {
             if is_buy_order {
                 (
                     Action::AddInvoice,
                     order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+                    if let Some(order_with_fee) = order_with_fee {
+                        Payload::Order(order_with_fee, Some(reputation_data))
+                    } else {
+                        //Error in case of a buy order with missing order with fee
+                        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+                    },
                 )
             } else {
+                //Error in case of a sell order and
                 return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
             }
         }
@@ -1156,14 +1188,12 @@ pub async fn notify_taker_reputation(
         }
     };
 
+    // Enqueue message to notify taker reputation to maker
     enqueue_order_msg(
-        None,
+        request_id,
         Some(order.id),
         action,
-        Some(Payload::Peer(Peer {
-            pubkey: "".to_string(),
-            reputation: Some(reputation_data),
-        })),
+        Some(payload),
         receiver,
         None,
     )

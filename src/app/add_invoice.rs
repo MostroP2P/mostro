@@ -1,6 +1,5 @@
 use crate::util::{
-    enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
-    validate_invoice,
+    enqueue_order_msg, get_order, show_hold_invoice, update_order_event, validate_invoice,
 };
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -63,10 +62,6 @@ pub async fn add_invoice_action(
         }
     }
 
-    // Notify taker reputation
-    tracing::info!("Notifying taker reputation to maker");
-    notify_taker_reputation(pool, &order).await?;
-
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     // Check if the order has a preimage
@@ -89,7 +84,7 @@ pub async fn add_invoice_action(
             None,
             Some(active_order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()), None)),
             seller_pubkey,
             None,
         )
@@ -99,7 +94,7 @@ pub async fn add_invoice_action(
             msg.get_inner_message_kind().request_id,
             Some(active_order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()), None)),
             buyer_pubkey,
             None,
         )

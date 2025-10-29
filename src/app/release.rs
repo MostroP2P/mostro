@@ -85,9 +85,10 @@ pub async fn check_failure_retries(
             request_id,
             Some(order.id),
             Action::AddInvoice,
-            Some(Payload::Order(SmallOrder::from(
-                order_payment_failed.clone(),
-            ))),
+            Some(Payload::Order(
+                SmallOrder::from(order_payment_failed.clone()),
+                None,
+            )),
             buyer_pubkey,
             None,
         )
@@ -407,7 +408,7 @@ async fn handle_child_order(
             request_id,
             new_order.id,
             Action::NewOrder,
-            Some(Payload::Order(new_order)),
+            Some(Payload::Order(new_order, None)),
             PublicKey::from_str(&destination_pubkey).map_err(|_| {
                 MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string()))
             })?,

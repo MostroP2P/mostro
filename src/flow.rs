@@ -9,6 +9,7 @@ pub async fn hold_invoice_paid(
     hash: &str,
     request_id: Option<u64>,
     pool: &SqlitePool,
+    payment_request: Option<String>,
 ) -> Result<(), MostroError> {
     let order = crate::db::find_order_by_hash(pool, hash)
         .await
@@ -95,7 +96,8 @@ pub async fn hold_invoice_paid(
 
         // Notify taker reputation to maker
         tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(pool, &order, request_id, None, Some(order_data)).await?;
+        notify_taker_reputation(pool, &order, request_id, payment_request, Some(order_data))
+            .await?;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id

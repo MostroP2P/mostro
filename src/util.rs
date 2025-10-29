@@ -655,6 +655,9 @@ pub async fn show_hold_invoice(
         order.buyer_invoice = Some(invoice);
     };
 
+    // we need to have a copy before updating the order
+    let order_for_maker_message = order.clone();
+
     // Using CRUD to update all fiels
     order.preimage = Some(bytes_to_string(&preimage));
     order.hash = Some(bytes_to_string(&hash));
@@ -679,14 +682,13 @@ pub async fn show_hold_invoice(
     // Set order status to waiting payment
     new_order.status = Some(Status::WaitingPayment);
 
-    // Notify taker reputation
-    tracing::info!("Notifying taker reputation to maker");
+    // Notify taker reputation to maker
     notify_taker_reputation(
         &pool,
-        &order,
+        &order_for_maker_message,
         request_id,
         Some(invoice_response.payment_request.clone()),
-        None,
+        Some(new_order),
     )
     .await?;
 
@@ -701,13 +703,22 @@ pub async fn show_hold_invoice(
     )
     .await;
 
-    let _ = invoice_subscribe(hash, request_id).await;
+    let _ = invoice_subscribe(
+        hash,
+        request_id,
+        Some(invoice_response.payment_request.clone()),
+    )
+    .await;
 
     Ok(())
 }
 
 // Create function to reuse in case of resubscription
-pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result<(), MostroError> {
+pub async fn invoice_subscribe(
+    hash: Vec<u8>,
+    request_id: Option<u64>,
+    payment_request: Option<String>,
+) -> Result<(), MostroError> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
@@ -731,7 +742,10 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool).await {
+                    if let Err(e) =
+                        flow::hold_invoice_paid(&hash, request_id, &pool, payment_request.clone())
+                            .await
+                    {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");

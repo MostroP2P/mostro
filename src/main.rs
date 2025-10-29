@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
                 tracing::info!("Resubscribing order id - {}", invoice.id);
-                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None).await {
+                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None, None).await {
                     tracing::error!("Ln node error {e}")
                 }
             }

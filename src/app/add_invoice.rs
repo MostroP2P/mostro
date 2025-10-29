@@ -65,7 +65,7 @@ pub async fn add_invoice_action(
 
     // Notify taker reputation
     tracing::info!("Notifying taker reputation to maker");
-    notify_taker_reputation(pool, &order, msg.get_inner_message_kind().request_id, &SmallOrder::from(order.clone())).await?;
+    notify_taker_reputation(pool, &order).await?;
 
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
@@ -89,7 +89,7 @@ pub async fn add_invoice_action(
             None,
             Some(active_order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()), None)),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             seller_pubkey,
             None,
         )
@@ -99,7 +99,7 @@ pub async fn add_invoice_action(
             msg.get_inner_message_kind().request_id,
             Some(active_order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()), None)),
+            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
             buyer_pubkey,
             None,
         )

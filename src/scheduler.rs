@@ -277,7 +277,7 @@ async fn notify_users_canceled_order(
     // if maker action is NewOrder, we send the order to the maker
     let (payload, maker_action) = if maker_action == Some(Action::NewOrder) {
         (
-            Some(Payload::Order(SmallOrder::from(updated_order.clone()), None)),
+            Some(Payload::Order(SmallOrder::from(updated_order.clone()))),
             Action::NewOrder,
         )
     } else {

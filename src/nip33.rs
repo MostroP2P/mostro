@@ -241,7 +241,7 @@ pub fn order_to_tags(
                 vec!["lightning".to_string()],
             ),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("order_expires_at")),
+                TagKind::Custom(Cow::Borrowed("expires_at")),
                 vec![order.expires_at.to_string()],
             ),
             Tag::custom(

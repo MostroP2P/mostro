@@ -32,6 +32,13 @@ sign-commit = true
 sign-tag = true
 # Use 'allow-branch' if you release from other branches. Check defaults if needed.
 allow-branch = ["main"]
+# Generate CHANGELOG.md before creating the release tag (only during actual release, not dry-run)
+pre-release-hook = [
+  "sh",
+  "-c",
+  "GITHUB_TOKEN=\"${GITHUB_TOKEN:-}\" git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}} && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi"
+]
+
 
 [dependencies]
 chrono = "0.4.35"

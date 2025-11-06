@@ -181,7 +181,7 @@ async fn check_trade_index(
         Err(_) => {
             if let Some(last_trade_index) = message_kind.trade_index {
                 // Refuse case of index 0, means identikey key and new user cannot use it!
-                if last_trade_index == 0{
+                if last_trade_index == 0 {
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
                 if event.sender != event.rumor.pubkey {

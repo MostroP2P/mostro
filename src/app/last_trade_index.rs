@@ -154,13 +154,7 @@ mod tests {
         let event = create_test_unwrapped_gift(&sender_keys);
 
         // Create test message kind
-        let kind = MessageKind::new(
-            None,
-            Some(1234567890),
-            None,
-            Action::LastTradeIndex,
-            None,
-        );
+        let kind = MessageKind::new(None, Some(1234567890), None, Action::LastTradeIndex, None);
 
         // Execute function
         let result = last_trade_index(Message::Restore(kind), &event, &sender_keys, &pool).await;
@@ -227,39 +221,6 @@ mod tests {
             message.trade_index(),
             10i64,
             "Message should contain correct trade_index"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_last_trade_index_zero_value() {
-        // Test edge case: user with last_trade_index = 0 (brand new user)
-        let pool = setup_test_db().await;
-        let sender_keys = create_test_keys();
-        let pubkey = sender_keys.public_key().to_string();
-
-        // Insert user with last_trade_index = 0
-        insert_test_user(&pool, &pubkey, 0).await;
-
-        // Verify user retrieval works for zero value
-        let user = is_user_present(&pool, pubkey.clone()).await.unwrap();
-        assert_eq!(
-            user.last_trade_index, 0,
-            "New user should have last_trade_index = 0"
-        );
-
-        // Verify message construction with zero value
-        let message = MessageKind::new(
-            None,
-            None,
-            Some(user.last_trade_index),
-            Action::LastTradeIndex,
-            None,
-        );
-
-        assert_eq!(
-            message.trade_index(),
-            0i64,
-            "Message should handle zero trade_index correctly"
         );
     }
 

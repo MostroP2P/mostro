@@ -49,6 +49,8 @@ pub async fn last_trade_index(
 ) -> Result<(), MostroError> {
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
+    // Get trade key from the event rumor
+    let trade_key = event.rumor.pubkey;
 
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
@@ -88,7 +90,7 @@ pub async fn last_trade_index(
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
     // Send DM back to the requester
-    if let Err(e) = send_dm(event.sender, my_keys, &message_json, None).await {
+    if let Err(e) = send_dm(trade_key, my_keys, &message_json, None).await {
         tracing::error!("Error sending DM with last trade index: {:?}", e);
     }
 

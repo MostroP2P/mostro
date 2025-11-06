@@ -153,8 +153,17 @@ mod tests {
         // Create test event for non-existent user
         let event = create_test_unwrapped_gift(&sender_keys);
 
+        // Create test message kind
+        let kind = MessageKind::new(
+            None,
+            Some(1234567890),
+            None,
+            Action::LastTradeIndex,
+            None,
+        );
+
         // Execute function
-        let result = last_trade_index(&event, &sender_keys, &pool).await;
+        let result = last_trade_index(Message::Restore(kind), &event, &sender_keys, &pool).await;
 
         // Should fail because user doesn't exist
         assert!(

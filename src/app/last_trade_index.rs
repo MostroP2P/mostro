@@ -7,12 +7,16 @@ use sqlx::{Pool, Sqlite};
 
 // Handle last_trade_index action
 pub async fn last_trade_index(
+    msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<(), MostroError> {
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
+
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
 
     // Check if user is present in the database
     // If not, return a not found error
@@ -23,10 +27,15 @@ pub async fn last_trade_index(
         }
     };
 
+    // Zero should never be returned by the database - because it's related to identity key
+    if user.last_trade_index == 0 {
+        return Err(MostroCantDo(CantDoReason::InvalidTradeIndex));
+    }
+
     // Build response message embedding the last_trade_index in the trade_index field
     let kind = MessageKind::new(
         None,
-        None,
+        request_id,
         Some(user.last_trade_index),
         Action::LastTradeIndex,
         None,

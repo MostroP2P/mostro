@@ -235,7 +235,7 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
-        Action::LastTradeIndex => last_trade_index(event, my_keys, pool)
+        Action::LastTradeIndex => last_trade_index(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
 

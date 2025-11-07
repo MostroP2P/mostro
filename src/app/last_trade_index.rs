@@ -5,14 +5,55 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-// Handle last_trade_index action
+/// Handles a `last_trade_index` action request from a user.
+///
+/// This function retrieves the requester's last trade index from the database and sends it back
+/// via a direct message. The last trade index represents the most recent trade identifier
+/// associated with the user's identity key.
+///
+/// # Parameters
+///
+/// * `msg` - The incoming message containing the request details, including the request ID
+/// * `event` - The unwrapped gift event containing the sender's public key
+/// * `my_keys` - The daemon's keys used for signing and sending the response
+/// * `pool` - The database connection pool for querying user information
+///
+/// # Returns
+///
+/// * `Ok(())` - If the last trade index was successfully retrieved and sent
+/// * `Err(MostroCantDo(CantDoReason::NotFound))` - If the requester is not found in the database
+/// * `Err(MostroCantDo(CantDoReason::InvalidTradeIndex))` - If the user's last_trade_index is 0
+///   (which should never occur as it's related to identity key)
+/// * `Err(MostroError::MostroInternalErr(ServiceError::MessageSerializationError))` - If message
+///   serialization fails
+///
+/// # Behavior
+///
+/// The function performs the following steps:
+/// 1. Extracts the requester's public key from the unwrapped gift event
+/// 2. Retrieves the request ID from the message
+/// 3. Queries the database to verify the user exists and get their last trade index
+/// 4. Validates that the last trade index is not zero (invalid state)
+/// 5. Constructs a response message with `Action::LastTradeIndex` containing the trade index
+/// 6. Serializes the message to JSON and sends it as a direct message to the requester
+///
+/// # Errors
+///
+/// Errors are logged but not propagated for DM sending failures. All other errors are returned
+/// to the caller.
 pub async fn last_trade_index(
+    msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
 ) -> Result<(), MostroError> {
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
+    // Get trade key from the event rumor
+    let trade_key = event.rumor.pubkey;
+
+    // Get request id
+    let request_id = msg.get_inner_message_kind().request_id;
 
     // Check if user is present in the database
     // If not, return a not found error
@@ -23,10 +64,15 @@ pub async fn last_trade_index(
         }
     };
 
+    // Zero should never be returned by the database - because it's related to identity key
+    if user.last_trade_index == 0 {
+        return Err(MostroCantDo(CantDoReason::InvalidTradeIndex));
+    }
+
     // Build response message embedding the last_trade_index in the trade_index field
     let kind = MessageKind::new(
         None,
-        None,
+        request_id,
         Some(user.last_trade_index),
         Action::LastTradeIndex,
         None,
@@ -44,7 +90,7 @@ pub async fn last_trade_index(
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
     // Send DM back to the requester
-    if let Err(e) = send_dm(event.sender, my_keys, &message_json, None).await {
+    if let Err(e) = send_dm(trade_key, my_keys, &message_json, None).await {
         tracing::error!("Error sending DM with last trade index: {:?}", e);
     }
 
@@ -144,8 +190,11 @@ mod tests {
         // Create test event for non-existent user
         let event = create_test_unwrapped_gift(&sender_keys);
 
+        // Create test message kind
+        let kind = MessageKind::new(None, Some(1234567890), None, Action::LastTradeIndex, None);
+
         // Execute function
-        let result = last_trade_index(&event, &sender_keys, &pool).await;
+        let result = last_trade_index(Message::Restore(kind), &event, &sender_keys, &pool).await;
 
         // Should fail because user doesn't exist
         assert!(
@@ -209,39 +258,6 @@ mod tests {
             message.trade_index(),
             10i64,
             "Message should contain correct trade_index"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_last_trade_index_zero_value() {
-        // Test edge case: user with last_trade_index = 0 (brand new user)
-        let pool = setup_test_db().await;
-        let sender_keys = create_test_keys();
-        let pubkey = sender_keys.public_key().to_string();
-
-        // Insert user with last_trade_index = 0
-        insert_test_user(&pool, &pubkey, 0).await;
-
-        // Verify user retrieval works for zero value
-        let user = is_user_present(&pool, pubkey.clone()).await.unwrap();
-        assert_eq!(
-            user.last_trade_index, 0,
-            "New user should have last_trade_index = 0"
-        );
-
-        // Verify message construction with zero value
-        let message = MessageKind::new(
-            None,
-            None,
-            Some(user.last_trade_index),
-            Action::LastTradeIndex,
-            None,
-        );
-
-        assert_eq!(
-            message.trade_index(),
-            0i64,
-            "Message should handle zero trade_index correctly"
         );
     }
 

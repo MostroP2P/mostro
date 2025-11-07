@@ -179,14 +179,21 @@ async fn check_trade_index(
             Ok(())
         }
         Err(_) => {
-            if message_kind.trade_index.is_some() && event.sender != event.rumor.pubkey {
-                let new_user: User = User {
-                    pubkey: event.sender.to_string(),
-                    ..Default::default()
-                };
-                if let Err(e) = add_new_user(pool, new_user).await {
-                    tracing::error!("Error creating new user: {}", e);
-                    return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
+            if let Some(last_trade_index) = message_kind.trade_index {
+                // Refuse case of index 0, means identikey key and new user cannot use it!
+                if last_trade_index == 0 {
+                    return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
+                }
+                if event.sender != event.rumor.pubkey {
+                    let new_user: User = User {
+                        pubkey: event.sender.to_string(),
+                        last_trade_index,
+                        ..Default::default()
+                    };
+                    if let Err(e) = add_new_user(pool, new_user).await {
+                        tracing::error!("Error creating new user: {}", e);
+                        return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
+                    }
                 }
             }
             Ok(())
@@ -235,7 +242,7 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => todo!(),
-        Action::LastTradeIndex => last_trade_index(event, my_keys, pool)
+        Action::LastTradeIndex => last_trade_index(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
 

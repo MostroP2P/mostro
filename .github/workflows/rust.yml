@@ -119,6 +119,23 @@ jobs:
           name: artifact-${{ matrix.target }}
           path: artifacts/*
 
+  # Publish to crates.io (only if all builds succeed)
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
   # Create release with all artifacts
   release:
     runs-on: ubuntu-latest

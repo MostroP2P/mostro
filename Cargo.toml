@@ -1,6 +1,6 @@
 [package]
 name = "mostro"
-version = "0.15.3"
+version = "0.15.4"
 edition = "2021"
 license = "MIT"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
@@ -36,7 +36,7 @@ allow-branch = ["main"]
 pre-release-hook = [
   "sh",
   "-c",
-  "cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && GITHUB_TOKEN=\"${GITHUB_TOKEN:-}\" git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}} && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi"
+  "cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && if [ -n \"${GITHUB_TOKEN:-}\" ]; then GITHUB_TOKEN=\"$GITHUB_TOKEN\" git cliff --unreleased --github-repo MostroP2P/mostro -o CHANGELOG.md --tag {{version}}; else git cliff --unreleased -o CHANGELOG.md --tag {{version}}; fi && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; else echo \"DRY RUN: Skip git add and commit\"; fi",
 ]
 
 

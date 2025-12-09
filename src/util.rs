@@ -142,7 +142,7 @@ pub async fn get_market_quote(
     // Added premium value to have correct sats value
     if premium != 0 {
         sats = sats - (premium as f64) / 100_f64 * sats;
-        println!("Quote result + premium of {}%: {}", premium, sats);
+        println!("Final amount - premium is {}% - Fees are {} sats", premium, sats);
     }
 
     Ok(sats as i64)

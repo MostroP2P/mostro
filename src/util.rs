@@ -26,7 +26,6 @@ use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::ops::Sub;
 use std::str::FromStr;
 use std::thread;
 use tokio::sync::mpsc::channel;
@@ -142,7 +141,7 @@ pub async fn get_market_quote(
 
     // Added premium value to have correct sats value
     if premium != 0 {
-        sats = sats.sub((premium as f64) / 100_f64 * sats);
+        sats = sats - (premium as f64) / 100_f64 * sats;
         println!("Quote result + premium of {}%: {}", premium, sats);
     }
 

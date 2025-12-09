@@ -137,15 +137,10 @@ pub async fn get_market_quote(
     };
 
     let mut sats = quote.result * 100_000_000_f64;
-    println!("Quote result: {}", sats);
 
     // Added premium value to have correct sats value
     if premium != 0 {
         sats = sats - (premium as f64) / 100_f64 * sats;
-        println!(
-            "Final amount - premium is {}% - Fees are {} sats",
-            premium, sats
-        );
     }
 
     Ok(sats as i64)
@@ -770,10 +765,6 @@ pub async fn get_market_amount_and_fee(
     // Update amount order
     let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
     let fee = get_fee(new_sats_amount);
-    println!(
-        "Final sats amount with premium and fee: {} - fees are {} sats",
-        new_sats_amount, fee
-    );
 
     Ok((new_sats_amount, fee))
 }

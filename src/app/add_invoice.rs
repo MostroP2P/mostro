@@ -98,7 +98,7 @@ pub async fn add_invoice_action(
         .await;
         // We send a message to buyer saying seller paid
         let mut buyer_order = SmallOrder::from(active_order.clone());
-        buyer_order.amount = active_order.amount - active_order.fee;
+        buyer_order.amount = active_order.amount.saturating_sub(active_order.fee);
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
             Some(active_order.id),

@@ -55,21 +55,25 @@ pub async fn hold_invoice_paid(
         status = Status::Active;
         order_data.status = Some(status);
         // We send a confirmation message to seller
+        let mut seller_order_data = order_data.clone();
+        seller_order_data.amount = order.amount.saturating_add(order.fee);
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(order_data.clone())),
+            Some(Payload::Order(seller_order_data)),
             seller_pubkey,
             None,
         )
         .await;
         // We send a message to buyer saying seller paid
+        let mut buyer_order_data = order_data.clone();
+        buyer_order_data.amount = order.amount.saturating_sub(order.fee);
         enqueue_order_msg(
             request_id,
             Some(order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(order_data)),
+            Some(Payload::Order(buyer_order_data)),
             buyer_pubkey,
             None,
         )

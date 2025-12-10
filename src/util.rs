@@ -140,7 +140,7 @@ pub async fn get_market_quote(
 
     // Added premium value to have correct sats value
     if premium != 0 {
-        sats += (premium as f64) / 100_f64 * sats;
+        sats = sats - (premium as f64) / 100_f64 * sats;
     }
 
     Ok(sats as i64)

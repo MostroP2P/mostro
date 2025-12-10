@@ -676,6 +676,8 @@ pub async fn show_hold_invoice(
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
+    new_order.amount = order.amount + order.fee;
+
     // We create a Message to send the hold invoice to seller
     enqueue_order_msg(
         request_id,

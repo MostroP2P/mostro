@@ -85,21 +85,25 @@ pub async fn add_invoice_action(
         };
 
         // We send a confirmation message to seller
+        let mut seller_order = SmallOrder::from(active_order.clone());
+        seller_order.amount = active_order.amount + active_order.fee;
         enqueue_order_msg(
             None,
             Some(active_order.id),
             Action::BuyerTookOrder,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
+            Some(Payload::Order(seller_order)),
             seller_pubkey,
             None,
         )
         .await;
         // We send a message to buyer saying seller paid
+        let mut buyer_order = SmallOrder::from(active_order.clone());
+        buyer_order.amount = active_order.amount - active_order.fee;
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
             Some(active_order.id),
             Action::HoldInvoicePaymentAccepted,
-            Some(Payload::Order(SmallOrder::from(active_order.clone()))),
+            Some(Payload::Order(buyer_order)),
             buyer_pubkey,
             None,
         )

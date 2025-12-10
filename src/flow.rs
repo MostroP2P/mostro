@@ -56,7 +56,7 @@ pub async fn hold_invoice_paid(
         order_data.status = Some(status);
         // We send a confirmation message to seller
         let mut seller_order_data = order_data.clone();
-        seller_order_data.amount = order.amount + order.fee;
+        seller_order_data.amount = order.amount.saturating_add(order.fee);
         enqueue_order_msg(
             request_id,
             Some(order.id),

@@ -30,16 +30,12 @@ Before settings initialization, the daemon performs:
 
 ### Settings Initialization Details
 
-**Function flow**:
-1. `cli::settings_init()` (cli.rs:47)
-2. Calls `config::util::init_configuration_file()` (config/util.rs:16)
-
 **Directory setup**:
 - Creates `~/.mostro/` directory if not exists
 - Checks for existing `~/.mostro/settings.toml`
 - If missing: copies `settings.tpl.toml` to `~/.mostro/settings.toml`
+- On first run after creating the file, the process exits so the user can edit `settings.toml`, then restart Mostro.
 - Overrides database URL: `~/.mostro/mostro.db`
-
 **Settings loading**:
 - Parses TOML into Settings struct
 - Stores in global `config::MOSTRO_CONFIG` via `init_mostro_settings()`

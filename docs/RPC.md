@@ -12,15 +12,15 @@ The RPC interface provides a direct communication method for admin operations, c
 
 ## Configuration
 
-Add the following section to your `settings.toml`:
+Add the following section to your `settings.toml` (keys are required; fields have Rust Default implementations but must be present):
 
 ```toml
 [rpc]
-# Enable RPC server for direct admin communication
+# Enable RPC server for direct admin communication (required key; default=false)
 enabled = true
-# RPC server listen address
+# RPC server listen address (required key; default="127.0.0.1")
 listen_address = "127.0.0.1"
-# RPC server port
+# RPC server port (required key; default=50051)
 port = 50051
 ```
 

@@ -84,7 +84,7 @@ Before settings initialization, the daemon performs:
 
 **File**: `src/config/settings.rs`, types in `src/config/types.rs`.
 
-Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.toml`). Values shown below come from the template and indicate the required keys that must exist in `settings.toml`. Some fields have Rust Default implementations; however, the daemon still expects these keys to be present in `settings.toml`. If a key relies on a Rust Default and is left empty or omitted by tooling, the daemon will fall back to the Rust Default value.
+Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.toml`). Values shown below come from the template and indicate the required keys that must exist in `settings.toml`. Some fields have Rust Default implementations; however, the daemon still expects these keys to be present in `settings.toml`. If a key relies on a Rust Default and is present but empty or omitted by tooling, the daemon falls back to the Rust Default value.
 
 ### Configuration Sections:
 
@@ -141,7 +141,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `enabled` (bool): Enable RPC server (Rust Default: false)
 - `listen_address` (String): Bind address (Rust Default: "127.0.0.1")
 - `port` (u16): Listen port (Rust Default: 50051)
-- Note: These fields have a Rust Default impl, but `settings.toml` must still include these keys. If a key is present but empty or omitted by tooling, the daemon falls back to the Rust Default value.
+- Note: These fields have a Rust Default implementation, but `settings.toml` must still include these keys. If a key is present but empty or omitted by tooling, the daemon falls back to the Rust Default value.
 
 ## Global Variables
 

@@ -84,7 +84,7 @@ Before settings initialization, the daemon performs:
 
 **File**: `src/config/settings.rs`, types in `src/config/types.rs`.
 
-Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.toml`). Default values shown below are from the template and represent required configuration values unless otherwise noted.
+Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.toml`). Values shown below come from the template and indicate the required keys that must exist in `settings.toml`. Some fields have Rust Default implementations; however, the daemon still expects these keys to be present in `settings.toml`. If a key relies on a Rust Default and is left empty or omitted by tooling, the daemon will fall back to the Rust Default value.
 
 ### Configuration Sections:
 
@@ -138,10 +138,10 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `fiat_currencies_accepted` (Vec<String>): Accepted fiat currencies; empty list accepts all (default: ['USD', 'EUR', 'ARS', 'CUP'])
 
 **RPC** (`src/config/types.rs:55-74`):
-- `enabled` (bool): Enable RPC server (Rust default: false)
-- `listen_address` (String): Bind address (Rust default: "127.0.0.1")
-- `port` (u16): Listen port (Rust default: 50051)
-- Note: RPC has actual Rust defaults implemented in Default trait
+- `enabled` (bool): Enable RPC server (Rust Default: false)
+- `listen_address` (String): Bind address (Rust Default: "127.0.0.1")
+- `port` (u16): Listen port (Rust Default: 50051)
+- Note: These fields have a Rust Default impl, but `settings.toml` must still include these keys. If a key is present but empty or omitted by tooling, the daemon falls back to the Rust Default value.
 
 ## Global Variables
 

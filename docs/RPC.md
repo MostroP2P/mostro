@@ -72,6 +72,26 @@ Take a dispute for resolution.
 - `success`: Boolean indicating operation success
 - `error_message`: Optional error message if operation failed
 
+### 5. Validate Database Password
+Validate the database password for encrypted databases.
+
+**Request:**
+- `password`: Database password to validate
+- `request_id`: Optional request identifier
+
+**Response:**
+- `success`: Boolean indicating password validity
+- `error_message`: Optional error message if validation failed
+
+### 6. Get Version
+Retrieve the Mostro daemon version.
+
+**Request:**
+- No parameters required
+
+**Response:**
+- `version`: String containing the daemon version (from CARGO_PKG_VERSION)
+
 ## Protocol Details
 
 The RPC interface uses gRPC with Protocol Buffers. The service definition is:
@@ -82,6 +102,8 @@ service AdminService {
   rpc SettleOrder(SettleOrderRequest) returns (SettleOrderResponse);
   rpc AddSolver(AddSolverRequest) returns (AddSolverResponse);
   rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
+  rpc ValidateDbPassword(ValidateDbPasswordRequest) returns (ValidateDbPasswordResponse);
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
 }
 ```
 

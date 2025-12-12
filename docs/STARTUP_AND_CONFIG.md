@@ -132,7 +132,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Network/API:*
 - `pow` (u8): Proof-of-work difficulty requirement (default: 0)
-- `bitcoin_price_api_url` (String): Bitcoin price API base URL (default: "https://api.yadio.io")
+- `bitcoin_price_api_url` (String): Bitcoin price API base URL (default: [`https://api.yadio.io`](https://api.yadio.io))
 
 *Market Support:*
 - `fiat_currencies_accepted` (Vec<String>): Accepted fiat currencies; empty list accepts all (default: ['USD', 'EUR', 'ARS', 'CUP'])

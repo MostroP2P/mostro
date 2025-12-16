@@ -1,5 +1,6 @@
 use crate::config;
 use crate::config::MOSTRO_DB_PASSWORD;
+use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -528,6 +529,39 @@ async fn payment_success(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // ============ SEND DEVELOPMENT FEE ============
+    match send_dev_fee_payment(order).await {
+        Ok(payment_hash) if !payment_hash.is_empty() => {
+            order.dev_fee_paid = true;
+            order.dev_fee_payment_hash = Some(payment_hash);
+            tracing::info!(
+                target: "dev_fee",
+                order_id = %order.id,
+                dev_fee = order.dev_fee,
+                "Development fee payment succeeded"
+            );
+        }
+        Ok(_) => {
+            // Empty hash means no dev fee (zero amount)
+            tracing::debug!(
+                target: "dev_fee",
+                order_id = %order.id,
+                "No development fee to send"
+            );
+        }
+        Err(e) => {
+            order.dev_fee_paid = false;
+            tracing::error!(
+                target: "dev_fee",
+                order_id = %order.id,
+                dev_fee = order.dev_fee,
+                error = %e,
+                "Development fee payment failed - order completing anyway"
+            );
+        }
+    }
+    // ==============================================
+
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         let order = order_updated
             .update(&pool)
@@ -545,6 +579,116 @@ async fn payment_success(
         .await;
     }
     Ok(())
+}
+
+/// Sends development fee to Mostro development Lightning Address
+/// Returns payment hash on success, error on failure
+/// Errors are non-fatal - logged but don't block order completion
+async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
+    // Check if dev fee exists and is non-zero
+    let dev_fee_amount = match order.dev_fee {
+        fee if fee > 0 => fee,
+        _ => return Ok(String::new()), // No dev fee to send
+    };
+
+    tracing::info!(
+        target: "dev_fee",
+        order_id = %order.id,
+        amount_sats = dev_fee_amount,
+        destination = %DEV_FEE_LIGHTNING_ADDRESS,
+        "Initiating development fee payment"
+    );
+
+    // Resolve Lightning Address to BOLT11 invoice
+    let payment_request = resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount as u64)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "dev_fee",
+                order_id = %order.id,
+                error = %e,
+                stage = "address_resolution",
+                "Failed to resolve development Lightning Address"
+            );
+            MostroInternalErr(ServiceError::LnAddressParseError)
+        })?;
+
+    if payment_request.is_empty() {
+        tracing::error!(
+            target: "dev_fee",
+            order_id = %order.id,
+            "Lightning Address resolution returned empty invoice"
+        );
+        return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+    }
+
+    // Send payment via LND
+    let mut ln_client = LndConnector::new().await?;
+    let (tx, mut rx) = channel(1);
+
+    ln_client
+        .send_payment(&payment_request, dev_fee_amount, tx)
+        .await?;
+
+    // Wait for payment result with 30-second timeout
+    let payment_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rx.recv()
+    ).await;
+
+    match payment_result {
+        Ok(Some(msg)) => {
+            if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                match status {
+                    PaymentStatus::Succeeded => {
+                        let hash = msg.payment.payment_hash;
+                        tracing::info!(
+                            target: "dev_fee",
+                            order_id = %order.id,
+                            payment_hash = %hash,
+                            "Development fee payment succeeded"
+                        );
+                        Ok(hash)
+                    }
+                    _ => {
+                        tracing::error!(
+                            target: "dev_fee",
+                            order_id = %order.id,
+                            status = ?status,
+                            "Development fee payment failed"
+                        );
+                        Err(MostroInternalErr(ServiceError::LnPaymentError(
+                            format!("Payment failed: {:?}", status)
+                        )))
+                    }
+                }
+            } else {
+                Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "Invalid payment status".to_string()
+                )))
+            }
+        }
+        Ok(None) => {
+            tracing::error!(
+                target: "dev_fee",
+                order_id = %order.id,
+                "Payment channel closed unexpectedly"
+            );
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "Channel closed".to_string()
+            )))
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "dev_fee",
+                order_id = %order.id,
+                "Payment timeout after 30 seconds"
+            );
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "Timeout".to_string()
+            )))
+        }
+    }
 }
 
 /// Check if order is range type

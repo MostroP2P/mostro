@@ -1,5 +1,6 @@
 // Mostro module for configurataion settings
 pub mod settings;
+pub mod constants;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.
 pub mod types;
@@ -19,6 +20,7 @@ use nostr_sdk::prelude::*;
 use secrecy::SecretString;
 pub use settings::{get_db_pool, init_mostro_settings, Settings};
 pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
+pub use constants::{DEV_FEE_LIGHTNING_ADDRESS, MIN_DEV_FEE_PERCENTAGE, MAX_DEV_FEE_PERCENTAGE};
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool
 // almost all of them are initialized with OnceLock to ensure they are set only once

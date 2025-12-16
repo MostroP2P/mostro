@@ -3,7 +3,10 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::config::{init_mostro_settings, Settings};
-use crate::config::constants::{MIN_DEV_FEE_PERCENTAGE, MAX_DEV_FEE_PERCENTAGE, DEV_FEE_LIGHTNING_ADDRESS};
+use crate::config::constants::{
+    DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
+};
+use crate::lnurl::ln_exists;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use std::fs;
@@ -12,36 +15,27 @@ use std::path::PathBuf;
 const DB_FILENAME: &str = "mostro.db";
 
 /// Validates Mostro settings on startup
-fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
+async fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
     let dev_fee = settings.mostro.dev_fee_percentage;
 
     // Validate dev_fee_percentage range
     if dev_fee < MIN_DEV_FEE_PERCENTAGE {
-        return Err(MostroInternalErr(ServiceError::IOError(
-            format!(
-                "dev_fee_percentage ({}) is below minimum ({})",
-                dev_fee, MIN_DEV_FEE_PERCENTAGE
-            )
-        )));
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "dev_fee_percentage ({}) is below minimum ({})",
+            dev_fee, MIN_DEV_FEE_PERCENTAGE
+        ))));
     }
 
     if dev_fee > MAX_DEV_FEE_PERCENTAGE {
-        return Err(MostroInternalErr(ServiceError::IOError(
-            format!(
-                "dev_fee_percentage ({}) exceeds maximum ({})",
-                dev_fee, MAX_DEV_FEE_PERCENTAGE
-            )
-        )));
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "dev_fee_percentage ({}) exceeds maximum ({})",
+            dev_fee, MAX_DEV_FEE_PERCENTAGE
+        ))));
     }
 
-    // Validate Lightning Address format (basic check for user@domain pattern)
-    if !DEV_FEE_LIGHTNING_ADDRESS.contains('@') || DEV_FEE_LIGHTNING_ADDRESS.split('@').count() != 2 {
-        return Err(MostroInternalErr(ServiceError::IOError(
-            format!(
-                "Invalid development Lightning Address format: {}",
-                DEV_FEE_LIGHTNING_ADDRESS
-            )
-        )));
+    // Validate Lightning Address format and reachability
+    if ln_exists(DEV_FEE_LIGHTNING_ADDRESS).await.is_err() {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
 
     Ok(())
@@ -89,7 +83,10 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     // Validate settings before initializing
-    validate_mostro_settings(&settings)?;
+    // Validate settings before initializing
+    // Network check for Lightning Address reachability requires async
+    tokio::runtime::Handle::current()
+        .block_on(validate_mostro_settings(&settings))?;
 
     // Override database URL
     settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());

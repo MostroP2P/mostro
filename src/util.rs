@@ -1219,6 +1219,18 @@ mod tests {
             .await
             .unwrap();
 
+        // Apply dev fee migration columns for tests
+        sqlx::query(
+            r#"
+            ALTER TABLE orders ADD COLUMN dev_fee INTEGER DEFAULT 0;
+            ALTER TABLE orders ADD COLUMN dev_fee_paid INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE orders ADD COLUMN dev_fee_payment_hash CHAR(64);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .ok();
+
         pool
     }
 
@@ -1441,7 +1453,8 @@ mod tests {
                 },
                 rpc: RpcSettings::default(),
             };
-            init_mostro_settings(settings);
+            // Ignore if settings already initialized in other tests
+            let _ = std::panic::catch_unwind(|| init_mostro_settings(settings));
         });
     }
 

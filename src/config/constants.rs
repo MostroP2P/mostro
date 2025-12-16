@@ -1,6 +1,4 @@
 /// Development fee configuration constants
-/// These values are hardcoded and cannot be changed without recompiling
-
 /// Minimum development fee percentage (10% of Mostro fee)
 pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 

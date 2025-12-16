@@ -86,7 +86,8 @@ mod tests {
                                             publish_mostro_info_interval = 300
                                             bitcoin_price_api_url = "https://api.yadio.io"
                                             fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
-                                            max_orders_per_response = 10"#;
+                                            max_orders_per_response = 10
+                                            dev_fee_percentage = 0.30"#;
 
     // Stub structures for the test
     #[derive(Debug, Deserialize)]

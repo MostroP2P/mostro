@@ -153,6 +153,14 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+/// Calculate development fee from the existing Mostro fee
+/// Returns the amount in satoshis to send to dev fund
+pub fn get_dev_fee(mostro_fee: i64) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    let dev_fee = (mostro_fee as f64) * mostro_settings.dev_fee_percentage;
+    dev_fee.round() as i64
+}
+
 /// Calculates the expiration timestamp for an order.
 ///
 /// This function computes the expiration time based on the current time and application settings.
@@ -365,8 +373,11 @@ async fn prepare_new_order(
     trade_pubkey: PublicKey,
 ) -> Result<Order, MostroError> {
     let mut fee = 0;
+    let mut dev_fee = 0;
+
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
+        dev_fee = get_dev_fee(fee);
     }
 
     // Get expiration time of the order
@@ -381,6 +392,9 @@ async fn prepare_new_order(
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
         fee,
+        dev_fee,
+        dev_fee_paid: false,
+        dev_fee_payment_hash: None,
         fiat_code: new_order.fiat_code.clone(),
         min_amount: new_order.min_amount,
         max_amount: new_order.max_amount,
@@ -635,8 +649,9 @@ pub async fn show_hold_invoice(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
-    // Add fee of seller to hold invoice
-    let new_amount = order.amount + order.fee;
+    // Calculate dev fee and include in seller invoice
+    let dev_fee = get_dev_fee(order.fee);
+    let new_amount = order.amount + order.fee + dev_fee;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -661,6 +676,7 @@ pub async fn show_hold_invoice(
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
+    order.dev_fee = dev_fee;
 
     // We need to publish a new event with the new status
     let pool = db::connect()
@@ -1403,5 +1419,59 @@ mod tests {
             .unwrap();
 
         assert!(orders.is_empty());
+    }
+
+    static SETTINGS_INIT: Once = Once::new();
+
+    fn init_test_settings() {
+        use crate::config::types::*;
+        use crate::config::init_mostro_settings;
+
+        // Initialize settings with test values only once
+        SETTINGS_INIT.call_once(|| {
+            let settings = crate::config::Settings {
+                database: DatabaseSettings {
+                    url: "sqlite::memory:".to_string(),
+                },
+                lightning: LightningSettings::default(),
+                nostr: NostrSettings::default(),
+                mostro: MostroSettings {
+                    dev_fee_percentage: 0.30, // 30% for tests
+                    ..Default::default()
+                },
+                rpc: RpcSettings::default(),
+            };
+            init_mostro_settings(settings);
+        });
+    }
+
+    #[test]
+    fn test_dev_fee_calculation_30_percent() {
+        init_test_settings();
+        let mostro_fee = 1000;
+        let dev_fee = get_dev_fee(mostro_fee);
+        assert_eq!(dev_fee, 300);
+    }
+
+    #[test]
+    fn test_dev_fee_rounding() {
+        init_test_settings();
+        let mostro_fee = 333;
+        let dev_fee = get_dev_fee(mostro_fee);
+        assert_eq!(dev_fee, 100); // 99.9 rounds to 100
+    }
+
+    #[test]
+    fn test_dev_fee_zero_mostro_fee() {
+        init_test_settings();
+        assert_eq!(get_dev_fee(0), 0);
+    }
+
+    #[test]
+    fn test_dev_fee_small_amounts() {
+        init_test_settings();
+        let mostro_fee = 3;
+        let dev_fee = get_dev_fee(mostro_fee);
+        assert_eq!(dev_fee, 1); // 0.9 rounds to 1
     }
 }

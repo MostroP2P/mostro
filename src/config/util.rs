@@ -1,11 +1,11 @@
+use crate::config::constants::{
+    DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
+};
 /// Utility functions for the config module
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::config::{init_mostro_settings, Settings};
-use crate::config::constants::{
-    DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
-};
 use crate::lnurl::ln_exists;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -85,8 +85,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     // Validate settings before initializing
     // Validate settings before initializing
     // Network check for Lightning Address reachability requires async
-    tokio::runtime::Handle::current()
-        .block_on(validate_mostro_settings(&settings))?;
+    tokio::runtime::Handle::current().block_on(validate_mostro_settings(&settings))?;
 
     // Override database URL
     settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());

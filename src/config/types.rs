@@ -125,7 +125,12 @@ impl Default for MostroSettings {
             pow: 0,
             publish_mostro_info_interval: 300,
             bitcoin_price_api_url: "https://api.yadio.io".to_string(),
-            fiat_currencies_accepted: vec!["USD".to_string(), "EUR".to_string(), "ARS".to_string(), "CUP".to_string()],
+            fiat_currencies_accepted: vec![
+                "USD".to_string(),
+                "EUR".to_string(),
+                "ARS".to_string(),
+                "CUP".to_string(),
+            ],
             max_orders_per_response: 10,
             dev_fee_percentage: 0.30,
         }

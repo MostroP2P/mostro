@@ -254,7 +254,10 @@ mod tests {
         });
 
         // Build the LNURL for this port and encode it
-        let url = format!("http://127.0.0.1:{}/.well-known/lnurlp/MostroP2Ptestlnurl", port);
+        let url = format!(
+            "http://127.0.0.1:{}/.well-known/lnurlp/MostroP2Ptestlnurl",
+            port
+        );
 
         // Create LnUrl from URL and encode to string
         let lnurl_obj = LnUrl { url: url.clone() };
@@ -343,7 +346,10 @@ mod tests {
             // Use 127.0.0.1 to match test resolver in cfg(test)
             let valid_address = "MostroP2P@127.0.0.1".to_string();
             let result = is_valid_invoice(valid_address, None, None).await;
-            assert!(result.is_ok(), "Valid Lightning address should pass validation");
+            assert!(
+                result.is_ok(),
+                "Valid Lightning address should pass validation"
+            );
 
             // Test with an invalid Lightning address
             let invalid_address = "nonexistent@127.0.0.1".to_string();

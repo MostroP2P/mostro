@@ -1,6 +1,6 @@
 use crate::config;
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
+use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -631,10 +631,7 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
         .await?;
 
     // Wait for payment result with 30-second timeout
-    let payment_result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        rx.recv()
-    ).await;
+    let payment_result = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await;
 
     match payment_result {
         Ok(Some(msg)) => {
@@ -657,14 +654,15 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
                             status = ?status,
                             "Development fee payment failed"
                         );
-                        Err(MostroInternalErr(ServiceError::LnPaymentError(
-                            format!("Payment failed: {:?}", status)
-                        )))
+                        Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                            "Payment failed: {:?}",
+                            status
+                        ))))
                     }
                 }
             } else {
                 Err(MostroInternalErr(ServiceError::LnPaymentError(
-                    "Invalid payment status".to_string()
+                    "Invalid payment status".to_string(),
                 )))
             }
         }
@@ -675,7 +673,7 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
                 "Payment channel closed unexpectedly"
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Channel closed".to_string()
+                "Channel closed".to_string(),
             )))
         }
         Err(_) => {
@@ -685,7 +683,7 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
                 "Payment timeout after 30 seconds"
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Timeout".to_string()
+                "Timeout".to_string(),
             )))
         }
     }

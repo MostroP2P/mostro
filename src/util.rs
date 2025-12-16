@@ -1436,8 +1436,8 @@ mod tests {
     static SETTINGS_INIT: Once = Once::new();
 
     fn init_test_settings() {
-        use crate::config::types::*;
         use crate::config::init_mostro_settings;
+        use crate::config::types::*;
 
         // Initialize settings with test values only once
         SETTINGS_INIT.call_once(|| {

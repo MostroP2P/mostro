@@ -50,6 +50,24 @@ To handle a Mostro is not going to be that easy, a Mostro admin needs to have a 
 
 Users will be able to rate Mostros and Mostros will compete to obtain more users in order to survive. Bad Mostros should be rejected by users and will lose incentives to keep existing.
 
+## Development Fee
+
+Mostro includes a sustainable development fee mechanism that automatically sends a configurable percentage of the Mostro fee to the official development fund on each successful order.
+
+**Key Features:**
+- **Configurable**: Set `dev_fee_percentage` in `~/.mostro/settings.toml` (default: 30%, minimum: 10%)
+- **Transparent**: Hardcoded destination address `development@mostro.network`
+- **Non-blocking**: Failed dev payments are logged but don't prevent order completion
+- **Seller-pays**: Development fee is included in the seller's hold invoice
+- **Full audit trail**: Database tracking with payment hashes for reconciliation
+
+**Example:**
+- Order: 100,000 sats with 1% Mostro fee (1,000 sats)
+- Development fee at 30%: 300 sats
+- Seller pays: 101,300 sats total (amount + Mostro fee + dev fee)
+
+For technical details and configuration options, see [docs/DEV_FEE_TECHNICAL_SPEC.md](docs/DEV_FEE_TECHNICAL_SPEC.md).
+
 ## Requirements
 
 0. You need Rust version 1.86 or higher to compile.

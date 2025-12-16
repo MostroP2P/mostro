@@ -21,6 +21,53 @@ gpg: Good signature from "Arkanoider <github.913zc@simplelogin.com>" [ultimate]
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
+## Unreleased
+
+### 🚀 Features
+
+* **Development Fee Mechanism**: Implemented sustainable funding system for Mostro development
+  - Automatic development fee payment to `development@mostro.network` on successful orders
+  - Configurable percentage (default 30%, minimum 10%) via `dev_fee_percentage` setting
+  - Non-blocking design: failed payments logged but don't prevent order completion
+  - Seller-pays model: dev fee included in hold invoice amount
+  - Full audit trail with database tracking (`dev_fee`, `dev_fee_paid`, `dev_fee_payment_hash`)
+  - Lightning Address (LNURL) resolution with 30-second timeout
+  - Comprehensive error handling and logging with `dev_fee` target
+  - Startup validation enforces minimum 10% fee requirement
+
+### 🗄️ Database
+
+* **Migration 20251126120000**: Added development fee tracking columns to orders table
+  - `dev_fee` (INTEGER): Fee amount in satoshis
+  - `dev_fee_paid` (INTEGER): Payment status (0/1)
+  - `dev_fee_payment_hash` (CHAR(64)): Lightning payment hash
+  - Backward compatible with existing orders (default values: 0, 0, NULL)
+
+### 📚 Documentation
+
+* Added comprehensive technical specification: `docs/DEV_FEE_TECHNICAL_SPEC.md`
+  - Architecture diagrams and fee flow
+  - Configuration and validation rules
+  - Implementation details and code references
+  - Monitoring queries and log filtering
+  - Troubleshooting guide and manual retry procedures
+* Updated README.md with Development Fee section
+* Unit tests for fee calculation with various edge cases
+
+### 🔧 Configuration
+
+* New setting: `dev_fee_percentage` in `[mostro]` section of `settings.toml`
+* New constants: `MIN_DEV_FEE_PERCENTAGE` (0.10), `MAX_DEV_FEE_PERCENTAGE` (1.0)
+* Hardcoded destination: `DEV_FEE_LIGHTNING_ADDRESS` = "development@mostro.network"
+
+### 📦 Dependencies
+
+* Updated to mostro-core v0.6.57 (includes Order struct dev_fee fields)
+
+### ⚠️ Breaking Changes
+
+None - fully backward compatible with default values
+
 ## What's Changed in 0.15.5
 
 ### 🚀 Features

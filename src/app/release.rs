@@ -437,7 +437,9 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     };
 
     let ln_addr = LightningAddress::from_str(&payment_request);
-    let amount = order.amount as u64 - order.fee as u64;
+    // Buyer receives order amount minus their Mostro fee share minus their dev fee share
+    let buyer_dev_fee = (order.dev_fee / 2) as u64;
+    let amount = order.amount as u64 - order.fee as u64 - buyer_dev_fee;
     let payment_request = if let Ok(addr) = ln_addr {
         resolv_ln_address(&addr.to_string(), amount)
             .await

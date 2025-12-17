@@ -58,13 +58,13 @@ Mostro includes a sustainable development fee mechanism that automatically sends
 - **Configurable**: Set `dev_fee_percentage` in `~/.mostro/settings.toml` (default: 30%, minimum: 10%)
 - **Transparent**: Hardcoded destination address `development@mostro.network`
 - **Non-blocking**: Failed dev payments are logged but don't prevent order completion
-- **Seller-pays**: Development fee is included in the seller's hold invoice
 - **Full audit trail**: Database tracking with payment hashes for reconciliation
 
 **Example:**
 - Order: 100,000 sats with 1% Mostro fee (1,000 sats)
 - Development fee at 30%: 300 sats
-- Seller pays: 101,300 sats total (amount + Mostro fee + dev fee)
+- Seller pays: 100,650 sats total (amount + Mostro fee / 2 + dev fee / 2)
+- Buyer pays: 99,350 sats total (amount - (Mostro fee / 2 + dev fee / 2) )
 
 For technical details and configuration options, see [docs/DEV_FEE_TECHNICAL_SPEC.md](docs/DEV_FEE_TECHNICAL_SPEC.md).
 

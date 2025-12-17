@@ -153,11 +153,13 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
-/// Calculate development fee from the existing Mostro fee
-/// Returns the amount in satoshis to send to dev fund
-pub fn get_dev_fee(mostro_fee: i64) -> i64 {
+/// Calculate total development fee from the total Mostro fee
+/// Takes the TOTAL Mostro fee (both parties combined) and returns the TOTAL dev fee
+/// The returned value should be split 50/50 between buyer and seller
+/// Returns the total amount in satoshis for the dev fund
+pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
     let mostro_settings = Settings::get_mostro();
-    let dev_fee = (mostro_fee as f64) * mostro_settings.dev_fee_percentage;
+    let dev_fee = (total_mostro_fee as f64) * mostro_settings.dev_fee_percentage;
     dev_fee.round() as i64
 }
 
@@ -376,8 +378,9 @@ async fn prepare_new_order(
     let mut dev_fee = 0;
 
     if new_order.amount > 0 {
-        fee = get_fee(new_order.amount);
-        dev_fee = get_dev_fee(fee);
+        fee = get_fee(new_order.amount); // Get split fee (each party's share)
+        let total_mostro_fee = fee * 2; // Calculate total Mostro fee
+        dev_fee = get_dev_fee(total_mostro_fee); // Calculate total dev fee (to be split 50/50)
     }
 
     // Get expiration time of the order
@@ -649,9 +652,9 @@ pub async fn show_hold_invoice(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
-    // Calculate dev fee and include in seller invoice
-    let dev_fee = get_dev_fee(order.fee);
-    let new_amount = order.amount + order.fee + dev_fee;
+    // Seller pays their half of the dev fee (order.dev_fee stores total)
+    let seller_dev_fee = order.dev_fee / 2;
+    let new_amount = order.amount + order.fee + seller_dev_fee;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -676,7 +679,7 @@ pub async fn show_hold_invoice(
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
-    order.dev_fee = dev_fee;
+    // order.dev_fee already set during order creation, no need to update
 
     // We need to publish a new event with the new status
     let pool = db::connect()
@@ -1461,30 +1464,37 @@ mod tests {
     #[test]
     fn test_dev_fee_calculation_30_percent() {
         init_test_settings();
-        let mostro_fee = 1000;
-        let dev_fee = get_dev_fee(mostro_fee);
+        // Total Mostro fee (both parties combined)
+        let total_mostro_fee = 1000;
+        let dev_fee = get_dev_fee(total_mostro_fee);
+        // 30% of 1000 = 300 sats total dev fee (150 buyer + 150 seller)
         assert_eq!(dev_fee, 300);
     }
 
     #[test]
     fn test_dev_fee_rounding() {
         init_test_settings();
-        let mostro_fee = 333;
-        let dev_fee = get_dev_fee(mostro_fee);
-        assert_eq!(dev_fee, 100); // 99.9 rounds to 100
+        // Total Mostro fee with rounding edge case
+        let total_mostro_fee = 333;
+        let dev_fee = get_dev_fee(total_mostro_fee);
+        // 333 × 0.30 = 99.9 → rounds to 100 sats total
+        assert_eq!(dev_fee, 100);
     }
 
     #[test]
     fn test_dev_fee_zero_mostro_fee() {
         init_test_settings();
+        // Zero Mostro fee should result in zero dev fee
         assert_eq!(get_dev_fee(0), 0);
     }
 
     #[test]
     fn test_dev_fee_small_amounts() {
         init_test_settings();
-        let mostro_fee = 3;
-        let dev_fee = get_dev_fee(mostro_fee);
-        assert_eq!(dev_fee, 1); // 0.9 rounds to 1
+        // Small total Mostro fee
+        let total_mostro_fee = 3;
+        let dev_fee = get_dev_fee(total_mostro_fee);
+        // 3 × 0.30 = 0.9 → rounds to 1 sat total
+        assert_eq!(dev_fee, 1);
     }
 }

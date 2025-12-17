@@ -8,7 +8,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Transparent and configurable
 - Non-blocking (failures don't prevent order completion)
 - Full audit trail for accountability
-- Seller-pays model (included in hold invoice)
+- Split payment model (both buyer and seller pay half)
 
 ## Architecture
 
@@ -90,12 +90,14 @@ pub fn get_dev_fee(mostro_fee: i64) -> i64 {
 
 **Formula:**
 ```
-dev_fee = round(mostro_fee × dev_fee_percentage)
+total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
+buyer_dev_fee = total_dev_fee / 2
+seller_dev_fee = total_dev_fee / 2
 ```
 
 **Examples:**
-- Mostro fee: 1,000 sats, Percentage: 30% → Dev fee: 300 sats
-- Mostro fee: 333 sats, Percentage: 30% → Dev fee: 100 sats (rounded)
+- Total Mostro fee: 1,000 sats, Percentage: 30% → Total dev fee: 300 sats (150 buyer + 150 seller)
+- Total Mostro fee: 333 sats, Percentage: 30% → Total dev fee: 100 sats (50 buyer + 50 seller, rounded)
 - Mostro fee: 0 sats → Dev fee: 0 sats
 
 ### Order Creation
@@ -111,17 +113,49 @@ When creating a new order:
 
 **Location:** `src/util.rs::show_hold_invoice()` (lines 651-679)
 
-Seller's hold invoice includes dev fee:
+Seller's hold invoice includes seller's half of the dev fee:
 ```rust
-let dev_fee = get_dev_fee(order.fee);
-let new_amount = order.amount + order.fee + dev_fee;
+let total_dev_fee = get_dev_fee(total_mostro_fee);  // 30% of total Mostro fee
+let seller_dev_fee = total_dev_fee / 2;              // Seller pays half
+let new_amount = order.amount + order.fee + seller_dev_fee;
 ```
 
-**Example:**
-- Order amount: 100,000 sats
-- Mostro fee (1%): 1,000 sats
-- Dev fee (30%): 300 sats
-- **Seller pays:** 101,300 sats
+Buyer's received amount is reduced by buyer's half of the dev fee:
+```rust
+let buyer_dev_fee = total_dev_fee / 2;              // Buyer pays half
+buyer_receives = order.amount - buyer_fee_share - buyer_dev_fee;
+```
+
+### Example Calculation
+
+**Order Amount**: 100,000 sats
+**Mostro Fee (1%)**: 1,000 sats (split: 500 buyer + 500 seller)
+**Dev Fee Percentage**: 30%
+**Total Dev Fee**: 1,000 × 0.30 = 300 sats
+**Dev Fee Split**: 150 sats (buyer) + 150 sats (seller)
+
+**Seller Pays**: 100,000 + 500 + 150 = **100,650 sats**
+**Buyer Receives**: 100,000 - 500 - 150 = **99,350 sats**
+
+**Fee Distribution:**
+- Buyer pays: 500 (Mostro fee) + 150 (dev fee) = **650 sats total**
+- Seller pays: 500 (Mostro fee) + 150 (dev fee) = **650 sats total**
+- Total dev fee collected: **300 sats** (split 50/50 between parties)
+
+### Edge Cases
+
+**Rounding**:
+- Total: 333 sats Mostro fee × 30% = 99.9 → **100 sats total dev fee** (50 buyer + 50 seller after split)
+- Total: 3 sats Mostro fee × 30% = 0.9 → **1 sat total dev fee** (split: 0 buyer + 1 seller, or round-robin)
+- **Odd numbers**: When total dev fee is odd, one party pays 1 sat more (implementation decides which)
+
+**Zero Fee Orders**:
+- If `mostro_fee = 0`, then `total_dev_fee = 0`
+- No dev payment attempted from either party
+
+**Tiny Amounts**:
+- Smallest: 1 sat Mostro fee × 10% = 0.1 → **0 sats** total (rounds to zero, neither party pays)
+- No dev payment attempted for 0 sat dev fees
 
 ### Payment Execution
 
@@ -351,7 +385,9 @@ cargo test test_dev_fee
 
 2. **Fee Calculation:**
    - Create 100,000 sat order with 1% Mostro fee
-   - Verify seller hold invoice: 101,300 sats (100k + 1k + 300)
+   - Verify seller hold invoice: 100,650 sats (100k + 500 + 150)
+   - Verify buyer receives: 99,350 sats (100k - 500 - 150)
+   - Verify total dev fee: 300 sats (150 from buyer + 150 from seller)
 
 3. **Payment Flow:**
    - Complete order successfully

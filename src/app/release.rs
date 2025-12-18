@@ -440,10 +440,24 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
         _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
     };
 
+    // Reset failed_payment flag to prevent scheduler from retrying this order
+    // while we're processing the payment
+    let pool = db::connect().await?;
+    order.failed_payment = false;
+    order
+        .clone()
+        .update(&pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     let ln_addr = LightningAddress::from_str(&payment_request);
     // Buyer receives order amount minus their Mostro fee share minus their dev fee share
     let buyer_dev_fee = (order.dev_fee / 2) as u64;
-    let amount = order.amount as u64 - order.fee as u64 - buyer_dev_fee;
+
+    let amount = (order.amount as u64)
+        .checked_sub(order.fee as u64)
+        .and_then(|a| a.checked_sub(buyer_dev_fee))
+        .ok_or_else(|| MostroCantDo(CantDoReason::InvalidAmount))?;
     let payment_request = if let Ok(addr) = ln_addr {
         resolv_ln_address(&addr.to_string(), amount)
             .await

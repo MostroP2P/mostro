@@ -1,3 +1,4 @@
+use crate::app::release::do_payment;
 use crate::util::{
     enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
     validate_invoice,
@@ -13,12 +14,18 @@ pub async fn pay_new_invoice(
     pool: &Pool<Sqlite>,
     msg: &Message,
 ) -> Result<(), MostroError> {
+    // Reset payment state for new invoice
     order.payment_attempts = 0;
+    order.failed_payment = false;
+
+    // Update order in database BEFORE starting payment
     order
         .clone()
         .update(pool)
         .await
         .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    // Notify buyer that invoice was updated
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order.id),
@@ -28,6 +35,10 @@ pub async fn pay_new_invoice(
         None,
     )
     .await;
+
+    // Start payment with new invoice
+    do_payment(order.clone(), msg.get_inner_message_kind().request_id).await?;
+
     Ok(())
 }
 

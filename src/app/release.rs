@@ -68,7 +68,11 @@ pub async fn check_failure_retries(
         // Clone order
         let mut order_payment_failed = order.clone();
         // Update amount notified to the buyer
-        order_payment_failed.amount = order_payment_failed.amount.saturating_sub(order.fee);
+        let buyer_dev_fee = order.dev_fee / 2;
+        order_payment_failed.amount = order_payment_failed
+            .amount
+            .saturating_sub(order.fee)
+            .saturating_sub(buyer_dev_fee);
         if order_payment_failed.amount <= 0 {
             return Err(MostroCantDo(CantDoReason::InvalidAmount));
         }

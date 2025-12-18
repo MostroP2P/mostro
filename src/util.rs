@@ -695,7 +695,7 @@ pub async fn show_hold_invoice(
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
-    new_order.amount = order.amount + order.fee;
+    new_order.amount = order.amount + order.fee + seller_dev_fee;
 
     // We create a Message to send the hold invoice to seller
     enqueue_order_msg(
@@ -800,7 +800,11 @@ pub async fn set_waiting_invoice_status(
         .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
-    let buyer_final_amount = order.amount.saturating_sub(order.fee);
+    let buyer_dev_fee = order.dev_fee / 2;
+    let buyer_final_amount = order
+        .amount
+        .saturating_sub(order.fee)
+        .saturating_sub(buyer_dev_fee);
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),

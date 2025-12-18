@@ -91,12 +91,12 @@ pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String, Mos
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
         let tag = body["tag"].as_str().unwrap_or("");
         if tag != "payRequest" {
-            return Ok("".to_string());
+            return Err(MostroInternalErr(ServiceError::LnAddressParseError));
         }
         let min = body["minSendable"].as_u64().unwrap_or(0);
         let max = body["maxSendable"].as_u64().unwrap_or(0);
         if min > amount_msat || max < amount_msat {
-            return Ok("".to_string());
+            return Err(MostroInternalErr(ServiceError::LnAddressParseError));
         }
         let callback = body["callback"].as_str().unwrap_or("");
         let callback = format!("{callback}?amount={amount_msat}");
@@ -117,8 +117,10 @@ pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String, Mos
 
             return Ok(pr.to_string());
         }
-        Ok("".to_string())
+        Err(MostroInternalErr(ServiceError::LnPaymentError(
+            "Callback failed".to_string(),
+        )))
     } else {
-        Ok("".to_string())
+        Err(MostroInternalErr(ServiceError::LnAddressParseError))
     }
 }

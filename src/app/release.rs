@@ -536,16 +536,15 @@ async fn payment_success(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // ============ SEND DEVELOPMENT FEE ============
-    match send_dev_fee_payment(order).await {
+    let (dev_fee_paid, dev_fee_payment_hash) = match send_dev_fee_payment(order).await {
         Ok(payment_hash) if !payment_hash.is_empty() => {
-            order.dev_fee_paid = true;
-            order.dev_fee_payment_hash = Some(payment_hash);
             tracing::info!(
                 target: "dev_fee",
                 order_id = %order.id,
                 dev_fee = order.dev_fee,
                 "Development fee payment succeeded"
             );
+            (true, Some(payment_hash))
         }
         Ok(_) => {
             // Empty hash means no dev fee (zero amount)
@@ -554,9 +553,9 @@ async fn payment_success(
                 order_id = %order.id,
                 "No development fee to send"
             );
+            (false, None)
         }
         Err(e) => {
-            order.dev_fee_paid = false;
             tracing::error!(
                 target: "dev_fee",
                 order_id = %order.id,
@@ -564,11 +563,16 @@ async fn payment_success(
                 error = %e,
                 "Development fee payment failed - order completing anyway"
             );
+            (false, None)
         }
-    }
+    };
     // ==============================================
 
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
+    if let Ok(mut order_updated) = update_order_event(my_keys, Status::Success, order).await {
+        // Apply dev_fee changes AFTER update_order_event to ensure they are saved
+        order_updated.dev_fee_paid = dev_fee_paid;
+        order_updated.dev_fee_payment_hash = dev_fee_payment_hash;
+
         let order = order_updated
             .update(&pool)
             .await

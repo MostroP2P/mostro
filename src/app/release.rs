@@ -447,7 +447,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     let amount = (order.amount as u64)
         .checked_sub(order.fee as u64)
         .and_then(|a| a.checked_sub(buyer_dev_fee))
-        .ok_or_else(|| MostroCantDo(CantDoReason::InvalidAmount))?;
+        .ok_or(MostroCantDo(CantDoReason::InvalidAmount))?;
     let payment_request = if let Ok(addr) = ln_addr {
         resolv_ln_address(&addr.to_string(), amount)
             .await

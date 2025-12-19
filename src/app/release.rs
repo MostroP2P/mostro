@@ -564,52 +564,14 @@ async fn payment_success(
             MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
         })?;
 
-    tracing::info!(
-        "Order Id {}: DB connection established, calling send_dev_fee_payment",
-        order.id
-    );
-
-    // ============ SEND DEVELOPMENT FEE ============
-    // Wrap dev fee payment with 45-second timeout to prevent indefinite hanging
-    let dev_fee_result = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        send_dev_fee_payment(order)
-    ).await;
-
-    let (dev_fee_paid, dev_fee_payment_hash) = match dev_fee_result {
-        Ok(Ok(payment_hash)) if !payment_hash.is_empty() => {
-            tracing::info!(
-                "Order Id {}: Development fee payment succeeded - amount: {} sats, hash: {}",
-                order.id,
-                order.dev_fee,
-                payment_hash
-            );
-            (true, Some(payment_hash))
-        }
-        Ok(Ok(_)) => {
-            // Empty hash means no dev fee (zero amount)
-            tracing::debug!("Order Id {}: No development fee to send", order.id);
-            (false, None)
-        }
-        Ok(Err(e)) => {
-            tracing::error!(
-                "Order Id {}: Development fee payment failed (amount: {} sats): {:?} - order completing anyway",
-                order.id,
-                order.dev_fee,
-                e
-            );
-            (false, None)
-        }
-        Err(_timeout) => {
-            // Timeout after 45 seconds
-            tracing::error!(
-                "Order Id {}: Development fee payment timed out after 45 seconds - order completing anyway",
-                order.id
-            );
-            (false, None)
-        }
-    };
-    // ==============================================
+    // Development fee will be processed asynchronously by scheduler
+    if order.dev_fee > 0 {
+        tracing::info!(
+            "Order Id {}: Development fee payment ({} sats) will be processed by scheduler",
+            order.id,
+            order.dev_fee
+        );
+    }
 
     // Update order event to Success status
     let mut order_updated = update_order_event(my_keys, Status::Success, order)
@@ -624,10 +586,6 @@ async fn payment_success(
                 "Failed to update order event".to_string(),
             ))
         })?;
-
-    // Apply dev_fee changes AFTER update_order_event to ensure they are saved
-    order_updated.dev_fee_paid = dev_fee_paid;
-    order_updated.dev_fee_payment_hash = dev_fee_payment_hash;
 
     // Reset failed payment flags after successful payment
     order_updated.failed_payment = false;
@@ -665,7 +623,7 @@ async fn payment_success(
 /// Sends development fee to Mostro development Lightning Address
 /// Returns payment hash on success, error on failure
 /// Errors are non-fatal - logged but don't block order completion
-async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
+pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
     // Check if dev fee exists and is non-zero
     let dev_fee_amount = match order.dev_fee {
         fee if fee > 0 => fee,

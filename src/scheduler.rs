@@ -13,6 +13,7 @@ use config::*;
 use mostro_core::prelude::*;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Kind as NostrKind, Tag};
+use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -26,6 +27,7 @@ pub async fn start_scheduler() {
     job_update_rate_events().await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
+    job_pay_dev_fees().await;
     job_info_event_send().await;
     job_relay_list().await;
     job_update_bitcoin_prices().await;
@@ -196,6 +198,137 @@ async fn job_retry_failed_payments() {
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
+}
+
+/// Job to process unpaid development fees
+/// Runs every payment_retries_interval seconds
+/// Retries indefinitely until payment succeeds
+async fn job_pay_dev_fees() {
+    let ln_settings = Settings::get_ln();
+    let interval = ln_settings.payment_retries_interval as u64;
+
+    // Arc clone db pool for thread safety
+    let pool = get_db_pool();
+
+    tokio::spawn(async move {
+        loop {
+            info!(
+                "Development fee payment job running (every {} seconds) - checking for unpaid dev fees",
+                interval
+            );
+
+            // Query orders with unpaid dev_fee
+            match crate::db::find_orders_with_unpaid_dev_fee(&pool).await {
+                Ok(orders) => {
+                    if orders.is_empty() {
+                        tracing::debug!("No unpaid development fees found");
+                    } else {
+                        tracing::info!("Found {} orders with unpaid dev fees", orders.len());
+
+                        for order in orders.into_iter() {
+                            // Attempt payment with timeout
+                            match process_dev_fee_payment(&pool, order.clone()).await {
+                                Ok(payment_hash) => {
+                                    tracing::info!(
+                                        "Order Id {}: Dev fee payment succeeded - hash: {}",
+                                        order.id,
+                                        payment_hash
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Order Id {}: Dev fee payment failed: {:?} - will retry on next cycle",
+                                        order.id,
+                                        e
+                                    );
+                                    // Continue to next order, will retry this one on next cycle
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to query unpaid dev fees: {:?}", e);
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Process development fee payment for a single order
+/// Returns payment hash on success, error on failure
+async fn process_dev_fee_payment(pool: &SqlitePool, mut order: Order) -> Result<String, MostroError> {
+    use crate::app::release::send_dev_fee_payment;
+    use sqlx_crud::Crud;
+
+    tracing::info!(
+        "Order Id {}: Processing dev fee payment - amount: {} sats",
+        order.id,
+        order.dev_fee
+    );
+
+    // Attempt payment with 45-second timeout
+    let payment_result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        send_dev_fee_payment(&order)
+    ).await;
+
+    match payment_result {
+        Ok(Ok(payment_hash)) if !payment_hash.is_empty() => {
+            // Payment succeeded - update database
+            order.dev_fee_paid = true;
+            order.dev_fee_payment_hash = Some(payment_hash.clone());
+
+            let order_id = order.id;
+            order.update(pool).await.map_err(|e| {
+                tracing::error!(
+                    "Order Id {}: Failed to save dev_fee_paid status: {:?}",
+                    order_id,
+                    e
+                );
+                MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+            })?;
+
+            tracing::info!(
+                "Order Id {}: Dev fee payment saved to database successfully",
+                order_id
+            );
+
+            Ok(payment_hash)
+        }
+        Ok(Ok(_)) => {
+            // Empty hash - shouldn't happen since we query dev_fee > 0
+            tracing::warn!(
+                "Order Id {}: Dev fee payment returned empty hash (dev_fee={})",
+                order.id,
+                order.dev_fee
+            );
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "Empty payment hash".to_string()
+            )))
+        }
+        Ok(Err(e)) => {
+            // Payment failed
+            tracing::error!(
+                "Order Id {}: Dev fee payment failed: {:?}",
+                order.id,
+                e
+            );
+            Err(e)
+        }
+        Err(_timeout) => {
+            // Timeout after 45 seconds
+            tracing::error!(
+                "Order Id {}: Dev fee payment timed out after 45 seconds",
+                order.id
+            );
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "Payment timeout".to_string()
+            )))
+        }
+    }
 }
 
 async fn job_update_rate_events() {

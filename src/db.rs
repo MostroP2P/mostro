@@ -892,6 +892,23 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
     Ok(order)
 }
 
+/// Find orders with unpaid development fees
+/// Query: status='success' AND dev_fee > 0 AND dev_fee_paid = 0
+pub async fn find_orders_with_unpaid_dev_fee(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, MostroError> {
     if let Some(user) = sqlx::query_as::<_, User>(
         r#"

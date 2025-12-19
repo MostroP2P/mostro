@@ -259,7 +259,10 @@ async fn job_pay_dev_fees() {
 
 /// Process development fee payment for a single order
 /// Returns payment hash on success, error on failure
-async fn process_dev_fee_payment(pool: &SqlitePool, mut order: Order) -> Result<String, MostroError> {
+async fn process_dev_fee_payment(
+    pool: &SqlitePool,
+    mut order: Order,
+) -> Result<String, MostroError> {
     use crate::app::release::send_dev_fee_payment;
     use sqlx_crud::Crud;
 
@@ -272,8 +275,9 @@ async fn process_dev_fee_payment(pool: &SqlitePool, mut order: Order) -> Result<
     // Attempt payment with 45-second timeout
     let payment_result = tokio::time::timeout(
         std::time::Duration::from_secs(45),
-        send_dev_fee_payment(&order)
-    ).await;
+        send_dev_fee_payment(&order),
+    )
+    .await;
 
     match payment_result {
         Ok(Ok(payment_hash)) if !payment_hash.is_empty() => {
@@ -306,16 +310,12 @@ async fn process_dev_fee_payment(pool: &SqlitePool, mut order: Order) -> Result<
                 order.dev_fee
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Empty payment hash".to_string()
+                "Empty payment hash".to_string(),
             )))
         }
         Ok(Err(e)) => {
             // Payment failed
-            tracing::error!(
-                "Order Id {}: Dev fee payment failed: {:?}",
-                order.id,
-                e
-            );
+            tracing::error!("Order Id {}: Dev fee payment failed: {:?}", order.id, e);
             Err(e)
         }
         Err(_timeout) => {
@@ -325,7 +325,7 @@ async fn process_dev_fee_payment(pool: &SqlitePool, mut order: Order) -> Result<
                 order.id
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Payment timeout".to_string()
+                "Payment timeout".to_string(),
             )))
         }
     }

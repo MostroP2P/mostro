@@ -531,10 +531,7 @@ async fn payment_success(
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
-    tracing::info!(
-        "Order Id {}: payment_success starting",
-        order.id
-    );
+    tracing::info!("Order Id {}: payment_success starting", order.id);
 
     // Purchase completed message to buyer
     enqueue_order_msg(
@@ -547,22 +544,17 @@ async fn payment_success(
     )
     .await;
 
-    tracing::info!(
-        "Order Id {}: Getting DB connection",
-        order.id
-    );
+    tracing::info!("Order Id {}: Getting DB connection", order.id);
 
     // Get db connection
-    let pool = db::connect()
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "Order Id {}: Failed to connect to database: {:?}",
-                order.id,
-                e
-            );
-            MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
-        })?;
+    let pool = db::connect().await.map_err(|e| {
+        tracing::error!(
+            "Order Id {}: Failed to connect to database: {:?}",
+            order.id,
+            e
+        );
+        MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+    })?;
 
     // Development fee will be processed asynchronously by scheduler
     if order.dev_fee > 0 {
@@ -675,10 +667,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
     let mut ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel(1);
 
-    tracing::info!(
-        "Order Id {}: Sending dev fee payment via LND",
-        order.id
-    );
+    tracing::info!("Order Id {}: Sending dev fee payment via LND", order.id);
     ln_client
         .send_payment(&payment_request, dev_fee_amount, tx)
         .await?;

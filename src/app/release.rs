@@ -488,7 +488,10 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            if let Err(e) = payment_success(&mut order, buyer_pubkey, &my_keys, request_id).await {
+                            if let Err(e) =
+                                payment_success(&mut order, buyer_pubkey, &my_keys, request_id)
+                                    .await
+                            {
                                 tracing::error!(
                                     "Order Id {}: payment_success failed: {:?}",
                                     order.id,
@@ -528,6 +531,11 @@ async fn payment_success(
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
+    tracing::info!(
+        "Order Id {}: payment_success starting",
+        order.id
+    );
+
     // Purchase completed message to buyer
     enqueue_order_msg(
         None,
@@ -539,14 +547,37 @@ async fn payment_success(
     )
     .await;
 
+    tracing::info!(
+        "Order Id {}: Getting DB connection",
+        order.id
+    );
+
     // Get db connection
     let pool = db::connect()
         .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        .map_err(|e| {
+            tracing::error!(
+                "Order Id {}: Failed to connect to database: {:?}",
+                order.id,
+                e
+            );
+            MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+        })?;
+
+    tracing::info!(
+        "Order Id {}: DB connection established, calling send_dev_fee_payment",
+        order.id
+    );
 
     // ============ SEND DEVELOPMENT FEE ============
-    let (dev_fee_paid, dev_fee_payment_hash) = match send_dev_fee_payment(order).await {
-        Ok(payment_hash) if !payment_hash.is_empty() => {
+    // Wrap dev fee payment with 45-second timeout to prevent indefinite hanging
+    let dev_fee_result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        send_dev_fee_payment(order)
+    ).await;
+
+    let (dev_fee_paid, dev_fee_payment_hash) = match dev_fee_result {
+        Ok(Ok(payment_hash)) if !payment_hash.is_empty() => {
             tracing::info!(
                 "Order Id {}: Development fee payment succeeded - amount: {} sats, hash: {}",
                 order.id,
@@ -555,15 +586,12 @@ async fn payment_success(
             );
             (true, Some(payment_hash))
         }
-        Ok(_) => {
+        Ok(Ok(_)) => {
             // Empty hash means no dev fee (zero amount)
-            tracing::debug!(
-                "Order Id {}: No development fee to send",
-                order.id
-            );
+            tracing::debug!("Order Id {}: No development fee to send", order.id);
             (false, None)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(
                 "Order Id {}: Development fee payment failed (amount: {} sats): {:?} - order completing anyway",
                 order.id,
@@ -572,33 +600,65 @@ async fn payment_success(
             );
             (false, None)
         }
+        Err(_timeout) => {
+            // Timeout after 45 seconds
+            tracing::error!(
+                "Order Id {}: Development fee payment timed out after 45 seconds - order completing anyway",
+                order.id
+            );
+            (false, None)
+        }
     };
     // ==============================================
 
-    if let Ok(mut order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        // Apply dev_fee changes AFTER update_order_event to ensure they are saved
-        order_updated.dev_fee_paid = dev_fee_paid;
-        order_updated.dev_fee_payment_hash = dev_fee_payment_hash;
+    // Update order event to Success status
+    let mut order_updated = update_order_event(my_keys, Status::Success, order)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "Order Id {}: Failed to update order event to Success: {:?}",
+                order.id,
+                e
+            );
+            MostroInternalErr(ServiceError::NostrError(
+                "Failed to update order event".to_string(),
+            ))
+        })?;
 
-        // Reset failed payment flags after successful payment
-        order_updated.failed_payment = false;
-        order_updated.payment_attempts = 0;
+    // Apply dev_fee changes AFTER update_order_event to ensure they are saved
+    order_updated.dev_fee_paid = dev_fee_paid;
+    order_updated.dev_fee_payment_hash = dev_fee_payment_hash;
 
-        let order = order_updated
-            .update(&pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        // Send dm to buyer to rate counterpart
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::Rate,
-            None,
-            buyer_pubkey,
-            None,
-        )
-        .await;
-    }
+    // Reset failed payment flags after successful payment
+    order_updated.failed_payment = false;
+    order_updated.payment_attempts = 0;
+
+    // Save to database
+    order_updated.update(&pool).await.map_err(|e| {
+        tracing::error!(
+            "Order Id {}: Failed to save order to database: {:?}",
+            order.id,
+            e
+        );
+        MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+    })?;
+
+    tracing::info!(
+        "Order Id {}: Order successfully updated to Success status",
+        order.id
+    );
+
+    // Send dm to buyer to rate counterpart
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -619,6 +679,11 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
         DEV_FEE_LIGHTNING_ADDRESS
     );
 
+    tracing::info!(
+        "Order Id {}: Resolving Lightning Address for dev fee payment",
+        order.id
+    );
+
     // Resolve Lightning Address to BOLT11 invoice
     let payment_request = resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount as u64)
         .await
@@ -631,6 +696,11 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
             MostroInternalErr(ServiceError::LnAddressParseError)
         })?;
 
+    tracing::info!(
+        "Order Id {}: Lightning Address resolved successfully, got invoice",
+        order.id
+    );
+
     if payment_request.is_empty() {
         tracing::error!(
             "Order Id {}: Lightning Address resolution returned empty invoice",
@@ -640,12 +710,25 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
     }
 
     // Send payment via LND
+    tracing::info!(
+        "Order Id {}: Creating LND client for dev fee payment",
+        order.id
+    );
     let mut ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel(1);
 
+    tracing::info!(
+        "Order Id {}: Sending dev fee payment via LND",
+        order.id
+    );
     ln_client
         .send_payment(&payment_request, dev_fee_amount, tx)
         .await?;
+
+    tracing::info!(
+        "Order Id {}: Waiting for dev fee payment result (30s timeout)",
+        order.id
+    );
 
     // Wait for payment result with 30-second timeout
     let payment_result = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await;

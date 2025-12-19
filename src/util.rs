@@ -782,12 +782,16 @@ pub async fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
     premium: i64,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64, i64)> {
     // Update amount order
     let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
     let fee = get_fee(new_sats_amount);
 
-    Ok((new_sats_amount, fee))
+    // Calculate dev_fee from total Mostro fee
+    let total_mostro_fee = fee * 2;
+    let dev_fee = get_dev_fee(total_mostro_fee);
+
+    Ok((new_sats_amount, fee, dev_fee))
 }
 
 /// Set order sats amount, this used when a buyer takes a sell order

@@ -53,7 +53,8 @@ pub async fn take_buy_action(
         match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
             Ok(amount_fees) => {
                 order.amount = amount_fees.0;
-                order.fee = amount_fees.1
+                order.fee = amount_fees.1;
+                order.dev_fee = amount_fees.2;
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };

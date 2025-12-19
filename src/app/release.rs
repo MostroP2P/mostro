@@ -488,8 +488,13 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ = payment_success(&mut order, buyer_pubkey, &my_keys, request_id)
-                                .await;
+                            if let Err(e) = payment_success(&mut order, buyer_pubkey, &my_keys, request_id).await {
+                                tracing::error!(
+                                    "Order Id {}: payment_success failed: {:?}",
+                                    order.id,
+                                    e
+                                );
+                            }
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -543,29 +548,27 @@ async fn payment_success(
     let (dev_fee_paid, dev_fee_payment_hash) = match send_dev_fee_payment(order).await {
         Ok(payment_hash) if !payment_hash.is_empty() => {
             tracing::info!(
-                target: "dev_fee",
-                order_id = %order.id,
-                dev_fee = order.dev_fee,
-                "Development fee payment succeeded"
+                "Order Id {}: Development fee payment succeeded - amount: {} sats, hash: {}",
+                order.id,
+                order.dev_fee,
+                payment_hash
             );
             (true, Some(payment_hash))
         }
         Ok(_) => {
             // Empty hash means no dev fee (zero amount)
             tracing::debug!(
-                target: "dev_fee",
-                order_id = %order.id,
-                "No development fee to send"
+                "Order Id {}: No development fee to send",
+                order.id
             );
             (false, None)
         }
         Err(e) => {
             tracing::error!(
-                target: "dev_fee",
-                order_id = %order.id,
-                dev_fee = order.dev_fee,
-                error = %e,
-                "Development fee payment failed - order completing anyway"
+                "Order Id {}: Development fee payment failed (amount: {} sats): {:?} - order completing anyway",
+                order.id,
+                order.dev_fee,
+                e
             );
             (false, None)
         }
@@ -610,11 +613,10 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
     };
 
     tracing::info!(
-        target: "dev_fee",
-        order_id = %order.id,
-        amount_sats = dev_fee_amount,
-        destination = %DEV_FEE_LIGHTNING_ADDRESS,
-        "Initiating development fee payment"
+        "Order Id {}: Initiating development fee payment - amount: {} sats to: {}",
+        order.id,
+        dev_fee_amount,
+        DEV_FEE_LIGHTNING_ADDRESS
     );
 
     // Resolve Lightning Address to BOLT11 invoice
@@ -622,20 +624,17 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
         .await
         .map_err(|e| {
             tracing::error!(
-                target: "dev_fee",
-                order_id = %order.id,
-                error = %e,
-                stage = "address_resolution",
-                "Failed to resolve development Lightning Address"
+                "Order Id {}: Failed to resolve development Lightning Address: {:?}",
+                order.id,
+                e
             );
             MostroInternalErr(ServiceError::LnAddressParseError)
         })?;
 
     if payment_request.is_empty() {
         tracing::error!(
-            target: "dev_fee",
-            order_id = %order.id,
-            "Lightning Address resolution returned empty invoice"
+            "Order Id {}: Lightning Address resolution returned empty invoice",
+            order.id
         );
         return Err(MostroInternalErr(ServiceError::LnAddressParseError));
     }
@@ -658,19 +657,17 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
                     PaymentStatus::Succeeded => {
                         let hash = msg.payment.payment_hash;
                         tracing::info!(
-                            target: "dev_fee",
-                            order_id = %order.id,
-                            payment_hash = %hash,
-                            "Development fee payment succeeded"
+                            "Order Id {}: Development fee payment succeeded - hash: {}",
+                            order.id,
+                            hash
                         );
                         Ok(hash)
                     }
                     _ => {
                         tracing::error!(
-                            target: "dev_fee",
-                            order_id = %order.id,
-                            status = ?status,
-                            "Development fee payment failed"
+                            "Order Id {}: Development fee payment failed - status: {:?}",
+                            order.id,
+                            status
                         );
                         Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
                             "Payment failed: {:?}",
@@ -686,9 +683,8 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
         }
         Ok(None) => {
             tracing::error!(
-                target: "dev_fee",
-                order_id = %order.id,
-                "Payment channel closed unexpectedly"
+                "Order Id {}: Development fee payment channel closed unexpectedly",
+                order.id
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
                 "Channel closed".to_string(),
@@ -696,9 +692,8 @@ async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
         }
         Err(_) => {
             tracing::error!(
-                target: "dev_fee",
-                order_id = %order.id,
-                "Payment timeout after 30 seconds"
+                "Order Id {}: Development fee payment timeout after 30 seconds",
+                order.id
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(
                 "Timeout".to_string(),

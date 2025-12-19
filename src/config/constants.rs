@@ -6,4 +6,4 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
 /// Official Mostro development Lightning Address
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "mostro_p2p@sats.mobi";
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.com";

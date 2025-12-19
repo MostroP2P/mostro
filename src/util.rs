@@ -1095,11 +1095,15 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     let mut payment_request = None;
     // if payment request is present
     if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
+        // Calculate total buyer fees (Mostro fee + dev fee)
+        let buyer_dev_fee = order.dev_fee / 2;
+        let total_buyer_fees = order.fee + buyer_dev_fee;
+
         // if invoice is valid
         if is_valid_invoice(
             pr.clone(),
             Some(order.amount as u64),
-            Some(order.fee as u64),
+            Some(total_buyer_fees as u64),
         )
         .await
         .is_err()

@@ -272,9 +272,9 @@ async fn process_dev_fee_payment(
         order.dev_fee
     );
 
-    // Attempt payment with 45-second timeout
+    // Timeout increased to 50s to accommodate 15s LNURL + 25s payment = 40s max
     let payment_result = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
+        std::time::Duration::from_secs(50),
         send_dev_fee_payment(&order),
     )
     .await;
@@ -319,9 +319,9 @@ async fn process_dev_fee_payment(
             Err(e)
         }
         Err(_timeout) => {
-            // Timeout after 45 seconds
+            // Timeout after 50 seconds
             tracing::error!(
-                "Order Id {}: Dev fee payment timed out after 45 seconds",
+                "Order Id {}: Dev fee payment timed out after 50 seconds",
                 order.id
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(

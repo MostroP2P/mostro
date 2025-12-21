@@ -2,7 +2,7 @@ use crate::config;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
-use crate::lightning::LndConnector;
+use crate::lightning::{LndConnector, PaymentMessage};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_event, order_to_tags};
 use crate::util::{
@@ -630,24 +630,37 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
     );
 
     tracing::info!(
-        "Order Id {}: Resolving Lightning Address for dev fee payment",
-        order.id
+        "Order Id {}: [Step 1/3] Starting LNURL resolution for {}",
+        order.id,
+        DEV_FEE_LIGHTNING_ADDRESS
     );
 
-    // Resolve Lightning Address to BOLT11 invoice
-    let payment_request = resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount as u64)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "Order Id {}: Failed to resolve development Lightning Address: {:?}",
-                order.id,
-                e
-            );
-            MostroInternalErr(ServiceError::LnAddressParseError)
-        })?;
+    // Resolve Lightning Address to BOLT11 invoice with 15-second timeout
+    let payment_request = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount as u64),
+    )
+    .await
+    .map_err(|_| {
+        tracing::error!(
+            "Order Id {}: [Step 1/3 FAILED] LNURL resolution timed out after 15 seconds",
+            order.id
+        );
+        MostroInternalErr(ServiceError::LnPaymentError(
+            "LNURL timeout".to_string(),
+        ))
+    })?
+    .map_err(|e| {
+        tracing::error!(
+            "Order Id {}: [Step 1/3 FAILED] Failed to resolve development Lightning Address: {:?}",
+            order.id,
+            e
+        );
+        MostroInternalErr(ServiceError::LnAddressParseError)
+    })?;
 
     tracing::info!(
-        "Order Id {}: Lightning Address resolved successfully, got invoice",
+        "Order Id {}: [Step 1/3 SUCCESS] LNURL resolved successfully, got invoice",
         order.id
     );
 
@@ -661,25 +674,63 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
 
     // Send payment via LND
     tracing::info!(
-        "Order Id {}: Creating LND client for dev fee payment",
+        "Order Id {}: [Step 2/3] Creating LND client for dev fee payment",
         order.id
     );
     let mut ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel(1);
 
-    tracing::info!("Order Id {}: Sending dev fee payment via LND", order.id);
-    ln_client
-        .send_payment(&payment_request, dev_fee_amount, tx)
-        .await?;
-
     tracing::info!(
-        "Order Id {}: Waiting for dev fee payment result (30s timeout)",
+        "Order Id {}: [Step 3/3] Sending dev fee payment via LND",
         order.id
     );
 
-    // Wait for payment result with 30-second timeout
-    let payment_result = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await;
+    // Wrap send_payment in a 5-second timeout to prevent hanging
+    let send_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ln_client.send_payment(&payment_request, dev_fee_amount, tx),
+    )
+    .await;
 
+    match send_result {
+        Ok(Ok(_)) => {
+            // Payment request sent successfully, now wait for result
+            tracing::info!(
+                "Order Id {}: Waiting for dev fee payment result (25s timeout)",
+                order.id
+            );
+
+            // Wait for payment result with 25-second timeout
+            let payment_result =
+                tokio::time::timeout(std::time::Duration::from_secs(25), rx.recv()).await;
+
+            match_payment_result(payment_result, &order)
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                "Order Id {}: [Step 3/3 FAILED] send_payment returned error: {:?}",
+                order.id,
+                e
+            );
+            Err(e)
+        }
+        Err(_) => {
+            tracing::error!(
+                "Order Id {}: [Step 3/3 FAILED] send_payment timed out after 5 seconds",
+                order.id
+            );
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "send_payment timeout".to_string(),
+            )))
+        }
+    }
+}
+
+// Helper function to handle payment result matching
+fn match_payment_result(
+    payment_result: Result<Option<PaymentMessage>, tokio::time::error::Elapsed>,
+    order: &Order,
+) -> Result<String, MostroError> {
     match payment_result {
         Ok(Some(msg)) => {
             if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
@@ -687,7 +738,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
                     PaymentStatus::Succeeded => {
                         let hash = msg.payment.payment_hash;
                         tracing::info!(
-                            "Order Id {}: Development fee payment succeeded - hash: {}",
+                            "Order Id {}: [Step 3/3 SUCCESS] Development fee payment succeeded - hash: {}",
                             order.id,
                             hash
                         );
@@ -695,7 +746,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
                     }
                     _ => {
                         tracing::error!(
-                            "Order Id {}: Development fee payment failed - status: {:?}",
+                            "Order Id {}: [Step 3/3 FAILED] Development fee payment failed - status: {:?}",
                             order.id,
                             status
                         );
@@ -722,7 +773,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         }
         Err(_) => {
             tracing::error!(
-                "Order Id {}: Development fee payment timeout after 30 seconds",
+                "Order Id {}: [Step 3/3 FAILED] LND payment timed out after 25 seconds",
                 order.id
             );
             Err(MostroInternalErr(ServiceError::LnPaymentError(

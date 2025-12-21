@@ -109,6 +109,82 @@ When creating a new order:
 2. Calculate dev fee: `dev_fee = get_dev_fee(fee)`
 3. Store in Order struct with `dev_fee_paid = false`
 
+### Market Price Orders and Dev Fee Reset
+
+**Critical Behavior for Market Price Orders:**
+
+When a user takes a market price order, the following sequence occurs:
+
+1. **Order Taken** (status changes from `pending` to `waiting-buyer-invoice` or `waiting-payment`):
+   - Dev fee is calculated based on current market price
+   - `order.dev_fee` field is updated with the calculated amount
+   - Order waits for taker to provide invoice (sell order) or make payment (buy order)
+
+2. **Taker Abandons Order** (doesn't provide invoice or make payment):
+   - Order status is reset back to `pending`
+   - **CRITICAL:** `order.dev_fee` field **MUST** be reset to `0`
+   - This prevents incorrect dev fee charges if order is re-taken at different price
+
+3. **Why Reset is Necessary:**
+   - Market prices fluctuate continuously
+   - Next taker may take order at different fiat amount
+   - Mostro fee and dev fee must be recalculated for new amount
+   - Leaving old dev_fee value would cause incorrect accounting
+
+**Example Scenario:**
+
+```
+Initial Order: 100,000 sats at $50,000/BTC (market price)
+- Mostro fee: 1,000 sats
+- Dev fee (30%): 300 sats
+- Order status: pending, dev_fee: 0
+
+Taker 1 takes order at $50,000/BTC:
+- Order status: waiting-buyer-invoice
+- Dev fee calculated: 300 sats
+- Order dev_fee: 300
+
+Taker 1 abandons (doesn't provide invoice):
+- Order status: pending
+- Dev fee RESET: 0  ← CRITICAL RESET
+- Order dev_fee: 0
+
+Taker 2 takes order at $52,000/BTC (price increased):
+- Order status: waiting-buyer-invoice
+- Dev fee recalculated: 310 sats (new amount)
+- Order dev_fee: 310
+
+Taker 2 completes order:
+- Order status: success
+- Dev fee paid: 310 sats (correct amount for actual trade)
+```
+
+**Implementation Requirements:**
+
+When order status transitions back to `pending` from any intermediate state (`waiting-buyer-invoice`, `waiting-payment`, etc.):
+
+```rust
+// Reset order state for market price orders
+if order.is_market_price() {
+    order.dev_fee = 0;  // Reset to zero
+    order.status = Status::Pending;
+    order.update(pool).await?;
+}
+```
+
+**Database Consistency:**
+
+Orders in `pending` status should always have `dev_fee = 0` for market price orders. You can verify this:
+
+```sql
+-- Should return 0 rows (all pending market orders should have dev_fee = 0)
+SELECT id, premium, dev_fee
+FROM orders
+WHERE status = 'pending'
+  AND premium IS NULL  -- market price indicator
+  AND dev_fee != 0;
+```
+
 ### Hold Invoice Generation
 
 **Location:** `src/util.rs::show_hold_invoice()` (lines 651-679)
@@ -159,38 +235,98 @@ buyer_receives = order.amount - buyer_fee_share - buyer_dev_fee;
 
 ### Payment Execution
 
-**Location:** `src/app/release.rs::send_dev_fee_payment()` (lines 554-659)
+**Location:** `src/app/release.rs::send_dev_fee_payment()` (lines 618-784)
 
-**Flow:**
-1. Verify dev_fee > 0
-2. Resolve Lightning Address via LNURL: `resolv_ln_address()`
-3. Create LND connector
-4. Send payment with 30-second timeout
-5. Return payment hash or error
+**Scheduler-Based Payment Trigger:**
 
-**Non-blocking Design:**
+The dev fee payment is **NOT** executed immediately during order release. Instead:
+
+1. **Order Release** (`src/app/release.rs::payment_success()`):
+   - Buyer receives their satoshis successfully
+   - Order is marked as `status = 'success'`
+   - Order is **enqueued for scheduler processing** by marking `dev_fee_paid = false`
+   - Order completion notifications sent to both parties
+
+2. **Scheduler Processing** (`src/scheduler.rs::process_dev_fee_payment()`):
+   - Runs every 60 seconds
+   - Queries database for orders where: `status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0`
+   - Processes each unpaid dev fee asynchronously
+   - Timeout: 50 seconds per payment attempt
+
+**Why Scheduler-Based?**
+- **Non-blocking order completion:** Buyer receives sats immediately, dev fee payment happens asynchronously
+- **Retry mechanism:** Failed payments are automatically retried on the next cycle (60 seconds)
+- **Fault tolerance:** Order completes successfully even if dev fee payment fails temporarily
+- **Better user experience:** Users don't wait for dev fee payment during order release
+
+**Payment Flow (3 Steps with Timeouts):**
+
 ```rust
-match send_dev_fee_payment(order).await {
-    Ok(hash) if !hash.is_empty() => {
-        order.dev_fee_paid = true;
-        order.dev_fee_payment_hash = Some(hash);
-    }
-    Err(e) => {
-        order.dev_fee_paid = false;
-        // Log error but continue order completion
-    }
+// [Step 1/3] LNURL resolution (15 second timeout)
+let payment_request = tokio::time::timeout(
+    std::time::Duration::from_secs(15),
+    resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount)
+).await?;
+
+// [Step 2/3] Create LND connector
+let ln_client = LndConnector::new().await?;
+
+// [Step 3/3] Send payment (5 second timeout for send_payment call + 25 second timeout for payment result)
+let send_result = tokio::time::timeout(
+    std::time::Duration::from_secs(5),
+    ln_client.send_payment(&payment_request, dev_fee_amount, tx)
+).await?;
+
+// Wait for payment result (25 second timeout)
+let payment_result = tokio::time::timeout(
+    std::time::Duration::from_secs(25),
+    rx.recv()
+).await?;
+```
+
+**Total Time Budget:**
+- LNURL resolution: 15s max
+- send_payment call: 5s max (prevents hanging on self-payments or network issues)
+- Payment result wait: 25s max
+- **Total: 45s max** (under 50s scheduler timeout)
+
+**Success Response:**
+```rust
+Ok(hash) => {
+    order.dev_fee_paid = true;
+    order.dev_fee_payment_hash = Some(hash);
+    // Database updated, won't be retried
+}
+```
+
+**Failure Response:**
+```rust
+Err(e) => {
+    order.dev_fee_paid = false;
+    // Logged for audit
+    // Will be retried on next scheduler cycle (60 seconds)
 }
 ```
 
 ### Error Handling
 
 **Payment Failures:**
-- LNURL resolution failure
+- LNURL resolution failure (timeout: 15 seconds)
+- LND send_payment hanging (timeout: 5 seconds)
 - LND connection error
 - Payment routing failure
-- Timeout (30 seconds)
+- Payment result timeout (25 seconds)
+- Scheduler timeout (50 seconds total)
 
-**Response:** All errors logged with `target: "dev_fee"` but order completes successfully.
+**Response:** All errors logged but order completes successfully. Failed payments are automatically retried on next scheduler cycle (60 seconds).
+
+**Common Error Scenarios:**
+
+1. **Self-Payment Attempts:** When dev fee destination uses same Lightning node as Mostro, LND may hang trying to route payment. The 5-second timeout on `send_payment()` prevents indefinite blocking.
+
+2. **LNURL Resolution Failures:** Network issues or DNS problems resolving `development@mostro.network`. 15-second timeout ensures fast failure.
+
+3. **Routing Failures:** No route found to destination or insufficient liquidity. Payment fails after attempting routing for up to 25 seconds.
 
 ## Database Schema
 
@@ -296,9 +432,12 @@ Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 - Review error logs: `RUST_LOG="dev_fee=error" mostrod`
 
 **3. Payment Timeouts**
-- Current timeout: 30 seconds
-- May indicate routing issues or network congestion
-- Orders still complete successfully
+- LNURL resolution timeout: 15 seconds (indicates DNS/network issues)
+- send_payment timeout: 5 seconds (indicates LND hanging, often self-payment attempts)
+- Payment result timeout: 25 seconds (indicates routing issues or network congestion)
+- Total scheduler timeout: 50 seconds
+- Orders still complete successfully regardless of dev fee payment failures
+- Failed payments automatically retry every 60 seconds via scheduler
 
 ### Manual Retry Procedure
 
@@ -346,10 +485,12 @@ WHERE id = '<order_id>';
 
 ### Latency
 
-- LNURL resolution: ~1-3 seconds
-- Payment execution: ~2-5 seconds
-- Timeout: 30 seconds maximum
-- **Total order delay:** None (payment runs after order completion notification)
+- LNURL resolution: ~1-3 seconds (15s timeout)
+- LND send_payment call: ~100-500ms (5s timeout)
+- Payment execution: ~2-5 seconds (25s timeout)
+- Total payment time: ~3-8 seconds typical, 45s maximum
+- Scheduler processing interval: 60 seconds
+- **Total order delay:** None (payment runs asynchronously via scheduler after buyer receives sats)
 
 ### Resource Usage
 
@@ -448,11 +589,12 @@ If issues arise:
 
 ### Potential Improvements
 
-- Retry mechanism for failed payments
-- Configurable timeout duration
-- Multiple destination addresses (split funding)
-- Real-time payment status dashboard
-- Automatic reconciliation reports
+- **Retry attempt counter:** Track number of payment attempts per order (currently retries indefinitely every 60 seconds)
+- **Configurable timeout durations:** Make LNURL, send_payment, and payment result timeouts configurable
+- **Multiple destination addresses:** Split funding across multiple development contributors
+- **Real-time payment status dashboard:** Monitor dev fee payment success rates and failures
+- **Automatic reconciliation reports:** Generate periodic reports of collected vs. expected dev fees
+- **Exponential backoff:** Implement increasing retry intervals for persistent failures
 
 ### Not Recommended
 

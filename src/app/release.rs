@@ -646,9 +646,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
             "Order Id {}: [Step 1/3 FAILED] LNURL resolution timed out after 15 seconds",
             order.id
         );
-        MostroInternalErr(ServiceError::LnPaymentError(
-            "LNURL timeout".to_string(),
-        ))
+        MostroInternalErr(ServiceError::LnPaymentError("LNURL timeout".to_string()))
     })?
     .map_err(|e| {
         tracing::error!(
@@ -704,7 +702,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
             let payment_result =
                 tokio::time::timeout(std::time::Duration::from_secs(25), rx.recv()).await;
 
-            match_payment_result(payment_result, &order)
+            match_payment_result(payment_result, order)
         }
         Ok(Err(e)) => {
             tracing::error!(

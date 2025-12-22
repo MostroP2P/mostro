@@ -51,6 +51,9 @@ bitcoin_price_api_url = "https://api.yadio.io"
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
 # Maximum orders per response in orders action
 max_orders_per_response = 10
+# Development sustainability fee
+# Percentage of Mostro fee sent to development fund (0.30 means 30% of the Mostro fee)
+dev_fee_percentage = 0.30
 
 [database]
 url = "sqlite://mostro.db"

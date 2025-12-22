@@ -1,4 +1,5 @@
 // Mostro module for configurataion settings
+pub mod constants;
 pub mod settings;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.
@@ -14,6 +15,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use tokio::sync::RwLock;
 
 // Re-export for convenience
+pub use constants::{DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use secrecy::SecretString;

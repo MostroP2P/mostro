@@ -75,7 +75,7 @@ impl Default for RpcSettings {
 
 /// Mostro configuration settings
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MostroSettings {
     /// Fee percentage for the Mostro
     pub fee: f64,
@@ -105,6 +105,36 @@ pub struct MostroSettings {
     pub fiat_currencies_accepted: Vec<String>,
     /// Maximum orders per response in orders action
     pub max_orders_per_response: u8,
+    /// Development fee as percentage of Mostro fee (0.10 to 1.0)
+    /// Example: 0.30 means 30% of the Mostro fee goes to development
+    pub dev_fee_percentage: f64,
+}
+
+impl Default for MostroSettings {
+    fn default() -> Self {
+        Self {
+            fee: 0.0,
+            max_routing_fee: 0.001,
+            max_order_amount: 1000000,
+            min_payment_amount: 100,
+            expiration_hours: 24,
+            expiration_seconds: 900,
+            user_rates_sent_interval_seconds: 3600,
+            max_expiration_days: 15,
+            publish_relays_interval: 60,
+            pow: 0,
+            publish_mostro_info_interval: 300,
+            bitcoin_price_api_url: "https://api.yadio.io".to_string(),
+            fiat_currencies_accepted: vec![
+                "USD".to_string(),
+                "EUR".to_string(),
+                "ARS".to_string(),
+                "CUP".to_string(),
+            ],
+            max_orders_per_response: 10,
+            dev_fee_percentage: 0.30,
+        }
+    }
 }
 
 // Macro call here to implement the TryFrom trait for each of the structs in Settings

@@ -365,6 +365,7 @@ async fn prepare_new_order(
     trade_pubkey: PublicKey,
 ) -> Result<Order, MostroError> {
     let mut fee = 0;
+    let dev_fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
     }
@@ -381,6 +382,9 @@ async fn prepare_new_order(
         payment_method: new_order.payment_method.clone(),
         amount: new_order.amount,
         fee,
+        dev_fee,
+        dev_fee_paid: false,
+        dev_fee_payment_hash: None,
         fiat_code: new_order.fiat_code.clone(),
         min_amount: new_order.min_amount,
         max_amount: new_order.max_amount,
@@ -1199,6 +1203,10 @@ mod tests {
             .unwrap();
 
         sqlx::query(include_str!("../migrations/20221222153301_orders.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/20251126120000_dev_fee.sql"))
             .execute(&pool)
             .await
             .unwrap();

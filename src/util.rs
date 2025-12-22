@@ -153,6 +153,17 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+
+/// Calculate total development fee from the total Mostro fee
+/// Takes the TOTAL Mostro fee (both parties combined) and returns the TOTAL dev fee
+/// The returned value should be split 50/50 between buyer and seller
+/// Returns the total amount in satoshis for the dev fund
+pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
+    let mostro_settings = Settings::get_mostro();
+    let dev_fee = (total_mostro_fee as f64) * mostro_settings.dev_fee_percentage;
+    dev_fee.round() as i64
+}
+
 /// Calculates the expiration timestamp for an order.
 ///
 /// This function computes the expiration time based on the current time and application settings.
@@ -365,9 +376,11 @@ async fn prepare_new_order(
     trade_pubkey: PublicKey,
 ) -> Result<Order, MostroError> {
     let mut fee = 0;
-    let dev_fee = 0;
+    let mut dev_fee = 0;
     if new_order.amount > 0 {
-        fee = get_fee(new_order.amount);
+        fee = get_fee(new_order.amount); // Get split fee (each party's share)
+        let total_mostro_fee = fee * 2; // Calculate total Mostro fee
+        dev_fee = get_dev_fee(total_mostro_fee); // Calculate total dev fee (to be split 50/50)
     }
 
     // Get expiration time of the order
@@ -639,8 +652,9 @@ pub async fn show_hold_invoice(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
-    // Add fee of seller to hold invoice
-    let new_amount = order.amount + order.fee;
+    // Seller pays their half of the dev fee (order.dev_fee stores total)
+    let seller_dev_fee = order.dev_fee / 2;
+    let new_amount = order.amount + order.fee + seller_dev_fee;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -680,7 +694,7 @@ pub async fn show_hold_invoice(
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
-    new_order.amount = order.amount + order.fee;
+    new_order.amount = order.amount + order.fee + seller_dev_fee;
 
     // We create a Message to send the hold invoice to seller
     enqueue_order_msg(
@@ -785,7 +799,12 @@ pub async fn set_waiting_invoice_status(
         .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
-    let buyer_final_amount = order.amount.saturating_sub(order.fee);
+    // Subtract buyer's half of the dev fee from received amount
+    let buyer_dev_fee = order.dev_fee / 2;
+    let buyer_final_amount = order
+        .amount
+        .saturating_sub(order.fee)
+        .saturating_sub(buyer_dev_fee);
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),
@@ -1411,5 +1430,33 @@ mod tests {
             .unwrap();
 
         assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn test_get_dev_fee_basic() {
+        // 1000 sats Mostro fee at 30% -> 300 sats
+        // Use Settings default (0.30)
+        let fee = get_dev_fee(1_000);
+        assert_eq!(fee, 300);
+    }
+
+    #[test]
+    fn test_get_dev_fee_rounding() {
+        // 333 * 0.30 = 99.9 -> rounds to 100
+        let fee = get_dev_fee(333);
+        assert_eq!(fee, 100);
+    }
+
+    #[test]
+    fn test_get_dev_fee_zero() {
+        let fee = get_dev_fee(0);
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn test_get_dev_fee_tiny_amounts() {
+        // With default 30%, 1 * 0.30 = 0.3 -> 0
+        let fee = get_dev_fee(1);
+        assert_eq!(fee, 0);
     }
 }

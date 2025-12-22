@@ -19,6 +19,8 @@ fn reset_api_quotes(order: &mut Order) {
     if order.price_from_api {
         order.amount = 0;
         order.fee = 0;
+        // Also reset dev fee to ensure fresh recalculation on re-take
+        order.dev_fee = 0;
     }
 }
 

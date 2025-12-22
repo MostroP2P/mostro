@@ -153,7 +153,6 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
-
 /// Calculate total development fee from the total Mostro fee
 /// Takes the TOTAL Mostro fee (both parties combined) and returns the TOTAL dev fee
 /// The returned value should be split 50/50 between buyer and seller

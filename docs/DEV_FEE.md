@@ -10,6 +10,40 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Full audit trail for accountability
 - Split payment model (both buyer and seller pay half)
 
+## Implementation Status
+
+### Phase 1: Infrastructure ✅ COMPLETE
+
+**What's Implemented:**
+- Configuration constants (MIN/MAX percentages, Lightning address) in `src/config/constants.rs`
+- Settings validation on daemon startup in `src/config/util.rs`
+- Database schema with 3 columns: `dev_fee`, `dev_fee_paid`, `dev_fee_payment_hash`
+- Database fields initialized in order creation (currently hardcoded to 0)
+- Default dev_fee_percentage: 0.30 (30%)
+
+**Status:** Ready for Phase 2 implementation
+
+### Phase 2: Fee Calculation ⚠️ TO IMPLEMENT
+
+**Required Components:**
+- `get_dev_fee()` function in `src/util.rs`
+- Integration with `prepare_new_order()` for fee calculation
+- Integration with `show_hold_invoice()` for including dev fee in invoice amounts
+- Unit tests for fee calculation logic
+
+**Status:** Not yet implemented - currently all orders created with dev_fee = 0
+
+### Phase 3: Payment Execution ⚠️ TO IMPLEMENT
+
+**Required Components:**
+- `send_dev_fee_payment()` function in `src/app/release.rs`
+- Integration with `payment_success()` for triggering dev fee payment
+- Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
+- Error handling and retry logic
+- Payment timeout handling (LNURL: 15s, send_payment: 5s, result: 25s)
+
+**Status:** Not yet implemented - no dev fee payments are currently being made
+
 ## Architecture
 
 ### Fee Flow Diagram
@@ -78,7 +112,11 @@ dev_fee_percentage = 0.30
 
 ### Fee Calculation
 
-**Function:** `src/util.rs::get_dev_fee()`
+**Current State:** NOT IMPLEMENTED - The `get_dev_fee()` function does not exist in the codebase.
+
+**Required Implementation:**
+
+Create function `get_dev_fee()` in `src/util.rs`:
 
 ```rust
 pub fn get_dev_fee(mostro_fee: i64) -> i64 {
@@ -88,7 +126,7 @@ pub fn get_dev_fee(mostro_fee: i64) -> i64 {
 }
 ```
 
-**Formula:**
+**Formula Specification:**
 ```
 total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
 buyer_dev_fee = total_dev_fee / 2
@@ -102,7 +140,9 @@ seller_dev_fee = total_dev_fee / 2
 
 ### Order Creation
 
-**Location:** `src/util.rs::prepare_new_order()` (lines 375-407)
+**Current State:** Orders are created with `dev_fee = 0` (hardcoded). Database fields `dev_fee_paid` and `dev_fee_payment_hash` are initialized to `false` and `None` respectively.
+
+**Required Implementation:** Update `src/util.rs::prepare_new_order()`
 
 When creating a new order:
 1. Calculate Mostro fee: `fee = get_fee(amount)`
@@ -187,9 +227,11 @@ WHERE status = 'pending'
 
 ### Hold Invoice Generation
 
-**Location:** `src/util.rs::show_hold_invoice()` (lines 651-679)
+**Current State:** Hold invoices do not include dev fee. Currently: `new_amount = order.amount + order.fee` (no dev fee component).
 
-Seller's hold invoice includes seller's half of the dev fee:
+**Required Implementation:** Update `src/util.rs::show_hold_invoice()`
+
+Seller's hold invoice should include seller's half of the dev fee:
 ```rust
 let total_dev_fee = get_dev_fee(total_mostro_fee);  // 30% of total Mostro fee
 let seller_dev_fee = total_dev_fee / 2;              // Seller pays half
@@ -235,9 +277,13 @@ buyer_receives = order.amount - buyer_fee_share - buyer_dev_fee;
 
 ### Payment Execution
 
+**Current State:** NOT IMPLEMENTED - No dev fee payment logic exists. Orders complete without any dev fee payment attempts.
+
+**Required Implementation:**
+
 **Scheduler-Based Payment Trigger:**
 
-The dev fee payment is **NOT** executed immediately during order release. Instead:
+The dev fee payment should **NOT** be executed immediately during order release. Instead:
 
 1. **Order Release** (`src/app/release.rs::payment_success()`):
    - Buyer receives their satoshis successfully
@@ -257,7 +303,11 @@ The dev fee payment is **NOT** executed immediately during order release. Instea
 - **Fault tolerance:** Order completes successfully even if dev fee payment fails temporarily
 - **Better user experience:** Users don't wait for dev fee payment during order release
 
-**Payment Flow (3 Steps with Timeouts):**
+**Payment Flow Specification (3 Steps with Timeouts):**
+
+Implementation in `src/app/release.rs::send_dev_fee_payment()`:
+
+
 
 ```rust
 // [Step 1/3] LNURL resolution (15 second timeout)
@@ -349,6 +399,93 @@ ALTER TABLE orders ADD COLUMN dev_fee_payment_hash CHAR(64);
 - Existing orders: dev_fee = 0, dev_fee_paid = 0
 - No migration required for existing data
 - Daemon handles NULL/zero values gracefully
+
+## Implementation Roadmap
+
+This section provides a checklist for implementing the remaining phases of the development fee feature.
+
+### Phase 2: Fee Calculation (Estimated: 4-8 hours)
+
+**Prerequisites:** Phase 1 complete ✅
+
+**Implementation Tasks:**
+- [ ] Implement `get_dev_fee()` function in `src/util.rs`
+  - Input: `mostro_fee: i64`
+  - Output: `i64` (rounded dev fee amount)
+  - Logic: `(mostro_fee as f64) * dev_fee_percentage`, rounded
+- [ ] Update `prepare_new_order()` in `src/util.rs`
+  - Change: `let dev_fee = 0;` → `let dev_fee = get_dev_fee(fee);`
+  - Ensure dev_fee is stored in Order struct
+- [ ] Update `show_hold_invoice()` in `src/util.rs`
+  - Add seller dev fee to hold invoice amount: `order.amount + order.fee + (dev_fee / 2)`
+  - Subtract buyer dev fee from received amount: `order.amount - buyer_fee - (dev_fee / 2)`
+- [ ] Add unit tests for `get_dev_fee()` in `src/util.rs::tests`
+  - Test standard calculations (100 sats @ 30% = 30 sats)
+  - Test rounding (333 sats @ 30% = 100 sats)
+  - Test zero fee (0 sats → 0 sats)
+  - Test tiny amounts (1 sat @ 10% = 0 sats)
+- [ ] Integration testing with various order amounts
+  - Verify seller pays correct amount
+  - Verify buyer receives correct amount
+  - Verify dev_fee stored correctly in database
+
+**Deliverables:** Orders created with correct dev_fee amounts, included in hold invoices
+
+### Phase 3: Payment Execution (Estimated: 12-20 hours)
+
+**Prerequisites:** Phase 2 complete
+
+**Implementation Tasks:**
+- [ ] Implement `send_dev_fee_payment()` in `src/app/release.rs`
+  - Step 1: LNURL resolution with 15-second timeout
+    - Call: `resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, amount)`
+    - Error handling: Log and return error on timeout/failure
+  - Step 2: Create LND connector
+    - Call: `LndConnector::new().await`
+  - Step 3: Send payment with 5-second timeout
+    - Call: `ln_client.send_payment(&payment_request, amount, tx)`
+    - Error handling: Timeout prevents hanging
+  - Step 4: Wait for payment result with 25-second timeout
+    - Call: `rx.recv()`
+    - Success: Return payment hash
+    - Failure: Return error
+- [ ] Create scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
+  - Query: `SELECT * FROM orders WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0`
+  - For each unpaid order:
+    - Call `send_dev_fee_payment()` with 50-second timeout
+    - On success: Update `dev_fee_paid = 1`, `dev_fee_payment_hash = hash`
+    - On failure: Log error, leave `dev_fee_paid = 0` for retry
+  - Schedule: Run every 60 seconds
+- [ ] Add logging with `dev_fee` target
+  - Info: Payment initiation, success
+  - Error: Resolution failures, payment failures, timeouts
+  - Include: order_id, amount, destination, error details
+- [ ] Error handling and retry logic
+  - Self-payment detection (5s timeout prevents hanging)
+  - LNURL resolution failures (15s timeout)
+  - Routing failures (25s timeout)
+  - All errors: Log and allow retry on next cycle
+- [ ] Integration tests
+  - Test successful dev fee payment
+  - Test LNURL resolution failure
+  - Test payment timeout
+  - Test scheduler retry on failure
+  - Verify order completes regardless of dev fee payment status
+
+**Deliverables:** Automated dev fee payments on successful orders, with retry mechanism
+
+### Phase 4: Documentation and Deployment (Estimated: 2-4 hours)
+
+- [ ] Update this document to reflect actual implementation
+  - Change "Required Implementation" to "Implementation"
+  - Update all "TO IMPLEMENT" markers to "IMPLEMENTED"
+  - Add any implementation notes or deviations from spec
+- [ ] Update CHANGELOG.md with new feature
+- [ ] Update README.md if necessary
+- [ ] Create migration guide for existing installations
+- [ ] Test full workflow end-to-end on testnet/staging
+
+**Total Estimated Time:** 18-32 hours
 
 ## Monitoring and Operations
 
@@ -496,13 +633,15 @@ WHERE id = '<order_id>';
 - Negligible memory impact
 - Database: 3 additional columns per order (~76 bytes)
 
-## Testing
+## Testing Specification
 
 ### Unit Tests
 
-Location: `src/util.rs::tests` (lines 1424-1474)
+**Status:** TO IMPLEMENT
 
-**Coverage:**
+**Location:** `src/util.rs::tests` module
+
+**Coverage Required:**
 - Standard percentage calculation
 - Rounding behavior
 - Zero fee handling

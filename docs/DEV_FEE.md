@@ -52,7 +52,7 @@ Order Creation → Fee Calculation → Hold Invoice → Order Success → Dev Pa
 ```rust
 pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;  // 10% minimum
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;   // 100% maximum
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "some@lighting.dev.fund";
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "<dev@lightning.address>";
 ```
 
 ### Settings (`~/.mostro/settings.toml`)
@@ -403,7 +403,7 @@ RUST_LOG="dev_fee=error" mostrod
 
 Success:
 ```
-[INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 amount_sats=300 destination=some@lighting.dev.fund Initiating development fee payment
+[INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 amount_sats=300 destination=<dev@lightning.address> Initiating development fee payment
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 payment_hash=abcd1234... Development fee payment succeeded
 ```
 
@@ -425,7 +425,7 @@ Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 
 **2. High Failure Rate**
 - Check Lightning node connectivity
-- Verify `some@lighting.dev.fund` is reachable
+- Verify `<dev@lightning.address>` is reachable
 - Check routing capacity to destination
 - Review error logs: `RUST_LOG="dev_fee=error" mostrod`
 
@@ -462,7 +462,7 @@ WHERE id = '<order_id>';
 
 ### Hardcoded Values
 
-- Lightning Address: `some@lighting.dev.fund` (cannot be changed without recompiling)
+- Lightning Address: `<dev@lightning.address>` (cannot be changed without recompiling)
 - Minimum fee: 10% (enforced at startup)
 - Prevents misconfiguration or malicious changes
 

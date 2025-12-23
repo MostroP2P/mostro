@@ -51,6 +51,7 @@ pub async fn hold_invoice_paid(
     );
     let status;
 
+    let buyer_dev_fee = (order.dev_fee / 2) as i64;
     if order.buyer_invoice.is_some() {
         status = Status::Active;
         order_data.status = Some(status);
@@ -68,7 +69,10 @@ pub async fn hold_invoice_paid(
         .await;
         // We send a message to buyer saying seller paid
         let mut buyer_order_data = order_data.clone();
-        buyer_order_data.amount = order.amount.saturating_sub(order.fee);
+        buyer_order_data.amount = order
+            .amount
+            .saturating_sub(order.fee)
+            .saturating_sub(buyer_dev_fee);
         enqueue_order_msg(
             request_id,
             Some(order.id),
@@ -79,7 +83,7 @@ pub async fn hold_invoice_paid(
         )
         .await;
     } else {
-        let new_amount = order_data.amount - order.fee;
+        let new_amount = order_data.amount - order.fee - buyer_dev_fee;
         order_data.amount = new_amount;
         status = Status::WaitingBuyerInvoice;
         order_data.status = Some(status);

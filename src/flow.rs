@@ -51,13 +51,17 @@ pub async fn hold_invoice_paid(
     );
     let status;
 
-    let buyer_dev_fee = (order.dev_fee / 2) as i64;
+    // Calculate dev_fee split to avoid losing satoshis with odd amounts
+    let seller_dev_fee = order.dev_fee / 2;
+    let buyer_dev_fee = order.dev_fee - seller_dev_fee;
     if order.buyer_invoice.is_some() {
         status = Status::Active;
         order_data.status = Some(status);
         // We send a confirmation message to seller
         let mut seller_order_data = order_data.clone();
-        seller_order_data.amount = order.amount.saturating_add(order.fee);
+        seller_order_data.amount = order.amount
+            .saturating_add(order.fee)
+            .saturating_add(seller_dev_fee);
         enqueue_order_msg(
             request_id,
             Some(order.id),

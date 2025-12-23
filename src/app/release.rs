@@ -69,7 +69,8 @@ pub async fn check_failure_retries(
         // Update amount notified to the buyer
         let seller_dev_fee = order.dev_fee / 2;
         let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-        order_payment_failed.amount = order_payment_failed.amount
+        order_payment_failed.amount = order_payment_failed
+            .amount
             .saturating_sub(order.fee)
             .saturating_sub(buyer_dev_fee);
         if order_payment_failed.amount <= 0 {

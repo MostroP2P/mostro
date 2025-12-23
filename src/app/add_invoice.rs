@@ -87,7 +87,8 @@ pub async fn add_invoice_action(
         // We send a confirmation message to seller
         let seller_dev_fee = active_order.dev_fee / 2;
         let mut seller_order = SmallOrder::from(active_order.clone());
-        seller_order.amount = active_order.amount
+        seller_order.amount = active_order
+            .amount
             .saturating_add(active_order.fee)
             .saturating_add(seller_dev_fee);
         enqueue_order_msg(
@@ -102,7 +103,8 @@ pub async fn add_invoice_action(
         // We send a message to buyer saying seller paid
         let buyer_dev_fee = active_order.dev_fee - seller_dev_fee;
         let mut buyer_order = SmallOrder::from(active_order.clone());
-        buyer_order.amount = active_order.amount
+        buyer_order.amount = active_order
+            .amount
             .saturating_sub(active_order.fee)
             .saturating_sub(buyer_dev_fee);
         enqueue_order_msg(

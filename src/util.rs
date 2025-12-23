@@ -153,14 +153,29 @@ pub fn get_fee(amount: i64) -> i64 {
     split_fee.round() as i64
 }
 
+/// Calculates the development fee as a percentage of the total Mostro fee.
+///
+/// This is a pure function that performs the fee calculation without accessing global state.
+/// Useful for testing with different percentage values.
+///
+/// # Arguments
+/// * `total_mostro_fee` - The total Mostro fee amount in satoshis
+/// * `percentage` - The percentage to apply (e.g., 0.30 for 30%)
+///
+/// # Returns
+/// The calculated development fee, rounded to nearest satoshi
+pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
+    let dev_fee = (total_mostro_fee as f64) * percentage;
+    dev_fee.round() as i64
+}
+
 /// Calculate total development fee from the total Mostro fee
 /// Takes the TOTAL Mostro fee (both parties combined) and returns the TOTAL dev fee
 /// The returned value should be split 50/50 between buyer and seller
 /// Returns the total amount in satoshis for the dev fund
 pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
     let mostro_settings = Settings::get_mostro();
-    let dev_fee = (total_mostro_fee as f64) * mostro_settings.dev_fee_percentage;
-    dev_fee.round() as i64
+    calculate_dev_fee(total_mostro_fee, mostro_settings.dev_fee_percentage)
 }
 
 /// Calculates the expiration timestamp for an order.
@@ -1438,28 +1453,27 @@ mod tests {
     #[test]
     fn test_get_dev_fee_basic() {
         // 1000 sats Mostro fee at 30% -> 300 sats
-        // Use Settings default (0.30)
-        let fee = get_dev_fee(1_000);
+        let fee = calculate_dev_fee(1_000, 0.30);
         assert_eq!(fee, 300);
     }
 
     #[test]
     fn test_get_dev_fee_rounding() {
         // 333 * 0.30 = 99.9 -> rounds to 100
-        let fee = get_dev_fee(333);
+        let fee = calculate_dev_fee(333, 0.30);
         assert_eq!(fee, 100);
     }
 
     #[test]
     fn test_get_dev_fee_zero() {
-        let fee = get_dev_fee(0);
+        let fee = calculate_dev_fee(0, 0.30);
         assert_eq!(fee, 0);
     }
 
     #[test]
     fn test_get_dev_fee_tiny_amounts() {
-        // With default 30%, 1 * 0.30 = 0.3 -> 0
-        let fee = get_dev_fee(1);
+        // With 30%, 1 * 0.30 = 0.3 -> 0
+        let fee = calculate_dev_fee(1, 0.30);
         assert_eq!(fee, 0);
     }
 }

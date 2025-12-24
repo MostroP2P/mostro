@@ -46,6 +46,10 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - `send_dev_fee_payment()` function in `src/app/release.rs`
 - Integration with `payment_success()` for triggering dev fee payment
 - Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
+- **Database field updates:**
+  - `dev_fee`: Set during order creation, reset to 0 for abandoned market orders
+  - `dev_fee_paid`: Changed from 0 to 1 after successful payment in scheduler
+  - `dev_fee_payment_hash`: Set to Lightning payment hash on successful payment
 - Error handling and retry logic
 - Payment timeout handling (LNURL: 15s, send_payment: 5s, result: 25s)
 
@@ -450,6 +454,202 @@ Err(e) => {
     // Will be retried on next scheduler cycle (60 seconds)
 }
 ```
+
+### Database Field Updates
+
+This section details exactly when and how the database fields (`dev_fee`, `dev_fee_paid`, `dev_fee_payment_hash`) are modified throughout the order lifecycle.
+
+#### `dev_fee` Field Lifecycle
+
+**When Set:** During order creation in `src/util.rs::prepare_new_order()` (lines 392-398)
+
+**Calculation:**
+```rust
+let mut fee = 0;
+let mut dev_fee = 0;
+if new_order.amount > 0 {
+    fee = get_fee(new_order.amount);                    // Calculate Mostro fee
+    let total_mostro_fee = fee * 2;                     // Double the fee (both parties)
+    dev_fee = get_dev_fee(total_mostro_fee);            // Calculate dev fee (30% default)
+}
+```
+
+**Initial Value:** Calculated dev fee amount in satoshis based on `total_mostro_fee × dev_fee_percentage`
+
+**Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section (lines 182-256).
+
+**Database State:** Persists throughout order lifecycle unless order returns to pending status (market price orders only).
+
+#### `dev_fee_paid` Field Updates
+
+**Initial Value:** `0` (false) - Set during order creation in `src/util.rs::prepare_new_order()` (line 413)
+
+**When Changed to `1` (true):** After successful dev fee payment in the scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
+
+**Trigger Sequence:**
+1. Order completes successfully (`status = 'success'`)
+2. Scheduler runs every 60 seconds
+3. Query identifies unpaid orders: `SELECT * FROM orders WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0`
+4. Scheduler calls `send_dev_fee_payment()` for each unpaid order
+5. On payment success, scheduler updates: `order.dev_fee_paid = true` (stored as `1` in database)
+
+**Database Update:**
+```sql
+UPDATE orders
+SET dev_fee_paid = 1, dev_fee_payment_hash = ?
+WHERE id = ?
+```
+
+**Timing:** Asynchronously after order completes, typically within 60 seconds (next scheduler cycle)
+
+**Remains `0` When:**
+- Payment hasn't been attempted yet (order just completed)
+- Payment failed (LNURL resolution error, routing failure, timeout)
+- Will retry on next scheduler cycle (60 seconds)
+
+#### `dev_fee_payment_hash` Field Updates
+
+**Initial Value:** `NULL` - Set during order creation in `src/util.rs::prepare_new_order()` (line 414)
+
+**When Set:** Simultaneously with `dev_fee_paid = 1` after successful payment
+
+**Value Source:** Lightning payment hash returned from the Lightning Network payment result. The hash comes from the `ln_client.send_payment()` call's result channel in `src/app/release.rs::send_dev_fee_payment()`.
+
+**Payment Hash Retrieval Flow:**
+```rust
+// Step 1: LNURL resolution (15s timeout)
+let payment_request = resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount).await?;
+
+// Step 2: Send payment (5s timeout for send, 25s for result)
+let payment_result = ln_client.send_payment(&payment_request, dev_fee_amount, tx).await?;
+
+// Step 3: Extract hash from successful payment result
+let payment_hash = rx.recv().await?;  // ← THIS is what goes into dev_fee_payment_hash
+```
+
+**Format:** 64-character hexadecimal string (standard Lightning payment hash)
+
+**Purpose:**
+- Audit trail for reconciliation
+- Proof of payment for accountability
+- Debugging and payment verification
+
+**Remains `NULL` When:**
+- Payment hasn't been attempted yet
+- Payment failed (no hash generated for failed payments)
+
+#### Payment Flow Timeline
+
+Complete timeline showing database field states at each stage:
+
+```
+Order Creation (t=0):
+  └─> dev_fee = calculated_value (e.g., 300 sats)
+  └─> dev_fee_paid = 0
+  └─> dev_fee_payment_hash = NULL
+  └─> Database: INSERT INTO orders (dev_fee, dev_fee_paid, dev_fee_payment_hash) VALUES (300, 0, NULL)
+
+Order Processing (t=minutes):
+  └─> Buyer and seller complete trade
+  └─> Dev fee fields remain unchanged
+  └─> Database: No updates to dev_fee fields
+
+Order Success (t=order_complete):
+  └─> status = 'success'
+  └─> Buyer receives satoshis
+  └─> Dev fee fields unchanged
+  └─> Order enters scheduler queue
+  └─> Database: UPDATE orders SET status = 'success' WHERE id = ?
+
+Scheduler Cycle (t=next_60s_cycle, typically within 60s of order success):
+  └─> Scheduler wakes up every 60 seconds
+  └─> Query: SELECT * FROM orders WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0
+  └─> Order found in unpaid queue
+  └─> Call: send_dev_fee_payment(order)
+
+Payment Attempt (t=payment_start):
+  └─> Step 1/3: LNURL resolution (timeout: 15s)
+  └─> Step 2/3: LND send_payment call (timeout: 5s)
+  └─> Step 3/3: Wait for payment result (timeout: 25s)
+
+Payment Success (t=payment_complete, ~3-8 seconds typical):
+  └─> Payment hash received: "a1b2c3d4e5f6..."
+  └─> dev_fee_paid = 1
+  └─> dev_fee_payment_hash = "a1b2c3d4e5f6..."
+  └─> Database: UPDATE orders SET dev_fee_paid = 1, dev_fee_payment_hash = 'a1b2c3d4e5f6...' WHERE id = ?
+  └─> Order removed from retry queue
+  └─> DONE ✓
+
+Payment Failure (t=payment_timeout, could be 15s, 25s, or 50s timeout):
+  └─> Error logged (LNURL failure, routing failure, timeout, etc.)
+  └─> dev_fee_paid = 0 (unchanged)
+  └─> dev_fee_payment_hash = NULL (unchanged)
+  └─> Database: No update (fields remain unchanged)
+  └─> Order remains in retry queue
+  └─> Retry on next scheduler cycle (60 seconds later)
+  └─> Will retry indefinitely until payment succeeds
+```
+
+#### Implementation Code Example
+
+When implementing `src/scheduler.rs::process_dev_fee_payment()`, use this pattern:
+
+```rust
+/// Process unpaid development fees for successful orders
+/// Called every 60 seconds by scheduler
+async fn process_dev_fee_payment(pool: &SqlitePool) -> Result<()> {
+    // Query all successful orders with unpaid dev fees
+    let unpaid_orders = sqlx::query_as::<_, Order>(
+        "SELECT * FROM orders
+         WHERE status = 'success'
+           AND dev_fee > 0
+           AND dev_fee_paid = 0"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
+
+    for mut order in unpaid_orders {
+        // Attempt payment with 50-second timeout (under 60s cycle)
+        match timeout(
+            Duration::from_secs(50),
+            send_dev_fee_payment(&order)
+        ).await {
+            Ok(Ok(payment_hash)) => {
+                // SUCCESS: Update both fields atomically
+                order.dev_fee_paid = true;
+                order.dev_fee_payment_hash = Some(payment_hash.clone());
+                order.update(pool).await?;
+
+                info!(
+                    "Dev fee payment succeeded for order {} | amount: {} sats | hash: {}",
+                    order.id, order.dev_fee, payment_hash
+                );
+            }
+            Ok(Err(e)) | Err(_) => {
+                // FAILURE: Leave fields unchanged for retry
+                // Fields remain: dev_fee_paid = 0, dev_fee_payment_hash = NULL
+                error!(
+                    "Dev fee payment failed for order {} | amount: {} sats | error: {:?}",
+                    order.id, order.dev_fee, e
+                );
+                // Order will be retried on next scheduler cycle (60 seconds)
+            }
+        }
+    }
+
+    Ok(())
+}
+```
+
+**Key Implementation Points:**
+
+1. **Atomic Updates:** Always update `dev_fee_paid` and `dev_fee_payment_hash` together in a single database transaction
+2. **Only Update on Success:** Never update these fields on payment failure - leave them unchanged for retry
+3. **Scheduler Query:** The query `WHERE dev_fee_paid = 0` ensures only unpaid orders are processed
+4. **Automatic Retry:** Failed payments remain with `dev_fee_paid = 0`, causing them to be retried on the next cycle
+5. **Non-Blocking:** Order completion is never blocked by dev fee payment attempts
 
 ### Error Handling
 

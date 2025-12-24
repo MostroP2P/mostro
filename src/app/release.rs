@@ -1,4 +1,5 @@
 use crate::config;
+use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
 use crate::lightning::LndConnector;
@@ -23,7 +24,7 @@ use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::info;
+use tracing::{error, info};
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -558,6 +559,132 @@ async fn payment_success(
         .await;
     }
     Ok(())
+}
+
+/// Send development fee payment via Lightning Network
+///
+/// Attempts to pay the configured development fee for a completed order.
+/// Uses LNURL resolution to get payment invoice, then sends payment via LND.
+///
+/// # Timeouts
+/// - LNURL resolution: 15 seconds
+/// - send_payment call: 5 seconds
+/// - Payment result wait: 25 seconds
+/// - Total: 45 seconds maximum
+///
+/// # Returns
+/// - `Ok(String)`: Payment hash on successful payment
+/// - `Err(MostroError)`: Error if payment fails or times out
+pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
+    info!(
+        "Initiating dev fee payment for order {} - amount: {} sats to {}",
+        order.id, order.dev_fee, DEV_FEE_LIGHTNING_ADDRESS
+    );
+
+    // Step 1: LNURL resolution (15s timeout)
+    let payment_request = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, order.dev_fee as u64),
+    )
+    .await
+    .map_err(|_| {
+        error!(
+            "Dev fee LNURL resolution timeout for order {} ({} sats)",
+            order.id, order.dev_fee
+        );
+        MostroInternalErr(ServiceError::LnAddressParseError)
+    })?
+    .map_err(|e| {
+        error!(
+            "Dev fee LNURL resolution failed for order {} ({} sats): {:?}",
+            order.id, order.dev_fee, e
+        );
+        e
+    })?;
+
+    // Step 2: Create LND connector
+    let mut ln_client = LndConnector::new().await?;
+    let (tx, mut rx) = channel(100);
+
+    // Step 3: Send payment (5s timeout to prevent hanging)
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ln_client.send_payment(&payment_request, order.dev_fee, tx),
+    )
+    .await
+    .map_err(|_| {
+        error!(
+            "Dev fee send_payment timeout for order {} ({} sats)",
+            order.id, order.dev_fee
+        );
+        MostroInternalErr(ServiceError::LnPaymentError(
+            "send_payment timeout".to_string(),
+        ))
+    })?
+    .map_err(|e| {
+        error!(
+            "Dev fee send_payment failed for order {} ({} sats): {:?}",
+            order.id, order.dev_fee, e
+        );
+        e
+    })?;
+
+    // Step 4: Wait for payment result (25s timeout)
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(25), rx.recv())
+        .await
+        .map_err(|_| {
+            error!(
+                "Dev fee payment result timeout for order {} ({} sats)",
+                order.id, order.dev_fee
+            );
+            MostroInternalErr(ServiceError::LnPaymentError("result timeout".to_string()))
+        })?
+        .ok_or_else(|| {
+            error!(
+                "Dev fee payment channel closed for order {} ({} sats)",
+                order.id, order.dev_fee
+            );
+            MostroInternalErr(ServiceError::LnPaymentError("channel closed".to_string()))
+        })?;
+
+    // Step 5: Extract and return payment hash
+    if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+        match status {
+            PaymentStatus::Succeeded => {
+                info!(
+                    "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
+                    order.id, order.dev_fee, msg.payment.payment_hash
+                );
+                Ok(msg.payment.payment_hash)
+            }
+            PaymentStatus::Failed => {
+                error!(
+                    "Dev fee payment failed for order {} ({} sats)",
+                    order.id, order.dev_fee
+                );
+                Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "payment failed".to_string(),
+                )))
+            }
+            _ => {
+                error!(
+                    "Dev fee payment status unknown for order {} ({} sats)",
+                    order.id, order.dev_fee
+                );
+                Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "unknown status".to_string(),
+                )))
+            }
+        }
+    } else {
+        error!(
+            "Dev fee payment invalid status for order {} ({} sats)",
+            order.id, order.dev_fee
+        );
+        Err(MostroInternalErr(ServiceError::LnPaymentError(
+            "invalid status".to_string(),
+        )))
+    }
 }
 
 /// Check if order is range type

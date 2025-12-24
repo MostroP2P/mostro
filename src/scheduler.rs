@@ -1,4 +1,4 @@
-use crate::app::release::do_payment;
+use crate::app::release::{do_payment, send_dev_fee_payment};
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
 use crate::db::*;
@@ -26,6 +26,7 @@ pub async fn start_scheduler() {
     job_update_rate_events().await;
     job_cancel_orders().await;
     job_retry_failed_payments().await;
+    job_process_dev_fee_payment().await;
     job_info_event_send().await;
     job_relay_list().await;
     job_update_bitcoin_prices().await;
@@ -503,6 +504,65 @@ async fn job_update_bitcoin_prices() {
                 error!("Failed to update Bitcoin prices: {}", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
+async fn job_process_dev_fee_payment() {
+    let pool = get_db_pool();
+    let interval = 60u64; // Every 60 seconds
+
+    tokio::spawn(async move {
+        loop {
+            info!("Checking for unpaid development fees");
+
+            // Query unpaid orders
+            if let Ok(unpaid_orders) = find_unpaid_dev_fees(&pool).await {
+                info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
+
+                for mut order in unpaid_orders {
+                    // 50 second timeout per payment (under 60s cycle)
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(50),
+                        send_dev_fee_payment(&order),
+                    )
+                    .await
+                    {
+                        Ok(Ok(payment_hash)) => {
+                            // SUCCESS: Update both fields atomically
+                            let order_id = order.id;
+                            let dev_fee_amount = order.dev_fee;
+                            order.dev_fee_paid = true;
+                            order.dev_fee_payment_hash = Some(payment_hash.clone());
+
+                            if let Err(e) = order.update(&pool).await {
+                                error!("Failed to update database for order {}: {}", order_id, e);
+                            } else {
+                                info!(
+                                    "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
+                                    order_id, dev_fee_amount, payment_hash
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            // FAILURE: Leave fields unchanged for retry
+                            error!(
+                                "Dev fee payment failed for order {} ({} sats) - error: {:?}, will retry",
+                                order.id, order.dev_fee, e
+                            );
+                        }
+                        Err(_) => {
+                            // TIMEOUT: Leave fields unchanged for retry
+                            error!(
+                                "Dev fee payment timeout (50s) for order {} ({} sats) - will retry",
+                                order.id, order.dev_fee
+                            );
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
 }

@@ -630,61 +630,59 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
     })?;
 
     // Step 4: Wait for payment result (25s timeout)
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(25), rx.recv())
-        .await
-        .map_err(|_| {
-            error!(
-                "Dev fee payment result timeout for order {} ({} sats)",
-                order.id, order.dev_fee
-            );
-            MostroInternalErr(ServiceError::LnPaymentError("result timeout".to_string()))
-        })?
-        .ok_or_else(|| {
+    // Loop to receive multiple status messages from LND until terminal status
+    let payment_result = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        async {
+            while let Some(msg) = rx.recv().await {
+                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                    match status {
+                        PaymentStatus::Succeeded => {
+                            // Terminal status - payment succeeded
+                            return Ok(msg.payment.payment_hash);
+                        }
+                        PaymentStatus::Failed => {
+                            // Terminal status - payment failed
+                            error!(
+                                "Dev fee payment failed for order {} ({} sats) - failure_reason: {}",
+                                order.id, order.dev_fee, msg.payment.failure_reason
+                            );
+                            return Err(MostroInternalErr(ServiceError::LnPaymentError(
+                                format!("payment failed: reason {}", msg.payment.failure_reason),
+                            )));
+                        }
+                        _ => {
+                            // Ignore intermediate statuses (Unknown, InFlight)
+                            // Continue waiting for terminal status
+                        }
+                    }
+                }
+            }
+            // Channel closed without receiving terminal status
             error!(
                 "Dev fee payment channel closed for order {} ({} sats)",
                 order.id, order.dev_fee
             );
-            MostroInternalErr(ServiceError::LnPaymentError("channel closed".to_string()))
-        })?;
-
-    // Step 5: Extract and return payment hash
-    if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-        match status {
-            PaymentStatus::Succeeded => {
-                info!(
-                    "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
-                    order.id, order.dev_fee, msg.payment.payment_hash
-                );
-                Ok(msg.payment.payment_hash)
-            }
-            PaymentStatus::Failed => {
-                error!(
-                    "Dev fee payment failed for order {} ({} sats)",
-                    order.id, order.dev_fee
-                );
-                Err(MostroInternalErr(ServiceError::LnPaymentError(
-                    "payment failed".to_string(),
-                )))
-            }
-            _ => {
-                error!(
-                    "Dev fee payment status unknown for order {} ({} sats)",
-                    order.id, order.dev_fee
-                );
-                Err(MostroInternalErr(ServiceError::LnPaymentError(
-                    "unknown status".to_string(),
-                )))
-            }
-        }
-    } else {
+            Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "channel closed".to_string(),
+            )))
+        },
+    )
+    .await
+    .map_err(|_| {
         error!(
-            "Dev fee payment invalid status for order {} ({} sats)",
+            "Dev fee payment result timeout for order {} ({} sats)",
             order.id, order.dev_fee
         );
-        Err(MostroInternalErr(ServiceError::LnPaymentError(
-            "invalid status".to_string(),
-        )))
-    }
+        MostroInternalErr(ServiceError::LnPaymentError("result timeout".to_string()))
+    })??; // Double ? to unwrap both timeout Result and inner Result
+
+    // Step 5: Log and return the successful payment hash
+    info!(
+        "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
+        order.id, order.dev_fee, payment_result
+    );
+    Ok(payment_result)
 }
 
 /// Check if order is range type

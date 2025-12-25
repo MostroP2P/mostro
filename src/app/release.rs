@@ -631,43 +631,41 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
 
     // Step 4: Wait for payment result (25s timeout)
     // Loop to receive multiple status messages from LND until terminal status
-    let payment_result = tokio::time::timeout(
-        std::time::Duration::from_secs(25),
-        async {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-                    match status {
-                        PaymentStatus::Succeeded => {
-                            // Terminal status - payment succeeded
-                            return Ok(msg.payment.payment_hash);
-                        }
-                        PaymentStatus::Failed => {
-                            // Terminal status - payment failed
-                            error!(
-                                "Dev fee payment failed for order {} ({} sats) - failure_reason: {}",
-                                order.id, order.dev_fee, msg.payment.failure_reason
-                            );
-                            return Err(MostroInternalErr(ServiceError::LnPaymentError(
-                                format!("payment failed: reason {}", msg.payment.failure_reason),
-                            )));
-                        }
-                        _ => {
-                            // Ignore intermediate statuses (Unknown, InFlight)
-                            // Continue waiting for terminal status
-                        }
+    let payment_result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        while let Some(msg) = rx.recv().await {
+            if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                match status {
+                    PaymentStatus::Succeeded => {
+                        // Terminal status - payment succeeded
+                        return Ok(msg.payment.payment_hash);
+                    }
+                    PaymentStatus::Failed => {
+                        // Terminal status - payment failed
+                        error!(
+                            "Dev fee payment failed for order {} ({} sats) - failure_reason: {}",
+                            order.id, order.dev_fee, msg.payment.failure_reason
+                        );
+                        return Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                            "payment failed: reason {}",
+                            msg.payment.failure_reason
+                        ))));
+                    }
+                    _ => {
+                        // Ignore intermediate statuses (Unknown, InFlight)
+                        // Continue waiting for terminal status
                     }
                 }
             }
-            // Channel closed without receiving terminal status
-            error!(
-                "Dev fee payment channel closed for order {} ({} sats)",
-                order.id, order.dev_fee
-            );
-            Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "channel closed".to_string(),
-            )))
-        },
-    )
+        }
+        // Channel closed without receiving terminal status
+        error!(
+            "Dev fee payment channel closed for order {} ({} sats)",
+            order.id, order.dev_fee
+        );
+        Err(MostroInternalErr(ServiceError::LnPaymentError(
+            "channel closed".to_string(),
+        )))
+    })
     .await
     .map_err(|_| {
         error!(

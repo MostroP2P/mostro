@@ -60,13 +60,13 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Fee Flow Diagram
 
 ```
-Order Creation → Fee Calculation → Hold Invoice → Order Success → Dev Payment
-     ↓                 ↓                ↓              ↓              ↓
-  amount         mostro_fee        seller pays    settle hold    LNURL resolve
-                     ↓             amount + fees      ↓              ↓
-                 dev_fee                          buyer paid    send payment
-                                                                     ↓
-                                                              update db fields
+Order Creation → Fee Calculation → Hold Invoice → Seller Release → Dev Payment → Buyer Payment
+     ↓                 ↓                ↓              ↓                ↓             ↓
+  amount         mostro_fee        seller pays    settle hold     LNURL resolve   buyer paid
+                     ↓             amount + fees      ↓                ↓             ↓
+                 dev_fee                          status=settled   send payment   status=success
+                                                                       ↓
+                                                                update db fields
 ```
 
 ### System Components
@@ -384,20 +384,27 @@ buyer_amount = order.amount - order.fee - buyer_dev_fee;
 
 The dev fee payment should **NOT** be executed immediately during order release. Instead:
 
-1. **Order Release** (`src/app/release.rs::payment_success()`):
-   - Buyer receives their satoshis successfully
-   - Order is marked as `status = 'success'`
+1. **Order Release** (`src/app/release.rs::release_action()`):
+   - Seller's hold invoice is settled
+   - Order is marked as `status = 'settled-hold-invoice'`
    - Order is **enqueued for scheduler processing** by marking `dev_fee_paid = false`
-   - Order completion notifications sent to both parties
+   - Mostro then proceeds to pay buyer's invoice
+   - **Key Point:** Dev fee payment happens asynchronously AFTER seller releases but BEFORE buyer payment completes
 
 2. **Scheduler Processing** (`src/scheduler.rs::process_dev_fee_payment()`):
    - Runs every 60 seconds
-   - Queries database for orders where: `status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0`
+   - Queries database for orders where: `(status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
    - Processes each unpaid dev fee asynchronously
    - Timeout: 50 seconds per payment attempt
 
+**Why This Timing?**
+- **Fee Earned:** Seller has released funds, so Mostro has earned its fee
+- **Risk Mitigation:** Captures dev fees even if buyer payment fails permanently
+- **Non-blocking:** Order flow continues regardless of dev fee payment status
+- **Retry mechanism:** Failed payments are automatically retried every 60 seconds
+
 **Why Scheduler-Based?**
-- **Non-blocking order completion:** Buyer receives sats immediately, dev fee payment happens asynchronously
+- **Non-blocking order completion:** Seller release and buyer payment happen immediately, dev fee payment happens asynchronously
 - **Retry mechanism:** Failed payments are automatically retried on the next cycle (60 seconds)
 - **Fault tolerance:** Order completes successfully even if dev fee payment fails temporarily
 - **Better user experience:** Users don't wait for dev fee payment during order release
@@ -487,11 +494,12 @@ if new_order.amount > 0 {
 **When Changed to `1` (true):** After successful dev fee payment in the scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
 
 **Trigger Sequence:**
-1. Order completes successfully (`status = 'success'`)
+1. Seller releases order (`status = 'settled-hold-invoice'`)
 2. Scheduler runs every 60 seconds
-3. Query identifies unpaid orders: `SELECT * FROM orders WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0`
+3. Query identifies unpaid orders: `SELECT * FROM orders WHERE (status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
 4. Scheduler calls `send_dev_fee_payment()` for each unpaid order
 5. On payment success, scheduler updates: `order.dev_fee_paid = true` (stored as `1` in database)
+6. Important: Query includes BOTH statuses to handle race conditions where buyer payment completes during dev fee payment failure
 
 **Database Update:**
 ```sql
@@ -554,16 +562,16 @@ Order Processing (t=minutes):
   └─> Dev fee fields remain unchanged
   └─> Database: No updates to dev_fee fields
 
-Order Success (t=order_complete):
-  └─> status = 'success'
-  └─> Buyer receives satoshis
-  └─> Dev fee fields unchanged
+Order Release (t=seller_release):
+  └─> Seller's hold invoice settled
+  └─> status = 'settled-hold-invoice'
+  └─> Dev fee fields unchanged (dev_fee_paid = 0)
   └─> Order enters scheduler queue
-  └─> Database: UPDATE orders SET status = 'success' WHERE id = ?
+  └─> Buyer payment initiated (asynchronous)
 
-Scheduler Cycle (t=next_60s_cycle, typically within 60s of order success):
+Scheduler Cycle (t=next_60s_cycle, typically within 60s of seller release):
   └─> Scheduler wakes up every 60 seconds
-  └─> Query: SELECT * FROM orders WHERE status = 'success' AND dev_fee > 0 AND dev_fee_paid = 0
+  └─> Query: SELECT * FROM orders WHERE (status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0
   └─> Order found in unpaid queue
   └─> Call: send_dev_fee_payment(order)
 
@@ -572,7 +580,7 @@ Payment Attempt (t=payment_start):
   └─> Step 2/3: LND send_payment call (timeout: 5s)
   └─> Step 3/3: Wait for payment result (timeout: 25s)
 
-Payment Success (t=payment_complete, ~3-8 seconds typical):
+Dev Fee Payment Success (t=payment_complete, ~3-8 seconds typical):
   └─> Payment hash received: "a1b2c3d4e5f6..."
   └─> dev_fee_paid = 1
   └─> dev_fee_payment_hash = "a1b2c3d4e5f6..."
@@ -580,7 +588,13 @@ Payment Success (t=payment_complete, ~3-8 seconds typical):
   └─> Order removed from retry queue
   └─> DONE ✓
 
-Payment Failure (t=payment_timeout, could be 15s, 25s, or 50s timeout):
+Order Success (t=order_complete, after dev fee payment):
+  └─> status = 'success'
+  └─> Buyer receives satoshis
+  └─> Dev fee already paid (dev_fee_paid = 1)
+  └─> Database: UPDATE orders SET status = 'success' WHERE id = ?
+
+Dev Fee Payment Failure (t=payment_timeout, could be 15s, 25s, or 50s timeout):
   └─> Error logged (LNURL failure, routing failure, timeout, etc.)
   └─> dev_fee_paid = 0 (unchanged)
   └─> dev_fee_payment_hash = NULL (unchanged)
@@ -588,6 +602,21 @@ Payment Failure (t=payment_timeout, could be 15s, 25s, or 50s timeout):
   └─> Order remains in retry queue
   └─> Retry on next scheduler cycle (60 seconds later)
   └─> Will retry indefinitely until payment succeeds
+
+Edge Case - Buyer Payment Fails:
+  └─> Order remains in status = 'settled-hold-invoice'
+  └─> failed_payment = true
+  └─> Retry scheduler (job_retry_failed_payments) attempts buyer payment again
+  └─> Dev fee already paid regardless (dev_fee_paid = 1)
+  └─> This is correct: seller released, fee was earned
+
+Edge Case - Dev Fee Payment Fails, Buyer Payment Succeeds (Race Condition):
+  └─> Seller releases → status = 'settled-hold-invoice'
+  └─> Scheduler attempts dev fee payment → FAILS (dev_fee_paid = 0)
+  └─> Simultaneously, buyer payment → SUCCEEDS → status = 'success'
+  └─> Order now in 'success' status with dev_fee_paid = 0
+  └─> Query includes both statuses, so order is still picked up on next cycle
+  └─> Dev fee payment eventually succeeds and updates dev_fee_paid = 1
 ```
 
 #### Implementation Code Example
@@ -804,10 +833,14 @@ This section provides a checklist for implementing the remaining phases of the d
 ```sql
 SELECT id, dev_fee, created_at, status
 FROM orders
-WHERE status = 'success'
+WHERE (status = 'settled-hold-invoice' OR status = 'success')
   AND dev_fee > 0
   AND dev_fee_paid = 0
 ORDER BY created_at DESC;
+
+-- Note: This query shows ALL orders with unpaid dev fees regardless of whether
+-- they're still in settled-hold-invoice or have transitioned to success.
+-- This handles race conditions where buyer payment completes during dev fee payment failure.
 ```
 
 **Development Fee Summary:**
@@ -824,9 +857,18 @@ WHERE status = 'success' AND dev_fee > 0;
 
 **Recent Failures:**
 ```sql
-SELECT id, dev_fee, created_at
+-- Orders with unpaid dev fees older than 5 minutes (potential issues):
+SELECT id, dev_fee, dev_fee_paid, status, failed_payment, payment_attempts, created_at
 FROM orders
-WHERE status = 'success'
+WHERE (status = 'settled-hold-invoice' OR status = 'success')
+  AND dev_fee_paid = 0
+  AND created_at < strftime('%s', 'now', '-5 minutes')
+ORDER BY created_at DESC;
+
+-- Orders with unpaid dev fees in last 24 hours:
+SELECT id, dev_fee, created_at, status
+FROM orders
+WHERE (status = 'settled-hold-invoice' OR status = 'success')
   AND dev_fee > 0
   AND dev_fee_paid = 0
   AND created_at > strftime('%s', 'now', '-24 hours')

@@ -1,5 +1,6 @@
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
+    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
+    show_hold_invoice,
 };
 
 use crate::config::MOSTRO_DB_PASSWORD;
@@ -53,7 +54,10 @@ pub async fn take_buy_action(
         match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
             Ok(amount_fees) => {
                 order.amount = amount_fees.0;
-                order.fee = amount_fees.1
+                order.fee = amount_fees.1;
+                // Calculate dev_fee now that we know the fee amount
+                let total_mostro_fee = order.fee * 2;
+                order.dev_fee = get_dev_fee(total_mostro_fee);
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };

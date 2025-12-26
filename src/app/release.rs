@@ -582,7 +582,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
     );
 
     if order.dev_fee <= 0 {
-        return Err(MostroInternalErr(ServiceError::InvalidAmount));
+        return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
 
     // Step 1: LNURL resolution (15s timeout)

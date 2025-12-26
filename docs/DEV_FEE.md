@@ -259,6 +259,77 @@ WHERE status = 'pending'
   AND dev_fee != 0;
 ```
 
+### Market Price Order Dev Fee Calculation
+
+**Critical Implementation Detail:**
+
+When a market price order is taken, three fields must be updated atomically:
+
+**Locations:**
+- `/home/negrunch/dev/mostro/src/app/take_buy.rs` (lines 52-64)
+- `/home/negrunch/dev/mostro/src/app/take_sell.rs` (lines 104-115)
+
+**Update Sequence:**
+```rust
+if order.has_no_amount() {
+    match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+        Ok(amount_fees) => {
+            // 1. Update amount (from market price)
+            order.amount = amount_fees.0;
+
+            // 2. Update fee (calculated from amount)
+            order.fee = amount_fees.1;
+
+            // 3. Calculate and update dev_fee (calculated from fee)
+            let total_mostro_fee = order.fee * 2;
+            order.dev_fee = get_dev_fee(total_mostro_fee);
+        }
+    };
+}
+```
+
+**Why This Is Critical:**
+
+1. **Timing:** All three fields (`amount`, `fee`, `dev_fee`) must be updated when order is taken
+2. **Dependencies:** `dev_fee` depends on `fee`, which depends on `amount`
+3. **Atomicity:** Updates happen together before order proceeds to next status
+4. **Consistency:** Ensures market price orders have correct dev_fee for payment collection
+
+**Example Scenario:**
+
+```
+Market Price Order Created:
+- Fiat: $100 USD
+- BTC Price: $50,000
+- amount: 0 (unknown until taken)
+- fee: 0
+- dev_fee: 0
+- Status: pending
+
+Order Taken:
+- Market Price Lookup: $100 @ $50,000 = 200,000 sats
+- amount: 200,000 sats           ← Updated
+- fee: 2,000 sats (1%)           ← Updated
+- total_mostro_fee: 4,000 sats (both parties)
+- dev_fee: 1,200 sats (30%)      ← Updated
+- Status: waiting-buyer-invoice
+
+Order Completes:
+- Dev fee payment triggered: 1,200 sats sent to dev fund ✓
+```
+
+**Without This Fix:**
+```
+Order Taken:
+- amount: 200,000 sats  ✓
+- fee: 2,000 sats       ✓
+- dev_fee: 0            ✗ BUG - stays 0
+
+Order Completes:
+- Dev fee payment: NOT triggered (query requires dev_fee > 0)
+- Revenue loss: 1,200 sats not collected ✗
+```
+
 ### Hold Invoice Generation
 
 **Current State:** Hold invoices do not include dev fee. Currently: `new_amount = order.amount + order.fee` (no dev fee component).
@@ -924,6 +995,36 @@ Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 - Total scheduler timeout: 50 seconds
 - Orders still complete successfully regardless of dev fee payment failures
 - Failed payments automatically retry every 60 seconds via scheduler
+
+**4. Market Price Orders With Zero Dev Fee**
+
+**Symptom:**
+```sql
+-- Orders with fee but no dev_fee (indicates bug in market price flow)
+SELECT id, amount, fee, dev_fee, price_from_api, status
+FROM orders
+WHERE fee > 0
+  AND dev_fee = 0
+  AND price_from_api = 1;
+```
+
+**Cause:** Market price order was taken but `dev_fee` was not calculated
+
+**Impact:** Dev fee not collected from these orders (revenue loss)
+
+**Fix:** Ensure both `take_buy.rs` and `take_sell.rs` calculate `dev_fee` when updating `amount` and `fee` for market price orders (see Market Price Order Dev Fee Calculation section)
+
+**Verification:**
+```sql
+-- All market price orders should have consistent fees
+SELECT
+  COUNT(*) as total_market_orders,
+  SUM(CASE WHEN fee > 0 AND dev_fee = 0 THEN 1 ELSE 0 END) as broken_orders,
+  SUM(CASE WHEN fee > 0 AND dev_fee > 0 THEN 1 ELSE 0 END) as correct_orders
+FROM orders
+WHERE price_from_api = 1
+  AND amount > 0;  -- Only count taken orders
+```
 
 ### Manual Retry Procedure
 

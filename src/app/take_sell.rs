@@ -1,8 +1,8 @@
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
-    get_fiat_amount_requested, get_market_amount_and_fee, get_order, set_waiting_invoice_status,
-    show_hold_invoice, update_order_event, validate_invoice,
+    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
+    set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
 };
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -105,7 +105,10 @@ pub async fn take_sell_action(
         match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
             Ok(amount_fees) => {
                 order.amount = amount_fees.0;
-                order.fee = amount_fees.1
+                order.fee = amount_fees.1;
+                // Calculate dev_fee now that we know the fee amount
+                let total_mostro_fee = order.fee * 2;
+                order.dev_fee = get_dev_fee(total_mostro_fee);
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };

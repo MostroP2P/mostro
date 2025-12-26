@@ -532,16 +532,50 @@ async fn job_process_dev_fee_payment() {
                             // SUCCESS: Update both fields atomically
                             let order_id = order.id;
                             let dev_fee_amount = order.dev_fee;
+
+                            info!(
+                                "BEFORE UPDATE: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
+                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
+                            );
+
                             order.dev_fee_paid = true;
                             order.dev_fee_payment_hash = Some(payment_hash.clone());
 
-                            if let Err(e) = order.update(&pool).await {
-                                error!("Failed to update database for order {}: {}", order_id, e);
-                            } else {
-                                info!(
-                                    "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
-                                    order_id, dev_fee_amount, payment_hash
-                                );
+                            info!(
+                                "AFTER MODIFY: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
+                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
+                            );
+
+                            match order.update(&pool).await {
+                                Err(e) => {
+                                    error!("❌ DATABASE UPDATE FAILED for order {}: {:?}", order_id, e);
+                                    error!("   Fields attempted: dev_fee_paid=true, dev_fee_payment_hash={}", payment_hash);
+                                }
+                                Ok(_) => {
+                                    info!("✅ DATABASE UPDATE SUCCEEDED for order {}", order_id);
+                                    info!("   Updated: dev_fee_paid=true, dev_fee_payment_hash={}", payment_hash);
+
+                                    // Verify update by re-querying
+                                    if let Ok(verified_order) = sqlx::query_as::<_, Order>(
+                                        "SELECT * FROM orders WHERE id = ?"
+                                    )
+                                    .bind(&order_id)
+                                    .fetch_one(&*pool)
+                                    .await
+                                    {
+                                        info!(
+                                            "VERIFICATION: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
+                                            verified_order.id,
+                                            verified_order.dev_fee_paid,
+                                            verified_order.dev_fee_payment_hash
+                                        );
+                                    }
+
+                                    info!(
+                                        "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
+                                        order_id, dev_fee_amount, payment_hash
+                                    );
+                                }
                             }
                         }
                         Ok(Err(e)) => {

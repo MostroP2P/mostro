@@ -581,6 +581,10 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         order.id, order.dev_fee, DEV_FEE_LIGHTNING_ADDRESS
     );
 
+    if order.dev_fee <= 0 {
+        return Err(MostroInternalErr(ServiceError::InvalidAmount));
+    }
+
     // Step 1: LNURL resolution (15s timeout)
     let payment_request = tokio::time::timeout(
         std::time::Duration::from_secs(15),

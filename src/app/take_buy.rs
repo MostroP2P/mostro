@@ -1,6 +1,5 @@
 use crate::util::{
-    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
-    show_hold_invoice,
+    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
 };
 
 use crate::config::MOSTRO_DB_PASSWORD;

@@ -548,18 +548,24 @@ async fn job_process_dev_fee_payment() {
 
                             match order.update(&pool).await {
                                 Err(e) => {
-                                    error!("❌ DATABASE UPDATE FAILED for order {}: {:?}", order_id, e);
+                                    error!(
+                                        "❌ DATABASE UPDATE FAILED for order {}: {:?}",
+                                        order_id, e
+                                    );
                                     error!("   Fields attempted: dev_fee_paid=true, dev_fee_payment_hash={}", payment_hash);
                                 }
                                 Ok(_) => {
                                     info!("✅ DATABASE UPDATE SUCCEEDED for order {}", order_id);
-                                    info!("   Updated: dev_fee_paid=true, dev_fee_payment_hash={}", payment_hash);
+                                    info!(
+                                        "   Updated: dev_fee_paid=true, dev_fee_payment_hash={}",
+                                        payment_hash
+                                    );
 
                                     // Verify update by re-querying
                                     if let Ok(verified_order) = sqlx::query_as::<_, Order>(
-                                        "SELECT * FROM orders WHERE id = ?"
+                                        "SELECT * FROM orders WHERE id = ?",
                                     )
-                                    .bind(&order_id)
+                                    .bind(order_id)
                                     .fetch_one(&*pool)
                                     .await
                                     {

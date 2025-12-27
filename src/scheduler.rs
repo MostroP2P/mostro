@@ -12,7 +12,7 @@ use chrono::{TimeDelta, Utc};
 use config::*;
 use mostro_core::prelude::*;
 use nostr_sdk::EventBuilder;
-use nostr_sdk::{Kind as NostrKind, Tag};
+use nostr_sdk::{Kind as NostrKind, Tag, Timestamp};
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -529,6 +529,51 @@ async fn job_process_dev_fee_payment() {
     tokio::spawn(async move {
         loop {
             info!("Checking for unpaid development fees");
+
+            // Cleanup stale PENDING entries (crash recovery)
+            let cleanup_ttl = 300; // 5 minutes in seconds
+            let cutoff_time = Timestamp::now() - cleanup_ttl;
+
+            if let Ok(stale_orders) = sqlx::query_as::<_, Order>(
+                "SELECT * FROM orders
+                 WHERE dev_fee_payment_hash LIKE 'PENDING-%'
+                   AND taken_at > 0
+                   AND taken_at < ?1"
+            )
+            .bind(cutoff_time.to_string())
+            .fetch_all(&*pool)
+            .await
+            {
+                if !stale_orders.is_empty() {
+                    warn!(
+                        "Found {} stale PENDING dev fee orders (older than {}s), resetting",
+                        stale_orders.len(),
+                        cleanup_ttl
+                    );
+
+                    for mut stale_order in stale_orders {
+                        let order_id = stale_order.id;
+                        let age_seconds = Timestamp::now().as_u64() - stale_order.taken_at as u64;
+
+                        warn!(
+                            "Resetting stale PENDING order {} (age: {}s)",
+                            order_id, age_seconds
+                        );
+
+                        stale_order.dev_fee_paid = false;
+                        stale_order.dev_fee_payment_hash = None;
+
+                        match stale_order.update(&pool).await {
+                            Ok(_) => {
+                                info!("✅ Reset stale PENDING for order {}, will retry payment", order_id);
+                            }
+                            Err(e) => {
+                                error!("Failed to reset stale PENDING for order {}: {:?}", order_id, e);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Query unpaid orders
             if let Ok(unpaid_orders) = find_unpaid_dev_fees(&pool).await {

@@ -1274,6 +1274,43 @@ WHERE price_from_api = 1
   AND amount > 0;  -- Only count taken orders
 ```
 
+**5. Market Price Orders with Stale dev_fee After Timeout**
+
+**Symptom:**
+```sql
+-- Orders that timed out but dev_fee wasn't reset
+SELECT id, amount, fee, dev_fee, price_from_api, status
+FROM orders
+WHERE status = 'pending'
+  AND price_from_api = 1
+  AND amount = 0
+  AND fee = 0
+  AND dev_fee != 0;  -- BUG: Should be 0
+```
+
+**Cause:** Taker abandoned order (timeout) but `dev_fee` wasn't reset to 0
+
+**Impact:** Next taker will be charged incorrect dev_fee from previous take attempt at different market price
+
+**Fix:** Ensure both scheduler and cancel paths reset all three fields:
+- `src/scheduler.rs` lines 354-358: Automatic timeout handler
+- `src/app/cancel.rs` lines 18-25: Explicit cancellation handler
+
+**Prevention:** Both paths now include `order.dev_fee = 0` for market price orders. See "Taker Abandonment and Order Reset" section for details.
+
+**Verification:**
+```sql
+-- All pending market price orders should have dev_fee = 0
+SELECT COUNT(*) as stale_dev_fee_orders
+FROM orders
+WHERE status = 'pending'
+  AND price_from_api = 1
+  AND amount = 0
+  AND fee = 0
+  AND dev_fee != 0;
+-- Should return 0 if fix is working correctly
+```
+
 ### Manual Retry Procedure
 
 For orders with unpaid dev fees:

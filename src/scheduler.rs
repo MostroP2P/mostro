@@ -549,15 +549,21 @@ async fn job_process_dev_fee_payment() {
                         order.dev_fee_paid = true;
                         match order.update(&pool).await {
                             Ok(_) => {
-                                info!("✅ Recovered order {} - marked as paid with existing hash", order_id);
+                                info!(
+                                    "✅ Recovered order {} - marked as paid with existing hash",
+                                    order_id
+                                );
                                 // Verify recovery
-                                if let Ok(verified) = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
-                                    .bind(order_id)
-                                    .fetch_one(&*pool)
-                                    .await
+                                if let Ok(verified) =
+                                    sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+                                        .bind(order_id)
+                                        .fetch_one(&*pool)
+                                        .await
                                 {
-                                    info!("RECOVERY VERIFIED: dev_fee_paid={}, hash={:?}",
-                                        verified.dev_fee_paid, verified.dev_fee_payment_hash);
+                                    info!(
+                                        "RECOVERY VERIFIED: dev_fee_paid={}, hash={:?}",
+                                        verified.dev_fee_paid, verified.dev_fee_payment_hash
+                                    );
                                 }
                             }
                             Err(e) => error!("❌ Failed to recover order {}: {:?}", order_id, e),
@@ -611,7 +617,10 @@ async fn job_process_dev_fee_payment() {
                                 }
                                 Ok(_) => {
                                     info!("✅ Dev fee payment completed for order {}", order_id);
-                                    info!("   Amount: {} sats, Hash: {}", dev_fee_amount, payment_hash);
+                                    info!(
+                                        "   Amount: {} sats, Hash: {}",
+                                        dev_fee_amount, payment_hash
+                                    );
 
                                     // Verify update
                                     if let Ok(verified_order) = sqlx::query_as::<_, Order>(
@@ -634,7 +643,10 @@ async fn job_process_dev_fee_payment() {
                         Ok(Err(e)) => {
                             // STEP 4: Payment failed, reset to unpaid for retry
                             let order_id = order.id;
-                            error!("Dev fee payment failed for order {} - error: {:?}", order_id, e);
+                            error!(
+                                "Dev fee payment failed for order {} - error: {:?}",
+                                order_id, e
+                            );
 
                             order.dev_fee_paid = false;
                             order.dev_fee_payment_hash = None;
@@ -650,7 +662,10 @@ async fn job_process_dev_fee_payment() {
                                     error!("   ACTION REQUIRED: Manual intervention - order stuck in 'paid' state with no payment");
                                 }
                                 Ok(_) => {
-                                    info!("Reset order {} to unpaid, will retry next cycle", order_id);
+                                    info!(
+                                        "Reset order {} to unpaid, will retry next cycle",
+                                        order_id
+                                    );
                                 }
                             }
                         }
@@ -658,17 +673,26 @@ async fn job_process_dev_fee_payment() {
                             // STEP 5: Timeout, reset to unpaid for retry
                             let order_id = order.id;
                             let dev_fee = order.dev_fee;
-                            error!("Dev fee payment timeout (50s) for order {} ({} sats)", order_id, dev_fee);
+                            error!(
+                                "Dev fee payment timeout (50s) for order {} ({} sats)",
+                                order_id, dev_fee
+                            );
 
                             order.dev_fee_paid = false;
                             order.dev_fee_payment_hash = None;
 
                             match order.update(&pool).await {
                                 Err(e) => {
-                                    error!("Failed to reset after timeout for order {}: {:?}", order_id, e);
+                                    error!(
+                                        "Failed to reset after timeout for order {}: {:?}",
+                                        order_id, e
+                                    );
                                 }
                                 Ok(_) => {
-                                    info!("Reset order {} to unpaid after timeout, will retry", order_id);
+                                    info!(
+                                        "Reset order {} to unpaid after timeout, will retry",
+                                        order_id
+                                    );
                                 }
                             }
                         }

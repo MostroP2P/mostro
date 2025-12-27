@@ -16,7 +16,7 @@ use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler() {
@@ -534,7 +534,55 @@ async fn job_process_dev_fee_payment() {
                 info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
 
                 for mut order in unpaid_orders {
-                    // 50 second timeout per payment (under 60s cycle)
+                    // GUARD: Detect partial success scenario (payment succeeded but DB update failed)
+                    if order.dev_fee_payment_hash.is_some() {
+                        let order_id = order.id;
+                        let payment_hash = order.dev_fee_payment_hash.as_ref().unwrap().clone();
+
+                        warn!(
+                            "Order {} has payment hash '{}' but dev_fee_paid=false. Recovering from failed DB update.",
+                            order_id,
+                            payment_hash
+                        );
+
+                        // Recovery: Mark as paid since hash exists (payment already succeeded)
+                        order.dev_fee_paid = true;
+                        match order.update(&pool).await {
+                            Ok(_) => {
+                                info!("✅ Recovered order {} - marked as paid with existing hash", order_id);
+                                // Verify recovery
+                                if let Ok(verified) = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+                                    .bind(order_id)
+                                    .fetch_one(&*pool)
+                                    .await
+                                {
+                                    info!("RECOVERY VERIFIED: dev_fee_paid={}, hash={:?}",
+                                        verified.dev_fee_paid, verified.dev_fee_payment_hash);
+                                }
+                            }
+                            Err(e) => error!("❌ Failed to recover order {}: {:?}", order_id, e),
+                        }
+                        continue; // Skip payment attempt
+                    }
+
+                    // STEP 1: Pre-mark as paid to prevent duplicate attempts
+                    let order_id = order.id;
+                    info!("Pre-marking order {} as payment pending", order_id);
+                    order.dev_fee_paid = true;
+                    order.dev_fee_payment_hash = Some(format!("PENDING-{}", order_id));
+
+                    let mut order = match order.update(&pool).await {
+                        Err(e) => {
+                            error!("Failed to pre-mark dev fee for order {}: {:?}", order_id, e);
+                            continue; // Skip this order, will retry next cycle
+                        }
+                        Ok(updated_order) => {
+                            info!("Order {} marked as payment pending", order_id);
+                            updated_order
+                        }
+                    };
+
+                    // STEP 2: Attempt payment (protected from retry by dev_fee_paid = true)
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(50),
                         send_dev_fee_payment(&order),
@@ -542,39 +590,30 @@ async fn job_process_dev_fee_payment() {
                     .await
                     {
                         Ok(Ok(payment_hash)) => {
-                            // SUCCESS: Update both fields atomically
                             let order_id = order.id;
                             let dev_fee_amount = order.dev_fee;
 
-                            info!(
-                                "BEFORE UPDATE: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
-                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
-                            );
-
-                            order.dev_fee_paid = true;
+                            // STEP 3: Update with actual payment hash
                             order.dev_fee_payment_hash = Some(payment_hash.clone());
 
-                            info!(
-                                "AFTER MODIFY: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
-                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
-                            );
+                            info!("Payment succeeded for order {}, updating hash", order_id);
 
                             match order.update(&pool).await {
                                 Err(e) => {
-                                    error!(
-                                        "❌ DATABASE UPDATE FAILED for order {}: {:?}",
-                                        order_id, e
-                                    );
-                                    error!("   Fields attempted: dev_fee_paid=true, dev_fee_payment_hash={}", payment_hash);
+                                    // CRITICAL: Payment succeeded but can't update hash
+                                    error!("❌ CRITICAL: Dev fee PAID for order {} but DB update FAILED", order_id);
+                                    error!("   Payment amount: {} sats", dev_fee_amount);
+                                    error!("   Payment hash: {}", payment_hash);
+                                    error!("   Database error: {:?}", e);
+                                    error!("   ACTION REQUIRED: Manual reconciliation - order marked as paid but hash not recorded");
+                                    // Note: Order is marked as paid (dev_fee_paid=true), so won't retry
+                                    // Hash is in logs for manual reconciliation
                                 }
                                 Ok(_) => {
-                                    info!("✅ DATABASE UPDATE SUCCEEDED for order {}", order_id);
-                                    info!(
-                                        "   Updated: dev_fee_paid=true, dev_fee_payment_hash={}",
-                                        payment_hash
-                                    );
+                                    info!("✅ Dev fee payment completed for order {}", order_id);
+                                    info!("   Amount: {} sats, Hash: {}", dev_fee_amount, payment_hash);
 
-                                    // Verify update by re-querying
+                                    // Verify update
                                     if let Ok(verified_order) = sqlx::query_as::<_, Order>(
                                         "SELECT * FROM orders WHERE id = ?",
                                     )
@@ -589,27 +628,49 @@ async fn job_process_dev_fee_payment() {
                                             verified_order.dev_fee_payment_hash
                                         );
                                     }
-
-                                    info!(
-                                        "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
-                                        order_id, dev_fee_amount, payment_hash
-                                    );
                                 }
                             }
                         }
                         Ok(Err(e)) => {
-                            // FAILURE: Leave fields unchanged for retry
-                            error!(
-                                "Dev fee payment failed for order {} ({} sats) - error: {:?}, will retry",
-                                order.id, order.dev_fee, e
-                            );
+                            // STEP 4: Payment failed, reset to unpaid for retry
+                            let order_id = order.id;
+                            error!("Dev fee payment failed for order {} - error: {:?}", order_id, e);
+
+                            order.dev_fee_paid = false;
+                            order.dev_fee_payment_hash = None;
+
+                            match order.update(&pool).await {
+                                Err(db_err) => {
+                                    error!(
+                                        "❌ CRITICAL: Failed to reset dev fee status after payment failure for order {}",
+                                        order_id
+                                    );
+                                    error!("   Payment error: {:?}", e);
+                                    error!("   Database error: {:?}", db_err);
+                                    error!("   ACTION REQUIRED: Manual intervention - order stuck in 'paid' state with no payment");
+                                }
+                                Ok(_) => {
+                                    info!("Reset order {} to unpaid, will retry next cycle", order_id);
+                                }
+                            }
                         }
                         Err(_) => {
-                            // TIMEOUT: Leave fields unchanged for retry
-                            error!(
-                                "Dev fee payment timeout (50s) for order {} ({} sats) - will retry",
-                                order.id, order.dev_fee
-                            );
+                            // STEP 5: Timeout, reset to unpaid for retry
+                            let order_id = order.id;
+                            let dev_fee = order.dev_fee;
+                            error!("Dev fee payment timeout (50s) for order {} ({} sats)", order_id, dev_fee);
+
+                            order.dev_fee_paid = false;
+                            order.dev_fee_payment_hash = None;
+
+                            match order.update(&pool).await {
+                                Err(e) => {
+                                    error!("Failed to reset after timeout for order {}: {:?}", order_id, e);
+                                }
+                                Ok(_) => {
+                                    info!("Reset order {} to unpaid after timeout, will retry", order_id);
+                                }
+                            }
                         }
                     }
                 }

@@ -349,12 +349,13 @@ async fn job_cancel_orders() {
                             info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
                         };
                         let mut order = order.clone();
+                        // dev_fee should be reset unconditionally
+                        order.dev_fee = 0;
                         // We re-publish the event with Pending status
                         // and update on local database
                         if order.price_from_api {
                             order.amount = 0;
                             order.fee = 0;
-                            order.dev_fee = 0;
                         }
 
                         // Get order status and kind

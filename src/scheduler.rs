@@ -354,6 +354,7 @@ async fn job_cancel_orders() {
                         if order.price_from_api {
                             order.amount = 0;
                             order.fee = 0;
+                            order.dev_fee = 0;
                         }
 
                         // Get order status and kind

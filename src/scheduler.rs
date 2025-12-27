@@ -509,6 +509,18 @@ async fn job_update_bitcoin_prices() {
     });
 }
 
+/// Processes unpaid development fees for completed orders
+///
+/// Runs every 60 seconds and attempts to pay dev fees for orders that have:
+/// - status = 'settled-hold-invoice' OR 'success'
+/// - dev_fee > 0
+/// - dev_fee_paid = false
+///
+/// Design decisions:
+/// - 50-second timeout per payment (10s buffer before next cycle)
+/// - Sequential processing (one order at a time) to avoid overwhelming scheduler
+/// - Automatic retry on next cycle for failed payments
+/// - Enhanced logging (BEFORE/AFTER/VERIFY) for troubleshooting database persistence
 async fn job_process_dev_fee_payment() {
     let pool = get_db_pool();
     let interval = 60u64; // Every 60 seconds

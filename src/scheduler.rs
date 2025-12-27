@@ -538,7 +538,7 @@ async fn job_process_dev_fee_payment() {
                 "SELECT * FROM orders
                  WHERE dev_fee_payment_hash LIKE 'PENDING-%'
                    AND taken_at > 0
-                   AND taken_at < ?1"
+                   AND taken_at < ?1",
             )
             .bind(cutoff_time.to_string())
             .fetch_all(&*pool)
@@ -565,10 +565,16 @@ async fn job_process_dev_fee_payment() {
 
                         match stale_order.update(&pool).await {
                             Ok(_) => {
-                                info!("✅ Reset stale PENDING for order {}, will retry payment", order_id);
+                                info!(
+                                    "✅ Reset stale PENDING for order {}, will retry payment",
+                                    order_id
+                                );
                             }
                             Err(e) => {
-                                error!("Failed to reset stale PENDING for order {}: {:?}", order_id, e);
+                                error!(
+                                    "Failed to reset stale PENDING for order {}: {:?}",
+                                    order_id, e
+                                );
                             }
                         }
                     }

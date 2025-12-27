@@ -540,7 +540,7 @@ async fn job_process_dev_fee_payment() {
                    AND taken_at > 0
                    AND taken_at < ?1",
             )
-            .bind(cutoff_time.to_string())
+            .bind(cutoff_time.as_u64() as i64)
             .fetch_all(&*pool)
             .await
             {

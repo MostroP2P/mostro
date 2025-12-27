@@ -727,7 +727,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
           WHERE expires_at < ?1 AND status == 'pending'
         "#,
     )
-    .bind(expire_time.to_string())
+    .bind(expire_time.as_u64() as i64)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -746,7 +746,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, Most
           WHERE taken_at < ?1 AND ( status == 'waiting-buyer-invoice' OR status == 'waiting-payment' )
         "#,
     )
-    .bind(expire_time.to_string())
+    .bind(expire_time.as_u64() as i64)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -973,7 +973,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(
         "
-            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at) 
+            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ",
     )
@@ -989,7 +989,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .bind(new_user.last_rating)
     .bind(new_user.max_rating)
     .bind(new_user.min_rating)
-    .bind(created_at.to_string())
+    .bind(created_at.as_u64() as i64)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

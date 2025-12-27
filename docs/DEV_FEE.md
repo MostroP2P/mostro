@@ -66,6 +66,16 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - 42253f1: Fix edge case on dev fund payment
 - 2655943: fix: improve dev fee payment reliability and coverage
 
+### Phase 4: Audit Events via Nostr ⚠️ TO IMPLEMENT
+
+**What Will Be Implemented:**
+- Custom Nostr event kind (38383) for dev fee payment audits
+- Event publishing in scheduler after successful payment
+- Public relay distribution for third-party verification and total tracking
+- Complete payment details: order_id, dev_fee, payment_hash, timestamp
+
+**Status:** ⚠️ TO IMPLEMENT - Planned for future release (see Phase 4 section for full specification)
+
 ### Implementation Notes
 
 This section documents key improvements and fixes made during Phase 3 implementation.
@@ -1109,25 +1119,142 @@ This section provides a checklist for implementing the remaining phases of the d
 
 **Deliverables:** ✅ Automated dev fee payment system fully operational with scheduler-based processing, enhanced logging, race condition handling, and automatic retry mechanism
 
-### Phase 4: Documentation and Deployment ✅ COMPLETE
+### Phase 4: Audit Events via Nostr ⚠️ TO IMPLEMENT
 
-- [x] Update this document to reflect actual implementation
-  - Changed "Required Implementation" to "Implementation"
-  - Updated all "TO IMPLEMENT" markers to "IMPLEMENTED"
-  - Added implementation notes with commit references
-  - Added "Implementation Notes" section documenting key improvements
-  - Updated all queries to match actual implementation (dual-status queries)
-  - Documented enhanced logging patterns
-  - Documented race condition handling
-- [ ] Update CHANGELOG.md with new feature (pending)
-- [ ] Update README.md if necessary (pending)
-- [ ] Create migration guide for existing installations (included in "Migration Guide" section)
-- [x] Test full workflow end-to-end on testnet/staging
-  - Fixed through multiple commits (102cfed, eaf3319, 42253f1, 2655943)
-  - Edge cases identified and resolved
-  - Race conditions handled
+**Purpose:** Provide transparent, verifiable audit trail of all dev fee payments through Nostr relays.
 
-**Total Time:** Phases 1-4 completed across multiple commits
+**What Will Be Implemented:**
+- Custom Nostr event kind (38383) for dev fee payment audits
+- Event publishing in scheduler after successful payment
+- Complete payment details: amount, hash, order reference, timestamp
+- Public relay distribution for third-party verification
+- Queryable tags for analytics and reporting
+
+**Event Specification:**
+
+| Property | Value |
+|----------|-------|
+| Event Kind | 38383 (Regular Event) |
+| Replaceability | No - complete audit trail |
+| Published After | Successful dev fee payment & DB update |
+| Content Format | JSON with structured payment data |
+| Tags | `y`, `z`, `order`, `amount`, `hash`, `t`, `currency`, `network` |
+
+**Event Kind Rationale:**
+
+Why kind 38383 (Regular Event)?
+- ✅ **Complete History:** Every payment is a separate, permanent event
+- ✅ **Third-Party Auditing:** Anyone can query all historical payments
+- ✅ **Total Calculation:** Sum all `amount` tags to get total dev fund contributions
+- ✅ **Immutable Record:** Events cannot be replaced or deleted
+- ✅ **Standard Compliance:** Follows NIP-01 application-specific event range (1000-9999)
+
+**Event Structure Example:**
+
+```json
+{
+  "kind": 38383,
+  "content": {
+    "order_id": "550e8400-e29b-41d4-a716-446655440000",
+    "dev_fee_sats": 100,
+    "payment_hash": "abc123...",
+    "payment_timestamp": 1234567890,
+    "destination": "dev@getalby.com",
+    "order_amount_sats": 10000,
+    "order_fiat_amount": 50,
+    "order_fiat_code": "USD",
+    "status": "success"
+  },
+  "tags": [
+    ["y", "mostro"],
+    ["z", "dev-fee-payment"],
+    ["order", "550e8400-e29b-..."],
+    ["amount", "100"],
+    ["hash", "abc123..."],
+    ["t", "audit"],
+    ["t", "dev-fund"],
+    ["currency", "USD"],
+    ["network", "mainnet"]
+  ]
+}
+```
+
+**Query Examples:**
+
+```javascript
+// Get all dev fee payments
+const filter = {
+  kinds: [38383],
+  "#y": ["mostro"],
+  "#z": ["dev-fee-payment"]
+};
+
+// Calculate total dev fund contributions
+let total = 0;
+events.forEach(event => {
+  const amountTag = event.tags.find(t => t[0] === "amount");
+  if (amountTag) total += parseInt(amountTag[1]);
+});
+
+// Filter by currency
+const usdPayments = {
+  kinds: [38383],
+  "#currency": ["USD"]
+};
+
+// Find payments for specific order
+const orderPayments = {
+  kinds: [38383],
+  "#order": ["550e8400-e29b-41d4-a716-446655440000"]
+};
+```
+
+**Implementation Details:**
+
+**Location:** `src/scheduler.rs::job_process_dev_fee_payment()` (after payment success)
+
+**Function:** `publish_dev_fee_audit_event(order: &Order, payment_hash: &str)`
+
+**Error Handling:** Audit event failures are logged but don't fail the payment transaction
+
+**Retry Logic:** None - if event publish fails, payment still succeeds (prioritize financial reliability)
+
+**Privacy Considerations:**
+- Order ID included for transparency
+- Buyer/seller pubkeys NOT included (privacy)
+- Only aggregate payment data published
+
+**Benefits:**
+
+1. **Transparency:** Anyone can verify dev fund contributions
+2. **Accountability:** Public record of all fee payments
+3. **Analytics:** Query by currency, date range, network
+4. **Trust:** Third-party auditing without Mostro access
+5. **Compliance:** Verifiable fee collection for reporting
+
+**Testing:**
+
+```bash
+# Query dev fee events from relay
+nostr-cli -k 38383 --tag y=mostro --tag z=dev-fee-payment
+
+# Calculate total contributions
+nostr-cli -k 38383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") | .[1] | tonumber] | add'
+```
+
+**Status:** ⚠️ TO IMPLEMENT - Planned for future release
+
+**Implementation Roadmap:**
+1. Add `DEV_FEE_AUDIT_EVENT_KIND` constant to `src/config/constants.rs`
+2. Create `publish_dev_fee_audit_event()` function in `src/util.rs` or new `src/app/audit_event.rs`
+3. Integrate event publishing in `src/scheduler.rs` after successful payment
+4. Test event publishing to relays
+5. Verify third-party queryability
+
+**Future Enhancements:**
+- Aggregate statistics event (kind 38100) updated monthly with totals
+- Dashboard for visualizing dev fund contributions
+- NIP-05 verification for Mostro's audit event pubkey
 
 ## Monitoring and Operations
 

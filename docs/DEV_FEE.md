@@ -47,7 +47,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs` (lines 511-608)
 - Database query function `find_unpaid_dev_fees()` in `src/db.rs` (lines 895-908)
 - **Database field updates:**
-  - `dev_fee`: Set during order creation, reset to 0 for abandoned market orders, calculated for market price orders
+  - `dev_fee`: Always set to 0 at order creation, calculated when order is taken (unified for all order types)
   - `dev_fee_paid`: Changed from 0 to 1 after successful payment in scheduler
   - `dev_fee_payment_hash`: Set to Lightning payment hash on successful payment
 - Error handling and retry logic with automatic retries every 60 seconds
@@ -55,9 +55,10 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Dev fee amount validation (rejects payments with dev_fee <= 0)
 - Enhanced logging with BEFORE/AFTER state tracking and database verification
 - Race condition handling (query checks both 'settled-hold-invoice' AND 'success' statuses)
-- Market price order dev_fee calculation in `take_buy.rs` and `take_sell.rs`
+- Unified dev_fee calculation at order take time for both fixed and market price orders
+- Invoice validation fix ensuring dev_fee is calculated before validating buyer invoices
 
-**Status:** ✅ Complete - Automated dev fee payment system fully operational
+**Status:** ✅ Complete - Automated dev fee payment system fully operational with unified calculation logic
 
 **Implementation Commits:**
 - f508669: feat: implement automated development fee payment system
@@ -65,6 +66,8 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - eaf3319: Validate dev_fee amount before attempting payment
 - 42253f1: Fix edge case on dev fund payment
 - 2655943: fix: improve dev fee payment reliability and coverage
+- 2349669: refactor: unify dev_fee calculation at order take time
+- 7e9b0a0: fix: calculate dev_fee before invoice validation in take_sell
 
 ### Phase 4: Audit Events via Nostr ⚠️ TO IMPLEMENT
 
@@ -120,6 +123,44 @@ This section documents key improvements and fixes made during Phase 3 implementa
     VERIFICATION: order_id=abc123, dev_fee_paid=true, dev_fee_payment_hash=Some("a1b2c3...")
     ```
 - **Result:** Complete diagnostic trail for debugging payment issues and database persistence
+
+**Commit 2349669 - Unified dev_fee Calculation:**
+- **Problem:** Inconsistent dev_fee calculation timing between order types
+  - Fixed price orders: dev_fee calculated at order creation in `prepare_new_order()`
+  - Market price orders: dev_fee calculated at order take time
+  - This inconsistency made code harder to maintain and reason about
+- **Solution:** Unified behavior for all order types
+  - ALL orders now have `dev_fee = 0` at creation time (`src/util.rs`)
+  - ALL orders calculate `dev_fee` when taken (`take_buy.rs` and `take_sell.rs`)
+  - Added else block for fixed price orders to calculate dev_fee at take time
+- **Benefits:**
+  - Consistent behavior across all order types
+  - Single point of calculation makes code easier to understand
+  - All pending orders have `dev_fee = 0`, all taken orders have `dev_fee > 0`
+  - Simplifies logic and reduces code duplication
+- **Files Modified:**
+  - `src/util.rs`: Set `dev_fee = 0` for all orders at creation
+  - `src/app/take_buy.rs`: Added dev_fee calculation for fixed price orders
+  - `src/app/take_sell.rs`: Added dev_fee calculation for fixed price orders
+  - `docs/DEV_FEE.md`: Updated documentation to reflect unified behavior
+
+**Commit 7e9b0a0 - Invoice Validation Fix:**
+- **Problem:** Critical bug in `take_sell.rs` where `validate_invoice()` was called BEFORE `dev_fee` was calculated
+  - Invoice validation used `dev_fee = 0`, resulting in incorrect validation
+  - Validation only checked Mostro fee, NOT dev_fee
+  - Buyers could submit invoices that were too high (missing dev_fee portion)
+- **Impact:** For a 200,000 sat order with 1,200 sat dev_fee:
+  - Before fix: Validation expected 198,000 sats (missing 600 sat dev_fee) ❌
+  - After fix: Validation expects 197,400 sats (correct total fees) ✅
+- **Solution:** Reordered operations in `take_sell.rs`
+  - Move `get_fiat_amount_requested()` before dev_fee calculation (needed for market orders)
+  - Move dev_fee calculation block before `validate_invoice()` call
+  - Now `validate_invoice()` receives order with correct `dev_fee` value
+- **Verification:**
+  - Invoice validation now correctly checks: `amount - (fee + buyer_dev_fee)`
+  - All 107 tests pass
+  - Buyer invoices are properly validated for total fees (Mostro fee + dev_fee)
+- **Note:** `take_buy.rs` was not affected as buy orders don't call `validate_invoice()`
 
 **Key Design Decisions:**
 

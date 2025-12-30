@@ -563,10 +563,7 @@ pub async fn publish_dev_fee_audit_event(
             TagKind::Custom(Cow::Borrowed("destination")),
             vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()],
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("network")),
-            vec![ln_network],
-        ),
+        Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
             vec!["mostro".to_string()],
@@ -578,13 +575,10 @@ pub async fn publish_dev_fee_audit_event(
     ]);
 
     // Create and sign event
-    let event = EventBuilder::new(
-        nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND),
-        "",
-    )
-    .tags(tags)
-    .sign_with_keys(&keys)
-    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
+        .tags(tags)
+        .sign_with_keys(&keys)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Publish event to relays
     client

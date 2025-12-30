@@ -510,7 +510,7 @@ pub async fn send_dm(
 
 /// Publishes a dev fee payment audit event to Nostr relays
 ///
-/// This function creates and publishes a Nostr event (kind 38383) containing
+/// This function creates and publishes a Nostr event (kind 8383) containing
 /// audit information about a successful dev fee payment. The event includes
 /// payment details for transparency and third-party verification.
 ///

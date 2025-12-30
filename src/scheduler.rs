@@ -694,9 +694,11 @@ async fn job_process_dev_fee_payment() {
                                         );
 
                                         // Publish audit event to Nostr (non-blocking - failure doesn't affect payment)
-                                        if let Err(e) =
-                                            publish_dev_fee_audit_event(&verified_order, &payment_hash)
-                                                .await
+                                        if let Err(e) = publish_dev_fee_audit_event(
+                                            &verified_order,
+                                            &payment_hash,
+                                        )
+                                        .await
                                         {
                                             warn!(
                                                 "Failed to publish audit event for order {}: {:?}",

@@ -508,6 +508,112 @@ pub async fn send_dm(
     Ok(())
 }
 
+/// Publishes a dev fee payment audit event to Nostr relays
+///
+/// This function creates and publishes a Nostr event (kind 38383) containing
+/// audit information about a successful dev fee payment. The event includes
+/// payment details for transparency and third-party verification.
+///
+/// # Arguments
+/// * `order` - The order for which dev fee was paid
+/// * `payment_hash` - The Lightning Network payment hash
+///
+/// # Returns
+/// * `Ok(())` if event was published successfully
+/// * `Err(MostroError)` if publishing failed
+///
+/// # Privacy
+/// This function does NOT include buyer or seller pubkeys to maintain user privacy.
+/// Only aggregate payment data and order metadata are published.
+pub async fn publish_dev_fee_audit_event(
+    order: &Order,
+    payment_hash: &str,
+) -> Result<(), MostroError> {
+    use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
+    use std::borrow::Cow;
+
+    // Get Mostro keys for signing
+    let keys = get_keys()?;
+
+    // Get Nostr client
+    let client = get_nostr_client()?;
+
+    // Prepare event content as JSON
+    let content = serde_json::json!({
+        "order_id": order.id.to_string(),
+        "dev_fee_sats": order.dev_fee,
+        "payment_hash": payment_hash,
+        "payment_timestamp": Timestamp::now().as_u64(),
+        "destination": DEV_FEE_LIGHTNING_ADDRESS,
+        "order_amount_sats": order.amount,
+        "order_fiat_amount": order.fiat_amount,
+        "order_fiat_code": order.fiat_code,
+        "status": "success"
+    });
+
+    // Create tags for queryability
+    let tags = Tags::from_list(vec![
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("y")),
+            vec!["mostro".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("z")),
+            vec!["dev-fee-payment".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("order")),
+            vec![order.id.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("amount")),
+            vec![order.dev_fee.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("hash")),
+            vec![payment_hash.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("t")),
+            vec!["audit".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("t")),
+            vec!["dev-fund".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("currency")),
+            vec![order.fiat_code.clone()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("network")),
+            vec!["mainnet".to_string()],
+        ),
+    ]);
+
+    // Create and sign event
+    let event = EventBuilder::new(
+        nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND),
+        content.to_string(),
+    )
+    .tags(tags)
+    .sign_with_keys(&keys)
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Publish event to relays
+    client
+        .send_event(&event)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    info!(
+        "📡 Published dev fee audit event for order {} - {} sats to relays",
+        order.id, order.dev_fee
+    );
+
+    Ok(())
+}
+
 pub fn get_keys() -> Result<Keys, MostroError> {
     let nostr_settings = Settings::get_nostr();
     // nostr private key

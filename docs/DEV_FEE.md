@@ -69,15 +69,16 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - 2349669: refactor: unify dev_fee calculation at order take time
 - 7e9b0a0: fix: calculate dev_fee before invoice validation in take_sell
 
-### Phase 4: Audit Events via Nostr ⚠️ TO IMPLEMENT
+### Phase 4: Audit Events via Nostr ✅ COMPLETE
 
-**What Will Be Implemented:**
+**What Was Implemented:**
 - Custom Nostr event kind (38383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Public relay distribution for third-party verification and total tracking
 - Complete payment details: order_id, dev_fee, payment_hash, timestamp
+- Non-blocking event publication (payment succeeds even if event fails)
 
-**Status:** ⚠️ TO IMPLEMENT - Planned for future release (see Phase 4 section for full specification)
+**Status:** ✅ Complete - Dev fee payments are auditable via Nostr events (see Phase 4 section for full specification)
 
 ### Implementation Notes
 
@@ -1187,11 +1188,11 @@ This section provides a checklist for implementing the remaining phases of the d
 
 **Deliverables:** ✅ Automated dev fee payment system fully operational with scheduler-based processing, enhanced logging, race condition handling, and automatic retry mechanism
 
-### Phase 4: Audit Events via Nostr ⚠️ TO IMPLEMENT
+### Phase 4: Audit Events via Nostr ✅ COMPLETE
 
 **Purpose:** Provide transparent, verifiable audit trail of all dev fee payments through Nostr relays.
 
-**What Will Be Implemented:**
+**What Was Implemented:**
 - Custom Nostr event kind (38383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Complete payment details: amount, hash, order reference, timestamp
@@ -1310,14 +1311,14 @@ nostr-cli -k 38383 --tag y=mostro --tag z=dev-fee-payment
 nostr-cli -k 38383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") | .[1] | tonumber] | add'
 ```
 
-**Status:** ⚠️ TO IMPLEMENT - Planned for future release
+**Status:** ✅ Complete - Dev fee audit events are now published to Nostr relays
 
-**Implementation Roadmap:**
-1. Add `DEV_FEE_AUDIT_EVENT_KIND` constant to `src/config/constants.rs`
-2. Create `publish_dev_fee_audit_event()` function in `src/util.rs` or new `src/app/audit_event.rs`
-3. Integrate event publishing in `src/scheduler.rs` after successful payment
-4. Test event publishing to relays
-5. Verify third-party queryability
+**Implementation:**
+1. ✅ Added `DEV_FEE_AUDIT_EVENT_KIND` constant to `src/config/constants.rs`
+2. ✅ Created `publish_dev_fee_audit_event()` function in `src/util.rs`
+3. ✅ Integrated event publishing in `src/scheduler.rs` after successful payment
+4. ✅ Non-blocking implementation - event failures don't affect payment
+5. ✅ Events are queryable via standard Nostr clients and relays
 
 **Future Enhancements:**
 - Aggregate statistics event (kind 38100) updated monthly with totals

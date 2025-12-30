@@ -67,15 +67,36 @@ pub async fn take_sell_action(
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
-    // Validate invoice and get payment request if present
-    let payment_request = validate_invoice(&msg, &order).await?;
-
     // Get amount request if user requested one for range order - fiat amount will be used below
+    // IMPORTANT: This must come BEFORE dev_fee calculation for market price orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
         order.fiat_amount = am;
     } else {
         return Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount));
     }
+
+    // Calculate dev_fee BEFORE validate_invoice
+    // Invoice validation needs the correct dev_fee to verify buyer invoice amount
+    if order.has_no_amount() {
+        // Market price: calculate amount, fee, and dev_fee
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+            Ok(amount_fees) => {
+                order.amount = amount_fees.0;
+                order.fee = amount_fees.1;
+                let total_mostro_fee = order.fee * 2;
+                order.dev_fee = get_dev_fee(total_mostro_fee);
+            }
+            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
+        };
+    } else {
+        // Fixed price: only calculate dev_fee (amount/fee already set at creation)
+        let total_mostro_fee = order.fee * 2;
+        order.dev_fee = get_dev_fee(total_mostro_fee);
+    }
+
+    // Validate invoice and get payment request if present
+    // NOW dev_fee is set correctly for proper validation
+    let payment_request = validate_invoice(&msg, &order).await?;
 
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
@@ -99,25 +120,6 @@ pub async fn take_sell_action(
     order.trade_index_buyer = Some(trade_index);
     // Timestamp take order time
     order.set_timestamp_now();
-
-    // Check market price value in sats - if order was with market price then calculate it and send a DM to buyer
-    if order.has_no_amount() {
-        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
-            Ok(amount_fees) => {
-                order.amount = amount_fees.0;
-                order.fee = amount_fees.1;
-                // Calculate dev_fee now that we know the fee amount
-                let total_mostro_fee = order.fee * 2;
-                order.dev_fee = get_dev_fee(total_mostro_fee);
-            }
-            Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
-        };
-    } else {
-        // Calculate dev_fee for fixed price orders
-        // The fee is already calculated at order creation, we only calculate dev_fee here
-        let total_mostro_fee = order.fee * 2;
-        order.dev_fee = get_dev_fee(total_mostro_fee);
-    }
 
     // Update trade index only after all checks are done
     update_user_trade_index(pool, event.sender.to_string(), trade_index)

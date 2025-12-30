@@ -483,6 +483,26 @@ Order Re-taken at BTC=$52,000 (price increased):
   ```
 - Database function: `update_order_to_initial_state()` persists the reset values
 
+**Database Persistence Fix:**
+
+Prior to commit `c803471`, the `update_order_to_initial_state()` function in `src/db.rs`
+did not include `dev_fee` in its SQL UPDATE statement, causing stale dev_fee values to
+remain in the database even though the in-memory Order struct had `dev_fee = 0`.
+
+**Before Fix:**
+- Memory: `order.dev_fee = 0` ✓
+- Database: `dev_fee = 300` (stale) ✗
+- After `edit_pubkeys_order()` fetches from DB: `order.dev_fee = 300` (wrong!) ✗
+
+**After Fix:**
+- Memory: `order.dev_fee = 0` ✓
+- Database: `dev_fee = 0` ✓
+- After `edit_pubkeys_order()` fetches from DB: `order.dev_fee = 0` ✓
+
+The fix added `dev_fee` as a parameter to `update_order_to_initial_state()` and
+included it in the SQL UPDATE statement, ensuring the value is properly persisted
+to the database.
+
 **Configuration:**
 - Timeout duration: Configured via `expiration_seconds` in settings
 - Default: Orders return to pending after taker hasn't proceeded for configured time
@@ -1401,11 +1421,19 @@ WHERE price_from_api = 1
   AND amount > 0;  -- Only count taken orders
 ```
 
-**5. Market Price Orders with Stale dev_fee After Timeout**
+**5. Market Price Orders with Stale dev_fee After Timeout** ✅ FIXED
 
-**Symptom:**
+**Status:** This bug was fixed in commit `c803471`. The `update_order_to_initial_state()`
+function now properly persists `dev_fee = 0` to the database.
+
+**Historical Issue (Pre-Fix):**
+The function set `dev_fee = 0` in memory but didn't include it in the SQL UPDATE statement,
+causing stale values to remain in the database. When `edit_pubkeys_order()` fetched the
+order from the database, it would return the old dev_fee value.
+
+**Symptom (Before Fix):**
 ```sql
--- Orders that timed out but dev_fee wasn't reset
+-- Orders that timed out but dev_fee wasn't reset in database
 SELECT id, amount, fee, dev_fee, price_from_api, status
 FROM orders
 WHERE status = 'pending'
@@ -1415,12 +1443,13 @@ WHERE status = 'pending'
   AND dev_fee != 0;  -- BUG: Should be 0
 ```
 
-**Cause:** Taker abandoned order (timeout) but `dev_fee` wasn't reset to 0
+**Cause:** `update_order_to_initial_state()` didn't persist dev_fee to database
 
-**Impact:** Next taker will be charged incorrect dev_fee from previous take attempt at different market price
+**Impact:** Next taker would be charged incorrect dev_fee from previous attempt
 
-**Fix:** Ensure both scheduler and cancel paths reset all three fields:
-- `src/scheduler.rs` lines 354-358: Automatic timeout handler
+**Fix Applied:** Added `dev_fee` parameter to `update_order_to_initial_state()` and
+included it in the SQL UPDATE statement:
+- `src/db.rs` lines 776-817: Function signature and SQL UPDATE modified
 - `src/app/cancel.rs` lines 18-25: Explicit cancellation handler
 
 **Prevention:** Both paths now include `order.dev_fee = 0` for market price orders. See "Taker Abandonment and Order Reset" section for details.

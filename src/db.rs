@@ -778,6 +778,7 @@ pub async fn update_order_to_initial_state(
     order_id: Uuid,
     amount: i64,
     fee: i64,
+    dev_fee: i64,
 ) -> Result<bool, MostroError> {
     let status = Status::Pending.to_string();
     let hash: Option<String> = None;
@@ -791,16 +792,18 @@ pub async fn update_order_to_initial_state(
             status = ?1,
             amount = ?2,
             fee = ?3,
-            hash = ?4,
-            preimage = ?5,
-            buyer_invoice = ?6,
-            taken_at = ?7,
-            invoice_held_at = ?8
-            WHERE id = ?9
+            dev_fee = ?4,
+            hash = ?5,
+            preimage = ?6,
+            buyer_invoice = ?7,
+            taken_at = ?8,
+            invoice_held_at = ?9
+            WHERE id = ?10
         "#,
         status,
         amount,
         fee,
+        dev_fee,
         hash,
         preimage,
         buyer_invoice,

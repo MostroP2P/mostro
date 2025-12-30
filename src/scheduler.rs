@@ -381,6 +381,7 @@ async fn job_cancel_orders() {
                                         order.id,
                                         order.amount,
                                         order.fee,
+                                        order.dev_fee,
                                     )
                                     .await;
                                     info!(

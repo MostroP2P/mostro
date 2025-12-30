@@ -72,7 +72,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 4: Audit Events via Nostr ✅ COMPLETE
 
 **What Was Implemented:**
-- Custom Nostr event kind (38383) for dev fee payment audits
+- Custom Nostr event kind (8383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Public relay distribution for third-party verification and total tracking
 - Complete payment details: order_id, dev_fee, payment_hash, timestamp
@@ -1193,7 +1193,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Purpose:** Provide transparent, verifiable audit trail of all dev fee payments through Nostr relays.
 
 **What Was Implemented:**
-- Custom Nostr event kind (38383) for dev fee payment audits
+- Custom Nostr event kind (8383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Complete payment details: amount, hash, order reference, timestamp
 - Public relay distribution for third-party verification
@@ -1203,7 +1203,7 @@ This section provides a checklist for implementing the remaining phases of the d
 
 | Property | Value |
 |----------|-------|
-| Event Kind | 38383 (Regular Event) |
+| Event Kind | 8383 (Regular Event) |
 | Replaceability | No - complete audit trail |
 | Published After | Successful dev fee payment & DB update |
 | Content Format | JSON with structured payment data |
@@ -1211,7 +1211,7 @@ This section provides a checklist for implementing the remaining phases of the d
 
 **Event Kind Rationale:**
 
-Why kind 38383 (Regular Event)?
+Why kind 8383 (Regular Event)?
 - ✅ **Complete History:** Every payment is a separate, permanent event
 - ✅ **Third-Party Auditing:** Anyone can query all historical payments
 - ✅ **Total Calculation:** Sum all `amount` tags to get total dev fund contributions
@@ -1222,7 +1222,7 @@ Why kind 38383 (Regular Event)?
 
 ```json
 {
-  "kind": 38383,
+  "kind": 8383,
   "content": {
     "order_id": "550e8400-e29b-41d4-a716-446655440000",
     "dev_fee_sats": 100,
@@ -1253,7 +1253,7 @@ Why kind 38383 (Regular Event)?
 ```javascript
 // Get all dev fee payments
 const filter = {
-  kinds: [38383],
+  kinds: [8383],
   "#y": ["mostro"],
   "#z": ["dev-fee-payment"]
 };
@@ -1267,13 +1267,13 @@ events.forEach(event => {
 
 // Filter by currency
 const usdPayments = {
-  kinds: [38383],
+  kinds: [8383],
   "#currency": ["USD"]
 };
 
 // Find payments for specific order
 const orderPayments = {
-  kinds: [38383],
+  kinds: [8383],
   "#order": ["550e8400-e29b-41d4-a716-446655440000"]
 };
 ```
@@ -1305,10 +1305,10 @@ const orderPayments = {
 
 ```bash
 # Query dev fee events from relay
-nostr-cli -k 38383 --tag y=mostro --tag z=dev-fee-payment
+nostr-cli -k 8383 --tag y=mostro --tag z=dev-fee-payment
 
 # Calculate total contributions
-nostr-cli -k 38383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") | .[1] | tonumber] | add'
+nostr-cli -k 8383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") | .[1] | tonumber] | add'
 ```
 
 **Status:** ✅ Complete - Dev fee audit events are now published to Nostr relays

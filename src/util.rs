@@ -531,7 +531,10 @@ pub async fn publish_dev_fee_audit_event(
 ) -> Result<(), MostroError> {
     use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
     use std::borrow::Cow;
-
+    let ln_network = match LN_STATUS.get() {
+        Some(status) => status.networks.join(","),
+        None => "unknown".to_string(),
+    };
     // Get Mostro keys for signing
     let keys = get_keys()?;
 
@@ -554,15 +557,7 @@ pub async fn publish_dev_fee_audit_event(
     // Create tags for queryability
     let tags = Tags::from_list(vec![
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["dev-fee-payment".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("order")),
+            TagKind::Custom(Cow::Borrowed("order-id")),
             vec![order.id.to_string()],
         ),
         Tag::custom(
@@ -574,20 +569,20 @@ pub async fn publish_dev_fee_audit_event(
             vec![payment_hash.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("t")),
-            vec!["audit".to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("t")),
-            vec!["dev-fund".to_string()],
-        ),
-        Tag::custom(
             TagKind::Custom(Cow::Borrowed("currency")),
             vec![order.fiat_code.clone()],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
-            vec!["mainnet".to_string()],
+            vec![ln_network],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("y")),
+            vec!["mostro".to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("z")),
+            vec!["dev-fee-payment".to_string()],
         ),
     ]);
 

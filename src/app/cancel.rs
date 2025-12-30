@@ -194,7 +194,7 @@ async fn cancel_order_by_taker(
     reset_api_quotes(&mut order);
 
     // Update order to initial state and save it to the database
-    update_order_to_initial_state(pool, order.id, order.amount, order.fee)
+    update_order_to_initial_state(pool, order.id, order.amount, order.fee, order.dev_fee)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

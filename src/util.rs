@@ -390,11 +390,12 @@ async fn prepare_new_order(
     trade_pubkey: PublicKey,
 ) -> Result<Order, MostroError> {
     let mut fee = 0;
-    let mut dev_fee = 0;
+    // dev_fee is always calculated when the order is taken, not at creation time
+    // This unifies the behavior for both fixed price and market price orders
+    let dev_fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount); // Get split fee (each party's share)
-        let total_mostro_fee = fee * 2; // Calculate total Mostro fee
-        dev_fee = get_dev_fee(total_mostro_fee); // Calculate total dev fee (to be split 50/50)
+                                         // dev_fee will be calculated in take_buy_action() or take_sell_action()
     }
 
     // Get expiration time of the order

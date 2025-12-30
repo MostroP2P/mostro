@@ -541,19 +541,6 @@ pub async fn publish_dev_fee_audit_event(
     // Get Nostr client
     let client = get_nostr_client()?;
 
-    // Prepare event content as JSON
-    let content = serde_json::json!({
-        "order_id": order.id.to_string(),
-        "dev_fee_sats": order.dev_fee,
-        "payment_hash": payment_hash,
-        "payment_timestamp": Timestamp::now().as_u64(),
-        "destination": DEV_FEE_LIGHTNING_ADDRESS,
-        "order_amount_sats": order.amount,
-        "order_fiat_amount": order.fiat_amount,
-        "order_fiat_code": order.fiat_code,
-        "status": "success"
-    });
-
     // Create tags for queryability
     let tags = Tags::from_list(vec![
         Tag::custom(
@@ -573,6 +560,10 @@ pub async fn publish_dev_fee_audit_event(
             vec![order.fiat_code.clone()],
         ),
         Tag::custom(
+            TagKind::Custom(Cow::Borrowed("destination")),
+            vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()],
+        ),
+        Tag::custom(
             TagKind::Custom(Cow::Borrowed("network")),
             vec![ln_network],
         ),
@@ -589,7 +580,7 @@ pub async fn publish_dev_fee_audit_event(
     // Create and sign event
     let event = EventBuilder::new(
         nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND),
-        content.to_string(),
+        "",
     )
     .tags(tags)
     .sign_with_keys(&keys)

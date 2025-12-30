@@ -262,19 +262,20 @@ buyer_dev_fee = total_dev_fee - seller_dev_fee  (gets remainder, prevents satosh
 
 ### Order Creation
 
-**Current State:** ✅ IMPLEMENTED - Orders are created with calculated `dev_fee` based on order amount. Database fields `dev_fee_paid` and `dev_fee_payment_hash` are initialized to `false` and `None` respectively.
+**Current State:** ✅ IMPLEMENTED - ALL orders are created with `dev_fee = 0`. The `dev_fee` is calculated when the order is taken, unifying the behavior for both fixed price and market price orders. Database fields `dev_fee_paid` and `dev_fee_payment_hash` are initialized to `false` and `None` respectively.
 
 **Implementation:** `src/util.rs::prepare_new_order()`
 
 When creating a new order:
-1. Calculate Mostro fee: `fee = get_fee(amount)`
-2. Calculate dev fee: `dev_fee = get_dev_fee(fee * 2)` (multiply by 2 for total Mostro fee from both parties)
+1. Calculate Mostro fee: `fee = get_fee(amount)` (for fixed price orders where amount > 0)
+2. Set `dev_fee = 0` for ALL orders (both fixed price and market price)
 3. Store in Order struct with `dev_fee_paid = false` and `dev_fee_payment_hash = None`
 
-**Special Case - Market Price Orders:**
-- Orders created with `amount = 0` will have `dev_fee = 0` initially
-- Dev fee is calculated when order is taken (see "Market Price Order Dev Fee Calculation" section)
-- Implemented in `take_buy.rs` and `take_sell.rs` (commit 2655943)
+**Dev Fee Calculation at Take Time:**
+- ALL orders (both fixed price and market price) have `dev_fee = 0` at creation
+- Dev fee is calculated when order is taken (see "Dev Fee Calculation at Take Time" section)
+- Implemented in `take_buy.rs` and `take_sell.rs`
+- Formula: `dev_fee = get_dev_fee(fee * 2)` where fee is calculated based on the order amount
 
 ### Market Price Orders and Dev Fee Reset
 
@@ -352,52 +353,70 @@ WHERE status = 'pending'
   AND dev_fee != 0;
 ```
 
-### Market Price Order Dev Fee Calculation
+### Dev Fee Calculation at Take Time
 
-**Implementation Status:** ✅ IMPLEMENTED (Commit 2655943)
+**Implementation Status:** ✅ IMPLEMENTED - Unified calculation for both fixed price and market price orders
 
 **Critical Implementation Detail:**
 
-When a market price order is taken, three fields must be updated atomically:
+When ANY order is taken (both fixed price and market price), the `dev_fee` is calculated. This ensures consistent behavior across all order types.
 
 **Locations:**
-- `/home/negrunch/dev/mostro/src/app/take_buy.rs` (lines 52-64)
-- `/home/negrunch/dev/mostro/src/app/take_sell.rs` (lines 104-115)
+- `/home/negrunch/dev/mostro/src/app/take_buy.rs` (lines 52-68)
+- `/home/negrunch/dev/mostro/src/app/take_sell.rs` (lines 104-120)
 
 **Actual Implementation (take_buy.rs and take_sell.rs):**
 ```rust
+// For market price orders: calculate amount, fee, and dev_fee
 if order.has_no_amount() {
     match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
         Ok(amount_fees) => {
-            // 1. Update amount (from market price)
             order.amount = amount_fees.0;
-
-            // 2. Update fee (calculated from amount)
             order.fee = amount_fees.1;
-
-            // 3. Calculate and update dev_fee (calculated from fee)
-            // IMPLEMENTED in commit 2655943
             let total_mostro_fee = order.fee * 2;
             order.dev_fee = get_dev_fee(total_mostro_fee);
         }
         Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
     };
+} else {
+    // For fixed price orders: calculate dev_fee only (amount and fee already set at creation)
+    let total_mostro_fee = order.fee * 2;
+    order.dev_fee = get_dev_fee(total_mostro_fee);
 }
 ```
 
 **Why This Is Critical:**
 
-1. **Timing:** All three fields (`amount`, `fee`, `dev_fee`) must be updated when order is taken
-2. **Dependencies:** `dev_fee` depends on `fee`, which depends on `amount`
-3. **Atomicity:** Updates happen together before order proceeds to next status
-4. **Consistency:** Ensures market price orders have correct dev_fee for payment collection
+1. **Unified Behavior:** Both fixed price and market price orders calculate `dev_fee` at the same time (when taken)
+2. **Consistency:** All pending orders have `dev_fee = 0`, all taken orders have `dev_fee > 0`
+3. **Simplicity:** Single point of calculation makes the code easier to understand and maintain
+4. **Correctness:** Ensures all order types have correct dev_fee for payment collection
 
-**Example Scenario:**
+**Example Scenarios:**
 
+**Fixed Price Order:**
 ```
-Market Price Order Created:
+Order Created:
+- amount: 100,000 sats (known at creation)
+- fee: 1,000 sats (calculated at creation)
+- dev_fee: 0 (NOT calculated at creation anymore)
+- Status: pending
+
+Order Taken:
+- amount: 100,000 sats (unchanged)
+- fee: 1,000 sats (unchanged)
+- total_mostro_fee: 2,000 sats (both parties)
+- dev_fee: 600 sats (30%)        ← Calculated when taken
+- Status: waiting-buyer-invoice
+
+Order Completes:
+- Dev fee payment triggered: 600 sats sent to dev fund ✓
+```
+
+**Market Price Order:**
+```
+Order Created:
 - Fiat: $100 USD
-- BTC Price: $50,000
 - amount: 0 (unknown until taken)
 - fee: 0
 - dev_fee: 0
@@ -405,26 +424,14 @@ Market Price Order Created:
 
 Order Taken:
 - Market Price Lookup: $100 @ $50,000 = 200,000 sats
-- amount: 200,000 sats           ← Updated
-- fee: 2,000 sats (1%)           ← Updated
+- amount: 200,000 sats           ← Calculated
+- fee: 2,000 sats (1%)           ← Calculated
 - total_mostro_fee: 4,000 sats (both parties)
-- dev_fee: 1,200 sats (30%)      ← Updated
+- dev_fee: 1,200 sats (30%)      ← Calculated
 - Status: waiting-buyer-invoice
 
 Order Completes:
 - Dev fee payment triggered: 1,200 sats sent to dev fund ✓
-```
-
-**Without This Fix:**
-```
-Order Taken:
-- amount: 200,000 sats  ✓
-- fee: 2,000 sats       ✓
-- dev_fee: 0            ✗ BUG - stays 0
-
-Order Completes:
-- Dev fee payment: NOT triggered (query requires dev_fee > 0)
-- Revenue loss: 1,200 sats not collected ✗
 ```
 
 ### Taker Abandonment and Order Reset

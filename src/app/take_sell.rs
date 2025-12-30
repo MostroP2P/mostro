@@ -112,6 +112,11 @@ pub async fn take_sell_action(
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };
+    } else {
+        // Calculate dev_fee for fixed price orders
+        // The fee is already calculated at order creation, we only calculate dev_fee here
+        let total_mostro_fee = order.fee * 2;
+        order.dev_fee = get_dev_fee(total_mostro_fee);
     }
 
     // Update trade index only after all checks are done

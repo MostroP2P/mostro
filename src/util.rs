@@ -395,7 +395,7 @@ async fn prepare_new_order(
     let dev_fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount); // Get split fee (each party's share)
-        // dev_fee will be calculated in take_buy_action() or take_sell_action()
+                                         // dev_fee will be calculated in take_buy_action() or take_sell_action()
     }
 
     // Get expiration time of the order

@@ -17,7 +17,10 @@ use sqlx_crud::Crud;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
+use util::{
+    enqueue_order_msg, get_keys, get_nostr_relays, publish_dev_fee_audit_event, send_dm,
+    update_order_event,
+};
 
 pub async fn start_scheduler() {
     info!("Creating scheduler");
@@ -689,6 +692,20 @@ async fn job_process_dev_fee_payment() {
                                             verified_order.dev_fee_paid,
                                             verified_order.dev_fee_payment_hash
                                         );
+
+                                        // Publish audit event to Nostr (non-blocking - failure doesn't affect payment)
+                                        if let Err(e) = publish_dev_fee_audit_event(
+                                            &verified_order,
+                                            &payment_hash,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "Failed to publish audit event for order {}: {:?}",
+                                                order_id, e
+                                            );
+                                            warn!("Payment succeeded but audit event not published - manual review may be needed");
+                                        }
                                     }
                                 }
                             }

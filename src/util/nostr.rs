@@ -1,8 +1,8 @@
 use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::Settings;
+use crate::config::MESSAGE_QUEUES;
 use crate::nip33::new_event;
 use crate::util::orders::get_order;
-use crate::config::MESSAGE_QUEUES;
 use crate::LN_STATUS;
 use crate::NOSTR_CLIENT;
 use mostro_core::prelude::*;

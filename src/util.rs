@@ -556,10 +556,6 @@ pub async fn publish_dev_fee_audit_event(
             vec![payment_hash.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("currency")),
-            vec![order.fiat_code.clone()],
-        ),
-        Tag::custom(
             TagKind::Custom(Cow::Borrowed("destination")),
             vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()],
         ),

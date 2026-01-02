@@ -8,7 +8,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Transparent and configurable
 - Non-blocking (failures don't prevent order completion)
 - Full audit trail for accountability
-- Split payment model (both buyer and seller pay half)
+- Node operator contribution model (mostrod pays from its earnings, not users)
 
 ## Implementation Status
 
@@ -28,15 +28,15 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 **Implemented Components:**
 - `calculate_dev_fee()` pure function in `src/util.rs` (lines 167-170)
 - `get_dev_fee()` wrapper function in `src/util.rs` (lines 176-179)
-- Proper dev_fee split calculation (seller = dev_fee/2, buyer = dev_fee - seller_dev_fee)
+- Dev fee calculation (total amount paid by mostrod from its earnings)
 - Integration in message amount calculations across 4 critical locations
 - Unit tests for fee calculation logic (4 tests passing)
 
 **Implementation Details:**
 - Two-function approach: Pure calculation function + Settings wrapper
-- Prevents satoshi loss with odd dev_fee amounts
-- Buyer pays extra satoshi when dev_fee is odd
-- All fee calculations include dev_fee in buyer/seller amounts
+- Simple rounding for whole satoshi amounts
+- Dev fee tracked for payment by mostrod
+- User payments simplified (no dev_fee in buyer/seller amounts)
 
 **Status:** ✅ Complete - Fee calculations implemented and tested across all order flows
 
@@ -80,89 +80,6 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 
 **Status:** ✅ Complete - Dev fee payments are auditable via Nostr events (see Phase 4 section for full specification)
 
-### Implementation Notes
-
-This section documents key improvements and fixes made during Phase 3 implementation.
-
-**Commit f508669 - Initial Implementation:**
-- Implemented `send_dev_fee_payment()` with 4-step payment flow (validation, LNURL, send, wait)
-- Created `job_process_dev_fee_payment()` scheduler job running every 60 seconds
-- Added `find_unpaid_dev_fees()` database query function
-- Established automatic retry mechanism for failed payments
-
-**Commit 102cfed - Race Condition Fix:**
-- **Problem:** Original query only checked `status = 'success'`, missing orders stuck in `settled-hold-invoice`
-- **Solution:** Updated query to check BOTH statuses: `WHERE (status = 'settled-hold-invoice' OR status = 'success')`
-- **Impact:** Handles edge case where buyer payment succeeds while dev fee payment is processing
-- **Result:** Dev fee payment now triggers immediately when seller releases, not just after buyer payment completes
-
-**Commit eaf3319 - Payment Validation:**
-- **Problem:** Function could attempt payment with `dev_fee = 0` or negative values
-- **Solution:** Added validation check at function start: `if order.dev_fee <= 0 { return Err(...) }`
-- **Impact:** Prevents unnecessary LNURL resolution and payment attempts
-- **Result:** Cleaner error handling and faster failure for invalid amounts
-
-**Commit 42253f1 - Edge Case Fix:**
-- Fixed specific edge case in dev fund payment flow
-- Improved error handling for corner cases in payment processing
-
-**Commit 2655943 - Reliability & Coverage Improvements:**
-- **Market Price Orders:**
-  - Added dev_fee calculation in `take_buy.rs` and `take_sell.rs`
-  - Formula: `dev_fee = get_dev_fee(fee * 2)` when order amount is determined
-  - Fixes bug where market price orders permanently had `dev_fee = 0`
-- **Enhanced Logging:**
-  - Logs BEFORE state: `order_id, dev_fee_paid, dev_fee_payment_hash` before update
-  - Logs AFTER state: Modified values before database write
-  - Logs database update result: Success/failure with details
-  - Logs verification query: Re-queries database to confirm persistence
-  - Example output:
-    ```
-    BEFORE UPDATE: order_id=abc123, dev_fee_paid=false, dev_fee_payment_hash=None
-    AFTER MODIFY: order_id=abc123, dev_fee_paid=true, dev_fee_payment_hash=Some("a1b2c3...")
-    ✅ DATABASE UPDATE SUCCEEDED for order abc123
-    VERIFICATION: order_id=abc123, dev_fee_paid=true, dev_fee_payment_hash=Some("a1b2c3...")
-    ```
-- **Result:** Complete diagnostic trail for debugging payment issues and database persistence
-
-**Commit 2349669 - Unified dev_fee Calculation:**
-- **Problem:** Inconsistent dev_fee calculation timing between order types
-  - Fixed price orders: dev_fee calculated at order creation in `prepare_new_order()`
-  - Market price orders: dev_fee calculated at order take time
-  - This inconsistency made code harder to maintain and reason about
-- **Solution:** Unified behavior for all order types
-  - ALL orders now have `dev_fee = 0` at creation time (`src/util.rs`)
-  - ALL orders calculate `dev_fee` when taken (`take_buy.rs` and `take_sell.rs`)
-  - Added else block for fixed price orders to calculate dev_fee at take time
-- **Benefits:**
-  - Consistent behavior across all order types
-  - Single point of calculation makes code easier to understand
-  - All pending orders have `dev_fee = 0`, all taken orders have `dev_fee > 0`
-  - Simplifies logic and reduces code duplication
-- **Files Modified:**
-  - `src/util.rs`: Set `dev_fee = 0` for all orders at creation
-  - `src/app/take_buy.rs`: Added dev_fee calculation for fixed price orders
-  - `src/app/take_sell.rs`: Added dev_fee calculation for fixed price orders
-  - `docs/DEV_FEE.md`: Updated documentation to reflect unified behavior
-
-**Commit 7e9b0a0 - Invoice Validation Fix:**
-- **Problem:** Critical bug in `take_sell.rs` where `validate_invoice()` was called BEFORE `dev_fee` was calculated
-  - Invoice validation used `dev_fee = 0`, resulting in incorrect validation
-  - Validation only checked Mostro fee, NOT dev_fee
-  - Buyers could submit invoices that were too high (missing dev_fee portion)
-- **Impact:** For a 200,000 sat order with 1,200 sat dev_fee:
-  - Before fix: Validation expected 198,000 sats (missing 600 sat dev_fee) ❌
-  - After fix: Validation expects 197,400 sats (correct total fees) ✅
-- **Solution:** Reordered operations in `take_sell.rs`
-  - Move `get_fiat_amount_requested()` before dev_fee calculation (needed for market orders)
-  - Move dev_fee calculation block before `validate_invoice()` call
-  - Now `validate_invoice()` receives order with correct `dev_fee` value
-- **Verification:**
-  - Invoice validation now correctly checks: `amount - (fee + buyer_dev_fee)`
-  - All 107 tests pass
-  - Buyer invoices are properly validated for total fees (Mostro fee + dev_fee)
-- **Note:** `take_buy.rs` was not affected as buy orders don't call `validate_invoice()`
-
 **Key Design Decisions:**
 
 1. **Scheduler-Based vs Inline Payment:**
@@ -190,13 +107,14 @@ This section documents key improvements and fixes made during Phase 3 implementa
 ### Fee Flow Diagram
 
 ```
-Order Creation → Fee Calculation → Hold Invoice → Seller Release → Dev Payment → Buyer Payment
+Order Creation → Fee Calculation → Hold Invoice → Seller Release → Buyer Payment → Dev Payment
      ↓                 ↓                ↓              ↓                ↓             ↓
-  amount         mostro_fee        seller pays    settle hold     LNURL resolve   buyer paid
-                     ↓             amount + fees      ↓                ↓             ↓
-                 dev_fee                          status=settled   send payment   status=success
-                                                                       ↓
-                                                                update db fields
+  amount         mostro_fee        seller pays    settle hold      buyer paid    mostrod pays
+                     ↓             amount + fee       ↓                ↓             ↓
+                 dev_fee                       mostrod collects   status=success  send dev_fee
+                 (tracking)                      mostro fee                       from earnings
+                                                                                      ↓
+                                                                              update db fields
 ```
 
 ### System Components
@@ -286,20 +204,18 @@ pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
 **Formula Specification:**
 ```
 total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
-seller_dev_fee = total_dev_fee / 2  (integer division, rounds down for odd amounts)
-buyer_dev_fee = total_dev_fee - seller_dev_fee  (gets remainder, prevents satoshi loss)
 ```
 
 **Why This Formula:**
-- Integer division of odd numbers loses 1 satoshi if both parties use `dev_fee / 2`
-- Our approach: seller pays rounded-down half, buyer pays remainder
-- Ensures full dev_fee is always collected with no satoshi loss
-- Buyer pays extra 1 sat when dev_fee is odd (fair distribution)
+- Simple percentage calculation of total Mostro fee
+- Mostrod pays this amount from its earnings to the development fund
+- No need for buyer/seller split since users don't pay dev_fee
+- Rounding ensures whole satoshi amounts
 
 **Examples:**
-- Total Mostro fee: 1,000 sats, Percentage: 30% → Total dev fee: 300 sats (150 buyer + 150 seller) ✓
-- Total Mostro fee: 1,003 sats, Percentage: 30% → Total dev fee: 301 sats (151 buyer + 150 seller) ✓
-- Total Mostro fee: 333 sats, Percentage: 30% → Total dev fee: 100 sats (50 buyer + 50 seller) ✓
+- Total Mostro fee: 1,000 sats, Percentage: 30% → Dev fee: 300 sats (paid by mostrod) ✓
+- Total Mostro fee: 1,003 sats, Percentage: 30% → Dev fee: 301 sats (paid by mostrod) ✓
+- Total Mostro fee: 333 sats, Percentage: 30% → Dev fee: 100 sats (paid by mostrod) ✓
 - Mostro fee: 0 sats → Dev fee: 0 sats ✓
 
 ### Order Creation
@@ -558,86 +474,75 @@ to the database.
 
 ### Hold Invoice Generation
 
-**Current State:** ✅ IMPLEMENTED - Hold invoices include seller's half of the dev fee.
+**Current State:** ✅ IMPLEMENTED - Hold invoices include only the Mostro fee (no dev fee).
 
 **Implementation:** `src/util.rs::show_hold_invoice()` (lines 660-675)
 
-Seller's hold invoice includes seller's half of the dev fee:
+Seller's hold invoice includes only the order amount and Mostro fee:
 ```rust
-// Seller pays their half of the dev fee (order.dev_fee stores total)
-// Integer division rounds down, so seller gets the smaller half for odd amounts
-let seller_dev_fee = order.dev_fee / 2;
-let new_amount = order.amount + order.fee + seller_dev_fee;
+// Seller pays the order amount plus their Mostro fee
+// Dev fee is NOT charged to seller - it's paid by mostrod from its earnings
+let new_amount = order.amount + order.fee;
 
 // Now we generate the hold invoice that seller should pay
 let (invoice_response, preimage, hash) = ln_client...
 ```
 
 **Key Points:**
-- `order.dev_fee` stores the total dev fee for the order (both buyer and seller combined)
-- Seller pays `dev_fee / 2` (integer division rounds down for odd amounts)
-- Buyer pays `dev_fee - seller_dev_fee` (gets the remainder, see Message Amount Calculations section)
-- Hold invoice amount = `order.amount + order.fee + seller_dev_fee`
+- `order.dev_fee` stores the total dev fee for tracking purposes only
+- Seller pays only `order.amount + order.fee` (no dev_fee added)
+- Buyer receives only `order.amount - order.fee` (no dev_fee subtracted)
+- Hold invoice amount = `order.amount + order.fee` (transparent, as advertised)
+- Mostrod pays `dev_fee` from its earnings after collecting the Mostro fee
 
 ### Message Amount Calculations
 
 **Implementation Status:** ✅ COMPLETE
 
-When creating messages for buyers and sellers during order flow, the amounts must include proper dev_fee calculations. The implementation ensures correct amounts are communicated to both parties.
+When creating messages for buyers and sellers during order flow, the amounts include only the Mostro fee (not dev_fee). The implementation ensures correct amounts are communicated to both parties.
 
 **Seller Messages:**
 ```rust
-let seller_dev_fee = order.dev_fee / 2;
-seller_order.amount = order.amount
-    .saturating_add(order.fee)
-    .saturating_add(seller_dev_fee);
+seller_order.amount = order.amount.saturating_add(order.fee);
 ```
 
 **Buyer Messages:**
 ```rust
-let seller_dev_fee = order.dev_fee / 2;
-let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-buyer_order.amount = order.amount
-    .saturating_sub(order.fee)
-    .saturating_sub(buyer_dev_fee);
+buyer_order.amount = order.amount.saturating_sub(order.fee);
 ```
 
 **Critical Implementation Locations:**
 
 1. **`src/flow.rs::hold_invoice_paid()`** (lines 54-75)
    - Purpose: Status updates after seller payment
-   - Seller amount: Includes `seller_dev_fee` (line 62-64)
-   - Buyer amount: Subtracts `buyer_dev_fee` (line 72-75)
+   - Seller amount: `order.amount + order.fee` (no dev_fee)
+   - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Initial payment confirmation messages
 
 2. **`src/app/add_invoice.rs::add_invoice_action()`** (lines 88-109)
    - Purpose: Invoice acceptance flow
-   - Seller amount: Includes `seller_dev_fee` (line 90-93)
-   - Buyer amount: Subtracts `buyer_dev_fee` (line 105-109)
+   - Seller amount: `order.amount + order.fee` (no dev_fee)
+   - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Order acceptance notifications
 
 3. **`src/app/release.rs::check_failure_retries()`** (lines 70-75)
    - Purpose: Payment failure handling
-   - Buyer amount: Subtracts `buyer_dev_fee` (line 72-75)
+   - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Failure notification amounts
 
 4. **`src/app/release.rs::do_payment()`** ⚠️ **CRITICAL** (lines 443-448)
    - Purpose: Actual Lightning payment calculation
-   - Payment amount: Subtracts `buyer_dev_fee` (line 446-448)
+   - Payment amount: `order.amount - order.fee` (no dev_fee)
    - Impact: **Real sats transferred** to buyer via Lightning
    - Why critical: Determines actual payment amount, not just messages
 
 **Implementation Pattern:**
 
-All locations follow the same pattern for consistency:
+All locations follow the same simplified pattern:
 ```rust
-// Calculate split to avoid satoshi loss
-let seller_dev_fee = order.dev_fee / 2;
-let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-
-// Apply to amounts based on party
-seller_amount = order.amount + order.fee + seller_dev_fee;
-buyer_amount = order.amount - order.fee - buyer_dev_fee;
+// No dev_fee split needed - users only pay Mostro fee
+seller_amount = order.amount + order.fee;
+buyer_amount = order.amount - order.fee;
 ```
 
 ### Example Calculation
@@ -646,33 +551,33 @@ buyer_amount = order.amount - order.fee - buyer_dev_fee;
 **Mostro Fee (1%)**: 1,000 sats (split: 500 buyer + 500 seller)
 **Dev Fee Percentage**: 30%
 **Total Dev Fee**: 1,000 × 0.30 = 300 sats
-**Dev Fee Split**: 150 sats (buyer) + 150 sats (seller)
 
-**Seller Pays**: 100,000 + 500 + 150 = **100,650 sats**
-**Buyer Receives**: 100,000 - 500 - 150 = **99,350 sats**
+**Seller Pays**: 100,000 + 500 = **100,500 sats**
+**Buyer Receives**: 100,000 - 500 = **99,500 sats**
+
+**Mostrod pays**: 300 sats (to development fund)
 
 **Fee Distribution:**
-- Buyer pays: 500 (Mostro fee) + 150 (dev fee) = **650 sats total**
-- Seller pays: 500 (Mostro fee) + 150 (dev fee) = **650 sats total**
-- Total dev fee collected: **300 sats** (split 50/50 between parties)
+- Buyer pays: 500 (Mostro fee) = **500 sats total**
+- Seller pays: 500 (Mostro fee) = **500 sats total**
+- Mostrod receives: 1,000 - 300 = **700 sats** (keeps after donating to dev fund)
+- Dev fund receives: **300 sats** (paid by mostrod from its earnings)
 
 ### Edge Cases
 
 **Rounding**:
-- Total: 333 sats Mostro fee × 30% = 99.9 → **100 sats total dev fee** (50 buyer + 50 seller after split)
-- Total: 3 sats Mostro fee × 30% = 0.9 → **1 sat total dev fee** (split: 0 buyer + 1 seller, or round-robin)
-- **Odd numbers**: When total dev fee is odd, buyer always pays 1 sat more
-- Example: 301 sats total → seller: 150, buyer: 151 (total: 301 ✓)
-- Formula: `seller_dev_fee = dev_fee / 2`, `buyer_dev_fee = dev_fee - seller_dev_fee`
-- Reason: Ensures full fee collection with no satoshi loss
-- Implementation: `src/util.rs`, `src/flow.rs`, `src/app/add_invoice.rs`, `src/app/release.rs`
+- Total: 333 sats Mostro fee × 30% = 99.9 → **100 sats dev fee** (paid by mostrod)
+- Total: 3 sats Mostro fee × 30% = 0.9 → **1 sat dev fee** (paid by mostrod)
+- **Odd or even numbers**: No longer matters, mostrod pays the total rounded amount
+- Formula: `dev_fee = round(total_mostro_fee × dev_fee_percentage)`
+- Implementation: `src/util.rs`
 
 **Zero Fee Orders**:
-- If `mostro_fee = 0`, then `total_dev_fee = 0`
-- No dev payment attempted from either party
+- If `mostro_fee = 0`, then `dev_fee = 0`
+- No dev payment attempted
 
 **Tiny Amounts**:
-- Smallest: 1 sat Mostro fee × 10% = 0.1 → **0 sats** total (rounds to zero, neither party pays)
+- Smallest: 1 sat Mostro fee × 10% = 0.1 → **0 sats** dev fee (rounds to zero)
 - No dev payment attempted for 0 sat dev fees
 
 ### Payment Execution
@@ -683,25 +588,28 @@ buyer_amount = order.amount - order.fee - buyer_dev_fee;
 
 **Scheduler-Based Payment Trigger:**
 
-The dev fee payment should **NOT** be executed immediately during order release. Instead:
+The dev fee payment is executed by mostrod **from its earnings**, not from users. The payment happens asynchronously:
 
 1. **Order Release** (`src/app/release.rs::release_action()`):
    - Seller's hold invoice is settled
    - Order is marked as `status = 'settled-hold-invoice'`
+   - Mostrod collects the Mostro fee (1,000 sats in our example)
    - Order is **enqueued for scheduler processing** by marking `dev_fee_paid = false`
    - Mostro then proceeds to pay buyer's invoice
-   - **Key Point:** Dev fee payment happens asynchronously AFTER seller releases but BEFORE buyer payment completes
+   - **Key Point:** Dev fee payment happens asynchronously AFTER mostrod collects the Mostro fee
 
 2. **Scheduler Processing** (`src/scheduler.rs::job_process_dev_fee_payment()` lines 511-608):
    - Runs every 60 seconds
    - Uses `find_unpaid_dev_fees()` to query database for orders where: `(status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
    - **Important:** Query checks BOTH statuses to handle race conditions where buyer payment succeeds during dev fee payment
    - Processes each unpaid dev fee asynchronously with 50-second timeout per payment attempt
+   - Mostrod pays the dev_fee amount (e.g., 300 sats) from its earnings to the development fund
    - Enhanced logging: Logs BEFORE/AFTER state, database update results, and verification queries
 
 **Why This Timing?**
-- **Fee Earned:** Seller has released funds, so Mostro has earned its fee
-- **Risk Mitigation:** Captures dev fees even if buyer payment fails permanently
+- **Fee Earned:** Seller has released funds, so mostrod has earned the Mostro fee
+- **Contribution from earnings:** Mostrod donates a percentage of what it earned to the dev fund
+- **Risk Mitigation:** Dev fee payment independent of buyer payment status
 - **Non-blocking:** Order flow continues regardless of dev fee payment status
 - **Retry mechanism:** Failed payments are automatically retried every 60 seconds
 
@@ -790,6 +698,8 @@ if new_order.amount > 0 {
 ```
 
 **Initial Value:** Calculated dev fee amount in satoshis based on `total_mostro_fee × dev_fee_percentage`
+
+**Purpose:** Tracking amount that mostrod will pay to the development fund from its earnings (not charged to users)
 
 **Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section (lines 182-256).
 
@@ -1106,20 +1016,21 @@ This section provides a checklist for implementing the remaining phases of the d
   - Input: `total_mostro_fee: i64`
   - Output: `i64` (calls calculate_dev_fee with Settings percentage)
   - Location: Lines 176-179
-- [x] Implement proper dev_fee split (avoid satoshi loss)
-  - Formula: `seller_dev_fee = dev_fee / 2`, `buyer_dev_fee = dev_fee - seller_dev_fee`
-  - Ensures full fee collection with odd amounts
+- [x] Implement dev_fee calculation (for tracking mostrod's donation amount)
+  - Formula: `dev_fee = round(total_mostro_fee × dev_fee_percentage)`
+  - Simple rounding for whole satoshi amounts
 - [x] Update message creation in `src/flow.rs::hold_invoice_paid()`
-  - Lines 54-56: Calculate proper dev_fee split
-  - Lines 62-64: Seller amount includes seller_dev_fee
-  - Lines 72-75: Buyer amount subtracts buyer_dev_fee
+  - Lines 54-75: Simplified amount calculations
+  - Seller amount: `order.amount + order.fee`
+  - Buyer amount: `order.amount - order.fee`
 - [x] Update message creation in `src/app/add_invoice.rs::add_invoice_action()`
-  - Lines 88-93: Seller amount includes seller_dev_fee
-  - Lines 103-109: Buyer amount subtracts buyer_dev_fee
+  - Lines 88-109: Simplified amount calculations
+  - No dev_fee in user-facing amounts
 - [x] Update payment calculation in `src/app/release.rs::check_failure_retries()`
-  - Lines 70-75: Buyer amount subtracts buyer_dev_fee on failure
+  - Lines 70-75: Buyer amount without dev_fee
 - [x] Update Lightning payment in `src/app/release.rs::do_payment()` ⚠️ CRITICAL
-  - Lines 443-448: Actual payment amount subtracts buyer_dev_fee
+  - Lines 443-448: Actual payment amount = `order.amount - order.fee`
+  - Dev fee paid separately by mostrod
 - [x] Add unit tests for `calculate_dev_fee()` in `src/util.rs::tests`
   - Test `test_get_dev_fee_basic`: Standard calculation (1000 @ 30% = 300)
   - Test `test_get_dev_fee_rounding`: Rounding (333 @ 30% = 100)
@@ -1129,7 +1040,7 @@ This section provides a checklist for implementing the remaining phases of the d
 - [x] Integration testing with various order amounts
   - Verified correct amounts in all message flows
   - Verified correct Lightning payment amounts
-  - Verified no satoshi loss with odd dev_fee values
+  - Verified users only pay Mostro fee (not dev_fee)
 
 **Deliverables:** ✅ All fee calculations implemented, tested, and integrated across entire order flow
 
@@ -1631,9 +1542,9 @@ cargo test test_get_dev_fee
 
 2. **Fee Calculation:**
    - Create 100,000 sat order with 1% Mostro fee
-   - Verify seller hold invoice: 100,650 sats (100k + 500 + 150)
-   - Verify buyer receives: 99,350 sats (100k - 500 - 150)
-   - Verify total dev fee: 300 sats (150 from buyer + 150 from seller)
+   - Verify seller hold invoice: 100,500 sats (100k + 500)
+   - Verify buyer receives: 99,500 sats (100k - 500)
+   - Verify total dev fee: 300 sats (paid by mostrod from its earnings)
 
 3. **Payment Flow:**
    - Complete order successfully

@@ -67,13 +67,8 @@ pub async fn check_failure_retries(
     } else if order.payment_attempts >= retries_number {
         // Clone order
         let mut order_payment_failed = order.clone();
-        // Update amount notified to the buyer
-        let seller_dev_fee = order.dev_fee / 2;
-        let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-        order_payment_failed.amount = order_payment_failed
-            .amount
-            .saturating_sub(order.fee)
-            .saturating_sub(buyer_dev_fee);
+        // Update amount notified to the buyer (only Mostro fee, not dev fee)
+        order_payment_failed.amount = order_payment_failed.amount.saturating_sub(order.fee);
         if order_payment_failed.amount <= 0 {
             return Err(MostroCantDo(CantDoReason::InvalidAmount));
         }
@@ -442,12 +437,9 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     };
 
     let ln_addr = LightningAddress::from_str(&payment_request);
-    // Calculate buyer's portion after subtracting fees
-    let seller_dev_fee = order.dev_fee / 2;
-    let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-    let amount = (order.amount as u64)
-        .saturating_sub(order.fee as u64)
-        .saturating_sub(buyer_dev_fee as u64);
+    // Calculate buyer's portion after subtracting only the Mostro fee
+    // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
+    let amount = (order.amount as u64).saturating_sub(order.fee as u64);
     if amount == 0 {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }

@@ -749,10 +749,9 @@ pub async fn show_hold_invoice(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
-    // Seller pays their half of the dev fee (order.dev_fee stores total)
-    // Integer division rounds down, so seller gets the smaller half for odd amounts
-    let seller_dev_fee = order.dev_fee / 2;
-    let new_amount = order.amount + order.fee + seller_dev_fee;
+    // Seller pays only the order amount and their Mostro fee
+    // Dev fee is NOT charged to seller - it's paid by mostrod from its earnings
+    let new_amount = order.amount + order.fee;
 
     // Now we generate the hold invoice that seller should pay
     let (invoice_response, preimage, hash) = ln_client
@@ -897,14 +896,9 @@ pub async fn set_waiting_invoice_status(
         .map_err(|_| MostroCantDo(CantDoReason::InvalidOrderKind))?;
     let status = Status::WaitingBuyerInvoice;
 
-    // Subtract buyer's half of the dev fee from received amount
-    // Buyer pays the remainder to ensure full dev_fee is collected (handles odd amounts)
-    let seller_dev_fee = order.dev_fee / 2;
-    let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-    let buyer_final_amount = order
-        .amount
-        .saturating_sub(order.fee)
-        .saturating_sub(buyer_dev_fee);
+    // Buyer receives order amount minus only the Mostro fee
+    // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
+    let buyer_final_amount = order.amount.saturating_sub(order.fee);
     // We send this data related to the buyer
     let order_data = SmallOrder::new(
         Some(order.id),
@@ -1195,11 +1189,9 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     let mut payment_request = None;
     // if payment request is present
     if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
-        // Calculate total buyer fees (Mostro fee + dev fee)
-        // Buyer pays the remainder to ensure full dev_fee is collected (handles odd amounts)
-        let seller_dev_fee = order.dev_fee / 2;
-        let buyer_dev_fee = order.dev_fee - seller_dev_fee;
-        let total_buyer_fees = order.fee + buyer_dev_fee;
+        // Calculate total buyer fees (only Mostro fee)
+        // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
+        let total_buyer_fees = order.fee;
 
         // if invoice is valid
         if is_valid_invoice(

@@ -1,4 +1,10 @@
 pub mod invoice;
+pub mod operations;
+
+// Re-export operations for easier access
+pub use operations::{
+    get_market_amount_and_fee, invoice_subscribe, settle_seller_hold_invoice, show_hold_invoice,
+};
 
 use crate::config::settings::Settings;
 use crate::lightning::invoice::decode_invoice;

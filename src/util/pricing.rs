@@ -5,8 +5,8 @@ use crate::models::Yadio;
 use chrono::Duration;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::Timestamp;
-use std::thread;
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 pub type FiatNames = std::collections::HashMap<String, String>;
 const MAX_RETRY: u16 = 4;
@@ -74,11 +74,11 @@ pub async fn get_market_quote(
                 if retries_num == MAX_RETRY {
                     no_answer_api = true;
                 }
-                println!(
+                warn!(
                     "API price request failed retrying - {} tentatives left.",
                     (MAX_RETRY - retries_num)
                 );
-                thread::sleep(std::time::Duration::from_secs(2));
+                sleep(std::time::Duration::from_secs(2)).await;
             }
         };
     }

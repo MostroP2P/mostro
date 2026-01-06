@@ -5,7 +5,6 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::nip33::{new_event, order_to_tags};
 use crate::util::pricing::{get_expiration_date, get_fee};
 use crate::util::queues::enqueue_order_msg;
-use crate::NOSTR_CLIENT;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, QueryBuilder, Sqlite, SqlitePool};

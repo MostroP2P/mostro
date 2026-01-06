@@ -229,7 +229,7 @@ async fn prepare_new_order(
                     MOSTRO_DB_PASSWORD.get(),
                     None,
                 )
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+                .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
             );
             new_order_db.trade_index_seller = trade_index;
         }

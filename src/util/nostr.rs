@@ -239,7 +239,7 @@ mod tests {
     #[serial_test::serial]
     async fn test_get_nostr_client_success() {
         // Mock NOSTR_CLIENT initialization - use get_or_init to handle already-initialized case
-        let _client = NOSTR_CLIENT.get_or_init(|| Client::default());
+        let _client = NOSTR_CLIENT.get_or_init(Client::default);
         let client_result = get_nostr_client();
         assert!(client_result.is_ok());
     }

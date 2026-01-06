@@ -157,9 +157,7 @@ pub async fn publish_order(
     )
     .await;
 
-    NOSTR_CLIENT
-        .get()
-        .unwrap()
+    crate::util::nostr::get_nostr_client()?
         .send_event(&event)
         .await
         .map(|_s| ())

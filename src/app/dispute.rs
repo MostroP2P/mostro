@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
 ///
-/// Creates and publishes a NIP-33 replaceable event containing dispute details
-/// including status and application metadata.
+/// Creates and publishes a NIP-33 replaceable event containing dispute details,
+/// including status, initiator (`buyer` or `seller`), and application metadata.
 async fn publish_dispute_event(
     dispute: &Dispute,
     my_keys: &Keys,

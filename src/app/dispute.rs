@@ -17,13 +17,27 @@ use uuid::Uuid;
 ///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details
 /// including status and application metadata.
-async fn publish_dispute_event(dispute: &Dispute, my_keys: &Keys) -> Result<(), MostroError> {
+async fn publish_dispute_event(
+    dispute: &Dispute,
+    my_keys: &Keys,
+    is_buyer_dispute: bool,
+) -> Result<(), MostroError> {
+    // Create initiator string
+    let initiator = match is_buyer_dispute {
+        true => "buyer",
+        false => "seller",
+    };
+
     // Create tags for the dispute event
     let tags = Tags::from_list(vec![
         // Status tag - indicates the current state of the dispute
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("s")),
             vec![dispute.status.to_string()],
+        ),
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("initiator")),
+            vec![initiator.to_string()],
         ),
         // Application identifier tag
         Tag::custom(
@@ -218,7 +232,7 @@ pub async fn dispute_action(
     .await?;
 
     // Publish dispute event to network
-    publish_dispute_event(&dispute, my_keys)
+    publish_dispute_event(&dispute, my_keys, is_buyer_dispute)
         .await
         .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
 

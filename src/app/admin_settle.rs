@@ -78,13 +78,6 @@ pub async fn admin_settle_action(
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
 
-    // Get the creator of the dispute
-    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-        (true, false) => "seller",
-        (false, true) => "buyer",
-        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
-    };
-
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
         // we update the dispute
@@ -92,6 +85,14 @@ pub async fn admin_settle_action(
         d.update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Get the creator of the dispute
+        let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+            (true, false) => "seller",
+            (false, true) => "buyer",
+            (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+        };
+
         // We create a tag to show status of the dispute
         let tags: Tags = Tags::from_list(vec![
             Tag::custom(

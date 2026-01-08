@@ -72,6 +72,12 @@ pub async fn admin_cancel_action(
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
 
+    // Get the creator of the dispute
+    let dispute_initiator = match order.buyer_dispute {
+        true => "buyer",
+        false => "seller",
+    };
+
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
         // we update the dispute
@@ -85,6 +91,11 @@ pub async fn admin_cancel_action(
                 TagKind::Custom(Cow::Borrowed("s")),
                 vec![DisputeStatus::SellerRefunded.to_string()],
             ),
+            // Who is the dispute creator
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
+                vec![dispute_initiator.to_string()],
+            ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),
                 vec!["mostro".to_string()],
@@ -97,6 +108,9 @@ pub async fn admin_cancel_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        // Publish dispute event with update
+        info!("Dispute event to be published: {event:#?}");
 
         match get_nostr_client() {
             Ok(client) => {

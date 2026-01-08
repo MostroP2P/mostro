@@ -35,6 +35,7 @@ async fn publish_dispute_event(
             TagKind::Custom(Cow::Borrowed("s")),
             vec![dispute.status.to_string()],
         ),
+        // Who is the dispute creator
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("initiator")),
             vec![initiator.to_string()],

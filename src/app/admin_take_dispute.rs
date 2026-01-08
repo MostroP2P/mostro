@@ -211,11 +211,23 @@ pub async fn admin_take_dispute_action(
     .await
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
+    // Get the creator of the dispute
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+    };
+
     // We create a tag to show status of the dispute
     let tags: Tags = Tags::from_list(vec![
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("s")),
             vec![Status::InProgress.to_string()],
+        ),
+        // Who is the dispute creator
+        Tag::custom(
+            TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
+            vec![dispute_initiator],
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("y")),

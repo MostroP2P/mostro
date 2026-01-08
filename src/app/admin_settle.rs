@@ -48,7 +48,7 @@ pub async fn admin_settle_action(
         _ => {}
     }
 
-    // Was orde cooperatively cancelled?
+    // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
             request_id,
@@ -85,11 +85,24 @@ pub async fn admin_settle_action(
         d.update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Get the creator of the dispute
+        let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+            (true, false) => "seller",
+            (false, true) => "buyer",
+            (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+        };
+
         // We create a tag to show status of the dispute
         let tags: Tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("s")),
                 vec![DisputeStatus::Settled.to_string()],
+            ),
+            // Who is the dispute creator
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
+                vec![dispute_initiator],
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("y")),
@@ -104,6 +117,9 @@ pub async fn admin_settle_action(
         // nip33 kind with dispute id as identifier
         let event = new_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        // Print event dispute with update
+        tracing::info!("Dispute event to be published: {event:#?}");
 
         match get_nostr_client() {
             Ok(client) => {

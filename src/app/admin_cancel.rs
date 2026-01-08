@@ -95,7 +95,7 @@ pub async fn admin_cancel_action(
             // Who is the dispute creator
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-                vec![dispute_initiator.to_string()],
+                vec![dispute_initiator],
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),

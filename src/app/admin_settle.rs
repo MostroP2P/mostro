@@ -48,7 +48,7 @@ pub async fn admin_settle_action(
         _ => {}
     }
 
-    // Was orde cooperatively cancelled?
+    // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
             request_id,
@@ -102,7 +102,7 @@ pub async fn admin_settle_action(
             // Who is the dispute creator
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-                vec![dispute_initiator.to_string()],
+                vec![dispute_initiator],
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("y")),

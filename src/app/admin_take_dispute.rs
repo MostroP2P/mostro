@@ -227,7 +227,7 @@ pub async fn admin_take_dispute_action(
         // Who is the dispute creator
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-            vec![dispute_initiator.to_string()],
+            vec![dispute_initiator],
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("y")),

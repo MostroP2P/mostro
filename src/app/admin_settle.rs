@@ -79,9 +79,10 @@ pub async fn admin_settle_action(
     let dispute = find_dispute_by_order_id(pool, order.id).await;
 
     // Get the creator of the dispute
-    let dispute_initiator = match order.buyer_dispute {
-        true => "buyer",
-        false => "seller",
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
     };
 
     if let Ok(mut d) = dispute {

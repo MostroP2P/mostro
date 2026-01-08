@@ -212,9 +212,10 @@ pub async fn admin_take_dispute_action(
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Get the creator of the dispute
-    let dispute_initiator = match order.buyer_dispute {
-        true => "buyer",
-        false => "seller",
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
     };
 
     // We create a tag to show status of the dispute

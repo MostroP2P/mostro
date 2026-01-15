@@ -11,7 +11,7 @@ use crate::lightning::LndConnector;
 use crate::lnurl::HTTP_CLIENT;
 use crate::messages;
 use crate::models::Yadio;
-use crate::nip33::{new_event, order_to_tags};
+use crate::nip33::{new_order_event, new_rating_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
@@ -340,11 +340,11 @@ pub async fn publish_order(
     info!("New order saved Id: {}", order_id);
 
     // Get tags for new order in case of full privacy or normal order
-    // nip33 kind with order fields as tags and order id as identifier
+    // nip33 kind with order fields as tags and order id as identifier (kind 38383 for orders)
     let event = if let Some(tags) =
         get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?
     {
-        new_event(keys, "", order_id.to_string(), tags)
+        new_order_event(keys, "", order_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
@@ -615,8 +615,8 @@ pub async fn update_user_rating_event(
     // Get order from msg
     let mut order = get_order(msg, pool).await?;
 
-    // nip33 kind with user as identifier
-    let event = new_event(keys, "", user.to_string(), tags)?;
+    // nip33 kind with user as identifier (kind 38384 for ratings)
+    let event = new_rating_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
     if buyer_sent_rate {
@@ -688,8 +688,8 @@ pub async fn update_order_event(
 
     // We transform the order fields to tags to use in the event
     if let Some(tags) = order_to_tags(&order_updated, reputation_data)? {
-        // nip33 kind with order id as identifier and order fields as tags
-        let event = new_event(keys, "", order.id.to_string(), tags)
+        // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
+        let event = new_order_event(keys, "", order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         info!("Sending replaceable event: {event:#?}");

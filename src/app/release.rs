@@ -4,7 +4,7 @@ use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
-use crate::nip33::{new_event, order_to_tags};
+use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
@@ -764,9 +764,9 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
         Err(_) => order_to_tags(new_order, Some((0.0, 0, 0)))?,
     };
 
-    // Prepare new child order event for sending
+    // Prepare new child order event for sending (kind 38383 for orders)
     let event = if let Some(tags) = tags {
-        new_event(my_keys, "", new_order.id.to_string(), tags)
+        new_order_event(my_keys, "", new_order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(

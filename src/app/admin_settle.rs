@@ -1,6 +1,6 @@
 use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
-use crate::nip33::new_event;
+use crate::nip33::new_dispute_event;
 use crate::util::{
     enqueue_order_msg, get_nostr_client, get_order, settle_seller_hold_invoice, update_order_event,
 };
@@ -114,8 +114,8 @@ pub async fn admin_settle_action(
             ),
         ]);
 
-        // nip33 kind with dispute id as identifier
-        let event = new_event(my_keys, "", dispute_id.to_string(), tags)
+        // nip33 kind with dispute id as identifier (kind 38386 for disputes)
+        let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         // Print event dispute with update

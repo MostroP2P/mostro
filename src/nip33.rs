@@ -1,3 +1,6 @@
+use crate::config::constants::{
+    NOSTR_DISPUTE_EVENT_KIND, NOSTR_INFO_EVENT_KIND, NOSTR_RATING_EVENT_KIND,
+};
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
 use crate::LN_STATUS;
@@ -9,7 +12,123 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::vec;
 
-/// Creates a new mostro nip33 event
+/// Internal helper function to create a NIP-33 replaceable event with a specific kind
+fn create_event(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+    kind: u16,
+) -> Result<Event, Error> {
+    let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
+    tags.push(Tag::identifier(identifier));
+    tags.extend(extra_tags);
+    let tags = Tags::from_list(tags);
+
+    EventBuilder::new(nostr::Kind::Custom(kind), content)
+        .tags(tags)
+        .sign_with_keys(keys)
+}
+
+/// Creates a new order event (kind 38383)
+///
+/// # Arguments
+///
+/// * `keys` - The keys used to sign the event
+/// * `content` - The content of the event
+/// * `identifier` - The nip33 d tag (order ID) used to replace the event
+/// * `extra_tags` - Additional tags for the event
+///
+/// # Returns
+/// Returns a new order event
+pub fn new_order_event(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_REPLACEABLE_EVENT_KIND,
+    )
+}
+
+/// Creates a new rating event (kind 38384)
+///
+/// # Arguments
+///
+/// * `keys` - The keys used to sign the event
+/// * `content` - The content of the event
+/// * `identifier` - The nip33 d tag (user pubkey) used to replace the event
+/// * `extra_tags` - Additional tags for the event
+///
+/// # Returns
+/// Returns a new rating event
+pub fn new_rating_event(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_RATING_EVENT_KIND,
+    )
+}
+
+/// Creates a new info event (kind 38385)
+///
+/// # Arguments
+///
+/// * `keys` - The keys used to sign the event
+/// * `content` - The content of the event
+/// * `identifier` - The nip33 d tag (mostro pubkey) used to replace the event
+/// * `extra_tags` - Additional tags for the event
+///
+/// # Returns
+/// Returns a new info event
+pub fn new_info_event(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+) -> Result<Event, Error> {
+    create_event(keys, content, identifier, extra_tags, NOSTR_INFO_EVENT_KIND)
+}
+
+/// Creates a new dispute event (kind 38386)
+///
+/// # Arguments
+///
+/// * `keys` - The keys used to sign the event
+/// * `content` - The content of the event
+/// * `identifier` - The nip33 d tag (dispute ID) used to replace the event
+/// * `extra_tags` - Additional tags for the event
+///
+/// # Returns
+/// Returns a new dispute event
+pub fn new_dispute_event(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_DISPUTE_EVENT_KIND,
+    )
+}
+
+/// Creates a new mostro nip33 event (legacy function for orders)
 ///
 /// # Arguments
 ///
@@ -21,20 +140,19 @@ use std::vec;
 /// # Returns
 /// Returns a new event
 ///
+/// # Note
+/// This function uses the default order event kind (38383).
+/// For other event types, use the specific functions:
+/// - `new_rating_event()` for ratings (kind 38384)
+/// - `new_info_event()` for info (kind 38385)
+/// - `new_dispute_event()` for disputes (kind 38386)
 pub fn new_event(
     keys: &Keys,
     content: &str,
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
-    let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-    tags.push(Tag::identifier(identifier));
-    tags.extend(extra_tags);
-    let tags = Tags::from_list(tags);
-
-    EventBuilder::new(nostr::Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
-        .tags(tags)
-        .sign_with_keys(keys)
+    new_order_event(keys, content, identifier, extra_tags)
 }
 
 /// Create a rating tag

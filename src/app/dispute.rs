@@ -3,7 +3,7 @@
 //! and publish dispute events to the network.
 
 use crate::db::find_dispute_by_order_id;
-use crate::nip33::new_event;
+use crate::nip33::new_dispute_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -52,9 +52,9 @@ async fn publish_dispute_event(
         ),
     ]);
 
-    // Create a new NIP-33 replaceable event
+    // Create a new NIP-33 replaceable event (kind 38386 for disputes)
     // Empty content string as the information is in the tags
-    let event = new_event(my_keys, "", dispute.id.to_string(), tags)
+    let event = new_dispute_event(my_keys, "", dispute.id.to_string(), tags)
         .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
 
     tracing::info!("Publishing dispute event: {:#?}", event);

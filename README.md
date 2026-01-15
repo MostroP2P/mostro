@@ -1076,7 +1076,7 @@ Mostro is licensed under the [MIT License](LICENSE).
 Mostro is built by the community, for the community. Special thanks to:
 
 - **Contributors**: Everyone who has submitted code, documentation, bug reports, and feedback
-- **Grant Support**: Organizations that have provided funding to sustain development
+- **Grant Support**: Organizations that have provided funding to sustain development: [HRF](https://hrf.org) and [Opensats](https://opensats.org)
 - **@lnp2pBot**: The Telegram bot that proved the need and validated the model
 - **Nostr Protocol**: The censorship-resistant foundation that makes Mostro possible
 - **Bitcoin & Lightning Network**: The decentralized financial infrastructure
@@ -1094,7 +1094,5 @@ As of v0.15.6, Mostro includes a transparent development fee system where Mostro
 All development fee payments are published to Nostr (kind 8383 events) for public verification. See [docs/DEV_FEE.md](docs/DEV_FEE.md) for complete details.
 
 ## Maintainers
-
-- **Francisco Calderón** ([@grunch](https://github.com/grunch)) - Project creator and lead maintainer
 
 For a complete list of contributors, see the [contributors page](https://github.com/MostroP2P/mostro/graphs/contributors).

@@ -1,151 +1,1100 @@
 # Mostro 🧌
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust Version](https://img.shields.io/badge/rust-1.86%2B-blue.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-0.15.6-green.svg)](https://github.com/MostroP2P/mostro/releases)
+
+> **A production-ready, censorship-resistant, non-custodial Lightning Network peer-to-peer exchange built on Nostr**
+
 ![Mostro-logo](static/logo.png)
+
+## Quick Links
+
+- [Documentation](https://mostro.network/protocol/) - Protocol specification & guides
+- [FAQ](https://mostro.network/docs-english/) - Frequently asked questions ([Spanish](https://mostro.network/docs-spanish/))
+- [Installation Guide](INSTALL.md) - Detailed production setup
+- [Contributing](CONTRIBUTING.md) - How to contribute
+- [Rewards Board](https://github.com/orgs/MostroP2P/projects/2/views/1) - Bounties for contributors
+
+---
 
 ## Overview
 
-Due to the growing need to be able to operate with Bitcoin without giving up personal data, in 2021 I started a project to allows people to buy and sell Bitcoin through Lightning Network without funds custody and without KYC, this project is a telegram bot called @lnp2pbot.
+Mostro is a production-ready Lightning Network peer-to-peer exchange that enables Bitcoin trading without custodial risk or KYC requirements. Built on the censorship-resistant Nostr protocol, Mostro provides a decentralized alternative to centralized exchanges and custodial platforms.
 
-[@lnp2pBot](https://github.com/lnp2pBot/bot) is growing steadily and organically, it's being use in the whole world and is having a bigger impact in Latin-America, a place where there is no need to explain to people that money is broken, it's being used more and more in dictatorial regimes like Cuba and Venezuela, where people keep resisting tyranny and protesting using less the local currency and more Bitcoin.
+### Why Mostro Exists
 
-Although the bot works excellent, it's running on top of Telegram, a great platform but we do not know if one day it will be reached by the tentacles of a powerful government asking for political dissidents or simply awkward public person.
+The need for KYC-free Bitcoin trading has never been greater. [@lnp2pBot](https://github.com/lnp2pBot/bot), a Telegram-based P2P exchange, has demonstrated strong global demand—particularly in regions facing monetary instability like Latin America, Cuba, and Venezuela, where citizens resist tyranny by adopting Bitcoin over broken fiat currencies.
 
-At this point Nostr appears as a platform where a system like this can live without the possibility of being censored by a powerful entity. This document explains how we can create a censorship-resistant and non custodial lightning network peer-to-peer exchange without a single point of failure like a telegram bot.
+While @lnp2pBot works excellently, it relies on Telegram—a platform potentially vulnerable to government pressure. Nostr solves this: as a decentralized protocol with no single point of failure, it provides the censorship-resistant foundation needed for a truly unstoppable peer-to-peer exchange.
 
-## How it works?
+**Mostro brings this vision to life**. It's not just a proof of concept—it's a fully operational daemon powering real trades today, with robust features including dispute resolution, reputation systems, development fee transparency, and admin tooling.
 
-Mostro works with a p2p communication on top of Nostr, Mostro will be the escrow that will allow buyer and seller operate reducing the risk for both parties.
+---
 
-Mostro will handle Bitcoin using a Lightning Network node, the node will create the hold invoices for sellers to pay and pays to the buyers lightning regular invoices.
+## Key Features
 
-Mostro will need a private key to be able to create, sign and send events through Nostr network.
+### Core Trading
+- **Non-Custodial Orders** - Escrow via Lightning hold invoices; Mostro never controls user funds
+- **KYC-Free** - No identity verification, registration, or personal data required
+- **Multiple Order Types** - Fixed-price and market-price orders with fiat premium support
+- **Maker/Taker Model** - Create or take orders with transparent fee structure (configurable, default 0.6%)
 
-In the next graphic we can see a very summarized version of how Mostro, the seller and the lightning node interact, a more detailed explanation can be found [here](https://mostro.network/protocol/):
+### Reliability & Safety
+- **Dispute Resolution** - Built-in arbiter system with dispute tracking and admin settlement tools
+- **User Reputation** - Peer rating system to build trust between traders
+- **Automatic Timeouts** - Configurable expiration for orders and payment windows
+- **Payment Retry Logic** - Automatic retry for failed Lightning payments with configurable attempts
+
+### Advanced Features
+- **Development Fee System** - Transparent fee collection with Nostr audit events (kind 8383)
+- **RPC Admin Interface** - gRPC interface for direct daemon management and dispute handling
+- **Background Scheduler** - Automated order expiration, payment retries, and dev fee processing
+- **Multi-Currency Support** - Configurable fiat currency list with real-time price feeds
+- **Proof-of-Work Protection** - Optional PoW requirements to prevent spam
+
+### Deployment Options
+- **Native Binary** - Direct installation on Linux/Mac with systemd integration
+- **Docker Compose** - Containerized deployment with included Nostr relay
+- **StartOS Package** - One-click installation on Start9 sovereign computing platform
+
+### Developer Tools
+- **Comprehensive Docs** - Architecture guides, event routing, Lightning operations, RPC reference
+- **SQLite Backend** - Lightweight, embedded database with full migration support
+- **Nostr Protocol** - NIP-59 (GiftWrap), NIP-33 (replaceable events) compliance
+- **Observability** - Structured logging with `tracing`, configurable log levels
+
+---
+
+## How It Works
+
+Mostro acts as a non-custodial escrow coordinator between buyers and sellers using the Lightning Network. The daemon handles three primary flows: order lifecycle, dispute resolution, and fee distribution.
+
+### Order Flow (Complete Lifecycle)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    Seller->>Mostro: I want to sell Bitcoin
-    Mostro-->>LN-Node: Give me a hold invoice
-    LN-Node->>Mostro: Hold invoice
-    Mostro->>Seller: Please pay this hold invoice
-    Seller->>LN-Node: Paying through lightning
-    LN-Node-->>Mostro: Payment received
-    Mostro-->>Seller: Thanks! talk to buyer now
+    participant S as Seller
+    participant M as Mostro
+    participant LN as Lightning Node
+    participant B as Buyer
+
+    Note over S,B: 1. ORDER CREATION
+    S->>M: Create sell order (100k sats @ market)
+    M->>M: Calculate fees (1% = 1k sats total)
+    M-->>S: Order published (pending)
+
+    Note over S,B: 2. ORDER ACCEPTANCE
+    B->>M: Take order
+    M->>M: Reserve order for buyer
+    M-->>S: Buyer found, prepare hold invoice
+    M-->>B: Order reserved, wait for seller
+
+    Note over S,B: 3. ESCROW SETUP
+    M->>LN: Create hold invoice (100,500 sats)
+    LN-->>M: Hold invoice + preimage
+    M->>S: Pay this hold invoice
+    S->>LN: Payment (holds funds)
+    LN-->>M: Payment received (held)
+    M-->>S: Escrowed! Wait for buyer invoice
+    M-->>B: Seller paid, send your invoice
+
+    Note over S,B: 4. BUYER INVOICE & FIAT TRANSFER
+    B->>M: Here's my invoice (99,500 sats)
+    M-->>S: Buyer ready, send fiat via [payment method]
+    S->>B: [Off-chain fiat transfer]
+    B->>M: Fiat sent
+    M-->>S: Buyer claims fiat sent
+
+    Note over S,B: 5. RELEASE
+    S->>M: Fiat received, release!
+    M->>LN: Settle hold invoice (preimage)
+    LN-->>M: Released (1,000 sats fee to Mostro)
+    M->>LN: Pay buyer invoice (99,500 sats)
+    LN-->>B: Payment received
+    M-->>S: Trade complete ✓
+    M-->>B: Trade complete ✓
+
+    Note over S,B: 6. POST-TRADE
+    M->>M: Update reputations
+    M->>M: Schedule dev fee payment (300 sats)
+    M->>LN: Pay dev fee to fund
+    M->>M: Publish audit event (kind 8383)
 ```
 
-In this repository we are building a Mostro daemon on Rust.
+**Key Points**:
+- **Non-Custodial**: Lightning hold invoices ensure Mostro never controls funds
+- **Trustless**: Preimage released only when seller confirms fiat receipt
+- **Fee Structure**: Seller pays 500 sats, buyer pays 500 sats (split from 1% of 100k)
+- **Dev Sustainability**: Mostro pays 30% of its fee (300 sats) to development fund
 
-## Client
+For more detailed protocol specifications, see the [official protocol documentation](https://mostro.network/protocol/).
 
-Buyers and sellers will need Mostro's clients in order to buy/sell Bitcoin and a Lightning Wallet, for this we need to build at least a web client to start, we plan to build mobile and desktop clients in the future.
+---
 
-## Removing the single point of failure
+### Dispute Flow
 
-For this idea to work we need to make it as easy as possible for anyone to be a Mostro, we don't need dozens of Mostros but we do need the ones that are running to be reliable, that's why with this implementation we encourage to create your own Mostro and give more options to users.
+When disputes occur, Mostro's arbiter system ensures fair resolution:
 
-To handle a Mostro is not going to be that easy, a Mostro admin needs to have a lightning node up and running, it will need to have enough liquidity for users to operate lightning fast, the node MUST have uptime closer to 99.9%, all this requires resources that can be obtained by the fee that sellers pay on each successful order, this is a percentage that can vary between Mostros.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (Buyer/Seller)
+    participant M as Mostro
+    participant A as Admin/Arbiter
+    participant LN as Lightning Node
 
-## Mostro's reputation
+    U->>M: Open dispute (order stuck)
+    M->>M: Mark order as "Dispute"
+    M->>M: Record initiator (buyer/seller)
+    M-->>U: Dispute created, awaiting arbiter
+    M-->>A: New dispute notification
 
-Users will be able to rate Mostros and Mostros will compete to obtain more users in order to survive. Bad Mostros should be rejected by users and will lose incentives to keep existing.
+    A->>M: Take dispute (via RPC or Nostr)
+    M->>M: Assign arbiter to case
+    M-->>U: Arbiter assigned
 
-## Requirements
+    Note over U,A: Investigation & Communication
+    A->>U: Request evidence/information
+    U->>A: Provide proof of payment/issue
 
-0. You need Rust version 1.86 or higher to compile.
-1. You will need a lightning network node.
+    Note over A,LN: Resolution Decision
+    alt Settle to seller
+        A->>M: Settle order (seller wins)
+        M->>LN: Settle hold invoice
+        LN-->>M: Released to seller
+        M-->>U: Dispute resolved (seller)
+    else Cancel/Refund to buyer
+        A->>M: Cancel order (buyer wins)
+        M->>LN: Cancel hold invoice
+        LN-->>M: Refunded to buyer
+        M-->>U: Dispute resolved (buyer)
+    end
 
-## Install dependencies
+    M->>M: Log resolution for audit
+    M-->>U: Case closed
+```
 
-To compile on Ubuntu/Pop!\_OS, please install [cargo](https://www.rust-lang.org/tools/install), then run the following commands:
+**Dispute Tracking** (v0.15.6): Each dispute includes initiator identification (buyer or seller), arbiter assignment, resolution status, and audit trail in the database.
 
+---
+
+### Development Fee Distribution
+
+Mostro implements a transparent development sustainability model:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Mostro Daemon
+    participant DB as Database
+    participant LN as Lightning Node
+    participant Fund as Dev Fund (Lightning Address)
+    participant Nostr as Nostr Relays
+
+    Note over M,Nostr: After Successful Trade
+    M->>M: Order completed (status: settled-hold-invoice)
+    M->>M: Mostro collected 1,000 sats fee
+    M->>DB: Mark dev_fee=300, dev_fee_paid=0
+
+    Note over M,Nostr: Scheduler (every 60s)
+    M->>DB: Query unpaid dev fees
+    DB-->>M: Order #123: 300 sats unpaid
+
+    M->>LN: Resolve Lightning address (LNURL)
+    LN-->>M: Payment request
+    M->>LN: Send payment (300 sats)
+    LN-->>Fund: Payment delivered
+    LN-->>M: Payment hash: abc123...
+
+    M->>DB: UPDATE dev_fee_paid=1, hash=abc123...
+    M->>Nostr: Publish audit event (kind 8383)
+    Note over Nostr: Transparent, queryable by anyone
+    Nostr-->>M: Event published
+
+    Note over M,Nostr: Result
+    M->>M: Mostro keeps 700 sats (70%)
+    Fund->>Fund: Dev fund receives 300 sats (30%)
+```
+
+**Transparency Features**:
+- **Configurable**: Node operators set `dev_fee_percentage` (min 10%, max 100%, default 30%)
+- **Non-Blocking**: Failed payments don't prevent order completion; retries automatic
+- **Auditable**: All dev fee payments published to Nostr (kind 8383 events)
+- **Operator Contribution**: Mostro daemon pays from its earnings, not charged to users
+
+Query all dev fee payments on Nostr:
+```bash
+# Requires nostreq and nostcat tools
+nostreq --kinds 8383 --tag y=mostro --tag z=dev-fee-payment | nostcat --stream wss://relay.damus.io
+```
+
+---
+
+## Architecture
+
+Mostro is a Rust-based daemon with a modular architecture:
+
+```mermaid
+flowchart TB
+    subgraph "External Systems"
+        Nostr[Nostr Relays<br/>NIP-59 GiftWrap]
+        LND[LND Node<br/>Hold Invoices]
+        API[Price API<br/>Yadio]
+    end
+
+    subgraph "Mostro Daemon (mostrod)"
+        Main[main.rs<br/>Entry Point]
+
+        subgraph "Core Modules"
+            App[app.rs<br/>Event Router]
+            Lightning[lightning/*<br/>LND Client]
+            RPC[rpc/*<br/>gRPC Server]
+            Scheduler[scheduler.rs<br/>Background Jobs]
+        end
+
+        subgraph "Order Handlers (app/*)"
+            Order[order.rs]
+            TakeBuy[take_buy.rs]
+            TakeSell[take_sell.rs]
+            Release[release.rs]
+            Dispute[dispute.rs]
+            Admin[admin_*.rs]
+        end
+
+        DB[(SQLite<br/>mostro.db)]
+        Config[settings.toml]
+    end
+
+    Nostr <-->|GiftWrap Events| App
+    LND <-->|gRPC| Lightning
+    API -->|Price Feed| Order
+
+    Main --> Config
+    Main --> DB
+    Main --> App
+    Main --> Lightning
+    Main --> RPC
+    Main --> Scheduler
+
+    App --> Order
+    App --> TakeBuy
+    App --> TakeSell
+    App --> Release
+    App --> Dispute
+    App --> Admin
+
+    Order --> DB
+    Order --> Lightning
+    Release --> Lightning
+    Admin --> DB
+    Admin --> Lightning
+
+    Scheduler --> DB
+    Scheduler --> Lightning
+
+    RPC --> Admin
+```
+
+**Key Components**:
+- **Event Router** (`app.rs`): Unwraps NIP-59 GiftWraps, validates PoW/signatures, routes to action handlers
+- **Action Handlers** (`app/*`): 17 modules handling order lifecycle, disputes, admin operations
+- **Lightning Client** (`lightning/*`): Creates hold invoices, settles/cancels, manages payments
+- **RPC Server** (`rpc/*`): gRPC interface for direct admin communication (optional)
+- **Scheduler** (`scheduler.rs`): Background jobs for expiration, retries, dev fee payments
+- **Database** (`db.rs` + SQLx): Order state, user reputation, trade indices, audit trails
+
+**Technology Stack**:
+- **Runtime**: Tokio async executor
+- **Nostr**: `nostr-sdk` v0.43 (NIP-59 GiftWrap, NIP-33 replaceable events)
+- **Lightning**: `fedimint-tonic-lnd` v0.3 (LND gRPC client)
+- **Database**: SQLite via `sqlx` v0.6 with offline compile-time query verification
+- **RPC**: `tonic` + `prost` (Protocol Buffers)
+
+For detailed architecture documentation, see the [docs/](docs/) directory:
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Module map, startup sequence, event routing
+- [EVENT_ROUTING.md](docs/EVENT_ROUTING.md) - Message handling flow
+- [LIGHTNING_OPS.md](docs/LIGHTNING_OPS.md) - Hold invoice lifecycle
+- [ORDERS_AND_ACTIONS.md](docs/ORDERS_AND_ACTIONS.md) - Action handler details
+
+---
+
+## Installation
+
+Mostro supports three deployment methods. For production deployments, see [INSTALL.md](INSTALL.md) for complete step-by-step instructions.
+
+### Prerequisites
+
+**All Methods**:
+- Rust 1.86+ (for native builds)
+- Lightning Network node (LND required)
+  - Recommended: [Polar](https://lightningpolar.com/) for local testing
+  - Production: Full LND node with adequate liquidity
+- Nostr relays (public or private)
+
+**Native Build Dependencies**:
+
+Ubuntu/Debian:
 ```bash
 sudo apt update
 sudo apt install -y cmake build-essential libsqlite3-dev pkg-config protobuf-compiler
 ```
 
-To compile on Mac, then use brew:
-
+macOS:
 ```bash
 brew update
 brew install cmake pkg-config sqlite3 protobuf
 ```
 
-## Install
+---
 
-If you want to run Mostro on your local machine, you can follow the instructions below, if you want to run it on a server, you can follow the instructions in the [INSTALL.md](INSTALL.md) file.
+### Option 1: Native Installation (Production)
 
-Clone the repository and then edit the `settings.tpl.toml` file with your Mostro Nostr private key and other settings.
+Best for: Production servers, VPS deployments, full control over the daemon
 
+**Quick Start**:
 ```bash
+# Clone repository
 git clone https://github.com/MostroP2P/mostro.git
 cd mostro
+
+# Build release binary
+cargo build --release
+
+# Install to system
+sudo install target/release/mostrod /usr/local/bin
+
+# Setup configuration
+mkdir -p ~/.mostro
+cp settings.tpl.toml ~/.mostro/settings.toml
+# Edit ~/.mostro/settings.toml (see Configuration section)
+
+# Initialize database
+cargo install sqlx-cli --version 0.6.2
+./init_db.sh
+
+# Run daemon
+mostrod
 ```
 
-To connect to an LND node, you must define 3 variables within the [lightning] section of the settings.toml file.
+**Production Setup** (systemd):
 
-_lnd_cert_file:_ LND node TLS certificate file path.
+See [INSTALL.md](INSTALL.md) for complete Digital Ocean/VPS setup including:
+- Service configuration (`/etc/systemd/system/mostro.service`)
+- Permissions and security hardening
+- Log management with journalctl
+- Database backup procedures
+- Monitoring and operational queries
 
-_lnd_macaroon_file:_ Macaroon file path, the macaroon file contains permission for doing actions on the lnd node.
+---
 
-_lnd_grpc_host:_ IP address or domain name from the LND node and port, example: `https://127.0.0.1:10009`.
+### Option 2: Docker Compose (Local Development)
 
-### Database
+Best for: Local testing, development environments, quick experiments
 
-The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.
-
-This file is automatically created and initialized when you run the Mostro daemon for the first time.
-
-### Running it
-
-Before running it you need to set `nsec_privkey` in the `[nostr]` section of the `settings.toml` file with the private key of your Mostro, if you don't have a nostr private key you can use [rana 🐸](https://github.com/grunch/rana) to generate a new one.
-
-When you run mostro for first time it will create a .mostro directory in /home/user/ and copy the settings.toml and mostro.db files inside.
-
-Every time you make a change in the settings.toml file of the project, you need to update those changes in /home/user/.mostro/settings.toml file
-
-Finnaly run it:
-
+**Quick Start**:
 ```bash
-cargo run
-```
+# Clone repository
+git clone https://github.com/MostroP2P/mostro.git
+cd mostro
 
-## Connecting to relay
+# Setup configuration
+mkdir -p docker/config
+cp docker/settings.docker.toml docker/config/settings.toml
+cp docker/empty.mostro.db docker/config/mostro.db
+# Edit docker/config/settings.toml
 
-### Option 1: Run Mostro with a private dockerized relay
+# Configure LND paths in docker/.env
+echo "LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert" >> docker/.env
+echo "LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon" >> docker/.env
 
-```bash
+# Build and run
+make docker-build
 make docker-up
 ```
 
-This will spin a new docker container with an instance of [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay), that will listen at port `7000`.
+This starts:
+- Mostro daemon (exposed via configured relays)
+- Local Nostr relay (port 7000 by default)
 
-So the relay URL you want to connect to is: `ws://localhost:7000`.
+**Stop**: `make docker-down`
 
-You need to set `relays` in the `[nostr]` section of the `settings.toml` file:
-relays = ['ws://localhost:7000']
+For detailed Docker setup, see [docker/README.md](docker/README.md).
 
-## Dockerized Mostro
+---
 
-If you want to run a dockerized version of Mostro, you can follow the step-by-step instructions in the [Docker Guide for MostroP2P](./docker/README.md).
+### Option 3: StartOS (One-Click Install)
 
-Or you can use [mostro-regtest](https://github.com/MostroP2P/mostro-regtest) to run a local nostr relay, lightning node and a Mostro instance.
+Best for: Start9 users, sovereign computing, non-technical users
 
-## Contribute
+Mostro is available as a StartOS package with enhanced features. Install directly from the Start9 marketplace or sideload:
 
-You may be interested in contributing to Mostro. If you're looking for somewhere to start contributing, check out the [good first issue](https://github.com/MostroP2P/mostro/labels/good%20first%20issue) list.
+```bash
+# Build StartOS package
+make docker-startos
+```
 
-More info in our [contributing guide](CONTRIBUTING.md).
+Features in StartOS build:
+- Integrated with Start9 LND node
+- Web UI for configuration
+- Automatic backups
+- Health monitoring
+- One-click updates
 
-### Rewards board
+For StartOS-specific documentation, see [docker/README.md](docker/README.md#building-and-running-with-startos-features).
 
-To incentivize collaborators we have a **Rewards board**, we must clarify that Mostro is not a company but an open source project, the amounts offered are a way to thank for collaboration and we can offer it thanks to the generous donation of contributors, mostly anonymous, but also to two important institutions that have given us grants, you can check it [here](https://github.com/orgs/MostroP2P/projects/2/views/1).
+---
+
+### Alternative: Regtest Environment (Development)
+
+For complete local testing with mocked Lightning Network:
+
+```bash
+# Clone mostro-regtest (includes relay + LND + Mostro)
+git clone https://github.com/MostroP2P/mostro-regtest.git
+cd mostro-regtest
+# Follow mostro-regtest README for setup
+```
+
+This provides a full Bitcoin regtest environment with pre-configured LND nodes and Nostr relay.
+
+---
+
+## Configuration
+
+Mostro uses a TOML configuration file (`settings.toml`). Copy the template and customize:
+
+```bash
+cp settings.tpl.toml ~/.mostro/settings.toml
+```
+
+### Key Configuration Sections
+
+#### Lightning Network
+```toml
+[lightning]
+lnd_cert_file = '/path/to/lnd/tls.cert'
+lnd_macaroon_file = '/path/to/lnd/admin.macaroon'
+lnd_grpc_host = 'https://127.0.0.1:10009'
+
+# Hold invoice expiration (5 minutes = 300 seconds)
+hold_invoice_expiration_window = 300
+
+# Payment retry configuration
+payment_attempts = 3
+payment_retries_interval = 60  # seconds between retries
+```
+
+**Required**: LND connection details. Mostro needs admin macaroon for hold invoice management.
+
+---
+
+#### Nostr Configuration
+```toml
+[nostr]
+# Your Mostro daemon's private key (nsec format)
+nsec_privkey = 'nsec1...'
+
+# Relays to connect to
+relays = [
+  'wss://relay.damus.io',
+  'wss://relay.mostro.network',
+  'wss://nostr.wine'
+]
+```
+
+**Required**: Generate a dedicated Nostr key for your Mostro instance:
+```bash
+# Using rana (https://github.com/grunch/rana)
+rana --vanity mostro
+```
+
+**Important**: Never reuse keys between Mostro instances. Each daemon needs a unique identity.
+
+---
+
+#### Mostro Business Logic
+```toml
+[mostro]
+# Trading fee (0.006 = 0.6%, charged to both parties)
+fee = 0.006
+
+# Maximum Lightning routing fee tolerance (0.001 = 0.1%)
+max_routing_fee = 0.001
+
+# Order limits (satoshis)
+max_order_amount = 1000000     # 1M sats max per order
+min_payment_amount = 100       # 100 sats minimum
+
+# Order expiration
+expiration_hours = 24          # Orders expire after 24 hours if not taken
+expiration_seconds = 900       # 15 minutes for taker to complete payment
+
+# Proof-of-Work requirement (0 = disabled)
+pow = 0  # Set to 10-20 to prevent spam
+
+# Development sustainability fee (0.30 = 30% of Mostro fee goes to dev fund)
+dev_fee_percentage = 0.30      # Minimum: 0.10 (10%), Maximum: 1.0 (100%)
+
+# Fiat currency whitelist (empty = accept all)
+fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'BRL']
+
+# Price feed API
+bitcoin_price_api_url = "https://api.yadio.io"
+```
+
+**Key Settings**:
+- `fee`: Your Mostro's fee percentage (default 0.6% split between buyer/seller)
+- `dev_fee_percentage`: Portion of your fee donated to Mostro development (default 30%)
+- `pow`: Increase to 10-20 if experiencing spam (higher = slower client messages)
+- `fiat_currencies_accepted`: Restrict supported currencies (empty array = accept all)
+
+---
+
+#### RPC Interface (Optional)
+```toml
+[rpc]
+enabled = false              # Set to true to enable gRPC admin interface
+listen_address = "127.0.0.1"
+port = 50051
+```
+
+When enabled, exposes gRPC interface on `127.0.0.1:50051` for:
+- Admin order cancellation
+- Dispute settlement
+- Solver management
+
+---
+
+#### Database
+```toml
+[database]
+url = "sqlite://mostro.db"  # Relative path or absolute: "sqlite:///home/mostro/.mostro/mostro.db"
+```
+
+**Database Management**:
+```bash
+# Initialize new database
+cargo sqlx database create
+cargo sqlx migrate run
+
+# Backup database
+cp ~/.mostro/mostro.db ~/.mostro/mostro.db.backup
+
+# Inspect database
+sqlite3 ~/.mostro/mostro.db
+```
+
+---
+
+### Configuration Tips
+
+1. **Never commit `settings.toml`** - Contains private keys and credentials
+2. **Validate config on startup** - Mostro will refuse to start with invalid settings
+3. **Update after schema changes** - Run `cargo sqlx migrate run` after pulling updates
+4. **Monitor dev fee payments** - Check logs: `journalctl -u mostro | grep "dev_fee"`
+5. **Adjust PoW for load** - Start at 0, increase to 15-20 if spam becomes an issue
+
+For complete settings reference, see [settings.tpl.toml](settings.tpl.toml).
+
+---
+
+## Usage
+
+### Running Mostro
+
+**Native Binary**:
+```bash
+# Foreground (see logs)
+mostrod
+
+# Background (systemd)
+sudo systemctl start mostro
+sudo systemctl status mostro
+sudo journalctl -u mostro -f  # Follow logs
+```
+
+**Docker**:
+```bash
+make docker-up      # Start services
+make docker-down    # Stop services
+docker compose logs -f mostro  # View logs
+```
+
+---
+
+### Monitoring Operations
+
+**Check active orders**:
+```bash
+sqlite3 ~/.mostro/mostro.db "SELECT id, status, amount, fiat_amount FROM orders WHERE status = 'pending' ORDER BY created_at DESC LIMIT 10;"
+```
+
+**Monitor dev fee payments**:
+```bash
+sqlite3 ~/.mostro/mostro.db "SELECT id, dev_fee, dev_fee_paid, dev_fee_payment_hash FROM orders WHERE status = 'success' ORDER BY created_at DESC LIMIT 10;"
+```
+
+**Query Nostr for Mostro info event**:
+```bash
+# Install nostr tools: cargo install nostreq nostcat
+# Fetch Mostro settings (kind 38383)
+nostreq --kinds 38383 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
+```
+
+---
+
+### Using Clients
+
+Mostro requires a client to interact with the daemon. Available clients:
+
+- **[mostro-cli](https://github.com/MostroP2P/mostro-cli)** - Command-line interface (recommended for testing)
+- **[mostro-web](https://github.com/MostroP2P/mostro-web)** - Web interface (in development)
+
+**Example: Creating an order with mostro-cli**:
+```bash
+# Install mostro-cli
+git clone https://github.com/MostroP2P/mostro-cli.git
+cd mostro-cli
+cargo install --path .
+
+# Create sell order (sell 100k sats for $50 USD via bank transfer)
+mostro-cli order create --kind sell --amount 100000 --fiat-amount 50 --fiat-code USD --payment-method bank-transfer
+
+# List available orders
+mostro-cli order list
+
+# Take an order
+mostro-cli order take <order-id>
+```
+
+For client documentation, see the respective client repositories.
+
+---
+
+### Admin Operations (RPC Interface)
+
+If RPC is enabled, use admin tools for dispute resolution:
+
+```bash
+# Cancel an order (admin override)
+grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/CancelOrder
+
+# Settle disputed order
+grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/SettleOrder
+
+# Add dispute solver
+grpcurl -plaintext -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
+```
+
+---
+
+### Querying Audit Events
+
+Development fee payments are auditable via Nostr (kind 8383):
+
+```bash
+# Get all dev fee payments from your Mostro
+nostreq --kinds 8383 --tag y=mostro --tag z=dev-fee-payment --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
+
+# Calculate total dev fund contributions
+nostreq --kinds 8383 --tag y=mostro --tag z=dev-fee-payment | jq '[.[] | .tags[] | select(.[0]=="amount") | .[1] | tonumber] | add'
+```
+
+This transparency allows third-party verification of development fund contributions.
+
+---
+
+## Clients
+
+Mostro is a backend daemon. Users interact with it through client applications that communicate via Nostr.
+
+### Official Clients
+
+#### mostro-cli (Command-Line Interface)
+**Repository**: https://github.com/MostroP2P/mostro-cli
+**Status**: Production-ready
+**Best For**: Testing, automation, power users
+
+Features:
+- Create and manage orders
+- Take orders and complete trades
+- Query order history and status
+- Dispute management
+
+**Installation**:
+```bash
+git clone https://github.com/MostroP2P/mostro-cli.git
+cd mostro-cli
+cargo install --path .
+```
+
+---
+
+#### mostro-web (Web Interface)
+**Repository**: https://github.com/MostroP2P/mostro-web
+**Status**: In development
+**Best For**: General users, accessibility
+
+Features (planned):
+- Browser-based trading interface
+- Lightning wallet integration
+- Order book visualization
+- Real-time trade status
+
+---
+
+### Mobile & Desktop Clients
+
+Mobile (iOS/Android) and desktop (Windows/Mac/Linux) clients are planned for future releases. Community contributions welcome!
+
+---
+
+### Building Your Own Client
+
+Mostro clients communicate via Nostr using the [mostro-core](https://github.com/MostroP2P/mostro-core) protocol library.
+
+**Quick Start**:
+```rust
+// Add to Cargo.toml
+[dependencies]
+mostro-core = "0.6.57"
+nostr-sdk = "0.43"
+
+// Basic client structure
+use mostro_core::{Message, Action, Order};
+use nostr_sdk::Client;
+
+// Connect to relays
+let client = Client::new(&keys);
+client.add_relay("wss://relay.mostro.network").await?;
+
+// Create order message
+let order = Order { /* ... */ };
+let message = Message::new(Action::NewOrder, order);
+
+// Send via NIP-59 GiftWrap to Mostro pubkey
+// ...
+```
+
+**Resources**:
+- Protocol specification: https://mostro.network/protocol/
+- mostro-core docs: https://docs.rs/mostro-core/
+- Example implementations: See mostro-cli source code
+
+For detailed client development guide, see the [protocol documentation](https://mostro.network/protocol/).
+
+---
+
+## Development
+
+Mostro is actively developed and welcomes contributions. Whether you're fixing bugs, adding features, or improving documentation, your help makes Mostro better for everyone.
+
+### Getting Started
+
+1. **Fork and clone**:
+```bash
+git clone https://github.com/YOUR_USERNAME/mostro.git
+cd mostro
+```
+
+2. **Install development tools**:
+```bash
+# Rust toolchain (1.86+)
+rustup update stable
+
+# SQLx CLI (for database migrations)
+cargo install sqlx-cli --version 0.6.2
+
+# Development dependencies
+sudo apt install protobuf-compiler cmake build-essential  # Ubuntu
+brew install protobuf cmake  # macOS
+```
+
+3. **Setup local environment**:
+```bash
+# Copy template configuration
+cp settings.tpl.toml settings.toml
+# Edit settings.toml with your LND/Nostr config
+
+# Initialize database
+./init_db.sh
+```
+
+4. **Run in development mode**:
+```bash
+# With debug logging
+RUST_LOG=debug cargo run
+
+# Run tests
+cargo test
+
+# Check code formatting
+cargo fmt --all -- --check
+
+# Run linter
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+---
+
+### Project Structure
+
+```
+mostro/
+├── src/
+│   ├── main.rs              # Entry point, initialization
+│   ├── app.rs               # Event router, message dispatcher
+│   ├── app/                 # Order lifecycle handlers (17 modules)
+│   │   ├── order.rs         # Create orders
+│   │   ├── take_buy.rs      # Buyer takes sell order
+│   │   ├── take_sell.rs     # Seller takes buy order
+│   │   ├── release.rs       # Release escrow, payments
+│   │   ├── dispute.rs       # Dispute handling
+│   │   └── admin_*.rs       # Admin operations (4 modules)
+│   ├── lightning/           # LND integration
+│   │   ├── mod.rs           # Client, hold invoice management
+│   │   └── invoice.rs       # Invoice parsing, validation
+│   ├── rpc/                 # gRPC server
+│   │   └── server.rs        # Admin service implementation
+│   ├── config/              # Configuration management
+│   ├── db.rs                # Database queries (SQLx)
+│   ├── scheduler.rs         # Background jobs
+│   └── util.rs              # Shared utilities
+├── proto/                   # Protocol Buffer definitions
+│   └── admin.proto          # RPC API specification
+├── migrations/              # SQLx database migrations
+├── docs/                    # Architecture documentation
+│   ├── ARCHITECTURE.md      # System overview
+│   ├── ORDERS_AND_ACTIONS.md
+│   ├── DEV_FEE.md          # Development fee technical spec
+│   └── RPC.md              # RPC API reference
+├── docker/                  # Docker configuration
+└── settings.tpl.toml        # Configuration template
+```
+
+---
+
+### Development Workflow
+
+**Before committing**:
+```bash
+# Format code
+cargo fmt
+
+# Run linter
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Run tests
+cargo test
+
+# Update SQLx offline data (after query/schema changes)
+cargo sqlx prepare -- --bin mostrod
+```
+
+**After schema changes**:
+```bash
+# Create migration
+sqlx migrate add my_feature_name
+
+# Edit migrations/YYYYMMDDHHMMSS_my_feature_name.sql
+# Apply migration
+sqlx migrate run
+
+# Update offline data
+cargo sqlx prepare -- --bin mostrod
+```
+
+---
+
+### Finding Issues to Work On
+
+- **Good first issues**: https://github.com/MostroP2P/mostro/labels/good%20first%20issue
+- **Rewards board**: https://github.com/orgs/MostroP2P/projects/2/views/1 (bounties available)
+- **Help wanted**: https://github.com/MostroP2P/mostro/labels/help%20wanted
+
+---
+
+### Communication Channels
+
+- **Development**: [Telegram @mostro_dev](https://t.me/mostro_dev) - Technical discussions
+- **General**: [Telegram @MostroP2P](https://t.me/MostroP2P) - Community chat
+- **Issues**: [GitHub Issues](https://github.com/MostroP2P/mostro/issues) - Bug reports, feature requests
+
+---
+
+### Testing
+
+**Unit Tests**: Co-located in modules under `mod tests`
+```bash
+# Run all tests
+cargo test
+
+# Run specific test
+cargo test test_get_dev_fee
+
+# Run with output
+cargo test -- --nocapture
+```
+
+**Integration Testing**: Use `mostro-regtest` for full stack testing
+```bash
+git clone https://github.com/MostroP2P/mostro-regtest.git
+cd mostro-regtest
+# Follow README for complete regtest environment
+```
+
+---
+
+### Documentation
+
+When adding features:
+- Update relevant docs in `docs/` directory
+- Add inline documentation (`///`) for public APIs
+- Include examples in doc comments
+- Update CHANGELOG.md for user-facing changes
+
+For extensive features, add a dedicated doc file (e.g., `docs/MY_FEATURE.md`).
+
+For detailed contributing guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## Running Your Own Mostro
+
+Mostro's open-source design enables anyone to operate their own instance, ensuring no single entity controls the network. Multiple independent Mostro operators create a resilient, censorship-resistant ecosystem.
+
+### Why Run Your Own Mostro?
+
+**For the Network**:
+- **Decentralization**: More operators = harder to shut down
+- **Geographic Diversity**: Serve your local community/currency
+- **Resilience**: Network continues even if some operators go offline
+
+**For You**:
+- **Revenue**: Earn fees on successful trades (default 0.6% per order, configurable)
+- **Control**: Set your own fee structure, supported currencies, order limits
+- **Community**: Build reputation and trust within your local Bitcoin economy
+
+### Requirements for Operators
+
+**Technical Prerequisites**:
+- Lightning Network node with adequate liquidity (LND required)
+- Server with 99%+ uptime (VPS recommended: 2vCPU, 2GB RAM, 60GB storage)
+- Basic Linux/Docker administration skills
+- Nostr relay access (can run your own or use public relays)
+
+**Operational Commitment**:
+- **Liquidity Management**: Maintain sufficient Lightning channel capacity for order volume
+- **Dispute Resolution**: Assign trusted arbiters to handle disputes fairly
+- **Monitoring**: Track order flow, payment failures, system health
+- **Updates**: Keep Mostro daemon updated with latest releases
+
+**Financial Considerations**:
+- **Upfront Liquidity**: Lightning channels require capital (amount depends on expected order sizes)
+- **Operating Costs**: VPS hosting ($10-50/month), Lightning channel fees
+- **Revenue Model**: Fee income from successful orders (both parties pay, operator keeps fee minus dev contribution)
+
+### Operator Reputation
+
+Mostro implements a reputation system where users rate their experience with each Mostro operator. Poor reputation = fewer users = lower revenue. This creates economic incentives for operators to:
+- Maintain high uptime
+- Resolve disputes fairly
+- Provide responsive support
+- Keep competitive fees
+
+### Getting Started as an Operator
+
+1. **Setup Infrastructure**: Follow [INSTALL.md](INSTALL.md) for production deployment
+2. **Configure Settings**: Set fee structure, currencies, limits in `settings.toml`
+3. **Announce Your Mostro**: Publish info event (kind 38383) - done automatically on startup
+4. **Add to Directories**: Submit your Mostro to community listings and websites
+5. **Assign Arbiters**: Add trusted npubs as dispute solvers via RPC or admin actions
+
+### Finding Other Mostros
+
+Users can discover Mostro operators by:
+- Querying Nostr for kind 38383 events (Mostro info)
+- Checking community-maintained directories (e.g., mostro.network)
+- Word-of-mouth and local Bitcoin communities
+
+**Example Query**:
+```bash
+# Find all Mostro instances on Nostr
+nostreq --kinds 38383 | nostcat --stream wss://relay.damus.io | jq
+```
+
+### Operator Support
+
+Join the operator community:
+- **Telegram**: [@mostro_dev](https://t.me/mostro_dev) - Technical support
+- **GitHub Discussions**: Share operational insights, ask questions
+- **Documentation**: [docs/](docs/) - Technical references for operators
+
+---
 
 ## Documentation
 
-- Protocol documentation: [https://mostro.network/protocol](https://mostro.network/protocol/)
-- Frequently Asked Questions: in [English](https://mostro.network/docs-english/), in [Spanish](https://mostro.network/docs-spanish/).
+### Official Documentation
+- **Protocol Specification**: https://mostro.network/protocol/ - Complete Nostr protocol specification
+- **FAQ (English)**: https://mostro.network/docs-english/ - Frequently asked questions
+- **FAQ (Español)**: https://mostro.network/docs-spanish/ - Preguntas frecuentes
+
+### Technical Documentation (This Repository)
+- **[Architecture Overview](docs/ARCHITECTURE.md)** - System design, module map, startup sequence
+- **[Event Routing](docs/EVENT_ROUTING.md)** - Message handling, NIP-59 GiftWrap processing
+- **[Lightning Operations](docs/LIGHTNING_OPS.md)** - Hold invoice lifecycle, payment flows
+- **[Orders & Actions](docs/ORDERS_AND_ACTIONS.md)** - Order state machine, action handlers
+- **[Admin RPC & Disputes](docs/ADMIN_RPC_AND_DISPUTES.md)** - Dispute resolution, admin interface
+- **[Development Fee System](docs/DEV_FEE.md)** - Complete technical specification
+- **[Startup & Configuration](docs/STARTUP_AND_CONFIG.md)** - Initialization, settings guide
+
+### Guides
+- **[Installation Guide](INSTALL.md)** - Production deployment on VPS/Digital Ocean
+- **[Docker Guide](docker/README.md)** - Containerized deployment, StartOS builds
+- **[Contributing Guide](CONTRIBUTING.md)** - Development workflow, PR guidelines
+
+### API Documentation
+- **Rust Docs**: Run `cargo doc --open` to generate and browse API documentation
+- **mostro-core**: https://docs.rs/mostro-core/ - Protocol library for building clients
+- **Protocol Buffers**: [proto/admin.proto](proto/admin.proto) - RPC service definitions
+
+### External Resources
+- **Mostro Network**: https://mostro.network/ - Official website
+- **GitHub Organization**: https://github.com/MostroP2P - All Mostro projects
+- **Rewards Board**: https://github.com/orgs/MostroP2P/projects/2/views/1 - Bounties and incentives
+
+---
 
 ## License
 
-Mostro is licensed under the [MIT license](LICENSE).
+Mostro is licensed under the [MIT License](LICENSE).
+
+## Credits & Acknowledgments
+
+Mostro is built by the community, for the community. Special thanks to:
+
+- **Contributors**: Everyone who has submitted code, documentation, bug reports, and feedback
+- **Grant Support**: Organizations that have provided funding to sustain development
+- **@lnp2pBot**: The Telegram bot that proved the need and validated the model
+- **Nostr Protocol**: The censorship-resistant foundation that makes Mostro possible
+- **Bitcoin & Lightning Network**: The decentralized financial infrastructure
+
+### Rewards Program
+
+Mostro offers bounties for contributions through our [Rewards Board](https://github.com/orgs/MostroP2P/projects/2/views/1). We're grateful for the generous donations from contributors (many anonymous) and institutional grants that make this program possible.
+
+While Mostro is not a company, the rewards program enables us to thank collaborators and accelerate development.
+
+### Development Sustainability
+
+As of v0.15.6, Mostro includes a transparent development fee system where Mostro operators contribute a configurable percentage (default 30%, minimum 10%) of their fee income to the development fund. This ensures long-term sustainability while maintaining the project's open-source ethos.
+
+All development fee payments are published to Nostr (kind 8383 events) for public verification. See [docs/DEV_FEE.md](docs/DEV_FEE.md) for complete details.
+
+## Maintainers
+
+- **Francisco Calderón** ([@grunch](https://github.com/grunch)) - Project creator and lead maintainer
+
+For a complete list of contributors, see the [contributors page](https://github.com/MostroP2P/mostro/graphs/contributors).

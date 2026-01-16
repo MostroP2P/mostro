@@ -161,7 +161,7 @@ async fn job_info_event_send() {
             let tags = crate::nip33::info_to_tags(ln_status);
             let id = mostro_keys.public_key().to_string();
 
-            let info_ev = match crate::nip33::new_event(&mostro_keys, "", id, tags) {
+            let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
                 Ok(info) => info,
                 Err(e) => return error!("{e}"),
             };

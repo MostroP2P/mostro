@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
-use crate::nip33::new_event;
+use crate::nip33::new_dispute_event;
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order, send_dm, update_order_event};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -106,8 +106,8 @@ pub async fn admin_cancel_action(
                 vec!["dispute".to_string()],
             ),
         ]);
-        // nip33 kind with dispute id as identifier
-        let event = new_event(my_keys, "", dispute_id.to_string(), tags)
+        // nip33 kind with dispute id as identifier (kind 38386 for disputes)
+        let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         // Publish dispute event with update

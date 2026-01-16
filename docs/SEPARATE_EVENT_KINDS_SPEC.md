@@ -8,7 +8,7 @@ This document specifies the implementation of separate Nostr event kinds for dif
 
 ### Current Architecture
 
-All Mostro events currently use `NOSTR_REPLACEABLE_EVENT_KIND` (kind `38383`) from `mostro_core`:
+All Mostro events currently use `NOSTR_ORDER_EVENT_KIND` (kind `38383`) from `mostro_core`:
 
 | Event Type | Current Kind | Identifier (`z` tag) |
 |------------|-------------|---------------------|
@@ -47,7 +47,7 @@ All kinds remain in the NIP-33 replaceable event range (30000-39999), ensuring e
 
 ```rust
 // Current constant (unchanged)
-pub const NOSTR_REPLACEABLE_EVENT_KIND: u16 = 38383;
+pub const NOSTR_ORDER_EVENT_KIND: u16 = 38383;
 
 // New constants to add
 pub const NOSTR_RATING_EVENT_KIND: u16 = 38384;
@@ -70,8 +70,8 @@ pub fn new_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
-    // Uses NOSTR_REPLACEABLE_EVENT_KIND for all events
-    EventBuilder::new(nostr::Kind::Custom(NOSTR_REPLACEABLE_EVENT_KIND), content)
+    // Uses NOSTR_ORDER_EVENT_KIND for all events
+    EventBuilder::new(nostr::Kind::Custom(NOSTR_ORDER_EVENT_KIND), content)
         .tags(tags)
         .sign_with_keys(keys)
 }
@@ -110,7 +110,7 @@ pub fn new_order_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
-    create_event(keys, content, identifier, extra_tags, NOSTR_REPLACEABLE_EVENT_KIND)
+    create_event(keys, content, identifier, extra_tags, NOSTR_ORDER_EVENT_KIND)
 }
 
 /// Creates a new rating event (kind 38384)
@@ -170,7 +170,7 @@ fn create_event(
 
 **Current Usage**: Events created via `new_event()` with order tags
 
-**Change**: Use `new_order_event()` (or `new_event()` with `NOSTR_REPLACEABLE_EVENT_KIND`)
+**Change**: Use `new_order_event()` (or `new_event()` with `NOSTR_ORDER_EVENT_KIND`)
 
 **Files to Update**:
 - `src/util.rs` - `send_new_order_msg()` and related functions

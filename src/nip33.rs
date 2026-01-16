@@ -1,6 +1,3 @@
-use crate::config::constants::{
-    NOSTR_DISPUTE_EVENT_KIND, NOSTR_INFO_EVENT_KIND, NOSTR_RATING_EVENT_KIND,
-};
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
 use crate::LN_STATUS;
@@ -52,7 +49,7 @@ pub fn new_order_event(
         content,
         identifier,
         extra_tags,
-        NOSTR_REPLACEABLE_EVENT_KIND,
+        NOSTR_ORDER_EVENT_KIND,
     )
 }
 

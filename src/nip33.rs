@@ -128,33 +128,6 @@ pub fn new_dispute_event(
     )
 }
 
-/// Creates a new mostro nip33 event (legacy function for orders)
-///
-/// # Arguments
-///
-/// * `keys` - The keys used to sign the event
-/// * `content` - The content of the event
-/// * `identifier` - The nip33 d tag used to replaced the event with a new one
-/// * `extra_tags` - The nip33 other tags used to subscribe order type notifications
-///
-/// # Returns
-/// Returns a new event
-///
-/// # Note
-/// This function uses the default order event kind (38383).
-/// For other event types, use the specific functions:
-/// - `new_rating_event()` for ratings (kind 38384)
-/// - `new_info_event()` for info (kind 38385)
-/// - `new_dispute_event()` for disputes (kind 38386)
-pub fn new_event(
-    keys: &Keys,
-    content: &str,
-    identifier: String,
-    extra_tags: Tags,
-) -> Result<Event, Error> {
-    new_order_event(keys, content, identifier, extra_tags)
-}
-
 /// Create a rating tag
 ///
 /// # Arguments

@@ -108,6 +108,14 @@ pub struct MostroSettings {
     /// Development fee as percentage of Mostro fee (0.10 to 1.0)
     /// Example: 0.30 means 30% of the Mostro fee goes to development
     pub dev_fee_percentage: f64,
+    /// NIP-01 kind 0 metadata: human-readable name for this Mostro instance
+    pub name: Option<String>,
+    /// NIP-01 kind 0 metadata: short description of this Mostro instance
+    pub about: Option<String>,
+    /// NIP-01 kind 0 metadata: URL to avatar image (recommended max 128x128px)
+    pub picture: Option<String>,
+    /// NIP-01 kind 0 metadata: operator website URL
+    pub website: Option<String>,
 }
 
 impl Default for MostroSettings {
@@ -133,6 +141,10 @@ impl Default for MostroSettings {
             ],
             max_orders_per_response: 10,
             dev_fee_percentage: 0.30,
+            name: None,
+            about: None,
+            picture: None,
+            website: None,
         }
     }
 }

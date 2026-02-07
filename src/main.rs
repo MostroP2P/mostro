@@ -15,7 +15,7 @@ pub mod util;
 
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::{get_db_pool, DB_POOL, LN_STATUS, NOSTR_CLIENT};
+use crate::config::{get_db_pool, Settings, DB_POOL, LN_STATUS, NOSTR_CLIENT};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
@@ -81,6 +81,43 @@ async fn main() -> Result<()> {
 
     // Client subscription
     client.subscribe(subscription, None).await?;
+
+    // Publish NIP-01 kind 0 metadata event
+    let mostro_settings = Settings::get_mostro();
+    let mut has_metadata = false;
+    let mut metadata = nostr_sdk::Metadata::new();
+
+    if let Some(ref name) = mostro_settings.name {
+        metadata = metadata.name(name);
+        has_metadata = true;
+    }
+    if let Some(ref about) = mostro_settings.about {
+        metadata = metadata.about(about);
+        has_metadata = true;
+    }
+    if let Some(ref picture) = mostro_settings.picture {
+        if let Ok(url) = nostr_sdk::Url::parse(picture) {
+            metadata = metadata.picture(url);
+            has_metadata = true;
+        } else {
+            tracing::warn!("Invalid picture URL in settings: {}", picture);
+        }
+    }
+    if let Some(ref website) = mostro_settings.website {
+        if let Ok(url) = nostr_sdk::Url::parse(website) {
+            metadata = metadata.website(url);
+            has_metadata = true;
+        } else {
+            tracing::warn!("Invalid website URL in settings: {}", website);
+        }
+    }
+
+    if has_metadata {
+        if let Ok(metadata_ev) = EventBuilder::metadata(&metadata).sign_with_keys(&mostro_keys) {
+            let _ = client.send_event(&metadata_ev).await;
+            tracing::info!("Published NIP-01 kind 0 metadata event");
+        }
+    }
 
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;

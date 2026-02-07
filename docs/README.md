@@ -9,6 +9,7 @@ Quick links to architecture and feature guides.
 - Orders & Actions: ORDERS_AND_ACTIONS.md
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - RPC Interface Reference: RPC.md
+- NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 
 Tips
 - Run tests and lints before pushing: `cargo test`, `cargo fmt`, `cargo clippy --all-targets --all-features`.

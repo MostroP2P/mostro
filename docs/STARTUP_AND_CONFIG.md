@@ -73,12 +73,13 @@ Before settings initialization, the daemon performs:
 1) Settings init: `cli::settings_init()` loads `settings.toml` (template: `settings.tpl.toml`).
 2) DB connect: `db::connect()` sets `config::DB_POOL`.
 3) Nostr: `util::connect_nostr()` sets `config::NOSTR_CLIENT`.
-4) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
-5) Held invoices: `db::find_held_invoices()` → resubscribe via `util::invoice_subscribe`.
-6) RPC: start if `rpc.enabled`.
-7) Scheduler: `scheduler::start_scheduler()`.
-8) Scheduler jobs: Payment retry job configured with `payment_retries_interval`
-9) Event loop: `app::run(keys, client, ln_client)`.
+4) NIP-01 Kind 0 Metadata: If any metadata fields (`name`, `about`, `picture`, `website`) are configured, publishes a kind 0 metadata event so clients can display the Mostro instance's profile.
+5) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
+6) Held invoices: `db::find_held_invoices()` → resubscribe via `util::invoice_subscribe`.
+7) RPC: start if `rpc.enabled`.
+8) Scheduler: `scheduler::start_scheduler()`.
+9) Scheduler jobs: Payment retry job configured with `payment_retries_interval`.
+10) Event loop: `app::run(keys, client, ln_client)`.
 
 ## Settings Structure
 
@@ -136,6 +137,12 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Market Support:*
 - `fiat_currencies_accepted` (Vec<String>): Accepted fiat currencies; empty list accepts all (default: ['USD', 'EUR', 'ARS', 'CUP'])
+
+*NIP-01 Kind 0 Metadata (optional):*
+- `name` (Option\<String\>): Human-readable name for this Mostro instance (default: None)
+- `about` (Option\<String\>): Short description of this Mostro instance (default: None)
+- `picture` (Option\<String\>): URL to avatar image, recommended square max 128x128px (default: None)
+- `website` (Option\<String\>): Operator website URL (default: None)
 
 **RPC** (`src/config/types.rs:55-74`):
 - `enabled` (bool): Enable RPC server (Rust Default: false)

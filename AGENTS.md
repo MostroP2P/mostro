@@ -37,6 +37,9 @@
 - Squash fixups before review.
 - PRs: link the motivating issue, include `cargo test` output, and call out schema or config changes to ease verification.
 
+## Documentation Guidelines
+- Do not hardcode source code line numbers in documentation (e.g., `src/app/take_buy.rs:11`). Line numbers drift as the codebase evolves, misleading developers. Reference file paths (`src/app/take_buy.rs`) or function names (`fn take_buy_action`) instead, which are far more stable and easily searchable.
+
 ## Security & Configuration Tips
 - Do not commit populated `settings.toml`. Copy from `settings.tpl.toml` to `~/.mostro/settings.toml` for local runs.
 - Protect LND credentials before `make docker-build`.

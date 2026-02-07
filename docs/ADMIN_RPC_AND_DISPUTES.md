@@ -27,6 +27,7 @@ sequenceDiagram
   participant AdminSettle as app/admin_settle.rs
   participant DB as DB
   participant LND as LND
+  participant Admin as Admin
 
   User->>Mostro: Action=Dispute
   Mostro->>Dispute: dispute_action

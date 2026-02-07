@@ -684,24 +684,24 @@ This section details exactly when and how the database fields (`dev_fee`, `dev_f
 
 #### `dev_fee` Field Lifecycle
 
-**When Set:** During order creation in `src/util.rs::prepare_new_order()` (lines 392-398)
+**When Initialized:** During order creation in `src/util.rs::prepare_new_order()` (lines 392-398)
 
-**Calculation:**
+**Initialization:**
 ```rust
 let mut fee = 0;
-let mut dev_fee = 0;
+let dev_fee = 0;
 if new_order.amount > 0 {
-    fee = get_fee(new_order.amount);                    // Calculate Mostro fee
-    let total_mostro_fee = fee * 2;                     // Double the fee (both parties)
-    dev_fee = get_dev_fee(total_mostro_fee);            // Calculate dev fee (30% default)
+    fee = get_fee(new_order.amount);
+    // dev_fee is NOT calculated here — always initialized to 0
+    // It is calculated later when the order is taken
 }
 ```
 
-**Initial Value:** Calculated dev fee amount in satoshis based on `total_mostro_fee × dev_fee_percentage`
+**Initial Value:** Always 0 (zero) — dev fee is calculated later when the order is taken (in `take_buy.rs` / `take_sell.rs`), not at creation time.
 
 **Purpose:** Tracking amount that mostrod will pay to the development fund from its earnings (not charged to users)
 
-**Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section (lines 182-256).
+**Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section (lines 238-287).
 
 **Database State:** Persists throughout order lifecycle unless order returns to pending status (market price orders only).
 
@@ -770,10 +770,15 @@ Complete timeline showing database field states at each stage:
 
 ```
 Order Creation (t=0):
-  └─> dev_fee = calculated_value (e.g., 300 sats)
+  └─> dev_fee = 0 (always zero at creation)
   └─> dev_fee_paid = 0
   └─> dev_fee_payment_hash = NULL
-  └─> Database: INSERT INTO orders (dev_fee, dev_fee_paid, dev_fee_payment_hash) VALUES (300, 0, NULL)
+  └─> Database: INSERT INTO orders (dev_fee, dev_fee_paid, dev_fee_payment_hash) VALUES (0, 0, NULL)
+
+Order Taken (t=take):
+  └─> dev_fee = calculated_value (e.g., 300 sats)
+  └─> Calculated in take_buy.rs / take_sell.rs based on total_mostro_fee × dev_fee_percentage
+  └─> Database: UPDATE orders SET dev_fee = 300 WHERE id = ?
 
 Order Processing (t=minutes):
   └─> Buyer and seller complete trade

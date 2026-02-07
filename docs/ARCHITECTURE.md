@@ -50,10 +50,10 @@ flowchart LR
 ### Per‑Action Summaries
 
 - `app/order.rs` – validates and creates new orders; persists to DB; emits acknowledgements.
-- `app/take_buy.rs` – buyer accepts a sell offer; checks order state, reserves amount. Entry: `src/app/take_buy.rs:11`.
+- `app/take_buy.rs` – buyer accepts a sell offer; checks order state, reserves amount.
 - `app/take_sell.rs` – seller accepts a buy offer; mirrors `take_buy` logic for sell side.
-- `app/add_invoice.rs` – records buyer invoice or creates hold invoice for escrow; may call LND. Entry: `src/app/add_invoice.rs:21`.
-- `app/release.rs` – releases held funds on successful trade; settles hold invoice via LND. Entry: `src/app/release.rs:94`.
+- `app/add_invoice.rs` – records buyer invoice or creates hold invoice for escrow; may call LND.
+- `app/release.rs` – releases held funds on successful trade; settles hold invoice via LND.
 - `app/fiat_sent.rs` – buyer signals fiat transfer; updates order state, notifies counterparty.
 - `app/cancel.rs` – cancels pending orders; may cancel hold invoice if present.
 - `app/dispute.rs` – opens a dispute; flags order and awaits admin solver.

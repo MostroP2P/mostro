@@ -16,9 +16,9 @@ How Nostr events become actions and side effects.
 - Ensures monotonic `trade_index` for trading actions; verifies signature binding; auto-creates user on first valid trade.
 
 ## Key Actions (entries)
-- Take Buy: `src/app/take_buy.rs:12`
-- Add Invoice: `src/app/add_invoice.rs:34`
-- Release: `src/app/release.rs:160`
+- Take Buy: `src/app/take_buy.rs`
+- Add Invoice: `src/app/add_invoice.rs`
+- Release: `src/app/release.rs`
 - Cancel: `src/app/cancel.rs`
 - Dispute: `src/app/dispute.rs`
 

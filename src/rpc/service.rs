@@ -311,12 +311,16 @@ impl AdminService for AdminServiceImpl {
         request: Request<ValidateDbPasswordRequest>,
     ) -> Result<Response<ValidateDbPasswordResponse>, Status> {
         // Extract client address for rate limiting
-        let remote_addr = request.remote_addr().ok_or_else(|| {
-            Status::internal("Unable to determine client address")
-        })?;
+        let remote_addr = request
+            .remote_addr()
+            .ok_or_else(|| Status::internal("Unable to determine client address"))?;
 
         // Check rate limit before processing
-        if let Err(msg) = self.password_rate_limiter.check_rate_limit(&remote_addr).await {
+        if let Err(msg) = self
+            .password_rate_limiter
+            .check_rate_limit(&remote_addr)
+            .await
+        {
             warn!(
                 "ValidateDbPassword rate-limited for client {}",
                 remote_addr.ip()
@@ -325,12 +329,17 @@ impl AdminService for AdminServiceImpl {
         }
 
         let req = request.into_inner();
-        info!("Received ValidateDbPassword request from {}", remote_addr.ip());
+        info!(
+            "Received ValidateDbPassword request from {}",
+            remote_addr.ip()
+        );
 
         match verify_and_set_db_password(&self.pool, req.password).await {
             Ok(()) => {
                 // Reset rate limit state on success
-                self.password_rate_limiter.record_success(&remote_addr).await;
+                self.password_rate_limiter
+                    .record_success(&remote_addr)
+                    .await;
                 Ok(Response::new(ValidateDbPasswordResponse {
                     success: true,
                     error_message: None,
@@ -342,7 +351,9 @@ impl AdminService for AdminServiceImpl {
                     "Failed password validation attempt from {}",
                     remote_addr.ip()
                 );
-                self.password_rate_limiter.record_failure(&remote_addr).await;
+                self.password_rate_limiter
+                    .record_failure(&remote_addr)
+                    .await;
                 Ok(Response::new(ValidateDbPasswordResponse {
                     success: false,
                     error_message: Some(e.to_string()),

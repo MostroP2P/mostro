@@ -4,6 +4,8 @@
 [![Rust Version](https://img.shields.io/badge/rust-1.86%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/badge/version-0.15.6-green.svg)](https://github.com/MostroP2P/mostro/releases)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
+
 > **A production-ready, censorship-resistant, non-custodial Lightning Network peer-to-peer exchange built on Nostr**
 
 ![Mostro-logo](static/logo.png)
@@ -650,7 +652,8 @@ nostreq --kinds 38383 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream 
 Mostro requires a client to interact with the daemon. Available clients:
 
 - **[mostro-cli](https://github.com/MostroP2P/mostro-cli)** - Command-line interface (recommended for testing)
-- **[mostro-web](https://github.com/MostroP2P/mostro-web)** - Web interface (in development)
+- **[Mostro Mobile](https://github.com/MostroP2P/mobile)** - Mobile app (beta)
+- **[MostriX](https://github.com/MostroP2P/mostrix)** - Terminal UI client (work in progress)
 
 **Example: Creating an order with mostro-cli**:
 ```bash
@@ -732,22 +735,39 @@ cargo install --path .
 
 ---
 
-#### mostro-web (Web Interface)
-**Repository**: https://github.com/MostroP2P/mostro-web
-**Status**: In development
+#### Mostro Mobile (Mobile App)
+**Repository**: https://github.com/MostroP2P/mobile
+**Status**: Beta
 **Best For**: General users, accessibility
 
-Features (planned):
-- Browser-based trading interface
-- Lightning wallet integration
-- Order book visualization
-- Real-time trade status
+Features:
+- Complete trading (create, take, and cancel orders)
+- Encrypted P2P chat (ECDH shared key + NIP-59 gift wrapping, Blossom servers for multimedia)
+- Key management (NIP-06 and NIP-59, unique keys per trade)
+- Real-time order book updates
+- Multi-language support (English, Spanish, Italian)
+- Push notifications
+- User rating system
+- Dispute resolution
+
+**Stack**: Flutter (Android)
 
 ---
 
-### Mobile & Desktop Clients
+#### MostriX (Terminal UI Client)
+**Repository**: https://github.com/MostroP2P/mostrix
+**Status**: Work in progress
+**Best For**: Admins
 
-Mobile (iOS/Android) and desktop (Windows/Mac/Linux) clients are planned for future releases. Community contributions welcome!
+Features:
+- Admin mode with separate key
+- Dispute management
+- Order book visualization
+- Take buy/sell orders
+- Create buy/sell orders (with LN address support)
+- Key management (Mostro protocol compliant)
+
+**Stack**: Rust (TUI)
 
 ---
 

@@ -1,5 +1,6 @@
 //! RPC service implementation for admin operations
 
+use crate::config::settings::Settings;
 use crate::db::verify_and_set_db_password;
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
@@ -7,7 +8,6 @@ use crate::rpc::admin::{
     CancelOrderResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
     TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
-use crate::config::settings::Settings;
 use crate::rpc::rate_limiter::RateLimiter;
 use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
 use sqlx::{Pool, Sqlite};
@@ -35,9 +35,7 @@ impl AdminServiceImpl {
             keys,
             pool,
             ln_client,
-            password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(
-                retention_secs,
-            ))),
+            password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
         }
     }
 
@@ -327,10 +325,13 @@ impl AdminService for AdminServiceImpl {
             .await
         {
             warn!(
-                "ValidateDbPassword rate-limited for client {}",
-                remote_addr.ip()
+                "ValidateDbPassword rate-limited for client {}: {}",
+                remote_addr.ip(),
+                msg
             );
-            return Err(Status::resource_exhausted(msg));
+            return Err(Status::resource_exhausted(
+                "Too many requests, try again later",
+            ));
         }
 
         let req = request.into_inner();

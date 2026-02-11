@@ -797,26 +797,70 @@ async fn job_process_dev_fee_payment() {
                             }
                         }
                         Err(_) => {
-                            // STEP 5: Timeout — DO NOT reset to unpaid.
-                            //
-                            // A timeout does NOT mean the payment failed. The Lightning
-                            // payment may still be in-flight and could succeed after the
-                            // timeout window. Resetting dev_fee_paid=false here would
-                            // cause a duplicate payment on the next scheduler cycle.
-                            //
-                            // Instead, leave the order in PENDING state (dev_fee_paid=true,
-                            // dev_fee_payment_hash="PENDING-{uuid}-{ts}"). The stale
-                            // PENDING detection (with timestamp-based TTL) will clean it
-                            // up after the configured TTL if the payment never resolves.
-                            //
-                            // See: https://github.com/MostroP2P/mostro/issues/568
+                            // STEP 5: Timeout — check actual payment status before resetting
+                            // A timeout does NOT mean the payment failed; it could still be
+                            // in-flight or may have succeeded. Blindly resetting would cause
+                            // duplicate payments (see #568).
                             let order_id = order.id;
                             let dev_fee = order.dev_fee;
                             warn!(
-                                "Dev fee payment timeout (50s) for order {} ({} sats). \
-                                 Leaving in PENDING state — stale cleanup will handle if payment never resolves.",
+                                "Dev fee payment timeout (50s) for order {} ({} sats), checking LN status",
                                 order_id, dev_fee
                             );
+
+                            // Try to check the payment status on the LN node
+                            let should_reset = match check_dev_fee_payment_status(&order, &pool)
+                                .await
+                            {
+                                DevFeePaymentState::Succeeded => {
+                                    info!(
+                                        "Payment actually succeeded for order {} despite timeout",
+                                        order_id
+                                    );
+                                    false // Don't reset — already handled
+                                }
+                                DevFeePaymentState::InFlight => {
+                                    warn!(
+                                        "Payment still in-flight for order {}, skipping reset",
+                                        order_id
+                                    );
+                                    false // Don't reset — payment may still complete
+                                }
+                                DevFeePaymentState::Failed => {
+                                    info!(
+                                        "Payment definitively failed for order {}, safe to retry",
+                                        order_id
+                                    );
+                                    true // Safe to reset and retry
+                                }
+                                DevFeePaymentState::Unknown => {
+                                    warn!(
+                                        "Cannot determine payment status for order {}, skipping reset to avoid duplicate",
+                                        order_id
+                                    );
+                                    false // Err on the side of caution
+                                }
+                            };
+
+                            if should_reset {
+                                order.dev_fee_paid = false;
+                                order.dev_fee_payment_hash = None;
+
+                                match order.update(&pool).await {
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to reset after timeout for order {}: {:?}",
+                                            order_id, e
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        info!(
+                                            "Reset order {} to unpaid after confirmed failure, will retry",
+                                            order_id
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -877,5 +921,111 @@ mod tests {
             .as_secs();
         let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
         assert_eq!(parse_pending_timestamp(&marker), Some(now));
+    }
+}
+
+/// Possible states of a dev fee payment after checking the LN node.
+enum DevFeePaymentState {
+    /// Payment confirmed successful on the LN node.
+    Succeeded,
+    /// Payment is still in-flight on the LN network.
+    InFlight,
+    /// Payment definitively failed — safe to retry.
+    Failed,
+    /// Could not determine status (LN node unreachable, unknown hash, etc.)
+    Unknown,
+}
+
+/// Check the actual payment status on the LN node for a dev fee payment.
+///
+/// If the payment succeeded, marks the order as paid in the DB.
+/// Returns the current payment state so the caller can decide whether to reset.
+async fn check_dev_fee_payment_status(
+    order: &Order,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+) -> DevFeePaymentState {
+    use crate::lightning::LndConnector;
+    use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
+
+    // Get the payment hash — if it's a PENDING marker or missing, we can't check
+    let payment_hash_str = match &order.dev_fee_payment_hash {
+        Some(h) if !h.starts_with("PENDING-") => h.clone(),
+        _ => {
+            warn!(
+                "Order {} has no trackable payment hash, cannot verify LN status",
+                order.id
+            );
+            return DevFeePaymentState::Unknown;
+        }
+    };
+
+    // Decode hex hash to bytes
+    use nostr_sdk::nostr::hashes::hex::FromHex;
+    let payment_hash_bytes: Vec<u8> = match FromHex::from_hex(&payment_hash_str) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(
+                "Failed to decode payment hash '{}' for order {}: {}",
+                payment_hash_str, order.id, e
+            );
+            return DevFeePaymentState::Unknown;
+        }
+    };
+
+    // Query LND for the payment status
+    let mut ln_client = match LndConnector::new().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!(
+                "Failed to connect to LN node to check payment status: {:?}",
+                e
+            );
+            return DevFeePaymentState::Unknown;
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ln_client.check_payment_status(&payment_hash_bytes),
+    )
+    .await
+    {
+        Ok(Ok(status)) => match status {
+            PaymentStatus::Succeeded => {
+                // Payment actually went through — update DB
+                let order_id = order.id;
+                let mut order = order.clone();
+                order.dev_fee_paid = true;
+                if let Err(e) = order.update(pool).await {
+                    error!(
+                        "Payment succeeded but failed to update DB for order {}: {:?}",
+                        order_id, e
+                    );
+                } else {
+                    info!(
+                        "✅ Order {} dev fee payment confirmed via LN status check",
+                        order_id
+                    );
+                }
+                DevFeePaymentState::Succeeded
+            }
+            PaymentStatus::InFlight => DevFeePaymentState::InFlight,
+            PaymentStatus::Failed => DevFeePaymentState::Failed,
+            _ => DevFeePaymentState::Unknown,
+        },
+        Ok(Err(e)) => {
+            warn!(
+                "LN status check failed for order {} (hash {}): {:?}",
+                order.id, payment_hash_str, e
+            );
+            DevFeePaymentState::Unknown
+        }
+        Err(_) => {
+            warn!(
+                "LN status check timed out for order {} (hash {})",
+                order.id, payment_hash_str
+            );
+            DevFeePaymentState::Unknown
+        }
     }
 }

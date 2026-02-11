@@ -74,3 +74,5 @@ enabled = false
 listen_address = "127.0.0.1"
 # RPC server port
 port = 50051
+# Duration in seconds after which inactive rate-limiter entries are evicted
+# rate_limiter_stale_duration = 3600

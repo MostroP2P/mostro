@@ -7,10 +7,12 @@ use crate::rpc::admin::{
     CancelOrderResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
     TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
+use crate::config::settings::Settings;
 use crate::rpc::rate_limiter::RateLimiter;
 use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -28,11 +30,14 @@ impl AdminServiceImpl {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
     ) -> Self {
+        let retention_secs = Settings::get_rpc().rate_limiter_stale_duration;
         Self {
             keys,
             pool,
             ln_client,
-            password_rate_limiter: Arc::new(RateLimiter::new()),
+            password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(
+                retention_secs,
+            ))),
         }
     }
 

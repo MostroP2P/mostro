@@ -13,6 +13,7 @@ use tracing::warn;
 const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(300); // 5 minutes
 const BASE_DELAY_MS: u64 = 1000; // 1 second base delay
+const DEFAULT_RETENTION: Duration = Duration::from_secs(3600); // 1 hour
 
 /// Tracks the state of failed attempts for a single client.
 #[derive(Debug)]
@@ -38,19 +39,35 @@ impl ClientState {
 /// In-memory rate limiter keyed by client IP address.
 pub struct RateLimiter {
     clients: Mutex<HashMap<String, ClientState>>,
+    retention: Duration,
 }
 
 impl Default for RateLimiter {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_RETENTION)
     }
 }
 
 impl RateLimiter {
-    pub fn new() -> Self {
+    pub fn new(retention: Duration) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
+            retention,
         }
+    }
+
+    /// Remove entries whose `last_attempt` is older than `self.retention`
+    /// and whose lockout (if any) has already expired.
+    fn evict_stale(&self, clients: &mut HashMap<String, ClientState>) {
+        let now = Instant::now();
+        let retention = self.retention;
+        clients.retain(|_, state| {
+            let within_retention = now.duration_since(state.last_attempt) <= retention;
+            let still_locked = state
+                .locked_until
+                .is_some_and(|locked_until| now < locked_until);
+            within_retention || still_locked
+        });
     }
 
     /// Check if the client is allowed to make a request.
@@ -59,6 +76,8 @@ impl RateLimiter {
     pub async fn check_rate_limit(&self, addr: &SocketAddr) -> Result<(), String> {
         let key = addr.ip().to_string();
         let mut clients = self.clients.lock().await;
+
+        self.evict_stale(&mut clients);
 
         let state = clients.entry(key.clone()).or_insert_with(ClientState::new);
 
@@ -90,6 +109,8 @@ impl RateLimiter {
         let key = addr.ip().to_string();
         let mut clients = self.clients.lock().await;
 
+        self.evict_stale(&mut clients);
+
         let state = clients.entry(key.clone()).or_insert_with(ClientState::new);
         state.failed_attempts += 1;
         state.last_attempt = Instant::now();
@@ -119,6 +140,9 @@ impl RateLimiter {
     pub async fn record_success(&self, addr: &SocketAddr) {
         let key = addr.ip().to_string();
         let mut clients = self.clients.lock().await;
+
+        self.evict_stale(&mut clients);
+
         clients.remove(&key);
     }
 }
@@ -134,13 +158,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_first_attempt_allowed() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
         assert!(limiter.check_rate_limit(&test_addr(1)).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_lockout_after_max_attempts() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
         let addr = test_addr(2);
 
         for _ in 0..MAX_ATTEMPTS {
@@ -152,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_success_resets_state() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
         let addr = test_addr(3);
 
         limiter.record_failure(&addr).await;
@@ -165,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_ips_independent() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
         let addr1 = test_addr(4);
         let addr2 = test_addr(5);
 
@@ -176,5 +200,28 @@ mod tests {
         // addr1 locked out, addr2 should be fine
         assert!(limiter.check_rate_limit(&addr1).await.is_err());
         assert!(limiter.check_rate_limit(&addr2).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stale_entries_evicted() {
+        // Use zero retention so entries become stale immediately
+        let limiter = RateLimiter::new(Duration::ZERO);
+        let addr = test_addr(6);
+
+        // Record a failure — this inserts an entry
+        limiter.record_failure(&addr).await;
+
+        // The entry's last_attempt is now in the past (or at best equal to now)
+        // and there is no active lockout (only 1 failure < MAX_ATTEMPTS).
+        // With ZERO retention the entry is stale, so the next call should evict it.
+        assert!(limiter.check_rate_limit(&addr).await.is_ok());
+
+        // Verify the map is empty (stale entry was evicted, and the fresh
+        // entry inserted by check_rate_limit has zero failures so it's benign,
+        // but let's verify the old failure state is gone).
+        let clients = limiter.clients.lock().await;
+        // The entry exists (created by check_rate_limit) but has 0 failures
+        let state = clients.get(&addr.ip().to_string());
+        assert!(state.is_none() || state.unwrap().failed_attempts == 0);
     }
 }

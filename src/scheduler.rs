@@ -591,9 +591,9 @@ async fn job_process_dev_fee_payment() {
 
                 for mut order in unpaid_orders {
                     // GUARD: Detect partial success scenario (payment succeeded but DB update failed)
-                    if order.dev_fee_payment_hash.is_some() {
+                    if let Some(payment_hash) = &order.dev_fee_payment_hash {
                         let order_id = order.id;
-                        let payment_hash = order.dev_fee_payment_hash.as_ref().unwrap().clone();
+                        let payment_hash = payment_hash.clone();
 
                         warn!(
                             "Order {} has payment hash '{}' but dev_fee_paid=false. Recovering from failed DB update.",

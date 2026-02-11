@@ -100,6 +100,25 @@ impl RateLimiter {
             state.locked_until = None;
         }
 
+        // Enforce exponential backoff between attempts
+        if state.failed_attempts > 0 {
+            let delay_ms = BASE_DELAY_MS * 2u64.pow(state.failed_attempts.saturating_sub(1));
+            let backoff_deadline = state.last_attempt + Duration::from_millis(delay_ms);
+            let now = Instant::now();
+            if now < backoff_deadline {
+                let remaining = backoff_deadline.duration_since(now);
+                warn!(
+                    "Rate limit: client {} is in backoff for {} more seconds",
+                    key,
+                    remaining.as_secs()
+                );
+                return Err(format!(
+                    "Rate limited. Try again in {} seconds.",
+                    remaining.as_secs() + 1
+                ));
+            }
+        }
+
         Ok(())
     }
 

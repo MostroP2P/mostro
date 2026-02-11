@@ -535,19 +535,35 @@ async fn job_process_dev_fee_payment() {
             info!("Checking for unpaid development fees");
 
             // Cleanup stale PENDING entries (crash recovery)
-            let cleanup_ttl = 300; // 5 minutes in seconds
-            let cutoff_time = Timestamp::now() - cleanup_ttl;
+            // The PENDING marker format is "PENDING-{order_id}-{unix_timestamp}"
+            // where the timestamp is when the payment was initiated, NOT when the
+            // order was taken. This fixes false positives on old orders with fresh
+            // payments and false negatives on recent orders with stuck payments.
+            // See: https://github.com/MostroP2P/mostro/issues/570
+            let cleanup_ttl = 300u64; // 5 minutes in seconds
+            let now = Timestamp::now().as_u64();
 
-            if let Ok(stale_orders) = sqlx::query_as::<_, Order>(
-                "SELECT * FROM orders
-                 WHERE dev_fee_payment_hash LIKE 'PENDING-%'
-                   AND taken_at > 0
-                   AND taken_at < ?1",
+            if let Ok(pending_orders) = sqlx::query_as::<_, Order>(
+                "SELECT * FROM orders WHERE dev_fee_payment_hash LIKE 'PENDING-%'",
             )
-            .bind(cutoff_time.as_u64() as i64)
             .fetch_all(&*pool)
             .await
             {
+                // Filter stale entries by parsing the timestamp from the PENDING marker
+                let stale_orders: Vec<_> = pending_orders
+                    .into_iter()
+                    .filter(|order| {
+                        if let Some(hash) = &order.dev_fee_payment_hash {
+                            if let Some(ts) = parse_pending_timestamp(hash) {
+                                return now.saturating_sub(ts) > cleanup_ttl;
+                            }
+                        }
+                        // Can't parse timestamp — treat legacy "PENDING-{id}" as stale
+                        // to handle upgrade from old format
+                        true
+                    })
+                    .collect();
+
                 if !stale_orders.is_empty() {
                     warn!(
                         "Found {} stale PENDING dev fee orders (older than {}s), resetting",
@@ -557,11 +573,17 @@ async fn job_process_dev_fee_payment() {
 
                     for mut stale_order in stale_orders {
                         let order_id = stale_order.id;
-                        let age_seconds = Timestamp::now().as_u64() - stale_order.taken_at as u64;
+                        let age_str = if let Some(hash) = &stale_order.dev_fee_payment_hash {
+                            parse_pending_timestamp(hash)
+                                .map(|ts| format!("{}s", now.saturating_sub(ts)))
+                                .unwrap_or_else(|| "unknown".to_string())
+                        } else {
+                            "unknown".to_string()
+                        };
 
                         warn!(
-                            "Resetting stale PENDING order {} (age: {}s)",
-                            order_id, age_seconds
+                            "Resetting stale PENDING order {} (age: {})",
+                            order_id, age_str
                         );
 
                         stale_order.dev_fee_paid = false;
@@ -631,7 +653,11 @@ async fn job_process_dev_fee_payment() {
                     let order_id = order.id;
                     info!("Pre-marking order {} as payment pending", order_id);
                     order.dev_fee_paid = true;
-                    order.dev_fee_payment_hash = Some(format!("PENDING-{}", order_id));
+                    order.dev_fee_payment_hash = Some(format!(
+                        "PENDING-{}-{}",
+                        order_id,
+                        Timestamp::now().as_u64()
+                    ));
 
                     let mut order = match order.update(&pool).await {
                         Err(e) => {
@@ -773,4 +799,67 @@ async fn job_process_dev_fee_payment() {
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
+}
+
+/// Parse the unix timestamp from a PENDING marker string.
+///
+/// Supports both formats:
+/// - New: `PENDING-{uuid_order_id}-{unix_timestamp}` → returns Some(timestamp)
+/// - Legacy: `PENDING-{uuid_order_id}` → returns None
+///
+/// Since UUIDs contain dashes, we extract the timestamp as the last segment
+/// after the final dash. A valid timestamp is a number with 10+ digits
+/// (unix seconds since ~2001).
+fn parse_pending_timestamp(pending_hash: &str) -> Option<u64> {
+    if !pending_hash.starts_with("PENDING-") {
+        return None;
+    }
+    // The timestamp is the last dash-separated segment.
+    // We distinguish it from UUID hex segments by checking that it's
+    // exactly 10 decimal digits (valid for unix timestamps 2001–2286).
+    let last_segment = pending_hash.rsplit('-').next()?;
+    if last_segment.len() != 10 {
+        return None;
+    }
+    let ts = last_segment.parse::<u64>().ok()?;
+    // Sanity check: must be a plausible unix timestamp (after year 2020)
+    if ts > 1_577_836_800 {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod pending_marker_tests {
+    use super::parse_pending_timestamp;
+
+    #[test]
+    fn test_parse_new_format_with_uuid() {
+        let hash = "PENDING-550e8400-e29b-41d4-a716-446655440000-1707681234";
+        assert_eq!(parse_pending_timestamp(hash), Some(1707681234));
+    }
+
+    #[test]
+    fn test_parse_legacy_format_uuid() {
+        // Legacy format: no timestamp appended, last segment is UUID part (not a valid timestamp)
+        let hash = "PENDING-550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(parse_pending_timestamp(hash), None);
+    }
+
+    #[test]
+    fn test_parse_legacy_format_simple() {
+        let hash = "PENDING-550e8400";
+        assert_eq!(parse_pending_timestamp(hash), None);
+    }
+
+    #[test]
+    fn test_parse_not_pending() {
+        assert_eq!(parse_pending_timestamp("some-random-hash"), None);
+    }
+
+    #[test]
+    fn test_parse_empty() {
+        assert_eq!(parse_pending_timestamp(""), None);
+    }
 }

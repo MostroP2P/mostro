@@ -1,5 +1,6 @@
 //! RPC service implementation for admin operations
 
+use crate::config::settings::Settings;
 use crate::db::verify_and_set_db_password;
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
@@ -7,17 +8,20 @@ use crate::rpc::admin::{
     CancelOrderResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
     TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
+use crate::rpc::rate_limiter::RateLimiter;
 use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Implementation of the AdminService gRPC service
 pub struct AdminServiceImpl {
     keys: Keys,
     pool: Arc<Pool<Sqlite>>,
     ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
+    password_rate_limiter: Arc<RateLimiter>,
 }
 
 impl AdminServiceImpl {
@@ -26,10 +30,12 @@ impl AdminServiceImpl {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
     ) -> Self {
+        let retention_secs = Settings::get_rpc().rate_limiter_stale_duration;
         Self {
             keys,
             pool,
             ln_client,
+            password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
         }
     }
 
@@ -307,16 +313,53 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ValidateDbPasswordRequest>,
     ) -> Result<Response<ValidateDbPasswordResponse>, Status> {
+        // Extract client address for rate limiting
+        let remote_addr = request
+            .remote_addr()
+            .ok_or_else(|| Status::internal("Unable to determine client address"))?;
+
+        // Check rate limit before processing
+        if let Err(msg) = self
+            .password_rate_limiter
+            .check_rate_limit(&remote_addr)
+            .await
+        {
+            warn!(
+                "ValidateDbPassword rate-limited for client {}: {}",
+                remote_addr.ip(),
+                msg
+            );
+            return Err(Status::resource_exhausted(
+                "Too many requests, try again later",
+            ));
+        }
+
         let req = request.into_inner();
-        info!("Received ValidateDbPassword request");
+        info!(
+            "Received ValidateDbPassword request from {}",
+            remote_addr.ip()
+        );
 
         match verify_and_set_db_password(&self.pool, req.password).await {
-            Ok(()) => Ok(Response::new(ValidateDbPasswordResponse {
-                success: true,
-                error_message: None,
-            })),
+            Ok(()) => {
+                // Reset rate limit state on success
+                self.password_rate_limiter
+                    .record_success(&remote_addr)
+                    .await;
+                Ok(Response::new(ValidateDbPasswordResponse {
+                    success: true,
+                    error_message: None,
+                }))
+            }
             Err(e) => {
-                error!("ValidateDbPassword failed: {}", e);
+                // Record failure for rate limiting (applies exponential backoff)
+                warn!(
+                    "Failed password validation attempt from {}",
+                    remote_addr.ip()
+                );
+                self.password_rate_limiter
+                    .record_failure(&remote_addr)
+                    .await;
                 Ok(Response::new(ValidateDbPasswordResponse {
                     success: false,
                     error_message: Some(e.to_string()),

@@ -4,6 +4,7 @@
 //! for admin operations without going through the Nostr protocol. This is useful
 //! for local development and admin applications that need low-latency access.
 
+pub mod rate_limiter;
 pub mod server;
 pub mod service;
 

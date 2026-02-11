@@ -61,6 +61,13 @@ pub struct RpcSettings {
     pub listen_address: String,
     /// RPC server port
     pub port: u16,
+    /// Duration in seconds after which inactive rate-limiter entries are evicted
+    #[serde(default = "default_rate_limiter_stale_duration")]
+    pub rate_limiter_stale_duration: u64,
+}
+
+fn default_rate_limiter_stale_duration() -> u64 {
+    3600
 }
 
 impl Default for RpcSettings {
@@ -69,6 +76,7 @@ impl Default for RpcSettings {
             enabled: false,
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
+            rate_limiter_stale_duration: default_rate_limiter_stale_duration(),
         }
     }
 }

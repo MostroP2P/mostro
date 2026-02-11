@@ -4,6 +4,8 @@
 [![Rust Version](https://img.shields.io/badge/rust-1.86%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/badge/version-0.15.6-green.svg)](https://github.com/MostroP2P/mostro/releases)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
+
 > **A production-ready, censorship-resistant, non-custodial Lightning Network peer-to-peer exchange built on Nostr**
 
 ![Mostro-logo](static/logo.png)

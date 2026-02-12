@@ -2,12 +2,13 @@ use crate::config;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{self};
+use crate::lightning::invoice::decode_invoice;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
-    enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
-    update_order_event,
+    bytes_to_string, enqueue_order_msg, get_keys, get_nostr_client, get_order,
+    settle_seller_hold_invoice, update_order_event,
 };
 
 use argon2::password_hash::SaltString;
@@ -553,23 +554,22 @@ async fn payment_success(
     Ok(())
 }
 
-/// Send development fee payment via Lightning Network
+/// Resolve the dev fee invoice and extract the real payment hash.
 ///
-/// Attempts to pay the configured development fee for a completed order.
-/// Uses LNURL resolution to get payment invoice, then sends payment via LND.
+/// Performs LNURL resolution to get a BOLT11 invoice, then decodes it
+/// to extract the payment hash. This allows storing the real hash in the
+/// database *before* sending the payment, enabling LN status checks on
+/// timeout or crash recovery.
 ///
 /// # Timeouts
 /// - LNURL resolution: 15 seconds
-/// - send_payment call: 5 seconds
-/// - Payment result wait: 25 seconds
-/// - Total: 45 seconds maximum
 ///
 /// # Returns
-/// - `Ok(String)`: Payment hash on successful payment
-/// - `Err(MostroError)`: Error if payment fails or times out
-pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> {
+/// - `Ok((payment_request, payment_hash_hex))` on success
+/// - `Err(MostroError)` if resolution or decoding fails
+pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), MostroError> {
     info!(
-        "Initiating dev fee payment for order {} - amount: {} sats to {}",
+        "Resolving dev fee invoice for order {} - amount: {} sats to {}",
         order.id, order.dev_fee, DEV_FEE_LIGHTNING_ADDRESS
     );
 
@@ -577,7 +577,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
 
-    // Step 1: LNURL resolution (15s timeout)
+    // LNURL resolution (15s timeout)
     let payment_request = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, order.dev_fee as u64),
@@ -598,14 +598,53 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         e
     })?;
 
-    // Step 2: Create LND connector
+    // Decode invoice and extract payment hash
+    let invoice = decode_invoice(&payment_request)?;
+    let payment_hash_hex = bytes_to_string(invoice.payment_hash().as_ref());
+
+    info!(
+        "Resolved dev fee invoice for order {} - hash: {}",
+        order.id, payment_hash_hex
+    );
+
+    Ok((payment_request, payment_hash_hex))
+}
+
+/// Send development fee payment via Lightning Network
+///
+/// Sends a pre-resolved invoice payment via LND. The caller must first
+/// call `resolve_dev_fee_invoice` to obtain the payment request and store
+/// the payment hash in the database.
+///
+/// # Timeouts
+/// - send_payment call: 5 seconds
+/// - Payment result wait: 25 seconds
+/// - Total: 30 seconds maximum
+///
+/// # Returns
+/// - `Ok(String)`: Payment hash on successful payment
+/// - `Err(MostroError)`: Error if payment fails or times out
+pub async fn send_dev_fee_payment(
+    order: &Order,
+    payment_request: &str,
+) -> Result<String, MostroError> {
+    info!(
+        "Sending dev fee payment for order {} - amount: {} sats",
+        order.id, order.dev_fee
+    );
+
+    if order.dev_fee <= 0 {
+        return Err(MostroInternalErr(ServiceError::WrongAmountError));
+    }
+
+    // Step 1: Create LND connector
     let mut ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
-    // Step 3: Send payment (5s timeout to prevent hanging)
+    // Step 2: Send payment (5s timeout to prevent hanging)
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        ln_client.send_payment(&payment_request, order.dev_fee, tx),
+        ln_client.send_payment(payment_request, order.dev_fee, tx),
     )
     .await
     .map_err(|_| {
@@ -625,7 +664,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         e
     })?;
 
-    // Step 4: Wait for payment result (25s timeout)
+    // Step 3: Wait for payment result (25s timeout)
     // Loop to receive multiple status messages from LND until terminal status
     let payment_result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
         while let Some(msg) = rx.recv().await {
@@ -671,7 +710,7 @@ pub async fn send_dev_fee_payment(order: &Order) -> Result<String, MostroError> 
         MostroInternalErr(ServiceError::LnPaymentError("result timeout".to_string()))
     })??; // Double ? to unwrap both timeout Result and inner Result
 
-    // Step 5: Log and return the successful payment hash
+    // Step 4: Log and return the successful payment hash
     info!(
         "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
         order.id, order.dev_fee, payment_result

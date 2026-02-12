@@ -1,4 +1,4 @@
-use crate::app::release::{do_payment, send_dev_fee_payment};
+use crate::app::release::{do_payment, resolve_dev_fee_invoice, send_dev_fee_payment};
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
 use crate::db::*;
@@ -640,6 +640,47 @@ async fn job_process_dev_fee_payment() {
                 }
             }
 
+            // Cleanup stale real-hash entries (crash recovery)
+            // These orders have a real payment hash stored before sending, but the
+            // payment may not have completed (e.g. crash between storing hash and
+            // receiving LND confirmation). Check LND for actual status.
+            if let Ok(real_hash_orders) = sqlx::query_as::<_, Order>(
+                "SELECT * FROM orders
+                 WHERE dev_fee_paid = 1
+                   AND dev_fee_payment_hash IS NOT NULL
+                   AND dev_fee_payment_hash NOT LIKE 'PENDING-%'
+                   AND (status = 'settled-hold-invoice' OR status = 'success')",
+            )
+            .fetch_all(&*pool)
+            .await
+            {
+                for mut real_hash_order in real_hash_orders {
+                    let order_id = real_hash_order.id;
+                    match check_dev_fee_payment_status(&real_hash_order, &pool).await {
+                        DevFeePaymentState::Succeeded => {
+                            // Already handled by check_dev_fee_payment_status
+                        }
+                        DevFeePaymentState::Failed => {
+                            info!(
+                                "Stale dev fee payment failed for order {}, resetting for retry",
+                                order_id
+                            );
+                            real_hash_order.dev_fee_paid = false;
+                            real_hash_order.dev_fee_payment_hash = None;
+                            if let Err(e) = real_hash_order.update(&pool).await {
+                                error!(
+                                    "Failed to reset stale failed payment for order {}: {:?}",
+                                    order_id, e
+                                );
+                            }
+                        }
+                        DevFeePaymentState::InFlight | DevFeePaymentState::Unknown => {
+                            // Leave alone - payment may still complete
+                        }
+                    }
+                }
+            }
+
             // Query unpaid orders
             if let Ok(unpaid_orders) = find_unpaid_dev_fees(&pool).await {
                 info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
@@ -682,29 +723,59 @@ async fn job_process_dev_fee_payment() {
                         continue; // Skip payment attempt
                     }
 
-                    // STEP 1: Pre-mark as paid to prevent duplicate attempts
+                    // STEP 1: Resolve invoice and extract real payment hash
                     let order_id = order.id;
-                    info!("Pre-marking order {} as payment pending", order_id);
+                    info!("Resolving dev fee invoice for order {}", order_id);
+
+                    let (payment_request, payment_hash_hex) = match tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        resolve_dev_fee_invoice(&order),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(e)) => {
+                            error!(
+                                "Failed to resolve dev fee invoice for order {}: {:?}",
+                                order_id, e
+                            );
+                            continue; // Skip this order, will retry next cycle
+                        }
+                        Err(_) => {
+                            error!(
+                                "Dev fee invoice resolution timeout (20s) for order {}",
+                                order_id
+                            );
+                            continue; // Skip this order, will retry next cycle
+                        }
+                    };
+
+                    // STEP 2: Store real payment hash before sending
+                    info!(
+                        "Storing payment hash {} for order {}",
+                        payment_hash_hex, order_id
+                    );
                     order.dev_fee_paid = true;
-                    let pending_ts = Utc::now().timestamp() as u64;
-                    order.dev_fee_payment_hash =
-                        Some(format!("PENDING-{}-{}", order_id, pending_ts));
+                    order.dev_fee_payment_hash = Some(payment_hash_hex.clone());
 
                     let mut order = match order.update(&pool).await {
                         Err(e) => {
-                            error!("Failed to pre-mark dev fee for order {}: {:?}", order_id, e);
+                            error!(
+                                "Failed to store payment hash for order {}: {:?}",
+                                order_id, e
+                            );
                             continue; // Skip this order, will retry next cycle
                         }
                         Ok(updated_order) => {
-                            info!("Order {} marked as payment pending", order_id);
+                            info!("Order {} marked with real payment hash", order_id);
                             updated_order
                         }
                     };
 
-                    // STEP 2: Attempt payment (protected from retry by dev_fee_paid = true)
+                    // STEP 3: Send payment with pre-resolved invoice
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(50),
-                        send_dev_fee_payment(&order),
+                        send_dev_fee_payment(&order, &payment_request),
                     )
                     .await
                     {
@@ -712,10 +783,16 @@ async fn job_process_dev_fee_payment() {
                             let order_id = order.id;
                             let dev_fee_amount = order.dev_fee;
 
-                            // STEP 3: Update with actual payment hash
-                            order.dev_fee_payment_hash = Some(payment_hash.clone());
+                            // STEP 4: Verify hash matches, use LND's value as authoritative
+                            if order.dev_fee_payment_hash.as_deref() != Some(&payment_hash) {
+                                warn!(
+                                    "Order {}: LND returned hash '{}' differs from stored hash '{:?}', using LND's value",
+                                    order_id, payment_hash, order.dev_fee_payment_hash
+                                );
+                                order.dev_fee_payment_hash = Some(payment_hash.clone());
+                            }
 
-                            info!("Payment succeeded for order {}, updating hash", order_id);
+                            info!("Payment succeeded for order {}, verifying DB", order_id);
 
                             match order.update(&pool).await {
                                 Err(e) => {
@@ -768,7 +845,7 @@ async fn job_process_dev_fee_payment() {
                             }
                         }
                         Ok(Err(e)) => {
-                            // STEP 4: Payment failed, reset to unpaid for retry
+                            // STEP 5: Payment failed, reset to unpaid for retry
                             let order_id = order.id;
                             error!(
                                 "Dev fee payment failed for order {} - error: {:?}",
@@ -797,7 +874,7 @@ async fn job_process_dev_fee_payment() {
                             }
                         }
                         Err(_) => {
-                            // STEP 5: Timeout — check actual payment status before resetting
+                            // STEP 6: Timeout — check actual payment status before resetting
                             // A timeout does NOT mean the payment failed; it could still be
                             // in-flight or may have succeeded. Blindly resetting would cause
                             // duplicate payments (see #568).

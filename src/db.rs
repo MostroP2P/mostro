@@ -903,7 +903,6 @@ pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, Mostr
           WHERE (status = 'settled-hold-invoice' OR status = 'success')
             AND dev_fee > 0
             AND dev_fee_paid = 0
-            AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash NOT LIKE 'PENDING-%')
         "#,
     )
     .fetch_all(pool)

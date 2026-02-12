@@ -514,9 +514,6 @@ async fn job_update_bitcoin_prices() {
     });
 }
 
-/// Processes unpaid development fees for completed orders
-///
-/// Runs every 60 seconds and attempts to pay dev fees for orders that have:
 /// Parse the unix timestamp from a PENDING marker.
 ///
 /// Marker format: `PENDING-{uuid}-{unix_timestamp}`
@@ -543,6 +540,9 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
     ts_str.parse::<u64>().ok().filter(|&ts| ts > 1_000_000_000)
 }
 
+/// Processes unpaid development fees for completed orders
+///
+/// Runs every 60 seconds and attempts to pay dev fees for orders that have:
 /// - status = 'settled-hold-invoice' OR 'success'
 /// - dev_fee > 0
 /// - dev_fee_paid = false
@@ -565,10 +565,7 @@ async fn job_process_dev_fee_payment() {
             // to determine staleness, rather than taken_at which reflects order creation time.
             // Legacy markers without timestamps are treated as stale for backward compatibility.
             let cleanup_ttl_secs: u64 = 300; // 5 minutes
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_unix = Utc::now().timestamp() as u64;
 
             if let Ok(pending_orders) = sqlx::query_as::<_, Order>(
                 "SELECT * FROM orders
@@ -689,10 +686,7 @@ async fn job_process_dev_fee_payment() {
                     let order_id = order.id;
                     info!("Pre-marking order {} as payment pending", order_id);
                     order.dev_fee_paid = true;
-                    let pending_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let pending_ts = Utc::now().timestamp() as u64;
                     order.dev_fee_payment_hash =
                         Some(format!("PENDING-{}-{}", order_id, pending_ts));
 
@@ -834,7 +828,7 @@ async fn job_process_dev_fee_payment() {
 }
 
 #[cfg(test)]
-mod pending_marker_tests {
+mod tests {
     use super::parse_pending_timestamp;
 
     #[test]

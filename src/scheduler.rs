@@ -556,6 +556,12 @@ async fn job_process_dev_fee_payment() {
     let pool = get_db_pool();
     let interval = 60u64; // Every 60 seconds
 
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client for dev fee payment job");
+    };
+
     tokio::spawn(async move {
         loop {
             info!("Checking for unpaid development fees");
@@ -656,7 +662,7 @@ async fn job_process_dev_fee_payment() {
             {
                 for mut real_hash_order in real_hash_orders {
                     let order_id = real_hash_order.id;
-                    match check_dev_fee_payment_status(&real_hash_order, &pool).await {
+                    match check_dev_fee_payment_status(&real_hash_order, &pool, &mut ln_client).await {
                         DevFeePaymentState::Succeeded => {
                             // Already handled by check_dev_fee_payment_status
                         }
@@ -886,7 +892,7 @@ async fn job_process_dev_fee_payment() {
                             );
 
                             // Try to check the payment status on the LN node
-                            let should_reset = match check_dev_fee_payment_status(&order, &pool)
+                            let should_reset = match check_dev_fee_payment_status(&order, &pool, &mut ln_client)
                                 .await
                             {
                                 DevFeePaymentState::Succeeded => {
@@ -967,8 +973,8 @@ enum DevFeePaymentState {
 async fn check_dev_fee_payment_status(
     order: &Order,
     pool: &sqlx::Pool<sqlx::Sqlite>,
+    ln_client: &mut LndConnector,
 ) -> DevFeePaymentState {
-    use crate::lightning::LndConnector;
     use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 
     // Get the payment hash — if it's a PENDING marker or missing, we can't check
@@ -997,17 +1003,6 @@ async fn check_dev_fee_payment_status(
     };
 
     // Query LND for the payment status
-    let mut ln_client = match LndConnector::new().await {
-        Ok(client) => client,
-        Err(e) => {
-            error!(
-                "Failed to connect to LN node to check payment status: {:?}",
-                e
-            );
-            return DevFeePaymentState::Unknown;
-        }
-    };
-
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         ln_client.check_payment_status(&payment_hash_bytes),

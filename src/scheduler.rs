@@ -871,59 +871,6 @@ async fn job_process_dev_fee_payment() {
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_pending_timestamp;
-
-    #[test]
-    fn test_parse_new_format_with_uuid() {
-        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1707700000";
-        assert_eq!(parse_pending_timestamp(marker), Some(1707700000));
-    }
-
-    #[test]
-    fn test_parse_legacy_format_uuid() {
-        // Legacy format without timestamp → None
-        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(parse_pending_timestamp(marker), None);
-    }
-
-    #[test]
-    fn test_parse_not_pending() {
-        assert_eq!(parse_pending_timestamp("some-random-hash"), None);
-        assert_eq!(parse_pending_timestamp(""), None);
-    }
-
-    #[test]
-    fn test_parse_plain_pending() {
-        assert_eq!(parse_pending_timestamp("PENDING"), None);
-        assert_eq!(parse_pending_timestamp("PENDING-"), None);
-    }
-
-    #[test]
-    fn test_parse_invalid_timestamp() {
-        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-notanumber";
-        assert_eq!(parse_pending_timestamp(marker), None);
-    }
-
-    #[test]
-    fn test_parse_too_small_timestamp() {
-        // Timestamps < 1_000_000_000 (before ~2001) are rejected
-        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-12345";
-        assert_eq!(parse_pending_timestamp(marker), None);
-    }
-
-    #[test]
-    fn test_parse_current_timestamp() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
-        assert_eq!(parse_pending_timestamp(&marker), Some(now));
-    }
-}
-
 /// Possible states of a dev fee payment after checking the LN node.
 enum DevFeePaymentState {
     /// Payment confirmed successful on the LN node.
@@ -1027,5 +974,58 @@ async fn check_dev_fee_payment_status(
             );
             DevFeePaymentState::Unknown
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pending_timestamp;
+
+    #[test]
+    fn test_parse_new_format_with_uuid() {
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1707700000";
+        assert_eq!(parse_pending_timestamp(marker), Some(1707700000));
+    }
+
+    #[test]
+    fn test_parse_legacy_format_uuid() {
+        // Legacy format without timestamp → None
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_not_pending() {
+        assert_eq!(parse_pending_timestamp("some-random-hash"), None);
+        assert_eq!(parse_pending_timestamp(""), None);
+    }
+
+    #[test]
+    fn test_parse_plain_pending() {
+        assert_eq!(parse_pending_timestamp("PENDING"), None);
+        assert_eq!(parse_pending_timestamp("PENDING-"), None);
+    }
+
+    #[test]
+    fn test_parse_invalid_timestamp() {
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-notanumber";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_too_small_timestamp() {
+        // Timestamps < 1_000_000_000 (before ~2001) are rejected
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-12345";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_current_timestamp() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
+        assert_eq!(parse_pending_timestamp(&marker), Some(now));
     }
 }

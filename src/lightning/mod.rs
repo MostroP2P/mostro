@@ -284,18 +284,22 @@ impl LndConnector {
             .into_inner();
 
         // Get the first (current) status update
-        if let Ok(Some(payment)) = stream.message().await {
-            fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status).map_err(
-                |_| {
-                    MostroInternalErr(ServiceError::LnPaymentError(
-                        "Unknown payment status".to_string(),
-                    ))
-                },
+        match stream.message().await {
+            Ok(Some(payment)) => fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(
+                payment.status,
             )
-        } else {
-            Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "No payment status received".to_string(),
-            )))
+            .map_err(|_| {
+                MostroInternalErr(ServiceError::LnPaymentError(
+                    "Unknown payment status".to_string(),
+                ))
+            }),
+            Ok(None) => Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "No payment status received (stream ended)".to_string(),
+            ))),
+            Err(e) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "Failed to get payment status: {}",
+                e
+            )))),
         }
     }
 

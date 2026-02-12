@@ -598,6 +598,13 @@ pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), 
         e
     })?;
 
+    if payment_request.is_empty() {
+        error!(
+            "Dev fee LNURL resolution returned empty invoice for order {} ({} sats)",
+            order.id, order.dev_fee
+        );
+        return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+    }
     // Decode invoice and extract payment hash
     let invoice = decode_invoice(&payment_request)?;
     let payment_hash_hex = bytes_to_string(invoice.payment_hash().as_ref());

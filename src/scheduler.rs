@@ -662,7 +662,9 @@ async fn job_process_dev_fee_payment() {
             {
                 for mut real_hash_order in real_hash_orders {
                     let order_id = real_hash_order.id;
-                    match check_dev_fee_payment_status(&real_hash_order, &pool, &mut ln_client).await {
+                    match check_dev_fee_payment_status(&real_hash_order, &pool, &mut ln_client)
+                        .await
+                    {
                         DevFeePaymentState::Succeeded => {
                             // Already handled by check_dev_fee_payment_status
                         }
@@ -892,8 +894,12 @@ async fn job_process_dev_fee_payment() {
                             );
 
                             // Try to check the payment status on the LN node
-                            let should_reset = match check_dev_fee_payment_status(&order, &pool, &mut ln_client)
-                                .await
+                            let should_reset = match check_dev_fee_payment_status(
+                                &order,
+                                &pool,
+                                &mut ln_client,
+                            )
+                            .await
                             {
                                 DevFeePaymentState::Succeeded => {
                                     info!(

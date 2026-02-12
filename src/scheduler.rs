@@ -14,6 +14,7 @@ use mostro_core::prelude::*;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -555,6 +556,11 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
 async fn job_process_dev_fee_payment() {
     let pool = get_db_pool();
     let interval = 60u64; // Every 60 seconds
+                          // Track orders whose dev fee payment has been confirmed via LN status check.
+                          // This prevents redundant LND queries on every scheduler cycle for orders
+                          // that are already in their final state (paid + real hash). On daemon restart,
+                          // the set is empty so each order gets re-checked once (crash recovery).
+    let mut confirmed_dev_fee_orders: HashSet<uuid::Uuid> = HashSet::new();
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client
@@ -662,11 +668,18 @@ async fn job_process_dev_fee_payment() {
             {
                 for mut real_hash_order in real_hash_orders {
                     let order_id = real_hash_order.id;
+
+                    // Skip orders already confirmed in this daemon session
+                    if confirmed_dev_fee_orders.contains(&order_id) {
+                        continue;
+                    }
+
                     match check_dev_fee_payment_status(&real_hash_order, &pool, &mut ln_client)
                         .await
                     {
                         DevFeePaymentState::Succeeded => {
-                            // Already handled by check_dev_fee_payment_status
+                            // Payment confirmed — remember so we don't re-check
+                            confirmed_dev_fee_orders.insert(order_id);
                         }
                         DevFeePaymentState::Failed => {
                             info!(
@@ -819,6 +832,7 @@ async fn job_process_dev_fee_payment() {
                                         "   Amount: {} sats, Hash: {}",
                                         dev_fee_amount, payment_hash
                                     );
+                                    confirmed_dev_fee_orders.insert(order_id);
 
                                     // Verify update
                                     if let Ok(verified_order) = sqlx::query_as::<_, Order>(

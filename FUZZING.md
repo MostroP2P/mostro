@@ -81,7 +81,7 @@ cargo +nightly fuzz tmin fuzz_message_deser fuzz/artifacts/fuzz_message_deser/cr
 
 1. Create a new file in `fuzz/fuzz_targets/`
 2. Add a `[[bin]]` entry in `fuzz/Cargo.toml`
-3. Add seed corpus files in `fuzz/corpus/<target_name>/`
+3. Add seed corpus files in `fuzz/seeds/<target_name>/`
 
 Template:
 

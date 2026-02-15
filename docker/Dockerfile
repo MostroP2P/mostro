@@ -34,8 +34,10 @@ COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
 
 WORKDIR /home/mostrouser
 
-# Copy settings and empty database
-COPY ./docker/settings.docker.toml ./docker/empty.mostro.db ./
+# Default config for start.sh to copy into /config when missing (DB created at startup)
+RUN mkdir -p /mostro
+COPY ./settings.tpl.toml /mostro/settings.toml
+RUN chown -R mostrouser:mostrouser /mostro
 
 # Copy start script
 COPY ./docker/start.sh ./start.sh

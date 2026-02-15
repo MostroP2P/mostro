@@ -403,8 +403,7 @@ cd mostro
 
 # Setup configuration
 mkdir -p docker/config
-cp docker/settings.docker.toml docker/config/settings.toml
-cp docker/empty.mostro.db docker/config/mostro.db
+cp settings.tpl.toml docker/config/settings.toml
 # Edit docker/config/settings.toml
 
 # Configure LND paths in docker/.env

@@ -13,8 +13,9 @@ You need to have a LND node running locally. We recommend using [Polar](https://
 The `compose.yml` sets up the following services:
 
 - `mostro`: the MostroP2P service (standard build using `docker/Dockerfile`)
-- `mostro-startos`: the MostroP2P service with StartOS features (using `docker/dockerfile-startos`)
 - `nostr-relay`: the Nostr relay
+
+StartOS users: install Mostro from the StartOS marketplace (one-click).
 
 ## Building and Running the Docker Container
 
@@ -32,8 +33,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
    ```sh
    mkdir docker/config
-   cp docker/settings.docker.toml docker/config/settings.toml
-   cp docker/empty.mostro.db docker/config/mostro.db
+   cp settings.tpl.toml docker/config/settings.toml
    ```
 
    _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file._
@@ -63,44 +63,99 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-up
    ```
 
-## Building and Running with StartOS Features
+## Running the plain image from Docker Hub
 
-For StartOS-specific builds with enhanced features:
+You can run the plain Mostro image without building locally. Use a single **config directory** on the host and mount it at `/config` in the container. Paths in `settings.toml` are **inside the container**, so use `/config/...` for certs, macaroon, and database.
 
-### Local Development (StartOS)
-
-1. Build the StartOS version locally:
+1. Create a config directory and copy the template:
 
    ```sh
-   make docker-build-startos
+   mkdir -p ~/mostro-config/lnd
+   cp settings.tpl.toml ~/mostro-config/settings.toml
    ```
 
-2. Run the StartOS service:
+2. Copy your LND TLS cert and macaroon into the config dir (so they appear at `/config/lnd/` in the container):
 
    ```sh
-   cd docker && docker compose up mostro-startos
+   cp /path/to/your/tls.cert ~/mostro-config/lnd/tls.cert
+   cp /path/to/your/admin.macaroon ~/mostro-config/lnd/admin.macaroon
    ```
 
-### Production Deployment (Docker Hub)
+3. Edit `~/mostro-config/settings.toml`: set `nsec_privkey`, `relays`, and for Docker set `lnd_cert_file` / `lnd_macaroon_file` to `/config/lnd/...`, `lnd_grpc_host` (e.g. `https://host.docker.internal:10001`), and `[database]` `url = "sqlite:///config/mostro.db"`.
 
-To build and push the StartOS version to Docker Hub:
+4. Run the container. On Linux, add `--add-host=host.docker.internal:host-gateway` so the container can reach LND on the host:
 
-```sh
-make docker-startos
-```
+   ```sh
+   docker run -d --name mostro \
+     --add-host=host.docker.internal:host-gateway \
+     -v ~/mostro-config:/config \
+     mostrop2p/mostro:latest
+   ```
 
-This command will:
+   If you use an empty config dir, the entrypoint will copy default `settings.toml` from the image into `/config` on first run; Mostro creates `mostro.db` at startup. Then edit the copied file and restart.
 
-- Extract the version from `Cargo.toml` (currently 0.14.0)
-- Build using `docker/dockerfile-startos` with `--features startos`
-- Tag as `mostrop2p/mostro:VERSION`
-- Push directly to Docker Hub with `linux/amd64` platform
+5. Check logs: `docker logs -f mostro`.
 
-**Note**: Make sure you're logged in to Docker Hub first:
+## Running plain Mostro on a VPS
 
-```sh
-docker login
-```
+Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker Hub).
+
+1. **Install Docker** on the VPS (e.g. [Docker Engine](https://docs.docker.com/engine/install/)).
+
+2. **Create a config directory** (e.g. `/opt/mostro` or `~/mostro-config`):
+
+   ```sh
+   mkdir -p /opt/mostro/lnd
+   ```
+
+3. **Get the settings template** into that directory as `settings.toml`:
+
+   - Either run the container once with an empty config dir; the entrypoint will copy the default template to `/config/settings.toml`. Stop the container, then edit the file on the host.
+   - Or download the template and copy it:
+
+   ```sh
+   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
+   ```
+
+4. **Put LND files** in the config dir so they appear at `/config/lnd/` in the container:
+
+   ```sh
+   cp /path/to/lnd/tls.cert /opt/mostro/lnd/tls.cert
+   cp /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
+   ```
+
+   (If LND is on another host, you only need the cert and macaroon copied here; point `lnd_grpc_host` at that host in step 5.)
+
+5. **Edit `/opt/mostro/settings.toml`**:
+
+   - `[lightning]`: `lnd_cert_file = '/config/lnd/tls.cert'`, `lnd_macaroon_file = '/config/lnd/admin.macaroon'`, `lnd_grpc_host` = your LND gRPC URL (e.g. `https://host.docker.internal:10009` if LND is on the same VPS, or `https://your-lnd-host:10009` if remote).
+   - `[database]`: `url = "sqlite:///config/mostro.db"`.
+   - `[nostr]`: set `nsec_privkey` and `relays` (e.g. public relays).
+
+6. **Run the container**:
+
+   - If LND is on the **same VPS** (e.g. another container or process), so the container must reach the host:
+
+   ```sh
+   docker run -d --name mostro \
+     --restart unless-stopped \
+     --add-host=host.docker.internal:host-gateway \
+     -v /opt/mostro:/config \
+     mostrop2p/mostro:latest
+   ```
+
+   - If LND is on a **different machine**, omit `--add-host` and use that machine’s hostname or IP in `lnd_grpc_host`:
+
+   ```sh
+   docker run -d --name mostro \
+     --restart unless-stopped \
+     -v /opt/mostro:/config \
+     mostrop2p/mostro:latest
+   ```
+
+7. **Check logs**: `docker logs -f mostro`. Mostro will create `mostro.db` in the config dir on first run.
+
+8. **Optional**: Pin the image to a version, e.g. `mostrop2p/mostro:v0.14.0` instead of `:latest`.
 
 ## Stopping the Docker Container
 
@@ -112,17 +167,10 @@ make docker-down
 
 ## Available Make Commands
 
-### Standard Build Commands
-
 - `make docker-build` - Build the standard mostro service
 - `make docker-up` - Start all services (mostro + nostr-relay)
 - `make docker-down` - Stop all services
 - `make docker-relay-up` - Start only the Nostr relay
-
-### StartOS Build Commands
-
-- `make docker-build-startos` - Build the StartOS version locally
-- `make docker-startos` - Build and push StartOS version to Docker Hub
 
 ## Steps for running just the Nostr relay
 

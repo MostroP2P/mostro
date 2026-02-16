@@ -37,27 +37,43 @@ To build and run the Docker container using Docker Compose, follow these steps:
    cp ../settings.tpl.toml config/settings.toml
    ```
 
-   _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file._
+   _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file. Note that paths in `settings.toml` refer to paths **inside the container**, so use `/config/lnd/tls.cert` and `/config/lnd/admin.macaroon` for the LND certificate and macaroon files (these will be copied there by `make docker-build`)._
 
-3. Build the docker image. You need to provide the `LND_CERT_FILE` and `LND_MACAROON_FILE` environment variables with the paths to your LND TLS certificate and macaroon files. These files will be copied to the `docker/config/lnd` directory by the `make docker-build` command:
+3. Build the docker image. You need to provide the `LND_CERT_FILE` and `LND_MACAROON_FILE` environment variables with the paths to your LND TLS certificate and macaroon files. These files will be copied to the `docker/config/lnd` directory by the `make docker-build` command. The build process will validate that these variables are set and that the files exist before proceeding.
 
+   **Linux/macOS:**
    ```sh
    LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert \
    LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon \
    make docker-build
    ```
 
-   On Windows PowerShell:
+   **Windows PowerShell:**
    ```powershell
    $env:LND_CERT_FILE="C:\Users\YourUser\.polar\networks\1\volumes\lnd\alice\tls.cert"
    $env:LND_MACAROON_FILE="C:\Users\YourUser\.polar\networks\1\volumes\lnd\alice\data\chain\bitcoin\regtest\admin.macaroon"
    make docker-build
    ```
 
-4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set):
+   **Alternative:** You can export the variables for your session:
+   ```sh
+   export LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert
+   export LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon
+   make docker-build
+   ```
+
+   For more details about environment variables, see [ENV_VARIABLES.md](ENV_VARIABLES.md).
+
+4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set). This can be set before running `make docker-up`:
 
    ```sh
    export MOSTRO_RELAY_LOCAL_PORT=7000
+   make docker-up
+   ```
+
+   Or pass it inline:
+   ```sh
+   MOSTRO_RELAY_LOCAL_PORT=7000 make docker-up
    ```
 
 5. Run the docker compose file (the make command automatically runs from the `docker/` directory):
@@ -170,10 +186,13 @@ make docker-down
 
 ## Available Make Commands
 
-- `make docker-build` - Build the standard mostro service
+- `make docker-build` - Build the standard mostro service (requires `LND_CERT_FILE` and `LND_MACAROON_FILE` environment variables)
 - `make docker-up` - Start all services (mostro + nostr-relay)
 - `make docker-down` - Stop all services
 - `make docker-relay-up` - Start only the Nostr relay
+- `make docker-build-startos` - Build the StartOS variant of mostro service
+
+See [ENV_VARIABLES.md](ENV_VARIABLES.md) for details about required environment variables.
 
 ## Steps for running just the Nostr relay
 

@@ -86,12 +86,16 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
 You can run the plain Mostro image without building locally. Use a single **config directory** on the host and mount it at `/config` in the container. Paths in `settings.toml` are **inside the container**, so use `/config/...` for certs, macaroon, and database.
 
-1. Create a config directory and copy the template:
+1. Create a config directory and get the settings template:
+
+   **Option A — download the template** (from the [settings.tpl.toml](https://github.com/MostroP2P/mostro/blob/main/settings.tpl.toml) repo file):
 
    ```sh
    mkdir -p ~/mostro-config/lnd
-   cp settings.tpl.toml ~/mostro-config/settings.toml
+   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
    ```
+
+   **Option B — use the entrypoint default:** run the container once with an empty config dir; the entrypoint copies a default `settings.toml` (from the image, built from `settings.tpl.toml`) into `/config`. Stop the container, edit the file on the host (e.g. `~/mostro-config/settings.toml`), then start the container again.
 
 2. Copy your LND TLS cert and macaroon into the config dir (so they appear at `/config/lnd/` in the container):
 
@@ -100,7 +104,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
    cp /path/to/your/admin.macaroon ~/mostro-config/lnd/admin.macaroon
    ```
 
-3. Edit `~/mostro-config/settings.toml`: set `nsec_privkey`, `relays`, and for Docker set `lnd_cert_file` / `lnd_macaroon_file` to `/config/lnd/...`, `lnd_grpc_host` (e.g. `https://host.docker.internal:10001`), and `[database]` `url = "sqlite:///config/mostro.db"`.
+3. Edit `~/mostro-config/settings.toml`: set `nsec_privkey`, `relays`, and for Docker set `lnd_cert_file` / `lnd_macaroon_file` to `/config/lnd/...`, `lnd_grpc_host` (e.g. `https://host.docker.internal:10009`), and `[database]` `url = "sqlite:///config/mostro.db"`.
 
 4. Run the container. On Linux, add `--add-host=host.docker.internal:host-gateway` so the container can reach LND on the host:
 
@@ -111,7 +115,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
      mostrop2p/mostro:latest
    ```
 
-   If you use an empty config dir, the entrypoint will copy default `settings.toml` from the image into `/config` on first run; Mostro creates `mostro.db` at startup. Then edit the copied file and restart.
+   If you used Option B (empty config dir), edit the copied `settings.toml` and restart. Mostro creates `mostro.db` at startup when missing.
 
 5. Check logs: `docker logs -f mostro`.
 

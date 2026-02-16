@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag (used when run manually; default: latest)'
+        required: false
+        default: 'latest'
 
 jobs:
   build-and-push-plain:
@@ -11,6 +17,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set image tag for metadata
+        id: set_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -30,7 +45,7 @@ jobs:
         with:
           images: mostrop2p/mostro
           tags: |
-            type=ref,event=tag
+            type=raw,value=${{ steps.set_tag.outputs.tag }}
 
       - name: Build and push plain Docker image
         uses: docker/build-push-action@v5
@@ -50,6 +65,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set image tag for metadata
+        id: set_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -68,7 +92,7 @@ jobs:
         with:
           images: mostrop2p/mostro-startos
           tags: |
-            type=ref,event=tag
+            type=raw,value=${{ steps.set_tag.outputs.tag }}
 
       - name: Build and push StartOS Docker image
         uses: docker/build-push-action@v5

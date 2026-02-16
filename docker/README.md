@@ -29,7 +29,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    git clone https://github.com/MostroP2P/mostro.git
    ```
 
-2. Ensure you have the `settings.toml` configuration file and the `mostro.db` SQLite database in a `config` directory (according to the `volumes` section in compose.yml file). The `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. If you don't have those files from a previous installation, then the first time they will be created as follows:
+2. Ensure you have `settings.toml` (and, after running `make docker-build`, the LND cert and macaroon in `config/lnd/`) in a `config` directory. The `compose.yml` `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. On first run you only need `settings.toml`; Mostro creates `mostro.db` automatically. Create the config dir and copy the template as follows:
 
    ```sh
    cd docker

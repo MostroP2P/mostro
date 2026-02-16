@@ -48,5 +48,5 @@ RUN chown -R mostrouser:mostrouser /home/mostrouser
 # Switch to non-root user
 USER mostrouser
 
-# Start mostro (copy settings and database if it's not created yet)
+# Start mostro
 CMD ["./start.sh"]

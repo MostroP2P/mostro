@@ -29,35 +29,38 @@ To build and run the Docker container using Docker Compose, follow these steps:
    git clone https://github.com/MostroP2P/mostro.git
    ```
 
-2. Ensure you have the `settings.toml` configuration file and the `mostro.db` SQLite database in a `config` directory (acording to the `volumes` section in compose.yml file). If you don't have those files from a previous installation, then the first time they will be created as follows:
+2. Ensure you have the `settings.toml` configuration file and the `mostro.db` SQLite database in a `config` directory (according to the `volumes` section in compose.yml file). The `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. If you don't have those files from a previous installation, then the first time they will be created as follows:
 
    ```sh
-   mkdir docker/config
-   cp settings.tpl.toml docker/config/settings.toml
+   cd docker
+   mkdir -p config
+   cp ../settings.tpl.toml config/settings.toml
    ```
 
    _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file._
 
-3. Set the `LND_CERT_FILE` and `LND_MACAROON_FILE` to the paths of the LND TLS certificate and macaroon files on the `docker/.env` file. These files will be copied to the `docker/config/lnd` directory. For example:
+3. Build the docker image. You need to provide the `LND_CERT_FILE` and `LND_MACAROON_FILE` environment variables with the paths to your LND TLS certificate and macaroon files. These files will be copied to the `docker/config/lnd` directory by the `make docker-build` command:
 
    ```sh
-   LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert
-   LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon
-   ```
-
-4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` to the port you want to use for the local relay on the `docker/.env` file. For example:
-
-   ```sh
-   MOSTRO_RELAY_LOCAL_PORT=7000
-   ```
-
-5. Build the docker image:
-
-   ```sh
+   LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert \
+   LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon \
    make docker-build
    ```
 
-6. Run the docker compose file:
+   On Windows PowerShell:
+   ```powershell
+   $env:LND_CERT_FILE="C:\Users\YourUser\.polar\networks\1\volumes\lnd\alice\tls.cert"
+   $env:LND_MACAROON_FILE="C:\Users\YourUser\.polar\networks\1\volumes\lnd\alice\data\chain\bitcoin\regtest\admin.macaroon"
+   make docker-build
+   ```
+
+4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set):
+
+   ```sh
+   export MOSTRO_RELAY_LOCAL_PORT=7000
+   ```
+
+5. Run the docker compose file (the make command automatically runs from the `docker/` directory):
 
    ```sh
    make docker-up

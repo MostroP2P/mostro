@@ -4,11 +4,20 @@ VERSION := $(shell grep "^version = " Cargo.toml | sed "s/version = \"\(.*\)\"/\
 docker-build:
 	@set -o pipefail; \
 	cd docker && \
-	set -a && source .env && set +a && \
 	mkdir -p config/lnd && \
 	echo "Checking LND files..." && \
 	echo "LND_CERT_FILE=$${LND_CERT_FILE}" && \
 	echo "LND_MACAROON_FILE=$${LND_MACAROON_FILE}" && \
+	if [ -z "$${LND_CERT_FILE}" ]; then \
+		echo "Error: LND_CERT_FILE environment variable is not set"; \
+		echo "Usage: LND_CERT_FILE=/path/to/tls.cert LND_MACAROON_FILE=/path/to/admin.macaroon make docker-build"; \
+		exit 1; \
+	fi && \
+	if [ -z "$${LND_MACAROON_FILE}" ]; then \
+		echo "Error: LND_MACAROON_FILE environment variable is not set"; \
+		echo "Usage: LND_CERT_FILE=/path/to/tls.cert LND_MACAROON_FILE=/path/to/admin.macaroon make docker-build"; \
+		exit 1; \
+	fi && \
 	if [ ! -f "$${LND_CERT_FILE}" ]; then \
 		echo "Error: LND cert file not found at: $${LND_CERT_FILE}"; \
 		exit 1; \

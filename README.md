@@ -406,11 +406,9 @@ mkdir -p docker/config
 cp settings.tpl.toml docker/config/settings.toml
 # Edit docker/config/settings.toml
 
-# Configure LND paths in docker/.env
-echo "LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert" >> docker/.env
-echo "LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon" >> docker/.env
-
-# Build and run
+# Build and run (provide LND paths as environment variables)
+LND_CERT_FILE=~/.polar/networks/1/volumes/lnd/alice/tls.cert \
+LND_MACAROON_FILE=~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon \
 make docker-build
 make docker-up
 ```

@@ -1,4 +1,5 @@
 #!/bin/sh
+set -e
 
 # Check if the settings.toml file exists, if not, create a new one
 if [ ! -f /config/settings.toml ]; then

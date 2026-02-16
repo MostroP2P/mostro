@@ -174,7 +174,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
 
 7. **Check logs**: `docker logs -f mostro`. Mostro will create `mostro.db` in the config dir on first run.
 
-8. **Optional**: Pin the image to a version, e.g. `mostrop2p/mostro:v0.14.0` instead of `:latest`.
+8. **Optional**: Pin the image to a version, e.g. `mostrop2p/mostro:v0.16.2` instead of `:latest`.
 
 ## Stopping the Docker Container
 

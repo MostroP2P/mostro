@@ -262,6 +262,47 @@ impl LndConnector {
         Ok(())
     }
 
+    /// Query the current status of a payment by its hash.
+    ///
+    /// Returns the LND `PaymentStatus` if the payment is found, or an error
+    /// if the payment cannot be tracked (e.g., unknown hash).
+    pub async fn check_payment_status(
+        &mut self,
+        payment_hash: &[u8],
+    ) -> Result<fedimint_tonic_lnd::lnrpc::payment::PaymentStatus, MostroError> {
+        let track_req = TrackPaymentRequest {
+            payment_hash: payment_hash.to_vec(),
+            no_inflight_updates: false,
+        };
+
+        let mut stream = self
+            .client
+            .router()
+            .track_payment_v2(track_req)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?
+            .into_inner();
+
+        // Get the first (current) status update
+        match stream.message().await {
+            Ok(Some(payment)) => fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(
+                payment.status,
+            )
+            .map_err(|_| {
+                MostroInternalErr(ServiceError::LnPaymentError(
+                    "Unknown payment status".to_string(),
+                ))
+            }),
+            Ok(None) => Err(MostroInternalErr(ServiceError::LnPaymentError(
+                "No payment status received (stream ended)".to_string(),
+            ))),
+            Err(e) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "Failed to get payment status: {}",
+                e
+            )))),
+        }
+    }
+
     pub async fn get_node_info(&mut self) -> Result<GetInfoResponse, MostroError> {
         let info = self.client.lightning().get_info(GetInfoRequest {}).await;
 

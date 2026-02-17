@@ -1,4 +1,4 @@
-use crate::app::release::{do_payment, send_dev_fee_payment};
+use crate::app::release::{do_payment, resolve_dev_fee_invoice, send_dev_fee_payment};
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
 use crate::db::*;
@@ -12,8 +12,9 @@ use chrono::{TimeDelta, Utc};
 use config::*;
 use mostro_core::prelude::*;
 use nostr_sdk::EventBuilder;
-use nostr_sdk::{Kind as NostrKind, Tag, Timestamp};
+use nostr_sdk::{Kind as NostrKind, Tag};
 use sqlx_crud::Crud;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -514,6 +515,32 @@ async fn job_update_bitcoin_prices() {
     });
 }
 
+/// Parse the unix timestamp from a PENDING marker.
+///
+/// Marker format: `PENDING-{uuid}-{unix_timestamp}`
+/// Legacy format: `PENDING-{uuid}` (no timestamp) → returns `None`
+///
+/// Returns `Some(timestamp)` if a valid unix timestamp is found at the end,
+/// `None` otherwise.
+fn parse_pending_timestamp(marker: &str) -> Option<u64> {
+    let stripped = marker.strip_prefix("PENDING-")?;
+
+    // Expected format: {uuid}-{unix_timestamp}
+    // UUID is exactly 36 chars (8-4-4-4-12 hex digits with dashes).
+    // The timestamp follows after the UUID and a separating dash.
+    if stripped.len() <= 37 {
+        return None;
+    }
+
+    // Verify the 37th char (index 36) is a dash separating UUID from timestamp
+    if stripped.as_bytes().get(36) != Some(&b'-') {
+        return None;
+    }
+
+    let ts_str = &stripped[37..];
+    ts_str.parse::<u64>().ok().filter(|&ts| ts > 1_000_000_000)
+}
+
 /// Processes unpaid development fees for completed orders
 ///
 /// Runs every 60 seconds and attempts to pay dev fees for orders that have:
@@ -529,57 +556,147 @@ async fn job_update_bitcoin_prices() {
 async fn job_process_dev_fee_payment() {
     let pool = get_db_pool();
     let interval = 60u64; // Every 60 seconds
+                          // Track orders whose dev fee payment has been confirmed via LN status check.
+                          // This prevents redundant LND queries on every scheduler cycle for orders
+                          // that are already in their final state (paid + real hash). On daemon restart,
+                          // the set is empty so each order gets re-checked once (crash recovery).
+    let mut confirmed_dev_fee_orders: HashSet<uuid::Uuid> = HashSet::new();
+
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client for dev fee payment job");
+    };
 
     tokio::spawn(async move {
         loop {
             info!("Checking for unpaid development fees");
 
             // Cleanup stale PENDING entries (crash recovery)
-            let cleanup_ttl = 300; // 5 minutes in seconds
-            let cutoff_time = Timestamp::now() - cleanup_ttl;
+            // Uses the timestamp embedded in the PENDING marker (format: PENDING-{uuid}-{unix_ts})
+            // to determine staleness, rather than taken_at which reflects order creation time.
+            // Legacy markers without timestamps are treated as stale for backward compatibility.
+            let cleanup_ttl_secs: u64 = 300; // 5 minutes
+            let now_unix = Utc::now().timestamp() as u64;
 
-            if let Ok(stale_orders) = sqlx::query_as::<_, Order>(
+            if let Ok(pending_orders) = sqlx::query_as::<_, Order>(
                 "SELECT * FROM orders
-                 WHERE dev_fee_payment_hash LIKE 'PENDING-%'
-                   AND taken_at > 0
-                   AND taken_at < ?1",
+                 WHERE dev_fee_payment_hash LIKE 'PENDING-%'",
             )
-            .bind(cutoff_time.as_u64() as i64)
             .fetch_all(&*pool)
             .await
             {
-                if !stale_orders.is_empty() {
+                let mut stale_count = 0u32;
+
+                for mut pending_order in pending_orders {
+                    let order_id = pending_order.id;
+                    let marker = pending_order
+                        .dev_fee_payment_hash
+                        .as_deref()
+                        .unwrap_or_default();
+
+                    // Parse timestamp from marker: PENDING-{uuid}-{unix_ts}
+                    // Legacy format (PENDING-{uuid}) has no timestamp → treat as stale
+                    let pending_ts = parse_pending_timestamp(marker);
+
+                    let is_stale = match pending_ts {
+                        Some(ts) => now_unix.saturating_sub(ts) >= cleanup_ttl_secs,
+                        None => {
+                            // Legacy marker without timestamp — treat as stale
+                            warn!(
+                                "Order {} has legacy PENDING marker without timestamp, treating as stale",
+                                order_id
+                            );
+                            true
+                        }
+                    };
+
+                    if !is_stale {
+                        continue;
+                    }
+
+                    stale_count += 1;
+                    let age_display = pending_ts
+                        .map(|ts| format!("{}s", now_unix.saturating_sub(ts)))
+                        .unwrap_or_else(|| "unknown (legacy)".to_string());
+
                     warn!(
-                        "Found {} stale PENDING dev fee orders (older than {}s), resetting",
-                        stale_orders.len(),
-                        cleanup_ttl
+                        "Resetting stale PENDING order {} (age: {})",
+                        order_id, age_display
                     );
 
-                    for mut stale_order in stale_orders {
-                        let order_id = stale_order.id;
-                        let age_seconds = Timestamp::now().as_u64() - stale_order.taken_at as u64;
+                    pending_order.dev_fee_paid = false;
+                    pending_order.dev_fee_payment_hash = None;
 
-                        warn!(
-                            "Resetting stale PENDING order {} (age: {}s)",
-                            order_id, age_seconds
-                        );
+                    match pending_order.update(&pool).await {
+                        Ok(_) => {
+                            info!(
+                                "✅ Reset stale PENDING for order {}, will retry payment",
+                                order_id
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to reset stale PENDING for order {}: {:?}",
+                                order_id, e
+                            );
+                        }
+                    }
+                }
 
-                        stale_order.dev_fee_paid = false;
-                        stale_order.dev_fee_payment_hash = None;
+                if stale_count > 0 {
+                    warn!(
+                        "Reset {} stale PENDING dev fee orders (TTL: {}s)",
+                        stale_count, cleanup_ttl_secs
+                    );
+                }
+            }
 
-                        match stale_order.update(&pool).await {
-                            Ok(_) => {
-                                info!(
-                                    "✅ Reset stale PENDING for order {}, will retry payment",
-                                    order_id
-                                );
-                            }
-                            Err(e) => {
+            // Cleanup stale real-hash entries (crash recovery)
+            // These orders have a real payment hash stored before sending, but the
+            // payment may not have completed (e.g. crash between storing hash and
+            // receiving LND confirmation). Check LND for actual status.
+            if let Ok(real_hash_orders) = sqlx::query_as::<_, Order>(
+                "SELECT * FROM orders
+                 WHERE dev_fee_paid = 1
+                   AND dev_fee_payment_hash IS NOT NULL
+                   AND dev_fee_payment_hash NOT LIKE 'PENDING-%'
+                   AND (status = 'settled-hold-invoice' OR status = 'success')",
+            )
+            .fetch_all(&*pool)
+            .await
+            {
+                for mut real_hash_order in real_hash_orders {
+                    let order_id = real_hash_order.id;
+
+                    // Skip orders already confirmed in this daemon session
+                    if confirmed_dev_fee_orders.contains(&order_id) {
+                        continue;
+                    }
+
+                    match check_dev_fee_payment_status(&real_hash_order, &pool, &mut ln_client)
+                        .await
+                    {
+                        DevFeePaymentState::Succeeded => {
+                            // Payment confirmed — remember so we don't re-check
+                            confirmed_dev_fee_orders.insert(order_id);
+                        }
+                        DevFeePaymentState::Failed => {
+                            info!(
+                                "Stale dev fee payment failed for order {}, resetting for retry",
+                                order_id
+                            );
+                            real_hash_order.dev_fee_paid = false;
+                            real_hash_order.dev_fee_payment_hash = None;
+                            if let Err(e) = real_hash_order.update(&pool).await {
                                 error!(
-                                    "Failed to reset stale PENDING for order {}: {:?}",
+                                    "Failed to reset stale failed payment for order {}: {:?}",
                                     order_id, e
                                 );
                             }
+                        }
+                        DevFeePaymentState::InFlight | DevFeePaymentState::Unknown => {
+                            // Leave alone - payment may still complete
                         }
                     }
                 }
@@ -591,9 +708,9 @@ async fn job_process_dev_fee_payment() {
 
                 for mut order in unpaid_orders {
                     // GUARD: Detect partial success scenario (payment succeeded but DB update failed)
-                    if order.dev_fee_payment_hash.is_some() {
+                    if let Some(payment_hash) = &order.dev_fee_payment_hash {
                         let order_id = order.id;
-                        let payment_hash = order.dev_fee_payment_hash.as_ref().unwrap().clone();
+                        let payment_hash = payment_hash.clone();
 
                         warn!(
                             "Order {} has payment hash '{}' but dev_fee_paid=false. Recovering from failed DB update.",
@@ -627,27 +744,59 @@ async fn job_process_dev_fee_payment() {
                         continue; // Skip payment attempt
                     }
 
-                    // STEP 1: Pre-mark as paid to prevent duplicate attempts
+                    // STEP 1: Resolve invoice and extract real payment hash
                     let order_id = order.id;
-                    info!("Pre-marking order {} as payment pending", order_id);
+                    info!("Resolving dev fee invoice for order {}", order_id);
+
+                    let (payment_request, payment_hash_hex) = match tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        resolve_dev_fee_invoice(&order),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(e)) => {
+                            error!(
+                                "Failed to resolve dev fee invoice for order {}: {:?}",
+                                order_id, e
+                            );
+                            continue; // Skip this order, will retry next cycle
+                        }
+                        Err(_) => {
+                            error!(
+                                "Dev fee invoice resolution timeout (20s) for order {}",
+                                order_id
+                            );
+                            continue; // Skip this order, will retry next cycle
+                        }
+                    };
+
+                    // STEP 2: Store real payment hash before sending
+                    info!(
+                        "Storing payment hash {} for order {}",
+                        payment_hash_hex, order_id
+                    );
                     order.dev_fee_paid = true;
-                    order.dev_fee_payment_hash = Some(format!("PENDING-{}", order_id));
+                    order.dev_fee_payment_hash = Some(payment_hash_hex.clone());
 
                     let mut order = match order.update(&pool).await {
                         Err(e) => {
-                            error!("Failed to pre-mark dev fee for order {}: {:?}", order_id, e);
+                            error!(
+                                "Failed to store payment hash for order {}: {:?}",
+                                order_id, e
+                            );
                             continue; // Skip this order, will retry next cycle
                         }
                         Ok(updated_order) => {
-                            info!("Order {} marked as payment pending", order_id);
+                            info!("Order {} marked with real payment hash", order_id);
                             updated_order
                         }
                     };
 
-                    // STEP 2: Attempt payment (protected from retry by dev_fee_paid = true)
+                    // STEP 3: Send payment with pre-resolved invoice
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(50),
-                        send_dev_fee_payment(&order),
+                        send_dev_fee_payment(&order, &payment_request),
                     )
                     .await
                     {
@@ -655,10 +804,16 @@ async fn job_process_dev_fee_payment() {
                             let order_id = order.id;
                             let dev_fee_amount = order.dev_fee;
 
-                            // STEP 3: Update with actual payment hash
-                            order.dev_fee_payment_hash = Some(payment_hash.clone());
+                            // STEP 4: Verify hash matches, use LND's value as authoritative
+                            if order.dev_fee_payment_hash.as_deref() != Some(&payment_hash) {
+                                warn!(
+                                    "Order {}: LND returned hash '{}' differs from stored hash '{:?}', using LND's value",
+                                    order_id, payment_hash, order.dev_fee_payment_hash
+                                );
+                                order.dev_fee_payment_hash = Some(payment_hash.clone());
+                            }
 
-                            info!("Payment succeeded for order {}, updating hash", order_id);
+                            info!("Payment succeeded for order {}, verifying DB", order_id);
 
                             match order.update(&pool).await {
                                 Err(e) => {
@@ -677,6 +832,7 @@ async fn job_process_dev_fee_payment() {
                                         "   Amount: {} sats, Hash: {}",
                                         dev_fee_amount, payment_hash
                                     );
+                                    confirmed_dev_fee_orders.insert(order_id);
 
                                     // Verify update
                                     if let Ok(verified_order) = sqlx::query_as::<_, Order>(
@@ -711,7 +867,7 @@ async fn job_process_dev_fee_payment() {
                             }
                         }
                         Ok(Err(e)) => {
-                            // STEP 4: Payment failed, reset to unpaid for retry
+                            // STEP 5: Payment failed, reset to unpaid for retry
                             let order_id = order.id;
                             error!(
                                 "Dev fee payment failed for order {} - error: {:?}",
@@ -740,29 +896,72 @@ async fn job_process_dev_fee_payment() {
                             }
                         }
                         Err(_) => {
-                            // STEP 5: Timeout, reset to unpaid for retry
+                            // STEP 6: Timeout — check actual payment status before resetting
+                            // A timeout does NOT mean the payment failed; it could still be
+                            // in-flight or may have succeeded. Blindly resetting would cause
+                            // duplicate payments (see #568).
                             let order_id = order.id;
                             let dev_fee = order.dev_fee;
-                            error!(
-                                "Dev fee payment timeout (50s) for order {} ({} sats)",
+                            warn!(
+                                "Dev fee payment timeout (50s) for order {} ({} sats), checking LN status",
                                 order_id, dev_fee
                             );
 
-                            order.dev_fee_paid = false;
-                            order.dev_fee_payment_hash = None;
-
-                            match order.update(&pool).await {
-                                Err(e) => {
-                                    error!(
-                                        "Failed to reset after timeout for order {}: {:?}",
-                                        order_id, e
-                                    );
-                                }
-                                Ok(_) => {
+                            // Try to check the payment status on the LN node
+                            let should_reset = match check_dev_fee_payment_status(
+                                &order,
+                                &pool,
+                                &mut ln_client,
+                            )
+                            .await
+                            {
+                                DevFeePaymentState::Succeeded => {
                                     info!(
-                                        "Reset order {} to unpaid after timeout, will retry",
+                                        "Payment actually succeeded for order {} despite timeout",
                                         order_id
                                     );
+                                    false // Don't reset — already handled
+                                }
+                                DevFeePaymentState::InFlight => {
+                                    warn!(
+                                        "Payment still in-flight for order {}, skipping reset",
+                                        order_id
+                                    );
+                                    false // Don't reset — payment may still complete
+                                }
+                                DevFeePaymentState::Failed => {
+                                    info!(
+                                        "Payment definitively failed for order {}, safe to retry",
+                                        order_id
+                                    );
+                                    true // Safe to reset and retry
+                                }
+                                DevFeePaymentState::Unknown => {
+                                    warn!(
+                                        "Cannot determine payment status for order {}, skipping reset to avoid duplicate",
+                                        order_id
+                                    );
+                                    false // Err on the side of caution
+                                }
+                            };
+
+                            if should_reset {
+                                order.dev_fee_paid = false;
+                                order.dev_fee_payment_hash = None;
+
+                                match order.update(&pool).await {
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to reset after timeout for order {}: {:?}",
+                                            order_id, e
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        info!(
+                                            "Reset order {} to unpaid after confirmed failure, will retry",
+                                            order_id
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -773,4 +972,152 @@ async fn job_process_dev_fee_payment() {
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
+}
+
+/// Possible states of a dev fee payment after checking the LN node.
+enum DevFeePaymentState {
+    /// Payment confirmed successful on the LN node.
+    Succeeded,
+    /// Payment is still in-flight on the LN network.
+    InFlight,
+    /// Payment definitively failed — safe to retry.
+    Failed,
+    /// Could not determine status (LN node unreachable, unknown hash, etc.)
+    Unknown,
+}
+
+/// Check the actual payment status on the LN node for a dev fee payment.
+///
+/// If the payment succeeded, marks the order as paid in the DB.
+/// Returns the current payment state so the caller can decide whether to reset.
+async fn check_dev_fee_payment_status(
+    order: &Order,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    ln_client: &mut LndConnector,
+) -> DevFeePaymentState {
+    use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
+
+    // Get the payment hash — if it's a PENDING marker or missing, we can't check
+    let payment_hash_str = match &order.dev_fee_payment_hash {
+        Some(h) if !h.starts_with("PENDING-") => h.clone(),
+        _ => {
+            warn!(
+                "Order {} has no trackable payment hash, cannot verify LN status",
+                order.id
+            );
+            return DevFeePaymentState::Unknown;
+        }
+    };
+
+    // Decode hex hash to bytes
+    use nostr_sdk::nostr::hashes::hex::FromHex;
+    let payment_hash_bytes: Vec<u8> = match FromHex::from_hex(&payment_hash_str) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(
+                "Failed to decode payment hash '{}' for order {}: {}",
+                payment_hash_str, order.id, e
+            );
+            return DevFeePaymentState::Unknown;
+        }
+    };
+
+    // Query LND for the payment status
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ln_client.check_payment_status(&payment_hash_bytes),
+    )
+    .await
+    {
+        Ok(Ok(status)) => match status {
+            PaymentStatus::Succeeded => {
+                // Payment actually went through — update DB
+                let order_id = order.id;
+                let mut order = order.clone();
+                order.dev_fee_paid = true;
+                if let Err(e) = order.update(pool).await {
+                    error!(
+                        "Payment succeeded but failed to update DB for order {}: {:?}",
+                        order_id, e
+                    );
+                } else {
+                    info!(
+                        "✅ Order {} dev fee payment confirmed via LN status check",
+                        order_id
+                    );
+                }
+                DevFeePaymentState::Succeeded
+            }
+            PaymentStatus::InFlight => DevFeePaymentState::InFlight,
+            PaymentStatus::Failed => DevFeePaymentState::Failed,
+            _ => DevFeePaymentState::Unknown,
+        },
+        Ok(Err(e)) => {
+            warn!(
+                "LN status check failed for order {} (hash {}): {:?}",
+                order.id, payment_hash_str, e
+            );
+            DevFeePaymentState::Unknown
+        }
+        Err(_) => {
+            warn!(
+                "LN status check timed out for order {} (hash {})",
+                order.id, payment_hash_str
+            );
+            DevFeePaymentState::Unknown
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pending_timestamp;
+
+    #[test]
+    fn test_parse_new_format_with_uuid() {
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1707700000";
+        assert_eq!(parse_pending_timestamp(marker), Some(1707700000));
+    }
+
+    #[test]
+    fn test_parse_legacy_format_uuid() {
+        // Legacy format without timestamp → None
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_not_pending() {
+        assert_eq!(parse_pending_timestamp("some-random-hash"), None);
+        assert_eq!(parse_pending_timestamp(""), None);
+    }
+
+    #[test]
+    fn test_parse_plain_pending() {
+        assert_eq!(parse_pending_timestamp("PENDING"), None);
+        assert_eq!(parse_pending_timestamp("PENDING-"), None);
+    }
+
+    #[test]
+    fn test_parse_invalid_timestamp() {
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-notanumber";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_too_small_timestamp() {
+        // Timestamps < 1_000_000_000 (before ~2001) are rejected
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-12345";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_current_timestamp() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
+        assert_eq!(parse_pending_timestamp(&marker), Some(now));
+    }
 }

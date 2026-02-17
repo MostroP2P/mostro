@@ -37,6 +37,10 @@
 - Squash fixups before review.
 - PRs: link the motivating issue, include `cargo test` output, and call out schema or config changes to ease verification.
 
+## Documentation Guidelines
+- Do not hardcode source code line numbers in documentation (e.g., `src/app/take_buy.rs:11`). Line numbers drift as the codebase evolves, misleading developers. Reference file paths (`src/app/take_buy.rs`) or function names (`fn take_buy_action`) instead, which are far more stable and easily searchable.
+- Add a language specifier to every fenced code block. Static analysis (markdownlint MD040) flags blocks without a language identifier. Example: ` ```flutter test ` instead of bare ` ``` `.
+
 ## Security & Configuration Tips
 - Do not commit populated `settings.toml`. Copy from `settings.tpl.toml` to `~/.mostro/settings.toml` for local runs.
 - Protect LND credentials before `make docker-build`.

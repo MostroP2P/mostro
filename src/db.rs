@@ -1306,14 +1306,16 @@ pub async fn find_user_disputes_by_master_key(
         // Single JOIN query - adapted from your non-encrypted approach
         let sql_query = format!(
             r#"
-            SELECT 
+            SELECT
                 d.id AS dispute_id,
                 d.order_id AS order_id,
                 d.status AS dispute_status,
                 o.master_buyer_pubkey,
                 o.master_seller_pubkey,
                 o.trade_index_buyer,
-                o.trade_index_seller
+                o.trade_index_seller,
+                o.buyer_dispute,
+                o.seller_dispute
             FROM disputes d
             JOIN orders o ON d.order_id = o.id
             WHERE d.status IN ({})
@@ -1353,11 +1355,18 @@ pub async fn find_user_disputes_by_master_key(
             };
 
             if let Some(involved_key) = involved_key {
+                let initiator = match (dispute.buyer_dispute, dispute.seller_dispute) {
+                    (true, false) => Some("buyer".to_string()),
+                    (false, true) => Some("seller".to_string()),
+                    _ => None,
+                };
+
                 matching_disputes.push(RestoredDisputesInfo {
                     dispute_id: dispute.dispute_id,
                     order_id: dispute.order_id,
                     trade_index: involved_key,
                     status: dispute.dispute_status,
+                    initiator,
                 });
             }
             tracing::info!("Time taken to process dispute: {:?}", timer.elapsed());
@@ -1369,17 +1378,22 @@ pub async fn find_user_disputes_by_master_key(
         // by joining with orders table
         let sql_query = format!(
             r#"
-            SELECT 
+            SELECT
                 d.id AS dispute_id,
                 d.order_id AS order_id,
                 COALESCE(
-                    CASE 
+                    CASE
                         WHEN o.master_buyer_pubkey = ? THEN o.trade_index_buyer
                         WHEN o.master_seller_pubkey = ? THEN o.trade_index_seller
                         ELSE 0
                     END, 0
                 ) AS trade_index,
-                d.status AS status
+                d.status AS status,
+                CASE
+                    WHEN o.buyer_dispute = 1 AND o.seller_dispute = 0 THEN 'buyer'
+                    WHEN o.seller_dispute = 1 AND o.buyer_dispute = 0 THEN 'seller'
+                    ELSE NULL
+                END AS initiator
             FROM disputes d
             JOIN orders o ON d.order_id = o.id
             WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)

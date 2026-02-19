@@ -72,25 +72,40 @@ To build and run the Docker container using Docker Compose, follow these steps:
    Or pass it inline:
    ```sh
    MOSTRO_RELAY_LOCAL_PORT=7000 make docker-up
-
-5. [Optional] Set `MOSTRO_DB_PASSWORD` in `docker/.env` when running in non-interactive mode (`docker compose up -d`):
-
-   > **Important:** Add `docker/.env` to `.gitignore` to prevent accidentally committing sensitive credentials to version control.
-
-   ```dotenv
-   # Use a strong password to enable DB encryption
-   MOSTRO_DB_PASSWORD='Str0ngPassw0rd!'
    ```
 
-   ```dotenv
-   # Or set it to empty to skip DB encryption
+5. Configure `MOSTRO_DB_PASSWORD` for non-interactive startup (`docker compose up -d`):
+
+   - New DB + encryption enabled: set a strong password.
+   - New DB + cleartext DB: set it to empty.
+   - Existing encrypted DB: you must set the same password used when the DB was created.
+   - Existing cleartext DB: keep it empty.
+
+   ```sh
+   # Enable DB encryption
+   MOSTRO_DB_PASSWORD=Str0ngPassw0rd123
+   ```
+
+   ```sh
+   # Disable DB encryption (cleartext DB)
    MOSTRO_DB_PASSWORD=
    ```
+
+   One-shot override from command line:
+
+   ```sh
+   MOSTRO_DB_PASSWORD=Str0ngPassw0rd123 make docker-up
+   ```
+
+   ```sh
+   MOSTRO_DB_PASSWORD="" make docker-up
+   ```
+
+   For a persistent value, place the same `MOSTRO_DB_PASSWORD=...` line in `docker/.env`.
 
    For more details about environment variables, see [ENV_VARIABLES.md](ENV_VARIABLES.md).
 
 6. Run the docker compose file:
-
 
    ```sh
    make docker-up

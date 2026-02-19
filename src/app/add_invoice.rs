@@ -87,6 +87,8 @@ pub async fn add_invoice_action(
         // We send a confirmation message to seller
         let mut seller_order = SmallOrder::from(active_order.clone());
         seller_order.amount = active_order.amount.saturating_add(active_order.fee);
+        // Clear buyer_invoice to avoid leaking buyer's payment info to seller
+        seller_order.buyer_invoice = None;
         enqueue_order_msg(
             None,
             Some(active_order.id),

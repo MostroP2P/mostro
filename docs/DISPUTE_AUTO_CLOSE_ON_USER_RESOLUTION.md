@@ -43,7 +43,7 @@ returned to seller):
 **Why `SellerRefunded`?** The hold invoice is canceled, returning sats to the
 seller. This is semantically identical to an admin cancel.
 
-```
+```text
 cancel_action()
   └─ cancel_active_order()
        └─ cancel_cooperative_execution_step_2()
@@ -67,7 +67,7 @@ buyer):
 **Why `Settled`?** The seller voluntarily released the funds, which will go to
 the buyer. This is semantically identical to an admin settle.
 
-```
+```text
 release_action()
   ├─ Settle hold invoice
   ├─ Set order status to SettledHoldInvoice

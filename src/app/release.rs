@@ -243,16 +243,24 @@ pub async fn release_action(
                 ),
             ]);
 
-            if let Ok(event) = new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
-                match get_nostr_client() {
-                    Ok(client) => {
-                        if let Err(e) = client.send_event(&event).await {
-                            error!("Failed to publish dispute close event: {}", e);
+            match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
+                Ok(dispute_event) => {
+                    match get_nostr_client() {
+                        Ok(client) => {
+                            if let Err(e) = client.send_event(&dispute_event).await {
+                                error!("Failed to publish dispute close event: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to get Nostr client for dispute event: {}", e);
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to get Nostr client for dispute event: {}", e);
-                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create dispute close event for dispute {}: {}",
+                        dispute_id, e
+                    );
                 }
             }
         }

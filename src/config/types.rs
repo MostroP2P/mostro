@@ -3,6 +3,29 @@
 use crate::config::MOSTRO_CONFIG;
 use serde::Deserialize;
 
+/// Event expiration configuration settings
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ExpirationSettings {
+    /// Order events (kind 38383) expiration in days
+    pub order_days: Option<u32>,
+    /// Dispute events (kind 38386) expiration in days
+    pub dispute_days: Option<u32>,
+    /// Fee audit events (kind 8383) expiration in days
+    pub fee_audit_days: Option<u32>,
+}
+
+impl ExpirationSettings {
+    /// Get expiration days for a specific event kind
+    pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
+        match kind {
+            38383 => self.order_days.or(Some(30)),    // orders
+            38386 => self.dispute_days.or(Some(90)),  // disputes
+            8383 => self.fee_audit_days.or(Some(365)), // fee audits
+            _ => None, // unknown kinds don't get expiration
+        }
+    }
+}
+
 // / Implement the TryFrom trait for each of the structs in Settings
 // / This allows you to convert from Settings to each of the structs directly.
 macro_rules! impl_try_from_settings {
@@ -165,3 +188,12 @@ impl_try_from_settings!(
     MostroSettings => mostro,
     RpcSettings => rpc
 );
+
+// Manual implementation for ExpirationSettings since it's optional
+impl TryFrom<super::Settings> for ExpirationSettings {
+    type Error = mostro_core::error::MostroError;
+
+    fn try_from(_: super::Settings) -> Result<Self, Self::Error> {
+        Ok(MOSTRO_CONFIG.get().unwrap().expiration.clone().unwrap_or_default())
+    }
+}

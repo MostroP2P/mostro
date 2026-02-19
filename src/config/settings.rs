@@ -1,6 +1,6 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -18,6 +18,8 @@ pub struct Settings {
     pub lightning: LightningSettings,
     /// RPC configuration settings
     pub rpc: RpcSettings,
+    /// Event expiration configuration settings
+    pub expiration: Option<ExpirationSettings>,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -65,5 +67,10 @@ impl Settings {
     /// This function retrieves the RPC configuration from the global MOSTRO_CONFIG struct.
     pub fn get_rpc() -> &'static RpcSettings {
         &MOSTRO_CONFIG.get().expect("No RPC settings found").rpc
+    }
+
+    /// This function retrieves the Expiration configuration from the global MOSTRO_CONFIG struct.
+    pub fn get_expiration() -> Option<&'static ExpirationSettings> {
+        MOSTRO_CONFIG.get().expect("No settings found").expiration.as_ref()
     }
 }

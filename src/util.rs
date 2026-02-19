@@ -219,6 +219,47 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     expire_date
 }
 
+/// Get expiration timestamp for an event kind based on expiration configuration
+/// 
+/// This function calculates the expiration timestamp for different event kinds
+/// using the configured expiration days per kind. Falls back to max_expiration_days
+/// if no expiration configuration is available (backward compatibility).
+///
+/// # Arguments
+///
+/// * `kind` - The event kind (38383 for orders, 38386 for disputes, 8383 for fee audits)
+///
+/// # Returns
+///
+/// * `Some(i64)` - Unix timestamp when the event should expire
+/// * `None` - If the event kind should not have expiration
+///
+/// # Examples
+///
+/// ```
+/// // Get expiration for a dispute event (kind 38386)  
+/// let dispute_expiration = get_expiration_timestamp_for_kind(38386);
+/// ```
+pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
+    let now = Timestamp::now().as_u64() as i64;
+    
+    // Try to get expiration from new configuration first
+    if let Some(exp_config) = Settings::get_expiration() {
+        if let Some(days) = exp_config.get_expiration_for_kind(kind) {
+            return Some(now + Duration::days(days as i64).num_seconds());
+        }
+    }
+    
+    // Fallback to max_expiration_days for backward compatibility (only for known kinds)
+    match kind {
+        38383 | 38386 | 8383 => {
+            let mostro_settings = Settings::get_mostro();
+            Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
+        }
+        _ => None,
+    }
+}
+
 /// Checks whether an order qualifies as a full privacy order and returns corresponding event tags.
 ///
 /// This asynchronous function verifies whether the user associated with the order exists in the database.

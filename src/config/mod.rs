@@ -20,7 +20,7 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use secrecy::SecretString;
 pub use settings::{get_db_pool, init_mostro_settings, Settings};
-pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
+pub use types::{DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings};
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool
 // almost all of them are initialized with OnceLock to ensure they are set only once

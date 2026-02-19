@@ -1,5 +1,6 @@
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
+use crate::util::get_expiration_timestamp_for_kind;
 use crate::LN_STATUS;
 use chrono::Duration;
 use mostro_core::prelude::*;
@@ -17,8 +18,14 @@ fn create_event(
     extra_tags: Tags,
     kind: u16,
 ) -> Result<Event, Error> {
-    let mut tags: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
+    let mut tags: Vec<Tag> = Vec::with_capacity(2 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
+    
+    // Add expiration tag if configured for this kind
+    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(kind) {
+        tags.push(Tag::expiration(Timestamp::from(expiration_timestamp as u64)));
+    }
+    
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 

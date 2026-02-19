@@ -75,6 +75,8 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
 5. [Optional] Set `MOSTRO_DB_PASSWORD` in `docker/.env` when running in non-interactive mode (`docker compose up -d`):
 
+   > **Important:** Add `docker/.env` to `.gitignore` to prevent accidentally committing sensitive credentials to version control.
+
    ```sh
    # Use a strong password to enable DB encryption
    MOSTRO_DB_PASSWORD='Str0ngPassw0rd!'

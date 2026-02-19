@@ -33,16 +33,12 @@ pub async fn orders_action(
     if orders.is_empty() {
         return Err(MostroCantDo(CantDoReason::NotFound));
     }
-    let requester = event.sender.to_string();
     let small_orders = orders
         .into_iter()
         .map(|order| {
-            let is_buyer = order.master_buyer_pubkey.as_deref() == Some(requester.as_str());
             let mut small = SmallOrder::from(order);
-            // Clear buyer_invoice if requester is not the buyer
-            if !is_buyer {
-                small.buyer_invoice = None;
-            }
+            // Clear buyer_invoice to avoid leaking buyer's payment info
+            small.buyer_invoice = None;
             small
         })
         .collect::<Vec<SmallOrder>>();

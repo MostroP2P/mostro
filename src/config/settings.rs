@@ -1,6 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
+    RpcSettings,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -71,6 +72,10 @@ impl Settings {
 
     /// This function retrieves the Expiration configuration from the global MOSTRO_CONFIG struct.
     pub fn get_expiration() -> Option<&'static ExpirationSettings> {
-        MOSTRO_CONFIG.get().expect("No settings found").expiration.as_ref()
+        MOSTRO_CONFIG
+            .get()
+            .expect("No settings found")
+            .expiration
+            .as_ref()
     }
 }

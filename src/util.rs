@@ -220,7 +220,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
 }
 
 /// Get expiration timestamp for an event kind based on expiration configuration
-/// 
+///
 /// This function calculates the expiration timestamp for different event kinds
 /// using the configured expiration days per kind. Falls back to max_expiration_days
 /// if no expiration configuration is available (backward compatibility).
@@ -242,14 +242,14 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
 /// ```
 pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
     let now = Timestamp::now().as_u64() as i64;
-    
+
     // Try to get expiration from new configuration first
     if let Some(exp_config) = Settings::get_expiration() {
         if let Some(days) = exp_config.get_expiration_for_kind(kind) {
             return Some(now + Duration::days(days as i64).num_seconds());
         }
     }
-    
+
     // Fallback to max_expiration_days for backward compatibility (only for known kinds)
     match kind {
         38383 | 38386 | 8383 => {

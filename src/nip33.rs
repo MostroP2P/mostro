@@ -20,12 +20,20 @@ fn create_event(
 ) -> Result<Event, Error> {
     let mut tags: Vec<Tag> = Vec::with_capacity(2 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
-    
-    // Add expiration tag if configured for this kind
-    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(kind) {
-        tags.push(Tag::expiration(Timestamp::from(expiration_timestamp as u64)));
+
+    // Add NIP-40 expiration tag if configured for this kind and not already present in extra_tags
+    let extra_has_expiration = extra_tags.iter().any(|t| {
+        matches!(t.kind(), TagKind::Expiration)
+            || (matches!(t.kind(), TagKind::Custom(ref c) if c == "expiration"))
+    });
+    if !extra_has_expiration {
+        if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(kind) {
+            tags.push(Tag::expiration(Timestamp::from(
+                expiration_timestamp as u64,
+            )));
+        }
     }
-    
+
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 

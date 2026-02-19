@@ -18,10 +18,10 @@ impl ExpirationSettings {
     /// Get expiration days for a specific event kind
     pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
         match kind {
-            38383 => self.order_days.or(Some(30)),    // orders
-            38386 => self.dispute_days.or(Some(90)),  // disputes
+            38383 => self.order_days.or(Some(30)),     // orders
+            38386 => self.dispute_days.or(Some(90)),   // disputes
             8383 => self.fee_audit_days.or(Some(365)), // fee audits
-            _ => None, // unknown kinds don't get expiration
+            _ => None,                                 // unknown kinds don't get expiration
         }
     }
 }
@@ -194,6 +194,11 @@ impl TryFrom<super::Settings> for ExpirationSettings {
     type Error = mostro_core::error::MostroError;
 
     fn try_from(_: super::Settings) -> Result<Self, Self::Error> {
-        Ok(MOSTRO_CONFIG.get().unwrap().expiration.clone().unwrap_or_default())
+        Ok(MOSTRO_CONFIG
+            .get()
+            .unwrap()
+            .expiration
+            .clone()
+            .unwrap_or_default())
     }
 }

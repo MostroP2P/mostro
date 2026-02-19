@@ -16,7 +16,7 @@ use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
 use std::fs::{set_permissions, Permissions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -191,9 +191,33 @@ fn password_instructions(password_requirements: &PasswordRequirements) {
     println!("- At least one special character");
 }
 
-async fn get_user_password() -> Result<(), MostroError> {
+fn load_db_password_from_env() -> bool {
+    if MOSTRO_DB_PASSWORD.get().is_some() {
+        return false;
+    }
+
+    match std::env::var("MOSTRO_DB_PASSWORD") {
+        Ok(password) if password.is_empty() => {
+            tracing::info!("MOSTRO_DB_PASSWORD is empty, DB encryption will be disabled");
+            true
+        }
+        Ok(password) => {
+            let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password));
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+async fn get_user_password(cleartext_requested: bool) -> Result<(), MostroError> {
     // Password requirements settings
     let password_requirements = PasswordRequirements::default();
+
+    if cleartext_requested {
+        tracing::info!("No password encryption will be used for database");
+        return Ok(());
+    }
+
     // If password is already set, check if it's strong enough
     // If not, prompt user to enter a new password
     // password here is set from command line argument --password
@@ -217,6 +241,11 @@ async fn get_user_password() -> Result<(), MostroError> {
             tracing::info!("No password encryption will be used for database");
             return Ok(());
         }
+    }
+
+    if !std::io::stdin().is_terminal() {
+        tracing::info!("Non-interactive startup detected, skipping database encryption prompt");
+        return Ok(());
     }
 
     // New database - need password creation
@@ -483,6 +512,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     let db_url = &db_settings.url;
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
+    let cleartext_requested = load_db_password_from_env();
 
     let conn = if !db_path.exists() {
         //Create new database file
@@ -518,7 +548,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
                         }
 
                         // Get user password
-                        match get_user_password().await {
+                        match get_user_password(cleartext_requested).await {
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::error!("Failed to set up database password: {}", e);
@@ -579,6 +609,13 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         let mut attempts = 0;
 
         if MOSTRO_DB_PASSWORD.get().is_none() {
+            if !std::io::stdin().is_terminal() && get_admin_password(&conn).await?.is_some() {
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    "Encrypted database requires a password in non-interactive mode. Set MOSTRO_DB_PASSWORD or use --password."
+                        .to_string(),
+                )));
+            }
+
             while let Some(argon2_hash) = get_admin_password(&conn).await? {
                 // Database already exists - and yet opened
                 let parsed_hash = PasswordHash::new(&argon2_hash)

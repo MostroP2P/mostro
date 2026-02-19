@@ -583,7 +583,7 @@ pub async fn publish_dev_fee_audit_event(
     let client = get_nostr_client()?;
 
     // Create tags for queryability
-    let tags = Tags::from_list(vec![
+    let mut tag_list = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("order-id")),
             vec![order.id.to_string()],
@@ -609,7 +609,14 @@ pub async fn publish_dev_fee_audit_event(
             TagKind::Custom(Cow::Borrowed("z")),
             vec!["dev-fee-payment".to_string()],
         ),
-    ]);
+    ];
+
+    // Add expiration tag if configured
+    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(DEV_FEE_AUDIT_EVENT_KIND) {
+        tag_list.push(Tag::expiration(Timestamp::from(expiration_timestamp as u64)));
+    }
+
+    let tags = Tags::from_list(tag_list);
 
     // Create and sign event
     let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")

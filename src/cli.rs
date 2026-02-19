@@ -36,7 +36,6 @@ pub struct Cli {
     #[arg(short, long)]
     password: Option<String>,
     /// Set cleartext password for db encryption (no password required)
-    #[cfg(feature = "startos")]
     #[arg(short, long, action = clap::ArgAction::SetTrue)]
     pub cleartext: bool,
 }
@@ -80,7 +79,10 @@ mod tests {
             cleartext: false,
         };
         #[cfg(not(feature = "startos"))]
-        let cli = Cli { dirsettings: None };
+        let cli = Cli {
+            dirsettings: None,
+            cleartext: false,
+        };
         assert!(cli.dirsettings.is_none());
 
         #[cfg(feature = "startos")]
@@ -92,6 +94,7 @@ mod tests {
         #[cfg(not(feature = "startos"))]
         let cli_with_path = Cli {
             dirsettings: Some("/custom/path".to_string()),
+            cleartext: false,
         };
         assert_eq!(cli_with_path.dirsettings.unwrap(), "/custom/path");
     }
@@ -145,7 +148,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "startos")]
     fn test_cli_parsing_cleartext_flag() {
         // Test parsing with cleartext flag (no value required)
         let result = Cli::try_parse_from(["mostro", "-c"]);
@@ -194,6 +196,7 @@ mod tests {
             #[cfg(not(feature = "startos"))]
             let cli = Cli {
                 dirsettings: custom_path.clone(),
+                cleartext: false,
             };
 
             if let Some(path) = cli.dirsettings.as_deref() {
@@ -213,7 +216,10 @@ mod tests {
                 cleartext: false,
             };
             #[cfg(not(feature = "startos"))]
-            let cli = Cli { dirsettings: None };
+            let cli = Cli {
+                dirsettings: None,
+                cleartext: false,
+            };
 
             if cli.dirsettings.is_none() {
                 // This is the expected path for default settings

@@ -50,6 +50,12 @@ docker-relay-up:
 	echo "Starting Nostr relay" && \
 	docker compose up -d nostr-relay
 
+docker-mostro-up:
+	@set -o pipefail; \
+	cd docker && \
+	echo "Starting Mostro service only" && \
+	docker compose up -d mostro
+
 docker-down:
 	@set -o pipefail; \
 	cd docker && \

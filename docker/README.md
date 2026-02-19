@@ -15,6 +15,8 @@ The `compose.yml` sets up the following services:
 - `mostro`: the MostroP2P service (standard build using `docker/Dockerfile`)
 - `nostr-relay`: the Nostr relay
 
+The Mostro service uses `extra_hosts: host.docker.internal:host-gateway` so the container can reach LND (or other services) running on the host. In `settings.toml`, set `lnd_grpc_host` to `https://host.docker.internal:10001` (or your LND port).
+
 StartOS users: install Mostro from the StartOS marketplace (one-click).
 
 ## Building and Running the Docker Container
@@ -29,7 +31,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    git clone https://github.com/MostroP2P/mostro.git
    ```
 
-2. Ensure you have `settings.toml` (and, after running `make docker-build`, the LND cert and macaroon in `config/lnd/`) in a `config` directory. The `compose.yml` `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. On first run you only need `settings.toml`; Mostro creates `mostro.db` automatically. Create the config dir and copy the template as follows:
+2. Ensure you have `settings.toml` (and, after `make docker-build` completes, the LND cert and macaroon will be in `config/lnd/`) in a `config` directory. The `compose.yml` `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. On first run you only need `settings.toml`; Mostro creates `mostro.db` automatically. Create the config dir and copy the template as follows:
 
    ```sh
    cd docker
@@ -82,6 +84,13 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-up
    ```
 
+6. View Mostro logs (optional):
+
+   ```sh
+   cd docker && docker compose logs -f mostro
+   ```
+   Press Ctrl+C to stop following. Use `--tail 50` to see only the last 50 lines.
+
 ## Running the plain image from Docker Hub
 
 You can run the plain Mostro image without building locally. Use a single **config directory** on the host and mount it at `/config` in the container. Paths in `settings.toml` are **inside the container**, so use `/config/...` for certs, macaroon, and database.
@@ -115,7 +124,23 @@ You can run the plain Mostro image without building locally. Use a single **conf
      mostrop2p/mostro:latest
    ```
 
-   If you used Option B (empty config dir), edit the copied `settings.toml` and restart. Mostro creates `mostro.db` at startup when missing.
+   **Optional:** To run without database password encryption (useful for automated deployments), add the `--cleartext` flag:
+
+   ```sh
+   docker run -d --name mostro \
+     --add-host=host.docker.internal:host-gateway \
+     -v ~/mostro-config:/config \
+     mostrop2p/mostro:latest \
+     mostrod -d /config --cleartext
+   ```
+
+   If you used Option B (empty config dir), edit the copied `settings.toml` and restart the container:
+
+   ```sh
+   docker restart mostro
+   ```
+
+   Mostro creates `mostro.db` at startup when missing.
 
 5. Check logs: `docker logs -f mostro`.
 
@@ -176,25 +201,69 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
      mostrop2p/mostro:latest
    ```
 
+   **Optional:** To run without database password encryption, add `--cleartext`:
+
+   ```sh
+   docker run -d --name mostro \
+     --restart unless-stopped \
+     --add-host=host.docker.internal:host-gateway \
+     -v /opt/mostro:/config \
+     mostrop2p/mostro:latest \
+     mostrod -d /config --cleartext
+   ```
+
 7. **Check logs**: `docker logs -f mostro`. Mostro will create `mostro.db` in the config dir on first run.
 
 8. **Optional**: Pin the image to a version, e.g. `mostrop2p/mostro:v0.16.2` instead of `:latest`.
 
 ## Stopping the Docker Container
 
-To stop the Docker container, run:
+**For Docker Compose** (when using `make docker-up`):
 
 ```sh
 make docker-down
+```
+
+**For plain `docker run`** (when running from Docker Hub):
+
+```sh
+docker stop mostro
+docker rm mostro
+```
+
+## Running Mostro without the relay
+
+To run only the Mostro service (no Nostr relay):
+
+```sh
+make docker-mostro-up
+```
+
+Or with docker compose directly:
+
+```sh
+cd docker && docker compose up -d mostro
+```
+
+To view Mostro logs (follow live):
+
+```sh
+cd docker && docker compose logs -f mostro
+```
+
+To see the last 50 lines:
+
+```sh
+cd docker && docker compose logs mostro --tail 50
 ```
 
 ## Available Make Commands
 
 - `make docker-build` - Build the standard mostro service (requires `LND_CERT_FILE` and `LND_MACAROON_FILE` environment variables)
 - `make docker-up` - Start all services (mostro + nostr-relay)
+- `make docker-mostro-up` - Start only the Mostro service (no relay)
 - `make docker-down` - Stop all services
 - `make docker-relay-up` - Start only the Nostr relay
-- `make docker-build-startos` - Build the StartOS variant of mostro service
 
 See [ENV_VARIABLES.md](ENV_VARIABLES.md) for details about required environment variables.
 

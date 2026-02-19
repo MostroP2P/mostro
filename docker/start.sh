@@ -8,4 +8,4 @@ if [ ! -f /config/settings.toml ]; then
 fi
 
 # Run application (Mostro creates mostro.db at startup if missing)
-exec /usr/local/bin/mostrod -d /config
+exec /usr/local/bin/mostrod -d /config --cleartext

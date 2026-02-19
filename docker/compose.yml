@@ -6,6 +6,8 @@ services:
     volumes:
       - ./config:/config  # settings.toml and mostro.db
     platform: linux/amd64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - default
 

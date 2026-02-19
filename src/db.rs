@@ -1,10 +1,8 @@
-#[cfg(feature = "startos")]
 use crate::cli::Cli;
 use crate::config::settings::Settings;
 use crate::config::MOSTRO_DB_PASSWORD;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-#[cfg(feature = "startos")]
 use clap::Parser;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
@@ -210,7 +208,6 @@ async fn get_user_password() -> Result<(), MostroError> {
         }
     }
 
-    #[cfg(feature = "startos")]
     {
         let cli = Cli::parse();
         if cli.cleartext {

@@ -77,21 +77,19 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
    > **Important:** Add `docker/.env` to `.gitignore` to prevent accidentally committing sensitive credentials to version control.
 
-   ```sh
+   ```dotenv
    # Use a strong password to enable DB encryption
    MOSTRO_DB_PASSWORD='Str0ngPassw0rd!'
    ```
 
-   ```sh
+   ```dotenv
    # Or set it to empty to skip DB encryption
    MOSTRO_DB_PASSWORD=
    ```
 
-6. Build the docker image:
-
    For more details about environment variables, see [ENV_VARIABLES.md](ENV_VARIABLES.md).
 
-7. Run the docker compose file:
+6. Run the docker compose file:
 
 
    ```sh

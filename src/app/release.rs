@@ -1,11 +1,11 @@
 use crate::config;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::MOSTRO_DB_PASSWORD;
-use crate::db::{self};
+use crate::db::{self, find_dispute_by_order_id};
 use crate::lightning::invoice::decode_invoice;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
-use crate::nip33::{new_order_event, order_to_tags};
+use crate::nip33::{new_dispute_event, new_order_event, order_to_tags};
 use crate::util::{
     bytes_to_string, enqueue_order_msg, get_keys, get_nostr_client, get_order,
     settle_seller_hold_invoice, update_order_event,
@@ -22,6 +22,7 @@ use rand;
 use rand::rngs::OsRng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
@@ -198,6 +199,64 @@ pub async fn release_action(
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // If there was an active dispute on this order, close it since the seller
+    // released the funds, resolving the situation.
+    if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
+        let dispute_id = dispute.id;
+        dispute.status = DisputeStatus::Settled.to_string();
+        if let Err(e) = dispute.update(pool).await {
+            error!(
+                "Failed to update dispute {} status after release: {}",
+                dispute_id, e
+            );
+        } else {
+            info!(
+                "Dispute {} closed automatically after release of order {}",
+                dispute_id, order.id
+            );
+
+            // Determine who initiated the dispute for the event tag
+            let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+                (true, false) => "seller",
+                (false, true) => "buyer",
+                _ => "unknown",
+            };
+
+            // Publish updated dispute event to Nostr so admin clients see it as resolved
+            let tags = Tags::from_list(vec![
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("s")),
+                    vec![DisputeStatus::Settled.to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("initiator")),
+                    vec![dispute_initiator.to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("y")),
+                    vec!["mostro".to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("z")),
+                    vec!["dispute".to_string()],
+                ),
+            ]);
+
+            if let Ok(event) = new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
+                match get_nostr_client() {
+                    Ok(client) => {
+                        if let Err(e) = client.send_event(&event).await {
+                            error!("Failed to publish dispute close event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to get Nostr client for dispute event: {}", e);
+                    }
+                }
+            }
+        }
+    }
 
     enqueue_order_msg(
         None,

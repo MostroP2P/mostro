@@ -83,7 +83,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
    ```sh
    # Enable DB encryption
-   MOSTRO_DB_PASSWORD=Str0ngPassw0rd123
+   MOSTRO_DB_PASSWORD=YOUR_STRONG_PASSWORD_HERE
    ```
 
    ```sh
@@ -94,7 +94,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    One-shot override from command line:
 
    ```sh
-   MOSTRO_DB_PASSWORD=Str0ngPassw0rd123 make docker-up
+   MOSTRO_DB_PASSWORD="YOUR_STRONG_PASSWORD_HERE" make docker-up
    ```
 
    ```sh

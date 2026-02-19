@@ -51,13 +51,25 @@ To build and run the Docker container using Docker Compose, follow these steps:
    MOSTRO_RELAY_LOCAL_PORT=7000
    ```
 
-5. Build the docker image:
+5. [Optional] Set `MOSTRO_DB_PASSWORD` in `docker/.env` when running in non-interactive mode (`docker compose up -d`):
+
+   ```sh
+   # Use a strong password to enable DB encryption
+   MOSTRO_DB_PASSWORD='Str0ngPassw0rd!'
+   ```
+
+   ```sh
+   # Or set it to empty to skip DB encryption
+   MOSTRO_DB_PASSWORD=
+   ```
+
+6. Build the docker image:
 
    ```sh
    make docker-build
    ```
 
-6. Run the docker compose file:
+7. Run the docker compose file:
 
    ```sh
    make docker-up

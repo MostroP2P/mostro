@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    environment:
+      MOSTRO_DB_PASSWORD: ${MOSTRO_DB_PASSWORD-}
     volumes:
       - ./config:/config  # settings.toml and mostro.db
     platform: linux/amd64
@@ -13,6 +15,8 @@ services:
     build:
       context: ..
       dockerfile: docker/dockerfile-startos
+    environment:
+      MOSTRO_DB_PASSWORD: ${MOSTRO_DB_PASSWORD-}
     platform: linux/amd64
     networks:
       - default

@@ -6,6 +6,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 #[cfg(feature = "startos")]
 use clap::Parser;
+use mostro_core::message::DisputeInitiator;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -1356,8 +1357,8 @@ pub async fn find_user_disputes_by_master_key(
 
             if let Some(involved_key) = involved_key {
                 let initiator = match (dispute.buyer_dispute, dispute.seller_dispute) {
-                    (true, false) => Some("buyer".to_string()),
-                    (false, true) => Some("seller".to_string()),
+                    (true, false) => Some(DisputeInitiator::Buyer),
+                    (false, true) => Some(DisputeInitiator::Seller),
                     _ => None,
                 };
 

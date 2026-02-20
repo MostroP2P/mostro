@@ -1,7 +1,32 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
+use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
 use crate::config::MOSTRO_CONFIG;
+use mostro_core::prelude::*;
 use serde::Deserialize;
+
+/// Event expiration configuration settings
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ExpirationSettings {
+    /// Order events (kind 38383) expiration in days
+    pub order_days: Option<u32>,
+    /// Dispute events (kind 38386) expiration in days
+    pub dispute_days: Option<u32>,
+    /// Fee audit events (kind 8383) expiration in days
+    pub fee_audit_days: Option<u32>,
+}
+
+impl ExpirationSettings {
+    /// Get expiration days for a specific event kind
+    pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
+        match kind {
+            NOSTR_ORDER_EVENT_KIND => self.order_days.or(Some(30)), // orders
+            NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
+            DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
+            _ => None, // unknown kinds don't get expiration
+        }
+    }
+}
 
 // / Implement the TryFrom trait for each of the structs in Settings
 // / This allows you to convert from Settings to each of the structs directly.

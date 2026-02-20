@@ -1,4 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
+use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::config::*;
@@ -217,6 +218,49 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
             + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
     }
     expire_date
+}
+
+/// Get expiration timestamp for an event kind based on expiration configuration
+///
+/// This function calculates the expiration timestamp for different event kinds
+/// using the configured expiration days per kind. Falls back to max_expiration_days
+/// if no expiration configuration is available (backward compatibility).
+///
+/// # Arguments
+///
+/// * `kind` - The event kind (38383 for orders, 38386 for disputes, 8383 for fee audits)
+///
+/// # Returns
+///
+/// * `Some(i64)` - Unix timestamp when the event should expire
+/// * `None` - If the event kind should not have expiration
+///
+/// # Examples
+///
+/// ```
+/// // Get expiration for a dispute event (kind 38386)  
+/// let dispute_expiration = get_expiration_timestamp_for_kind(38386);
+/// ```
+pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
+    let now = Timestamp::now().as_u64() as i64;
+
+    // Try to get expiration from new configuration first
+    if let Some(exp_config) = Settings::get_expiration() {
+        if let Some(days) = exp_config.get_expiration_for_kind(kind) {
+            return Some(now + Duration::days(days as i64).num_seconds());
+        }
+    }
+
+    // Backward-compat fallback for known kinds only.
+    // Keep this list in sync with `ExpirationSettings::get_expiration_for_kind` in `src/config/types.rs`
+    // when adding/removing event kinds.
+    match kind {
+        NOSTR_ORDER_EVENT_KIND | NOSTR_DISPUTE_EVENT_KIND | DEV_FEE_AUDIT_EVENT_KIND => {
+            let mostro_settings = Settings::get_mostro();
+            Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
+        }
+        _ => None,
+    }
 }
 
 /// Checks whether an order qualifies as a full privacy order and returns corresponding event tags.
@@ -529,7 +573,6 @@ pub async fn publish_dev_fee_audit_event(
     order: &Order,
     payment_hash: &str,
 ) -> Result<(), MostroError> {
-    use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
     use std::borrow::Cow;
     let ln_network = match LN_STATUS.get() {
         Some(status) => status.networks.join(","),
@@ -542,7 +585,7 @@ pub async fn publish_dev_fee_audit_event(
     let client = get_nostr_client()?;
 
     // Create tags for queryability
-    let tags = Tags::from_list(vec![
+    let mut tag_list = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("order-id")),
             vec![order.id.to_string()],
@@ -568,7 +611,17 @@ pub async fn publish_dev_fee_audit_event(
             TagKind::Custom(Cow::Borrowed("z")),
             vec!["dev-fee-payment".to_string()],
         ),
-    ]);
+    ];
+
+    // Add expiration tag if configured
+    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(DEV_FEE_AUDIT_EVENT_KIND)
+    {
+        tag_list.push(Tag::expiration(Timestamp::from(
+            expiration_timestamp as u64,
+        )));
+    }
+
+    let tags = Tags::from_list(tag_list);
 
     // Create and sign event
     let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")

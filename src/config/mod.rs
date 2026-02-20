@@ -20,7 +20,9 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use secrecy::SecretString;
 pub use settings::{get_db_pool, init_mostro_settings, Settings};
-pub use types::{DatabaseSettings, LightningSettings, MostroSettings, NostrSettings};
+pub use types::{
+    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
+};
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool
 // almost all of them are initialized with OnceLock to ensure they are set only once
@@ -52,6 +54,8 @@ pub static MESSAGE_QUEUES: LazyLock<MessageQueues> = LazyLock::new(MessageQueues
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
+    use mostro_core::prelude::{NOSTR_DISPUTE_EVENT_KIND, NOSTR_ORDER_EVENT_KIND};
     use serde::Deserialize;
 
     // Fake settings for the test
@@ -89,6 +93,13 @@ mod tests {
                                             max_orders_per_response = 10
                                             dev_fee_percentage = 0.30"#;
 
+    const EXPIRATION_SETTINGS: &str = r#"[expiration]
+                                            order_days = 45
+                                            dispute_days = 120
+                                            fee_audit_days = 400"#;
+
+    const EXPIRATION_SETTINGS_MISSING: &str = "";
+
     // Stub structures for the test
     #[derive(Debug, Deserialize)]
     struct StubSettingsLightning {
@@ -108,6 +119,42 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct StubSettingsMostro {
         mostro: MostroSettings,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct StubSettingsExpiration {
+        expiration: Option<ExpirationSettings>,
+    }
+
+    #[test]
+    fn test_expiration_settings_present() {
+        let parsed: StubSettingsExpiration =
+            toml::from_str(EXPIRATION_SETTINGS).expect("Failed to deserialize");
+        let expiration = parsed.expiration.expect("Expected expiration settings");
+
+        assert_eq!(expiration.order_days, Some(45));
+        assert_eq!(expiration.dispute_days, Some(120));
+        assert_eq!(expiration.fee_audit_days, Some(400));
+    }
+
+    #[test]
+    fn test_expiration_settings_absent() {
+        let parsed: StubSettingsExpiration =
+            toml::from_str(EXPIRATION_SETTINGS_MISSING).expect("Failed to deserialize");
+        let expiration = parsed.expiration.unwrap_or_default();
+
+        assert_eq!(
+            expiration.get_expiration_for_kind(NOSTR_ORDER_EVENT_KIND),
+            Some(30)
+        );
+        assert_eq!(
+            expiration.get_expiration_for_kind(NOSTR_DISPUTE_EVENT_KIND),
+            Some(90)
+        );
+        assert_eq!(
+            expiration.get_expiration_for_kind(DEV_FEE_AUDIT_EVENT_KIND),
+            Some(365)
+        );
     }
 
     #[test]

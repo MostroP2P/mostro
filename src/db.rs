@@ -1359,7 +1359,17 @@ pub async fn find_user_disputes_by_master_key(
                 let initiator = match (dispute.buyer_dispute, dispute.seller_dispute) {
                     (true, false) => Some(DisputeInitiator::Buyer),
                     (false, true) => Some(DisputeInitiator::Seller),
-                    _ => None,
+                    (true, true) => {
+                        tracing::warn!(
+                            dispute_id = %dispute.dispute_id,
+                            order_id = %dispute.order_id,
+                            buyer_dispute = true,
+                            seller_dispute = true,
+                            "Data integrity issue: both buyer_dispute and seller_dispute are true"
+                        );
+                        None
+                    }
+                    (false, false) => None,
                 };
 
                 matching_disputes.push(RestoredDisputesInfo {

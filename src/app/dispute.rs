@@ -282,7 +282,17 @@ pub async fn close_dispute_after_user_resolution(
             let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
                 (true, false) => "seller",
                 (false, true) => "buyer",
-                _ => "unknown",
+                _ => {
+                    tracing::warn!(
+                        "Dispute {} for order {} has inconsistent dispute flags (seller={}, buyer={}); \
+                        publishing initiator as 'unknown'",
+                        dispute_id,
+                        order.id,
+                        order.seller_dispute,
+                        order.buyer_dispute,
+                    );
+                    "unknown"
+                }
             };
 
             // Publish updated dispute event to Nostr so admin clients see it as resolved
@@ -308,6 +318,7 @@ pub async fn close_dispute_after_user_resolution(
             match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
                 Ok(event) => match get_nostr_client() {
                     Ok(client) => {
+                        tracing::info!("Publishing dispute close event: {:#?}", event);
                         if let Err(e) = client.send_event(&event).await {
                             tracing::error!("Failed to publish dispute close event: {}", e);
                         }

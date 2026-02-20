@@ -1,0 +1,78 @@
+[lightning]
+# path to tls.cert file
+lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
+# path to macaroon file
+lnd_macaroon_file = '/home/user/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon'
+# lnd grpc host and port
+lnd_grpc_host = 'https://127.0.0.1:10001'
+# lightning invoices sent by the buyer to Mostro should have at least
+# this expiration time in seconds
+invoice_expiration_window = 3600
+# Hold invoice cltv delta (expiration time in blocks)
+hold_invoice_cltv_delta = 144
+# This is the time that a taker has to pay the invoice (seller) or 
+# to add a new invoice (buyer), in seconds
+hold_invoice_expiration_window = 300
+# Retries for failed payments
+payment_attempts = 3
+# Retries interval for failed payments
+payment_retries_interval = 60
+
+[nostr]
+nsec_privkey = 'nsec1...'
+relays = ['ws://localhost:7000']
+
+[mostro]
+# NIP-01 Kind 0 Metadata (optional)
+# Human-readable name for this Mostro instance
+# name = "Mostro"
+# Short description of this Mostro instance
+# about = "A peer-to-peer Bitcoin trading daemon over the Lightning Network"
+# URL to avatar image (recommended: square, max 128x128px)
+# picture = "https://mostro.network/mostro-avatar.png"
+# Operator website URL
+# website = "https://mostro.network"
+# Mostro Fee
+fee = 0
+# Max routing fee that we want to pay to the network, 0.001 = 0.1%
+max_routing_fee = 0.001
+# Max order amount (sats)
+max_order_amount = 1000000
+# Minimum amount for a payment in satoshis
+min_payment_amount = 100
+# Expiration order hours
+expiration_hours = 24
+# Max expiration days for an order
+max_expiration_days = 15
+# Expiration of pending orders
+expiration_seconds = 900
+# User rate events scheduled time interval
+user_rates_sent_interval_seconds = 3600
+# Relay list event time interval
+publish_relays_interval = 60
+# Requested POW
+pow = 0
+# Publish mostro info interval
+publish_mostro_info_interval = 300
+# Bitcoin price API base URL
+bitcoin_price_api_url = "https://api.yadio.io"
+# Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
+fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
+# Maximum orders per response in orders action
+max_orders_per_response = 10
+# Development sustainability fee
+# Percentage of Mostro fee sent to development fund (0.30 means 30% of the Mostro fee)
+dev_fee_percentage = 0.30
+
+[database]
+url = "sqlite://mostro.db"
+
+[rpc]
+# Enable RPC server for direct admin communication
+enabled = false
+# RPC server listen address
+listen_address = "127.0.0.1"
+# RPC server port
+port = 50051
+# Duration in seconds after which inactive rate-limiter entries are evicted
+# rate_limiter_stale_duration = 3600

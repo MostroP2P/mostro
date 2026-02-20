@@ -35,7 +35,12 @@ pub async fn orders_action(
     }
     let small_orders = orders
         .into_iter()
-        .map(SmallOrder::from)
+        .map(|order| {
+            let mut small = SmallOrder::from(order);
+            // Clear buyer_invoice to avoid leaking buyer's payment info
+            small.buyer_invoice = None;
+            small
+        })
         .collect::<Vec<SmallOrder>>();
     let response_payload = Payload::Orders(small_orders);
     // Enqueue response message

@@ -239,3 +239,91 @@ pub async fn dispute_action(
 
     Ok(())
 }
+
+/// Closes a dispute after users resolve it themselves (cooperative cancel or release).
+///
+/// This is a best-effort operation: if the dispute update or event publishing fails,
+/// errors are logged but not propagated, since the primary order operation has already
+/// succeeded.
+///
+/// # Arguments
+/// * `pool` - Database connection pool
+/// * `order` - The order associated with the dispute
+/// * `new_status` - The new dispute status (e.g., SellerRefunded or Settled)
+/// * `my_keys` - Mostro's keys for signing the dispute event
+/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
+pub async fn close_dispute_after_user_resolution(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    new_status: DisputeStatus,
+    my_keys: &Keys,
+    context: &str,
+) {
+    if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
+        let dispute_id = dispute.id;
+        dispute.status = new_status.to_string();
+
+        if let Err(e) = dispute.update(pool).await {
+            tracing::error!(
+                "Failed to update dispute {} status after {}: {}",
+                dispute_id,
+                context,
+                e
+            );
+        } else {
+            tracing::info!(
+                "Dispute {} closed automatically after {} of order {}",
+                dispute_id,
+                context,
+                order.id
+            );
+
+            // Determine who initiated the dispute for the event tag
+            let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+                (true, false) => "seller",
+                (false, true) => "buyer",
+                _ => "unknown",
+            };
+
+            // Publish updated dispute event to Nostr so admin clients see it as resolved
+            let tags = Tags::from_list(vec![
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("s")),
+                    vec![new_status.to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("initiator")),
+                    vec![dispute_initiator.to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("y")),
+                    vec!["mostro".to_string()],
+                ),
+                Tag::custom(
+                    TagKind::Custom(Cow::Borrowed("z")),
+                    vec!["dispute".to_string()],
+                ),
+            ]);
+
+            match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
+                Ok(event) => match get_nostr_client() {
+                    Ok(client) => {
+                        if let Err(e) = client.send_event(&event).await {
+                            tracing::error!("Failed to publish dispute close event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to get Nostr client for dispute event: {}", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create dispute close event for dispute {}: {}",
+                        dispute_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}

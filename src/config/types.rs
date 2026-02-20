@@ -190,17 +190,3 @@ impl_try_from_settings!(
     MostroSettings => mostro,
     RpcSettings => rpc
 );
-
-// Manual implementation for ExpirationSettings since it's optional
-impl TryFrom<super::Settings> for ExpirationSettings {
-    type Error = mostro_core::error::MostroError;
-
-    fn try_from(_: super::Settings) -> Result<Self, Self::Error> {
-        Ok(MOSTRO_CONFIG
-            .get()
-            .unwrap()
-            .expiration
-            .clone()
-            .unwrap_or_default())
-    }
-}

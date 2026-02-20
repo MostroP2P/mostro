@@ -251,7 +251,9 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
         }
     }
 
-    // Fallback to max_expiration_days for backward compatibility (only for known kinds)
+    // Backward-compat fallback for known kinds only.
+    // Keep this list in sync with `ExpirationSettings::get_expiration_for_kind` in `src/config/types.rs`
+    // when adding/removing event kinds.
     match kind {
         NOSTR_ORDER_EVENT_KIND | NOSTR_DISPUTE_EVENT_KIND | DEV_FEE_AUDIT_EVENT_KIND => {
             let mostro_settings = Settings::get_mostro();

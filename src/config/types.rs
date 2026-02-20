@@ -1,6 +1,8 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
+use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
 use crate::config::MOSTRO_CONFIG;
+use mostro_core::prelude::*;
 use serde::Deserialize;
 
 /// Event expiration configuration settings
@@ -18,10 +20,10 @@ impl ExpirationSettings {
     /// Get expiration days for a specific event kind
     pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
         match kind {
-            38383 => self.order_days.or(Some(30)),     // orders
-            38386 => self.dispute_days.or(Some(90)),   // disputes
-            8383 => self.fee_audit_days.or(Some(365)), // fee audits
-            _ => None,                                 // unknown kinds don't get expiration
+            NOSTR_ORDER_EVENT_KIND => self.order_days.or(Some(30)), // orders
+            NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
+            DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
+            _ => None, // unknown kinds don't get expiration
         }
     }
 }

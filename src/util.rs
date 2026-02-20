@@ -1,4 +1,5 @@
 use crate::bitcoin_price::BitcoinPriceManager;
+use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::MOSTRO_DB_PASSWORD;
 use crate::config::*;
@@ -252,7 +253,7 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
 
     // Fallback to max_expiration_days for backward compatibility (only for known kinds)
     match kind {
-        38383 | 38386 | 8383 => {
+        NOSTR_ORDER_EVENT_KIND | NOSTR_DISPUTE_EVENT_KIND | DEV_FEE_AUDIT_EVENT_KIND => {
             let mostro_settings = Settings::get_mostro();
             Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
         }
@@ -570,7 +571,6 @@ pub async fn publish_dev_fee_audit_event(
     order: &Order,
     payment_hash: &str,
 ) -> Result<(), MostroError> {
-    use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
     use std::borrow::Cow;
     let ln_network = match LN_STATUS.get() {
         Some(status) => status.networks.join(","),

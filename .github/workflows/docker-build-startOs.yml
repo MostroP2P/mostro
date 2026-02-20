@@ -27,6 +27,15 @@ jobs:
             echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check if stable release
+        id: check_stable
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
+            echo "is_stable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -46,7 +55,7 @@ jobs:
           images: mostrop2p/mostro
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
 
       - name: Build and push plain Docker image
         uses: docker/build-push-action@v5
@@ -75,6 +84,15 @@ jobs:
             echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check if stable release
+        id: check_stable
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
+            echo "is_stable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -94,7 +112,7 @@ jobs:
           images: mostrop2p/mostro-startos
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
 
       - name: Build and push StartOS Docker image
         uses: docker/build-push-action@v5

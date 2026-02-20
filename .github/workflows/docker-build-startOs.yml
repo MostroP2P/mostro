@@ -46,6 +46,7 @@ jobs:
           images: mostrop2p/mostro
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
+            type=raw,value=latest
 
       - name: Build and push plain Docker image
         uses: docker/build-push-action@v5
@@ -93,6 +94,7 @@ jobs:
           images: mostrop2p/mostro-startos
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
+            type=raw,value=latest
 
       - name: Build and push StartOS Docker image
         uses: docker/build-push-action@v5

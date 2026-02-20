@@ -612,8 +612,11 @@ pub async fn publish_dev_fee_audit_event(
     ];
 
     // Add expiration tag if configured
-    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(DEV_FEE_AUDIT_EVENT_KIND) {
-        tag_list.push(Tag::expiration(Timestamp::from(expiration_timestamp as u64)));
+    if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(DEV_FEE_AUDIT_EVENT_KIND)
+    {
+        tag_list.push(Tag::expiration(Timestamp::from(
+            expiration_timestamp as u64,
+        )));
     }
 
     let tags = Tags::from_list(tag_list);

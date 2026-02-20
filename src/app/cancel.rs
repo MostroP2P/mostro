@@ -1,15 +1,14 @@
-use crate::db::{edit_pubkeys_order, find_dispute_by_order_id, update_order_to_initial_state};
+use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
-use crate::nip33::new_dispute_event;
-use crate::util::{enqueue_order_msg, get_nostr_client, get_order, update_order_event};
+use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
-use std::borrow::Cow;
 use std::str::FromStr;
-use tracing::{error, info};
+use tracing::info;
 
 /// Reset API-provided quote-derived amounts when republishing an order.
 ///
@@ -115,59 +114,14 @@ async fn cancel_cooperative_execution_step_2(
 
     // If there was an active dispute on this order, close it since the users
     // resolved the situation themselves via cooperative cancellation.
-    if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
-        let dispute_id = dispute.id;
-        dispute.status = DisputeStatus::SellerRefunded.to_string();
-        if let Err(e) = dispute.update(pool).await {
-            error!(
-                "Failed to update dispute {} status after cooperative cancel: {}",
-                dispute_id, e
-            );
-        } else {
-            info!(
-                "Dispute {} closed automatically after cooperative cancel of order {}",
-                dispute_id, order.id
-            );
-
-            // Determine who initiated the dispute for the event tag
-            let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-                (true, false) => "seller",
-                (false, true) => "buyer",
-                _ => "unknown",
-            };
-
-            // Publish updated dispute event to Nostr so admin clients see it as resolved
-            let tags = Tags::from_list(vec![
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("s")),
-                    vec![DisputeStatus::SellerRefunded.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("initiator")),
-                    vec![dispute_initiator.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("y")),
-                    vec!["mostro".to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("z")),
-                    vec!["dispute".to_string()],
-                ),
-            ]);
-
-            if let Ok(event) = new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
-                match get_nostr_client() {
-                    Ok(client) => {
-                        if let Err(e) = client.send_event(&event).await {
-                            error!("Failed to publish dispute close event: {}", e);
-                        }
-                    }
-                    Err(e) => error!("Failed to get Nostr client: {}", e),
-                }
-            }
-        }
-    }
+    close_dispute_after_user_resolution(
+        pool,
+        &order,
+        DisputeStatus::SellerRefunded,
+        my_keys,
+        "cooperative cancel",
+    )
+    .await;
 
     Ok(())
 }

@@ -1,7 +1,8 @@
+use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::MOSTRO_DB_PASSWORD;
-use crate::db::{self};
+use crate::db;
 use crate::lightning::invoice::decode_invoice;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -198,6 +199,17 @@ pub async fn release_action(
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // If there was an active dispute on this order, close it since the seller
+    // released the funds, resolving the situation.
+    close_dispute_after_user_resolution(
+        pool,
+        &order,
+        DisputeStatus::Settled,
+        my_keys,
+        "release",
+    )
+    .await;
 
     enqueue_order_msg(
         None,

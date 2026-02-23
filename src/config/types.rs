@@ -10,6 +10,8 @@ use serde::Deserialize;
 pub struct ExpirationSettings {
     /// Order events (kind 38383) expiration in days
     pub order_days: Option<u32>,
+    /// Rating events (kind 38384) expiration in days
+    pub rating_days: Option<u32>,
     /// Dispute events (kind 38386) expiration in days
     pub dispute_days: Option<u32>,
     /// Fee audit events (kind 8383) expiration in days
@@ -21,6 +23,7 @@ impl ExpirationSettings {
     pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
         match kind {
             NOSTR_ORDER_EVENT_KIND => self.order_days.or(Some(30)), // orders
+            NOSTR_RATING_EVENT_KIND => self.rating_days.or(Some(90)), // ratings
             NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
             DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
             _ => None, // unknown kinds don't get expiration

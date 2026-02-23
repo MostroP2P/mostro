@@ -255,7 +255,10 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
     // Keep this list in sync with `ExpirationSettings::get_expiration_for_kind` in `src/config/types.rs`
     // when adding/removing event kinds.
     match kind {
-        NOSTR_ORDER_EVENT_KIND | NOSTR_DISPUTE_EVENT_KIND | DEV_FEE_AUDIT_EVENT_KIND => {
+        NOSTR_ORDER_EVENT_KIND
+        | NOSTR_RATING_EVENT_KIND
+        | NOSTR_DISPUTE_EVENT_KIND
+        | DEV_FEE_AUDIT_EVENT_KIND => {
             let mostro_settings = Settings::get_mostro();
             Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
         }

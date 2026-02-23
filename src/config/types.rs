@@ -10,6 +10,8 @@ use serde::Deserialize;
 pub struct ExpirationSettings {
     /// Order events (kind 38383) expiration in days
     pub order_days: Option<u32>,
+    /// Rating events (kind 38384) expiration in days
+    pub rating_days: Option<u32>,
     /// Dispute events (kind 38386) expiration in days
     pub dispute_days: Option<u32>,
     /// Fee audit events (kind 8383) expiration in days
@@ -21,10 +23,61 @@ impl ExpirationSettings {
     pub fn get_expiration_for_kind(&self, kind: u16) -> Option<u32> {
         match kind {
             NOSTR_ORDER_EVENT_KIND => self.order_days.or(Some(30)), // orders
+            NOSTR_RATING_EVENT_KIND => self.rating_days.or(Some(90)), // ratings
             NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
             DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
             _ => None, // unknown kinds don't get expiration
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rating_kind_uses_configured_days() {
+        let settings = ExpirationSettings {
+            rating_days: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_RATING_EVENT_KIND),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn rating_kind_falls_back_to_90_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_RATING_EVENT_KIND),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn order_kind_falls_back_to_30_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_ORDER_EVENT_KIND),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn dispute_kind_falls_back_to_90_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_DISPUTE_EVENT_KIND),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn unknown_kind_returns_none() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(settings.get_expiration_for_kind(12345), None);
     }
 }
 

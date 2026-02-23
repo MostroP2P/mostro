@@ -71,6 +71,8 @@ url = "sqlite://mostro.db"
 [expiration]
 # Order events (kind 38383) - trades resolve quickly
 order_days = 30
+# Rating events (kind 38384) - reputation history retention
+rating_days = 90
 # Dispute events (kind 38386) - need longer retention for auditing
 dispute_days = 90
 # Fee audit events (kind 8383) - annual transparency

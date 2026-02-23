@@ -31,6 +31,56 @@ impl ExpirationSettings {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rating_kind_uses_configured_days() {
+        let settings = ExpirationSettings {
+            rating_days: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_RATING_EVENT_KIND),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn rating_kind_falls_back_to_90_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_RATING_EVENT_KIND),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn order_kind_falls_back_to_30_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_ORDER_EVENT_KIND),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn dispute_kind_falls_back_to_90_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(NOSTR_DISPUTE_EVENT_KIND),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn unknown_kind_returns_none() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(settings.get_expiration_for_kind(12345), None);
+    }
+}
+
 // / Implement the TryFrom trait for each of the structs in Settings
 // / This allows you to convert from Settings to each of the structs directly.
 macro_rules! impl_try_from_settings {

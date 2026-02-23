@@ -228,7 +228,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
 ///
 /// # Arguments
 ///
-/// * `kind` - The event kind (38383 for orders, 38386 for disputes, 8383 for fee audits)
+/// * `kind` - The event kind (38383 for orders, 38384 for ratings, 38386 for disputes, 8383 for fee audits)
 ///
 /// # Returns
 ///

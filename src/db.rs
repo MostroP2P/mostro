@@ -903,6 +903,58 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+pub async fn update_failed_payment_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    failed_payment: bool,
+    payment_attempts: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            failed_payment = ?1,
+            payment_attempts = ?2
+            WHERE id = ?3
+        "#,
+        failed_payment,
+        payment_attempts,
+        order_id,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
+pub async fn update_order_status_and_event(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    status: &str,
+    event_id: &str,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            status = ?1,
+            event_id = ?2
+            WHERE id = ?3
+        "#,
+        status,
+        event_id,
+        order_id,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let rows_affected = result.rows_affected();
+
+    Ok(rows_affected > 0)
+}
+
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"

@@ -37,6 +37,8 @@ All Mostro events currently use `NOSTR_ORDER_EVENT_KIND` (kind `38383`) from `mo
 
 All kinds remain in the NIP-33 replaceable event range (30000-39999), ensuring events can be updated by publishing new events with the same `d` tag.
 
+> **Note:** All pubkeys in `d` tags use **hex encoding** (not bech32/npub), consistent with how Nostr events are stored and processed internally. This ensures correct NIP-33 event replacement and relay filtering.
+
 ## Implementation Details
 
 ### Phase 1: Define New Constants in `mostro_core`
@@ -302,7 +304,7 @@ client.send_event(&new_event).await?;
   "kind": 38384,
   "content": "",
   "tags": [
-    ["d", "npub1abc123..."],
+    ["d", "a1b2c3d4e5f6..."],
     ["total_reviews", "42"],
     ["total_rating", "4.8"],
     ["last_rating", "5"],
@@ -321,7 +323,7 @@ client.send_event(&new_event).await?;
   "kind": 38385,
   "content": "",
   "tags": [
-    ["d", "npub1mostro..."],
+    ["d", "a1b2c3d4e5f6..."],
     ["mostro_version", "0.15.6"],
     ["mostro_commit_hash", "abc123"],
     ["max_order_amount", "1000000"],

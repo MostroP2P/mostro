@@ -2,7 +2,6 @@ use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
 use crate::util::get_expiration_timestamp_for_kind;
 use crate::LN_STATUS;
-use chrono::Duration;
 use mostro_core::prelude::*;
 use nostr::event::builder::Error;
 use nostr_sdk::prelude::*;
@@ -350,7 +349,7 @@ pub fn order_to_tags(
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("expiration")),
                 vec![get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
-                    .unwrap_or(order.expires_at + Duration::hours(24).num_seconds())
+                    .expect("expiration is always defined for order events")
                     .to_string()],
             ),
             Tag::custom(

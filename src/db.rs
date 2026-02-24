@@ -909,7 +909,7 @@ pub async fn update_failed_payment_status(
     failed_payment: bool,
     payment_attempts: i64,
 ) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE orders
             SET
@@ -917,10 +917,10 @@ pub async fn update_failed_payment_status(
             payment_attempts = ?2
             WHERE id = ?3
         "#,
-        failed_payment,
-        payment_attempts,
-        order_id,
     )
+    .bind(failed_payment)
+    .bind(payment_attempts)
+    .bind(order_id)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -935,7 +935,7 @@ pub async fn update_order_status_and_event(
     status: &str,
     event_id: &str,
 ) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE orders
             SET
@@ -943,10 +943,10 @@ pub async fn update_order_status_and_event(
             event_id = ?2
             WHERE id = ?3
         "#,
-        status,
-        event_id,
-        order_id,
     )
+    .bind(status)
+    .bind(event_id)
+    .bind(order_id)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

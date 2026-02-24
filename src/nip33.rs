@@ -349,7 +349,9 @@ pub fn order_to_tags(
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("expiration")),
-                vec![(order.expires_at + Duration::hours(24).num_seconds()).to_string()],
+                vec![get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
+                    .unwrap_or(order.expires_at + Duration::hours(24).num_seconds())
+                    .to_string()],
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),

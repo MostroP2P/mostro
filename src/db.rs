@@ -903,6 +903,13 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Targeted update of only `failed_payment` and `payment_attempts` fields.
+///
+/// Uses a partial UPDATE instead of a full struct write to avoid overwriting
+/// unrelated fields (e.g. `dev_fee_paid`) that may have been modified by
+/// concurrent processes.
+///
+/// Returns `true` if the order was found and updated, `false` otherwise.
 pub async fn update_failed_payment_status(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -929,6 +936,13 @@ pub async fn update_failed_payment_status(
     Ok(rows_affected > 0)
 }
 
+/// Targeted update of only `status` and `event_id` fields.
+///
+/// Uses a partial UPDATE instead of a full struct write to avoid overwriting
+/// unrelated fields (e.g. `dev_fee_paid`) that may have been modified by
+/// concurrent processes.
+///
+/// Returns `true` if the order was found and updated, `false` otherwise.
 pub async fn update_order_status_and_event(
     pool: &SqlitePool,
     order_id: Uuid,

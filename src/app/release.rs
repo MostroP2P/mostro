@@ -202,14 +202,8 @@ pub async fn release_action(
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation.
-    close_dispute_after_user_resolution(
-        pool,
-        &order,
-        DisputeStatus::Settled,
-        my_keys,
-        "release",
-    )
-    .await;
+    close_dispute_after_user_resolution(pool, &order, DisputeStatus::Settled, my_keys, "release")
+        .await;
 
     enqueue_order_msg(
         None,

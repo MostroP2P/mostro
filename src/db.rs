@@ -936,12 +936,10 @@ pub async fn update_failed_payment_status(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
-            format!(
-                "Order {} not updated: not found or no longer in settled-hold-invoice status",
-                order_id
-            ),
-        )));
+        return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Order {} not updated: not found or no longer in settled-hold-invoice status",
+            order_id
+        ))));
     }
 
     Ok(())
@@ -980,12 +978,10 @@ pub async fn update_order_status_and_event(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
-            format!(
-                "Order {} not updated: not found or no longer in settled-hold-invoice status",
-                order_id
-            ),
-        )));
+        return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Order {} not updated: not found or no longer in settled-hold-invoice status",
+            order_id
+        ))));
     }
 
     Ok(())
@@ -1761,8 +1757,7 @@ mod tests {
         let order_id = uuid::Uuid::new_v4();
         insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
 
-        let result =
-            super::update_failed_payment_status(&pool, order_id, true, 3).await;
+        let result = super::update_failed_payment_status(&pool, order_id, true, 3).await;
         assert!(result.is_ok());
 
         // Verify fields were updated
@@ -1782,8 +1777,7 @@ mod tests {
         let order_id = uuid::Uuid::new_v4();
         insert_test_order(&pool, order_id, "success", 0).await;
 
-        let result =
-            super::update_failed_payment_status(&pool, order_id, true, 1).await;
+        let result = super::update_failed_payment_status(&pool, order_id, true, 1).await;
         assert!(result.is_err());
     }
 
@@ -1792,8 +1786,7 @@ mod tests {
         let pool = setup_orders_db().await.unwrap();
         let random_id = uuid::Uuid::new_v4();
 
-        let result =
-            super::update_failed_payment_status(&pool, random_id, true, 1).await;
+        let result = super::update_failed_payment_status(&pool, random_id, true, 1).await;
         assert!(result.is_err());
     }
 
@@ -1808,12 +1801,11 @@ mod tests {
             .unwrap();
 
         // dev_fee_paid must remain 1
-        let dev_fee_paid: i64 =
-            sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
-                .bind(order_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let dev_fee_paid: i64 = sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(dev_fee_paid, 1);
     }
 
@@ -1825,10 +1817,8 @@ mod tests {
         let order_id = uuid::Uuid::new_v4();
         insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
 
-        let result = super::update_order_status_and_event(
-            &pool, order_id, "success", "new_event_456",
-        )
-        .await;
+        let result =
+            super::update_order_status_and_event(&pool, order_id, "success", "new_event_456").await;
         assert!(result.is_ok());
 
         // Verify fields were updated
@@ -1848,10 +1838,7 @@ mod tests {
         let order_id = uuid::Uuid::new_v4();
         insert_test_order(&pool, order_id, "success", 0).await;
 
-        let result = super::update_order_status_and_event(
-            &pool, order_id, "success", "evt",
-        )
-        .await;
+        let result = super::update_order_status_and_event(&pool, order_id, "success", "evt").await;
         assert!(result.is_err());
     }
 
@@ -1867,10 +1854,7 @@ mod tests {
             .unwrap();
 
         // Second call fails — status is now 'success', not 'settled-hold-invoice'
-        let result = super::update_order_status_and_event(
-            &pool, order_id, "success", "evt2",
-        )
-        .await;
+        let result = super::update_order_status_and_event(&pool, order_id, "success", "evt2").await;
         assert!(result.is_err());
     }
 
@@ -1884,12 +1868,11 @@ mod tests {
             .await
             .unwrap();
 
-        let dev_fee_paid: i64 =
-            sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
-                .bind(order_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let dev_fee_paid: i64 = sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(dev_fee_paid, 1);
     }
 

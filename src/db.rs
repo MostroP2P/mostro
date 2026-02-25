@@ -1687,7 +1687,7 @@ mod tests {
                 master_buyer_pubkey char(64),
                 seller_pubkey char(64),
                 master_seller_pubkey char(64),
-                status varchar(10) not null,
+                status varchar(50) not null,
                 price_from_api integer not null default 0,
                 premium integer not null,
                 payment_method varchar(500) not null,

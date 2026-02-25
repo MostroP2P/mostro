@@ -903,6 +903,90 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Targeted update of only `failed_payment` and `payment_attempts` fields.
+///
+/// Uses a partial UPDATE instead of a full struct write to avoid overwriting
+/// unrelated fields (e.g. `dev_fee_paid`) that may have been modified by
+/// concurrent processes.
+///
+/// Includes a `status = 'settled-hold-invoice'` guard as an optimistic lock
+/// to prevent writing to orders that have already transitioned to another state.
+///
+/// Returns an error if no rows were updated (order not found or status changed).
+pub async fn update_failed_payment_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    failed_payment: bool,
+    payment_attempts: i64,
+) -> Result<(), MostroError> {
+    let result = sqlx::query(
+        r#"
+            UPDATE orders
+            SET
+            failed_payment = ?1,
+            payment_attempts = ?2
+            WHERE id = ?3 AND status = 'settled-hold-invoice'
+        "#,
+    )
+    .bind(failed_payment)
+    .bind(payment_attempts)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Order {} not updated: not found or no longer in settled-hold-invoice status",
+            order_id
+        ))));
+    }
+
+    Ok(())
+}
+
+/// Targeted update of only `status` and `event_id` fields.
+///
+/// Uses a partial UPDATE instead of a full struct write to avoid overwriting
+/// unrelated fields (e.g. `dev_fee_paid`) that may have been modified by
+/// concurrent processes.
+///
+/// Includes a `status = 'settled-hold-invoice'` guard as an optimistic lock
+/// to prevent writing to orders that have already transitioned to another state.
+///
+/// Returns an error if no rows were updated (order not found or status changed).
+pub async fn update_order_status_and_event(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    status: &str,
+    event_id: &str,
+) -> Result<(), MostroError> {
+    let result = sqlx::query(
+        r#"
+            UPDATE orders
+            SET
+            status = ?1,
+            event_id = ?2
+            WHERE id = ?3 AND status = 'settled-hold-invoice'
+        "#,
+    )
+    .bind(status)
+    .bind(event_id)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Order {} not updated: not found or no longer in settled-hold-invoice status",
+            order_id
+        ))));
+    }
+
+    Ok(())
+}
+
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -1579,6 +1663,217 @@ mod tests {
         .await?;
 
         Ok(pool)
+    }
+
+    /// Create the orders table matching the production schema (base + dev_fee migration)
+    async fn setup_orders_db() -> Result<SqlitePool, Error> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(TEST_DB_URL)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS orders (
+                id char(36) primary key not null,
+                kind varchar(4) not null,
+                event_id char(64) not null,
+                hash char(64),
+                preimage char(64),
+                creator_pubkey char(64),
+                cancel_initiator_pubkey char(64),
+                dispute_initiator_pubkey char(64),
+                buyer_pubkey char(64),
+                master_buyer_pubkey char(64),
+                seller_pubkey char(64),
+                master_seller_pubkey char(64),
+                status varchar(50) not null,
+                price_from_api integer not null default 0,
+                premium integer not null,
+                payment_method varchar(500) not null,
+                amount integer not null,
+                min_amount integer default 0,
+                max_amount integer default 0,
+                buyer_dispute integer not null default 0,
+                seller_dispute integer not null default 0,
+                buyer_cooperativecancel integer not null default 0,
+                seller_cooperativecancel integer not null default 0,
+                fee integer not null default 0,
+                routing_fee integer not null default 0,
+                fiat_code varchar(5) not null,
+                fiat_amount integer not null,
+                buyer_invoice text,
+                range_parent_id char(36),
+                invoice_held_at integer default 0,
+                taken_at integer default 0,
+                created_at integer not null,
+                buyer_sent_rate integer default 0,
+                seller_sent_rate integer default 0,
+                payment_attempts integer default 0,
+                failed_payment integer default 0,
+                expires_at integer not null,
+                trade_index_seller integer default 0,
+                trade_index_buyer integer default 0,
+                next_trade_pubkey char(64),
+                next_trade_index integer default 0,
+                dev_fee integer default 0,
+                dev_fee_paid integer not null default 0,
+                dev_fee_payment_hash char(64)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(pool)
+    }
+
+    /// Insert a minimal test order with the given id, status, and dev_fee_paid value.
+    /// Binds `id` as `Uuid` so storage format matches production queries.
+    async fn insert_test_order(pool: &SqlitePool, id: uuid::Uuid, status: &str, dev_fee_paid: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                failed_payment, payment_attempts, dev_fee_paid)
+            VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, ?3)
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(dev_fee_paid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // -- Tests for update_failed_payment_status --
+
+    #[tokio::test]
+    async fn test_update_failed_payment_status_happy_path() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+
+        let result = super::update_failed_payment_status(&pool, order_id, true, 3).await;
+        assert!(result.is_ok());
+
+        // Verify fields were updated
+        let row: (bool, i64) =
+            sqlx::query_as("SELECT failed_payment, payment_attempts FROM orders WHERE id = ?1")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0);
+        assert_eq!(row.1, 3);
+    }
+
+    #[tokio::test]
+    async fn test_update_failed_payment_status_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 0).await;
+
+        let result = super::update_failed_payment_status(&pool, order_id, true, 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_failed_payment_status_nonexistent_order() {
+        let pool = setup_orders_db().await.unwrap();
+        let random_id = uuid::Uuid::new_v4();
+
+        let result = super::update_failed_payment_status(&pool, random_id, true, 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_failed_payment_status_preserves_dev_fee_paid() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 1).await;
+
+        super::update_failed_payment_status(&pool, order_id, true, 2)
+            .await
+            .unwrap();
+
+        // dev_fee_paid must remain 1
+        let dev_fee_paid: i64 = sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(dev_fee_paid, 1);
+    }
+
+    // -- Tests for update_order_status_and_event --
+
+    #[tokio::test]
+    async fn test_update_order_status_and_event_happy_path() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+
+        let result =
+            super::update_order_status_and_event(&pool, order_id, "success", "new_event_456").await;
+        assert!(result.is_ok());
+
+        // Verify fields were updated
+        let row: (String, String) =
+            sqlx::query_as("SELECT status, event_id FROM orders WHERE id = ?1")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "success");
+        assert_eq!(row.1, "new_event_456");
+    }
+
+    #[tokio::test]
+    async fn test_update_order_status_and_event_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 0).await;
+
+        let result = super::update_order_status_and_event(&pool, order_id, "success", "evt").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_order_status_and_event_not_idempotent() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+
+        // First call succeeds
+        super::update_order_status_and_event(&pool, order_id, "success", "evt1")
+            .await
+            .unwrap();
+
+        // Second call fails — status is now 'success', not 'settled-hold-invoice'
+        let result = super::update_order_status_and_event(&pool, order_id, "success", "evt2").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_order_status_and_event_preserves_dev_fee_paid() {
+        let pool = setup_orders_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 1).await;
+
+        super::update_order_status_and_event(&pool, order_id, "success", "evt")
+            .await
+            .unwrap();
+
+        let dev_fee_paid: i64 = sqlx::query_scalar("SELECT dev_fee_paid FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(dev_fee_paid, 1);
     }
 
     #[tokio::test]

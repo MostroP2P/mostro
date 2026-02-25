@@ -554,8 +554,7 @@ async fn payment_success(
             &order_updated.status,
             &order_updated.event_id,
         )
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        .await?;
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
             request_id,

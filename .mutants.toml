@@ -1,0 +1,53 @@
+# cargo-mutants configuration for Mostro
+# https://mutants.rs/
+
+# Examine only source files (not tests, not generated code)
+examine_globs = [
+    "src/**/*.rs",
+]
+
+# Exclude files/modules that are:
+# - Not critical for financial logic
+# - External interfaces (RPC, CLI)
+# - Configuration loading
+# - Background jobs
+exclude_globs = [
+    "**/target/**",
+    "**/tests/**",
+    "**/examples/**",
+    "src/main.rs",           # Entry point, minimal logic
+    "src/cli.rs",            # CLI argument parsing
+    "src/config/**",         # TOML/settings loading
+    "src/scheduler.rs",      # Background job scheduler
+    "src/bitcoin_price.rs",  # External API calls
+    "src/rpc/**",            # RPC server (external interface)
+    "src/lightning/**",      # LND integration (external interface)
+]
+
+# Timeout for each mutant (seconds)
+# Mostro tests involve SQLite DB operations, so we need generous timeout
+timeout = 600
+
+# Number of parallel jobs
+# Adjust based on CI runner capacity
+jobs = 4
+
+# Output directory for reports
+output_dir = "mutants.out"
+
+# Additional cargo test arguments
+# Use single thread for DB tests to avoid SQLite concurrency issues
+test_tool_options = ["--", "--test-threads=1"]
+
+# Exclude certain mutation patterns that often produce false positives
+# These are patterns that don't change observable behavior
+exclude_re = [
+    # Default implementations are often equivalent when mutated
+    "replace .*::default\\(\\) -> Self with .*::Default::default",
+]
+
+# Don't error on clean (useful for incremental runs)
+# error_on_clean = false
+
+# Cap the number of mutants to test (useful for CI with time limits)
+# max_mutants = 500

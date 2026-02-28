@@ -1,0 +1,180 @@
+name: Mutation Testing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Run full mutation testing weekly on Sundays at 3 AM UTC
+    - cron: '0 3 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Quick mutation testing on PRs (only changed files)
+  mutation-pr:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for --in-diff
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+
+      - name: Run mutation testing on changed files
+        # Only test mutants in files changed in this PR
+        # This gives faster feedback (minutes instead of hours)
+        run: cargo mutants --in-diff origin/${{ github.base_ref }} --output mutants.out
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report-pr
+          path: mutants.out/
+          retention-days: 30
+
+      - name: Comment PR with mutation results
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'mutants.out/outcomes.json';
+            
+            if (!fs.existsSync(path)) {
+              console.log('No mutation outcomes file found');
+              return;
+            }
+            
+            const outcomes = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const total = outcomes.length;
+            const killed = outcomes.filter(o => o.status === 'Success').length;
+            const survived = outcomes.filter(o => o.status === 'Failure').length;
+            const timeout = outcomes.filter(o => o.status === 'Timeout').length;
+            const score = total > 0 ? ((killed / total) * 100).toFixed(1) : 0;
+            
+            const body = `## 🧬 Mutation Testing Results
+            
+            | Metric | Count |
+            |--------|-------|
+            | Total Mutants | ${total} |
+            | ✅ Killed | ${killed} |
+            | ❌ Survived | ${survived} |
+            | ⏱️ Timeout | ${timeout} |
+            | **Score** | **${score}%** |
+            
+            ${survived > 0 ? '⚠️ **Note:** Some mutants survived. Consider improving tests for the changed code.' : '✅ All mutants killed!'}
+            
+            <details>
+            <summary>Surviving Mutants</summary>
+            
+            ${outcomes.filter(o => o.status === 'Failure').map(o => `- \`${o.mutant}\``).join('\n') || 'None'}
+            
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # Full mutation testing on main branch (baseline)
+  mutation-baseline:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+
+      - name: Run full mutation testing
+        # Generate HTML report for baseline
+        run: cargo mutants --html --output mutants.out
+        # Note: Do NOT fail on low score initially (report only mode)
+        continue-on-error: true
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report-baseline
+          path: |
+            mutants.out/
+          retention-days: 90
+
+      - name: Upload HTML report to GitHub Pages
+        if: github.ref == 'refs/heads/main' && always()
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./mutants.out/html
+          destination_dir: mutation-testing
+
+      - name: Generate mutation summary
+        if: always()
+        run: |
+          echo "## Mutation Testing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f mutants.out/outcomes.json ]; then
+            total=$(jq '. | length' mutants.out/outcomes.json)
+            killed=$(jq '[.[] | select(.status == "Success")] | length' mutants.out/outcomes.json)
+            survived=$(jq '[.[] | select(.status == "Failure")] | length' mutants.out/outcomes.json)
+            timeout=$(jq '[.[] | select(.status == "Timeout")] | length' mutants.out/outcomes.json)
+            
+            if [ "$total" -gt 0 ]; then
+              score=$(echo "scale=1; ($killed / $total) * 100" | bc)
+              echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| Total Mutants | $total |" >> $GITHUB_STEP_SUMMARY
+              echo "| ✅ Killed | $killed |" >> $GITHUB_STEP_SUMMARY
+              echo "| ❌ Survived | $survived |" >> $GITHUB_STEP_SUMMARY
+              echo "| ⏱️ Timeout | $timeout |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Mutation Score** | **$score%** |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              if (( $(echo "$score >= 80" | bc -l) )); then
+                echo "✅ **Excellent test quality!**" >> $GITHUB_STEP_SUMMARY
+              elif (( $(echo "$score >= 50" | bc -l) )); then
+                echo "⚠️ **Acceptable test quality, room for improvement.**" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "🔴 **Poor test quality. Consider improving tests.**" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 [View Full Report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/mutation-testing/)" >> $GITHUB_STEP_SUMMARY

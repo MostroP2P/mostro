@@ -33,8 +33,12 @@ print_help() {
 
 check_install() {
     if ! command -v cargo-mutants &> /dev/null; then
-        echo -e "${YELLOW}cargo-mutants not found. Installing...${NC}"
-        cargo install cargo-mutants
+        if cargo --list | grep -q "mutants"; then
+            echo -e "${GREEN}cargo-mutants is installed as a cargo subcommand${NC}"
+        else
+            echo -e "${YELLOW}cargo-mutants not found. Installing...${NC}"
+            cargo install cargo-mutants
+        fi
     fi
 }
 
@@ -49,8 +53,13 @@ run_full() {
 run_quick() {
     check_install
     echo -e "${BLUE}Running mutation testing on changed files only...${NC}"
-    cargo mutants --in-diff HEAD~1
-    echo -e "${GREEN}Done!${NC}"
+    # Check if HEAD~1 exists (may not in shallow clones or initial commit)
+    if git rev-parse HEAD~1 &>/dev/null; then
+        cargo mutants --in-diff HEAD~1
+    else
+        echo -e "${YELLOW}Warning: HEAD~1 not available. Running on HEAD instead.${NC}"
+        cargo mutants
+    fi
 }
 
 run_file() {
@@ -82,22 +91,27 @@ run_report() {
         echo -e "${RED}No mutation output found. Run mutation testing first.${NC}"
         exit 1
     fi
-    
+
     if [ -f "mutants.out/outcomes.json" ]; then
         total=$(jq '. | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
-        killed=$(jq '[.[] | select(.status == "Success")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
-        survived=$(jq '[.[] | select(.status == "Failure")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
-        
+        # cargo-mutants uses 'summary' field with values: Killed, Survived, Timeout, Unviable, MissedMutant, CaughtMutant
+        killed=$(jq '[.[] | select(.summary == "Killed" or .summary == "CaughtMutant")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
+        survived=$(jq '[.[] | select(.summary == "Survived" or .summary == "MissedMutant")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
+        timeout=$(jq '[.[] | select(.summary == "Timeout")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
+        unviable=$(jq '[.[] | select(.summary == "Unviable")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
+
         if [ "$total" -gt 0 ]; then
             score=$(echo "scale=1; ($killed / $total) * 100" | bc)
-            
+
             echo -e "${BLUE}=== Mutation Testing Results ===${NC}"
             echo ""
             echo "Total Mutants: $total"
             echo -e "${GREEN}Killed: $killed${NC}"
             echo -e "${RED}Survived: $survived${NC}"
+            echo -e "${YELLOW}Timeout: $timeout${NC}"
+            echo "Unviable: $unviable"
             echo ""
-            
+
             if (( $(echo "$score >= 80" | bc -l) )); then
                 echo -e "Mutation Score: ${GREEN}$score%${NC} ✅ Excellent"
             elif (( $(echo "$score >= 50" | bc -l) )); then
@@ -107,7 +121,7 @@ run_report() {
             fi
         fi
     fi
-    
+
     if [ -f "mutants.out/html/index.html" ]; then
         echo ""
         echo -e "${BLUE}Full HTML report: mutants.out/html/index.html${NC}"

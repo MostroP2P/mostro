@@ -24,7 +24,7 @@ Mutation testing is a technique to measure the quality and effectiveness of the 
 
 ### Mutation Score
 
-```
+```text
 Score = (Mutants killed / Total mutants) × 100
 ```
 
@@ -175,7 +175,7 @@ Critical modules that should have high mutation scores (>80%):
 
 ### Example Output
 
-```
+```text
 INFO Found 245 mutants to test
 INFO 189 mutants killed (77.1%)
 INFO 56 mutants survived (22.9%)
@@ -187,7 +187,7 @@ INFO Mutation score: 77.1%
 
 Each surviving mutant represents a potential gap in testing:
 
-```
+```text
 INFO src/flow.rs:245:9: replace Order::validate -> bool with true
 ```
 

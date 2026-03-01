@@ -41,7 +41,10 @@ jobs:
       - name: Run mutation testing on changed files
         # Only test mutants in files changed in this PR
         # This gives faster feedback (minutes instead of hours)
-        run: cargo mutants --in-diff origin/${{ github.base_ref }} --output mutants.out
+        run: |
+          # Generate diff file for cargo-mutants
+          git diff origin/${{ github.base_ref }} > changes.diff
+          cargo mutants --in-diff changes.diff --output mutants.out
 
       - name: Upload mutation report
         uses: actions/upload-artifact@v4

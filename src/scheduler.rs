@@ -666,7 +666,7 @@ async fn job_process_dev_fee_payment() {
             .fetch_all(&*pool)
             .await
             {
-                for mut real_hash_order in real_hash_orders {
+                for real_hash_order in real_hash_orders {
                     let order_id = real_hash_order.id;
 
                     // Skip orders already confirmed in this daemon session
@@ -682,18 +682,20 @@ async fn job_process_dev_fee_payment() {
                             confirmed_dev_fee_orders.insert(order_id);
                         }
                         DevFeePaymentState::Failed => {
-                            info!(
-                                "Stale dev fee payment failed for order {}, resetting for retry",
-                                order_id
+                            // SAFETY: Do NOT immediately reset orders with real payment
+                            // hashes. LND may report "Failed" for payments that haven't
+                            // been fully indexed yet. Resetting prematurely causes
+                            // duplicate payments because LNURL resolution generates a
+                            // NEW invoice every time (see #620).
+                            //
+                            // Principle: better an unpaid dev fee (manual reconciliation)
+                            // than a duplicate payment (unrecoverable loss).
+                            warn!(
+                                "Dev fee payment reported as Failed for order {} (hash: {:?}), \
+                                 NOT resetting to avoid duplicate payment risk. \
+                                 Manual review may be needed.",
+                                order_id, real_hash_order.dev_fee_payment_hash
                             );
-                            real_hash_order.dev_fee_paid = false;
-                            real_hash_order.dev_fee_payment_hash = None;
-                            if let Err(e) = real_hash_order.update(&pool).await {
-                                error!(
-                                    "Failed to reset stale failed payment for order {}: {:?}",
-                                    order_id, e
-                                );
-                            }
                         }
                         DevFeePaymentState::InFlight | DevFeePaymentState::Unknown => {
                             // Leave alone - payment may still complete
@@ -702,50 +704,143 @@ async fn job_process_dev_fee_payment() {
                 }
             }
 
-            // Query unpaid orders
+            // ── OPTION A: Idempotency check for orders with existing payment hash ──
+            // Before resolving new LNURL invoices, check orders that have a real
+            // payment hash but dev_fee_paid=0 (partial success / crash recovery).
+            // This is the PRIMARY defense against duplicate payments (#620):
+            // reuse the existing hash instead of resolving a new LNURL invoice.
+            if let Ok(hash_orders) = sqlx::query_as::<_, Order>(
+                "SELECT * FROM orders
+                 WHERE (status = 'settled-hold-invoice' OR status = 'success')
+                   AND dev_fee > 0
+                   AND dev_fee_paid = 0
+                   AND dev_fee_payment_hash IS NOT NULL
+                   AND dev_fee_payment_hash != ''
+                   AND dev_fee_payment_hash NOT LIKE 'PENDING-%'",
+            )
+            .fetch_all(&*pool)
+            .await
+            {
+                for mut hash_order in hash_orders {
+                    let order_id = hash_order.id;
+                    let existing_hash = hash_order.dev_fee_payment_hash.clone().unwrap_or_default();
+
+                    info!(
+                        "Order {} has existing payment hash '{}' but dev_fee_paid=0, checking LN status",
+                        order_id, existing_hash
+                    );
+
+                    match check_dev_fee_payment_status(&hash_order, &pool, &mut ln_client).await {
+                        DevFeePaymentState::Succeeded => {
+                            // Payment went through — just mark as paid
+                            info!(
+                                "✅ Order {} payment already succeeded (hash {}), marking as paid",
+                                order_id, existing_hash
+                            );
+                            hash_order.dev_fee_paid = true;
+                            match hash_order.update(&pool).await {
+                                Ok(updated) => {
+                                    confirmed_dev_fee_orders.insert(order_id);
+
+                                    // Publish audit event if not already published
+                                    if let Err(e) =
+                                        publish_dev_fee_audit_event(&updated, &existing_hash).await
+                                    {
+                                        warn!(
+                                            "Failed to publish audit event for recovered order {}: {:?}",
+                                            order_id, e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to mark order {} as paid after confirming payment: {:?}",
+                                        order_id, e
+                                    );
+                                }
+                            }
+                        }
+                        DevFeePaymentState::Failed => {
+                            // Invoice expired or payment definitively failed.
+                            // Safe to clear the hash so a new invoice can be resolved.
+                            info!(
+                                "Order {} existing payment failed (hash {}), clearing for retry",
+                                order_id, existing_hash
+                            );
+                            hash_order.dev_fee_payment_hash = None;
+                            if let Err(e) = hash_order.update(&pool).await {
+                                error!(
+                                    "Failed to clear failed payment hash for order {}: {:?}",
+                                    order_id, e
+                                );
+                            }
+                            // Order will be picked up by find_unpaid_dev_fees on next cycle
+                        }
+                        DevFeePaymentState::InFlight => {
+                            // Payment still in-flight — do NOT resolve a new invoice
+                            info!(
+                                "Order {} payment still in-flight (hash {}), skipping",
+                                order_id, existing_hash
+                            );
+                        }
+                        DevFeePaymentState::Unknown => {
+                            // Cannot determine status — err on the side of caution
+                            // Do NOT clear the hash (would allow duplicate LNURL resolution)
+                            warn!(
+                                "Order {} payment status unknown (hash {}), skipping to avoid duplicate",
+                                order_id, existing_hash
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ── OPTION B: Process orders with NO existing payment hash ──
+            // find_unpaid_dev_fees only returns orders with NULL/empty hash (query filter),
+            // so these are genuinely new orders that need their first LNURL resolution.
             if let Ok(unpaid_orders) = find_unpaid_dev_fees(&pool).await {
                 info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
 
                 for mut order in unpaid_orders {
-                    // GUARD: Detect partial success scenario (payment succeeded but DB update failed)
-                    if let Some(payment_hash) = &order.dev_fee_payment_hash {
-                        let order_id = order.id;
-                        let payment_hash = payment_hash.clone();
+                    let order_id = order.id;
 
-                        warn!(
-                            "Order {} has payment hash '{}' but dev_fee_paid=false. Recovering from failed DB update.",
-                            order_id,
-                            payment_hash
-                        );
+                    // STEP 0: Atomically claim this order to prevent duplicate processing
+                    // across concurrent scheduler cycles. Uses SQL UPDATE with WHERE clause
+                    // so only one cycle can claim it (defense-in-depth for #620).
+                    let now_ts = Utc::now().timestamp() as u64;
+                    let pending_marker = format!("PENDING-{}-{}", uuid::Uuid::new_v4(), now_ts);
 
-                        // Recovery: Mark as paid since hash exists (payment already succeeded)
-                        order.dev_fee_paid = true;
-                        match order.update(&pool).await {
-                            Ok(_) => {
-                                info!(
-                                    "✅ Recovered order {} - marked as paid with existing hash",
-                                    order_id
-                                );
-                                // Verify recovery
-                                if let Ok(verified) =
-                                    sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
-                                        .bind(order_id)
-                                        .fetch_one(&*pool)
-                                        .await
-                                {
-                                    info!(
-                                        "RECOVERY VERIFIED: dev_fee_paid={}, hash={:?}",
-                                        verified.dev_fee_paid, verified.dev_fee_payment_hash
-                                    );
-                                }
-                            }
-                            Err(e) => error!("❌ Failed to recover order {}: {:?}", order_id, e),
+                    let claim_result = sqlx::query(
+                        "UPDATE orders SET dev_fee_payment_hash = ?
+                         WHERE id = ? AND dev_fee_paid = 0
+                           AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')",
+                    )
+                    .bind(&pending_marker)
+                    .bind(order_id)
+                    .execute(&*pool)
+                    .await;
+
+                    match claim_result {
+                        Ok(result) if result.rows_affected() == 0 => {
+                            info!(
+                                "Order {} already claimed by another cycle, skipping",
+                                order_id
+                            );
+                            continue;
                         }
-                        continue; // Skip payment attempt
+                        Err(e) => {
+                            error!(
+                                "Failed to claim order {} for dev fee payment: {:?}",
+                                order_id, e
+                            );
+                            continue;
+                        }
+                        _ => {
+                            info!("Claimed order {} with marker {}", order_id, pending_marker);
+                        }
                     }
 
                     // STEP 1: Resolve invoice and extract real payment hash
-                    let order_id = order.id;
                     info!("Resolving dev fee invoice for order {}", order_id);
 
                     let (payment_request, payment_hash_hex) = match tokio::time::timeout(
@@ -760,18 +855,39 @@ async fn job_process_dev_fee_payment() {
                                 "Failed to resolve dev fee invoice for order {}: {:?}",
                                 order_id, e
                             );
-                            continue; // Skip this order, will retry next cycle
+                            // Release the claim using exact marker match (safe release)
+                            let _ = sqlx::query(
+                                "UPDATE orders SET dev_fee_payment_hash = NULL
+                                 WHERE id = ? AND dev_fee_payment_hash = ?",
+                            )
+                            .bind(order_id)
+                            .bind(&pending_marker)
+                            .execute(&*pool)
+                            .await;
+                            continue;
                         }
                         Err(_) => {
                             error!(
                                 "Dev fee invoice resolution timeout (20s) for order {}",
                                 order_id
                             );
-                            continue; // Skip this order, will retry next cycle
+                            // Release the claim using exact marker match (safe release)
+                            let _ = sqlx::query(
+                                "UPDATE orders SET dev_fee_payment_hash = NULL
+                                 WHERE id = ? AND dev_fee_payment_hash = ?",
+                            )
+                            .bind(order_id)
+                            .bind(&pending_marker)
+                            .execute(&*pool)
+                            .await;
+                            continue;
                         }
                     };
 
-                    // STEP 2: Store real payment hash before sending
+                    // STEP 2: Store real payment hash BEFORE sending payment
+                    // This replaces the PENDING marker with the actual hash.
+                    // If daemon crashes after this point, the idempotency check (Option A)
+                    // will find the hash on the next cycle and verify with LND.
                     info!(
                         "Storing payment hash {} for order {}",
                         payment_hash_hex, order_id
@@ -785,7 +901,7 @@ async fn job_process_dev_fee_payment() {
                                 "Failed to store payment hash for order {}: {:?}",
                                 order_id, e
                             );
-                            continue; // Skip this order, will retry next cycle
+                            continue;
                         }
                         Ok(updated_order) => {
                             info!("Order {} marked with real payment hash", order_id);
@@ -804,7 +920,7 @@ async fn job_process_dev_fee_payment() {
                             let order_id = order.id;
                             let dev_fee_amount = order.dev_fee;
 
-                            // STEP 4: Verify hash matches, use LND's value as authoritative
+                            // Verify hash matches, use LND's value as authoritative
                             if order.dev_fee_payment_hash.as_deref() != Some(&payment_hash) {
                                 warn!(
                                     "Order {}: LND returned hash '{}' differs from stored hash '{:?}', using LND's value",
@@ -817,14 +933,11 @@ async fn job_process_dev_fee_payment() {
 
                             match order.update(&pool).await {
                                 Err(e) => {
-                                    // CRITICAL: Payment succeeded but can't update hash
                                     error!("❌ CRITICAL: Dev fee PAID for order {} but DB update FAILED", order_id);
                                     error!("   Payment amount: {} sats", dev_fee_amount);
                                     error!("   Payment hash: {}", payment_hash);
                                     error!("   Database error: {:?}", e);
-                                    error!("   ACTION REQUIRED: Manual reconciliation - order marked as paid but hash not recorded");
-                                    // Note: Order is marked as paid (dev_fee_paid=true), so won't retry
-                                    // Hash is in logs for manual reconciliation
+                                    error!("   ACTION REQUIRED: Manual reconciliation");
                                 }
                                 Ok(_) => {
                                     info!("✅ Dev fee payment completed for order {}", order_id);
@@ -843,13 +956,13 @@ async fn job_process_dev_fee_payment() {
                                     .await
                                     {
                                         info!(
-                                            "VERIFICATION: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
+                                            "VERIFICATION: order_id={}, dev_fee_paid={}, hash={:?}",
                                             verified_order.id,
                                             verified_order.dev_fee_paid,
                                             verified_order.dev_fee_payment_hash
                                         );
 
-                                        // Publish audit event to Nostr (non-blocking - failure doesn't affect payment)
+                                        // Publish audit event (non-blocking)
                                         if let Err(e) = publish_dev_fee_audit_event(
                                             &verified_order,
                                             &payment_hash,
@@ -860,46 +973,37 @@ async fn job_process_dev_fee_payment() {
                                                 "Failed to publish audit event for order {}: {:?}",
                                                 order_id, e
                                             );
-                                            warn!("Payment succeeded but audit event not published - manual review may be needed");
                                         }
                                     }
                                 }
                             }
                         }
                         Ok(Err(e)) => {
-                            // STEP 5: Payment failed, reset to unpaid for retry
+                            // Payment failed — but do NOT clear the hash.
+                            // The idempotency check (Option A) on the next cycle will
+                            // verify with LND and clear if truly failed. This prevents
+                            // a race where "failed" is reported prematurely.
                             let order_id = order.id;
                             error!(
                                 "Dev fee payment failed for order {} - error: {:?}",
                                 order_id, e
                             );
-
+                            warn!(
+                                "Keeping payment hash for order {} to let idempotency check verify on next cycle",
+                                order_id
+                            );
+                            // Mark as unpaid but KEEP the hash — idempotency check will handle it
                             order.dev_fee_paid = false;
-                            order.dev_fee_payment_hash = None;
-
-                            match order.update(&pool).await {
-                                Err(db_err) => {
-                                    error!(
-                                        "❌ CRITICAL: Failed to reset dev fee status after payment failure for order {}",
-                                        order_id
-                                    );
-                                    error!("   Payment error: {:?}", e);
-                                    error!("   Database error: {:?}", db_err);
-                                    error!("   ACTION REQUIRED: Manual intervention - order stuck in 'paid' state with no payment");
-                                }
-                                Ok(_) => {
-                                    info!(
-                                        "Reset order {} to unpaid, will retry next cycle",
-                                        order_id
-                                    );
-                                }
+                            if let Err(db_err) = order.update(&pool).await {
+                                error!(
+                                    "Failed to update order {} after payment failure: {:?}",
+                                    order_id, db_err
+                                );
                             }
                         }
                         Err(_) => {
-                            // STEP 6: Timeout — check actual payment status before resetting
-                            // A timeout does NOT mean the payment failed; it could still be
-                            // in-flight or may have succeeded. Blindly resetting would cause
-                            // duplicate payments (see #568).
+                            // Timeout — payment may still be in-flight.
+                            // Keep the hash; idempotency check will verify on next cycle.
                             let order_id = order.id;
                             let dev_fee = order.dev_fee;
                             warn!(
@@ -907,61 +1011,43 @@ async fn job_process_dev_fee_payment() {
                                 order_id, dev_fee
                             );
 
-                            // Try to check the payment status on the LN node
-                            let should_reset = match check_dev_fee_payment_status(
-                                &order,
-                                &pool,
-                                &mut ln_client,
-                            )
-                            .await
+                            match check_dev_fee_payment_status(&order, &pool, &mut ln_client).await
                             {
                                 DevFeePaymentState::Succeeded => {
                                     info!(
                                         "Payment actually succeeded for order {} despite timeout",
                                         order_id
                                     );
-                                    false // Don't reset — already handled
+                                    // Already handled by check_dev_fee_payment_status
+                                    confirmed_dev_fee_orders.insert(order_id);
                                 }
                                 DevFeePaymentState::InFlight => {
                                     warn!(
-                                        "Payment still in-flight for order {}, skipping reset",
+                                        "Payment still in-flight for order {}, keeping hash",
                                         order_id
                                     );
-                                    false // Don't reset — payment may still complete
+                                    // Keep hash — will be verified on next cycle
                                 }
                                 DevFeePaymentState::Failed => {
                                     info!(
-                                        "Payment definitively failed for order {}, safe to retry",
+                                        "Payment confirmed failed for order {}, clearing hash for retry",
                                         order_id
                                     );
-                                    true // Safe to reset and retry
-                                }
-                                DevFeePaymentState::Unknown => {
-                                    warn!(
-                                        "Cannot determine payment status for order {}, skipping reset to avoid duplicate",
-                                        order_id
-                                    );
-                                    false // Err on the side of caution
-                                }
-                            };
-
-                            if should_reset {
-                                order.dev_fee_paid = false;
-                                order.dev_fee_payment_hash = None;
-
-                                match order.update(&pool).await {
-                                    Err(e) => {
+                                    order.dev_fee_paid = false;
+                                    order.dev_fee_payment_hash = None;
+                                    if let Err(e) = order.update(&pool).await {
                                         error!(
-                                            "Failed to reset after timeout for order {}: {:?}",
+                                            "Failed to reset after confirmed failure for order {}: {:?}",
                                             order_id, e
                                         );
                                     }
-                                    Ok(_) => {
-                                        info!(
-                                            "Reset order {} to unpaid after confirmed failure, will retry",
-                                            order_id
-                                        );
-                                    }
+                                }
+                                DevFeePaymentState::Unknown => {
+                                    warn!(
+                                        "Cannot determine payment status for order {}, keeping hash to avoid duplicate",
+                                        order_id
+                                    );
+                                    // Keep hash — idempotency check will handle it
                                 }
                             }
                         }

@@ -21,11 +21,13 @@ Before resolving any new LNURL invoices, the scheduler queries orders that have 
 | LND Status | Action |
 |---|---|
 | `Succeeded` | Mark as paid, publish audit event — **no new invoice** |
-| `Failed` | Clear hash — order becomes eligible for fresh LNURL resolution |
+| `Failed` | Clear hash — order becomes eligible for fresh LNURL resolution (safe because `dev_fee_paid=0` means no payment was confirmed) |
 | `InFlight` | Skip — payment may still complete, **no new invoice** |
 | `Unknown` | Skip — err on side of caution, **no new invoice** |
 
 This ensures we **never resolve a second LNURL invoice while an existing payment is pending or succeeded**. The hash acts as an idempotency key.
+
+> **Note on `Failed` handling:** Clearing the hash on `Failed` is safe here because this path only handles orders with `dev_fee_paid=0` — the payment was never confirmed as successful. This is distinct from Layer 4 (conservative reset) which handles orders with `dev_fee_paid=1`, where resetting is dangerous because the payment may have actually succeeded.
 
 ### Layer 2: Atomic Claim Guard (Secondary Defense)
 
@@ -57,7 +59,9 @@ Orders with a PENDING marker or real hash are never picked up by `find_unpaid_de
 
 **File:** `src/scheduler.rs` — real-hash cleanup section
 
-The "real-hash cleanup" no longer resets orders when LND reports `Failed`. Instead it logs a warning. This prevents premature resets caused by LND indexing delays.
+The "real-hash cleanup" handles orders with `dev_fee_paid=1` and a real payment hash. When LND reports `Failed` for these orders, the system **no longer resets them**. Instead it logs a warning and leaves the order unchanged. This is the conservative path because `dev_fee_paid=1` means the payment was previously confirmed — a `Failed` status from LND may be a false negative due to indexing delays.
+
+> **Contrast with Layer 1:** The idempotency check (Layer 1) handles `dev_fee_paid=0` orders and *does* clear the hash on `Failed`, because in that state no payment was ever confirmed as successful. Layer 4 handles `dev_fee_paid=1` orders and does *not* clear on `Failed`, because the payment may have actually succeeded.
 
 **Principle:** Better an unpaid dev fee (manual reconciliation) than a duplicate payment (unrecoverable loss).
 
@@ -82,8 +86,8 @@ Store real hash: hash = "abc123...", dev_fee_paid = true
 send_dev_fee_payment() → LND pays the invoice
     │
     ├─ Success → publish audit event, done ✅
-    ├─ Failure → keep hash, dev_fee_paid = false
-    │            (idempotency check on next cycle will verify)
+    ├─ Failure → keep hash, dev_fee_paid = false (idempotency path)
+    │            (Layer 1 on next cycle: check LND, clear hash if truly failed)
     └─ Timeout → check LND status
                  ├─ Succeeded → done ✅
                  ├─ InFlight → keep hash, wait

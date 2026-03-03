@@ -20,3 +20,5 @@ docker/.env
 
 # AI
 CLAUDE.md
+# Mutation testing output
+mutants.out/

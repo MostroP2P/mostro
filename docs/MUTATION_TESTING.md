@@ -61,14 +61,14 @@ cargo mutants
 # Test with specific packages
 cargo mutants -p mostro-core
 
-# Generate HTML report
-cargo mutants --html
-
 # Test specific files
 cargo mutants --file src/flow.rs
 
 # Test with sharding (for CI parallelization)
 cargo mutants --shard 1/4
+
+# Output to specific directory
+cargo mutants --output mutants.out
 ```
 
 ## Configuration
@@ -211,17 +211,19 @@ fn test_order_validation_rejects_invalid() {
 
 ```bash
 # Quick check (mutants only in changed files)
-cargo mutants --in-diff HEAD~1
+./scripts/mutation-test.sh quick
 
 # Full run (takes ~30-60 min)
-cargo mutants
+./scripts/mutation-test.sh full
 
 # Specific module
-cargo mutants --file src/flow.rs
+./scripts/mutation-test.sh file src/flow.rs
 
-# Generate HTML report
-cargo mutants --html
-open mutants.out/index.html
+# Show results summary
+./scripts/mutation-test.sh report
+
+# Or run cargo-mutants directly:
+cargo mutants --file src/flow.rs --output mutants.out
 ```
 
 ## Performance Considerations

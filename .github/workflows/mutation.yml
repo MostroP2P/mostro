@@ -124,8 +124,7 @@ jobs:
         run: cargo install cargo-mutants
 
       - name: Run full mutation testing
-        # Generate HTML report for baseline
-        run: cargo mutants --html --output mutants.out
+        run: cargo mutants --output mutants.out
         # Note: Do NOT fail on low score initially (report only mode)
         continue-on-error: true
 

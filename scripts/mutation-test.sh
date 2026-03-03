@@ -32,13 +32,25 @@ print_help() {
 }
 
 check_install() {
-    if ! command -v cargo-mutants &> /dev/null; then
-        if cargo --list | grep -q "mutants"; then
-            echo -e "${GREEN}cargo-mutants is installed as a cargo subcommand${NC}"
-        else
-            echo -e "${YELLOW}cargo-mutants not found. Installing...${NC}"
-            cargo install cargo-mutants
-        fi
+    if ! cargo mutants --version &> /dev/null; then
+        echo -e "${YELLOW}cargo-mutants not found. Installing...${NC}"
+        cargo install cargo-mutants
+    fi
+}
+
+# Cross-platform open command
+open_report() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo -e "${YELLOW}No HTML report found at $file${NC}"
+        return
+    fi
+    if command -v xdg-open &> /dev/null; then
+        xdg-open "$file"
+    elif command -v open &> /dev/null; then
+        open "$file"
+    else
+        echo -e "${BLUE}Open in your browser: $file${NC}"
     fi
 }
 
@@ -46,8 +58,12 @@ run_full() {
     check_install
     echo -e "${BLUE}Running full mutation testing...${NC}"
     echo -e "${YELLOW}This may take 30-60 minutes depending on your hardware.${NC}"
-    cargo mutants --html
-    echo -e "${GREEN}Done! Report: mutants.out/html/index.html${NC}"
+    cargo mutants --output mutants.out
+    echo -e "${GREEN}Done! Results in mutants.out/${NC}"
+    if [ -f "mutants.out/html/index.html" ]; then
+        echo -e "${GREEN}HTML report: mutants.out/html/index.html${NC}"
+        open_report "mutants.out/html/index.html"
+    fi
 }
 
 run_quick() {
@@ -55,10 +71,19 @@ run_quick() {
     echo -e "${BLUE}Running mutation testing on changed files only...${NC}"
     # Check if HEAD~1 exists (may not in shallow clones or initial commit)
     if git rev-parse HEAD~1 &>/dev/null; then
-        cargo mutants --in-diff HEAD~1
+        # Generate a diff file for cargo-mutants --in-diff
+        git diff HEAD~1 > /tmp/mostro-quick-mutants.diff
+        if [ -s /tmp/mostro-quick-mutants.diff ]; then
+            cargo mutants --in-diff /tmp/mostro-quick-mutants.diff --output mutants.out
+        else
+            echo -e "${YELLOW}No changes detected in HEAD~1. Running on all files.${NC}"
+            cargo mutants --output mutants.out
+        fi
+        rm -f /tmp/mostro-quick-mutants.diff
     else
-        echo -e "${YELLOW}Warning: HEAD~1 not available. Running on HEAD instead.${NC}"
-        cargo mutants
+        echo -e "${YELLOW}Warning: HEAD~1 not available (shallow clone or initial commit).${NC}"
+        echo -e "${YELLOW}Running full mutation testing instead.${NC}"
+        cargo mutants --output mutants.out
     fi
 }
 
@@ -70,8 +95,8 @@ run_file() {
         exit 1
     fi
     echo -e "${BLUE}Running mutation testing on $1...${NC}"
-    cargo mutants --file "$1" --html
-    echo -e "${GREEN}Done! Report: mutants.out/html/index.html${NC}"
+    cargo mutants --file "$1" --output mutants.out
+    echo -e "${GREEN}Done! Results in mutants.out/${NC}"
 }
 
 run_install() {
@@ -94,7 +119,6 @@ run_report() {
 
     if [ -f "mutants.out/outcomes.json" ]; then
         total=$(jq '. | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
-        # cargo-mutants uses 'summary' field with values: Killed, Survived, Timeout, Unviable, MissedMutant, CaughtMutant
         killed=$(jq '[.[] | select(.summary == "Killed" or .summary == "CaughtMutant")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
         survived=$(jq '[.[] | select(.summary == "Survived" or .summary == "MissedMutant")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
         timeout=$(jq '[.[] | select(.summary == "Timeout")] | length' mutants.out/outcomes.json 2>/dev/null || echo "0")
@@ -130,27 +154,13 @@ run_report() {
 
 # Main
 case "${1:-help}" in
-    full)
-        run_full
-        ;;
-    quick)
-        run_quick
-        ;;
-    file)
-        run_file "$2"
-        ;;
-    install)
-        run_install
-        ;;
-    clean)
-        run_clean
-        ;;
-    report)
-        run_report
-        ;;
-    help|--help|-h)
-        print_help
-        ;;
+    full)    run_full ;;
+    quick)   run_quick ;;
+    file)    run_file "$2" ;;
+    install) run_install ;;
+    clean)   run_clean ;;
+    report)  run_report ;;
+    help|--help|-h) print_help ;;
     *)
         echo -e "${RED}Unknown command: $1${NC}"
         print_help

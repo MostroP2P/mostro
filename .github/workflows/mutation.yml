@@ -41,6 +41,9 @@ jobs:
       - name: Run mutation testing on changed files
         # Only test mutants in files changed in this PR
         # This gives faster feedback (minutes instead of hours)
+        # Note: cargo mutants exits with code 2 when mutants survive.
+        # This is expected in report-only mode — we don't fail the build.
+        continue-on-error: true
         run: |
           # Generate diff file for cargo-mutants
           git diff origin/${{ github.base_ref }} > changes.diff

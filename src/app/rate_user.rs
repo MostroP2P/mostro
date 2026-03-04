@@ -148,6 +148,19 @@ pub async fn update_user_reputation_action(
     .to_tags()
     .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
 
+    // Calculate days since first trade and add to rating tags
+    let days = if user_to_vote.created_at != 0 {
+        (Timestamp::now().as_u64() - user_to_vote.created_at as u64) / 86400
+    } else {
+        0
+    };
+    let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
+    tags.push(Tag::custom(
+        TagKind::Custom(std::borrow::Cow::Borrowed("days")),
+        vec![days.to_string()],
+    ));
+    let reputation_event = Tags::from_list(tags);
+
     // Save new rating to db
     if let Err(e) = update_user_rating(
         pool,

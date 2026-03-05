@@ -69,17 +69,6 @@ pub fn prepare_variables_for_vote(
 /// 7. Creates and saves a new rating event
 /// 8. Updates the database with the new rating information
 /// 9. Sends a confirmation message to the rating user
-/// Calculate the number of days since user creation.
-fn calculate_days_since_creation(created_at: i64) -> u64 {
-    const SECONDS_IN_DAY: u64 = 86_400;
-    let now = Timestamp::now().as_u64();
-    u64::try_from(created_at)
-        .ok()
-        .filter(|ts| *ts > 0)
-        .map(|ts| now.saturating_sub(ts) / SECONDS_IN_DAY)
-        .unwrap_or(0)
-}
-
 pub async fn update_user_reputation_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -218,6 +207,17 @@ pub async fn update_user_reputation_action(
     }
 
     Ok(())
+}
+
+/// Calculate the number of days since user creation.
+fn calculate_days_since_creation(created_at: i64) -> u64 {
+    const SECONDS_IN_DAY: u64 = 86_400;
+    let now = Timestamp::now().as_u64();
+    u64::try_from(created_at)
+        .ok()
+        .filter(|ts| *ts > 0)
+        .map(|ts| now.saturating_sub(ts) / SECONDS_IN_DAY)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

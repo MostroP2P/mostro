@@ -344,32 +344,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_user_reputation_updates_buyer_and_order_flags() {
+        use crate::db::{add_new_user, is_user_present};
+
         let pool = create_test_pool().await;
         let keys = create_test_keys();
 
+        // Trade keys (ephemeral per-trade)
         let seller_keys = create_test_keys();
         let buyer_keys = create_test_keys();
         let seller_pk = seller_keys.public_key();
         let buyer_pk = buyer_keys.public_key();
 
-        // Counterpart user (seller) exists in DB so rating can be applied
-        sqlx::query!(
-            r#"
-            INSERT INTO users (
-                pubkey, is_admin, admin_password, is_solver, is_banned,
-                category, last_trade_index, total_reviews, total_rating,
-                last_rating, max_rating, min_rating, created_at
-            )
-            VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, 0.0, 0, 0, 0, strftime('%s','now'))
-            "#,
-            seller_pk.to_string(),
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Identity keys (master keys, must differ from trade keys)
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
 
-        // Success order, no one has rated yet
-        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        // Counterpart user (seller identity) exists in DB so rating can be applied
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        // Success order with master keys set (not full-privacy)
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
         let order = order.create(&pool).await.unwrap();
 
         // Event where sender is the buyer (buyer_rating = true)
@@ -380,23 +382,13 @@ mod tests {
         assert!(result.is_ok());
 
         // The seller (counterpart of buyer rating) must have updated reputation
-        let user_row = sqlx::query!(
-            r#"
-            SELECT total_reviews, total_rating, last_rating, min_rating, max_rating
-            FROM users
-            WHERE pubkey = ?1
-            "#,
-            seller_pk.to_string(),
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(user_row.total_reviews, 1);
-        assert_eq!(user_row.last_rating, 5);
-        assert_eq!(user_row.min_rating, 5);
-        assert_eq!(user_row.max_rating, 5);
-        assert!((user_row.total_rating - 5.0).abs() < f64::EPSILON);
+        let seller_user = is_user_present(&pool, seller_id).await.unwrap();
+        assert_eq!(seller_user.total_reviews, 1);
+        assert_eq!(seller_user.last_rating, 5);
+        assert_eq!(seller_user.min_rating, 5);
+        assert_eq!(seller_user.max_rating, 5);
+        // First vote uses weight 1/2: total_rating = rating / 2.0
+        assert!((seller_user.total_rating - 2.5).abs() < f64::EPSILON);
 
         // Order buyer_sent_rate flag must be set via update_user_rating_event
         let updated_order = Order::by_id(&pool, order.id)
@@ -407,7 +399,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_user_reputation_updates_seller_and_order_flags() {
+    async fn test_update_user_reputation_buyer_already_rated_is_noop() {
+        use crate::db::{add_new_user, is_user_present};
+
         let pool = create_test_pool().await;
         let keys = create_test_keys();
 
@@ -416,24 +410,67 @@ mod tests {
         let seller_pk = seller_keys.public_key();
         let buyer_pk = buyer_keys.public_key();
 
-        // Counterpart user (buyer) exists in DB so rating can be applied
-        sqlx::query!(
-            r#"
-            INSERT INTO users (
-                pubkey, is_admin, admin_password, is_solver, is_banned,
-                category, last_trade_index, total_reviews, total_rating,
-                last_rating, max_rating, min_rating, created_at
-            )
-            VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, 0.0, 0, 0, 0, strftime('%s','now'))
-            "#,
-            buyer_pk.to_string(),
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
 
-        // Success order, no one has rated yet
-        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        // Order where buyer has already rated
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
+        order.buyer_sent_rate = true;
+        let order = order.create(&pool).await.unwrap();
+
+        // Buyer tries to rate again
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // Seller reputation must remain unchanged (no double-rating)
+        let seller_user = is_user_present(&pool, seller_id).await.unwrap();
+        assert_eq!(seller_user.total_reviews, 0);
+        assert!((seller_user.total_rating - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_updates_seller_and_order_flags() {
+        use crate::db::{add_new_user, is_user_present};
+
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        // Trade keys (ephemeral per-trade)
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Identity keys (master keys, must differ from trade keys)
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
+
+        // Counterpart user (buyer identity) exists in DB so rating can be applied
+        let buyer_user = User {
+            pubkey: buyer_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, buyer_user).await.unwrap();
+
+        // Success order with master keys set (not full-privacy)
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
         let order = order.create(&pool).await.unwrap();
 
         // Event where sender is the seller (seller_rating = true)
@@ -444,23 +481,13 @@ mod tests {
         assert!(result.is_ok());
 
         // The buyer (counterpart of seller rating) must have updated reputation
-        let user_row = sqlx::query!(
-            r#"
-            SELECT total_reviews, total_rating, last_rating, min_rating, max_rating
-            FROM users
-            WHERE pubkey = ?1
-            "#,
-            buyer_pk.to_string(),
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(user_row.total_reviews, 1);
-        assert_eq!(user_row.last_rating, 4);
-        assert_eq!(user_row.min_rating, 4);
-        assert_eq!(user_row.max_rating, 4);
-        assert!((user_row.total_rating - 4.0).abs() < f64::EPSILON);
+        let buyer_user = is_user_present(&pool, buyer_id).await.unwrap();
+        assert_eq!(buyer_user.total_reviews, 1);
+        assert_eq!(buyer_user.last_rating, 4);
+        assert_eq!(buyer_user.min_rating, 4);
+        assert_eq!(buyer_user.max_rating, 4);
+        // First vote uses weight 1/2: total_rating = rating / 2.0
+        assert!((buyer_user.total_rating - 2.0).abs() < f64::EPSILON);
 
         // Order seller_sent_rate flag must be set via update_user_rating_event
         let updated_order = Order::by_id(&pool, order.id)

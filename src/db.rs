@@ -941,6 +941,7 @@ pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, Mostr
           WHERE (status = 'settled-hold-invoice' OR status = 'success')
             AND dev_fee > 0
             AND dev_fee_paid = 0
+            AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')
         "#,
     )
     .fetch_all(pool)
@@ -1670,6 +1671,199 @@ mod tests {
             hash_set_values.len(),
             5,
             "Should have exactly 5 unique entries"
+        );
+    }
+
+    /// Helper: create an in-memory SQLite database with the orders table schema.
+    async fn setup_orders_db() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("Failed to create in-memory DB");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE orders (
+                id char(36) primary key not null,
+                kind varchar(4) not null default 'buy',
+                event_id char(64) not null default '',
+                hash char(64),
+                preimage char(64),
+                creator_pubkey char(64) default '',
+                cancel_initiator_pubkey char(64),
+                dispute_initiator_pubkey char(64),
+                buyer_pubkey char(64),
+                master_buyer_pubkey char(64),
+                seller_pubkey char(64),
+                master_seller_pubkey char(64),
+                status varchar(10) not null default 'active',
+                price_from_api integer not null default 0,
+                premium integer not null default 0,
+                payment_method varchar(500) not null default 'cash',
+                amount integer not null default 0,
+                min_amount integer default 0,
+                max_amount integer default 0,
+                buyer_dispute integer not null default 0,
+                seller_dispute integer not null default 0,
+                buyer_cooperativecancel integer not null default 0,
+                seller_cooperativecancel integer not null default 0,
+                fee integer not null default 0,
+                routing_fee integer not null default 0,
+                fiat_code varchar(5) not null default 'USD',
+                fiat_amount integer not null default 0,
+                buyer_invoice text,
+                range_parent_id char(36),
+                invoice_held_at integer default 0,
+                taken_at integer default 0,
+                created_at integer not null default 0,
+                buyer_sent_rate integer default 0,
+                seller_sent_rate integer default 0,
+                payment_attempts integer default 0,
+                failed_payment integer default 0,
+                expires_at integer not null default 0,
+                trade_index_seller integer default 0,
+                trade_index_buyer integer default 0,
+                next_trade_pubkey char(64),
+                next_trade_index integer default 0,
+                dev_fee integer default 0,
+                dev_fee_paid integer not null default 0,
+                dev_fee_payment_hash char(64)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create orders table");
+
+        pool
+    }
+
+    /// Helper: insert a test order with the fields relevant to dev fee queries.
+    /// Uses `uuid::Uuid` for the id to match sqlx's binary encoding.
+    async fn insert_test_order(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+        status: &str,
+        dev_fee: i64,
+        dev_fee_paid: bool,
+        dev_fee_payment_hash: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                dev_fee, dev_fee_paid, dev_fee_payment_hash)
+            VALUES (?, 'sell', 'evt1', ?, 0, 'cash', 1000, 'USD', 100, 0, 0, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(dev_fee)
+        .bind(dev_fee_paid as i32)
+        .bind(dev_fee_payment_hash)
+        .execute(pool)
+        .await
+        .expect("Failed to insert test order");
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_returns_eligible_orders() {
+        let pool = setup_orders_db().await;
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+
+        // Eligible: success status, dev_fee > 0, not paid, no hash
+        insert_test_order(&pool, id1, "success", 100, false, None).await;
+        // Also eligible: settled-hold-invoice status
+        insert_test_order(&pool, id2, "settled-hold-invoice", 50, false, None).await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert_eq!(result.len(), 2, "Should find both eligible orders");
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_already_paid() {
+        let pool = setup_orders_db().await;
+
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 100, true, None).await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(result.is_empty(), "Should not return already-paid orders");
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_orders_with_existing_hash() {
+        let pool = setup_orders_db().await;
+
+        // Has existing payment hash (in-flight or pending)
+        insert_test_order(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "success",
+            100,
+            false,
+            Some("abc123hash"),
+        )
+        .await;
+        // Has PENDING marker
+        insert_test_order(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "success",
+            100,
+            false,
+            Some("PENDING-uuid-123"),
+        )
+        .await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not return orders with existing payment hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_wrong_status() {
+        let pool = setup_orders_db().await;
+
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "active", 100, false, None).await;
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "pending", 100, false, None).await;
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "expired", 100, false, None).await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not return orders with non-eligible statuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_zero_dev_fee() {
+        let pool = setup_orders_db().await;
+
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 0, false, None).await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not return orders with zero dev_fee"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_with_empty_hash_string() {
+        let pool = setup_orders_db().await;
+
+        // Empty string hash (should be treated same as NULL)
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 100, false, Some("")).await;
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Empty string hash should be treated as no hash"
         );
     }
 }

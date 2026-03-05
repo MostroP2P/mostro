@@ -41,6 +41,7 @@ pre-release-hook = [
 
 
 [dependencies]
+mutants = "0.0.3" # For #[mutants::skip] annotations
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
 lightning-invoice = { version = "0.33.1", features = ["std"] }

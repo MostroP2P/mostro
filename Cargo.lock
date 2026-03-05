@@ -1793,6 +1793,7 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "mostro-core",
+ "mutants",
  "nostr-sdk",
  "once_cell",
  "prost 0.14.1",
@@ -1844,6 +1845,12 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
+name = "mutants"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0287524726960e07b119cebd01678f852f147742ae0d925e6a520dca956126"
 
 [[package]]
 name = "negentropy"

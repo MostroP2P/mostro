@@ -541,7 +541,34 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
     ts_str.parse::<u64>().ok().filter(|&ts| ts > 1_000_000_000)
 }
 
-/// Processes unpaid development fees for completed orders
+/// Atomically claim an order for dev fee processing.
+///
+/// Uses a SQL UPDATE with a WHERE guard so that only one scheduler cycle
+/// can claim a given order.
+///
+/// Returns `Ok(true)` when the claim succeeds (rows_affected > 0),
+/// `Ok(false)` when the order was already claimed (rows_affected == 0),
+/// and `Err` on database errors.
+pub(crate) async fn try_claim_order_for_dev_fee(
+    pool: &sqlx::SqlitePool,
+    order_id: uuid::Uuid,
+    pending_marker: &str,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET dev_fee_payment_hash = ?
+         WHERE id = ? AND dev_fee_paid = 0
+           AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')",
+    )
+    .bind(pending_marker)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Processes unpaid development fees for completed orders.
 ///
 /// Runs every 60 seconds and attempts to pay dev fees for orders that have:
 /// - status = 'settled-hold-invoice' OR 'success'
@@ -553,6 +580,7 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
 /// - Sequential processing (one order at a time) to avoid overwhelming scheduler
 /// - Automatic retry on next cycle for failed payments
 /// - Enhanced logging (BEFORE/AFTER/VERIFY) for troubleshooting database persistence
+#[mutants::skip] // Integration function: spawns infinite loop, requires LND + global DB pool
 async fn job_process_dev_fee_payment() {
     let pool = get_db_pool();
     let interval = 60u64; // Every 60 seconds
@@ -810,18 +838,8 @@ async fn job_process_dev_fee_payment() {
                     let now_ts = Utc::now().timestamp() as u64;
                     let pending_marker = format!("PENDING-{}-{}", uuid::Uuid::new_v4(), now_ts);
 
-                    let claim_result = sqlx::query(
-                        "UPDATE orders SET dev_fee_payment_hash = ?
-                         WHERE id = ? AND dev_fee_paid = 0
-                           AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')",
-                    )
-                    .bind(&pending_marker)
-                    .bind(order_id)
-                    .execute(&*pool)
-                    .await;
-
-                    match claim_result {
-                        Ok(result) if result.rows_affected() == 0 => {
+                    match try_claim_order_for_dev_fee(&pool, order_id, &pending_marker).await {
+                        Ok(false) => {
                             info!(
                                 "Order {} already claimed by another cycle, skipping",
                                 order_id
@@ -835,7 +853,7 @@ async fn job_process_dev_fee_payment() {
                             );
                             continue;
                         }
-                        _ => {
+                        Ok(true) => {
                             info!("Claimed order {} with marker {}", order_id, pending_marker);
                         }
                     }
@@ -1157,7 +1175,190 @@ async fn check_dev_fee_payment_status(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pending_timestamp;
+    use super::{parse_pending_timestamp, try_claim_order_for_dev_fee};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// Helper: create an in-memory SQLite database with the orders table schema.
+    async fn setup_orders_db() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("Failed to create in-memory DB");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE orders (
+                id char(36) primary key not null,
+                kind varchar(4) not null default 'buy',
+                event_id char(64) not null default '',
+                hash char(64),
+                preimage char(64),
+                creator_pubkey char(64) default '',
+                cancel_initiator_pubkey char(64),
+                dispute_initiator_pubkey char(64),
+                buyer_pubkey char(64),
+                master_buyer_pubkey char(64),
+                seller_pubkey char(64),
+                master_seller_pubkey char(64),
+                status varchar(10) not null default 'active',
+                price_from_api integer not null default 0,
+                premium integer not null default 0,
+                payment_method varchar(500) not null default 'cash',
+                amount integer not null default 0,
+                min_amount integer default 0,
+                max_amount integer default 0,
+                buyer_dispute integer not null default 0,
+                seller_dispute integer not null default 0,
+                buyer_cooperativecancel integer not null default 0,
+                seller_cooperativecancel integer not null default 0,
+                fee integer not null default 0,
+                routing_fee integer not null default 0,
+                fiat_code varchar(5) not null default 'USD',
+                fiat_amount integer not null default 0,
+                buyer_invoice text,
+                range_parent_id char(36),
+                invoice_held_at integer default 0,
+                taken_at integer default 0,
+                created_at integer not null default 0,
+                buyer_sent_rate integer default 0,
+                seller_sent_rate integer default 0,
+                payment_attempts integer default 0,
+                failed_payment integer default 0,
+                expires_at integer not null default 0,
+                trade_index_seller integer default 0,
+                trade_index_buyer integer default 0,
+                next_trade_pubkey char(64),
+                next_trade_index integer default 0,
+                dev_fee integer default 0,
+                dev_fee_paid integer not null default 0,
+                dev_fee_payment_hash char(64)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create orders table");
+
+        pool
+    }
+
+    /// Helper: insert a test order with fields relevant to dev fee processing.
+    /// Uses `uuid::Uuid` for the id to match sqlx's binary encoding.
+    async fn insert_test_order(
+        pool: &sqlx::SqlitePool,
+        id: uuid::Uuid,
+        status: &str,
+        dev_fee: i64,
+        dev_fee_paid: bool,
+        dev_fee_payment_hash: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                dev_fee, dev_fee_paid, dev_fee_payment_hash)
+            VALUES (?, 'sell', 'evt1', ?, 0, 'cash', 1000, 'USD', 100, 0, 0, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(dev_fee)
+        .bind(dev_fee_paid as i32)
+        .bind(dev_fee_payment_hash)
+        .execute(pool)
+        .await
+        .expect("Failed to insert test order");
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_succeeds_for_unclaimed_order() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 100, false, None).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(claimed, "Should successfully claim an unclaimed order");
+
+        // Verify the marker was stored
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash.as_deref(), Some("PENDING-test-1234567890"));
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_fails_for_already_claimed_order() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            order_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-other-cycle"),
+        )
+        .await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(
+            !claimed,
+            "Should not claim an order already claimed by another cycle"
+        );
+
+        // Verify original marker is untouched
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash.as_deref(), Some("PENDING-other-cycle"));
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_fails_for_already_paid_order() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 100, true, None).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(!claimed, "Should not claim an already-paid order");
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_fails_for_nonexistent_order() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(!claimed, "Should not claim a nonexistent order");
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_with_empty_hash_succeeds() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        // Empty string hash should be treated same as NULL (eligible for claim)
+        insert_test_order(&pool, order_id, "success", 100, false, Some("")).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(claimed, "Should claim order with empty string payment hash");
+    }
 
     #[test]
     fn test_parse_new_format_with_uuid() {

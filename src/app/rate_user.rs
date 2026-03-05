@@ -223,12 +223,48 @@ fn calculate_days_since_creation(created_at: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use sqlx::SqlitePool;
+    use sqlx_crud::Crud;
     use uuid::Uuid;
+
+    async fn create_test_pool() -> SqlitePool {
+        // Use a shared in-memory SQLite database and run migrations so that
+        // tables like `orders` and `users` exist for tests.
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
 
     fn create_test_keys() -> Keys {
         Keys::generate()
+    }
+
+    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
+        let unsigned_event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            NostrKind::GiftWrap,
+            Vec::new(),
+            "",
+        );
+        UnwrappedGift {
+            sender: pubkey,
+            rumor: unsigned_event,
+        }
+    }
+
+    fn create_rate_user_message(order_id: Uuid, rating: u8) -> Message {
+        let kind = MessageKind::new(
+            Some(order_id),
+            Some(1),
+            None,
+            Action::RateUser,
+            Some(Payload::RatingUser(rating)),
+        );
+        Message::Order(kind)
     }
 
     fn create_test_order(
@@ -245,6 +281,193 @@ mod tests {
             buyer_sent_rate: false,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_allows_success_status() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Event where the sender is the seller (so seller_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+
+        // Insert Success order in DB
+        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        // Message pointing to that order id with a valid rating payload
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+
+        // A Success order must not be rejected with InvalidOrderStatus
+        match result {
+            Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) => {
+                panic!("valid Success status must not be rejected");
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_rejects_settled_hold_invoice_buyer() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Event where the sender is the buyer (so buyer_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+
+        // SettledHoldInvoice order in DB
+        let order = create_test_order(Status::SettledHoldInvoice, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+
+        // Buyer must not be allowed to rate in SettledHoldInvoice status
+        match result {
+            Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) => {}
+            _ => panic!("buyer should not be able to rate SettledHoldInvoice order"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_updates_buyer_and_order_flags() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Counterpart user (seller) exists in DB so rating can be applied
+        sqlx::query!(
+            r#"
+            INSERT INTO users (
+                pubkey, is_admin, admin_password, is_solver, is_banned,
+                category, last_trade_index, total_reviews, total_rating,
+                last_rating, max_rating, min_rating, created_at
+            )
+            VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, 0.0, 0, 0, 0, strftime('%s','now'))
+            "#,
+            seller_pk.to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Success order, no one has rated yet
+        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        // Event where sender is the buyer (buyer_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // The seller (counterpart of buyer rating) must have updated reputation
+        let user_row = sqlx::query!(
+            r#"
+            SELECT total_reviews, total_rating, last_rating, min_rating, max_rating
+            FROM users
+            WHERE pubkey = ?1
+            "#,
+            seller_pk.to_string(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(user_row.total_reviews, 1);
+        assert_eq!(user_row.last_rating, 5);
+        assert_eq!(user_row.min_rating, 5);
+        assert_eq!(user_row.max_rating, 5);
+        assert!((user_row.total_rating - 5.0).abs() < f64::EPSILON);
+
+        // Order buyer_sent_rate flag must be set via update_user_rating_event
+        let updated_order = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order not found");
+        assert!(updated_order.buyer_sent_rate);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_updates_seller_and_order_flags() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Counterpart user (buyer) exists in DB so rating can be applied
+        sqlx::query!(
+            r#"
+            INSERT INTO users (
+                pubkey, is_admin, admin_password, is_solver, is_banned,
+                category, last_trade_index, total_reviews, total_rating,
+                last_rating, max_rating, min_rating, created_at
+            )
+            VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, 0.0, 0, 0, 0, strftime('%s','now'))
+            "#,
+            buyer_pk.to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Success order, no one has rated yet
+        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        // Event where sender is the seller (seller_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+        let msg = create_rate_user_message(order.id, 4);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // The buyer (counterpart of seller rating) must have updated reputation
+        let user_row = sqlx::query!(
+            r#"
+            SELECT total_reviews, total_rating, last_rating, min_rating, max_rating
+            FROM users
+            WHERE pubkey = ?1
+            "#,
+            buyer_pk.to_string(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(user_row.total_reviews, 1);
+        assert_eq!(user_row.last_rating, 4);
+        assert_eq!(user_row.min_rating, 4);
+        assert_eq!(user_row.max_rating, 4);
+        assert!((user_row.total_rating - 4.0).abs() < f64::EPSILON);
+
+        // Order seller_sent_rate flag must be set via update_user_rating_event
+        let updated_order = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order not found");
+        assert!(updated_order.seller_sent_rate);
     }
 
     #[test]

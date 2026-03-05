@@ -223,6 +223,8 @@ fn calculate_days_since_creation(created_at: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::Settings;
+    use crate::config::MOSTRO_CONFIG;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
     use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
@@ -230,9 +232,19 @@ mod tests {
     use sqlx_crud::Crud;
     use uuid::Uuid;
 
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(Settings {
+            database: Default::default(),
+            nostr: Default::default(),
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+        });
+    }
+
     async fn create_test_pool() -> SqlitePool {
-        // Use a shared in-memory SQLite database and run migrations so that
-        // tables like `orders` and `users` exist for tests.
+        init_test_settings();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool

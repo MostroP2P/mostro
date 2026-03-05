@@ -67,12 +67,23 @@ jobs:
               return;
             }
             
-            const outcomes = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const total = outcomes.length;
-            const killed = outcomes.filter(o => o.summary === 'Killed' || o.summary === 'CaughtMutant').length;
-            const survived = outcomes.filter(o => o.summary === 'Survived' || o.summary === 'MissedMutant').length;
-            const timeout = outcomes.filter(o => o.summary === 'Timeout').length;
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const outcomes = data.outcomes || [];
+            // Skip the baseline entry (scenario === "Baseline")
+            const mutants = outcomes.filter(o => o.scenario !== 'Baseline');
+            const total = mutants.length;
+            const killed = mutants.filter(o => o.summary === 'CaughtMutant').length;
+            const survived = mutants.filter(o => o.summary === 'MissedMutant').length;
+            const timeout = mutants.filter(o => o.summary === 'Timeout').length;
             const score = total > 0 ? ((killed / total) * 100).toFixed(1) : 0;
+            
+            const survivorList = mutants
+              .filter(o => o.summary === 'MissedMutant')
+              .map(o => {
+                const name = o.scenario?.Mutant?.name || 'unknown';
+                return `- \`${name}\``;
+              })
+              .join('\n') || 'None';
             
             const body = `## 🧬 Mutation Testing Results
             
@@ -89,7 +100,7 @@ jobs:
             <details>
             <summary>Surviving Mutants</summary>
             
-            ${outcomes.filter(o => o.summary === 'Survived' || o.summary === 'MissedMutant').map(o => `- \`${o.mutant}\``).join('\n') || 'None'}
+            ${survivorList}
             
             </details>
             `;
@@ -152,11 +163,11 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f mutants.out/outcomes.json ]; then
-            total=$(jq '. | length' mutants.out/outcomes.json)
-            killed=$(jq '[.[] | select(.summary == "Killed" or .summary == "CaughtMutant")] | length' mutants.out/outcomes.json)
-            survived=$(jq '[.[] | select(.summary == "Survived" or .summary == "MissedMutant")] | length' mutants.out/outcomes.json)
-            timeout=$(jq '[.[] | select(.summary == "Timeout")] | length' mutants.out/outcomes.json)
-            unviable=$(jq '[.[] | select(.summary == "Unviable")] | length' mutants.out/outcomes.json)
+            total=$(jq '[.outcomes[] | select(.scenario != "Baseline")] | length' mutants.out/outcomes.json)
+            killed=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "CaughtMutant")] | length' mutants.out/outcomes.json)
+            survived=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "MissedMutant")] | length' mutants.out/outcomes.json)
+            timeout=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "Timeout")] | length' mutants.out/outcomes.json)
+            unviable=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "Unviable")] | length' mutants.out/outcomes.json)
             
             if [ "$total" -gt 0 ]; then
               score=$(echo "scale=1; ($killed / $total) * 100" | bc)

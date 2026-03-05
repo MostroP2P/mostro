@@ -306,11 +306,8 @@ mod tests {
         let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
 
         // A Success order must not be rejected with InvalidOrderStatus
-        match result {
-            Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) => {
-                panic!("valid Success status must not be rejected");
-            }
-            _ => {}
+        if let Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) = result {
+            panic!("valid Success status must not be rejected");
         }
     }
 

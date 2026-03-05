@@ -69,6 +69,17 @@ pub fn prepare_variables_for_vote(
 /// 7. Creates and saves a new rating event
 /// 8. Updates the database with the new rating information
 /// 9. Sends a confirmation message to the rating user
+/// Calculate the number of days since user creation.
+fn calculate_days_since_creation(created_at: i64) -> u64 {
+    const SECONDS_IN_DAY: u64 = 86_400;
+    let now = Timestamp::now().as_u64();
+    u64::try_from(created_at)
+        .ok()
+        .filter(|ts| *ts > 0)
+        .map(|ts| now.saturating_sub(ts) / SECONDS_IN_DAY)
+        .unwrap_or(0)
+}
+
 pub async fn update_user_reputation_action(
     msg: Message,
     event: &UnwrappedGift,
@@ -149,10 +160,7 @@ pub async fn update_user_reputation_action(
     .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
 
     // Calculate days since user creation and add to rating tags
-    const SECONDS_IN_DAY: u64 = 86_400;
-    let now = Timestamp::now().as_u64();
-    let created_at = u64::try_from(user_to_vote.created_at).unwrap_or(0);
-    let days = now.saturating_sub(created_at) / SECONDS_IN_DAY;
+    let days = calculate_days_since_creation(user_to_vote.created_at);
     let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
     tags.push(Tag::custom(
         TagKind::Custom(std::borrow::Cow::Borrowed("days")),
@@ -360,5 +368,37 @@ mod tests {
         let can_rate_buyer = order.check_status(Status::Success).is_ok()
             || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
         assert!(!can_rate_buyer);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_normal() {
+        let now = Timestamp::now().as_u64();
+        // User created 10 days ago
+        let created_at = (now - 10 * 86_400) as i64;
+        let days = calculate_days_since_creation(created_at);
+        assert_eq!(days, 10);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_zero() {
+        // New user with created_at = 0 should return 0 days
+        let days = calculate_days_since_creation(0);
+        assert_eq!(days, 0);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_negative() {
+        // Corrupted created_at should return 0 days
+        let days = calculate_days_since_creation(-1);
+        assert_eq!(days, 0);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_partial_day() {
+        let now = Timestamp::now().as_u64();
+        // Created 1.5 days ago - should truncate to 1
+        let created_at = (now - 86_400 - 43_200) as i64;
+        let days = calculate_days_since_creation(created_at);
+        assert_eq!(days, 1);
     }
 }

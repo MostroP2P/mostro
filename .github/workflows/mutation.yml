@@ -71,17 +71,45 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const outcomesPath = 'mutants.out/outcomes.json';
+            const path = require('path');
 
+            // Try the expected path first
+            let outcomesPath = path.join('mutants.out', 'outcomes.json');
+
+            // If not found, search under the workspace so we can handle any
+            // unexpected layout changes while still using the results.
             if (!fs.existsSync(outcomesPath)) {
-              console.log('No mutation outcomes file found');
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: '## 🧬 Mutation Testing Results\n\nNo mutants were generated for the changed files in this PR.'
-              });
-              return;
+              const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+
+              /** @param {string} start */
+              function findOutcomes(start) {
+                const entries = fs.readdirSync(start, { withFileTypes: true });
+                for (const entry of entries) {
+                  const full = path.join(start, entry.name);
+                  if (entry.isDirectory()) {
+                    const found = findOutcomes(full);
+                    if (found) return found;
+                  } else if (entry.isFile() && entry.name === 'outcomes.json') {
+                    return full;
+                  }
+                }
+                return null;
+              }
+
+              const found = fs.existsSync(workspace) ? findOutcomes(workspace) : null;
+              if (found) {
+                console.log(`Found outcomes.json at ${found}`);
+                outcomesPath = found;
+              } else {
+                console.log('No mutation outcomes file found (no outcomes.json anywhere under workspace)');
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '## 🧬 Mutation Testing Results\n\nNo mutation outcomes file was found for this run. This usually means no mutants were generated for the changed files or mutation testing did not complete.'
+                });
+                return;
+              }
             }
 
             const data = JSON.parse(fs.readFileSync(outcomesPath, 'utf8'));

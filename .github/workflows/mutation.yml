@@ -55,7 +55,7 @@ jobs:
             file_args="$file_args --file $f"
           done
           echo "Testing mutants in: $changed_rs"
-          cargo mutants $file_args --output mutants.out
+          cargo mutants $file_args
 
       - name: Upload mutation report
         uses: actions/upload-artifact@v4
@@ -180,7 +180,7 @@ jobs:
         run: cargo install cargo-mutants
 
       - name: Run full mutation testing
-        run: cargo mutants --output mutants.out
+        run: cargo mutants
         # Note: Do NOT fail on low score initially (report only mode)
         continue-on-error: true
 

@@ -22,3 +22,4 @@ docker/.env
 CLAUDE.md
 # Mutation testing output
 mutants.out/
+mutants.out.old/

@@ -310,6 +310,7 @@ client.send_event(&new_event).await?;
     ["last_rating", "5"],
     ["min_rating", "3"],
     ["max_rating", "5"],
+    ["days", "21"],
     ["y", "mostro"],
     ["z", "rating"]
   ]

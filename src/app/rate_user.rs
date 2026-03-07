@@ -148,6 +148,15 @@ pub async fn update_user_reputation_action(
     .to_tags()
     .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
 
+    // Calculate days since user creation and add to rating tags
+    let days = calculate_days_since_creation(user_to_vote.created_at);
+    let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
+    tags.push(Tag::custom(
+        TagKind::Custom(std::borrow::Cow::Borrowed("days")),
+        vec![days.to_string()],
+    ));
+    let reputation_event = Tags::from_list(tags);
+
     // Save new rating to db
     if let Err(e) = update_user_rating(
         pool,
@@ -200,15 +209,74 @@ pub async fn update_user_reputation_action(
     Ok(())
 }
 
+/// Calculate the number of days since user creation.
+fn calculate_days_since_creation(created_at: i64) -> u64 {
+    const SECONDS_IN_DAY: u64 = 86_400;
+    let now = Timestamp::now().as_u64();
+    u64::try_from(created_at)
+        .ok()
+        .filter(|ts| *ts > 0)
+        .map(|ts| now.saturating_sub(ts) / SECONDS_IN_DAY)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::Settings;
+    use crate::config::MOSTRO_CONFIG;
+    use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use sqlx::SqlitePool;
+    use sqlx_crud::Crud;
     use uuid::Uuid;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(Settings {
+            database: Default::default(),
+            nostr: Default::default(),
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+        });
+    }
+
+    async fn create_test_pool() -> SqlitePool {
+        init_test_settings();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
 
     fn create_test_keys() -> Keys {
         Keys::generate()
+    }
+
+    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
+        let unsigned_event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            NostrKind::GiftWrap,
+            Vec::new(),
+            "",
+        );
+        UnwrappedGift {
+            sender: pubkey,
+            rumor: unsigned_event,
+        }
+    }
+
+    fn create_rate_user_message(order_id: Uuid, rating: u8) -> Message {
+        let kind = MessageKind::new(
+            Some(order_id),
+            Some(1),
+            None,
+            Action::RateUser,
+            Some(Payload::RatingUser(rating)),
+        );
+        Message::Order(kind)
     }
 
     fn create_test_order(
@@ -225,6 +293,217 @@ mod tests {
             buyer_sent_rate: false,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_allows_success_status() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Event where the sender is the seller (so seller_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+
+        // Insert Success order in DB
+        let order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        // Message pointing to that order id with a valid rating payload
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+
+        // A Success order must not be rejected with InvalidOrderStatus
+        if let Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) = result {
+            panic!("valid Success status must not be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_rejects_settled_hold_invoice_buyer() {
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Event where the sender is the buyer (so buyer_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+
+        // SettledHoldInvoice order in DB
+        let order = create_test_order(Status::SettledHoldInvoice, seller_pk, buyer_pk);
+        let order = order.create(&pool).await.unwrap();
+
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+
+        // Buyer must not be allowed to rate in SettledHoldInvoice status
+        match result {
+            Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) => {}
+            _ => panic!("buyer should not be able to rate SettledHoldInvoice order"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_updates_buyer_and_order_flags() {
+        use crate::db::{add_new_user, is_user_present};
+
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        // Trade keys (ephemeral per-trade)
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Identity keys (master keys, must differ from trade keys)
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
+
+        // Counterpart user (seller identity) exists in DB so rating can be applied
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        // Success order with master keys set (not full-privacy)
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
+        let order = order.create(&pool).await.unwrap();
+
+        // Event where sender is the buyer (buyer_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // The seller (counterpart of buyer rating) must have updated reputation
+        let seller_user = is_user_present(&pool, seller_id).await.unwrap();
+        assert_eq!(seller_user.total_reviews, 1);
+        assert_eq!(seller_user.last_rating, 5);
+        assert_eq!(seller_user.min_rating, 5);
+        assert_eq!(seller_user.max_rating, 5);
+        // First vote uses weight 1/2: total_rating = rating / 2.0
+        assert!((seller_user.total_rating - 2.5).abs() < f64::EPSILON);
+
+        // Order buyer_sent_rate flag must be set via update_user_rating_event
+        let updated_order = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order not found");
+        assert!(updated_order.buyer_sent_rate);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_buyer_already_rated_is_noop() {
+        use crate::db::{add_new_user, is_user_present};
+
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
+
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        // Order where buyer has already rated
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
+        order.buyer_sent_rate = true;
+        let order = order.create(&pool).await.unwrap();
+
+        // Buyer tries to rate again
+        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // Seller reputation must remain unchanged (no double-rating)
+        let seller_user = is_user_present(&pool, seller_id).await.unwrap();
+        assert_eq!(seller_user.total_reviews, 0);
+        assert!((seller_user.total_rating - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_reputation_updates_seller_and_order_flags() {
+        use crate::db::{add_new_user, is_user_present};
+
+        let pool = create_test_pool().await;
+        let keys = create_test_keys();
+
+        // Trade keys (ephemeral per-trade)
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let seller_pk = seller_keys.public_key();
+        let buyer_pk = buyer_keys.public_key();
+
+        // Identity keys (master keys, must differ from trade keys)
+        let seller_id_keys = create_test_keys();
+        let buyer_id_keys = create_test_keys();
+        let seller_id = seller_id_keys.public_key().to_string();
+        let buyer_id = buyer_id_keys.public_key().to_string();
+
+        // Counterpart user (buyer identity) exists in DB so rating can be applied
+        let buyer_user = User {
+            pubkey: buyer_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, buyer_user).await.unwrap();
+
+        // Success order with master keys set (not full-privacy)
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(buyer_id.clone());
+        let order = order.create(&pool).await.unwrap();
+
+        // Event where sender is the seller (seller_rating = true)
+        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+        let msg = create_rate_user_message(order.id, 4);
+
+        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        assert!(result.is_ok());
+
+        // The buyer (counterpart of seller rating) must have updated reputation
+        let buyer_user = is_user_present(&pool, buyer_id).await.unwrap();
+        assert_eq!(buyer_user.total_reviews, 1);
+        assert_eq!(buyer_user.last_rating, 4);
+        assert_eq!(buyer_user.min_rating, 4);
+        assert_eq!(buyer_user.max_rating, 4);
+        // First vote uses weight 1/2: total_rating = rating / 2.0
+        assert!((buyer_user.total_rating - 2.0).abs() < f64::EPSILON);
+
+        // Order seller_sent_rate flag must be set via update_user_rating_event
+        let updated_order = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order not found");
+        assert!(updated_order.seller_sent_rate);
     }
 
     #[test]
@@ -348,5 +627,37 @@ mod tests {
         let can_rate_buyer = order.check_status(Status::Success).is_ok()
             || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
         assert!(!can_rate_buyer);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_normal() {
+        let now = Timestamp::now().as_u64();
+        // User created 10 days ago
+        let created_at = (now - 10 * 86_400) as i64;
+        let days = calculate_days_since_creation(created_at);
+        assert_eq!(days, 10);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_zero() {
+        // New user with created_at = 0 should return 0 days
+        let days = calculate_days_since_creation(0);
+        assert_eq!(days, 0);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_negative() {
+        // Corrupted created_at should return 0 days
+        let days = calculate_days_since_creation(-1);
+        assert_eq!(days, 0);
+    }
+
+    #[test]
+    fn test_calculate_days_since_creation_partial_day() {
+        let now = Timestamp::now().as_u64();
+        // Created 1.5 days ago - should truncate to 1
+        let created_at = (now - 86_400 - 43_200) as i64;
+        let days = calculate_days_since_creation(created_at);
+        assert_eq!(days, 1);
     }
 }

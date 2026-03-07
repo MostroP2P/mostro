@@ -41,10 +41,21 @@ jobs:
       - name: Run mutation testing on changed files
         # Only test mutants in files changed in this PR
         # This gives faster feedback (minutes instead of hours)
+        continue-on-error: true
         run: |
-          # Generate diff file for cargo-mutants
-          git diff origin/${{ github.base_ref }} > changes.diff
-          cargo mutants --in-diff changes.diff --output mutants.out
+          # Collect changed Rust source files (exclude test-only changes)
+          changed_rs=$(git diff --name-only origin/${{ github.base_ref }} -- '*.rs' | grep -v '_test\.rs$' || true)
+          if [ -z "$changed_rs" ]; then
+            echo "No Rust source files changed in this PR"
+            exit 0
+          fi
+          # Build --file flags for each changed file
+          file_args=""
+          for f in $changed_rs; do
+            file_args="$file_args --file $f"
+          done
+          echo "Testing mutants in: $changed_rs"
+          cargo mutants $file_args
 
       - name: Upload mutation report
         uses: actions/upload-artifact@v4
@@ -60,41 +71,86 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = 'mutants.out/outcomes.json';
-            
-            if (!fs.existsSync(path)) {
-              console.log('No mutation outcomes file found');
-              return;
+            const path = require('path');
+
+            // Try the expected path first
+            let outcomesPath = path.join('mutants.out', 'outcomes.json');
+
+            // If not found, search under the workspace so we can handle any
+            // unexpected layout changes while still using the results.
+            if (!fs.existsSync(outcomesPath)) {
+              const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+
+              /** @param {string} start */
+              function findOutcomes(start) {
+                const entries = fs.readdirSync(start, { withFileTypes: true });
+                for (const entry of entries) {
+                  const full = path.join(start, entry.name);
+                  if (entry.isDirectory()) {
+                    const found = findOutcomes(full);
+                    if (found) return found;
+                  } else if (entry.isFile() && entry.name === 'outcomes.json') {
+                    return full;
+                  }
+                }
+                return null;
+              }
+
+              const found = fs.existsSync(workspace) ? findOutcomes(workspace) : null;
+              if (found) {
+                console.log(`Found outcomes.json at ${found}`);
+                outcomesPath = found;
+              } else {
+                console.log('No mutation outcomes file found (no outcomes.json anywhere under workspace)');
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '## 🧬 Mutation Testing Results\n\nNo mutation outcomes file was found for this run. This usually means no mutants were generated for the changed files or mutation testing did not complete.'
+                });
+                return;
+              }
             }
-            
-            const outcomes = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const total = outcomes.length;
-            const killed = outcomes.filter(o => o.summary === 'Killed' || o.summary === 'CaughtMutant').length;
-            const survived = outcomes.filter(o => o.summary === 'Survived' || o.summary === 'MissedMutant').length;
-            const timeout = outcomes.filter(o => o.summary === 'Timeout').length;
+
+            const data = JSON.parse(fs.readFileSync(outcomesPath, 'utf8'));
+            const outcomes = data.outcomes || [];
+            const mutants = outcomes.filter(o => o.scenario !== 'Baseline');
+            const total = mutants.length;
+            const killed = mutants.filter(o => o.summary === 'CaughtMutant').length;
+            const survived = mutants.filter(o => o.summary === 'MissedMutant').length;
+            const timeout = mutants.filter(o => o.summary === 'Timeout').length;
             const score = total > 0 ? ((killed / total) * 100).toFixed(1) : 0;
-            
-            const body = `## 🧬 Mutation Testing Results
-            
-            | Metric | Count |
-            |--------|-------|
-            | Total Mutants | ${total} |
-            | ✅ Killed | ${killed} |
-            | ❌ Survived | ${survived} |
-            | ⏱️ Timeout | ${timeout} |
-            | **Score** | **${score}%** |
-            
-            ${survived > 0 ? '⚠️ **Note:** Some mutants survived. Consider improving tests for the changed code.' : '✅ All mutants killed!'}
-            
-            <details>
-            <summary>Surviving Mutants</summary>
-            
-            ${outcomes.filter(o => o.summary === 'Survived' || o.summary === 'MissedMutant').map(o => `- \`${o.mutant}\``).join('\n') || 'None'}
-            
-            </details>
-            `;
-            
-            github.rest.issues.createComment({
+
+            const survivorList = mutants
+              .filter(o => o.summary === 'MissedMutant')
+              .map(o => {
+                const name = o.scenario?.Mutant?.name || 'unknown';
+                return `- \`${name}\``;
+              })
+              .join('\n') || 'None';
+
+            const body = [
+              '## 🧬 Mutation Testing Results',
+              '',
+              '| Metric | Count |',
+              '|--------|-------|',
+              `| Total Mutants | ${total} |`,
+              `| Killed | ${killed} |`,
+              `| Survived | ${survived} |`,
+              `| Timeout | ${timeout} |`,
+              `| **Score** | **${score}%** |`,
+              '',
+              survived > 0 ? '**Note:** Some mutants survived. Consider improving tests for the changed code.' : 'All mutants killed!',
+              '',
+              '<details>',
+              '<summary>Surviving Mutants</summary>',
+              '',
+              survivorList,
+              '',
+              '</details>'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -124,7 +180,7 @@ jobs:
         run: cargo install cargo-mutants
 
       - name: Run full mutation testing
-        run: cargo mutants --output mutants.out
+        run: cargo mutants
         # Note: Do NOT fail on low score initially (report only mode)
         continue-on-error: true
 
@@ -152,11 +208,11 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f mutants.out/outcomes.json ]; then
-            total=$(jq '. | length' mutants.out/outcomes.json)
-            killed=$(jq '[.[] | select(.summary == "Killed" or .summary == "CaughtMutant")] | length' mutants.out/outcomes.json)
-            survived=$(jq '[.[] | select(.summary == "Survived" or .summary == "MissedMutant")] | length' mutants.out/outcomes.json)
-            timeout=$(jq '[.[] | select(.summary == "Timeout")] | length' mutants.out/outcomes.json)
-            unviable=$(jq '[.[] | select(.summary == "Unviable")] | length' mutants.out/outcomes.json)
+            total=$(jq '[.outcomes[] | select(.scenario != "Baseline")] | length' mutants.out/outcomes.json)
+            killed=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "CaughtMutant")] | length' mutants.out/outcomes.json)
+            survived=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "MissedMutant")] | length' mutants.out/outcomes.json)
+            timeout=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "Timeout")] | length' mutants.out/outcomes.json)
+            unviable=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "Unviable")] | length' mutants.out/outcomes.json)
             
             if [ "$total" -gt 0 ]; then
               score=$(echo "scale=1; ($killed / $total) * 100" | bc)

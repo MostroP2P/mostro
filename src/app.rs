@@ -56,8 +56,8 @@ use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-/// Helper function to log warning messages for action errors
-fn warning_msg(action: &Action, err: ServiceError) {
+/// Log a warning for an action error and return the inner message.
+fn warning_msg(action: &Action, err: ServiceError) -> String {
     let message = match &err {
         ServiceError::EnvVarError(message) => message.to_string(),
         ServiceError::EncryptionError(message) => message.to_string(),
@@ -78,6 +78,14 @@ fn warning_msg(action: &Action, err: ServiceError) {
         err,
         message
     );
+
+    message
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ManagedErrorKind {
+    CantDo,
+    Internal,
 }
 
 /// Function to manage errors and send appropriate messages
@@ -86,7 +94,7 @@ async fn manage_errors(
     inner_message: Message,
     event: UnwrappedGift,
     action: &Action,
-) {
+) -> ManagedErrorKind {
     match e {
         MostroError::MostroCantDo(cause) => {
             enqueue_cant_do_msg(
@@ -95,9 +103,13 @@ async fn manage_errors(
                 cause,
                 event.rumor.pubkey,
             )
-            .await
+            .await;
+            ManagedErrorKind::CantDo
         }
-        MostroError::MostroInternalErr(e) => warning_msg(action, e),
+        MostroError::MostroInternalErr(e) => {
+            warning_msg(action, e);
+            ManagedErrorKind::Internal
+        }
     }
 }
 
@@ -456,67 +468,56 @@ mod tests {
     #[test]
     fn test_warning_msg_all_error_types() {
         let action = Action::NewOrder;
+        let sentinel = "sentinel_value";
 
-        // Test all ServiceError variants
-        warning_msg(&action, ServiceError::EnvVarError("env error".to_string()));
-        warning_msg(
-            &action,
-            ServiceError::EncryptionError("encryption error".to_string()),
-        );
-        warning_msg(
-            &action,
-            ServiceError::DecryptionError("decryption error".to_string()),
-        );
-        warning_msg(&action, ServiceError::IOError("io error".to_string()));
-        warning_msg(
-            &action,
-            ServiceError::UnexpectedError("unexpected error".to_string()),
-        );
-        warning_msg(
-            &action,
-            ServiceError::LnNodeError("ln node error".to_string()),
-        );
-        warning_msg(
-            &action,
-            ServiceError::LnPaymentError("ln payment error".to_string()),
-        );
-        warning_msg(
-            &action,
-            ServiceError::DbAccessError("db access error".to_string()),
-        );
-        warning_msg(&action, ServiceError::NostrError("nostr error".to_string()));
-        warning_msg(
-            &action,
-            ServiceError::HoldInvoiceError("hold invoice error".to_string()),
-        );
+        let variants: Vec<ServiceError> = vec![
+            ServiceError::EnvVarError(sentinel.into()),
+            ServiceError::EncryptionError(sentinel.into()),
+            ServiceError::DecryptionError(sentinel.into()),
+            ServiceError::IOError(sentinel.into()),
+            ServiceError::UnexpectedError(sentinel.into()),
+            ServiceError::LnNodeError(sentinel.into()),
+            ServiceError::LnPaymentError(sentinel.into()),
+            ServiceError::DbAccessError(sentinel.into()),
+            ServiceError::NostrError(sentinel.into()),
+            ServiceError::HoldInvoiceError(sentinel.into()),
+        ];
 
-        // Test default case
-        warning_msg(&action, ServiceError::MessageSerializationError);
+        for variant in variants {
+            assert_eq!(
+                warning_msg(&action, variant),
+                sentinel,
+                "Each message-carrying variant must return its inner text"
+            );
+        }
+
+        assert_eq!(
+            warning_msg(&action, ServiceError::MessageSerializationError),
+            "No message"
+        );
     }
 
     #[tokio::test]
-    async fn test_manage_errors_cant_do() {
-        let message = create_test_message(Action::NewOrder, None);
-        let event = create_test_unwrapped_gift();
+    async fn test_manage_errors_routes_error_variants() {
         let action = Action::NewOrder;
 
-        let error = MostroError::MostroCantDo(CantDoReason::InvalidSignature);
-        manage_errors(error, message, event, &action).await;
+        let cant_do = manage_errors(
+            MostroError::MostroCantDo(CantDoReason::InvalidSignature),
+            create_test_message(Action::NewOrder, None),
+            create_test_unwrapped_gift(),
+            &action,
+        )
+        .await;
+        assert_eq!(cant_do, ManagedErrorKind::CantDo);
 
-        // No-op: ensure no panic
-    }
-
-    #[tokio::test]
-    async fn test_manage_errors_internal_error() {
-        let message = create_test_message(Action::NewOrder, None);
-        let event = create_test_unwrapped_gift();
-        let action = Action::NewOrder;
-
-        let error =
-            MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string()));
-        manage_errors(error, message, event, &action).await;
-
-        // No-op: ensure no panic
+        let internal = manage_errors(
+            MostroError::MostroInternalErr(ServiceError::UnexpectedError("test error".to_string())),
+            create_test_message(Action::NewOrder, None),
+            create_test_unwrapped_gift(),
+            &action,
+        )
+        .await;
+        assert_eq!(internal, ManagedErrorKind::Internal);
     }
 
     mod check_trade_index_tests {
@@ -524,7 +525,75 @@ mod tests {
         use sqlx::SqlitePool;
 
         async fn create_test_pool() -> SqlitePool {
-            SqlitePool::connect(":memory:").await.unwrap()
+            let pool = SqlitePool::connect(":memory:").await.unwrap();
+            sqlx::query(
+                r#"
+                CREATE TABLE users (
+                    pubkey char(64) primary key not null,
+                    is_admin integer not null default 0,
+                    admin_password char(64),
+                    is_solver integer not null default 0,
+                    is_banned integer not null default 0,
+                    category integer not null default 0,
+                    last_trade_index integer not null default 0,
+                    total_reviews integer not null default 0,
+                    total_rating real not null default 0.0,
+                    last_rating integer not null default 0,
+                    max_rating integer not null default 0,
+                    min_rating integer not null default 0,
+                    created_at integer not null
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool
+        }
+
+        async fn insert_user(pool: &SqlitePool, pubkey: &str, last_trade_index: i64) {
+            sqlx::query(
+                r#"
+                INSERT INTO users (
+                    pubkey, is_admin, admin_password, is_solver, is_banned, category,
+                    last_trade_index, total_reviews, total_rating, last_rating,
+                    max_rating, min_rating, created_at
+                ) VALUES (?1, 0, NULL, 0, 0, 0, ?2, 0, 0.0, 0, 0, 0, 0)
+                "#,
+            )
+            .bind(pubkey)
+            .bind(last_trade_index)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        fn create_event_with_content(
+            sender: nostr_sdk::PublicKey,
+            rumor_pubkey: nostr_sdk::PublicKey,
+            content: String,
+        ) -> UnwrappedGift {
+            let unsigned_event = UnsignedEvent::new(
+                rumor_pubkey,
+                Timestamp::now(),
+                NostrKind::GiftWrap,
+                Vec::new(),
+                content,
+            );
+            UnwrappedGift {
+                sender,
+                rumor: unsigned_event,
+            }
+        }
+
+        fn make_parseable_signature() -> Signature {
+            use nostr_sdk::secp256k1::{Keypair, Message as SecpMessage, Secp256k1, SecretKey};
+
+            let secp = Secp256k1::new();
+            let keypair =
+                Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[1u8; 32]).unwrap());
+            let digest = SecpMessage::from_digest([2u8; 32]);
+            secp.sign_schnorr_no_aux_rand(&digest, &keypair)
         }
 
         #[tokio::test]
@@ -538,26 +607,108 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_check_trade_index_trading_action_no_index() {
+        async fn test_check_trade_index_rejects_bad_payload_for_existing_user() {
             let pool = create_test_pool().await;
-            let event = create_test_unwrapped_gift();
-            let message = create_test_message(Action::NewOrder, None);
+            let keys = create_test_keys();
+            let sender = keys.public_key();
+            insert_user(&pool, &sender.to_string(), 1).await;
+
+            let message = create_test_message(Action::NewOrder, Some(2));
+            let event = create_event_with_content(
+                sender,
+                create_test_keys().public_key(),
+                "not-valid-json".to_string(),
+            );
 
             let result = check_trade_index(&pool, &event, &message).await;
-            assert!(result.is_ok());
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroInternalErr(
+                    ServiceError::MessageSerializationError
+                ))
+            ));
         }
 
         #[tokio::test]
-        async fn test_check_trade_index_with_valid_index() {
+        async fn test_check_trade_index_rejects_non_increasing_trade_index() {
             let pool = create_test_pool().await;
-            let event = create_test_unwrapped_gift();
-            let message = create_test_message(Action::NewOrder, Some(1));
+            let keys = create_test_keys();
+            let sender = keys.public_key();
+            insert_user(&pool, &sender.to_string(), 5).await;
 
-            // This test would require database setup and user creation
-            // For now, we test the structure
+            let message = create_test_message(Action::NewOrder, Some(5));
+            let sig = make_parseable_signature();
+            let content = serde_json::to_string(&(message.clone(), sig)).unwrap();
+            let event = create_event_with_content(sender, create_test_keys().public_key(), content);
+
             let result = check_trade_index(&pool, &event, &message).await;
-            // Result could be Ok or Err depending on database state
-            assert!(result.is_ok() || result.is_err());
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex))
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_check_trade_index_rejects_invalid_signature() {
+            let pool = create_test_pool().await;
+            let keys = create_test_keys();
+            let sender = keys.public_key();
+            insert_user(&pool, &sender.to_string(), 1).await;
+
+            let message = create_test_message(Action::NewOrder, Some(2));
+            let sig = make_parseable_signature();
+            let content = serde_json::to_string(&(message.clone(), sig)).unwrap();
+            let event = create_event_with_content(sender, create_test_keys().public_key(), content);
+
+            let result = check_trade_index(&pool, &event, &message).await;
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature))
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_check_trade_index_new_user_rules() {
+            let pool = create_test_pool().await;
+
+            // New user cannot use index 0.
+            let zero_index_message = create_test_message(Action::NewOrder, Some(0));
+            let zero_index_event = create_event_with_content(
+                create_test_keys().public_key(),
+                create_test_keys().public_key(),
+                String::new(),
+            );
+            let zero_index_result =
+                check_trade_index(&pool, &zero_index_event, &zero_index_message).await;
+            assert!(matches!(
+                zero_index_result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex))
+            ));
+
+            // If sender equals rumor pubkey, no user is created.
+            let same_keys = create_test_keys();
+            let same_pubkey = same_keys.public_key();
+            let same_event = create_event_with_content(same_pubkey, same_pubkey, String::new());
+            let no_create_message = create_test_message(Action::NewOrder, Some(7));
+            assert!(check_trade_index(&pool, &same_event, &no_create_message)
+                .await
+                .is_ok());
+            assert!(is_user_present(&pool, same_pubkey.to_string())
+                .await
+                .is_err());
+
+            // If sender differs from rumor pubkey, create user with sender/index values.
+            let sender = create_test_keys().public_key();
+            let rumor = create_test_keys().public_key();
+            let create_event = create_event_with_content(sender, rumor, String::new());
+            let create_message = create_test_message(Action::NewOrder, Some(9));
+            assert!(check_trade_index(&pool, &create_event, &create_message)
+                .await
+                .is_ok());
+
+            let created_user = is_user_present(&pool, sender.to_string()).await.unwrap();
+            assert_eq!(created_user.pubkey, sender.to_string());
+            assert_eq!(created_user.last_trade_index, 9);
         }
     }
 

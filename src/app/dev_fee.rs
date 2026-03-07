@@ -165,7 +165,7 @@ async fn verify_confirmed_orders(
             continue;
         }
 
-        match check_dev_fee_payment_status(&real_hash_order, pool, ln_client).await {
+        match check_dev_fee_payment_status(&real_hash_order, ln_client).await {
             DevFeePaymentState::Succeeded => {
                 confirmed.insert(order_id);
             }
@@ -225,7 +225,7 @@ async fn recover_partial_payments(
             order_id, existing_hash
         );
 
-        match check_dev_fee_payment_status(&hash_order, pool, ln_client).await {
+        match check_dev_fee_payment_status(&hash_order, ln_client).await {
             DevFeePaymentState::Succeeded => {
                 info!(
                     "Order {} payment already succeeded (hash {}), marking as paid",
@@ -380,7 +380,7 @@ async fn process_new_dev_fee_payments(
         // STEP 3: Send payment with pre-resolved invoice.
         match tokio::time::timeout(
             std::time::Duration::from_secs(50),
-            send_dev_fee_payment(&order, &payment_request),
+            send_dev_fee_payment(&order, &payment_request, ln_client),
         )
         .await
         {
@@ -497,12 +497,19 @@ async fn handle_payment_timeout(
         order_id, dev_fee
     );
 
-    match check_dev_fee_payment_status(order, pool, ln_client).await {
+    match check_dev_fee_payment_status(order, ln_client).await {
         DevFeePaymentState::Succeeded => {
             info!(
                 "Payment actually succeeded for order {} despite timeout",
                 order_id
             );
+            order.dev_fee_paid = true;
+            if let Err(e) = order.clone().update(pool).await {
+                error!(
+                    "Payment succeeded but failed to update DB for order {}: {:?}",
+                    order_id, e
+                );
+            }
             confirmed.insert(order_id);
         }
         DevFeePaymentState::InFlight => {
@@ -562,11 +569,9 @@ enum DevFeePaymentState {
 
 /// Check the actual payment status on the LN node for a dev fee payment.
 ///
-/// If the payment succeeded, marks the order as paid in the DB.
-/// Returns the current payment state so the caller can decide whether to reset.
+/// Returns the current payment state so the caller can decide what to do.
 async fn check_dev_fee_payment_status(
     order: &Order,
-    pool: &SqlitePool,
     ln_client: &mut LndConnector,
 ) -> DevFeePaymentState {
     use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
@@ -601,23 +606,7 @@ async fn check_dev_fee_payment_status(
     .await
     {
         Ok(Ok(status)) => match status {
-            PaymentStatus::Succeeded => {
-                let order_id = order.id;
-                let mut order = order.clone();
-                order.dev_fee_paid = true;
-                if let Err(e) = order.update(pool).await {
-                    error!(
-                        "Payment succeeded but failed to update DB for order {}: {:?}",
-                        order_id, e
-                    );
-                } else {
-                    info!(
-                        "Order {} dev fee payment confirmed via LN status check",
-                        order_id
-                    );
-                }
-                DevFeePaymentState::Succeeded
-            }
+            PaymentStatus::Succeeded => DevFeePaymentState::Succeeded,
             PaymentStatus::InFlight => DevFeePaymentState::InFlight,
             PaymentStatus::Failed => DevFeePaymentState::Failed,
             _ => DevFeePaymentState::Unknown,
@@ -761,6 +750,7 @@ pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), 
 pub async fn send_dev_fee_payment(
     order: &Order,
     payment_request: &str,
+    ln_client: &mut LndConnector,
 ) -> Result<String, MostroError> {
     use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 
@@ -773,7 +763,6 @@ pub async fn send_dev_fee_payment(
         return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
 
-    let mut ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     tokio::time::timeout(

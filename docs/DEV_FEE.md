@@ -29,8 +29,8 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 
 **Implemented Components:**
 
-- `calculate_dev_fee()` pure function in `src/util.rs` (lines 167-170)
-- `get_dev_fee()` wrapper function in `src/util.rs` (lines 176-179)
+- `calculate_dev_fee()` pure function in `src/util.rs`
+- `get_dev_fee()` wrapper function in `src/util.rs`
 - Dev fee calculation (total amount paid by mostrod from its earnings)
 - Integration in message amount calculations across 4 critical locations
 - Unit tests for fee calculation logic (4 tests passing)

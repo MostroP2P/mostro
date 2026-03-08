@@ -418,6 +418,7 @@ async fn process_new_dev_fee_payments(
                     "Failed to store payment hash for order {}: {:?}",
                     order_id, e
                 );
+                release_pending_claim(pool, order_id, &pending_marker).await;
                 continue;
             }
             Ok(updated_order) => {
@@ -595,15 +596,22 @@ async fn handle_payment_timeout(
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
+/// Logs if the UPDATE fails (e.g. transient DB error).
 async fn release_pending_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_marker: &str) {
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE orders SET dev_fee_payment_hash = NULL
          WHERE id = ? AND dev_fee_payment_hash = ?",
     )
     .bind(order_id)
     .bind(pending_marker)
     .execute(pool)
-    .await;
+    .await
+    {
+        error!(
+            "Failed to release PENDING claim for order {}: {:?}",
+            order_id, e
+        );
+    }
 }
 
 /// Possible states of a dev fee payment after checking the LN node.
@@ -694,7 +702,10 @@ pub(crate) async fn try_claim_order_for_dev_fee(
 ) -> Result<bool, MostroError> {
     let result = sqlx::query(
         "UPDATE orders SET dev_fee_payment_hash = ?
-         WHERE id = ? AND dev_fee_paid = 0
+         WHERE id = ?
+           AND (status = 'settled-hold-invoice' OR status = 'success')
+           AND dev_fee > 0
+           AND dev_fee_paid = 0
            AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')",
     )
     .bind(pending_marker)

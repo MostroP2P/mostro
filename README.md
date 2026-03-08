@@ -1,8 +1,8 @@
 # Mostro 🧌
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.86%2B-blue.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.15.6-green.svg)](https://github.com/MostroP2P/mostro/releases)
+[![Rust Version](https://img.shields.io/badge/rust-1.93.0%2B-blue.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
 

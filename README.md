@@ -329,7 +329,7 @@ Mostro supports three deployment methods. For production deployments, see [INSTA
 ### Prerequisites
 
 **All Methods**:
-- Rust 1.86+ (for native builds)
+- Rust 1.93.0+ (for native builds)
 - Lightning Network node (LND required)
   - Recommended: [Polar](https://lightningpolar.com/) for local testing
   - Production: Full LND node with adequate liquidity
@@ -818,7 +818,7 @@ cd mostro
 
 2. **Install development tools**:
 ```bash
-# Rust toolchain (1.86+)
+# Rust toolchain (1.93.0+)
 rustup update stable
 
 # SQLx CLI (for database migrations)

@@ -14,9 +14,9 @@ The most likely trigger: the "real-hash cleanup" section reset an order's `dev_f
 
 ### Layer 1: Idempotency Check (Primary Defense)
 
-**File:** `src/scheduler.rs` — new section before `find_unpaid_dev_fees()`
+**File:** `src/app/dev_fee.rs` — within `run_dev_fee_cycle()`, before processing unpaid orders
 
-Before resolving any new LNURL invoices, the scheduler queries orders that have a real payment hash but `dev_fee_paid = 0` (partial success state). For each:
+Before resolving any new LNURL invoices, the dev fee cycle queries orders that have a real payment hash but `dev_fee_paid = 0` (partial success state). For each:
 
 | LND Status | Action |
 |---|---|
@@ -31,7 +31,7 @@ This ensures we **never resolve a second LNURL invoice while an existing payment
 
 ### Layer 2: Atomic Claim Guard (Secondary Defense)
 
-**File:** `src/scheduler.rs` — within the `find_unpaid_dev_fees()` processing loop
+**File:** `src/app/dev_fee.rs` — within the `run_dev_fee_cycle()` processing loop
 
 Before resolving a new LNURL invoice for orders with no existing hash, atomically claim the order:
 
@@ -57,7 +57,7 @@ Orders with a PENDING marker or real hash are never picked up by `find_unpaid_de
 
 ### Layer 4: Conservative Reset (Safety Net)
 
-**File:** `src/scheduler.rs` — real-hash cleanup section
+**File:** `src/app/dev_fee.rs` — real-hash cleanup section (within `run_dev_fee_cycle()`)
 
 The "real-hash cleanup" handles orders with `dev_fee_paid=1` and a real payment hash. When LND reports `Failed` for these orders, the system **no longer resets them**. Instead it logs a warning and leaves the order unchanged. This is the conservative path because `dev_fee_paid=1` means the payment was previously confirmed — a `Failed` status from LND may be a false negative due to indexing delays.
 
@@ -110,7 +110,8 @@ The last scenario is what caused the original bug. Previously, the order would b
 
 | File | Changes |
 |---|---|
-| `src/scheduler.rs` | Idempotency check (Option A), atomic claim (Option B), conservative reset |
+| `src/app/dev_fee.rs` | Idempotency check (Layer 1), atomic claim (Layer 2), conservative reset (Layer 4); scheduler calls `run_dev_fee_cycle()` |
+| `src/scheduler.rs` | Calls `run_dev_fee_cycle()` once per tick; no dev fee state-machine logic |
 | `src/db.rs` | Updated `find_unpaid_dev_fees()` query filter |
 | `docs/FIX_DUPLICATE_DEV_FEE.md` | This documentation |
 

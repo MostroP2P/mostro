@@ -26,9 +26,9 @@ See [Issue #568](https://github.com/MostroP2P/mostro/issues/568) for full detail
 
 ## Solution
 
-### Two-phase payment flow (`src/app/release.rs`, `src/scheduler.rs`)
+### Two-phase payment flow (`src/app/dev_fee.rs`)
 
-The dev fee payment is split into two phases:
+The dev fee payment is split into two phases (both implemented in `src/app/dev_fee.rs`; the scheduler calls `run_dev_fee_cycle()` once per tick):
 
 1. **Resolve phase** (`resolve_dev_fee_invoice`): LNURL resolution + invoice
    decode to extract the real LN payment hash.
@@ -44,7 +44,7 @@ available for querying LND.
 Queries the LN node for the current status of a payment using `TrackPaymentV2`.
 Returns the LND `PaymentStatus` enum (Succeeded, InFlight, Failed, Unknown).
 
-### `check_dev_fee_payment_status()` (`src/scheduler.rs`)
+### `check_dev_fee_payment_status()` (`src/app/dev_fee.rs`)
 
 Helper that:
 1. Extracts the payment hash from the order (skips `PENDING-` markers, which
@@ -60,7 +60,7 @@ remains only for backward compatibility with legacy markers from before this
 change — those correctly return `DevFeePaymentState::Unknown` since there is
 genuinely no trackable hash.
 
-### Timeout handler in `job_process_dev_fee_payment()` (`src/scheduler.rs`)
+### Timeout handler in `run_dev_fee_cycle()` (`src/app/dev_fee.rs`)
 
 Instead of unconditionally resetting on timeout:
 
@@ -71,9 +71,9 @@ Instead of unconditionally resetting on timeout:
 | **Failed** | Safe to reset `dev_fee_paid = false` and retry |
 | **Unknown** | Skip reset to err on the side of caution (avoid duplicate) |
 
-### Stale real-hash cleanup (`src/scheduler.rs`)
+### Stale real-hash cleanup (`src/app/dev_fee.rs`)
 
-A cleanup pass runs each cycle for orders that have `dev_fee_paid = true` and a
+A cleanup pass runs each cycle (inside `run_dev_fee_cycle()`) for orders that have `dev_fee_paid = true` and a
 real (non-PENDING) payment hash. This handles crash recovery: if the process
 crashes between storing the hash and receiving LND confirmation, the cleanup
 queries LND and resets failed payments for retry.
@@ -88,7 +88,6 @@ failed.
 ## Related
 
 - Issue: [#568](https://github.com/MostroP2P/mostro/issues/568)
-- Dev fee invoice resolution: `src/app/release.rs` (`resolve_dev_fee_invoice`)
-- Dev fee payment send: `src/app/release.rs` (`send_dev_fee_payment`)
-- Dev fee scheduler: `src/scheduler.rs` (`job_process_dev_fee_payment`)
+- Dev fee lifecycle (resolve, send, timeout, cleanup): `src/app/dev_fee.rs` (`run_dev_fee_cycle`, `resolve_dev_fee_invoice`, `send_dev_fee_payment`)
+- Scheduler entry point: `src/scheduler.rs` (`job_process_dev_fee_payment` calls `run_dev_fee_cycle`)
 - Dev fee documentation: `docs/DEV_FEE.md`

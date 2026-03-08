@@ -224,6 +224,7 @@ async fn check_trade_index(
 /// * `my_keys` - Node keypair for signing/verification
 /// * `pool` - Database connection pool
 /// * `ln_client` - Lightning network connector
+#[mutants::skip] // Uses LND; lightning/ excluded from mutation in .mutants.toml
 async fn handle_message_action(
     action: &Action,
     msg: Message,
@@ -726,6 +727,7 @@ mod tests {
                 Action::Release,
                 Action::AddInvoice,
                 Action::PayInvoice,
+                Action::LastTradeIndex,
                 Action::Dispute,
                 Action::RateUser,
                 Action::Cancel,
@@ -734,12 +736,11 @@ mod tests {
                 Action::AdminAddSolver,
                 Action::AdminTakeDispute,
                 Action::TradePubkey,
+                Action::RestoreSession,
+                Action::Orders,
             ];
 
-            // Verify we have handlers for all action types
             for action in actions {
-                // In a real test, we would verify each action is properly routed
-                // This test ensures we don't forget to handle new actions
                 match action {
                     Action::NewOrder
                     | Action::TakeSell
@@ -747,6 +748,7 @@ mod tests {
                     | Action::FiatSent
                     | Action::Release
                     | Action::AddInvoice
+                    | Action::LastTradeIndex
                     | Action::Dispute
                     | Action::RateUser
                     | Action::Cancel
@@ -754,15 +756,11 @@ mod tests {
                     | Action::AdminSettle
                     | Action::AdminAddSolver
                     | Action::AdminTakeDispute
-                    | Action::TradePubkey => {}
-                    Action::PayInvoice => {
-                        // This action is marked as todo!()
-                        // No-op
-                    }
-                    _ => {
-                        // Any unhandled actions should be caught here
-                        // No-op
-                    }
+                    | Action::TradePubkey
+                    | Action::RestoreSession
+                    | Action::Orders => {}
+                    Action::PayInvoice => {}
+                    _ => {}
                 }
             }
         }

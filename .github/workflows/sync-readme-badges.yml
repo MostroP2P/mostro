@@ -1,0 +1,48 @@
+# Sync README Rust badge with rust-toolchain.toml when the toolchain changes.
+# Version badge is already dynamic (crates.io); this keeps the Rust version in sync.
+name: Sync README Rust badge
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read Rust channel from rust-toolchain.toml
+        id: channel
+        run: |
+          CHANNEL=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [ -z "${CHANNEL}" ]; then
+            echo "::error::rust-toolchain.toml: could not extract 'channel'; got empty value. Check the file format."
+            exit 1
+          fi
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Rust badge in README
+        run: |
+          CHANNEL="${{ steps.channel.outputs.channel }}"
+          sed -i "s|badge/rust-[0-9.]*%2B-blue|badge/rust-${CHANNEL}%2B-blue|" README.md
+
+      - name: Commit and push if README changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --exit-code README.md || {
+            git add README.md
+            git commit -m "docs: sync README Rust badge with rust-toolchain.toml (${CHANNEL})"
+            git push
+          }
+        env:
+          CHANNEL: ${{ steps.channel.outputs.channel }}

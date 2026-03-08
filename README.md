@@ -1,8 +1,8 @@
 # Mostro 🧌
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.86%2B-blue.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-0.15.6-green.svg)](https://github.com/MostroP2P/mostro/releases)
+[![Rust Version](https://img.shields.io/badge/rust-1.93.0%2B-blue.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
 
@@ -329,7 +329,7 @@ Mostro supports three deployment methods. For production deployments, see [INSTA
 ### Prerequisites
 
 **All Methods**:
-- Rust 1.86+ (for native builds)
+- Rust 1.93.0+ (for native builds)
 - Lightning Network node (LND required)
   - Recommended: [Polar](https://lightningpolar.com/) for local testing
   - Production: Full LND node with adequate liquidity
@@ -818,7 +818,7 @@ cd mostro
 
 2. **Install development tools**:
 ```bash
-# Rust toolchain (1.86+)
+# Rust toolchain (1.93.0+)
 rustup update stable
 
 # SQLx CLI (for database migrations)

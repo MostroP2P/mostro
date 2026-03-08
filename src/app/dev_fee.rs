@@ -42,9 +42,10 @@
 //! 2. **Resolve** — LNURL resolution for the dev fee lightning address yields
 //!    a payment request and the real payment hash. On failure or timeout,
 //!    the PENDING claim is released so the order can be retried later.
-//! 3. **Store hash** — The real hash and `dev_fee_paid = true` are written
-//!    to the DB *before* sending the payment. If the daemon crashes after
-//!    this, Phase 3 will find the hash and verify with LND on the next run.
+//! 3. **Store hash** — The real hash is written to the DB (with
+//!    `dev_fee_paid` still false) *before* sending the payment. If the daemon
+//!    crashes after this, Phase 3 will find the hash and verify with LND on
+//!    the next run.
 //! 4. **Send payment** — Lightning payment is sent (50s timeout). Outcome:
 //!    - **Success** — DB is updated to reflect payment, order is added to
 //!      `confirmed`, and an audit event may be published.
@@ -402,14 +403,13 @@ async fn process_new_dev_fee_payments(
             }
         };
 
-        // STEP 2: Store real payment hash BEFORE sending payment.
+        // STEP 2: Store real payment hash BEFORE sending payment (leave dev_fee_paid false).
         // If daemon crashes after this point, Phase 3 will find the hash
         // on the next cycle and verify with LND.
         info!(
             "Storing payment hash {} for order {}",
             payment_hash_hex, order_id
         );
-        order.dev_fee_paid = true;
         order.dev_fee_payment_hash = Some(payment_hash_hex.clone());
 
         let mut order = match order.update(pool).await {
@@ -464,6 +464,8 @@ async fn handle_payment_success(
         );
         order.dev_fee_payment_hash = Some(payment_hash.to_string());
     }
+    // We only set dev_fee_paid to true if the payment hash is correct
+    order.dev_fee_paid = true;
 
     info!("Payment succeeded for order {}, verifying DB", order_id);
 

@@ -1,13 +1,62 @@
 //! Dev fee payment processing.
 //!
-//! Handles the full lifecycle of development fee payments:
-//! - Resolving LNURL invoices
-//! - Sending Lightning payments
-//! - Crash recovery (stale PENDING markers, partial payments)
-//! - Idempotency checks to prevent duplicate payments (#620)
+//! Handles the full lifecycle of development fee payments: resolving LNURL
+//! invoices, sending Lightning payments, crash recovery, and idempotency
+//! checks to prevent duplicate payments (#620). The scheduler calls
+//! [`run_dev_fee_cycle`] once per tick; all state‑machine logic lives here.
 //!
-//! The scheduler calls [`run_dev_fee_cycle`] once per tick; all state‑machine
-//! logic lives here so the scheduler stays a thin orchestrator.
+//! # Full cycle of dev fee payment
+//!
+//! Each tick runs four phases in order. Later phases rely on DB state left
+//! by earlier ones.
+//!
+//! ## Phase 1: Stale PENDING cleanup
+//!
+//! Orders with `dev_fee_payment_hash` like `PENDING-{uuid}-{ts}` older than
+//! 5 minutes are reset (hash cleared, `dev_fee_paid = false`). They become
+//! eligible again for Phase 4 so a fresh payment can be attempted.
+//!
+//! ## Phase 2: Verify confirmed orders
+//!
+//! Orders already marked `dev_fee_paid = 1` with a real (non-PENDING) hash
+//! are re-checked against the LN node. On daemon restart the in-memory
+//! `confirmed` set is empty, so every paid order is verified once. If LN
+//! reports success, the order is added to `confirmed`. Failed/Unknown are
+//! not reset to avoid duplicate payments (LNURL gives a new invoice each time).
+//!
+//! ## Phase 3: Recover partial payments
+//!
+//! Orders with a real payment hash but `dev_fee_paid = 0` are “partial”:
+//! the daemon stored the hash and then crashed before LND confirmed. This
+//! phase checks LN status for that hash. If **Succeeded**, the order is
+//! updated to paid and added to `confirmed`. If **Failed**, the hash is
+//! cleared so the next cycle can retry with a new invoice. InFlight/Unknown
+//! are left as-is to avoid duplicate payment risk.
+//!
+//! ## Phase 4: Process new dev fee payments
+//!
+//! Orders with no existing payment hash (or empty/PENDING) are processed:
+//!
+//! 1. **Claim** — Atomic DB update sets `dev_fee_payment_hash` to a unique
+//!    `PENDING-{uuid}-{ts}` so only one scheduler cycle owns the order.
+//! 2. **Resolve** — LNURL resolution for the dev fee lightning address yields
+//!    a payment request and the real payment hash. On failure or timeout,
+//!    the PENDING claim is released so the order can be retried later.
+//! 3. **Store hash** — The real hash and `dev_fee_paid = true` are written
+//!    to the DB *before* sending the payment. If the daemon crashes after
+//!    this, Phase 3 will find the hash and verify with LND on the next run.
+//! 4. **Send payment** — Lightning payment is sent (50s timeout). Outcome:
+//!    - **Success** — DB is updated to reflect payment, order is added to
+//!      `confirmed`, and an audit event may be published.
+//!    - **Failure** — `dev_fee_paid` is set false and DB updated; hash is
+//!      kept so the idempotency check (Phase 3 next cycle) can verify with LND.
+//!    - **Timeout** — LN status is checked; if Succeeded, order is updated
+//!      and confirmed; if Failed, hash is cleared for retry; InFlight/Unknown
+//!      leave the hash in place to avoid duplicates.
+//!
+//! Key principle: the real payment hash is always stored before sending, and
+//! recovery paths (Phase 3 and timeout handling) query LND by that hash
+//! instead of resolving a new invoice, preventing double payment.
 
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;

@@ -51,8 +51,7 @@ Helper that:
    are legacy placeholders that cannot be tracked on LND)
 2. Decodes the hex hash to bytes
 3. Queries LND with a 10-second timeout
-4. If payment succeeded: marks order as paid in DB
-5. Returns a `DevFeePaymentState` enum for the caller
+4. Returns a `DevFeePaymentState` enum for the caller
 
 With the two-phase flow, new payments always have a real hash stored before
 sending, so step 1 passes through to the LND query. The `PENDING-` guard

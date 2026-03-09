@@ -8,6 +8,7 @@ pub mod admin_cancel; // Admin order cancellation
 pub mod admin_settle; // Admin dispute settlement
 pub mod admin_take_dispute; // Admin dispute handling
 pub mod cancel; // User order cancellation
+pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;

@@ -902,11 +902,25 @@ mod tests {
         cleanup_stale_pending_markers, handle_payment_failure, handle_payment_success,
         parse_pending_timestamp, release_pending_claim, try_claim_order_for_dev_fee,
     };
+    use crate::config::settings::Settings;
+    use crate::config::MOSTRO_CONFIG;
     use mostro_core::error::MostroError;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashSet;
 
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(Settings {
+            database: Default::default(),
+            nostr: Default::default(),
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+        });
+    }
+
     async fn setup_orders_db() -> sqlx::SqlitePool {
+        init_test_settings();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")

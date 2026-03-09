@@ -26,8 +26,8 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 2: Fee Calculation ✅ COMPLETE
 
 **Implemented Components:**
-- `calculate_dev_fee()` pure function in `src/util.rs` (lines 167-170)
-- `get_dev_fee()` wrapper function in `src/util.rs` (lines 176-179)
+- `calculate_dev_fee()` pure function in `src/util.rs`
+- `get_dev_fee()` wrapper function in `src/util.rs`
 - Dev fee calculation (total amount paid by mostrod from its earnings)
 - Integration in message amount calculations across 4 critical locations
 - Unit tests for fee calculation logic (4 tests passing)
@@ -43,9 +43,9 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 3: Payment Execution ✅ COMPLETE
 
 **Implemented Components:**
-- `send_dev_fee_payment()` function in `src/app/release.rs` (lines 564-678)
-- Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs` (lines 511-608)
-- Database query function `find_unpaid_dev_fees()` in `src/db.rs` (lines 895-908)
+- `send_dev_fee_payment()` function in `src/app/release.rs`
+- Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
+- Database query function `find_unpaid_dev_fees()` in `src/db.rs`
 - **Database field updates:**
   - `dev_fee`: Always set to 0 at order creation, calculated when order is taken (unified for all order types)
   - `dev_fee_paid`: Changed from 0 to 1 after successful payment in scheduler
@@ -177,7 +177,7 @@ dev_fee_percentage = 0.30
 
 Two-function approach in `src/util.rs`:
 
-1. **Pure calculation function** (lines 167-170):
+1. **Pure calculation function**:
 ```rust
 /// Pure function for calculating dev fee - useful for testing
 pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
@@ -186,7 +186,7 @@ pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
 }
 ```
 
-2. **Settings wrapper** (lines 176-179):
+2. **Settings wrapper**:
 ```rust
 /// Wrapper that uses configured dev_fee_percentage from Settings
 pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
@@ -320,8 +320,8 @@ WHERE status = 'pending'
 When ANY order is taken (both fixed price and market price), the `dev_fee` is calculated. This ensures consistent behavior across all order types.
 
 **Locations:**
-- `/home/negrunch/dev/mostro/src/app/take_buy.rs` (lines 52-68)
-- `/home/negrunch/dev/mostro/src/app/take_sell.rs` (lines 104-120)
+- `/home/negrunch/dev/mostro/src/app/take_buy.rs`
+- `/home/negrunch/dev/mostro/src/app/take_sell.rs`
 
 **Actual Implementation (take_buy.rs and take_sell.rs):**
 ```rust
@@ -400,12 +400,12 @@ Order Completes:
 
 **Two Reset Paths:**
 
-1. **Explicit Cancellation** (`src/app/cancel.rs::reset_api_quotes()` lines 18-25):
+1. **Explicit Cancellation** (`src/app/cancel.rs::reset_api_quotes()`):
    - Taker explicitly calls cancel action
    - Resets: `amount = 0`, `fee = 0`, `dev_fee = 0`
    - Status: ✅ Implemented
 
-2. **Automatic Timeout** (`src/scheduler.rs::job_cancel_orders()` lines 354-358):
+2. **Automatic Timeout** (`src/scheduler.rs::job_cancel_orders()`):
    - Scheduler detects taker hasn't proceeded within `expiration_seconds`
    - Resets: `amount = 0`, `fee = 0`, `dev_fee = 0`
    - Status: ✅ Implemented
@@ -436,8 +436,8 @@ Order Re-taken at BTC=$52,000 (price increased):
 ```
 
 **Implementation Details:**
-- `src/app/cancel.rs` lines 18-25: `reset_api_quotes()` function
-- `src/scheduler.rs` lines 354-358: Automatic timeout handler in `job_cancel_orders()`
+- `src/app/cancel.rs`: `reset_api_quotes()` function
+- `src/scheduler.rs`: Automatic timeout handler in `job_cancel_orders()`
 - Both paths use same logic:
   ```rust
   if order.price_from_api {
@@ -476,7 +476,7 @@ to the database.
 
 **Current State:** ✅ IMPLEMENTED - Hold invoices include only the Mostro fee (no dev fee).
 
-**Implementation:** `src/util.rs::show_hold_invoice()` (lines 660-675)
+**Implementation:** `src/util.rs::show_hold_invoice()`
 
 Seller's hold invoice includes only the order amount and Mostro fee:
 ```rust
@@ -513,24 +513,24 @@ buyer_order.amount = order.amount.saturating_sub(order.fee);
 
 **Critical Implementation Locations:**
 
-1. **`src/flow.rs::hold_invoice_paid()`** (lines 54-75)
+1. **`src/flow.rs::hold_invoice_paid()`**
    - Purpose: Status updates after seller payment
    - Seller amount: `order.amount + order.fee` (no dev_fee)
    - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Initial payment confirmation messages
 
-2. **`src/app/add_invoice.rs::add_invoice_action()`** (lines 88-109)
+2. **`src/app/add_invoice.rs::add_invoice_action()`**
    - Purpose: Invoice acceptance flow
    - Seller amount: `order.amount + order.fee` (no dev_fee)
    - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Order acceptance notifications
 
-3. **`src/app/release.rs::check_failure_retries()`** (lines 70-75)
+3. **`src/app/release.rs::check_failure_retries()`**
    - Purpose: Payment failure handling
    - Buyer amount: `order.amount - order.fee` (no dev_fee)
    - Impact: Failure notification amounts
 
-4. **`src/app/release.rs::do_payment()`** ⚠️ **CRITICAL** (lines 443-448)
+4. **`src/app/release.rs::do_payment()`** ⚠️ **CRITICAL**
    - Purpose: Actual Lightning payment calculation
    - Payment amount: `order.amount - order.fee` (no dev_fee)
    - Impact: **Real sats transferred** to buyer via Lightning
@@ -598,7 +598,7 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
    - Mostro then proceeds to pay buyer's invoice
    - **Key Point:** Dev fee payment happens asynchronously AFTER mostrod collects the Mostro fee
 
-2. **Scheduler Processing** (`src/scheduler.rs::job_process_dev_fee_payment()` lines 511-608):
+2. **Scheduler Processing** (`src/scheduler.rs::job_process_dev_fee_payment()`):
    - Runs every 60 seconds
    - Uses `find_unpaid_dev_fees()` to query database for orders where: `(status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
    - **Important:** Query checks BOTH statuses to handle race conditions where buyer payment succeeds during dev fee payment
@@ -621,7 +621,7 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
 
 **Payment Flow Specification (4 Steps with Timeouts):**
 
-Implementation in `src/app/release.rs::send_dev_fee_payment()` (lines 564-678):
+Implementation in `src/app/release.rs::send_dev_fee_payment()`:
 
 ```rust
 // [Step 0] Validation - Reject invalid amounts
@@ -684,7 +684,7 @@ This section details exactly when and how the database fields (`dev_fee`, `dev_f
 
 #### `dev_fee` Field Lifecycle
 
-**When Initialized:** During order creation in `src/util.rs::prepare_new_order()` (lines 392-398)
+**When Initialized:** During order creation in `src/util.rs::prepare_new_order()`
 
 **Initialization:**
 ```rust
@@ -701,13 +701,13 @@ if new_order.amount > 0 {
 
 **Purpose:** Tracking amount that mostrod will pay to the development fund from its earnings (not charged to users)
 
-**Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section (lines 238-287).
+**Special Case - Market Price Orders:** When a market price order returns to `pending` status (taker abandons), the `dev_fee` field **MUST** be reset to `0` to allow recalculation at the new market price when re-taken. This is documented in detail in the "Market Price Orders and Dev Fee Reset" section.
 
 **Database State:** Persists throughout order lifecycle unless order returns to pending status (market price orders only).
 
 #### `dev_fee_paid` Field Updates
 
-**Initial Value:** `0` (false) - Set during order creation in `src/util.rs::prepare_new_order()` (line 413)
+**Initial Value:** `0` (false) - Set during order creation in `src/util.rs::prepare_new_order()`
 
 **When Changed to `1` (true):** After successful dev fee payment in the scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
 
@@ -735,7 +735,7 @@ WHERE id = ?
 
 #### `dev_fee_payment_hash` Field Updates
 
-**Initial Value:** `NULL` - Set during order creation in `src/util.rs::prepare_new_order()` (line 414)
+**Initial Value:** `NULL` - Set during order creation in `src/util.rs::prepare_new_order()`
 
 **When Set:** Simultaneously with `dev_fee_paid = 1` after successful payment
 
@@ -844,7 +844,7 @@ Edge Case - Dev Fee Payment Fails, Buyer Payment Succeeds (Race Condition):
 
 #### Actual Implementation
 
-The actual implementation in `src/scheduler.rs::job_process_dev_fee_payment()` (lines 511-608) includes enhanced logging:
+The actual implementation in `src/scheduler.rs::job_process_dev_fee_payment()` includes enhanced logging:
 
 ```rust
 /// Process unpaid development fees for successful orders
@@ -1016,25 +1016,19 @@ This section provides a checklist for implementing the remaining phases of the d
   - Input: `total_mostro_fee: i64, percentage: f64`
   - Output: `i64` (rounded dev fee amount)
   - Logic: `(total_mostro_fee as f64) * percentage`, rounded
-  - Location: Lines 167-170
 - [x] Implement `get_dev_fee()` wrapper function in `src/util.rs`
   - Input: `total_mostro_fee: i64`
   - Output: `i64` (calls calculate_dev_fee with Settings percentage)
-  - Location: Lines 176-179
 - [x] Implement dev_fee calculation (for tracking mostrod's donation amount)
   - Formula: `dev_fee = round(total_mostro_fee × dev_fee_percentage)`
   - Simple rounding for whole satoshi amounts
 - [x] Update message creation in `src/flow.rs::hold_invoice_paid()`
-  - Lines 54-75: Simplified amount calculations
   - Seller amount: `order.amount + order.fee`
   - Buyer amount: `order.amount - order.fee`
 - [x] Update message creation in `src/app/add_invoice.rs::add_invoice_action()`
-  - Lines 88-109: Simplified amount calculations
   - No dev_fee in user-facing amounts
 - [x] Update payment calculation in `src/app/release.rs::check_failure_retries()`
-  - Lines 70-75: Buyer amount without dev_fee
 - [x] Update Lightning payment in `src/app/release.rs::do_payment()` ⚠️ CRITICAL
-  - Lines 443-448: Actual payment amount = `order.amount - order.fee`
   - Dev fee paid separately by mostrod
 - [x] Add unit tests for `calculate_dev_fee()` in `src/util.rs::tests`
   - Test `test_get_dev_fee_basic`: Standard calculation (1000 @ 30% = 300)
@@ -1054,7 +1048,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Prerequisites:** Phase 2 complete ✅
 
 **Completed Implementation (Commits: f508669, 102cfed, eaf3319, 42253f1, 2655943):**
-- [x] Implement `send_dev_fee_payment()` in `src/app/release.rs` (lines 564-678)
+- [x] Implement `send_dev_fee_payment()` in `src/app/release.rs`
   - Step 0: Dev fee amount validation (`dev_fee > 0` check)
   - Step 1: LNURL resolution with 15-second timeout
     - Call: `resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, amount)`
@@ -1068,8 +1062,8 @@ This section provides a checklist for implementing the remaining phases of the d
     - Call: Loop receiving messages until terminal status
     - Success: Return payment hash
     - Failure: Return error with details
-- [x] Create scheduler job `job_process_dev_fee_payment()` in `src/scheduler.rs` (lines 511-608)
-  - Uses `find_unpaid_dev_fees()` database function (lines 895-908 in `src/db.rs`)
+- [x] Create scheduler job `job_process_dev_fee_payment()` in `src/scheduler.rs`
+  - Uses `find_unpaid_dev_fees()` database function (`src/db.rs`)
   - Query: `SELECT * FROM orders WHERE (status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
   - **Key improvement:** Query checks BOTH statuses to handle race conditions (commit 102cfed)
   - For each unpaid order:
@@ -1414,8 +1408,8 @@ WHERE status = 'pending'
 
 **Fix Applied:** Added `dev_fee` parameter to `update_order_to_initial_state()` and
 included it in the SQL UPDATE statement:
-- `src/db.rs` lines 776-817: Function signature and SQL UPDATE modified
-- `src/app/cancel.rs` lines 18-25: Explicit cancellation handler
+- `src/db.rs`: Function signature and SQL UPDATE modified
+- `src/app/cancel.rs`: Explicit cancellation handler
 
 **Prevention:** Both paths now include `order.dev_fee = 0` for market price orders. See "Taker Abandonment and Order Reset" section for details.
 
@@ -1497,26 +1491,26 @@ WHERE id = '<order_id>';
 
 **Status:** ✅ IMPLEMENTED
 
-**Location:** `src/util.rs::tests` module (lines 1453-1478)
+**Location:** `src/util.rs::tests` module
 
 **Tests Implemented:**
 
-1. **`test_get_dev_fee_basic`** (lines 1453-1458)
+1. **`test_get_dev_fee_basic`**
    - Purpose: Standard percentage calculation
    - Test: 1,000 sats @ 30% = 300 sats
    - Status: ✓ Passing
 
-2. **`test_get_dev_fee_rounding`** (lines 1460-1465)
+2. **`test_get_dev_fee_rounding`**
    - Purpose: Rounding behavior
    - Test: 333 sats @ 30% = 99.9 → rounds to 100 sats
    - Status: ✓ Passing
 
-3. **`test_get_dev_fee_zero`** (lines 1467-1471)
+3. **`test_get_dev_fee_zero`**
    - Purpose: Zero fee handling
    - Test: 0 sats @ 30% = 0 sats
    - Status: ✓ Passing
 
-4. **`test_get_dev_fee_tiny_amounts`** (lines 1473-1478)
+4. **`test_get_dev_fee_tiny_amounts`**
    - Purpose: Small amount edge cases
    - Test: 1 sat @ 30% = 0.3 → rounds to 0 sats
    - Status: ✓ Passing

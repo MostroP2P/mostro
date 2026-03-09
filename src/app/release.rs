@@ -97,12 +97,16 @@ pub async fn check_failure_retries(
         .await;
     }
 
-    // Update order
-    let result = order
-        .update(&pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
-    Ok(result)
+    // Update only payment-related fields to avoid overwriting
+    // other fields (like dev_fee_paid) modified by concurrent processes
+    db::update_failed_payment_status(
+        &pool,
+        order.id,
+        order.failed_payment,
+        order.payment_attempts,
+    )
+    .await?;
+    Ok(order)
 }
 
 /// Handles the release action for an order, managing the release of funds and subsequent order flow.
@@ -542,14 +546,19 @@ async fn payment_success(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        let order = order_updated
-            .update(&pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Update only status and event_id to avoid overwriting
+        // other fields (like dev_fee_paid) modified by concurrent processes
+        db::update_order_status_and_event(
+            &pool,
+            order_updated.id,
+            &order_updated.status,
+            &order_updated.event_id,
+        )
+        .await?;
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
             request_id,
-            Some(order.id),
+            Some(order_updated.id),
             Action::Rate,
             None,
             buyer_pubkey,

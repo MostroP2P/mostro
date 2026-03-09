@@ -412,7 +412,7 @@ async fn process_new_dev_fee_payments(
         );
         order.dev_fee_payment_hash = Some(payment_hash_hex.clone());
 
-        let mut order = match order.update(pool).await {
+        let order = match order.update(pool).await {
             Err(e) => {
                 error!(
                     "Failed to store payment hash for order {}: {:?}",
@@ -435,13 +435,13 @@ async fn process_new_dev_fee_payments(
         .await
         {
             Ok(Ok(payment_hash)) => {
-                handle_payment_success(&mut order, pool, confirmed, &payment_hash).await;
+                handle_payment_success(order, pool, confirmed, &payment_hash).await;
             }
             Ok(Err(e)) => {
-                handle_payment_failure(&mut order, pool, order_id, &e).await;
+                handle_payment_failure(order, pool, order_id, &e).await;
             }
             Err(_) => {
-                handle_payment_timeout(&mut order, pool, ln_client, confirmed).await;
+                handle_payment_timeout(order, pool, ln_client, confirmed).await;
             }
         }
     }
@@ -450,7 +450,7 @@ async fn process_new_dev_fee_payments(
 // ── Payment outcome handlers ────────────────────────────────────────────
 
 async fn handle_payment_success(
-    order: &mut Order,
+    mut order: Order,
     pool: &SqlitePool,
     confirmed: &mut HashSet<uuid::Uuid>,
     payment_hash: &str,
@@ -470,7 +470,7 @@ async fn handle_payment_success(
 
     info!("Payment succeeded for order {}, verifying DB", order_id);
 
-    match order.clone().update(pool).await {
+    match order.update(pool).await {
         Err(e) => {
             error!(
                 "CRITICAL: Dev fee PAID for order {} but DB update FAILED",
@@ -511,7 +511,7 @@ async fn handle_payment_success(
 }
 
 async fn handle_payment_failure(
-    order: &mut Order,
+    mut order: Order,
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     e: &MostroError,
@@ -528,7 +528,7 @@ async fn handle_payment_failure(
         order_id
     );
     order.dev_fee_paid = false;
-    if let Err(db_err) = order.clone().update(pool).await {
+    if let Err(db_err) = order.update(pool).await {
         error!(
             "Failed to update order {} after payment failure: {:?}",
             order_id, db_err
@@ -537,7 +537,7 @@ async fn handle_payment_failure(
 }
 
 async fn handle_payment_timeout(
-    order: &mut Order,
+    mut order: Order,
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
@@ -549,14 +549,14 @@ async fn handle_payment_timeout(
         order_id, dev_fee
     );
 
-    match check_dev_fee_payment_status(order, ln_client).await {
+    match check_dev_fee_payment_status(&order, ln_client).await {
         DevFeePaymentState::Succeeded => {
             info!(
                 "Payment actually succeeded for order {} despite timeout",
                 order_id
             );
             order.dev_fee_paid = true;
-            if let Err(e) = order.clone().update(pool).await {
+            if let Err(e) = order.update(pool).await {
                 error!(
                     "Payment succeeded but failed to update DB for order {}: {:?}",
                     order_id, e
@@ -898,69 +898,29 @@ pub async fn send_dev_fee_payment(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pending_timestamp, try_claim_order_for_dev_fee};
+    use super::{
+        cleanup_stale_pending_markers, handle_payment_failure, handle_payment_success,
+        parse_pending_timestamp, release_pending_claim, try_claim_order_for_dev_fee,
+    };
+    use mostro_core::error::MostroError;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashSet;
 
     async fn setup_orders_db() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect(":memory:")
             .await
             .expect("Failed to create in-memory DB");
 
-        sqlx::query(
-            r#"
-            CREATE TABLE orders (
-                id char(36) primary key not null,
-                kind varchar(4) not null default 'buy',
-                event_id char(64) not null default '',
-                hash char(64),
-                preimage char(64),
-                creator_pubkey char(64) default '',
-                cancel_initiator_pubkey char(64),
-                dispute_initiator_pubkey char(64),
-                buyer_pubkey char(64),
-                master_buyer_pubkey char(64),
-                seller_pubkey char(64),
-                master_seller_pubkey char(64),
-                status varchar(10) not null default 'active',
-                price_from_api integer not null default 0,
-                premium integer not null default 0,
-                payment_method varchar(500) not null default 'cash',
-                amount integer not null default 0,
-                min_amount integer default 0,
-                max_amount integer default 0,
-                buyer_dispute integer not null default 0,
-                seller_dispute integer not null default 0,
-                buyer_cooperativecancel integer not null default 0,
-                seller_cooperativecancel integer not null default 0,
-                fee integer not null default 0,
-                routing_fee integer not null default 0,
-                fiat_code varchar(5) not null default 'USD',
-                fiat_amount integer not null default 0,
-                buyer_invoice text,
-                range_parent_id char(36),
-                invoice_held_at integer default 0,
-                taken_at integer default 0,
-                created_at integer not null default 0,
-                buyer_sent_rate integer default 0,
-                seller_sent_rate integer default 0,
-                payment_attempts integer default 0,
-                failed_payment integer default 0,
-                expires_at integer not null default 0,
-                trade_index_seller integer default 0,
-                trade_index_buyer integer default 0,
-                next_trade_pubkey char(64),
-                next_trade_index integer default 0,
-                dev_fee integer default 0,
-                dev_fee_paid integer not null default 0,
-                dev_fee_payment_hash char(64)
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create orders table");
+        sqlx::query(include_str!("../../migrations/20221222153301_orders.sql"))
+            .execute(&pool)
+            .await
+            .expect("Failed to create base orders table");
+        sqlx::query(include_str!("../../migrations/20251126120000_dev_fee.sql"))
+            .execute(&pool)
+            .await
+            .expect("Failed to apply dev_fee migration");
 
         pool
     }
@@ -1121,5 +1081,158 @@ mod tests {
             .as_secs();
         let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
         assert_eq!(parse_pending_timestamp(&marker), Some(now));
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_pending_markers_resets_only_stale() {
+        let pool = setup_orders_db().await;
+        let fresh_id = uuid::Uuid::new_v4();
+        let stale_id = uuid::Uuid::new_v4();
+
+        insert_test_order(
+            &pool,
+            fresh_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-9999999999"),
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            stale_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-1"),
+        )
+        .await;
+
+        cleanup_stale_pending_markers(&pool).await;
+
+        let fresh: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(fresh_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fresh.0, 0);
+        assert_eq!(
+            fresh.1.as_deref(),
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-9999999999")
+        );
+
+        let stale: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(stale_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale.0, 0);
+        assert_eq!(stale.1, None);
+    }
+
+    #[tokio::test]
+    async fn release_pending_claim_clears_matching_marker_only() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            id,
+            "success",
+            100,
+            false,
+            Some("PENDING-test-marker"),
+        )
+        .await;
+
+        // Wrong marker should not change anything.
+        release_pending_claim(&pool, id, "PENDING-other-marker").await;
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash.as_deref(), Some("PENDING-test-marker"));
+
+        // Exact marker clears the hash.
+        release_pending_claim(&pool, id, "PENDING-test-marker").await;
+        let hash_after: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash_after, None);
+    }
+
+    #[tokio::test]
+    async fn handle_payment_success_sets_paid_and_hash_in_db() {
+        use mostro_core::order::Order;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 100, false, None).await;
+
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let mut confirmed = HashSet::new();
+        handle_payment_success(order, &pool, &mut confirmed, "deadbeef").await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("deadbeef"));
+        assert!(confirmed.contains(&order_id));
+    }
+
+    #[tokio::test]
+    async fn handle_payment_failure_marks_unpaid_and_preserves_hash() {
+        use mostro_core::order::Order;
+        use mostro_core::prelude::ServiceError;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            order_id,
+            "success",
+            100,
+            false,
+            Some("existing-hash"),
+        )
+        .await;
+
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let err = MostroError::MostroInternalErr(ServiceError::UnexpectedError(
+            "test failure".to_string(),
+        ));
+
+        handle_payment_failure(order, &pool, order_id, &err).await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1.as_deref(), Some("existing-hash"));
     }
 }

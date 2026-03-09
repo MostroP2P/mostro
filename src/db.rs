@@ -1729,22 +1729,32 @@ mod tests {
         Ok(pool)
     }
 
-    /// Insert a minimal test order with the given id, status, and dev_fee_paid value.
+    /// Insert a minimal test order with the fields relevant to order status and dev fee queries.
     /// Binds `id` as `Uuid` so storage format matches production queries.
-    async fn insert_test_order(pool: &SqlitePool, id: uuid::Uuid, status: &str, dev_fee_paid: i64) {
+    async fn insert_test_order(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+        status: &str,
+        dev_fee: i64,
+        dev_fee_paid: bool,
+        dev_fee_payment_hash: Option<&str>,
+    ) {
         sqlx::query(
             r#"
             INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                                 amount, fiat_code, fiat_amount, created_at, expires_at,
-                                failed_payment, payment_attempts, dev_fee_paid)
+                                failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                                dev_fee_payment_hash)
             VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
                     100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, ?3)
+                    0, 0, ?3, ?4, ?5)
             "#,
         )
         .bind(id)
         .bind(status)
+        .bind(dev_fee)
         .bind(dev_fee_paid)
+        .bind(dev_fee_payment_hash)
         .execute(pool)
         .await
         .unwrap();
@@ -1756,7 +1766,7 @@ mod tests {
     async fn test_update_failed_payment_status_happy_path() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0, false, None).await;
 
         let result = super::update_failed_payment_status(&pool, order_id, true, 3).await;
         assert!(result.is_ok());
@@ -1776,7 +1786,7 @@ mod tests {
     async fn test_update_failed_payment_status_wrong_status() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "success", 0).await;
+        insert_test_order(&pool, order_id, "success", 0, false, None).await;
 
         let result = super::update_failed_payment_status(&pool, order_id, true, 1).await;
         assert!(result.is_err());
@@ -1795,7 +1805,7 @@ mod tests {
     async fn test_update_failed_payment_status_preserves_dev_fee_paid() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "settled-hold-invoice", 1).await;
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0, true, None).await;
 
         super::update_failed_payment_status(&pool, order_id, true, 2)
             .await
@@ -1816,7 +1826,7 @@ mod tests {
     async fn test_update_order_status_and_event_happy_path() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0, false, None).await;
 
         let result =
             super::update_order_status_and_event(&pool, order_id, "success", "new_event_456").await;
@@ -1837,7 +1847,7 @@ mod tests {
     async fn test_update_order_status_and_event_wrong_status() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "success", 0).await;
+        insert_test_order(&pool, order_id, "success", 0, false, None).await;
 
         let result = super::update_order_status_and_event(&pool, order_id, "success", "evt").await;
         assert!(result.is_err());
@@ -1847,7 +1857,7 @@ mod tests {
     async fn test_update_order_status_and_event_not_idempotent() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "settled-hold-invoice", 0).await;
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0, false, None).await;
 
         // First call succeeds
         super::update_order_status_and_event(&pool, order_id, "success", "evt1")
@@ -1863,7 +1873,7 @@ mod tests {
     async fn test_update_order_status_and_event_preserves_dev_fee_paid() {
         let pool = setup_orders_db().await.unwrap();
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, order_id, "settled-hold-invoice", 1).await;
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 0, true, None).await;
 
         super::update_order_status_and_event(&pool, order_id, "success", "evt")
             .await
@@ -1969,102 +1979,9 @@ mod tests {
         );
     }
 
-    /// Helper: create an in-memory SQLite database with the orders table schema.
-    async fn setup_orders_db() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("Failed to create in-memory DB");
-
-        sqlx::query(
-            r#"
-            CREATE TABLE orders (
-                id char(36) primary key not null,
-                kind varchar(4) not null default 'buy',
-                event_id char(64) not null default '',
-                hash char(64),
-                preimage char(64),
-                creator_pubkey char(64) default '',
-                cancel_initiator_pubkey char(64),
-                dispute_initiator_pubkey char(64),
-                buyer_pubkey char(64),
-                master_buyer_pubkey char(64),
-                seller_pubkey char(64),
-                master_seller_pubkey char(64),
-                status varchar(10) not null default 'active',
-                price_from_api integer not null default 0,
-                premium integer not null default 0,
-                payment_method varchar(500) not null default 'cash',
-                amount integer not null default 0,
-                min_amount integer default 0,
-                max_amount integer default 0,
-                buyer_dispute integer not null default 0,
-                seller_dispute integer not null default 0,
-                buyer_cooperativecancel integer not null default 0,
-                seller_cooperativecancel integer not null default 0,
-                fee integer not null default 0,
-                routing_fee integer not null default 0,
-                fiat_code varchar(5) not null default 'USD',
-                fiat_amount integer not null default 0,
-                buyer_invoice text,
-                range_parent_id char(36),
-                invoice_held_at integer default 0,
-                taken_at integer default 0,
-                created_at integer not null default 0,
-                buyer_sent_rate integer default 0,
-                seller_sent_rate integer default 0,
-                payment_attempts integer default 0,
-                failed_payment integer default 0,
-                expires_at integer not null default 0,
-                trade_index_seller integer default 0,
-                trade_index_buyer integer default 0,
-                next_trade_pubkey char(64),
-                next_trade_index integer default 0,
-                dev_fee integer default 0,
-                dev_fee_paid integer not null default 0,
-                dev_fee_payment_hash char(64)
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create orders table");
-
-        pool
-    }
-
-    /// Helper: insert a test order with the fields relevant to dev fee queries.
-    /// Uses `uuid::Uuid` for the id to match sqlx's binary encoding.
-    async fn insert_test_order(
-        pool: &SqlitePool,
-        id: uuid::Uuid,
-        status: &str,
-        dev_fee: i64,
-        dev_fee_paid: bool,
-        dev_fee_payment_hash: Option<&str>,
-    ) {
-        sqlx::query(
-            r#"
-            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
-                                amount, fiat_code, fiat_amount, created_at, expires_at,
-                                dev_fee, dev_fee_paid, dev_fee_payment_hash)
-            VALUES (?, 'sell', 'evt1', ?, 0, 'cash', 1000, 'USD', 100, 0, 0, ?, ?, ?)
-            "#,
-        )
-        .bind(id)
-        .bind(status)
-        .bind(dev_fee)
-        .bind(dev_fee_paid as i32)
-        .bind(dev_fee_payment_hash)
-        .execute(pool)
-        .await
-        .expect("Failed to insert test order");
-    }
-
     #[tokio::test]
     async fn find_unpaid_dev_fees_returns_eligible_orders() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
         let id1 = uuid::Uuid::new_v4();
         let id2 = uuid::Uuid::new_v4();
 
@@ -2079,7 +1996,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unpaid_dev_fees_excludes_already_paid() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
 
         insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 100, true, None).await;
 
@@ -2089,7 +2006,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unpaid_dev_fees_excludes_orders_with_existing_hash() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
 
         // Has existing payment hash (in-flight or pending)
         insert_test_order(
@@ -2121,7 +2038,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unpaid_dev_fees_excludes_wrong_status() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
 
         insert_test_order(&pool, uuid::Uuid::new_v4(), "active", 100, false, None).await;
         insert_test_order(&pool, uuid::Uuid::new_v4(), "pending", 100, false, None).await;
@@ -2136,7 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unpaid_dev_fees_excludes_zero_dev_fee() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
 
         insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 0, false, None).await;
 
@@ -2149,7 +2066,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unpaid_dev_fees_with_empty_hash_string() {
-        let pool = setup_orders_db().await;
+        let pool = setup_orders_db().await.unwrap();
 
         // Empty string hash (should be treated same as NULL)
         insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 100, false, Some("")).await;

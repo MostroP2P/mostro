@@ -138,7 +138,6 @@ Critical modules that should have high mutation scores (>80%):
 | `src/flow.rs` | Critical | Order state transitions, trade logic |
 | `src/db.rs` | Critical | Database operations, state persistence |
 | `src/util.rs` | Critical | Utility functions used across codebase |
-| `src/app.rs` | High | Event routing; `handle_message_action` dispatches all actions |
 | `src/nip33.rs` | High | Nostr event tagging |
 | `src/lnurl.rs` | High | LNURL handling |
 | `src/messages.rs` | Medium | Message formatting |
@@ -207,14 +206,6 @@ fn test_order_validation_rejects_invalid() {
     assert!(!order.validate()); // This would catch the mutant
 }
 ```
-
-### handle_message_action (src/app.rs)
-
-The message router `handle_message_action` matches on `Action` and calls the corresponding handler. To kill "replace body with Ok(())" and "delete match arm" mutants:
-
-- **Parameterized test:** `test_handle_message_action_routes_each_action_to_handler` in `mod handle_message_action_tests` loops over a constant array `ROUTED_ACTIONS` (all actions except `PayInvoice`). For each action it calls `handle_message_action` with minimal message/event so the real handler returns `Err`, then asserts `result.is_err()`. If a match arm is deleted, the `_` arm returns `Ok(())` and the test fails.
-- **PayInvoice:** Tested separately with `#[should_panic]` because the handler currently uses `todo!()`.
-- **Running these tests:** They are `#[ignore]` because they require a live LND connection and DB config. Run with `cargo test --ignored` when LND is available to kill those mutants.
 
 ## Running Locally
 

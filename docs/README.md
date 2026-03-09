@@ -10,8 +10,6 @@ Quick links to architecture and feature guides.
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
-- Dev Fee: DEV_FEE.md
-- Mutation Testing: MUTATION_TESTING.md
 
 Tips
 - Run tests and lints before pushing: `cargo test`, `cargo fmt`, `cargo clippy --all-targets --all-features`.

@@ -45,8 +45,7 @@ flowchart LR
 
 - Orders: `order.rs`, `take_buy.rs`, `take_sell.rs`, `cancel.rs`, `release.rs`, `add_invoice.rs`, `fiat_sent.rs`, `orders.rs`, `restore_session.rs`, `trade_pubkey.rs`, `rate_user.rs`, `dispute.rs`.
 - Admin: `admin_cancel.rs`, `admin_settle.rs`, `admin_add_solver.rs`, `admin_take_dispute.rs`.
-- Dev fee: `dev_fee.rs` – payment lifecycle (LNURL resolution, LN payment, idempotency, timeout, crash recovery). The scheduler calls `run_dev_fee_cycle()` once per tick; all state-machine logic lives in this module.
-- Router: `app.rs:handle_message_action` matches `mostro_core::message::Action` and calls module functions. Mutation tests in `app.rs` (mod `handle_message_action_tests`) assert each action is routed to its handler.
+- Router: `app.rs:handle_message_action` matches `mostro_core::message::Action` and calls module functions.
 
 ### Per‑Action Summaries
 
@@ -63,7 +62,6 @@ flowchart LR
 - `app/restore_session.rs` – rehydrates context for a client after reconnect.
 - `app/trade_pubkey.rs` – exchanges/updates trade pubkeys for secure comms.
 - Admin modules – force cancel/settle, take disputes, add solvers; guarded and auditable.
-- `app/dev_fee.rs` – `run_dev_fee_cycle()`: finds unpaid dev fees, resolves LNURL invoice, sends payment via LND, updates DB and publishes audit events; idempotency and timeout handling included.
 
 ## Configuration Constants (src/config/constants.rs)
 

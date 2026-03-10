@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
   schedule:
     # Run full mutation testing weekly on Sundays at 3 AM UTC
@@ -15,9 +16,10 @@ env:
 
 jobs:
   # Quick mutation testing on PRs (only changed files)
+  # Opt-in only: add `run-mutation` label to the PR when needed.
   mutation-pr:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-mutation')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,21 +42,27 @@ jobs:
 
       - name: Run mutation testing on changed files
         # Only test mutants in files changed in this PR
-        # This gives faster feedback (minutes instead of hours)
+        # Runs only when PR has the `run-mutation` label
         continue-on-error: true
         run: |
-          # Collect changed Rust source files (exclude test-only changes)
-          changed_rs=$(git diff --name-only origin/${{ github.base_ref }} -- '*.rs' | grep -v '_test\.rs$' || true)
+          # Ensure base branch ref exists locally for reliable diffing
+          git fetch origin "${{ github.base_ref }}":"refs/remotes/origin/${{ github.base_ref }}"
+
+          # Collect changed Rust source files (exclude test-only and workflow files)
+          changed_rs=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.rs' | grep -v '_test\.rs$' || true)
           if [ -z "$changed_rs" ]; then
             echo "No Rust source files changed in this PR"
             exit 0
           fi
+
           # Build --file flags for each changed file
           file_args=""
           for f in $changed_rs; do
             file_args="$file_args --file $f"
           done
-          echo "Testing mutants in: $changed_rs"
+
+          echo "Running mutation testing for changed files:"
+          echo "$changed_rs"
           cargo mutants $file_args
 
       - name: Upload mutation report

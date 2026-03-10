@@ -2433,6 +2433,11 @@ mod tests {
     }
 
     // -- Tests for buyer/seller_has_pending_order (unencrypted path) --
+    // Note: These tests only cover the non-encrypted database path.
+    // The encrypted path (gated by MOSTRO_DB_PASSWORD + Argon2 key derivation)
+    // is intentionally not exercised here — it requires full encryption setup
+    // and should be covered by integration tests. Do not attempt to mock the
+    // env/derivation in unit tests.
 
     #[tokio::test]
     async fn test_buyer_has_pending_order_true() {

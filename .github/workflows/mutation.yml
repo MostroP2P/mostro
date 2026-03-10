@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
   schedule:
     # Run full mutation testing weekly on Sundays at 3 AM UTC

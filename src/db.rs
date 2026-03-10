@@ -693,6 +693,115 @@ async fn store_password_hash(
     Ok(())
 }
 
+/// Decrypt all encrypted master pubkeys in the database.
+///
+/// This is a one-time migration tool for operators moving away from full
+/// database encryption. It reads all orders with `master_buyer_pubkey` or
+/// `master_seller_pubkey`, attempts to decrypt them using the current
+/// `MOSTRO_DB_PASSWORD`, and writes back the plaintext values.
+///
+/// The operation is transactional: all-or-nothing.
+///
+/// Returns the number of orders that were decrypted.
+pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
+    let password = MOSTRO_DB_PASSWORD.get();
+    if password.is_none() {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "MOSTRO_DB_PASSWORD must be set to decrypt the database. \
+             Set it in your environment and try again."
+                .to_string(),
+        )));
+    }
+
+    tracing::info!("Starting database decryption migration...");
+
+    // Fetch all orders that have master pubkeys
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, master_buyer_pubkey, master_seller_pubkey FROM orders \
+         WHERE master_buyer_pubkey IS NOT NULL OR master_seller_pubkey IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    tracing::info!("Found {} orders with master pubkeys to check", rows.len());
+
+    let mut decrypted_count: u64 = 0;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    for (order_id, buyer_key, seller_key) in &rows {
+        let mut updated = false;
+
+        // Try to decrypt buyer key
+        let new_buyer = if let Some(key) = buyer_key {
+            match CryptoUtils::decrypt_data(key.clone(), password) {
+                Ok(decrypted) if decrypted != *key => {
+                    // Successfully decrypted (value changed = it was encrypted)
+                    updated = true;
+                    Some(decrypted)
+                }
+                _ => None, // Already plaintext or decryption failed
+            }
+        } else {
+            None
+        };
+
+        // Try to decrypt seller key
+        let new_seller = if let Some(key) = seller_key {
+            match CryptoUtils::decrypt_data(key.clone(), password) {
+                Ok(decrypted) if decrypted != *key => {
+                    updated = true;
+                    Some(decrypted)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if updated {
+            // Update with decrypted values (only update fields that changed)
+            if let Some(ref buyer) = new_buyer {
+                sqlx::query("UPDATE orders SET master_buyer_pubkey = ?1 WHERE id = ?2")
+                    .bind(buyer)
+                    .bind(order_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            }
+            if let Some(ref seller) = new_seller {
+                sqlx::query("UPDATE orders SET master_seller_pubkey = ?1 WHERE id = ?2")
+                    .bind(seller)
+                    .bind(order_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            }
+            decrypted_count += 1;
+        }
+    }
+
+    // Also clear the admin password hash (no longer needed without encryption)
+    sqlx::query("UPDATE users SET admin_password = NULL WHERE is_admin = 1")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    tracing::info!(
+        "Database decryption complete: {} orders decrypted, admin password hash cleared",
+        decrypted_count
+    );
+
+    Ok(decrypted_count)
+}
+
 pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Order, MostroError> {
     let null_key = None::<String>;
     let column_name = if let Ok(order_kind) = order.get_order_kind() {

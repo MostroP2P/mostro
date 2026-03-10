@@ -18,7 +18,6 @@ use tokio::sync::RwLock;
 pub use constants::{DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use secrecy::SecretString;
 pub use settings::{get_db_pool, init_mostro_settings, Settings};
 pub use types::{
     DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
@@ -31,7 +30,6 @@ pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
-pub static MOSTRO_DB_PASSWORD: OnceLock<SecretString> = OnceLock::new();
 
 /// Global message queues for Mostro
 /// This struct holds three queues:

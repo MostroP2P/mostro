@@ -60,7 +60,10 @@ async fn main() -> Result<()> {
     if decrypt_db_requested {
         match db::decrypt_database(&get_db_pool()).await {
             Ok(count) => {
-                tracing::info!("Successfully decrypted {count} orders. You can now remove MOSTRO_DB_PASSWORD from your environment.");
+                tracing::info!(
+                    "Successfully decrypted {count} orders. \
+                     You can now remove MOSTRO_DB_PASSWORD from your environment."
+                );
                 exit(0);
             }
             Err(e) => {

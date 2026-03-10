@@ -715,22 +715,41 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
 
     tracing::info!("Starting database decryption migration...");
 
-    // Fetch all orders that have master pubkeys
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Verify provided password against stored admin hash before mutating data
+    if let Some(argon2_hash) = get_admin_password(pool).await? {
+        let parsed_hash = PasswordHash::new(&argon2_hash)
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        if Argon2::default()
+            .verify_password(
+                password.expect("checked above").expose_secret().as_bytes(),
+                &parsed_hash,
+            )
+            .is_err()
+        {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                "Invalid MOSTRO_DB_PASSWORD: password verification failed".to_string(),
+            )));
+        }
+    }
+
+    // Fetch all orders that have master pubkeys (inside the transaction)
     let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT id, master_buyer_pubkey, master_seller_pubkey FROM orders \
          WHERE master_buyer_pubkey IS NOT NULL OR master_seller_pubkey IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     tracing::info!("Found {} orders with master pubkeys to check", rows.len());
 
     let mut decrypted_count: u64 = 0;
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     for (order_id, buyer_key, seller_key) in &rows {
         let mut updated = false;

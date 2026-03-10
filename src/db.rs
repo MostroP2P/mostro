@@ -515,6 +515,15 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     let db_path = Path::new(&tmp);
     let cleartext_requested = load_db_password_from_env();
 
+    // Deprecation warning for full database encryption
+    if MOSTRO_DB_PASSWORD.get().is_some() {
+        tracing::warn!(
+            "Full database encryption via MOSTRO_DB_PASSWORD is deprecated and will be \
+             removed in a future version. Please run `mostrod --decrypt-db` to migrate \
+             your database to plaintext. See https://github.com/MostroP2P/mostro/issues/642"
+        );
+    }
+
     let conn = if !db_path.exists() {
         //Create new database file
         let _file = std::fs::File::create_new(db_path)

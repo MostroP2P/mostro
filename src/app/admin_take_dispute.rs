@@ -1,4 +1,3 @@
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_dispute_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
@@ -39,7 +38,7 @@ async fn prepare_solver_info_message(
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Check if one or both users are in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+        .is_full_privacy_order(None)
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode

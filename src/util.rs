@@ -1,7 +1,6 @@
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
@@ -476,12 +475,8 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_buyer_pubkey = Some(
-                CryptoUtils::store_encrypted(
-                    &identity_pubkey.to_string(),
-                    MOSTRO_DB_PASSWORD.get(),
-                    None,
-                )
-                .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
+                CryptoUtils::store_encrypted(&identity_pubkey.to_string(), None, None)
+                    .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
             );
             new_order_db.trade_index_buyer = trade_index;
         }
@@ -489,12 +484,8 @@ async fn prepare_new_order(
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_seller_pubkey = Some(
-                CryptoUtils::store_encrypted(
-                    &identity_pubkey.to_string(),
-                    MOSTRO_DB_PASSWORD.get(),
-                    None,
-                )
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+                CryptoUtils::store_encrypted(&identity_pubkey.to_string(), None, None)
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
             );
             new_order_db.trade_index_seller = trade_index;
         }
@@ -695,10 +686,10 @@ async fn get_ratings_for_pending_order(
     if status == Status::Pending {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
-                .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
+                .get_master_seller_pubkey(None)
                 .map_err(MostroInternalErr)?,
             Err(_) => order_updated
-                .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
+                .get_master_buyer_pubkey(None)
                 .map_err(MostroInternalErr)?,
         };
 
@@ -1284,7 +1275,7 @@ pub async fn notify_taker_reputation(
 
     let user_decrypted_key = if let Some(user) = user {
         // Get reputation data
-        CryptoUtils::decrypt_data(user, MOSTRO_DB_PASSWORD.get()).map_err(MostroInternalErr)?
+        CryptoUtils::decrypt_data(user, None).map_err(MostroInternalErr)?
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     };

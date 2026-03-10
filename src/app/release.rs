@@ -1,6 +1,5 @@
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -260,7 +259,7 @@ pub async fn release_action(
 
 /// Helper function to store encrypted pubkey with optional salt
 fn store_encrypted_pubkey(pubkey: &str, salt: Option<SaltString>) -> Result<String, MostroError> {
-    CryptoUtils::store_encrypted(pubkey, MOSTRO_DB_PASSWORD.get(), salt).map_err(|_| {
+    CryptoUtils::store_encrypted(pubkey, None, salt).map_err(|_| {
         MostroInternalErr(ServiceError::EncryptionError(
             "Error storing encrypted pubkey".to_string(),
         ))
@@ -386,9 +385,8 @@ async fn handle_child_order(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     // Check if users are in rating mode or full privacy mode
-    let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
-        .map_err(|_| {
+    let (normal_buyer_idkey, normal_seller_idkey) =
+        order.is_full_privacy_order(None).map_err(|_| {
             MostroInternalErr(ServiceError::UnexpectedError(
                 "Error creating order event".to_string(),
             ))
@@ -635,10 +633,10 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
+            .get_master_seller_pubkey(None)
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
+            .get_master_buyer_pubkey(None)
             .map_err(MostroInternalErr)?,
     };
 

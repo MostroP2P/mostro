@@ -1,4 +1,3 @@
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::util::{enqueue_order_msg, get_order};
 
 use mostro_core::prelude::*;
@@ -26,20 +25,20 @@ pub async fn trade_pubkey_action(
     let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
         let master_buyer_key = CryptoUtils::decrypt_data(
             order
-                .get_master_buyer_pubkey(MOSTRO_DB_PASSWORD.get())
+                .get_master_buyer_pubkey(None)
                 .map_err(MostroInternalErr)?
                 .to_string(),
-            MOSTRO_DB_PASSWORD.get(),
+            None,
         )
         .map_err(MostroInternalErr)?;
         (Some(master_buyer_key), None)
     } else {
         let master_seller_key = CryptoUtils::decrypt_data(
             order
-                .get_master_seller_pubkey(MOSTRO_DB_PASSWORD.get())
+                .get_master_seller_pubkey(None)
                 .map_err(MostroInternalErr)?
                 .to_string(),
-            MOSTRO_DB_PASSWORD.get(),
+            None,
         )
         .map_err(MostroInternalErr)?;
         (None, Some(master_seller_key))

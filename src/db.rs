@@ -2078,4 +2078,609 @@ mod tests {
             "Empty string hash should be treated as no hash"
         );
     }
+
+    // -- Tests for find_held_invoices --
+
+    #[tokio::test]
+    async fn test_find_held_invoices_returns_active_with_held_at() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        // Insert order with invoice_held_at != 0 and status = 'active'
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Should find active order with held invoice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_non_active() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert order with invoice_held_at != 0 but wrong status
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'pending', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(result.is_empty(), "Should not find non-active orders");
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_zero_held_at() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert active order but invoice_held_at = 0
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 0)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(result.is_empty(), "Should not find orders with held_at = 0");
+    }
+
+    // -- Tests for find_failed_payment --
+
+    #[tokio::test]
+    async fn test_find_failed_payment_returns_matching() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert order with failed_payment = true and status = settled-hold-invoice
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    1, 3, 0, 0)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_failed_payment(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "Should find failed payment order");
+    }
+
+    #[tokio::test]
+    async fn test_find_failed_payment_ignores_non_failed() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert order with failed_payment = false
+        insert_test_order(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "settled-hold-invoice",
+            0,
+            false,
+            None,
+        )
+        .await;
+
+        let result = super::find_failed_payment(&pool).await.unwrap();
+        assert!(result.is_empty(), "Should not find non-failed orders");
+    }
+
+    #[tokio::test]
+    async fn test_find_failed_payment_ignores_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert order with failed_payment = true but wrong status
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    1, 3, 0, 0)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_failed_payment(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not find orders with wrong status"
+        );
+    }
+
+    // -- Tests for find_order_by_hash --
+
+    #[tokio::test]
+    async fn test_find_order_by_hash_found() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "abc123def456";
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid, hash)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, ?2)"#,
+        )
+        .bind(id)
+        .bind(hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_order_by_hash(&pool, hash).await;
+        assert!(result.is_ok(), "Should find order by hash");
+    }
+
+    #[tokio::test]
+    async fn test_find_order_by_hash_not_found() {
+        let pool = setup_orders_db().await.unwrap();
+
+        let result = super::find_order_by_hash(&pool, "nonexistent_hash").await;
+        assert!(result.is_err(), "Should error when hash not found");
+    }
+
+    // -- Tests for update_order_to_initial_state --
+
+    #[tokio::test]
+    async fn test_update_order_to_initial_state_resets_fields() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        // Insert an active order with hash, preimage, invoice, etc.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    hash, preimage, buyer_invoice, taken_at, invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 500, 0,
+                    'somehash', 'somepreimage', 'someinvoice', 1700001000, 1700002000)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::update_order_to_initial_state(&pool, id, 50000, 250, 100).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Should return true for existing order");
+
+        // Verify status was reset
+        let status: (String,) = sqlx::query_as("SELECT status FROM orders WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status.0, "pending", "Status should be reset to pending");
+
+        // Verify amounts were updated
+        let amounts: (i64, i64, i64) =
+            sqlx::query_as("SELECT amount, fee, dev_fee FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(amounts.0, 50000, "Amount should be updated");
+        assert_eq!(amounts.1, 250, "Fee should be updated");
+        assert_eq!(amounts.2, 100, "Dev fee should be updated");
+
+        // Verify fields were cleared
+        let cleared: (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT hash, preimage, buyer_invoice FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(cleared.0.is_none(), "Hash should be cleared");
+        assert!(cleared.1.is_none(), "Preimage should be cleared");
+        assert!(cleared.2.is_none(), "Buyer invoice should be cleared");
+
+        // Verify timestamps were reset
+        let times: (i64, i64) =
+            sqlx::query_as("SELECT taken_at, invoice_held_at FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(times.0, 0, "taken_at should be reset to 0");
+        assert_eq!(times.1, 0, "invoice_held_at should be reset to 0");
+    }
+
+    #[tokio::test]
+    async fn test_update_order_to_initial_state_nonexistent() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        let result = super::update_order_to_initial_state(&pool, id, 50000, 250, 100).await;
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "Should return false for nonexistent order"
+        );
+    }
+
+    // -- Tests for update_user_trade_index --
+
+    async fn setup_users_db() -> Result<SqlitePool, Error> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(TEST_DB_URL)
+            .await?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS users (
+                pubkey char(64) primary key not null,
+                is_admin integer not null default 0,
+                admin_password char(64),
+                is_solver integer not null default 0,
+                is_banned integer not null default 0,
+                category integer not null default 0,
+                last_trade_index integer not null default 0,
+                total_reviews integer not null default 0,
+                total_rating real not null default 0.0,
+                last_rating integer not null default 0,
+                max_rating integer not null default 0,
+                min_rating integer not null default 0,
+                created_at integer not null
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(pool)
+    }
+
+    async fn insert_test_user(pool: &SqlitePool, pubkey: &str) {
+        sqlx::query("INSERT INTO users (pubkey, created_at) VALUES (?1, 1700000000)")
+            .bind(pubkey)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    const VALID_PUBKEY: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    #[tokio::test]
+    async fn test_update_user_trade_index_valid() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        let result = super::update_user_trade_index(&pool, VALID_PUBKEY.to_string(), 5).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Should return true for existing user");
+
+        // Verify
+        let idx: (i64,) = sqlx::query_as("SELECT last_trade_index FROM users WHERE pubkey = ?1")
+            .bind(VALID_PUBKEY)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(idx.0, 5);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_trade_index_invalid_pubkey_short() {
+        let pool = setup_users_db().await.unwrap();
+
+        let result = super::update_user_trade_index(&pool, "abc123".to_string(), 5).await;
+        assert!(result.is_err(), "Should reject short pubkey");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_trade_index_invalid_pubkey_non_hex() {
+        let pool = setup_users_db().await.unwrap();
+
+        let bad = "g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let result = super::update_user_trade_index(&pool, bad.to_string(), 5).await;
+        assert!(result.is_err(), "Should reject non-hex pubkey");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_trade_index_negative() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        let result = super::update_user_trade_index(&pool, VALID_PUBKEY.to_string(), -1).await;
+        assert!(result.is_err(), "Should reject negative trade index");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_trade_index_nonexistent_user() {
+        let pool = setup_users_db().await.unwrap();
+
+        let result = super::update_user_trade_index(&pool, VALID_PUBKEY.to_string(), 5).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Should return false for nonexistent user");
+    }
+
+    // -- Tests for buyer/seller_has_pending_order (unencrypted path) --
+    // Note: These tests only cover the non-encrypted database path.
+    // The encrypted path (gated by MOSTRO_DB_PASSWORD + Argon2 key derivation)
+    // is intentionally not exercised here — it requires full encryption setup
+    // and should be covered by integration tests. Do not attempt to mock the
+    // env/derivation in unit tests.
+
+    #[tokio::test]
+    async fn test_buyer_has_pending_order_true() {
+        let pool = setup_orders_db().await.unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    master_buyer_pubkey)
+            VALUES (?1, 'buy', 'ev1', 'waiting-buyer-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(VALID_PUBKEY)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::buyer_has_pending_order(&pool, VALID_PUBKEY.to_string()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Buyer should have pending order");
+    }
+
+    #[tokio::test]
+    async fn test_buyer_has_pending_order_false() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert with different status
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    master_buyer_pubkey)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(VALID_PUBKEY)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::buyer_has_pending_order(&pool, VALID_PUBKEY.to_string()).await;
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "Buyer should NOT have pending order with wrong status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seller_has_pending_order_true() {
+        let pool = setup_orders_db().await.unwrap();
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    master_seller_pubkey)
+            VALUES (?1, 'sell', 'ev1', 'waiting-payment', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(VALID_PUBKEY)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::seller_has_pending_order(&pool, VALID_PUBKEY.to_string()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Seller should have pending order");
+    }
+
+    #[tokio::test]
+    async fn test_has_pending_order_invalid_pubkey() {
+        let pool = setup_orders_db().await.unwrap();
+
+        let result = super::buyer_has_pending_order(&pool, "not_hex".to_string()).await;
+        assert!(result.is_err(), "Should reject invalid pubkey");
+    }
+
+    // -- Tests for update_user_rating validation --
+
+    #[tokio::test]
+    async fn test_update_user_rating_valid() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Should update existing user rating");
+
+        // Verify
+        let row: (i64, i64, i64, i64, f64) = sqlx::query_as(
+            "SELECT last_rating, min_rating, max_rating, total_reviews, total_rating FROM users WHERE pubkey = ?1"
+        )
+        .bind(VALID_PUBKEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 4);
+        assert_eq!(row.1, 3);
+        assert_eq!(row.2, 5);
+        assert_eq!(row.3, 10);
+        assert!((row.4 - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_invalid_pubkey() {
+        let pool = setup_users_db().await.unwrap();
+
+        let result = super::update_user_rating(&pool, "short".to_string(), 4, 3, 5, 10, 40.0).await;
+        assert!(result.is_err(), "Should reject invalid pubkey");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_out_of_range() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        // Rating > 5
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 6, 3, 5, 10, 40.0).await;
+        assert!(result.is_err(), "Should reject rating > 5");
+
+        // Rating < 0
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), -1, 3, 5, 10, 40.0).await;
+        assert!(result.is_err(), "Should reject negative rating");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_negative_reviews() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, -1, 40.0).await;
+        assert!(result.is_err(), "Should reject negative total_reviews");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_total_exceeds_max() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        // total_rating > total_reviews * 5
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 2, 11.0).await;
+        assert!(result.is_err(), "Should reject total_rating > reviews * 5");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_min_gt_last() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        // min_rating > last_rating
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 2, 3, 5, 10, 40.0).await;
+        assert!(result.is_err(), "Should reject min_rating > last_rating");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_last_gt_max() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        // last_rating > max_rating
+        let result =
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 5, 3, 4, 10, 40.0).await;
+        assert!(result.is_err(), "Should reject last_rating > max_rating");
+    }
+
+    // -- Tests for reset_order_taken_at_time --
+
+    #[tokio::test]
+    async fn test_reset_order_taken_at_time() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    taken_at)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700005000)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::reset_order_taken_at_time(&pool, id).await;
+        assert!(result.is_ok());
+
+        let row: (i64,) = sqlx::query_as("SELECT taken_at FROM orders WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0, "taken_at should be reset to 0");
+    }
+
+    // -- Tests for update_order_invoice_held_at_time --
+
+    #[tokio::test]
+    async fn test_update_order_invoice_held_at_time() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 0)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::update_order_invoice_held_at_time(&pool, id, 1700005000).await;
+        assert!(result.is_ok());
+
+        let row: (i64,) = sqlx::query_as("SELECT invoice_held_at FROM orders WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.0, 1700005000,
+            "invoice_held_at should be set to provided value"
+        );
+    }
 }

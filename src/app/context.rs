@@ -4,12 +4,15 @@
 //! replacing direct access to global state (`get_db_pool()`, `get_nostr_client()`,
 //! `Settings::get_mostro()`, etc.).
 //!
-//! This enables unit testing with mock implementations — see `TestContext`.
+//! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::config::settings::Settings;
-use nostr_sdk::Client;
+use crate::config::MESSAGE_QUEUES;
+use mostro_core::prelude::Message;
+use nostr_sdk::{Client, PublicKey};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Shared application context passed to all handler functions.
 ///
@@ -19,23 +22,22 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust,ignore
-/// pub async fn cancel_action(
-///     ctx: &AppContext,
-///     msg: Message,
-///     event: &UnwrappedGift,
-///     my_keys: &Keys,
-///     ln_client: &mut LndConnector,
-/// ) -> Result<(), MostroError> {
-///     let pool = ctx.pool();
-///     let settings = ctx.settings();
-///     // ...
-/// }
+/// // DI entry point — extracts pool from ctx internally
+/// cancel_action_with_ctx(&ctx, msg, event, my_keys, &mut ln_client).await?;
+///
+/// // Or access dependencies directly:
+/// let pool = ctx.pool();
+/// let settings = ctx.settings();
 /// ```
+/// Shared queue type used for outbound order messages.
+pub type OrderMsgQueue = Arc<RwLock<Vec<(Message, PublicKey)>>>;
+
 #[derive(Clone)]
 pub struct AppContext {
     pool: Arc<Pool<Sqlite>>,
     nostr_client: Arc<Client>,
     settings: Arc<Settings>,
+    order_msg_queue: OrderMsgQueue,
 }
 
 impl AppContext {
@@ -56,14 +58,15 @@ impl AppContext {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| {
-                    MostroInternalErr(ServiceError::DbAccessError(
+                    MostroInternalErr(ServiceError::UnexpectedError(
                         "MOSTRO_CONFIG not initialized".to_string(),
                     ))
                 })?
                 .clone(),
         );
+        let order_msg_queue = MESSAGE_QUEUES.queue_order_msg.clone();
 
-        Ok(Self::new(pool, nostr_client, settings))
+        Ok(Self::new(pool, nostr_client, settings, order_msg_queue))
     }
 
     /// Create a new application context.
@@ -71,17 +74,24 @@ impl AppContext {
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Arc<Client>,
         settings: Arc<Settings>,
+        order_msg_queue: OrderMsgQueue,
     ) -> Self {
         Self {
             pool,
             nostr_client,
             settings,
+            order_msg_queue,
         }
     }
 
     /// Database connection pool.
     pub fn pool(&self) -> &Pool<Sqlite> {
         &self.pool
+    }
+
+    /// Cloned database connection pool (`Arc`) for `'static` tasks/spawns.
+    pub fn pool_arc(&self) -> Arc<Pool<Sqlite>> {
+        self.pool.clone()
     }
 
     /// Nostr client for publishing events.
@@ -92,6 +102,11 @@ impl AppContext {
     /// Full application settings.
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Shared queue for outbound order messages.
+    pub fn order_msg_queue(&self) -> &OrderMsgQueue {
+        &self.order_msg_queue
     }
 }
 
@@ -106,11 +121,12 @@ pub mod test_utils {
     /// ```rust,ignore
     /// let ctx = TestContextBuilder::new()
     ///     .with_pool(test_pool)
-    ///     .build()
-    ///     .await;
+    ///     .with_settings(test_settings)
+    ///     .build();
     /// ```
     pub struct TestContextBuilder {
         pool: Option<Arc<Pool<Sqlite>>>,
+        nostr_client: Option<Arc<Client>>,
         settings: Option<Arc<Settings>>,
     }
 
@@ -118,6 +134,7 @@ pub mod test_utils {
         pub fn new() -> Self {
             Self {
                 pool: None,
+                nostr_client: None,
                 settings: None,
             }
         }
@@ -125,6 +142,12 @@ pub mod test_utils {
         /// Use a specific database pool (e.g., in-memory SQLite for tests).
         pub fn with_pool(mut self, pool: Arc<Pool<Sqlite>>) -> Self {
             self.pool = Some(pool);
+            self
+        }
+
+        /// Use a specific Nostr client (e.g., a mock or test-configured client).
+        pub fn with_nostr_client(mut self, client: Arc<Client>) -> Self {
+            self.nostr_client = Some(client);
             self
         }
 
@@ -136,31 +159,28 @@ pub mod test_utils {
 
         /// Build the test context.
         ///
-        /// Creates an in-memory SQLite pool and a disconnected Nostr client
-        /// for any dependencies not explicitly provided.
+        /// This is synchronous: callers must provide dependencies explicitly.
+        /// The pool is required to avoid forcing async tests for pure logic.
         ///
         /// # Panics
         ///
-        /// Panics if `with_settings()` was not called — `Settings` has no
-        /// `Default` implementation because it requires valid TOML config.
-        pub async fn build(self) -> AppContext {
-            let pool = match self.pool {
-                Some(p) => p,
-                None => {
-                    let p = sqlx::SqlitePool::connect("sqlite::memory:")
-                        .await
-                        .expect("Failed to create test pool");
-                    Arc::new(p)
-                }
-            };
+        /// Panics if `with_pool()` or `with_settings()` were not called.
+        pub fn build(self) -> AppContext {
+            let pool = self
+                .pool
+                .expect("TestContextBuilder requires with_pool() for synchronous build");
 
-            let nostr_client = Arc::new(Client::default());
+            let nostr_client = self
+                .nostr_client
+                .unwrap_or_else(|| Arc::new(Client::default()));
 
             let settings = self
                 .settings
                 .expect("TestContextBuilder requires with_settings() — Settings has no Default");
 
-            AppContext::new(pool, nostr_client, settings)
+            let order_msg_queue = Arc::new(RwLock::new(Vec::new()));
+
+            AppContext::new(pool, nostr_client, settings, order_msg_queue)
         }
     }
 

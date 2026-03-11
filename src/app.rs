@@ -30,7 +30,7 @@ use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
-use crate::app::cancel::cancel_action;
+use crate::app::cancel::cancel_action_with_ctx;
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
@@ -259,7 +259,7 @@ async fn handle_message_action(
         Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
-        Action::Cancel => cancel_action(msg, event, my_keys, ctx.pool(), ln_client)
+        Action::Cancel => cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
 

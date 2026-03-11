@@ -1,7 +1,8 @@
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
-use crate::nip33::new_dispute_event;
+use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{
     enqueue_order_msg, get_nostr_client, get_order, settle_seller_hold_invoice, update_order_event,
 };
@@ -117,7 +118,7 @@ pub async fn admin_settle_action(
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-                vec!["mostro".to_string()],
+                create_platform_tag_values(Settings::get_mostro().name.as_deref()),
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("z")),

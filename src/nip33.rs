@@ -183,6 +183,13 @@ fn create_fiat_amt_array(order: &Order) -> Vec<String> {
     }
 }
 
+pub(crate) fn create_platform_tag_values(instance_name: Option<&str>) -> Vec<String> {
+    std::iter::once("mostro")
+        .chain(instance_name.map(str::trim).filter(|s| !s.is_empty()))
+        .map(String::from)
+        .collect()
+}
+
 ///
 /// # Arguments
 ///
@@ -281,7 +288,7 @@ fn create_source_tag(
 /// - `network`: Lightning network
 /// - `layer`: Always "lightning"
 /// - `expiration`: Order expiration timestamp
-/// - `y`: Always "mostro" (marketplace identifier)
+/// - `y`: "mostro" platform identifier, plus optional Mostro instance name from settings
 /// - `z`: Always "order" (event type)
 /// - `rating`: User reputation data (if available)
 /// - `source`: mostro: scheme link to pending orders (`mostro:{order_id}?{relay1,relay2,...}`)
@@ -354,7 +361,7 @@ pub fn order_to_tags(
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),
-                vec!["mostro".to_string()],
+                create_platform_tag_values(Settings::get_mostro().name.as_deref()),
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("z")),
@@ -477,7 +484,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
+            create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("z")),

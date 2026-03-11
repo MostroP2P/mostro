@@ -113,6 +113,10 @@ impl AppContext {
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
+    use crate::config::types::{
+        DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
+        RpcSettings,
+    };
 
     /// Builder for creating test contexts with mock/test dependencies.
     ///
@@ -124,10 +128,77 @@ pub mod test_utils {
     ///     .with_settings(test_settings)
     ///     .build();
     /// ```
+    #[derive(Debug, Clone)]
+    pub struct MockNostrClient {
+        pub published_event_ids: Arc<RwLock<Vec<String>>>,
+        pub connected_relays: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl MockNostrClient {
+        pub fn new() -> Self {
+            Self {
+                published_event_ids: Arc::new(RwLock::new(Vec::new())),
+                connected_relays: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        pub async fn record_published_event(&self, event_id: impl Into<String>) {
+            self.published_event_ids.write().await.push(event_id.into());
+        }
+
+        pub async fn record_connected_relay(&self, relay: impl Into<String>) {
+            self.connected_relays.write().await.push(relay.into());
+        }
+    }
+
+    impl Default for MockNostrClient {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MockOrderMsgQueue {
+        queue: OrderMsgQueue,
+    }
+
+    impl MockOrderMsgQueue {
+        pub fn new() -> Self {
+            Self {
+                queue: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        pub fn queue(&self) -> OrderMsgQueue {
+            self.queue.clone()
+        }
+
+        pub async fn len(&self) -> usize {
+            self.queue.read().await.len()
+        }
+
+        pub async fn is_empty(&self) -> bool {
+            self.queue.read().await.is_empty()
+        }
+
+        pub async fn clear(&self) {
+            self.queue.write().await.clear();
+        }
+    }
+
+    impl Default for MockOrderMsgQueue {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     pub struct TestContextBuilder {
         pool: Option<Arc<Pool<Sqlite>>>,
         nostr_client: Option<Client>,
         settings: Option<Arc<Settings>>,
+        order_msg_queue: Option<OrderMsgQueue>,
+        mock_nostr_client: Option<MockNostrClient>,
+        mock_order_msg_queue: Option<MockOrderMsgQueue>,
     }
 
     impl TestContextBuilder {
@@ -136,6 +207,9 @@ pub mod test_utils {
                 pool: None,
                 nostr_client: None,
                 settings: None,
+                order_msg_queue: None,
+                mock_nostr_client: None,
+                mock_order_msg_queue: None,
             }
         }
 
@@ -154,6 +228,29 @@ pub mod test_utils {
         /// Use specific settings.
         pub fn with_settings(mut self, settings: Settings) -> Self {
             self.settings = Some(Arc::new(settings));
+            self
+        }
+
+        /// Use a specific order message queue.
+        pub fn with_order_msg_queue(mut self, queue: OrderMsgQueue) -> Self {
+            self.order_msg_queue = Some(queue);
+            self
+        }
+
+        /// Attach a mock Nostr client helper for test assertions.
+        ///
+        /// This does not replace `nostr_sdk::Client` behavior directly; it provides
+        /// an explicit test-side recorder/state holder that tests can use while
+        /// migrating handlers away from globals.
+        pub fn with_mock_nostr_client(mut self, mock: MockNostrClient) -> Self {
+            self.mock_nostr_client = Some(mock);
+            self
+        }
+
+        /// Attach a mock order-message queue helper for test assertions.
+        pub fn with_mock_order_msg_queue(mut self, mock: MockOrderMsgQueue) -> Self {
+            self.order_msg_queue = Some(mock.queue());
+            self.mock_order_msg_queue = Some(mock);
             self
         }
 
@@ -176,9 +273,25 @@ pub mod test_utils {
                 .settings
                 .expect("TestContextBuilder requires with_settings() — Settings has no Default");
 
-            let order_msg_queue = Arc::new(RwLock::new(Vec::new()));
+            let order_msg_queue = self
+                .order_msg_queue
+                .unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
 
             AppContext::new(pool, nostr_client, settings, order_msg_queue)
+        }
+
+        /// Build context plus mock handles used for assertions.
+        pub fn build_with_mocks(
+            self,
+        ) -> (
+            AppContext,
+            Option<MockNostrClient>,
+            Option<MockOrderMsgQueue>,
+        ) {
+            let mock_nostr_client = self.mock_nostr_client.clone();
+            let mock_order_msg_queue = self.mock_order_msg_queue.clone();
+            let ctx = self.build();
+            (ctx, mock_nostr_client, mock_order_msg_queue)
         }
     }
 
@@ -186,5 +299,59 @@ pub mod test_utils {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// Generate deterministic test settings with sensible defaults.
+    pub fn test_settings() -> Settings {
+        Settings {
+            database: DatabaseSettings {
+                url: "sqlite::memory:".to_string(),
+            },
+            nostr: NostrSettings {
+                nsec_privkey: "nsec_test_placeholder".to_string(),
+                relays: vec!["wss://relay.test".to_string()],
+            },
+            mostro: MostroSettings::default(),
+            lightning: LightningSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: Some(ExpirationSettings::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_utils::{test_settings, MockOrderMsgQueue, TestContextBuilder};
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn builder_can_inject_mock_order_message_queue() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let mock_queue = MockOrderMsgQueue::new();
+
+        let (ctx, _mock_nostr, mock_order_queue) = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_mock_order_msg_queue(mock_queue)
+            .build_with_mocks();
+
+        let queue = mock_order_queue.expect("mock queue should be present");
+        assert_eq!(queue.len().await, 0);
+        assert_eq!(ctx.order_msg_queue().read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn builder_can_use_custom_queue() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let queue: super::OrderMsgQueue = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_order_msg_queue(queue.clone())
+            .build();
+
+        assert!(Arc::ptr_eq(&queue, ctx.order_msg_queue()));
     }
 }

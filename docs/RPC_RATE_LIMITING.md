@@ -7,9 +7,9 @@ with an in-memory rate limiter that tracks failed attempts per client IP.
 
 ## Problem
 
-The `ValidateDbPassword` endpoint accepts a password and validates it against the
-stored admin hash. Without protection, an attacker with network access to the RPC
-interface could systematically try passwords at thousands of attempts per second.
+The `ValidateDbPassword` endpoint is kept for backward compatibility (database
+encryption was removed, so it always succeeds). The rate limiter remains to
+throttle abuse of this endpoint.
 
 See [Issue #569](https://github.com/MostroP2P/mostro/issues/569) for full details.
 
@@ -38,9 +38,8 @@ The `validate_db_password` method now:
 
 1. Extracts the client's remote address from the gRPC request
 2. Checks the rate limiter — returns `RESOURCE_EXHAUSTED` if locked out
-3. Validates the password against the stored hash
-4. On failure: records the attempt (triggers exponential backoff delay)
-5. On success: resets the client's failure state
+3. Does not validate a password (database encryption was removed); always succeeds
+4. On success: resets the client's failure state
 
 ### Audit Logging
 

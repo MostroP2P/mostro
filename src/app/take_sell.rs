@@ -317,12 +317,9 @@ mod tests {
 
         #[test]
         fn test_encryption_logic_structure() {
-            // Test the structure of encryption logic
+            // Test that pubkey/password vars are used; database encryption was removed.
             let test_pubkey = create_test_keys().public_key().to_string();
             let test_password = "test_password";
-
-            // In a real test, we would test CryptoUtils::store_encrypted
-            // For now, we test the logic structure
             assert!(!test_pubkey.is_empty());
             assert!(!test_password.is_empty());
         }

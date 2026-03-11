@@ -21,8 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let mut client = AdminServiceClient::new(channel);
-    // Example 0: Validate database password
-    println!("Attempting to validate database password...");
+    // Example 0: ValidateDbPassword (backward compatibility; DB encryption removed, always succeeds)
+    println!("Calling ValidateDbPassword (backward-compat endpoint)...");
     let validate_request = tonic::Request::new(ValidateDbPasswordRequest {
         password: std::env::var("MOSTRO_DB_TEST_PASSWORD").unwrap_or_default(),
     });
@@ -31,10 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(response) => {
             let resp = response.get_ref();
             if resp.success {
-                println!("✅ Database password validated successfully");
+                println!("✅ ValidateDbPassword returned success");
             } else {
                 println!(
-                    "❌ Failed to validate DB password: {:?}",
+                    "❌ ValidateDbPassword returned failure: {:?}",
                     resp.error_message
                 );
             }

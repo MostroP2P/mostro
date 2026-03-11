@@ -27,18 +27,13 @@ pub struct Cli {
     /// Set folder for Mostro settings file - default is HOME/.mostro
     #[arg(short, long)]
     dirsettings: Option<String>,
-    /// Decrypt the database and remove encryption. Requires MOSTRO_DB_PASSWORD
-    /// environment variable to be set with the current database password.
-    #[arg(long)]
-    pub decrypt_db: bool,
 }
 
 /// Initialize the settings file and create the global config variable for Mostro settings
 /// Default folder is HOME but user can specify a custom folder with dirsettings (-d ) parameter from CLI
 /// Example: mostro p2p -d /user_folder/mostro
 ///
-/// Returns `true` if `--decrypt-db` was requested, `false` for normal startup.
-pub fn settings_init() -> Result<bool, Box<dyn std::error::Error>> {
+pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -51,7 +46,7 @@ pub fn settings_init() -> Result<bool, Box<dyn std::error::Error>> {
     };
 
     // Mostro settings are initialized
-    Ok(cli.decrypt_db)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -62,15 +57,11 @@ mod tests {
     #[test]
     fn test_cli_parser_creation() {
         // Test that CLI struct can be created
-        let cli = Cli {
-            dirsettings: None,
-            decrypt_db: false,
-        };
+        let cli = Cli { dirsettings: None };
         assert!(cli.dirsettings.is_none());
 
         let cli_with_path = Cli {
             dirsettings: Some("/custom/path".to_string()),
-            decrypt_db: false,
         };
         assert_eq!(cli_with_path.dirsettings.unwrap(), "/custom/path");
     }
@@ -132,7 +123,7 @@ mod tests {
             // In a real implementation, we would need dependency injection for testing
 
             // Test that the function signature is correct
-            let _: fn() -> Result<bool, Box<dyn std::error::Error>> = settings_init;
+            let _: fn() -> Result<(), Box<dyn std::error::Error>> = settings_init;
 
             // Verify function exists and has correct return type
             // No-op: type check above is sufficient
@@ -144,7 +135,6 @@ mod tests {
             let custom_path = Some("/custom/path".to_string());
             let cli = Cli {
                 dirsettings: custom_path.clone(),
-                decrypt_db: false,
             };
 
             if let Some(path) = cli.dirsettings.as_deref() {
@@ -157,10 +147,7 @@ mod tests {
         #[test]
         fn test_default_path_handling() {
             // Test the logical flow of default path handling
-            let cli = Cli {
-                dirsettings: None,
-                decrypt_db: false,
-            };
+            let cli = Cli { dirsettings: None };
 
             if cli.dirsettings.is_none() {
                 // This is the expected path for default settings

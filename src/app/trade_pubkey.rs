@@ -32,24 +32,16 @@ pub async fn trade_pubkey_action(
 
     // Get master keys decrypted
     let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
-        let master_buyer_key = CryptoUtils::decrypt_data(
-            order
-                .get_master_buyer_pubkey(None)
-                .map_err(MostroInternalErr)?
-                .to_string(),
-            None,
-        )
-        .map_err(MostroInternalErr)?;
+        let master_buyer_key = order
+            .get_master_buyer_pubkey()
+            .map_err(MostroInternalErr)?
+            .to_string();
         (Some(master_buyer_key), None)
     } else {
-        let master_seller_key = CryptoUtils::decrypt_data(
-            order
-                .get_master_seller_pubkey()
-                .map_err(MostroInternalErr)?
-                .to_string(),
-            None,
-        )
-        .map_err(MostroInternalErr)?;
+        let master_seller_key = order
+            .get_master_seller_pubkey()
+            .map_err(MostroInternalErr)?
+            .to_string();
         (None, Some(master_seller_key))
     };
 

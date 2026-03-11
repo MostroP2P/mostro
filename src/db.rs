@@ -6,7 +6,6 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 #[cfg(feature = "startos")]
 use clap::Parser;
-use mostro_core::message::DisputeInitiator;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -1315,42 +1314,16 @@ async fn has_pending_order_with_status(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    // Check if database is encrypted
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        let orders_to_check: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT {} FROM orders WHERE status = ?",
-            master_key_field
-        ))
-        .bind(status)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        // search for orders with the same pubkey
-        for master_key in orders_to_check {
-            // Decrypt master pubkey
-            let master_pubkey_decrypted =
-                CryptoUtils::decrypt_data(master_key, MOSTRO_DB_PASSWORD.get())
-                    .map_err(MostroInternalErr)?;
-            if master_pubkey_decrypted == pubkey {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-    // if not encrypted, use the default search
-    else {
-        let exists = sqlx::query_scalar::<_, bool>(&format!(
-            "SELECT EXISTS (SELECT 1 FROM orders WHERE {} = ? AND status = ?)",
-            master_key_field
-        ))
-        .bind(pubkey)
-        .bind(status)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        Ok(exists)
-    }
+    let exists = sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE {} = ? AND status = ?)",
+        master_key_field
+    ))
+    .bind(pubkey)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(exists)
 }
 
 pub async fn update_user_rating(
@@ -1469,83 +1442,26 @@ pub async fn find_user_orders_by_master_key(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    // Check if database is encrypted
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        // For encrypted databases, we need to fetch and decrypt
-        // But we can optimize by filtering out completed/success orders first
-        let sql_query = format!(
-            r#"
-            SELECT id, status, master_buyer_pubkey, master_seller_pubkey, 
-                trade_index_buyer, trade_index_seller
-            FROM orders 
-            WHERE status NOT IN ({})
-              AND (master_buyer_pubkey IS NOT NULL OR master_seller_pubkey IS NOT NULL)
-            "#,
-            EXCLUDED_ORDER_STATUSES
-        );
+    let sql_query = format!(
+        r#"
+        SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
+        WHERE (master_buyer_pubkey = ?)
+        AND status NOT IN ({})
+        UNION ALL
+        SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
+        WHERE (master_seller_pubkey = ?)
+        AND status NOT IN ({})
+        "#,
+        EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
+    );
+    let orders = sqlx::query_as::<_, RestoredOrdersInfo>(&sql_query)
+        .bind(master_key)
+        .bind(master_key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        let active_orders = sqlx::query_as::<_, RestoredOrderHelper>(&sql_query)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        tracing::info!("Total orders possibly matching: {}", active_orders.len());
-        // Filter orders that match the master key
-        let mut matching_orders = Vec::new();
-        let total_time = Instant::now();
-
-        for order in active_orders {
-            // Check master_buyer_pubkey
-            // Decrypt both keys upfront
-            let timer = Instant::now();
-            let decrypted_master_seller_key = order.master_seller_pubkey.as_ref().and_then(|enc| {
-                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-            });
-            let decrypted_master_buyer_key = order.master_buyer_pubkey.as_ref().and_then(|enc| {
-                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-            });
-            let involved_key = if decrypted_master_seller_key.as_deref() == Some(master_key) {
-                order.trade_index_seller
-            } else if decrypted_master_buyer_key.as_deref() == Some(master_key) {
-                order.trade_index_buyer
-            } else {
-                None
-            };
-            if let Some(involved_key) = involved_key {
-                matching_orders.push(RestoredOrdersInfo {
-                    order_id: order.id,
-                    trade_index: involved_key,
-                    status: order.status,
-                });
-            }
-            tracing::info!("Time taken to process order: {:?}", timer.elapsed());
-            tracing::info!("Total time taken: {:?}", total_time.elapsed());
-        }
-
-        Ok(matching_orders)
-    } else {
-        // For non-encrypted databases, use direct SQL queries
-        let sql_query = format!(
-            r#"
-            SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
-            WHERE (master_buyer_pubkey = ?)
-            AND status NOT IN ({})
-            UNION ALL
-            SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
-            WHERE (master_seller_pubkey = ?)
-            AND status NOT IN ({})
-            "#,
-            EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
-        );
-        let orders = sqlx::query_as::<_, RestoredOrdersInfo>(&sql_query)
-            .bind(master_key)
-            .bind(master_key)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        Ok(orders)
-    }
+    Ok(orders)
 }
 
 /// Find all disputes for a user by their master key (for restore session)
@@ -1558,132 +1474,43 @@ pub async fn find_user_disputes_by_master_key(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    // Check if database is encrypted
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        // For encrypted databases, we need to check each dispute's associated order
-        let mut matching_disputes = Vec::new();
-
-        // Single JOIN query - adapted from your non-encrypted approach
-        let sql_query = format!(
-            r#"
-            SELECT
-                d.id AS dispute_id,
-                d.order_id AS order_id,
-                d.status AS dispute_status,
-                o.master_buyer_pubkey,
-                o.master_seller_pubkey,
-                o.trade_index_buyer,
-                o.trade_index_seller,
-                o.buyer_dispute,
-                o.seller_dispute
-            FROM disputes d
-            JOIN orders o ON d.order_id = o.id
-            WHERE d.status IN ({})
-            "#,
-            ACTIVE_DISPUTE_STATUSES
-        );
-
-        let dispute_order_rows = sqlx::query_as::<_, RestoredDisputeHelper>(&sql_query)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        tracing::info!(
-            "Total disputes possibly matching: {}",
-            dispute_order_rows.len()
-        );
-        let total_time = Instant::now();
-        // Process all rows in memory (no more DB calls!)
-        for dispute in dispute_order_rows {
-            // Decrypt both keys upfront
-            let timer = Instant::now();
-            let decrypted_master_seller_key =
-                dispute.master_seller_pubkey.as_ref().and_then(|enc| {
-                    CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-                });
-            let decrypted_master_buyer_key = dispute.master_buyer_pubkey.as_ref().and_then(|enc| {
-                CryptoUtils::decrypt_data(enc.to_string(), MOSTRO_DB_PASSWORD.get()).ok()
-            });
-
-            // Check if user is involved and get trade_index (same logic as before)
-            let involved_key = if decrypted_master_seller_key.as_deref() == Some(master_key) {
-                dispute.trade_index_seller
-            } else if decrypted_master_buyer_key.as_deref() == Some(master_key) {
-                dispute.trade_index_buyer
-            } else {
-                None
-            };
-
-            if let Some(involved_key) = involved_key {
-                let initiator = match (dispute.buyer_dispute, dispute.seller_dispute) {
-                    (true, false) => Some(DisputeInitiator::Buyer),
-                    (false, true) => Some(DisputeInitiator::Seller),
-                    (true, true) => {
-                        tracing::warn!(
-                            dispute_id = %dispute.dispute_id,
-                            order_id = %dispute.order_id,
-                            buyer_dispute = true,
-                            seller_dispute = true,
-                            "Data integrity issue: both buyer_dispute and seller_dispute are true"
-                        );
-                        None
-                    }
-                    (false, false) => None,
-                };
-
-                matching_disputes.push(RestoredDisputesInfo {
-                    dispute_id: dispute.dispute_id,
-                    order_id: dispute.order_id,
-                    trade_index: involved_key,
-                    status: dispute.dispute_status,
-                    initiator,
-                });
-            }
-            tracing::info!("Time taken to process dispute: {:?}", timer.elapsed());
-            tracing::info!("Total time taken: {:?}", total_time.elapsed());
-        }
-        Ok(matching_disputes)
-    } else {
-        // For non-encrypted databases, we can use a more efficient approach
-        // by joining with orders table
-        let sql_query = format!(
-            r#"
-            SELECT
-                d.id AS dispute_id,
-                d.order_id AS order_id,
-                COALESCE(
-                    CASE
-                        WHEN o.master_buyer_pubkey = ? THEN o.trade_index_buyer
-                        WHEN o.master_seller_pubkey = ? THEN o.trade_index_seller
-                        ELSE 0
-                    END, 0
-                ) AS trade_index,
-                d.status AS status,
+    let sql_query = format!(
+        r#"
+        SELECT
+            d.id AS dispute_id,
+            d.order_id AS order_id,
+            COALESCE(
                 CASE
-                    WHEN o.buyer_dispute = 1 AND o.seller_dispute = 0 THEN 'buyer'
-                    WHEN o.seller_dispute = 1 AND o.buyer_dispute = 0 THEN 'seller'
-                    ELSE NULL
-                END AS initiator
-            FROM disputes d
-            JOIN orders o ON d.order_id = o.id
-            WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
-                AND d.status IN ({})
-            "#,
-            ACTIVE_DISPUTE_STATUSES
-        );
-        let restore_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(&sql_query)
-            //CASE
-            .bind(master_key)
-            .bind(master_key)
-            //WHERE
-            .bind(master_key)
-            .bind(master_key)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                    WHEN o.master_buyer_pubkey = ? THEN o.trade_index_buyer
+                    WHEN o.master_seller_pubkey = ? THEN o.trade_index_seller
+                    ELSE 0
+                END, 0
+            ) AS trade_index,
+            d.status AS status,
+            CASE
+                WHEN o.buyer_dispute = 1 AND o.seller_dispute = 0 THEN 'buyer'
+                WHEN o.seller_dispute = 1 AND o.buyer_dispute = 0 THEN 'seller'
+                ELSE NULL
+            END AS initiator
+        FROM disputes d
+        JOIN orders o ON d.order_id = o.id
+        WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)
+            AND d.status IN ({})
+        "#,
+        ACTIVE_DISPUTE_STATUSES
+    );
+    let restore_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(&sql_query)
+        //CASE
+        .bind(master_key)
+        .bind(master_key)
+        //WHERE
+        .bind(master_key)
+        .bind(master_key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        Ok(restore_disputes)
-    }
+    Ok(restore_disputes)
 }
 
 /// The actual work function that does the heavy decryption

@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
@@ -323,13 +324,25 @@ async fn cancel_pending_order_from_maker(
     Ok(())
 }
 
-/// Top-level cancel entrypoint.
+/// Cancel action entry point using dependency-injected context.
+///
+/// This is the preferred entry point. The `pool` is extracted from `ctx`
+/// internally. Callers that still pass `pool` directly can use the legacy
+/// [`cancel_action`] wrapper until the migration is complete.
+pub async fn cancel_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    cancel_action(msg, event, my_keys, ctx.pool(), ln_client).await
+}
+
+/// Top-level cancel entrypoint (legacy signature).
 ///
 /// Routes to one of the specific flows based on the current `Status` and who
-/// sent the request:
-/// - Pending: maker-only soft cancel (republish)
-/// - WaitingPayment/WaitingBuyerInvoice: not-active flows
-/// - Active/FiatSent/Dispute: cooperative flows between buyer and seller
+/// sent the request. Prefer [`cancel_action_with_ctx`] for new code.
 pub async fn cancel_action(
     msg: Message,
     event: &UnwrappedGift,

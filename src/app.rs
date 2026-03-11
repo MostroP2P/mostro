@@ -31,6 +31,7 @@ use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::cancel::cancel_action;
+use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
 use crate::app::last_trade_index::last_trade_index;
@@ -222,6 +223,7 @@ async fn handle_message_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    ctx: &AppContext,
 ) -> Result<()> {
     match action {
         // Order-related actions
@@ -257,7 +259,7 @@ async fn handle_message_action(
         Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
-        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client)
+        Action::Cancel => cancel_action(msg, event, my_keys, ctx.pool(), ln_client)
             .await
             .map_err(|e| e.into()),
 
@@ -305,6 +307,13 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
         let pool = get_db_pool();
         // Get pow from config
         let pow = Settings::get_mostro().pow;
+
+        // Build application context for dependency-injected handlers.
+        // This bridges the current global-based architecture with the new
+        // DI pattern (issue #639). Handlers will gradually migrate from
+        // using `pool` directly to using `ctx`.
+        let ctx = AppContext::from_globals()
+            .expect("Failed to build AppContext — globals not initialized");
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 // Verify proof of work
@@ -389,6 +398,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                                 &my_keys,
                                 &pool,
                                 ln_client,
+                                &ctx,
                             )
                             .await
                             {

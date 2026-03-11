@@ -11,17 +11,24 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
-#[tonic::async_trait]
 pub trait CancelLightning {
-    async fn cancel_hold_invoice(&mut self, hash: &str) -> Result<(), MostroError>;
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>;
 }
 
-#[tonic::async_trait]
 impl CancelLightning for LndConnector {
-    async fn cancel_hold_invoice(&mut self, hash: &str) -> Result<(), MostroError> {
-        LndConnector::cancel_hold_invoice(self, hash)
-            .await
-            .map(|_| ())
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            LndConnector::cancel_hold_invoice(self, hash)
+                .await
+                .map(|_| ())
+        })
     }
 }
 
@@ -596,17 +603,23 @@ mod tests {
 
     struct StubLnClient;
 
-    #[tonic::async_trait]
     impl CancelLightning for StubLnClient {
-        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
-            Ok(())
+        fn cancel_hold_invoice<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(()) })
         }
     }
 
     #[tokio::test]
     async fn cancel_action_with_ctx_rejects_non_creator_for_pending_order() {
         let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-        sqlx::migrate!().run(pool.as_ref()).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
         let ctx = TestContextBuilder::new()
             .with_pool(pool)
             .with_settings(test_settings())

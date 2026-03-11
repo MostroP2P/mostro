@@ -118,36 +118,6 @@ pub mod test_utils {
         RpcSettings,
     };
 
-    /// Test helper that records mock Nostr interactions for assertions.
-    #[derive(Debug, Clone)]
-    pub struct MockNostrClient {
-        pub published_event_ids: Arc<RwLock<Vec<String>>>,
-        pub connected_relays: Arc<RwLock<Vec<String>>>,
-    }
-
-    impl MockNostrClient {
-        pub fn new() -> Self {
-            Self {
-                published_event_ids: Arc::new(RwLock::new(Vec::new())),
-                connected_relays: Arc::new(RwLock::new(Vec::new())),
-            }
-        }
-
-        pub async fn record_published_event(&self, event_id: impl Into<String>) {
-            self.published_event_ids.write().await.push(event_id.into());
-        }
-
-        pub async fn record_connected_relay(&self, relay: impl Into<String>) {
-            self.connected_relays.write().await.push(relay.into());
-        }
-    }
-
-    impl Default for MockNostrClient {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
     pub struct MockOrderMsgQueue {
@@ -199,7 +169,6 @@ pub mod test_utils {
         nostr_client: Option<Client>,
         settings: Option<Arc<Settings>>,
         order_msg_queue: Option<OrderMsgQueue>,
-        mock_nostr_client: Option<MockNostrClient>,
         mock_order_msg_queue: Option<MockOrderMsgQueue>,
     }
 
@@ -210,7 +179,6 @@ pub mod test_utils {
                 nostr_client: None,
                 settings: None,
                 order_msg_queue: None,
-                mock_nostr_client: None,
                 mock_order_msg_queue: None,
             }
         }
@@ -221,10 +189,9 @@ pub mod test_utils {
             self
         }
 
-        /// Use a specific Nostr client (e.g., a mock or test-configured client).
+        /// Use a specific Nostr client for tests.
         pub fn with_nostr_client(mut self, client: Client) -> Self {
             self.nostr_client = Some(client);
-            self.mock_nostr_client = None;
             self
         }
 
@@ -238,16 +205,6 @@ pub mod test_utils {
         pub fn with_order_msg_queue(mut self, queue: OrderMsgQueue) -> Self {
             self.order_msg_queue = Some(queue);
             self.mock_order_msg_queue = None;
-            self
-        }
-
-        /// Attach a mock Nostr client helper for test assertions.
-        ///
-        /// This does not replace `nostr_sdk::Client` behavior directly; it provides
-        /// an explicit test-side recorder/state holder that tests can use while
-        /// migrating handlers away from globals.
-        pub fn with_mock_nostr_client(mut self, mock: MockNostrClient) -> Self {
-            self.mock_nostr_client = Some(mock);
             self
         }
 
@@ -285,17 +242,10 @@ pub mod test_utils {
         }
 
         /// Build context plus mock handles used for assertions.
-        pub fn build_with_mocks(
-            self,
-        ) -> (
-            AppContext,
-            Option<MockNostrClient>,
-            Option<MockOrderMsgQueue>,
-        ) {
-            let mock_nostr_client = self.mock_nostr_client.clone();
+        pub fn build_with_mocks(self) -> (AppContext, Option<MockOrderMsgQueue>) {
             let mock_order_msg_queue = self.mock_order_msg_queue.clone();
             let ctx = self.build();
-            (ctx, mock_nostr_client, mock_order_msg_queue)
+            (ctx, mock_order_msg_queue)
         }
     }
 
@@ -312,7 +262,9 @@ pub mod test_utils {
                 url: "sqlite::memory:".to_string(),
             },
             nostr: NostrSettings {
-                nsec_privkey: "nsec_test_placeholder".to_string(),
+                // Valid test nsec from src/config/mod.rs tests
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
                 relays: vec!["wss://relay.test".to_string()],
             },
             mostro: MostroSettings::default(),
@@ -334,7 +286,7 @@ mod tests {
         let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
         let mock_queue = MockOrderMsgQueue::new();
 
-        let (ctx, _mock_nostr, mock_order_queue) = TestContextBuilder::new()
+        let (ctx, mock_order_queue) = TestContextBuilder::new()
             .with_pool(pool)
             .with_settings(test_settings())
             .with_mock_order_msg_queue(mock_queue)

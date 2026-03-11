@@ -206,22 +206,11 @@ async fn check_trade_index(
     }
 }
 
-/// Handles the processing of a single message action by routing it to the appropriate handler
-/// based on the action type. This is the core message routing logic of the application.
-///
-/// # Arguments
-/// * `action` - The type of action to be performed
-/// * `msg` - The message containing action details
-/// * `event` - The unwrapped gift wrap event
-/// * `my_keys` - Node keypair for signing/verification
-/// * `ln_client` - Lightning network connector
-/// * `ctx` - Dependency-injected app context
-async fn handle_message_action(
+async fn handle_message_action_no_ln(
     action: &Action,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
-    ln_client: &mut LndConnector,
     ctx: &AppContext,
 ) -> Result<()> {
     match action {
@@ -236,11 +225,8 @@ async fn handle_message_action(
             .await
             .map_err(|e| e.into()),
 
-        // Payment-related actions
+        // Payment-related actions that do not require LN client
         Action::FiatSent => fiat_sent_action_with_ctx(ctx, msg, event, my_keys)
-            .await
-            .map_err(|e| e.into()),
-        Action::Release => release_action_with_ctx(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
         Action::AddInvoice => add_invoice_action_with_ctx(ctx, msg, event, my_keys)
@@ -258,17 +244,8 @@ async fn handle_message_action(
         Action::RateUser => update_user_reputation_action_with_ctx(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::Cancel => cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
-            .await
-            .map_err(|e| e.into()),
 
-        // Admin actions
-        Action::AdminCancel => admin_cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
-            .await
-            .map_err(|e| e.into()),
-        Action::AdminSettle => admin_settle_action_with_ctx(ctx, msg, event, my_keys, ln_client)
-            .await
-            .map_err(|e| e.into()),
+        // Admin actions without LN
         Action::AdminAddSolver => admin_add_solver_action_with_ctx(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
@@ -288,6 +265,33 @@ async fn handle_message_action(
             tracing::info!("Received message with action {:?}", action);
             Ok(())
         }
+    }
+}
+
+/// Handles the processing of a single message action by routing it to the appropriate handler
+/// based on the action type. This is the core message routing logic of the application.
+async fn handle_message_action(
+    action: &Action,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+    ctx: &AppContext,
+) -> Result<()> {
+    match action {
+        Action::Release => release_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::Cancel => cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminCancel => admin_cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        Action::AdminSettle => admin_settle_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+            .await
+            .map_err(|e| e.into()),
+        _ => handle_message_action_no_ln(action, msg, event, my_keys, ctx).await,
     }
 }
 
@@ -578,60 +582,121 @@ mod tests {
 
     mod handle_message_action_tests {
         use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use sqlx::SqlitePool;
+        use std::sync::Arc;
 
-        #[test]
-        fn test_action_routing_logic() {
-            // Test that all action types are handled in the match statement
-            let actions = vec![
-                Action::NewOrder,
-                Action::TakeSell,
-                Action::TakeBuy,
-                Action::FiatSent,
-                Action::Release,
-                Action::AddInvoice,
-                Action::PayInvoice,
-                Action::LastTradeIndex,
-                Action::Dispute,
-                Action::RateUser,
-                Action::Cancel,
-                Action::AdminCancel,
-                Action::AdminSettle,
-                Action::AdminAddSolver,
-                Action::AdminTakeDispute,
-                Action::TradePubkey,
-                Action::RestoreSession,
-                Action::Orders,
-            ];
+        fn create_restore_session_message() -> Message {
+            Message::new_restore(None)
+        }
 
-            // Verify we have handlers for all action types
-            for action in actions {
-                // In a real test, we would verify each action is properly routed
-                // This test ensures we don't forget to handle new actions
-                match action {
-                    Action::NewOrder
-                    | Action::TakeSell
-                    | Action::TakeBuy
-                    | Action::FiatSent
-                    | Action::Release
-                    | Action::AddInvoice
-                    | Action::LastTradeIndex
-                    | Action::Dispute
-                    | Action::RateUser
-                    | Action::Cancel
-                    | Action::AdminCancel
-                    | Action::AdminSettle
-                    | Action::AdminAddSolver
-                    | Action::AdminTakeDispute
-                    | Action::TradePubkey
-                    | Action::RestoreSession
-                    | Action::Orders
-                    | Action::PayInvoice => {}
-                    _ => {
-                        // Any unhandled actions should be caught here
-                        // No-op
-                    }
-                }
-            }
+        #[tokio::test]
+        async fn routes_last_trade_index_to_handler_and_returns_not_found() {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_gift();
+            let msg = create_test_message(Action::LastTradeIndex, None);
+
+            let result =
+                handle_message_action_no_ln(&Action::LastTradeIndex, msg, &event, &my_keys, &ctx)
+                    .await;
+
+            assert!(matches!(
+                result,
+                Err(e)
+                    if e.downcast_ref::<MostroError>()
+                        == Some(&MostroError::MostroCantDo(CantDoReason::NotFound))
+            ));
+        }
+
+        #[tokio::test]
+        async fn routes_restore_session_to_handler_and_returns_ok() {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_gift();
+            let msg = create_restore_session_message();
+
+            let result =
+                handle_message_action_no_ln(&Action::RestoreSession, msg, &event, &my_keys, &ctx)
+                    .await;
+
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn routes_orders_to_handler_and_returns_invalid_parameters() {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_gift();
+            let msg = create_test_message(Action::Orders, None);
+
+            let result =
+                handle_message_action_no_ln(&Action::Orders, msg, &event, &my_keys, &ctx).await;
+
+            assert!(matches!(
+                result,
+                Err(e)
+                    if e.downcast_ref::<MostroError>()
+                        == Some(&MostroError::MostroCantDo(CantDoReason::InvalidParameters))
+            ));
+        }
+
+        #[tokio::test]
+        async fn routes_payinvoice_to_typed_invalid_action_error() {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_gift();
+            let msg = create_test_message(Action::PayInvoice, None);
+
+            let result =
+                handle_message_action_no_ln(&Action::PayInvoice, msg, &event, &my_keys, &ctx).await;
+
+            assert!(matches!(
+                result,
+                Err(e)
+                    if e.downcast_ref::<MostroError>()
+                        == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
+            ));
         }
     }
 

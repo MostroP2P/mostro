@@ -113,6 +113,46 @@ impl AppContext {
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
+    use crate::config::types::{
+        DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
+        RpcSettings,
+    };
+
+    /// Test helper wrapper for inspecting the shared order-message queue.
+    #[derive(Debug, Clone)]
+    pub struct MockOrderMsgQueue {
+        queue: OrderMsgQueue,
+    }
+
+    impl MockOrderMsgQueue {
+        pub fn new() -> Self {
+            Self {
+                queue: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        pub fn queue(&self) -> OrderMsgQueue {
+            self.queue.clone()
+        }
+
+        pub async fn len(&self) -> usize {
+            self.queue.read().await.len()
+        }
+
+        pub async fn is_empty(&self) -> bool {
+            self.queue.read().await.is_empty()
+        }
+
+        pub async fn clear(&self) {
+            self.queue.write().await.clear();
+        }
+    }
+
+    impl Default for MockOrderMsgQueue {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     /// Builder for creating test contexts with mock/test dependencies.
     ///
@@ -128,6 +168,8 @@ pub mod test_utils {
         pool: Option<Arc<Pool<Sqlite>>>,
         nostr_client: Option<Client>,
         settings: Option<Arc<Settings>>,
+        order_msg_queue: Option<OrderMsgQueue>,
+        mock_order_msg_queue: Option<MockOrderMsgQueue>,
     }
 
     impl TestContextBuilder {
@@ -136,6 +178,8 @@ pub mod test_utils {
                 pool: None,
                 nostr_client: None,
                 settings: None,
+                order_msg_queue: None,
+                mock_order_msg_queue: None,
             }
         }
 
@@ -145,7 +189,7 @@ pub mod test_utils {
             self
         }
 
-        /// Use a specific Nostr client (e.g., a mock or test-configured client).
+        /// Use a specific Nostr client for tests.
         pub fn with_nostr_client(mut self, client: Client) -> Self {
             self.nostr_client = Some(client);
             self
@@ -154,6 +198,20 @@ pub mod test_utils {
         /// Use specific settings.
         pub fn with_settings(mut self, settings: Settings) -> Self {
             self.settings = Some(Arc::new(settings));
+            self
+        }
+
+        /// Use a specific order message queue.
+        pub fn with_order_msg_queue(mut self, queue: OrderMsgQueue) -> Self {
+            self.order_msg_queue = Some(queue);
+            self.mock_order_msg_queue = None;
+            self
+        }
+
+        /// Attach a mock order-message queue helper for test assertions.
+        pub fn with_mock_order_msg_queue(mut self, mock: MockOrderMsgQueue) -> Self {
+            self.order_msg_queue = Some(mock.queue());
+            self.mock_order_msg_queue = Some(mock);
             self
         }
 
@@ -176,9 +234,18 @@ pub mod test_utils {
                 .settings
                 .expect("TestContextBuilder requires with_settings() — Settings has no Default");
 
-            let order_msg_queue = Arc::new(RwLock::new(Vec::new()));
+            let order_msg_queue = self
+                .order_msg_queue
+                .unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
 
             AppContext::new(pool, nostr_client, settings, order_msg_queue)
+        }
+
+        /// Build context plus mock handles used for assertions.
+        pub fn build_with_mocks(self) -> (AppContext, Option<MockOrderMsgQueue>) {
+            let mock_order_msg_queue = self.mock_order_msg_queue.clone();
+            let ctx = self.build();
+            (ctx, mock_order_msg_queue)
         }
     }
 
@@ -186,5 +253,60 @@ pub mod test_utils {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// Generate deterministic test settings with sensible defaults.
+    pub fn test_settings() -> Settings {
+        Settings {
+            database: DatabaseSettings {
+                url: "sqlite::memory:".to_string(),
+            },
+            nostr: NostrSettings {
+                // Valid test nsec from src/config/mod.rs tests
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec!["wss://relay.test".to_string()],
+            },
+            mostro: MostroSettings::default(),
+            lightning: LightningSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: Some(ExpirationSettings::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_utils::{test_settings, MockOrderMsgQueue, TestContextBuilder};
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn builder_can_inject_mock_order_message_queue() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let mock_queue = MockOrderMsgQueue::new();
+
+        let (ctx, mock_order_queue) = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_mock_order_msg_queue(mock_queue)
+            .build_with_mocks();
+
+        let queue = mock_order_queue.expect("mock queue should be present");
+        assert!(Arc::ptr_eq(&queue.queue(), ctx.order_msg_queue()));
+    }
+
+    #[tokio::test]
+    async fn builder_can_use_custom_queue() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let queue: super::OrderMsgQueue = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_order_msg_queue(queue.clone())
+            .build();
+
+        assert!(Arc::ptr_eq(&queue, ctx.order_msg_queue()));
     }
 }

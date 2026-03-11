@@ -1,22 +1,12 @@
-#[cfg(feature = "startos")]
-use crate::cli::Cli;
 use crate::config::settings::Settings;
-use crate::config::MOSTRO_DB_PASSWORD;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-#[cfg(feature = "startos")]
-use clap::Parser;
+use argon2::PasswordVerifier;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use rpassword::read_password;
-use secrecy::zeroize::Zeroize;
-use secrecy::{ExposeSecret, SecretString};
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
 use std::fs::{set_permissions, Permissions};
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -28,284 +18,7 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-fn restrict_file_permissions(path: &Path) -> Result<(), MostroError> {
-    #[cfg(unix)]
-    {
-        let perms = Permissions::from_mode(0o600);
-        set_permissions(path, perms)
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    }
-
-    #[cfg(windows)]
-    {
-        // Optional: could integrate with `winapi` or use a placeholder
-        println!("⚠️ Skipping permission change on Windows. Set it manually if needed.");
-    }
-
-    Ok(())
-}
-
-/// Password strength requirements struct
-struct PasswordRequirements {
-    min_length: usize,
-    requires_uppercase: bool,
-    requires_lowercase: bool,
-    requires_digit: bool,
-    requires_special: bool,
-}
-
-impl Default for PasswordRequirements {
-    fn default() -> Self {
-        Self {
-            min_length: 12, // Recommended minimum length
-            requires_uppercase: true,
-            requires_lowercase: true,
-            requires_digit: true,
-            requires_special: true,
-        }
-    }
-}
-
-impl PasswordRequirements {
-    fn validate(&self, password: &str) -> Vec<String> {
-        let mut failures = Vec::new();
-
-        if password.len() < self.min_length {
-            failures.push(format!(
-                "Password must be at least {} characters long",
-                self.min_length
-            ));
-        }
-
-        if self.requires_uppercase && !password.chars().any(|c| c.is_uppercase()) {
-            failures.push("Password must contain at least one uppercase letter".to_string());
-        }
-
-        if self.requires_lowercase && !password.chars().any(|c| c.is_lowercase()) {
-            failures.push("Password must contain at least one lowercase letter".to_string());
-        }
-
-        if self.requires_digit && !password.chars().any(|c| c.is_ascii_digit()) {
-            failures.push("Password must contain at least one number".to_string());
-        }
-
-        if self.requires_special && !password.chars().any(|c| !c.is_alphanumeric()) {
-            failures.push("Password must contain at least one special character".to_string());
-        }
-
-        // If password is empty, clear failures
-        if password.is_empty() {
-            // Empty password is allowed to support optional encryption
-            failures.clear();
-        }
-
-        failures
-    }
-
-    fn is_strong_password(&self, password: &str) -> bool {
-        match self.validate(password).is_empty() {
-            true => true,
-            false => {
-                println!("\nPassword is not strong enough:");
-                for failure in self.validate(password) {
-                    println!("- {}", failure);
-                }
-                false
-            }
-        }
-    }
-}
-
-fn check_password_hash(password_hash: &PasswordHash) -> Result<bool, MostroError> {
-    // Get user input password to check against stored hash
-    print!("Enter database password: ");
-    std::io::stdout().flush().unwrap();
-    // Simulate a delay in password input to avoid timing attacks
-    let random_delay = rand::random::<u16>() % 1000;
-    let password = read_password()
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    // Simulate a delay in password input to avoid timing attacks
-    std::thread::sleep(std::time::Duration::from_millis(
-        100_u64 + random_delay as u64,
-    ));
-
-    if Argon2::default()
-        .verify_password(password.as_bytes(), password_hash)
-        .is_ok()
-    {
-        if MOSTRO_DB_PASSWORD.set(SecretString::from(password)).is_ok() {
-            Ok(true)
-        } else {
-            Err(MostroInternalErr(ServiceError::DbAccessError(
-                "Failed to save password".to_string(),
-            )))
-        }
-    } else {
-        Err(MostroInternalErr(ServiceError::DbAccessError(
-            "Invalid password".to_string(),
-        )))
-    }
-}
-
-/// Verify the provided password against the stored admin hash and set it in memory on success.
-/// This is a non-interactive variant used by RPC.
-pub async fn verify_and_set_db_password(
-    pool: &SqlitePool,
-    password: String,
-) -> Result<(), MostroError> {
-    // Fetch stored admin password hash
-    let Some(argon2_hash) = get_admin_password(pool).await? else {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
-            "Database encryption not enabled".to_string(),
-        )));
-    };
-
-    let parsed_hash = PasswordHash::new(&argon2_hash)
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    if Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok()
-    {
-        // Save the password in memory if not set. If already set, keep the existing value.
-        let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password));
-        Ok(())
-    } else {
-        Err(MostroInternalErr(ServiceError::DbAccessError(
-            "Invalid password".to_string(),
-        )))
-    }
-}
-
-fn password_instructions(password_requirements: &PasswordRequirements) {
-    // Print password requirements
-    println!("\nHey Mostro admin insert a password to encrypt the database:");
-    println!(
-        "- At least {} characters long",
-        password_requirements.min_length
-    );
-    println!("- At least one uppercase letter");
-    println!("- At least one lowercase letter");
-    println!("- At least one number");
-    println!("- At least one special character");
-}
-
-fn load_db_password_from_env() -> bool {
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        return false;
-    }
-
-    match std::env::var("MOSTRO_DB_PASSWORD") {
-        Ok(password) if password.is_empty() => {
-            tracing::info!("MOSTRO_DB_PASSWORD is empty, DB encryption will be disabled");
-            true
-        }
-        Ok(password) => {
-            let _ = MOSTRO_DB_PASSWORD.set(SecretString::from(password));
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-async fn get_user_password(cleartext_requested: bool) -> Result<(), MostroError> {
-    // Password requirements settings
-    let password_requirements = PasswordRequirements::default();
-
-    if cleartext_requested {
-        tracing::info!("No password encryption will be used for database");
-        return Ok(());
-    }
-
-    // If password is already set, check if it's strong enough
-    // If not, prompt user to enter a new password
-    // password here is set from command line argument --password
-    if let Some(password) = MOSTRO_DB_PASSWORD.get() {
-        if password_requirements.is_strong_password(password.expose_secret()) {
-            println!("Database password already set");
-            return Ok(());
-        } else {
-            println!("Database password is not strong enough");
-            password_instructions(&password_requirements);
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                "Database password is not strong enough".to_string(),
-            )));
-        }
-    }
-
-    #[cfg(feature = "startos")]
-    {
-        let cli = Cli::parse();
-        if cli.cleartext {
-            tracing::info!("No password encryption will be used for database");
-            return Ok(());
-        }
-    }
-
-    if !std::io::stdin().is_terminal() {
-        tracing::info!("Non-interactive startup detected, skipping database encryption prompt");
-        return Ok(());
-    }
-
-    // New database - need password creation
-    loop {
-        // First password entry
-        print!("\nEnter new database password (Press enter to skip encryption): ");
-
-        // get a random delay to avoid timing attacks
-        let random_delay = rand::random::<u16>() % 1000;
-
-        std::io::stdout().flush().unwrap();
-        let password = read_password()
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        // Simulate a delay in password input to avoid timing attacks
-        std::thread::sleep(std::time::Duration::from_millis(
-            100_u64 + random_delay as u64,
-        ));
-
-        // Check password strength
-        if !password_requirements.is_strong_password(&password) {
-            continue;
-        }
-        if password.is_empty() {
-            print!("Press enter to skip password");
-        } else {
-            // Confirm password
-            print!("Confirm database password: ");
-        }
-
-        std::io::stdout().flush().unwrap();
-        let mut confirm_password = read_password().map_err(|_| {
-            MostroInternalErr(ServiceError::IOError("Failed to read password".to_string()))
-        })?;
-
-        if password == confirm_password {
-            // zeroize confirm password in ram
-            confirm_password.zeroize();
-            if password.is_empty() {
-                println!("Password skipped!!");
-                break;
-            } else {
-                // Save password in static variable using OnceLock and SecretString to avoid exposing the password in memory and logs
-                if MOSTRO_DB_PASSWORD.set(SecretString::from(password)).is_ok() {
-                    break;
-                } else {
-                    println!("Failed to save password please try again");
-                }
-            }
-        } else {
-            println!("Passwords do not match. Please try again.");
-        }
-    }
-    Ok(())
-}
-
 /// Helper function to rebuild disputes table without token columns when DROP COLUMN is unsupported.
-///
-/// This creates a new table with the correct schema, copies data, and replaces the original table.
-/// Used as fallback when ALTER TABLE DROP COLUMN is not available in older SQLite versions.
 async fn rebuild_disputes_table_without_tokens(pool: &SqlitePool) -> Result<(), MostroError> {
     tracing::info!("Rebuilding disputes table without token columns (SQLite compatibility mode)");
 
@@ -512,26 +225,18 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     let db_url = &db_settings.url;
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
-    let cleartext_requested = load_db_password_from_env();
-
-    // Deprecation warning for full database encryption
-    if MOSTRO_DB_PASSWORD.get().is_some() {
-        tracing::warn!(
-            "Full database encryption via MOSTRO_DB_PASSWORD is deprecated and will be \
-             removed in a future version. Please run `mostrod --decrypt-db` to migrate \
-             your database to plaintext. See https://github.com/MostroP2P/mostro/issues/642"
-        );
-    }
 
     let conn = if !db_path.exists() {
-        //Create new database file
+        // Create new database file
         let _file = std::fs::File::create_new(db_path)
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        // Restrict file permissions only owner can read and write
-        // TODO: check if this is works on windows
-        restrict_file_permissions(db_path)
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Restrict file permissions — only owner can read and write
+        #[cfg(unix)]
+        {
+            set_permissions(db_path, Permissions::from_mode(0o600))
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        }
 
         // Create new database connection
         match SqlitePool::connect(db_url).await {
@@ -556,30 +261,6 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
                             return Err(e);
                         }
 
-                        // Get user password
-                        match get_user_password(cleartext_requested).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!("Failed to set up database password: {}", e);
-                                println!(
-                                    "Failed to set up database password. Removing database file."
-                                );
-                                if let Err(cleanup_err) = std::fs::remove_file(db_path) {
-                                    tracing::error!(
-                                        error = %cleanup_err,
-                                        path = %db_path.display(),
-                                        "Failed to clean up database file"
-                                    );
-                                }
-                                std::process::exit(1);
-                            }
-                        }
-                        // Save admin password hash securely
-                        if let Some(password) = MOSTRO_DB_PASSWORD.get() {
-                            store_password_hash(password, &pool).await.map_err(|e| {
-                                MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
-                            })?;
-                        }
                         pool
                     }
                     Err(e) => {
@@ -613,35 +294,6 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        // Opening existing database - allow maximum 3 attempts
-        let max_attempts = 3;
-        let mut attempts = 0;
-
-        if MOSTRO_DB_PASSWORD.get().is_none() {
-            if !std::io::stdin().is_terminal() && get_admin_password(&conn).await?.is_some() {
-                return Err(MostroInternalErr(ServiceError::DbAccessError(
-                    "Encrypted database requires a password in non-interactive mode. Set MOSTRO_DB_PASSWORD or use --password."
-                        .to_string(),
-                )));
-            }
-
-            while let Some(argon2_hash) = get_admin_password(&conn).await? {
-                // Database already exists - and yet opened
-                let parsed_hash = PasswordHash::new(&argon2_hash)
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-                if check_password_hash(&parsed_hash).is_ok() {
-                    break;
-                } else {
-                    attempts += 1;
-                    println!("Wrong password, attempts: {}", attempts);
-                    if attempts >= max_attempts {
-                        println!("Maximum password attempts exceeded!!");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-
         // Run legacy column migration for existing databases
         if let Err(e) = migrate_remove_token_columns(&conn).await {
             tracing::error!(
@@ -657,60 +309,32 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
 }
 
 // You'll need to implement these functions to store and verify the password hash
-async fn store_password_hash(
-    password: &SecretString,
-    pool: &SqlitePool,
-) -> Result<(), MostroError> {
-    // Generate a random salt
-    let salt = SaltString::generate(&mut OsRng);
-
-    // Configure Argon2 parameters
-    let argon2 = Argon2::default();
-
-    // Derive the key
-    let key = argon2
-        .hash_password(password.expose_secret().as_bytes(), &salt)
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        .to_string();
-
-    // Get mostro keys
-    let my_keys = crate::util::get_keys()
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
-    // Store the key and salt securely (e.g., in a file or database)
-    let new_user: User = User {
-        pubkey: my_keys.public_key.to_string(),
-        is_admin: 1,
-        admin_password: Some(key),
-        ..Default::default()
-    };
-    if let Err(e) = add_new_user(pool, new_user).await {
-        tracing::error!("Error creating new user: {}", e);
-        return Err(MostroError::MostroCantDo(CantDoReason::CantCreateUser));
-    }
-
-    Ok(())
-}
-
 /// Decrypt all encrypted master pubkeys in the database.
 ///
 /// This is a one-time migration tool for operators moving away from full
-/// database encryption. It reads all orders with `master_buyer_pubkey` or
-/// `master_seller_pubkey`, attempts to decrypt them using the current
-/// `MOSTRO_DB_PASSWORD`, and writes back the plaintext values.
+/// database encryption. It reads `MOSTRO_DB_PASSWORD` from the environment,
+/// verifies it against the stored admin hash, then decrypts all
+/// `master_buyer_pubkey` / `master_seller_pubkey` values.
 ///
 /// The operation is transactional: all-or-nothing.
 ///
 /// Returns the number of orders that were decrypted.
 pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
-    let password = MOSTRO_DB_PASSWORD.get();
-    if password.is_none() {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
+    let password_str = std::env::var("MOSTRO_DB_PASSWORD").map_err(|_| {
+        MostroInternalErr(ServiceError::DbAccessError(
             "MOSTRO_DB_PASSWORD must be set to decrypt the database. \
              Set it in your environment and try again."
                 .to_string(),
+        ))
+    })?;
+
+    if password_str.is_empty() {
+        return Err(MostroInternalErr(ServiceError::DbAccessError(
+            "MOSTRO_DB_PASSWORD must not be empty.".to_string(),
         )));
     }
+
+    let password = secrecy::SecretString::from(password_str);
 
     tracing::info!("Starting database decryption migration...");
 
@@ -721,12 +345,12 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
 
     // Verify provided password against stored admin hash before mutating data
     if let Some(argon2_hash) = get_admin_password(pool).await? {
-        let parsed_hash = PasswordHash::new(&argon2_hash)
+        let parsed_hash = argon2::PasswordHash::new(&argon2_hash)
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-        if Argon2::default()
+        if argon2::Argon2::default()
             .verify_password(
-                password.expect("checked above").expose_secret().as_bytes(),
+                secrecy::ExposeSecret::expose_secret(&password).as_bytes(),
                 &parsed_hash,
             )
             .is_err()
@@ -736,6 +360,9 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
             )));
         }
     }
+
+    // Wrap password in Option to match CryptoUtils::decrypt_data signature
+    let password_opt = Some(&password);
 
     // Fetch all orders that have master pubkeys (inside the transaction)
     let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -755,13 +382,12 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
 
         // Try to decrypt buyer key
         let new_buyer = if let Some(key) = buyer_key {
-            match CryptoUtils::decrypt_data(key.clone(), password) {
+            match CryptoUtils::decrypt_data(key.clone(), password_opt) {
                 Ok(decrypted) if decrypted != *key => {
-                    // Successfully decrypted (value changed = it was encrypted)
                     updated = true;
                     Some(decrypted)
                 }
-                _ => None, // Already plaintext or decryption failed
+                _ => None,
             }
         } else {
             None
@@ -769,7 +395,7 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
 
         // Try to decrypt seller key
         let new_seller = if let Some(key) = seller_key {
-            match CryptoUtils::decrypt_data(key.clone(), password) {
+            match CryptoUtils::decrypt_data(key.clone(), password_opt) {
                 Ok(decrypted) if decrypted != *key => {
                     updated = true;
                     Some(decrypted)
@@ -781,7 +407,6 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
         };
 
         if updated {
-            // Update with decrypted values (only update fields that changed)
             if let Some(ref buyer) = new_buyer {
                 sqlx::query("UPDATE orders SET master_buyer_pubkey = ?1 WHERE id = ?2")
                     .bind(buyer)
@@ -802,7 +427,7 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
         }
     }
 
-    // Also clear the admin password hash (no longer needed without encryption)
+    // Clear the admin password hash (no longer needed without encryption)
     sqlx::query("UPDATE users SET admin_password = NULL WHERE is_admin = 1")
         .execute(&mut *tx)
         .await
@@ -818,6 +443,29 @@ pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
     );
 
     Ok(decrypted_count)
+}
+
+/// Retrieve the stored admin password hash from the users table.
+pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, MostroError> {
+    if let Some(user) = sqlx::query_as::<_, User>(
+        r#"
+          SELECT *
+          FROM users
+          WHERE is_admin == 1
+          LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| {
+        MostroInternalErr(ServiceError::DbAccessError(
+            "Failed to get admin password".to_string(),
+        ))
+    })? {
+        Ok(user.admin_password)
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Order, MostroError> {
@@ -1169,28 +817,6 @@ pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, Mostr
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(orders)
-}
-
-pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, MostroError> {
-    if let Some(user) = sqlx::query_as::<_, User>(
-        r#"
-          SELECT *
-          FROM users
-          WHERE is_admin == 1
-          LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| {
-        MostroInternalErr(ServiceError::DbAccessError(
-            "Failed to get admin password".to_string(),
-        ))
-    })? {
-        Ok(user.admin_password)
-    } else {
-        Ok(None)
-    }
 }
 
 pub async fn find_solver_pubkey(
@@ -2396,12 +2022,7 @@ mod tests {
         assert!(!result.unwrap(), "Should return false for nonexistent user");
     }
 
-    // -- Tests for buyer/seller_has_pending_order (unencrypted path) --
-    // Note: These tests only cover the non-encrypted database path.
-    // The encrypted path (gated by MOSTRO_DB_PASSWORD + Argon2 key derivation)
-    // is intentionally not exercised here — it requires full encryption setup
-    // and should be covered by integration tests. Do not attempt to mock the
-    // env/derivation in unit tests.
+    // -- Tests for buyer/seller_has_pending_order --
 
     #[tokio::test]
     async fn test_buyer_has_pending_order_true() {

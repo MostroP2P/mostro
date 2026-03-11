@@ -1,7 +1,7 @@
 //! RPC service implementation for admin operations
 
 use crate::config::settings::Settings;
-use crate::db::verify_and_set_db_password;
+
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
@@ -340,32 +340,16 @@ impl AdminService for AdminServiceImpl {
             remote_addr.ip()
         );
 
-        match verify_and_set_db_password(&self.pool, req.password).await {
-            Ok(()) => {
-                // Reset rate limit state on success
-                self.password_rate_limiter
-                    .record_success(&remote_addr)
-                    .await;
-                Ok(Response::new(ValidateDbPasswordResponse {
-                    success: true,
-                    error_message: None,
-                }))
-            }
-            Err(e) => {
-                // Record failure for rate limiting (applies exponential backoff)
-                warn!(
-                    "Failed password validation attempt from {}",
-                    remote_addr.ip()
-                );
-                self.password_rate_limiter
-                    .record_failure(&remote_addr)
-                    .await;
-                Ok(Response::new(ValidateDbPasswordResponse {
-                    success: false,
-                    error_message: Some(e.to_string()),
-                }))
-            }
-        }
+        // Database encryption has been removed (#642).
+        // This endpoint is kept for backward compatibility but always succeeds.
+        let _ = req.password;
+        self.password_rate_limiter
+            .record_success(&remote_addr)
+            .await;
+        Ok(Response::new(ValidateDbPasswordResponse {
+            success: true,
+            error_message: None,
+        }))
     }
 }
 

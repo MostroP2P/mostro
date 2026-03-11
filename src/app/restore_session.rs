@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -7,6 +8,13 @@ use sqlx::{Pool, Sqlite};
 /// Handle restore session action
 /// This function starts a background task to process the restore session
 /// and immediately returns, avoiding blocking the main application
+pub async fn restore_session_action_with_ctx(
+    ctx: &AppContext,
+    event: &UnwrappedGift,
+) -> Result<(), MostroError> {
+    restore_session_action(event, ctx.pool()).await
+}
+
 pub async fn restore_session_action(
     event: &UnwrappedGift,
     pool: &Pool<Sqlite>,

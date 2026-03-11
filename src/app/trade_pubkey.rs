@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_order};
 
 use mostro_core::prelude::*;
@@ -5,6 +6,14 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
+
+pub async fn trade_pubkey_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+) -> Result<(), MostroError> {
+    trade_pubkey_action(msg, event, ctx.pool()).await
+}
 
 pub async fn trade_pubkey_action(
     msg: Message,

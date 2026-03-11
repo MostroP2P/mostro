@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
 use crate::db;
@@ -161,6 +162,16 @@ pub async fn check_failure_retries(
 /// * Only the seller can release funds for their order
 /// * The seller's identity is verified through the event signature
 /// * Hold invoices are settled only after proper verification
+pub async fn release_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    release_action(msg, event, my_keys, ctx.pool(), ln_client).await
+}
+
 pub async fn release_action(
     msg: Message,
     event: &UnwrappedGift,

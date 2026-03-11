@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::{is_user_present, update_user_rating};
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
@@ -68,6 +69,15 @@ pub fn prepare_variables_for_vote(
 /// 7. Creates and saves a new rating event
 /// 8. Updates the database with the new rating information
 /// 9. Sends a confirmation message to the rating user
+pub async fn update_user_reputation_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    update_user_reputation_action(msg, event, my_keys, ctx.pool()).await
+}
+
 pub async fn update_user_reputation_action(
     msg: Message,
     event: &UnwrappedGift,

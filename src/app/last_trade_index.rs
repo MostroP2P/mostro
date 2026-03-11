@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::is_user_present;
 use crate::util::send_dm;
 use mostro_core::prelude::*;
@@ -41,6 +42,15 @@ use sqlx::{Pool, Sqlite};
 ///
 /// Errors are logged but not propagated for DM sending failures. All other errors are returned
 /// to the caller.
+pub async fn last_trade_index_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    last_trade_index(msg, event, my_keys, ctx.pool()).await
+}
+
 pub async fn last_trade_index(
     msg: Message,
     event: &UnwrappedGift,

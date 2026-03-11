@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
     validate_invoice,
@@ -29,6 +30,15 @@ pub async fn pay_new_invoice(
     )
     .await;
     Ok(())
+}
+
+pub async fn add_invoice_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    add_invoice_action(msg, event, my_keys, ctx.pool()).await
 }
 
 pub async fn add_invoice_action(

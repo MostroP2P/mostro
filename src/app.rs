@@ -30,7 +30,8 @@ use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
-use crate::app::cancel::cancel_action;
+use crate::app::cancel::cancel_action_with_ctx;
+use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
 use crate::app::last_trade_index::last_trade_index;
@@ -213,15 +214,19 @@ async fn check_trade_index(
 /// * `msg` - The message containing action details
 /// * `event` - The unwrapped gift wrap event
 /// * `my_keys` - Node keypair for signing/verification
-/// * `pool` - Database connection pool
+/// * `pool` - Database connection pool (legacy migration parameter; new handlers should use `ctx.pool()`)
 /// * `ln_client` - Lightning network connector
+/// * `ctx` - Dependency-injected app context
 async fn handle_message_action(
     action: &Action,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
+    // `pool` is kept during migration for handlers not yet moved to `AppContext`.
+    // Remove once all handlers are migrated (issue #639).
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+    ctx: &AppContext,
 ) -> Result<()> {
     match action {
         // Order-related actions
@@ -257,7 +262,7 @@ async fn handle_message_action(
         Action::RateUser => update_user_reputation_action(msg, event, my_keys, pool)
             .await
             .map_err(|e| e.into()),
-        Action::Cancel => cancel_action(msg, event, my_keys, pool, ln_client)
+        Action::Cancel => cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
 
@@ -305,6 +310,15 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
         let pool = get_db_pool();
         // Get pow from config
         let pow = Settings::get_mostro().pow;
+
+        // Build application context for dependency-injected handlers.
+        // This bridges the current global-based architecture with the new
+        // DI pattern (issue #639). Handlers will gradually migrate from
+        // using `pool` directly to using `ctx`.
+        // NOTE: `ctx` captures `Client` and `Settings` at construction time.
+        // If either is reloaded/replaced at runtime, rebuild `ctx`.
+        let ctx = AppContext::from_globals()
+            .expect("Failed to build AppContext — globals not initialized");
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 // Verify proof of work
@@ -389,6 +403,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                                 &my_keys,
                                 &pool,
                                 ln_client,
+                                &ctx,
                             )
                             .await
                             {

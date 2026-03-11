@@ -246,7 +246,7 @@ async fn handle_message_action(
         Action::AddInvoice => add_invoice_action_with_ctx(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::PayInvoice => todo!(),
+        Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
         Action::LastTradeIndex => last_trade_index_with_ctx(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
@@ -590,6 +590,7 @@ mod tests {
                 Action::Release,
                 Action::AddInvoice,
                 Action::PayInvoice,
+                Action::LastTradeIndex,
                 Action::Dispute,
                 Action::RateUser,
                 Action::Cancel,
@@ -598,6 +599,8 @@ mod tests {
                 Action::AdminAddSolver,
                 Action::AdminTakeDispute,
                 Action::TradePubkey,
+                Action::RestoreSession,
+                Action::Orders,
             ];
 
             // Verify we have handlers for all action types
@@ -611,6 +614,7 @@ mod tests {
                     | Action::FiatSent
                     | Action::Release
                     | Action::AddInvoice
+                    | Action::LastTradeIndex
                     | Action::Dispute
                     | Action::RateUser
                     | Action::Cancel
@@ -618,11 +622,10 @@ mod tests {
                     | Action::AdminSettle
                     | Action::AdminAddSolver
                     | Action::AdminTakeDispute
-                    | Action::TradePubkey => {}
-                    Action::PayInvoice => {
-                        // This action is marked as todo!()
-                        // No-op
-                    }
+                    | Action::TradePubkey
+                    | Action::RestoreSession
+                    | Action::Orders
+                    | Action::PayInvoice => {}
                     _ => {
                         // Any unhandled actions should be caught here
                         // No-op

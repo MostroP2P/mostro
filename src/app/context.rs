@@ -4,7 +4,7 @@
 //! replacing direct access to global state (`get_db_pool()`, `get_nostr_client()`,
 //! `Settings::get_mostro()`, etc.).
 //!
-//! This enables unit testing with mock implementations — see `TestContext`.
+//! This enables unit testing with mock implementations — see [`test_utils::TestContextBuilder`].
 
 use crate::config::settings::Settings;
 use nostr_sdk::Client;
@@ -56,7 +56,7 @@ impl AppContext {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| {
-                    MostroInternalErr(ServiceError::DbAccessError(
+                    MostroInternalErr(ServiceError::UnexpectedError(
                         "MOSTRO_CONFIG not initialized".to_string(),
                     ))
                 })?
@@ -111,6 +111,7 @@ pub mod test_utils {
     /// ```
     pub struct TestContextBuilder {
         pool: Option<Arc<Pool<Sqlite>>>,
+        nostr_client: Option<Arc<Client>>,
         settings: Option<Arc<Settings>>,
     }
 
@@ -118,6 +119,7 @@ pub mod test_utils {
         pub fn new() -> Self {
             Self {
                 pool: None,
+                nostr_client: None,
                 settings: None,
             }
         }
@@ -125,6 +127,12 @@ pub mod test_utils {
         /// Use a specific database pool (e.g., in-memory SQLite for tests).
         pub fn with_pool(mut self, pool: Arc<Pool<Sqlite>>) -> Self {
             self.pool = Some(pool);
+            self
+        }
+
+        /// Use a specific Nostr client (e.g., a mock or test-configured client).
+        pub fn with_nostr_client(mut self, client: Arc<Client>) -> Self {
+            self.nostr_client = Some(client);
             self
         }
 
@@ -154,7 +162,9 @@ pub mod test_utils {
                 }
             };
 
-            let nostr_client = Arc::new(Client::default());
+            let nostr_client = self
+                .nostr_client
+                .unwrap_or_else(|| Arc::new(Client::default()));
 
             let settings = self
                 .settings

@@ -489,3 +489,100 @@ async fn cancel_not_active_order(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
+        let unsigned_event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            NostrKind::GiftWrap,
+            Vec::new(),
+            "",
+        );
+
+        UnwrappedGift {
+            sender: pubkey,
+            rumor: unsigned_event,
+        }
+    }
+
+    fn create_pending_order(maker_pubkey: PublicKey, taker_pubkey: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::Pending.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: maker_pubkey.to_string(),
+            seller_pubkey: Some(maker_pubkey.to_string()),
+            buyer_pubkey: Some(taker_pubkey.to_string()),
+            amount: 21_000,
+            fee: 21,
+            dev_fee: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reset_api_quotes_resets_amount_fee_and_dev_fee_only_when_api_priced() {
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut api_order = create_pending_order(maker, taker);
+        api_order.price_from_api = true;
+        reset_api_quotes(&mut api_order);
+        assert_eq!(api_order.amount, 0);
+        assert_eq!(api_order.fee, 0);
+        assert_eq!(api_order.dev_fee, 0);
+
+        let mut fixed_price_order = create_pending_order(maker, taker);
+        fixed_price_order.price_from_api = false;
+        let original = (
+            fixed_price_order.amount,
+            fixed_price_order.fee,
+            fixed_price_order.dev_fee,
+        );
+        reset_api_quotes(&mut fixed_price_order);
+        assert_eq!(
+            (
+                fixed_price_order.amount,
+                fixed_price_order.fee,
+                fixed_price_order.dev_fee
+            ),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_order_rejects_non_creator_using_context_pool() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build();
+
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let mut order = create_pending_order(maker, taker);
+
+        // Event is sent by a third party (neither maker nor taker) to trigger auth guard.
+        let intruder = Keys::generate().public_key();
+        let event = create_unwrapped_gift_with_pubkey(intruder);
+
+        let my_keys = Keys::generate();
+        let result =
+            cancel_pending_order_from_maker(ctx.pool(), &event, &mut order, &my_keys, Some(1))
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourOrder))
+        ));
+    }
+}

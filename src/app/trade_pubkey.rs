@@ -44,7 +44,7 @@ pub async fn trade_pubkey_action(
     } else {
         let master_seller_key = CryptoUtils::decrypt_data(
             order
-                .get_master_seller_pubkey(None)
+                .get_master_seller_pubkey()
                 .map_err(MostroInternalErr)?
                 .to_string(),
             None,

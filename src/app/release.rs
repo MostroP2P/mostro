@@ -397,7 +397,7 @@ async fn handle_child_order(
 ) -> Result<(), MostroError> {
     // Check if users are in rating mode or full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) =
-        order.is_full_privacy_order(None).map_err(|_| {
+        order.is_full_privacy_order().map_err(|_| {
             MostroInternalErr(ServiceError::UnexpectedError(
                 "Error creating order event".to_string(),
             ))
@@ -644,16 +644,16 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey(None)
+            .get_master_seller_pubkey()
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey(None)
+            .get_master_buyer_pubkey()
             .map_err(MostroInternalErr)?,
     };
 
     // If user has sent the order with his identity key means that he wants to be rate so we can just
     // check if we have identity key in db - if present we have to send reputation tags otherwise no.
-    let tags = match crate::db::is_user_present(&pool, identity_pubkey).await {
+    let tags = match crate::db::is_user_present(&pool, identity_pubkey.to_string()).await {
         Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),

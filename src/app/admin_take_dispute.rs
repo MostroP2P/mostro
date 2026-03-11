@@ -39,7 +39,7 @@ async fn prepare_solver_info_message(
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Check if one or both users are in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(None)
+        .is_full_privacy_order()
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode

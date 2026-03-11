@@ -686,10 +686,10 @@ async fn get_ratings_for_pending_order(
     if status == Status::Pending {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
-                .get_master_seller_pubkey(None)
+                .get_master_seller_pubkey()
                 .map_err(MostroInternalErr)?,
             Err(_) => order_updated
-                .get_master_buyer_pubkey(None)
+                .get_master_buyer_pubkey()
                 .map_err(MostroInternalErr)?,
         };
 
@@ -702,14 +702,14 @@ async fn get_ratings_for_pending_order(
                 .map_err(MostroInternalErr)?,
         };
 
-        match is_user_present(&get_db_pool(), identity_pubkey.clone()).await {
+        match is_user_present(&get_db_pool(), identity_pubkey.to_string()).await {
             Ok(user) => Ok(Some((
                 user.total_rating,
                 user.total_reviews,
                 user.created_at,
             ))),
             Err(_) => {
-                if identity_pubkey == trade_pubkey.to_string() {
+                if identity_pubkey == trade_pubkey {
                     Ok(Some((0.0, 0, 0)))
                 } else {
                     Err(MostroInternalErr(ServiceError::InvalidPubkey))

@@ -119,7 +119,7 @@ pub async fn update_user_reputation_action(
 
     // Check if users are in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(None)
+        .is_full_privacy_order()
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get counter to vote from db, but only if they're not in privacy mode

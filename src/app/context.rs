@@ -118,16 +118,7 @@ pub mod test_utils {
         RpcSettings,
     };
 
-    /// Builder for creating test contexts with mock/test dependencies.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let ctx = TestContextBuilder::new()
-    ///     .with_pool(test_pool)
-    ///     .with_settings(test_settings)
-    ///     .build();
-    /// ```
+    /// Test helper that records mock Nostr interactions for assertions.
     #[derive(Debug, Clone)]
     pub struct MockNostrClient {
         pub published_event_ids: Arc<RwLock<Vec<String>>>,
@@ -157,6 +148,7 @@ pub mod test_utils {
         }
     }
 
+    /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
     pub struct MockOrderMsgQueue {
         queue: OrderMsgQueue,
@@ -192,6 +184,16 @@ pub mod test_utils {
         }
     }
 
+    /// Builder for creating test contexts with mock/test dependencies.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ctx = TestContextBuilder::new()
+    ///     .with_pool(test_pool)
+    ///     .with_settings(test_settings)
+    ///     .build();
+    /// ```
     pub struct TestContextBuilder {
         pool: Option<Arc<Pool<Sqlite>>>,
         nostr_client: Option<Client>,
@@ -222,6 +224,7 @@ pub mod test_utils {
         /// Use a specific Nostr client (e.g., a mock or test-configured client).
         pub fn with_nostr_client(mut self, client: Client) -> Self {
             self.nostr_client = Some(client);
+            self.mock_nostr_client = None;
             self
         }
 
@@ -234,6 +237,7 @@ pub mod test_utils {
         /// Use a specific order message queue.
         pub fn with_order_msg_queue(mut self, queue: OrderMsgQueue) -> Self {
             self.order_msg_queue = Some(queue);
+            self.mock_order_msg_queue = None;
             self
         }
 
@@ -337,8 +341,7 @@ mod tests {
             .build_with_mocks();
 
         let queue = mock_order_queue.expect("mock queue should be present");
-        assert_eq!(queue.len().await, 0);
-        assert_eq!(ctx.order_msg_queue().read().await.len(), 0);
+        assert!(Arc::ptr_eq(&queue.queue(), ctx.order_msg_queue()));
     }
 
     #[tokio::test]

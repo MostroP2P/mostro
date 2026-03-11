@@ -35,7 +35,7 @@ pub type OrderMsgQueue = Arc<RwLock<Vec<(Message, PublicKey)>>>;
 #[derive(Clone)]
 pub struct AppContext {
     pool: Arc<Pool<Sqlite>>,
-    nostr_client: Arc<Client>,
+    nostr_client: Client,
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
 }
@@ -53,7 +53,7 @@ impl AppContext {
         use mostro_core::prelude::{MostroError::MostroInternalErr, ServiceError};
 
         let pool = get_db_pool();
-        let nostr_client = Arc::new(get_nostr_client()?.clone());
+        let nostr_client = get_nostr_client()?.clone();
         let settings = Arc::new(
             MOSTRO_CONFIG
                 .get()
@@ -72,7 +72,7 @@ impl AppContext {
     /// Create a new application context.
     pub fn new(
         pool: Arc<Pool<Sqlite>>,
-        nostr_client: Arc<Client>,
+        nostr_client: Client,
         settings: Arc<Settings>,
         order_msg_queue: OrderMsgQueue,
     ) -> Self {
@@ -126,7 +126,7 @@ pub mod test_utils {
     /// ```
     pub struct TestContextBuilder {
         pool: Option<Arc<Pool<Sqlite>>>,
-        nostr_client: Option<Arc<Client>>,
+        nostr_client: Option<Client>,
         settings: Option<Arc<Settings>>,
     }
 
@@ -146,7 +146,7 @@ pub mod test_utils {
         }
 
         /// Use a specific Nostr client (e.g., a mock or test-configured client).
-        pub fn with_nostr_client(mut self, client: Arc<Client>) -> Self {
+        pub fn with_nostr_client(mut self, client: Client) -> Self {
             self.nostr_client = Some(client);
             self
         }
@@ -170,9 +170,7 @@ pub mod test_utils {
                 .pool
                 .expect("TestContextBuilder requires with_pool() for synchronous build");
 
-            let nostr_client = self
-                .nostr_client
-                .unwrap_or_else(|| Arc::new(Client::default()));
+            let nostr_client = self.nostr_client.unwrap_or_default();
 
             let settings = self
                 .settings

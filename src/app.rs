@@ -214,13 +214,16 @@ async fn check_trade_index(
 /// * `msg` - The message containing action details
 /// * `event` - The unwrapped gift wrap event
 /// * `my_keys` - Node keypair for signing/verification
-/// * `pool` - Database connection pool
+/// * `pool` - Database connection pool (legacy migration parameter; new handlers should use `ctx.pool()`)
 /// * `ln_client` - Lightning network connector
+/// * `ctx` - Dependency-injected app context
 async fn handle_message_action(
     action: &Action,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
+    // `pool` is kept during migration for handlers not yet moved to `AppContext`.
+    // Remove once all handlers are migrated (issue #639).
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
     ctx: &AppContext,
@@ -312,6 +315,8 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
         // This bridges the current global-based architecture with the new
         // DI pattern (issue #639). Handlers will gradually migrate from
         // using `pool` directly to using `ctx`.
+        // NOTE: `ctx` captures `Client` and `Settings` at construction time.
+        // If either is reloaded/replaced at runtime, rebuild `ctx`.
         let ctx = AppContext::from_globals()
             .expect("Failed to build AppContext — globals not initialized");
         while let Ok(notification) = notifications.recv().await {

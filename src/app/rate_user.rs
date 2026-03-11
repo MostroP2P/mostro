@@ -1,4 +1,3 @@
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{is_user_present, update_user_rating};
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
@@ -110,7 +109,7 @@ pub async fn update_user_reputation_action(
 
     // Check if users are in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(MOSTRO_DB_PASSWORD.get())
+        .is_full_privacy_order(None)
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get counter to vote from db, but only if they're not in privacy mode

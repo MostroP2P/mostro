@@ -1,4 +1,3 @@
-use crate::config::MOSTRO_DB_PASSWORD;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
@@ -102,7 +101,7 @@ pub async fn take_sell_action(
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
     order.master_buyer_pubkey = Some(
-        CryptoUtils::store_encrypted(&event.sender.to_string(), MOSTRO_DB_PASSWORD.get(), None)
+        CryptoUtils::store_encrypted(&event.sender.to_string(), None, None)
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
     );
 

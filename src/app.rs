@@ -1,6 +1,9 @@
 //! Main application module for the P2P trading system.
 //! Handles message routing, action processing, and event loop management.
 
+// Application context (dependency injection)
+pub mod context;
+
 // Submodules for different trading actions
 pub mod add_invoice; // Handles invoice creation
 pub mod admin_add_solver; // Admin functionality to add dispute solvers

@@ -11,6 +11,27 @@ use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
 
+pub trait CancelLightning {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>;
+}
+
+impl CancelLightning for LndConnector {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            LndConnector::cancel_hold_invoice(self, hash)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
 /// Reset API-provided quote-derived amounts when republishing an order.
 ///
 /// When an order was created with `price_from_api`, its `amount` and `fee`
@@ -53,14 +74,14 @@ async fn notify_creator(order: &Order, request_id: Option<u64>) -> Result<(), Mo
 /// - Cancels the hold invoice if present (funds go back to seller)
 /// - Persists `Status::CooperativelyCanceled`
 /// - Publishes a new replaceable nostr event and notifies both parties
-async fn cancel_cooperative_execution_step_2(
+async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     request_id: Option<u64>,
     mut order: Order,
     counterparty_pubkey: String,
     my_keys: &Keys,
-    ln_client: &mut LndConnector,
+    ln_client: &mut L,
 ) -> Result<(), MostroError> {
     // Guard: the same party cannot both initiate and confirm the cooperative cancel.
     if let Some(initiator) = &order.cancel_initiator_pubkey {
@@ -177,13 +198,13 @@ async fn cancel_cooperative_execution_step_1(
 /// - Notify the taker
 /// - Reset quote-derived amounts (if any) and return order to initial state
 /// - Notify the maker/creator that the order is republished
-async fn cancel_order_by_taker(
+async fn cancel_order_by_taker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     mut order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
-    ln_client: &mut LndConnector,
+    ln_client: &mut L,
     taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
     // Cancel hold invoice if present
@@ -237,14 +258,14 @@ async fn cancel_order_by_taker(
 /// - Publishes `Status::Canceled` and persists it
 /// - Cancels any hold invoice
 /// - Notifies both parties
-async fn cancel_order_by_maker(
+async fn cancel_order_by_maker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     order: Order,
     taker_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
-    ln_client: &mut LndConnector,
+    ln_client: &mut L,
 ) -> Result<(), MostroError> {
     // We publish a new replaceable kind nostr event with the status updated
     if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
@@ -336,7 +357,17 @@ pub async fn cancel_action_with_ctx(
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    cancel_action(msg, event, my_keys, ctx.pool(), ln_client).await
+    cancel_action_with_ctx_generic(ctx, msg, event, my_keys, ln_client).await
+}
+
+async fn cancel_action_with_ctx_generic<L: CancelLightning + Send>(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    ln_client: &mut L,
+) -> Result<(), MostroError> {
+    cancel_action_generic(msg, event, my_keys, ctx.pool(), ln_client).await
 }
 
 /// Top-level cancel entrypoint (legacy signature).
@@ -349,6 +380,16 @@ pub async fn cancel_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    cancel_action_generic(msg, event, my_keys, pool, ln_client).await
+}
+
+async fn cancel_action_generic<L: CancelLightning + Send>(
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
 ) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
@@ -388,13 +429,13 @@ pub async fn cancel_action(
 ///
 /// Marks which side initiated the cooperative cancel and either starts the flow
 /// (step 1) or completes it (step 2) when both sides have acknowledged.
-async fn cancel_active_order(
+async fn cancel_active_order<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     mut order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
-    ln_client: &mut LndConnector,
+    ln_client: &mut L,
 ) -> Result<(), MostroError> {
     // Get seller and buyer pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
@@ -441,13 +482,13 @@ async fn cancel_active_order(
 ///
 /// If the maker sent the event, run the maker path; otherwise, only the taker
 /// can cancel. This ensures the correct party authorization for early cancels.
-async fn cancel_not_active_order(
+async fn cancel_not_active_order<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedGift,
     order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
-    ln_client: &mut LndConnector,
+    ln_client: &mut L,
 ) -> Result<(), MostroError> {
     // Get seller and buyer pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
@@ -488,4 +529,123 @@ async fn cancel_not_active_order(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use sqlx::SqlitePool;
+    use sqlx_crud::Crud;
+    use std::sync::Arc;
+
+    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
+        let unsigned_event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            NostrKind::GiftWrap,
+            Vec::new(),
+            "",
+        );
+
+        UnwrappedGift {
+            sender: pubkey,
+            rumor: unsigned_event,
+        }
+    }
+
+    fn create_pending_order(maker_pubkey: PublicKey, taker_pubkey: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::Pending.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: maker_pubkey.to_string(),
+            seller_pubkey: Some(maker_pubkey.to_string()),
+            buyer_pubkey: Some(taker_pubkey.to_string()),
+            amount: 21_000,
+            fee: 21,
+            dev_fee: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reset_api_quotes_resets_amount_fee_and_dev_fee_only_when_api_priced() {
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut api_order = create_pending_order(maker, taker);
+        api_order.price_from_api = true;
+        reset_api_quotes(&mut api_order);
+        assert_eq!(api_order.amount, 0);
+        assert_eq!(api_order.fee, 0);
+        assert_eq!(api_order.dev_fee, 0);
+
+        let mut fixed_price_order = create_pending_order(maker, taker);
+        fixed_price_order.price_from_api = false;
+        let original = (
+            fixed_price_order.amount,
+            fixed_price_order.fee,
+            fixed_price_order.dev_fee,
+        );
+        reset_api_quotes(&mut fixed_price_order);
+        assert_eq!(
+            (
+                fixed_price_order.amount,
+                fixed_price_order.fee,
+                fixed_price_order.dev_fee
+            ),
+            original
+        );
+    }
+
+    struct StubLnClient;
+
+    impl CancelLightning for StubLnClient {
+        fn cancel_hold_invoice<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_action_with_ctx_rejects_non_creator_for_pending_order() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build();
+
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let order = create_pending_order(maker, taker)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+
+        // Event is sent by a third party (neither maker nor taker) to trigger auth guard.
+        let intruder = Keys::generate().public_key();
+        let event = create_unwrapped_gift_with_pubkey(intruder);
+
+        let msg = Message::new_order(Some(order.id), Some(1), None, Action::Cancel, None);
+        let my_keys = Keys::generate();
+        let mut ln_client = StubLnClient;
+
+        let result =
+            cancel_action_with_ctx_generic(&ctx, msg, &event, &my_keys, &mut ln_client).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourOrder))
+        ));
+    }
 }

@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::config::settings::Settings;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
@@ -82,6 +83,15 @@ async fn calculate_and_check_quote(
 /// #     run_example().await.unwrap();
 /// # }
 /// ```
+pub async fn order_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    order_action(msg, event, my_keys, ctx.pool()).await
+}
+
 pub async fn order_action(
     msg: Message,
     event: &UnwrappedGift,

@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
@@ -31,6 +32,15 @@ async fn update_order_status(
         }
         Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),
     }
+}
+
+pub async fn take_sell_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    take_sell_action(msg, event, my_keys, ctx.pool()).await
 }
 
 pub async fn take_sell_action(

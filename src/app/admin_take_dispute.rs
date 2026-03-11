@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::new_dispute_event;
 use crate::util::{get_dispute, get_nostr_client, send_dm};
@@ -108,6 +109,15 @@ pub async fn pubkey_event_can_solve(
     }
 
     false
+}
+
+pub async fn admin_take_dispute_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    mostro_keys: &Keys,
+) -> Result<(), MostroError> {
+    admin_take_dispute_action(msg, event, mostro_keys, ctx.pool()).await
 }
 
 pub async fn admin_take_dispute_action(

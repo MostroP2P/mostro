@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::add_new_user;
 use crate::util::send_dm;
 use mostro_core::prelude::*;
@@ -6,6 +7,15 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use tracing::{error, info};
+
+pub async fn admin_add_solver_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    admin_add_solver_action(msg, event, my_keys, ctx.pool()).await
+}
 
 pub async fn admin_add_solver_action(
     msg: Message,

@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
 use crate::nip33::new_dispute_event;
@@ -14,6 +15,16 @@ use std::str::FromStr;
 use tracing::error;
 
 use super::release::do_payment;
+
+pub async fn admin_settle_action_with_ctx(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedGift,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    admin_settle_action(msg, event, my_keys, ctx.pool(), ln_client).await
+}
 
 pub async fn admin_settle_action(
     msg: Message,

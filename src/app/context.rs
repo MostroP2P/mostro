@@ -30,14 +30,14 @@ use tokio::sync::RwLock;
 /// let settings = ctx.settings();
 /// ```
 /// Shared queue type used for outbound order messages.
-pub type OrderMsgSender = Arc<RwLock<Vec<(Message, PublicKey)>>>;
+pub type OrderMsgQueue = Arc<RwLock<Vec<(Message, PublicKey)>>>;
 
 #[derive(Clone)]
 pub struct AppContext {
     pool: Arc<Pool<Sqlite>>,
     nostr_client: Arc<Client>,
     settings: Arc<Settings>,
-    msg_sender: OrderMsgSender,
+    order_msg_queue: OrderMsgQueue,
 }
 
 impl AppContext {
@@ -64,9 +64,9 @@ impl AppContext {
                 })?
                 .clone(),
         );
-        let msg_sender = MESSAGE_QUEUES.queue_order_msg.clone();
+        let order_msg_queue = MESSAGE_QUEUES.queue_order_msg.clone();
 
-        Ok(Self::new(pool, nostr_client, settings, msg_sender))
+        Ok(Self::new(pool, nostr_client, settings, order_msg_queue))
     }
 
     /// Create a new application context.
@@ -74,13 +74,13 @@ impl AppContext {
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Arc<Client>,
         settings: Arc<Settings>,
-        msg_sender: OrderMsgSender,
+        order_msg_queue: OrderMsgQueue,
     ) -> Self {
         Self {
             pool,
             nostr_client,
             settings,
-            msg_sender,
+            order_msg_queue,
         }
     }
 
@@ -104,9 +104,9 @@ impl AppContext {
         &self.settings
     }
 
-    /// Shared sender/queue for outbound order messages.
-    pub fn msg_sender(&self) -> &OrderMsgSender {
-        &self.msg_sender
+    /// Shared queue for outbound order messages.
+    pub fn order_msg_queue(&self) -> &OrderMsgQueue {
+        &self.order_msg_queue
     }
 }
 
@@ -178,9 +178,9 @@ pub mod test_utils {
                 .settings
                 .expect("TestContextBuilder requires with_settings() — Settings has no Default");
 
-            let msg_sender = Arc::new(RwLock::new(Vec::new()));
+            let order_msg_queue = Arc::new(RwLock::new(Vec::new()));
 
-            AppContext::new(pool, nostr_client, settings, msg_sender)
+            AppContext::new(pool, nostr_client, settings, order_msg_queue)
         }
     }
 

@@ -751,7 +751,7 @@ pub async fn update_order_status_and_event(
             SET
             status = ?1,
             event_id = ?2
-            WHERE id = ?3 AND status = 'settled-hold-invoice'
+            WHERE id = ?3 AND ( status = 'settled-hold-invoice' OR status = 'fiat-sent' )
         "#,
     )
     .bind(status)
@@ -763,7 +763,7 @@ pub async fn update_order_status_and_event(
 
     if result.rows_affected() == 0 {
         return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
-            "Order {} not updated: not found or no longer in settled-hold-invoice status",
+            "Order {} not updated: not found or status is not settled-hold-invoice or fiat-sent",
             order_id
         ))));
     }

@@ -214,7 +214,7 @@ pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
 
 **Formula Specification:**
 
-```
+```text
 total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
 ```
 
@@ -337,8 +337,8 @@ When ANY order is taken (both fixed price and market price), the `dev_fee` is ca
 
 **Locations:**
 
-- `/home/negrunch/dev/mostro/src/app/take_buy.rs`
-- `/home/negrunch/dev/mostro/src/app/take_sell.rs`
+- `src/app/take_buy.rs` (e.g. `take_buy_action` flow)
+- `src/app/take_sell.rs` (e.g. `take_sell_action` flow)
 
 **Actual Implementation (take_buy.rs and take_sell.rs):**
 
@@ -1301,7 +1301,7 @@ nostr-cli -k 8383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") |
 **Unpaid Development Fees:**
 
 ```sql
--- Same query used by find_unpaid_dev_fees() in src/db.rs:895-908
+-- Same query used by find_unpaid_dev_fees() in src/db.rs
 SELECT id, dev_fee, created_at, status
 FROM orders
 WHERE (status = 'settled-hold-invoice' OR status = 'success')
@@ -1380,14 +1380,14 @@ RUST_LOG="dev_fee=error" mostrod
 
 Success:
 
-```
+```log
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 amount_sats=300 destination=<dev@lightning.address> Initiating development fee payment
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 payment_hash=abcd1234... Development fee payment succeeded
 ```
 
 Failure:
 
-```
+```log
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 error=LnAddressParseError stage=address_resolution Failed to resolve development Lightning Address
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 dev_fee=300 Development fee payment failed - order completing anyway
 ```

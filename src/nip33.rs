@@ -494,3 +494,37 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 
     tags
 }
+
+#[cfg(test)]
+mod tests {
+    use super::create_platform_tag_values;
+
+    #[test]
+    fn create_platform_tag_values_with_none_returns_only_mostro() {
+        assert_eq!(create_platform_tag_values(None), vec!["mostro".to_string()]);
+    }
+
+    #[test]
+    fn create_platform_tag_values_with_name_appends_trimmed_name() {
+        assert_eq!(
+            create_platform_tag_values(Some("  name  ")),
+            vec!["mostro".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_platform_tag_values_with_empty_string_returns_only_mostro() {
+        assert_eq!(
+            create_platform_tag_values(Some("")),
+            vec!["mostro".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_platform_tag_values_with_whitespace_only_returns_only_mostro() {
+        assert_eq!(
+            create_platform_tag_values(Some("   \t  ")),
+            vec!["mostro".to_string()]
+        );
+    }
+}

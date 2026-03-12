@@ -709,7 +709,7 @@ pub async fn update_failed_payment_status(
             SET
             failed_payment = ?1,
             payment_attempts = ?2
-            WHERE id = ?3 AND status = 'settled-hold-invoice'
+            WHERE id = ?3 AND ( status = 'settled-hold-invoice' OR status = 'fiat-sent' )
         "#,
     )
     .bind(failed_payment)

@@ -5,6 +5,7 @@
 The development fee mechanism provides sustainable funding for Mostro development by automatically sending a configurable percentage of the Mostro fee to a lightning address set on `DEV_FEE_LIGHTNING_ADDRESS` on each successful order.
 
 **Key Design Principles:**
+
 - Transparent and configurable
 - Non-blocking (failures don't prevent order completion)
 - Full audit trail for accountability
@@ -15,6 +16,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 1: Infrastructure ✅ COMPLETE
 
 **What's Implemented:**
+
 - Configuration constants (MIN/MAX percentages, Lightning address) in `src/config/constants.rs`
 - Settings validation on daemon startup in `src/config/util.rs`
 - Database schema with 3 columns: `dev_fee`, `dev_fee_paid`, `dev_fee_payment_hash`
@@ -26,6 +28,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 2: Fee Calculation ✅ COMPLETE
 
 **Implemented Components:**
+
 - `calculate_dev_fee()` pure function in `src/util.rs`
 - `get_dev_fee()` wrapper function in `src/util.rs`
 - Dev fee calculation (total amount paid by mostrod from its earnings)
@@ -33,6 +36,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 - Unit tests for fee calculation logic (4 tests passing)
 
 **Implementation Details:**
+
 - Two-function approach: Pure calculation function + Settings wrapper
 - Simple rounding for whole satoshi amounts
 - Dev fee tracked for payment by mostrod
@@ -43,6 +47,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 3: Payment Execution ✅ COMPLETE
 
 **Implemented Components:**
+
 - `send_dev_fee_payment()` function in `src/app/release.rs`
 - Scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
 - Database query function `find_unpaid_dev_fees()` in `src/db.rs`
@@ -61,6 +66,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 **Status:** ✅ Complete - Automated dev fee payment system fully operational with unified calculation logic
 
 **Implementation Commits:**
+
 - f508669: feat: implement automated development fee payment system
 - 102cfed: fix: resolve dev fee payment failures with two critical fixes
 - eaf3319: Validate dev_fee amount before attempting payment
@@ -72,6 +78,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 ### Phase 4: Audit Events via Nostr ✅ COMPLETE
 
 **What Was Implemented:**
+
 - Custom Nostr event kind (8383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Public relay distribution for third-party verification and total tracking
@@ -158,6 +165,7 @@ dev_fee_percentage = 0.30
 ```
 
 **Validation Rules:**
+
 - Must be between 0.10 (10%) and 1.0 (100%)
 - Validated on daemon startup
 - Invalid values cause startup failure with error message
@@ -178,6 +186,7 @@ dev_fee_percentage = 0.30
 Two-function approach in `src/util.rs`:
 
 1. **Pure calculation function**:
+
 ```rust
 /// Pure function for calculating dev fee - useful for testing
 pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
@@ -187,6 +196,7 @@ pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
 ```
 
 2. **Settings wrapper**:
+
 ```rust
 /// Wrapper that uses configured dev_fee_percentage from Settings
 pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
@@ -196,23 +206,27 @@ pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
 ```
 
 **Benefits of Two-Function Approach:**
+
 - `calculate_dev_fee()` is pure, testable without global config
 - `get_dev_fee()` provides convenient access using Settings
 - Tests can verify behavior with different percentages
 - Production code uses Settings seamlessly
 
 **Formula Specification:**
+
 ```
 total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
 ```
 
 **Why This Formula:**
+
 - Simple percentage calculation of total Mostro fee
 - Mostrod pays this amount from its earnings to the development fund
 - No need for buyer/seller split since users don't pay dev_fee
 - Rounding ensures whole satoshi amounts
 
 **Examples:**
+
 - Total Mostro fee: 1,000 sats, Percentage: 30% → Dev fee: 300 sats (paid by mostrod) ✓
 - Total Mostro fee: 1,003 sats, Percentage: 30% → Dev fee: 301 sats (paid by mostrod) ✓
 - Total Mostro fee: 333 sats, Percentage: 30% → Dev fee: 100 sats (paid by mostrod) ✓
@@ -225,11 +239,13 @@ total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
 **Implementation:** `src/util.rs::prepare_new_order()`
 
 When creating a new order:
+
 1. Calculate Mostro fee: `fee = get_fee(amount)` (for fixed price orders where amount > 0)
 2. Set `dev_fee = 0` for ALL orders (both fixed price and market price)
 3. Store in Order struct with `dev_fee_paid = false` and `dev_fee_payment_hash = None`
 
 **Dev Fee Calculation at Take Time:**
+
 - ALL orders (both fixed price and market price) have `dev_fee = 0` at creation
 - Dev fee is calculated when order is taken (see "Dev Fee Calculation at Take Time" section)
 - Implemented in `take_buy.rs` and `take_sell.rs`
@@ -320,10 +336,12 @@ WHERE status = 'pending'
 When ANY order is taken (both fixed price and market price), the `dev_fee` is calculated. This ensures consistent behavior across all order types.
 
 **Locations:**
+
 - `/home/negrunch/dev/mostro/src/app/take_buy.rs`
 - `/home/negrunch/dev/mostro/src/app/take_sell.rs`
 
 **Actual Implementation (take_buy.rs and take_sell.rs):**
+
 ```rust
 // For market price orders: calculate amount, fee, and dev_fee
 if order.has_no_amount() {
@@ -353,6 +371,7 @@ if order.has_no_amount() {
 **Example Scenarios:**
 
 **Fixed Price Order:**
+
 ```
 Order Created:
 - amount: 100,000 sats (known at creation)
@@ -372,6 +391,7 @@ Order Completes:
 ```
 
 **Market Price Order:**
+
 ```
 Order Created:
 - Fiat: $100 USD
@@ -411,12 +431,14 @@ Order Completes:
    - Status: ✅ Implemented
 
 **Why All Three Must Reset:**
+
 - Market price can change between takes
 - Fee is calculated from amount
 - Dev fee is calculated from fee
 - Leaving stale `dev_fee` value causes incorrect charges on re-take
 
 **Example Flow:**
+
 ```
 Order Created (market price):
 - amount: 0, fee: 0, dev_fee: 0, status: pending
@@ -436,9 +458,11 @@ Order Re-taken at BTC=$52,000 (price increased):
 ```
 
 **Implementation Details:**
+
 - `src/app/cancel.rs`: `reset_api_quotes()` function
 - `src/scheduler.rs`: Automatic timeout handler in `job_cancel_orders()`
 - Both paths use same logic:
+
   ```rust
   if order.price_from_api {
       order.amount = 0;
@@ -446,6 +470,7 @@ Order Re-taken at BTC=$52,000 (price increased):
       order.dev_fee = 0;
   }
   ```
+
 - Database function: `update_order_to_initial_state()` persists the reset values
 
 **Database Persistence Fix:**
@@ -455,11 +480,13 @@ did not include `dev_fee` in its SQL UPDATE statement, causing stale dev_fee val
 remain in the database even though the in-memory Order struct had `dev_fee = 0`.
 
 **Before Fix:**
+
 - Memory: `order.dev_fee = 0` ✓
 - Database: `dev_fee = 300` (stale) ✗
 - After `edit_pubkeys_order()` fetches from DB: `order.dev_fee = 300` (wrong!) ✗
 
 **After Fix:**
+
 - Memory: `order.dev_fee = 0` ✓
 - Database: `dev_fee = 0` ✓
 - After `edit_pubkeys_order()` fetches from DB: `order.dev_fee = 0` ✓
@@ -469,6 +496,7 @@ included it in the SQL UPDATE statement, ensuring the value is properly persiste
 to the database.
 
 **Configuration:**
+
 - Timeout duration: Configured via `expiration_seconds` in settings
 - Default: Orders return to pending after taker hasn't proceeded for configured time
 
@@ -479,6 +507,7 @@ to the database.
 **Implementation:** `src/util.rs::show_hold_invoice()`
 
 Seller's hold invoice includes only the order amount and Mostro fee:
+
 ```rust
 // Seller pays the order amount plus their Mostro fee
 // Dev fee is NOT charged to seller - it's paid by mostrod from its earnings
@@ -489,6 +518,7 @@ let (invoice_response, preimage, hash) = ln_client...
 ```
 
 **Key Points:**
+
 - `order.dev_fee` stores the total dev fee for tracking purposes only
 - Seller pays only `order.amount + order.fee` (no dev_fee added)
 - Buyer receives only `order.amount - order.fee` (no dev_fee subtracted)
@@ -502,11 +532,13 @@ let (invoice_response, preimage, hash) = ln_client...
 When creating messages for buyers and sellers during order flow, the amounts include only the Mostro fee (not dev_fee). The implementation ensures correct amounts are communicated to both parties.
 
 **Seller Messages:**
+
 ```rust
 seller_order.amount = order.amount.saturating_add(order.fee);
 ```
 
 **Buyer Messages:**
+
 ```rust
 buyer_order.amount = order.amount.saturating_sub(order.fee);
 ```
@@ -539,6 +571,7 @@ buyer_order.amount = order.amount.saturating_sub(order.fee);
 **Implementation Pattern:**
 
 All locations follow the same simplified pattern:
+
 ```rust
 // No dev_fee split needed - users only pay Mostro fee
 seller_amount = order.amount + order.fee;
@@ -558,6 +591,7 @@ buyer_amount = order.amount - order.fee;
 **Mostrod pays**: 300 sats (to development fund)
 
 **Fee Distribution:**
+
 - Buyer pays: 500 (Mostro fee) = **500 sats total**
 - Seller pays: 500 (Mostro fee) = **500 sats total**
 - Mostrod receives: 1,000 - 300 = **700 sats** (keeps after donating to dev fund)
@@ -566,6 +600,7 @@ buyer_amount = order.amount - order.fee;
 ### Edge Cases
 
 **Rounding**:
+
 - Total: 333 sats Mostro fee × 30% = 99.9 → **100 sats dev fee** (paid by mostrod)
 - Total: 3 sats Mostro fee × 30% = 0.9 → **1 sat dev fee** (paid by mostrod)
 - **Odd or even numbers**: No longer matters, mostrod pays the total rounded amount
@@ -573,10 +608,12 @@ buyer_amount = order.amount - order.fee;
 - Implementation: `src/util.rs`
 
 **Zero Fee Orders**:
+
 - If `mostro_fee = 0`, then `dev_fee = 0`
 - No dev payment attempted
 
 **Tiny Amounts**:
+
 - Smallest: 1 sat Mostro fee × 10% = 0.1 → **0 sats** dev fee (rounds to zero)
 - No dev payment attempted for 0 sat dev fees
 
@@ -607,6 +644,7 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
    - Enhanced logging: Logs BEFORE/AFTER state, database update results, and verification queries
 
 **Why This Timing?**
+
 - **Fee Earned:** Seller has released funds, so mostrod has earned the Mostro fee
 - **Contribution from earnings:** Mostrod donates a percentage of what it earned to the dev fund
 - **Risk Mitigation:** Dev fee payment independent of buyer payment status
@@ -614,6 +652,7 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
 - **Retry mechanism:** Failed payments are automatically retried every 60 seconds
 
 **Why Scheduler-Based?**
+
 - **Non-blocking order completion:** Seller release and buyer payment happen immediately, dev fee payment happens asynchronously
 - **Retry mechanism:** Failed payments are automatically retried on the next cycle (60 seconds)
 - **Fault tolerance:** Order completes successfully even if dev fee payment fails temporarily
@@ -652,6 +691,7 @@ let payment_result = tokio::time::timeout(
 ```
 
 **Total Time Budget:**
+
 - Validation: Instant (< 1ms)
 - LNURL resolution: 15s max
 - send_payment call: 5s max (prevents hanging on self-payments or network issues)
@@ -661,6 +701,7 @@ let payment_result = tokio::time::timeout(
 **Validation Note:** The function validates `dev_fee > 0` before attempting payment. This was added in commit eaf3319 to prevent unnecessary payment attempts for orders with zero dev fees.
 
 **Success Response:**
+
 ```rust
 Ok(hash) => {
     order.dev_fee_paid = true;
@@ -670,6 +711,7 @@ Ok(hash) => {
 ```
 
 **Failure Response:**
+
 ```rust
 Err(e) => {
     order.dev_fee_paid = false;
@@ -687,6 +729,7 @@ This section details exactly when and how the database fields (`dev_fee`, `dev_f
 **When Initialized:** During order creation in `src/util.rs::prepare_new_order()`
 
 **Initialization:**
+
 ```rust
 let mut fee = 0;
 let dev_fee = 0;
@@ -712,14 +755,18 @@ if new_order.amount > 0 {
 **When Changed to `1` (true):** After successful dev fee payment in the scheduler job `process_dev_fee_payment()` in `src/scheduler.rs`
 
 **Trigger Sequence:**
-1. Seller releases order (`status = 'settled-hold-invoice'`)
+
+1. Seller releases order (order is typically `status = 'settled-hold-invoice'`; it may already be `fiat-sent` if the buyer confirmed fiat first).
 2. Scheduler runs every 60 seconds
 3. Query identifies unpaid orders: `SELECT * FROM orders WHERE (status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
+
+**Note:** The release flow uses targeted DB updates (`update_order_status_and_event`, `update_failed_payment_status` in `src/db.rs`) that allow the order to be in either `settled-hold-invoice` or `fiat-sent` when writing success or payment-retry fields, so completion is not blocked when the buyer has already sent Fiat Sent.
 4. Scheduler calls `send_dev_fee_payment()` for each unpaid order
 5. On payment success, scheduler updates: `order.dev_fee_paid = true` (stored as `1` in database)
 6. Important: Query includes BOTH statuses to handle race conditions where buyer payment completes during dev fee payment failure
 
 **Database Update:**
+
 ```sql
 UPDATE orders
 SET dev_fee_paid = 1, dev_fee_payment_hash = ?
@@ -729,6 +776,7 @@ WHERE id = ?
 **Timing:** Asynchronously after order completes, typically within 60 seconds (next scheduler cycle)
 
 **Remains `0` When:**
+
 - Payment hasn't been attempted yet (order just completed)
 - Payment failed (LNURL resolution error, routing failure, timeout)
 - Will retry on next scheduler cycle (60 seconds)
@@ -742,6 +790,7 @@ WHERE id = ?
 **Value Source:** Lightning payment hash returned from the Lightning Network payment result. The hash comes from the `ln_client.send_payment()` call's result channel in `src/app/release.rs::send_dev_fee_payment()`.
 
 **Payment Hash Retrieval Flow:**
+
 ```rust
 // Step 1: LNURL resolution (15s timeout)
 let payment_request = resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, dev_fee_amount).await?;
@@ -756,11 +805,13 @@ let payment_hash = rx.recv().await?;  // ← THIS is what goes into dev_fee_paym
 **Format:** 64-character hexadecimal string (standard Lightning payment hash)
 
 **Purpose:**
+
 - Audit trail for reconciliation
 - Proof of payment for accountability
 - Debugging and payment verification
 
 **Remains `NULL` When:**
+
 - Payment hasn't been attempted yet
 - Payment failed (no hash generated for failed payments)
 
@@ -962,6 +1013,7 @@ async fn job_process_dev_fee_payment() {
 ### Error Handling
 
 **Payment Failures:**
+
 - LNURL resolution failure (timeout: 15 seconds)
 - LND send_payment hanging (timeout: 5 seconds)
 - LND connection error
@@ -1012,6 +1064,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Prerequisites:** Phase 1 complete ✅
 
 **Implementation Tasks:**
+
 - [x] Implement `calculate_dev_fee()` pure function in `src/util.rs`
   - Input: `total_mostro_fee: i64, percentage: f64`
   - Output: `i64` (rounded dev fee amount)
@@ -1048,6 +1101,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Prerequisites:** Phase 2 complete ✅
 
 **Completed Implementation (Commits: f508669, 102cfed, eaf3319, 42253f1, 2655943):**
+
 - [x] Implement `send_dev_fee_payment()` in `src/app/release.rs`
   - Step 0: Dev fee amount validation (`dev_fee > 0` check)
   - Step 1: LNURL resolution with 15-second timeout
@@ -1103,6 +1157,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Purpose:** Provide transparent, verifiable audit trail of all dev fee payments through Nostr relays.
 
 **What Was Implemented:**
+
 - Custom Nostr event kind (8383) for dev fee payment audits
 - Event publishing in scheduler after successful payment
 - Complete payment details: amount, hash, order reference, timestamp
@@ -1122,6 +1177,7 @@ This section provides a checklist for implementing the remaining phases of the d
 **Event Kind Rationale:**
 
 Why kind 8383 (Regular Event)?
+
 - ✅ **Complete History:** Every payment is a separate, permanent event
 - ✅ **Third-Party Auditing:** Anyone can query all historical payments
 - ✅ **Total Calculation:** Sum all `amount` tags to get total dev fund contributions
@@ -1199,6 +1255,7 @@ const orderPayments = {
 **Retry Logic:** None - if event publish fails, payment still succeeds (prioritize financial reliability)
 
 **Privacy Considerations:**
+
 - Order ID included for transparency
 - Buyer/seller pubkeys NOT included (privacy)
 - Only aggregate payment data published
@@ -1224,6 +1281,7 @@ nostr-cli -k 8383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") |
 **Status:** ✅ Complete - Dev fee audit events are now published to Nostr relays
 
 **Implementation:**
+
 1. ✅ Added `DEV_FEE_AUDIT_EVENT_KIND` constant to `src/config/constants.rs`
 2. ✅ Created `publish_dev_fee_audit_event()` function in `src/util.rs`
 3. ✅ Integrated event publishing in `src/scheduler.rs` after successful payment
@@ -1231,6 +1289,7 @@ nostr-cli -k 8383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") |
 5. ✅ Events are queryable via standard Nostr clients and relays
 
 **Future Enhancements:**
+
 - Aggregate statistics event (kind 38100) updated monthly with totals
 - Dashboard for visualizing dev fund contributions
 - NIP-05 verification for Mostro's audit event pubkey
@@ -1240,6 +1299,7 @@ nostr-cli -k 8383 --tag y=mostro | jq '[.[] | .tags[] | select(.[0]=="amount") |
 ### Statistics Queries
 
 **Unpaid Development Fees:**
+
 ```sql
 -- Same query used by find_unpaid_dev_fees() in src/db.rs:895-908
 SELECT id, dev_fee, created_at, status
@@ -1256,6 +1316,7 @@ ORDER BY created_at DESC;
 ```
 
 **Development Fee Summary:**
+
 ```sql
 SELECT
   COUNT(*) as total_orders,
@@ -1268,6 +1329,7 @@ WHERE status = 'success' AND dev_fee > 0;
 ```
 
 **Recent Failures:**
+
 ```sql
 -- Orders with unpaid dev fees older than 5 minutes (potential issues):
 -- IMPORTANT: Uses dual-status query like find_unpaid_dev_fees()
@@ -1303,11 +1365,13 @@ ORDER BY created_at DESC;
 ### Log Filtering
 
 **View all dev fee logs:**
+
 ```bash
 RUST_LOG="dev_fee=debug" mostrod
 ```
 
 **View only errors:**
+
 ```bash
 RUST_LOG="dev_fee=error" mostrod
 ```
@@ -1315,12 +1379,14 @@ RUST_LOG="dev_fee=error" mostrod
 **Log Examples:**
 
 Success:
+
 ```
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 amount_sats=300 destination=<dev@lightning.address> Initiating development fee payment
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 payment_hash=abcd1234... Development fee payment succeeded
 ```
 
 Failure:
+
 ```
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 error=LnAddressParseError stage=address_resolution Failed to resolve development Lightning Address
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 dev_fee=300 Development fee payment failed - order completing anyway
@@ -1331,18 +1397,22 @@ Failure:
 ### Common Issues
 
 **1. Daemon Won't Start - Invalid Configuration**
+
 ```
 Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 ```
+
 **Solution:** Set `dev_fee_percentage` to at least 0.10 in settings.toml
 
 **2. High Failure Rate**
+
 - Check Lightning node connectivity
 - Verify `<dev@lightning.address>` is reachable
 - Check routing capacity to destination
 - Review error logs: `RUST_LOG="dev_fee=error" mostrod`
 
 **3. Payment Timeouts**
+
 - LNURL resolution timeout: 15 seconds (indicates DNS/network issues)
 - send_payment timeout: 5 seconds (indicates LND hanging, often self-payment attempts)
 - Payment result timeout: 25 seconds (indicates routing issues or network congestion)
@@ -1353,6 +1423,7 @@ Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 **4. Market Price Orders With Zero Dev Fee**
 
 **Symptom:**
+
 ```sql
 -- Orders with fee but no dev_fee (indicates bug in market price flow)
 SELECT id, amount, fee, dev_fee, price_from_api, status
@@ -1369,6 +1440,7 @@ WHERE fee > 0
 **Fix:** Ensure both `take_buy.rs` and `take_sell.rs` calculate `dev_fee` when updating `amount` and `fee` for market price orders (see Market Price Order Dev Fee Calculation section)
 
 **Verification:**
+
 ```sql
 -- All market price orders should have consistent fees
 SELECT
@@ -1391,6 +1463,7 @@ causing stale values to remain in the database. When `edit_pubkeys_order()` fetc
 order from the database, it would return the old dev_fee value.
 
 **Symptom (Before Fix):**
+
 ```sql
 -- Orders that timed out but dev_fee wasn't reset in database
 SELECT id, amount, fee, dev_fee, price_from_api, status
@@ -1408,12 +1481,14 @@ WHERE status = 'pending'
 
 **Fix Applied:** Added `dev_fee` parameter to `update_order_to_initial_state()` and
 included it in the SQL UPDATE statement:
+
 - `src/db.rs`: Function signature and SQL UPDATE modified
 - `src/app/cancel.rs`: Explicit cancellation handler
 
 **Prevention:** Both paths now include `order.dev_fee = 0` for market price orders. See "Taker Abandonment and Order Reset" section for details.
 
 **Verification:**
+
 ```sql
 -- All pending market price orders should have dev_fee = 0
 SELECT COUNT(*) as stale_dev_fee_orders
@@ -1431,16 +1506,19 @@ WHERE status = 'pending'
 For orders with unpaid dev fees:
 
 1. Identify unpaid fees:
+
 ```sql
 SELECT id, dev_fee FROM orders WHERE dev_fee_paid = 0 AND dev_fee > 0;
 ```
 
 2. Use Lightning CLI to manually pay:
+
 ```bash
 lncli payinvoice <invoice_from_lnurl>
 ```
 
 3. Update database:
+
 ```sql
 UPDATE orders
 SET dev_fee_paid = 1, dev_fee_payment_hash = '<payment_hash>'
@@ -1518,12 +1596,14 @@ WHERE id = '<order_id>';
 **All tests use `calculate_dev_fee()` directly with explicit percentage (0.30) to avoid dependency on global Settings.**
 
 **Run tests:**
+
 ```bash
 cargo test test_get_dev_fee
 # Output: test result: ok. 4 passed; 0 failed
 ```
 
 **Test Coverage:**
+
 - ✅ Standard calculations
 - ✅ Rounding behavior (both up and down)
 - ✅ Zero fee edge case
@@ -1560,28 +1640,33 @@ cargo test test_get_dev_fee
 ### For Existing Installations
 
 1. **Backup database:**
+
 ```bash
 cp ~/.mostro/mostro.db ~/.mostro/mostro.db.backup
 ```
 
 2. **Update Mostro:**
+
 ```bash
 git pull origin main
 cargo build --release
 ```
 
 3. **Update settings.toml:**
+
 ```toml
 [mostro]
 dev_fee_percentage = 0.30  # Add this line
 ```
 
 4. **Restart daemon:**
+
 ```bash
 mostrod
 ```
 
 5. **Verify:**
+
 ```bash
 # Check settings loaded
 grep "Settings correctly loaded" mostrod.log

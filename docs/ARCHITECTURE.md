@@ -155,6 +155,8 @@ sequenceDiagram
   Release->>DB: finalize order; update reputation cues
 ```
 
+**DB finalize:** `db::update_order_status_and_event` and `db::update_failed_payment_status` use targeted UPDATEs with an optimistic guard: they apply only when the order status is `settled-hold-invoice` or `fiat-sent`, so release can complete even if the buyer already sent Fiat Sent (order already in `fiat-sent`).
+
 ### Flow: Cancel with Held Invoice
 
 ```mermaid

@@ -3,8 +3,9 @@
 //! and publish dispute events to the network.
 
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::find_dispute_by_order_id;
-use crate::nip33::new_dispute_event;
+use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -44,7 +45,7 @@ async fn publish_dispute_event(
         // Application identifier tag
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
+            create_platform_tag_values(Settings::get_mostro().name.as_deref()),
         ),
         // Event type tag
         Tag::custom(
@@ -317,7 +318,7 @@ pub async fn close_dispute_after_user_resolution(
                 ),
                 Tag::custom(
                     TagKind::Custom(Cow::Borrowed("y")),
-                    vec!["mostro".to_string()],
+                    create_platform_tag_values(Settings::get_mostro().name.as_deref()),
                 ),
                 Tag::custom(
                     TagKind::Custom(Cow::Borrowed("z")),

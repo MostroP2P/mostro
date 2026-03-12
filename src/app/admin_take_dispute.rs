@@ -1,6 +1,7 @@
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::{find_solver_pubkey, is_user_present};
-use crate::nip33::new_dispute_event;
+use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{get_dispute, get_nostr_client, send_dm};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -240,7 +241,7 @@ pub async fn admin_take_dispute_action(
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
+            create_platform_tag_values(Settings::get_mostro().name.as_deref()),
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("z")),

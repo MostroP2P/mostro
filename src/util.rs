@@ -11,7 +11,7 @@ use crate::lightning::LndConnector;
 use crate::lnurl::HTTP_CLIENT;
 use crate::messages;
 use crate::models::Yadio;
-use crate::nip33::{new_order_event, new_rating_event, order_to_tags};
+use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
@@ -599,7 +599,7 @@ pub async fn publish_dev_fee_audit_event(
         Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            vec!["mostro".to_string()],
+            create_platform_tag_values(Settings::get_mostro().name.as_deref()),
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("z")),

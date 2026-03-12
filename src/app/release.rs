@@ -1,7 +1,6 @@
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
-use crate::db;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -95,15 +94,11 @@ pub async fn check_failure_retries(
         .await;
     }
 
-    // Update only payment-related fields to avoid overwriting
-    // other fields (like dev_fee_paid) modified by concurrent processes
-    db::update_failed_payment_status(
-        &pool,
-        order.id,
-        order.failed_payment,
-        order.payment_attempts,
-    )
-    .await?;
+    order
+        .clone()
+        .update(&pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(order)
 }
 
@@ -547,21 +542,15 @@ async fn payment_success(
     )
     .await;
 
-    // Get db connection
-    let pool = db::connect()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // Arc clone of db pool to use across threads
+    let pool = get_db_pool();
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        // Update only status and event_id to avoid overwriting
-        // other fields (like dev_fee_paid) modified by concurrent processes
-        db::update_order_status_and_event(
-            &pool,
-            order_updated.id,
-            &order_updated.status,
-            &order_updated.event_id,
-        )
-        .await?;
+        order_updated
+            .clone()
+            .update(&pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
             request_id,

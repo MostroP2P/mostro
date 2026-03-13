@@ -13,6 +13,34 @@ use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tracing::{error, info};
 
+/// Admin-initiated order cancellation.
+///
+/// Allows authorized dispute solvers or admins to cancel an order and refund
+/// any held Lightning invoice back to the seller.
+///
+/// # Parameters
+///
+/// * `ctx` - Application context containing DB pool, settings, and message queue
+/// * `msg` - Incoming message with the order ID and request metadata
+/// * `event` - Unwrapped gift event with sender verification
+/// * `my_keys` - Mostro daemon's signing keys
+/// * `ln_client` - Lightning network client for hold invoice cancellation
+///
+/// # Side Effects
+///
+/// - Cancels Lightning hold invoice (if present)
+/// - Updates order status to `CanceledByAdmin` in database
+/// - Publishes updated order event to Nostr
+/// - Sends direct messages to both buyer and seller
+///
+/// # Errors
+///
+/// Returns `MostroError` if:
+/// - Solver is not assigned to the dispute
+/// - Order/dispute not found
+/// - Lightning invoice cancellation fails
+/// - Database update fails
+/// - Nostr publish fails
 pub async fn admin_cancel_action(
     ctx: &AppContext,
     msg: Message,

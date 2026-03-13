@@ -163,6 +163,15 @@ mod tests {
         Keys::generate()
     }
 
+    /// Helper to build a test AppContext with the given pool.
+    fn build_test_context(pool: SqlitePool) -> AppContext {
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool))
+            .with_settings(test_settings())
+            .build()
+    }
+
     fn create_test_message(trade_index: Option<u32>) -> Message {
         // Create a basic message for TakeSell action
         // We'll use the new_order method since TakeSell isn't directly available
@@ -203,11 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_pending_order_exists() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        let ctx = TestContextBuilder::new()
-            .with_pool(std::sync::Arc::new(pool.clone()))
-            .with_settings(test_settings())
-            .build();
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -224,11 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_order_validation() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        let ctx = TestContextBuilder::new()
-            .with_pool(std::sync::Arc::new(pool.clone()))
-            .with_settings(test_settings())
-            .build();
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -243,11 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_trade_index_logic() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        let ctx = TestContextBuilder::new()
-            .with_pool(std::sync::Arc::new(pool.clone()))
-            .with_settings(test_settings())
-            .build();
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
 
         // Test case 1: sender == rumor.pubkey, no trade_index
@@ -277,11 +274,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_market_price_calculation() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        let ctx = TestContextBuilder::new()
-            .with_pool(std::sync::Arc::new(pool.clone()))
-            .with_settings(test_settings())
-            .build();
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -296,11 +289,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_payment_request_flows() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        let ctx = TestContextBuilder::new()
-            .with_pool(std::sync::Arc::new(pool.clone()))
-            .with_settings(test_settings())
-            .build();
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 

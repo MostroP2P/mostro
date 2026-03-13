@@ -21,49 +21,46 @@ gpg: Good signature from "Arkanoider <github.913zc@simplelogin.com>" [ultimate]
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.16.4
-
-### 🚀 Features
-
-
-* feat: add days field to user rating event (kind 38384) by [@Catrya](https://github.com/Catrya) in [#625](https://github.com/MostroP2P/mostro/pull/625)
-* feat: implement mutation testing for Rust codebase quality assurance by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#619](https://github.com/MostroP2P/mostro/pull/619)
-* feat: added latest tag to both mostro docker versions by [@arkanoider](https://github.com/arkanoider) in [#610](https://github.com/MostroP2P/mostro/pull/610)
-* feat: add expiration to rating events (kind 38384) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#612](https://github.com/MostroP2P/mostro/pull/612)
-
-### 🐛 Bug Fixes
-
-
-* fix: use targeted SQL updates in check_failure_retries and payment_success by [@Catrya](https://github.com/Catrya) in [#617](https://github.com/MostroP2P/mostro/pull/617)
-* fix: prevent duplicate dev fee payments via idempotency check by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#622](https://github.com/MostroP2P/mostro/pull/622)
-* fix: use expiration settings instead of hardcoded 24h for order events by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#614](https://github.com/MostroP2P/mostro/pull/614)
-* fix: close active dispute when seller releases funds by [@Mostrica](https://github.com/Mostrica) in [#606](https://github.com/MostroP2P/mostro/pull/606)
+## What's Changed in 0.16.5
 
 ### 💼 Other
 
 
-* Deduplicate db test helpers by [@grunch](https://github.com/grunch) in [#629](https://github.com/MostroP2P/mostro/pull/629)
-* Automated badge for toolchain and version in README.md by [@arkanoider](https://github.com/arkanoider) in [#628](https://github.com/MostroP2P/mostro/pull/628)
-* Fix restore session dispute initiator by [@BraCR10](https://github.com/BraCR10) in [#599](https://github.com/MostroP2P/mostro/pull/599)
+* Adding instance name to "y" tags by [@sergey3bv](https://github.com/sergey3bv) in [#653](https://github.com/MostroP2P/mostro/pull/653)
 
 ### 🚜 Refactor
 
 
-* refactor: extract dev fee logic into dedicated module by [@arkanoider](https://github.com/arkanoider) in [#627](https://github.com/MostroP2P/mostro/pull/627)
+* refactor: complete phase-5 handler DI migration to AppContext (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#657](https://github.com/MostroP2P/mostro/pull/657)
+* refactor: wire AppContext into dispatcher and migrate cancel module (#639 phase 2) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#652](https://github.com/MostroP2P/mostro/pull/652)
+* refactor: add AppContext struct for dependency injection (#639 phase 1) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#651](https://github.com/MostroP2P/mostro/pull/651)
+* refactor: remove password infrastructure and all encryption code paths by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#647](https://github.com/MostroP2P/mostro/pull/647)
+* refactor: remove dual encrypted/unencrypted code paths in db.rs by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#646](https://github.com/MostroP2P/mostro/pull/646)
+* refactor: remove encryption from app layer and util by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#645](https://github.com/MostroP2P/mostro/pull/645)
+* refactor: add --decrypt-db CLI command for database migration by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#644](https://github.com/MostroP2P/mostro/pull/644)
+* refactor: add deprecation warning for MOSTRO_DB_PASSWORD by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#643](https://github.com/MostroP2P/mostro/pull/643)
 
-### 📚 Documentation
+### 🧪 Testing
 
 
-* docs: fix inconsistent pubkey format in rating and info event examples by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#615](https://github.com/MostroP2P/mostro/pull/615)
+* test: add phase-4 cancel unit tests using AppContext builder (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#655](https://github.com/MostroP2P/mostro/pull/655)
+* test: add phase-3 mock test context utilities for AppContext (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#654](https://github.com/MostroP2P/mostro/pull/654)
+* test: add 28 mutation testing tests for db module by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#640](https://github.com/MostroP2P/mostro/pull/640)
+
+### ⚙️ Miscellaneous Tasks
+
+
+* ci: make PR mutation testing opt-in via label by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#648](https://github.com/MostroP2P/mostro/pull/648)
+
+### ◀️ Revert
+
+
+* revert: logical revert of PR #617 targeted update behavior by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#659](https://github.com/MostroP2P/mostro/pull/659)
 
 ## Contributors
-* [@arkanoider](https://github.com/arkanoider) made their contribution in [#627](https://github.com/MostroP2P/mostro/pull/627)
-* [@grunch](https://github.com/grunch) made their contribution in [#629](https://github.com/MostroP2P/mostro/pull/629)
-* [@Catrya](https://github.com/Catrya) made their contribution in [#617](https://github.com/MostroP2P/mostro/pull/617)
-* [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) made their contribution in [#622](https://github.com/MostroP2P/mostro/pull/622)
-* [@BraCR10](https://github.com/BraCR10) made their contribution in [#599](https://github.com/MostroP2P/mostro/pull/599)
-* [@Mostrica](https://github.com/Mostrica) made their contribution in [#606](https://github.com/MostroP2P/mostro/pull/606)
+* [@sergey3bv](https://github.com/sergey3bv) made their contribution in [#653](https://github.com/MostroP2P/mostro/pull/653)
+* [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) made their contribution in [#659](https://github.com/MostroP2P/mostro/pull/659)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.16.3...0.16.4
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.16.4...0.16.5
 
 <!-- generated by git-cliff -->

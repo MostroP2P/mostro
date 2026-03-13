@@ -186,8 +186,11 @@ mod tests {
     async fn test_last_trade_index_user_not_found() {
         // Setup: Create empty database (no users)
         let pool = setup_test_db().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let sender_keys = create_test_keys();
 
         // Create test event for non-existent user

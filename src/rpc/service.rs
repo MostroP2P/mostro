@@ -76,8 +76,8 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx = AppContext::from_globals()
-            .map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        let ctx =
+            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -118,8 +118,8 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx = AppContext::from_globals()
-            .map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        let ctx =
+            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -159,8 +159,8 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx = AppContext::from_globals()
-            .map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        let ctx =
+            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin add solver failed: {}", e))?;
@@ -200,8 +200,8 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx = AppContext::from_globals()
-            .map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        let ctx =
+            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin take dispute failed: {}", e))?;

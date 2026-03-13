@@ -199,8 +199,11 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_no_order() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
@@ -221,8 +224,11 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_with_valid_order() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -238,8 +244,11 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_range_order_validation() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
@@ -251,8 +260,11 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_zero_amount_with_premium() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
@@ -264,8 +276,11 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_trade_index_logic() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         // Test case 1: sender == rumor.pubkey, no trade_index

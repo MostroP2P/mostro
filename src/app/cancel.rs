@@ -617,8 +617,7 @@ mod tests {
         let my_keys = Keys::generate();
         let mut ln_client = StubLnClient;
 
-        let result =
-            cancel_action_generic(&ctx, msg, &event, &my_keys, &mut ln_client).await;
+        let result = cancel_action_generic(&ctx, msg, &event, &my_keys, &mut ln_client).await;
 
         assert!(matches!(
             result,

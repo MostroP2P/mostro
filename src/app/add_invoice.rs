@@ -1,4 +1,3 @@
-use sqlx::{Pool, Sqlite};
 use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
@@ -7,6 +6,7 @@ use crate::util::{
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 
 pub async fn pay_new_invoice(

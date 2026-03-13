@@ -2,13 +2,13 @@ use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
 use crate::lightning::LndConnector;
-use sqlx::{Pool, Sqlite};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
+use sqlx::{Pool, Sqlite};
 
 use argon2::password_hash::SaltString;
 use config::settings::*;

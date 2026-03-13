@@ -298,8 +298,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_user_reputation_allows_success_status() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -328,8 +331,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_user_reputation_rejects_settled_hold_invoice_buyer() {
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -360,8 +366,11 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         // Trade keys (ephemeral per-trade)
@@ -418,8 +427,11 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -463,8 +475,11 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
-        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
-        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
         let keys = create_test_keys();
 
         // Trade keys (ephemeral per-trade)

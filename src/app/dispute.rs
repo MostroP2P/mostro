@@ -3,7 +3,6 @@
 //! and publish dispute events to the network.
 
 use crate::app::context::AppContext;
-use sqlx::{Pool, Sqlite};
 use crate::config::settings::Settings;
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
@@ -11,6 +10,7 @@ use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use std::borrow::Cow;
 use uuid::Uuid;

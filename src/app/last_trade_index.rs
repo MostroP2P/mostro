@@ -4,7 +4,6 @@ use crate::util::send_dm;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
 /// Handles a `last_trade_index` action request from a user.
 ///
@@ -42,21 +41,13 @@ use sqlx::{Pool, Sqlite};
 ///
 /// Errors are logged but not propagated for DM sending failures. All other errors are returned
 /// to the caller.
-pub async fn last_trade_index_with_ctx(
+pub async fn last_trade_index(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    last_trade_index(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn last_trade_index(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get requester pubkey (sender of the message)
     let requester_pubkey = event.sender.to_string();
     // Get trade key from the event rumor
@@ -195,6 +186,8 @@ mod tests {
     async fn test_last_trade_index_user_not_found() {
         // Setup: Create empty database (no users)
         let pool = setup_test_db().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let sender_keys = create_test_keys();
 
         // Create test event for non-existent user
@@ -204,7 +197,7 @@ mod tests {
         let kind = MessageKind::new(None, Some(1234567890), None, Action::LastTradeIndex, None);
 
         // Execute function
-        let result = last_trade_index(Message::Restore(kind), &event, &sender_keys, &pool).await;
+        let result = last_trade_index(&ctx, Message::Restore(kind), &event, &sender_keys).await;
 
         // Should fail because user doesn't exist
         assert!(

@@ -4,7 +4,6 @@ use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
 pub fn prepare_variables_for_vote(
     message_sender: &str,
@@ -69,21 +68,13 @@ pub fn prepare_variables_for_vote(
 /// 7. Creates and saves a new rating event
 /// 8. Updates the database with the new rating information
 /// 9. Sends a confirmation message to the rating user
-pub async fn update_user_reputation_action_with_ctx(
+pub async fn update_user_reputation_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    update_user_reputation_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn update_user_reputation_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get order
     let order = get_order(&msg, pool).await?;
 
@@ -307,6 +298,8 @@ mod tests {
     #[tokio::test]
     async fn test_update_user_reputation_allows_success_status() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -324,7 +317,7 @@ mod tests {
         // Message pointing to that order id with a valid rating payload
         let msg = create_rate_user_message(order.id, 5);
 
-        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
 
         // A Success order must not be rejected with InvalidOrderStatus
         if let Err(MostroCantDo(CantDoReason::InvalidOrderStatus)) = result {
@@ -335,6 +328,8 @@ mod tests {
     #[tokio::test]
     async fn test_update_user_reputation_rejects_settled_hold_invoice_buyer() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -351,7 +346,7 @@ mod tests {
 
         let msg = create_rate_user_message(order.id, 5);
 
-        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
 
         // Buyer must not be allowed to rate in SettledHoldInvoice status
         match result {
@@ -365,6 +360,8 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         // Trade keys (ephemeral per-trade)
@@ -396,7 +393,7 @@ mod tests {
         let event = create_unwrapped_gift_with_pubkey(buyer_pk);
         let msg = create_rate_user_message(order.id, 5);
 
-        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok());
 
         // The seller (counterpart of buyer rating) must have updated reputation
@@ -421,6 +418,8 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         let seller_keys = create_test_keys();
@@ -450,7 +449,7 @@ mod tests {
         let event = create_unwrapped_gift_with_pubkey(buyer_pk);
         let msg = create_rate_user_message(order.id, 5);
 
-        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok());
 
         // Seller reputation must remain unchanged (no double-rating)
@@ -464,6 +463,8 @@ mod tests {
         use crate::db::{add_new_user, is_user_present};
 
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         // Trade keys (ephemeral per-trade)
@@ -495,7 +496,7 @@ mod tests {
         let event = create_unwrapped_gift_with_pubkey(seller_pk);
         let msg = create_rate_user_message(order.id, 4);
 
-        let result = update_user_reputation_action(msg, &event, &keys, &pool).await;
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok());
 
         // The buyer (counterpart of seller rating) must have updated reputation

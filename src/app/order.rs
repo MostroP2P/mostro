@@ -6,7 +6,6 @@ use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
-use sqlx::{Pool, Sqlite};
 
 async fn calculate_and_check_quote(
     order: &SmallOrder,
@@ -83,21 +82,13 @@ async fn calculate_and_check_quote(
 /// #     run_example().await.unwrap();
 /// # }
 /// ```
-pub async fn order_action_with_ctx(
+pub async fn order_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    order_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn order_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 
@@ -208,6 +199,8 @@ mod tests {
     #[tokio::test]
     async fn test_order_action_no_order() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
@@ -221,13 +214,15 @@ mod tests {
             payload: None,
         });
 
-        let result = order_action(msg, &event, &keys, &pool).await;
+        let result = order_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_order_action_with_valid_order() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -237,34 +232,40 @@ mod tests {
         // 2. Setting up database tables
         // 3. Mocking publish_order
         // For now, we test the structure
-        let _ = order_action(msg, &event, &keys, &pool).await;
+        let _ = order_action(&ctx, msg, &event, &keys).await;
     }
 
     #[tokio::test]
     async fn test_order_action_range_order_validation() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
         let msg = create_test_message(Some(1));
 
-        let _ = order_action(msg, &event, &keys, &pool).await;
+        let _ = order_action(&ctx, msg, &event, &keys).await;
     }
 
     #[tokio::test]
     async fn test_order_action_zero_amount_with_premium() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
         let msg = create_test_message(Some(1));
         // Structural check: ensure call does not panic
-        let _ = order_action(msg, &event, &keys, &pool).await;
+        let _ = order_action(&ctx, msg, &event, &keys).await;
     }
 
     #[tokio::test]
     async fn test_order_action_trade_index_logic() {
         let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{TestContextBuilder, test_settings};
+        let ctx = TestContextBuilder::new().with_pool(std::sync::Arc::new(pool.clone())).with_settings(test_settings()).build();
         let keys = create_test_keys();
 
         // Test case 1: sender == rumor.pubkey, no trade_index
@@ -272,7 +273,7 @@ mod tests {
         event.sender = event.rumor.pubkey;
         let msg = create_test_message(None);
 
-        let _ = order_action(msg, &event, &keys, &pool).await;
+        let _ = order_action(&ctx, msg, &event, &keys).await;
 
         // Test case 2: sender != rumor.pubkey, no trade_index
         let event2 = create_test_unwrapped_gift();
@@ -280,11 +281,11 @@ mod tests {
         let msg2 = create_test_message(None);
 
         // Structural check: ensure call returns a Result without panicking
-        let _ = order_action(msg2, &event2, &keys, &pool).await;
+        let _ = order_action(&ctx, msg2, &event2, &keys).await;
 
         // Test case 3: with trade_index
         let msg3 = create_test_message(Some(1));
-        let _ = order_action(msg3, &event2, &keys, &pool).await;
+        let _ = order_action(&ctx, msg3, &event2, &keys).await;
     }
 
     mod quote_calculation_tests {

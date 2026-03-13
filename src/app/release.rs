@@ -2,6 +2,7 @@ use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::config;
 use crate::lightning::LndConnector;
+use sqlx::{Pool, Sqlite};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
@@ -18,7 +19,6 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use rand;
 use rand::rngs::OsRng;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -157,23 +157,14 @@ pub async fn check_failure_retries(
 /// * Only the seller can release funds for their order
 /// * The seller's identity is verified through the event signature
 /// * Hold invoices are settled only after proper verification
-pub async fn release_action_with_ctx(
+pub async fn release_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    release_action(msg, event, my_keys, ctx.pool(), ln_client).await
-}
-
-pub async fn release_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order

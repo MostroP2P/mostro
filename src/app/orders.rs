@@ -3,22 +3,14 @@ use crate::config::settings::Settings;
 use crate::util::{enqueue_order_msg, get_user_orders_by_id};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
 // Handle orders action
-pub async fn orders_action_with_ctx(
+pub async fn orders_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
 ) -> Result<(), MostroError> {
-    orders_action(msg, event, ctx.pool()).await
-}
-
-pub async fn orders_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get order
     let payload = msg.get_inner_message_kind().get_payload();
 

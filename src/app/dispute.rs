@@ -3,6 +3,7 @@
 //! and publish dispute events to the network.
 
 use crate::app::context::AppContext;
+use sqlx::{Pool, Sqlite};
 use crate::config::settings::Settings;
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
@@ -10,7 +11,6 @@ use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::traits::Crud;
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -155,21 +155,13 @@ async fn notify_dispute_to_users(
 /// 3. Creates a new dispute record
 /// 4. Notifies both parties
 /// 5. Publishes the dispute event to the network
-pub async fn dispute_action_with_ctx(
+pub async fn dispute_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    dispute_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn dispute_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {

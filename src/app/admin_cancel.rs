@@ -10,27 +10,17 @@ use crate::util::{enqueue_order_msg, get_nostr_client, get_order, send_dm, updat
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tracing::{error, info};
 
-pub async fn admin_cancel_action_with_ctx(
+pub async fn admin_cancel_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    admin_cancel_action(msg, event, my_keys, ctx.pool(), ln_client).await
-}
-
-pub async fn admin_cancel_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order

@@ -10,30 +10,20 @@ use crate::util::{
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::error;
 
 use super::release::do_payment;
 
-pub async fn admin_settle_action_with_ctx(
+pub async fn admin_settle_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    admin_settle_action(msg, event, my_keys, ctx.pool(), ln_client).await
-}
-
-pub async fn admin_settle_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order

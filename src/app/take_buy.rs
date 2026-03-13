@@ -7,23 +7,14 @@ use crate::db::{seller_has_pending_order, update_user_trade_index};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
-pub async fn take_buy_action_with_ctx(
+pub async fn take_buy_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    take_buy_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn take_buy_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Extract order ID from the message, returning an error if not found
     // Safe unwrap as we verified the message
     let mut order = get_order(&msg, pool).await?;

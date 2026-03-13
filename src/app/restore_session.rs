@@ -3,22 +3,15 @@ use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
 /// Handle restore session action
 /// This function starts a background task to process the restore session
 /// and immediately returns, avoiding blocking the main application
-pub async fn restore_session_action_with_ctx(
+pub async fn restore_session_action(
     ctx: &AppContext,
     event: &UnwrappedGift,
 ) -> Result<(), MostroError> {
-    restore_session_action(event, ctx.pool()).await
-}
-
-pub async fn restore_session_action(
-    event: &UnwrappedGift,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get user master key from the event sender
     let master_key = event.sender.to_string();
     // Get trade key from the event rumor

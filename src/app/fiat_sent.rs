@@ -3,25 +3,16 @@ use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 
 // Handle fiat sent action
-pub async fn fiat_sent_action_with_ctx(
+pub async fn fiat_sent_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    fiat_sent_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn fiat_sent_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get order
     let order = get_order(&msg, pool).await?;
 

@@ -347,9 +347,8 @@ async fn cancel_pending_order_from_maker(
 
 /// Cancel action entry point using dependency-injected context.
 ///
-/// This is the preferred entry point. The `pool` is extracted from `ctx`
-/// internally. Callers that still pass `pool` directly can use the legacy
-/// [`cancel_action`] wrapper until the migration is complete.
+/// The database connection pool and other dependencies are extracted from `ctx`.
+/// Internal routing logic is delegated to `cancel_action_generic`.
 pub async fn cancel_action(
     ctx: &AppContext,
     msg: Message,

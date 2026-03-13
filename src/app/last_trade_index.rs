@@ -13,10 +13,10 @@ use nostr_sdk::prelude::*;
 ///
 /// # Parameters
 ///
+/// * `ctx` - Application context containing the database pool and other dependencies
 /// * `msg` - The incoming message containing the request details, including the request ID
 /// * `event` - The unwrapped gift event containing the sender's public key
 /// * `my_keys` - The daemon's keys used for signing and sending the response
-/// * `pool` - The database connection pool for querying user information
 ///
 /// # Returns
 ///

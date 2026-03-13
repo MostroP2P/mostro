@@ -19,7 +19,6 @@ use tracing::{error, info, warn};
 /// Implementation of the AdminService gRPC service
 pub struct AdminServiceImpl {
     keys: Keys,
-    #[allow(dead_code)]
     pool: Arc<Pool<Sqlite>>,
     ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
     password_rate_limiter: Arc<RateLimiter>,
@@ -76,8 +75,25 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx =
-            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        use crate::config::MOSTRO_CONFIG;
+        use crate::util::get_nostr_client;
+        use crate::config::MESSAGE_QUEUES;
+        
+        let nostr_client = get_nostr_client()
+            .map_err(|e| format!("Failed to get Nostr client: {}", e))?
+            .clone();
+        let settings = std::sync::Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
+                .clone()
+        );
+        let ctx = AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone()
+        );
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -118,8 +134,25 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx =
-            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        use crate::config::MOSTRO_CONFIG;
+        use crate::util::get_nostr_client;
+        use crate::config::MESSAGE_QUEUES;
+        
+        let nostr_client = get_nostr_client()
+            .map_err(|e| format!("Failed to get Nostr client: {}", e))?
+            .clone();
+        let settings = std::sync::Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
+                .clone()
+        );
+        let ctx = AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone()
+        );
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -159,8 +192,25 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx =
-            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        use crate::config::MOSTRO_CONFIG;
+        use crate::util::get_nostr_client;
+        use crate::config::MESSAGE_QUEUES;
+        
+        let nostr_client = get_nostr_client()
+            .map_err(|e| format!("Failed to get Nostr client: {}", e))?
+            .clone();
+        let settings = std::sync::Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
+                .clone()
+        );
+        let ctx = AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone()
+        );
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin add solver failed: {}", e))?;
@@ -200,8 +250,25 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
-        let ctx =
-            AppContext::from_globals().map_err(|e| format!("Failed to build AppContext: {}", e))?;
+        use crate::config::MOSTRO_CONFIG;
+        use crate::util::get_nostr_client;
+        use crate::config::MESSAGE_QUEUES;
+        
+        let nostr_client = get_nostr_client()
+            .map_err(|e| format!("Failed to get Nostr client: {}", e))?
+            .clone();
+        let settings = std::sync::Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
+                .clone()
+        );
+        let ctx = AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone()
+        );
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin take dispute failed: {}", e))?;

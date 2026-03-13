@@ -111,10 +111,10 @@ pub async fn check_failure_retries(
 ///
 /// # Arguments
 ///
+/// * `ctx` - Application context containing the database pool and other dependencies
 /// * `msg` - The message containing the release request and associated metadata
 /// * `event` - The unwrapped gift event containing the seller's signature and verification data
 /// * `my_keys` - The Mostro node's keys used for signing events and messages
-/// * `pool` - Database connection pool for order updates
 /// * `ln_client` - Lightning network client for invoice settlement
 ///
 /// # Returns

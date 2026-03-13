@@ -47,10 +47,10 @@ pub fn prepare_variables_for_vote(
 ///
 /// # Arguments
 ///
+/// * `ctx` - Application context containing the database pool and other dependencies
 /// * `msg` - The message containing the rating information
 /// * `event` - The unwrapped gift event containing the sender's information
 /// * `my_keys` - The keys used for signing events
-/// * `pool` - The database connection pool
 ///
 /// # Returns
 ///

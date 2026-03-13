@@ -75,10 +75,10 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
+        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
-        use crate::config::MESSAGE_QUEUES;
-        
+
         let nostr_client = get_nostr_client()
             .map_err(|e| format!("Failed to get Nostr client: {}", e))?
             .clone();
@@ -86,13 +86,13 @@ impl AdminServiceImpl {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
-                .clone()
+                .clone(),
         );
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
-            MESSAGE_QUEUES.queue_order_msg.clone()
+            MESSAGE_QUEUES.queue_order_msg.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -134,10 +134,10 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
+        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
-        use crate::config::MESSAGE_QUEUES;
-        
+
         let nostr_client = get_nostr_client()
             .map_err(|e| format!("Failed to get Nostr client: {}", e))?
             .clone();
@@ -145,13 +145,13 @@ impl AdminServiceImpl {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
-                .clone()
+                .clone(),
         );
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
-            MESSAGE_QUEUES.queue_order_msg.clone()
+            MESSAGE_QUEUES.queue_order_msg.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -192,10 +192,10 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
+        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
-        use crate::config::MESSAGE_QUEUES;
-        
+
         let nostr_client = get_nostr_client()
             .map_err(|e| format!("Failed to get Nostr client: {}", e))?
             .clone();
@@ -203,13 +203,13 @@ impl AdminServiceImpl {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
-                .clone()
+                .clone(),
         );
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
-            MESSAGE_QUEUES.queue_order_msg.clone()
+            MESSAGE_QUEUES.queue_order_msg.clone(),
         );
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
@@ -250,10 +250,10 @@ impl AdminServiceImpl {
         };
 
         use crate::app::context::AppContext;
+        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
-        use crate::config::MESSAGE_QUEUES;
-        
+
         let nostr_client = get_nostr_client()
             .map_err(|e| format!("Failed to get Nostr client: {}", e))?
             .clone();
@@ -261,13 +261,13 @@ impl AdminServiceImpl {
             MOSTRO_CONFIG
                 .get()
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
-                .clone()
+                .clone(),
         );
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
-            MESSAGE_QUEUES.queue_order_msg.clone()
+            MESSAGE_QUEUES.queue_order_msg.clone(),
         );
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await

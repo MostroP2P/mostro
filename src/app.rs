@@ -43,7 +43,6 @@ use crate::app::restore_session::restore_session_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
-use crate::config::settings::get_db_pool;
 // Core functionality imports
 use crate::config::settings::Settings;
 use crate::db::add_new_user;
@@ -58,7 +57,6 @@ use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 
 /// Helper function to log warning messages for action errors
 fn warning_msg(action: &Action, err: ServiceError) {
@@ -115,14 +113,15 @@ async fn manage_errors(
 /// 3. If the user is not found, it creates a new user entry with the provided trade index if applicable.
 ///
 /// # Arguments
-/// * `pool` - The database connection pool used to query and update user data.
+/// * `ctx` - Application context providing database pool and other dependencies.
 /// * `event` - The unwrapped gift event containing the sender's information.
 /// * `msg` - The message containing action details and trade index information.
 async fn check_trade_index(
-    pool: &Pool<Sqlite>,
+    ctx: &AppContext,
     event: &UnwrappedGift,
     msg: &Message,
 ) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     let message_kind = msg.get_inner_message_kind();
 
     // Only process actions related to trading
@@ -300,21 +299,14 @@ async fn handle_message_action(
 /// * `my_keys` - The node's keypair
 /// * `client` - Nostr client instance
 /// * `ln_client` - Lightning network connector
-/// * `pool` - SQLite connection pool
-/// * `rate_list` - Shared list of rating events
 pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
 
-        // Arc clone of db pool for main loop
-        let pool = get_db_pool();
         // Get pow from config
         let pow = Settings::get_mostro().pow;
 
-        // Build application context for dependency-injected handlers.
-        // This bridges the current global-based architecture with the new
-        // DI pattern (issue #639). Handlers will gradually migrate from
-        // using `pool` directly to using `ctx`.
+        // Build application context with all dependencies.
         // NOTE: `ctx` captures `Client` and `Settings` at construction time.
         // If either is reloaded/replaced at runtime, rebuild `ctx`.
         let ctx = AppContext::from_globals()
@@ -389,7 +381,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                     // Get inner message kind
                     let inner_message = message.get_inner_message_kind();
                     // Check if message is message with trade index
-                    if let Err(e) = check_trade_index(&pool, &event, &message).await {
+                    if let Err(e) = check_trade_index(&ctx, &event, &message).await {
                         tracing::warn!("Error checking trade index: {}", e);
                         continue;
                     }
@@ -538,41 +530,47 @@ mod tests {
 
     mod check_trade_index_tests {
         use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
         use sqlx::SqlitePool;
+        use std::sync::Arc;
 
-        async fn create_test_pool() -> SqlitePool {
-            SqlitePool::connect(":memory:").await.unwrap()
+        async fn create_test_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
         }
 
         #[tokio::test]
         async fn test_check_trade_index_non_trading_action() {
-            let pool = create_test_pool().await;
+            let ctx = create_test_ctx().await;
             let event = create_test_unwrapped_gift();
             let message = create_test_message(Action::FiatSent, None);
 
-            let result = check_trade_index(&pool, &event, &message).await;
+            let result = check_trade_index(&ctx, &event, &message).await;
             assert!(result.is_ok());
         }
 
         #[tokio::test]
         async fn test_check_trade_index_trading_action_no_index() {
-            let pool = create_test_pool().await;
+            let ctx = create_test_ctx().await;
             let event = create_test_unwrapped_gift();
             let message = create_test_message(Action::NewOrder, None);
 
-            let result = check_trade_index(&pool, &event, &message).await;
+            let result = check_trade_index(&ctx, &event, &message).await;
             assert!(result.is_ok());
         }
 
         #[tokio::test]
         async fn test_check_trade_index_with_valid_index() {
-            let pool = create_test_pool().await;
+            let ctx = create_test_ctx().await;
             let event = create_test_unwrapped_gift();
             let message = create_test_message(Action::NewOrder, Some(1));
 
             // This test would require database setup and user creation
             // For now, we test the structure
-            let result = check_trade_index(&pool, &event, &message).await;
+            let result = check_trade_index(&ctx, &event, &message).await;
             // Result could be Ok or Err depending on database state
             assert!(result.is_ok() || result.is_err());
         }

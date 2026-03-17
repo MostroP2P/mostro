@@ -5,8 +5,7 @@ use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
-    enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
-    update_order_event,
+    enqueue_order_msg, get_keys, get_order, settle_seller_hold_invoice, update_order_event,
 };
 use sqlx::{Pool, Sqlite};
 
@@ -200,7 +199,7 @@ pub async fn release_action(
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation.
-    close_dispute_after_user_resolution(pool, &order, DisputeStatus::Settled, my_keys, "release")
+    close_dispute_after_user_resolution(ctx, &order, DisputeStatus::Settled, my_keys, "release")
         .await;
 
     enqueue_order_msg(
@@ -215,10 +214,9 @@ pub async fn release_action(
 
     // Handle child order for range orders
     if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
-        if let Ok(client) = get_nostr_client() {
-            if client.send_event(&event).await.is_err() {
-                tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
-            }
+        let client = ctx.nostr_client();
+        if client.send_event(&event).await.is_err() {
+            tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
         }
         handle_child_order(child_order, &order, next_trade, pool, request_id)
             .await

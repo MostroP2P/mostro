@@ -1,5 +1,4 @@
 use crate::app::context::AppContext;
-use crate::config::settings::Settings;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::prelude::*;
@@ -8,11 +7,12 @@ use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
 
 async fn calculate_and_check_quote(
+    ctx: &AppContext,
     order: &SmallOrder,
     fiat_amount: &i64,
 ) -> Result<(), MostroError> {
     // Get mostro settings
-    let mostro_settings = Settings::get_mostro();
+    let mostro_settings = &ctx.settings().mostro;
     // Calculate quote
     let quote = match order.amount {
         0 => match get_bitcoin_price(&order.fiat_code) {
@@ -92,7 +92,7 @@ pub async fn order_action(
         let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
 
         // Check if fiat currency is accepted
-        let mostro_settings = Settings::get_mostro();
+        let mostro_settings = &ctx.settings().mostro;
         if let Err(cause) = order.check_fiat_currency(&mostro_settings.fiat_currencies_accepted) {
             return Err(MostroCantDo(cause));
         }
@@ -112,7 +112,7 @@ pub async fn order_action(
 
         // Check quote in sats for each amount
         for fiat_amount in amount_vec.iter() {
-            calculate_and_check_quote(order, fiat_amount).await?;
+            calculate_and_check_quote(ctx, order, fiat_amount).await?;
         }
 
         let trade_index = match msg.get_inner_message_kind().trade_index {

@@ -1,11 +1,8 @@
 use crate::app::context::AppContext;
-use crate::config::settings::Settings;
 use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
 use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
-use crate::util::{
-    enqueue_order_msg, get_nostr_client, get_order, settle_seller_hold_invoice, update_order_event,
-};
+use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
 
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
@@ -108,7 +105,7 @@ pub async fn admin_settle_action(
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-                create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+                create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
             ),
             Tag::custom(
                 TagKind::Custom(std::borrow::Cow::Borrowed("z")),
@@ -123,15 +120,9 @@ pub async fn admin_settle_action(
         // Print event dispute with update
         tracing::info!("Dispute event to be published: {event:#?}");
 
-        match get_nostr_client() {
-            Ok(client) => {
-                if let Err(e) = client.send_event(&event).await {
-                    error!("Failed to send dispute settlement event: {}", e);
-                }
-            }
-            Err(e) => {
-                error!("Failed to get Nostr client for dispute settlement: {}", e);
-            }
+        let client = ctx.nostr_client();
+        if let Err(e) = client.send_event(&event).await {
+            error!("Failed to send dispute settlement event: {}", e);
         }
     }
 

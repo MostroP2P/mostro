@@ -1,12 +1,12 @@
 use crate::app::context::AppContext;
-use crate::config::settings::Settings;
 use crate::db::{find_solver_pubkey, is_user_present};
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
-use crate::util::{get_dispute, get_nostr_client, send_dm};
+use crate::util::{get_dispute, send_dm};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
+
 use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::info;
@@ -233,7 +233,7 @@ pub async fn admin_take_dispute_action(
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-            create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+            create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
         ),
         Tag::custom(
             TagKind::Custom(std::borrow::Cow::Borrowed("z")),
@@ -245,16 +245,7 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Dispute event to be published: {event:#?}");
 
-    let client = get_nostr_client()
-        .map_err(|e| {
-            info!(
-                "Failed to get nostr client for dispute {}: {}",
-                dispute.id, e
-            );
-            e
-        })
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
+    let client = ctx.nostr_client();
     client
         .send_event(&event)
         .await

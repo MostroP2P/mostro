@@ -1,5 +1,4 @@
 use crate::app::context::AppContext;
-use crate::config::settings::Settings;
 use crate::util::{enqueue_order_msg, get_user_orders_by_id};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -24,7 +23,7 @@ pub async fn orders_action(
         return Err(MostroCantDo(CantDoReason::InvalidParameters));
     }
 
-    let mostro_settings = Settings::get_mostro();
+    let mostro_settings = &ctx.settings().mostro;
     if ids.len() > mostro_settings.max_orders_per_response as usize {
         return Err(MostroCantDo(CantDoReason::TooManyRequests));
     }

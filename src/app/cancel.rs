@@ -75,7 +75,7 @@ async fn notify_creator(order: &Order, request_id: Option<u64>) -> Result<(), Mo
 /// - Persists `Status::CooperativelyCanceled`
 /// - Publishes a new replaceable nostr event and notifies both parties
 async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
-    pool: &Pool<Sqlite>,
+    ctx: &AppContext,
     event: &UnwrappedGift,
     request_id: Option<u64>,
     mut order: Order,
@@ -83,6 +83,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     my_keys: &Keys,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Guard: the same party cannot both initiate and confirm the cooperative cancel.
     if let Some(initiator) = &order.cancel_initiator_pubkey {
         if *initiator == event.rumor.pubkey.to_string() {
@@ -137,7 +138,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     // If there was an active dispute on this order, close it since the users
     // resolved the situation themselves via cooperative cancellation.
     close_dispute_after_user_resolution(
-        pool,
+        ctx,
         &order,
         DisputeStatus::SellerRefunded,
         my_keys,
@@ -393,7 +394,7 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
             cancel_not_active_order(pool, event, order, my_keys, request_id, ln_client).await?
         }
         Status::Active | Status::FiatSent | Status::Dispute => {
-            cancel_active_order(pool, event, order, my_keys, request_id, ln_client).await?
+            cancel_active_order(ctx, event, order, my_keys, request_id, ln_client).await?
         }
         _ => return Err(MostroCantDo(CantDoReason::NotAllowedByStatus)),
     }
@@ -406,13 +407,14 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
 /// Marks which side initiated the cooperative cancel and either starts the flow
 /// (step 1) or completes it (step 2) when both sides have acknowledged.
 async fn cancel_active_order<L: CancelLightning + Send>(
-    pool: &Pool<Sqlite>,
+    ctx: &AppContext,
     event: &UnwrappedGift,
     mut order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get seller and buyer pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
@@ -430,7 +432,7 @@ async fn cancel_active_order<L: CancelLightning + Send>(
     match order.cancel_initiator_pubkey {
         Some(_) => {
             cancel_cooperative_execution_step_2(
-                pool,
+                ctx,
                 event,
                 request_id,
                 order,

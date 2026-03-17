@@ -3,14 +3,13 @@
 //! and publish dispute events to the network.
 
 use crate::app::context::AppContext;
-use crate::config::settings::Settings;
 use crate::db::find_dispute_by_order_id;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
-use crate::util::{enqueue_order_msg, get_nostr_client, get_order};
+use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
+
 use sqlx_crud::traits::Crud;
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -20,6 +19,7 @@ use uuid::Uuid;
 /// Creates and publishes a NIP-33 replaceable event containing dispute details,
 /// including status, initiator (`buyer` or `seller`), and application metadata.
 async fn publish_dispute_event(
+    ctx: &AppContext,
     dispute: &Dispute,
     my_keys: &Keys,
     is_buyer_dispute: bool,
@@ -45,7 +45,7 @@ async fn publish_dispute_event(
         // Application identifier tag
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("y")),
-            create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+            create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
         ),
         // Event type tag
         Tag::custom(
@@ -61,23 +61,18 @@ async fn publish_dispute_event(
 
     tracing::info!("Publishing dispute event: {:#?}", event);
 
-    // Get nostr client and publish the event
-    match get_nostr_client() {
-        Ok(client) => match client.send_event(&event).await {
-            Ok(_) => {
-                tracing::info!(
-                    "Successfully published dispute event for dispute ID: {}",
-                    dispute.id
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("Failed to send dispute event: {}", e);
-                Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
-            }
-        },
+    // Get nostr client from context and publish the event
+    let client = ctx.nostr_client();
+    match client.send_event(&event).await {
+        Ok(_) => {
+            tracing::info!(
+                "Successfully published dispute event for dispute ID: {}",
+                dispute.id
+            );
+            Ok(())
+        }
         Err(e) => {
-            tracing::error!("Failed to get Nostr client: {}", e);
+            tracing::error!("Failed to send dispute event: {}", e);
             Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
         }
     }
@@ -102,9 +97,9 @@ fn get_counterpart_info(sender: &str, buyer: &str, seller: &str) -> Result<bool,
 /// Checks that:
 /// - The order exists
 /// - The order status allows disputes (Active or FiatSent)
-async fn get_valid_order(pool: &Pool<Sqlite>, msg: &Message) -> Result<Order, MostroError> {
+async fn get_valid_order(ctx: &AppContext, msg: &Message) -> Result<Order, MostroError> {
     // Try to fetch the order from the database
-    let order = get_order(msg, pool).await?;
+    let order = get_order(msg, ctx.pool()).await?;
 
     // Check if the order status is Active or FiatSent
     if order.check_status(Status::Active).is_err() && order.check_status(Status::FiatSent).is_err()
@@ -172,7 +167,7 @@ pub async fn dispute_action(
         return Err(MostroInternalErr(ServiceError::DisputeAlreadyExists));
     }
     // Get and validate order
-    let mut order = get_valid_order(pool, &msg).await?;
+    let mut order = get_valid_order(ctx, &msg).await?;
     // Get seller and buyer pubkeys
     let (seller, buyer) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (seller.to_owned(), buyer.to_owned()),
@@ -236,7 +231,7 @@ pub async fn dispute_action(
     .await?;
 
     // Publish dispute event to network
-    publish_dispute_event(&dispute, my_keys, is_buyer_dispute)
+    publish_dispute_event(ctx, &dispute, my_keys, is_buyer_dispute)
         .await
         .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
 
@@ -256,12 +251,13 @@ pub async fn dispute_action(
 /// * `my_keys` - Mostro's keys for signing the dispute event
 /// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
 pub async fn close_dispute_after_user_resolution(
-    pool: &Pool<Sqlite>,
+    ctx: &AppContext,
     order: &Order,
     new_status: DisputeStatus,
     my_keys: &Keys,
     context: &str,
 ) {
+    let pool = ctx.pool();
     if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
         let dispute_id = dispute.id;
         dispute.status = new_status.to_string();
@@ -310,7 +306,7 @@ pub async fn close_dispute_after_user_resolution(
                 ),
                 Tag::custom(
                     TagKind::Custom(Cow::Borrowed("y")),
-                    create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+                    create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
                 ),
                 Tag::custom(
                     TagKind::Custom(Cow::Borrowed("z")),
@@ -319,17 +315,13 @@ pub async fn close_dispute_after_user_resolution(
             ]);
 
             match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
-                Ok(event) => match get_nostr_client() {
-                    Ok(client) => {
-                        tracing::info!("Publishing dispute close event: {:#?}", event);
-                        if let Err(e) = client.send_event(&event).await {
-                            tracing::error!("Failed to publish dispute close event: {}", e);
-                        }
+                Ok(event) => {
+                    let client = ctx.nostr_client();
+                    tracing::info!("Publishing dispute close event: {:#?}", event);
+                    if let Err(e) = client.send_event(&event).await {
+                        tracing::error!("Failed to publish dispute close event: {}", e);
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to get Nostr client for dispute event: {}", e);
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::error!(
                         "Failed to create dispute close event for dispute {}: {}",

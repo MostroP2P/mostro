@@ -8,6 +8,7 @@ use crate::util::{
     enqueue_order_msg, get_keys, get_nostr_client, get_order, settle_seller_hold_invoice,
     update_order_event,
 };
+use sqlx::{Pool, Sqlite};
 
 use argon2::password_hash::SaltString;
 use config::settings::*;
@@ -18,7 +19,6 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use rand;
 use rand::rngs::OsRng;
-use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -111,10 +111,10 @@ pub async fn check_failure_retries(
 ///
 /// # Arguments
 ///
+/// * `ctx` - Application context containing the database pool and other dependencies
 /// * `msg` - The message containing the release request and associated metadata
 /// * `event` - The unwrapped gift event containing the seller's signature and verification data
 /// * `my_keys` - The Mostro node's keys used for signing events and messages
-/// * `pool` - Database connection pool for order updates
 /// * `ln_client` - Lightning network client for invoice settlement
 ///
 /// # Returns
@@ -157,23 +157,14 @@ pub async fn check_failure_retries(
 /// * Only the seller can release funds for their order
 /// * The seller's identity is verified through the event signature
 /// * Hold invoices are settled only after proper verification
-pub async fn release_action_with_ctx(
+pub async fn release_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    release_action(msg, event, my_keys, ctx.pool(), ln_client).await
-}
-
-pub async fn release_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order

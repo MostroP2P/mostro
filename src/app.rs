@@ -25,24 +25,24 @@ pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
 
 // Import action handlers from submodules
-use crate::app::add_invoice::add_invoice_action_with_ctx;
-use crate::app::admin_add_solver::admin_add_solver_action_with_ctx;
-use crate::app::admin_cancel::admin_cancel_action_with_ctx;
-use crate::app::admin_settle::admin_settle_action_with_ctx;
-use crate::app::admin_take_dispute::admin_take_dispute_action_with_ctx;
-use crate::app::cancel::cancel_action_with_ctx;
+use crate::app::add_invoice::add_invoice_action;
+use crate::app::admin_add_solver::admin_add_solver_action;
+use crate::app::admin_cancel::admin_cancel_action;
+use crate::app::admin_settle::admin_settle_action;
+use crate::app::admin_take_dispute::admin_take_dispute_action;
+use crate::app::cancel::cancel_action;
 use crate::app::context::AppContext;
-use crate::app::dispute::dispute_action_with_ctx;
-use crate::app::fiat_sent::fiat_sent_action_with_ctx;
-use crate::app::last_trade_index::last_trade_index_with_ctx;
-use crate::app::order::order_action_with_ctx;
-use crate::app::orders::orders_action_with_ctx;
-use crate::app::rate_user::update_user_reputation_action_with_ctx;
-use crate::app::release::release_action_with_ctx;
-use crate::app::restore_session::restore_session_action_with_ctx;
-use crate::app::take_buy::take_buy_action_with_ctx;
-use crate::app::take_sell::take_sell_action_with_ctx;
-use crate::app::trade_pubkey::trade_pubkey_action_with_ctx;
+use crate::app::dispute::dispute_action;
+use crate::app::fiat_sent::fiat_sent_action;
+use crate::app::last_trade_index::last_trade_index;
+use crate::app::order::order_action;
+use crate::app::orders::orders_action;
+use crate::app::rate_user::update_user_reputation_action;
+use crate::app::release::release_action;
+use crate::app::restore_session::restore_session_action;
+use crate::app::take_buy::take_buy_action;
+use crate::app::take_sell::take_sell_action;
+use crate::app::trade_pubkey::trade_pubkey_action;
 use crate::config::settings::get_db_pool;
 // Core functionality imports
 use crate::config::settings::Settings;
@@ -215,52 +215,50 @@ async fn handle_message_action_no_ln(
 ) -> Result<()> {
     match action {
         // Order-related actions
-        Action::NewOrder => order_action_with_ctx(ctx, msg, event, my_keys)
+        Action::NewOrder => order_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::TakeSell => take_sell_action_with_ctx(ctx, msg, event, my_keys)
+        Action::TakeSell => take_sell_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::TakeBuy => take_buy_action_with_ctx(ctx, msg, event, my_keys)
+        Action::TakeBuy => take_buy_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
         // Payment-related actions that do not require LN client
-        Action::FiatSent => fiat_sent_action_with_ctx(ctx, msg, event, my_keys)
+        Action::FiatSent => fiat_sent_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::AddInvoice => add_invoice_action_with_ctx(ctx, msg, event, my_keys)
+        Action::AddInvoice => add_invoice_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
-        Action::LastTradeIndex => last_trade_index_with_ctx(ctx, msg, event, my_keys)
+        Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
         // Dispute and rating actions
-        Action::Dispute => dispute_action_with_ctx(ctx, msg, event, my_keys)
+        Action::Dispute => dispute_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::RateUser => update_user_reputation_action_with_ctx(ctx, msg, event, my_keys)
+        Action::RateUser => update_user_reputation_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
         // Admin actions without LN
-        Action::AdminAddSolver => admin_add_solver_action_with_ctx(ctx, msg, event, my_keys)
+        Action::AdminAddSolver => admin_add_solver_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::AdminTakeDispute => admin_take_dispute_action_with_ctx(ctx, msg, event, my_keys)
+        Action::AdminTakeDispute => admin_take_dispute_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::TradePubkey => trade_pubkey_action_with_ctx(ctx, msg, event)
+        Action::TradePubkey => trade_pubkey_action(ctx, msg, event)
             .await
             .map_err(|e| e.into()),
-        Action::RestoreSession => restore_session_action_with_ctx(ctx, event)
+        Action::RestoreSession => restore_session_action(ctx, event)
             .await
             .map_err(|e| e.into()),
-        Action::Orders => orders_action_with_ctx(ctx, msg, event)
-            .await
-            .map_err(|e| e.into()),
+        Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -279,16 +277,16 @@ async fn handle_message_action(
     ctx: &AppContext,
 ) -> Result<()> {
     match action {
-        Action::Release => release_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+        Action::Release => release_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
-        Action::Cancel => cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+        Action::Cancel => cancel_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
-        Action::AdminCancel => admin_cancel_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+        Action::AdminCancel => admin_cancel_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
-        Action::AdminSettle => admin_settle_action_with_ctx(ctx, msg, event, my_keys, ln_client)
+        Action::AdminSettle => admin_settle_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
         _ => handle_message_action_no_ln(action, msg, event, my_keys, ctx).await,

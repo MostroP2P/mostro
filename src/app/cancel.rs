@@ -347,50 +347,26 @@ async fn cancel_pending_order_from_maker(
 
 /// Cancel action entry point using dependency-injected context.
 ///
-/// This is the preferred entry point. The `pool` is extracted from `ctx`
-/// internally. Callers that still pass `pool` directly can use the legacy
-/// [`cancel_action`] wrapper until the migration is complete.
-pub async fn cancel_action_with_ctx(
-    ctx: &AppContext,
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    ln_client: &mut LndConnector,
-) -> Result<(), MostroError> {
-    cancel_action_with_ctx_generic(ctx, msg, event, my_keys, ln_client).await
-}
-
-async fn cancel_action_with_ctx_generic<L: CancelLightning + Send>(
-    ctx: &AppContext,
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    ln_client: &mut L,
-) -> Result<(), MostroError> {
-    cancel_action_generic(msg, event, my_keys, ctx.pool(), ln_client).await
-}
-
-/// Top-level cancel entrypoint (legacy signature).
-///
-/// Routes to one of the specific flows based on the current `Status` and who
-/// sent the request. Prefer [`cancel_action_with_ctx`] for new code.
+/// The database connection pool and other dependencies are extracted from `ctx`.
+/// Internal routing logic is delegated to `cancel_action_generic`.
 pub async fn cancel_action(
+    ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
-    pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
-    cancel_action_generic(msg, event, my_keys, pool, ln_client).await
+    cancel_action_generic(ctx, msg, event, my_keys, ln_client).await
 }
 
 async fn cancel_action_generic<L: CancelLightning + Send>(
+    ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
-    pool: &Pool<Sqlite>,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order id
@@ -640,8 +616,7 @@ mod tests {
         let my_keys = Keys::generate();
         let mut ln_client = StubLnClient;
 
-        let result =
-            cancel_action_with_ctx_generic(&ctx, msg, &event, &my_keys, &mut ln_client).await;
+        let result = cancel_action_generic(&ctx, msg, &event, &my_keys, &mut ln_client).await;
 
         assert!(matches!(
             result,

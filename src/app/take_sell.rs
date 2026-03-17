@@ -34,21 +34,13 @@ async fn update_order_status(
     }
 }
 
-pub async fn take_sell_action_with_ctx(
+pub async fn take_sell_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    take_sell_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn take_sell_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get order
     let mut order = get_order(&msg, pool).await?;
 
@@ -171,6 +163,15 @@ mod tests {
         Keys::generate()
     }
 
+    /// Helper to build a test AppContext with the given pool.
+    fn build_test_context(pool: SqlitePool) -> AppContext {
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool))
+            .with_settings(test_settings())
+            .build()
+    }
+
     fn create_test_message(trade_index: Option<u32>) -> Message {
         // Create a basic message for TakeSell action
         // We'll use the new_order method since TakeSell isn't directly available
@@ -211,6 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_pending_order_exists() {
         let pool = create_test_pool().await;
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -219,7 +221,7 @@ mod tests {
         // 1. Setting up database tables
         // 2. Creating a pending order for the buyer
         // 3. Mocking buyer_has_pending_order to return true
-        let result = take_sell_action(msg, &event, &keys, &pool).await;
+        let result = take_sell_action(&ctx, msg, &event, &keys).await;
         // Should fail if buyer has pending order, but we can't test that without DB setup
         assert!(result.is_ok() || result.is_err());
     }
@@ -227,6 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_sell_action_order_validation() {
         let pool = create_test_pool().await;
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -234,13 +237,14 @@ mod tests {
         // This test would require:
         // 1. Mocking get_order to return an order
         // 2. Setting up the order to be either valid or invalid
-        let result = take_sell_action(msg, &event, &keys, &pool).await;
+        let result = take_sell_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok() || result.is_err());
     }
 
     #[tokio::test]
     async fn test_take_sell_action_trade_index_logic() {
         let pool = create_test_pool().await;
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
 
         // Test case 1: sender == rumor.pubkey, no trade_index
@@ -248,7 +252,7 @@ mod tests {
         event.sender = event.rumor.pubkey;
         let msg = create_test_message(None);
 
-        let result = take_sell_action(msg, &event, &keys, &pool).await;
+        let result = take_sell_action(&ctx, msg, &event, &keys).await;
         // Should use trade_index = 0 when sender == rumor.pubkey
         assert!(result.is_ok() || result.is_err());
 
@@ -257,19 +261,20 @@ mod tests {
         // sender and rumor.pubkey are already different by default
         let msg2 = create_test_message(None);
 
-        let result2 = take_sell_action(msg2, &event2, &keys, &pool).await;
+        let result2 = take_sell_action(&ctx, msg2, &event2, &keys).await;
         // Should fail with InvalidPayload when sender != rumor.pubkey and no trade_index
         if let Err(MostroInternalErr(ServiceError::InvalidPayload)) = result2 {}
 
         // Test case 3: with trade_index
         let msg3 = create_test_message(Some(1));
-        let result3 = take_sell_action(msg3, &event2, &keys, &pool).await;
+        let result3 = take_sell_action(&ctx, msg3, &event2, &keys).await;
         assert!(result3.is_ok() || result3.is_err());
     }
 
     #[tokio::test]
     async fn test_take_sell_action_market_price_calculation() {
         let pool = create_test_pool().await;
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
         let msg = create_test_message(Some(1));
@@ -277,24 +282,25 @@ mod tests {
         // This test would require:
         // 1. Mocking get_order to return an order with amount = 0 (market price)
         // 2. Mocking get_market_amount_and_fee
-        let result = take_sell_action(msg, &event, &keys, &pool).await;
+        let result = take_sell_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok() || result.is_err());
     }
 
     #[tokio::test]
     async fn test_take_sell_action_payment_request_flows() {
         let pool = create_test_pool().await;
+        let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
         let event = create_test_unwrapped_gift();
 
         // Test with no payment request (should update order status)
         let msg1 = create_test_message(Some(1));
-        let result1 = take_sell_action(msg1, &event, &keys, &pool).await;
+        let result1 = take_sell_action(&ctx, msg1, &event, &keys).await;
         assert!(result1.is_ok() || result1.is_err());
 
         // Test with payment request (should show hold invoice)
         let msg2 = create_test_message(Some(1));
-        let result2 = take_sell_action(msg2, &event, &keys, &pool).await;
+        let result2 = take_sell_action(&ctx, msg2, &event, &keys).await;
         assert!(result2.is_ok() || result2.is_err());
     }
 

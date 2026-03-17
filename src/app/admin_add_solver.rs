@@ -5,24 +5,15 @@ use mostro_core::prelude::*;
 use mostro_core::user::User;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
 use tracing::{error, info};
 
-pub async fn admin_add_solver_action_with_ctx(
+pub async fn admin_add_solver_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    admin_add_solver_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn admin_add_solver_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 

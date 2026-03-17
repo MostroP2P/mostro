@@ -112,21 +112,13 @@ pub async fn pubkey_event_can_solve(
     false
 }
 
-pub async fn admin_take_dispute_action_with_ctx(
+pub async fn admin_take_dispute_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     mostro_keys: &Keys,
 ) -> Result<(), MostroError> {
-    admin_take_dispute_action(msg, event, mostro_keys, ctx.pool()).await
-}
-
-pub async fn admin_take_dispute_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    mostro_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
 

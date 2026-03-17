@@ -155,21 +155,13 @@ async fn notify_dispute_to_users(
 /// 3. Creates a new dispute record
 /// 4. Notifies both parties
 /// 5. Publishes the dispute event to the network
-pub async fn dispute_action_with_ctx(
+pub async fn dispute_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    dispute_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn dispute_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {

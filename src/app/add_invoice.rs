@@ -32,21 +32,13 @@ pub async fn pay_new_invoice(
     Ok(())
 }
 
-pub async fn add_invoice_action_with_ctx(
+pub async fn add_invoice_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedGift,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    add_invoice_action(msg, event, my_keys, ctx.pool()).await
-}
-
-pub async fn add_invoice_action(
-    msg: Message,
-    event: &UnwrappedGift,
-    my_keys: &Keys,
-    pool: &Pool<Sqlite>,
-) -> Result<(), MostroError> {
+    let pool = ctx.pool();
     // Get order
     let mut order = get_order(&msg, pool).await?;
     // Check order status

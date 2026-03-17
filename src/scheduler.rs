@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::do_payment;
 use crate::bitcoin_price::BitcoinPriceManager;
@@ -5,7 +6,6 @@ use crate::config;
 use crate::db::*;
 use crate::lightning::LndConnector;
 use crate::util;
-use crate::util::get_nostr_client;
 use crate::LN_STATUS;
 use crate::{Keys, PublicKey};
 
@@ -21,16 +21,16 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
 
-pub async fn start_scheduler() {
+pub async fn start_scheduler(ctx: AppContext) {
     info!("Creating scheduler");
 
-    job_expire_pending_older_orders().await;
-    job_update_rate_events().await;
-    job_cancel_orders().await;
-    job_retry_failed_payments().await;
-    job_process_dev_fee_payment().await;
-    job_info_event_send().await;
-    job_relay_list().await;
+    job_expire_pending_older_orders(ctx.clone()).await;
+    job_update_rate_events(ctx.clone()).await;
+    job_cancel_orders(ctx.clone()).await;
+    job_retry_failed_payments(ctx.clone()).await;
+    job_process_dev_fee_payment(ctx.clone()).await;
+    job_info_event_send(ctx.clone()).await;
+    job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
     job_flush_messages_queue().await;
 
@@ -107,21 +107,17 @@ async fn job_flush_messages_queue() {
     });
 }
 
-async fn job_relay_list() {
+async fn job_relay_list(ctx: AppContext) {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
-    let client = match get_nostr_client() {
-        Ok(client) => client,
-        Err(e) => return error!("{e}"),
-    };
+    let client = ctx.nostr_client().clone();
+    let interval = ctx.settings().mostro.publish_relays_interval as u64;
 
     tokio::spawn(async move {
         loop {
             info!("Sending Mostro relay list");
-
-            let interval = Settings::get_mostro().publish_relays_interval as u64;
             if let Some(relays) = get_nostr_relays().await {
                 let mut relay_tags: Vec<Tag> = vec![];
 
@@ -142,16 +138,13 @@ async fn job_relay_list() {
     });
 }
 
-async fn job_info_event_send() {
+async fn job_info_event_send(ctx: AppContext) {
     let mostro_keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
-    let client = match get_nostr_client() {
-        Ok(client) => client,
-        Err(e) => return error!("{e}"),
-    };
-    let interval = Settings::get_mostro().publish_mostro_info_interval as u64;
+    let client = ctx.nostr_client().clone();
+    let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
     let ln_status = LN_STATUS.get().unwrap();
     tokio::spawn(async move {
         loop {
@@ -172,13 +165,10 @@ async fn job_info_event_send() {
     });
 }
 
-async fn job_retry_failed_payments() {
-    let ln_settings = Settings::get_ln();
+async fn job_retry_failed_payments(ctx: AppContext) {
+    let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
     let interval = ln_settings.payment_retries_interval as u64;
-
-    // Arc clone db pool to safe use across threads
-    let pool = get_db_pool();
 
     tokio::spawn(async move {
         loop {
@@ -187,10 +177,10 @@ async fn job_retry_failed_payments() {
                 interval
             );
 
-            if let Ok(payment_failed_list) = crate::db::find_failed_payment(&pool).await {
+            if let Ok(payment_failed_list) = crate::db::find_failed_payment(ctx.pool()).await {
                 for payment_failed in payment_failed_list.into_iter() {
                     if payment_failed.payment_attempts < retries_number {
-                        if let Err(e) = do_payment(payment_failed.clone(), None).await {
+                        if let Err(e) = do_payment(&ctx, payment_failed.clone(), None).await {
                             error!("{e}");
                         }
                     }
@@ -201,15 +191,12 @@ async fn job_retry_failed_payments() {
     });
 }
 
-async fn job_update_rate_events() {
+async fn job_update_rate_events(ctx: AppContext) {
     // Clone for closure owning with Arc
     let queue_order_rate = MESSAGE_QUEUES.queue_order_rate.clone();
-    let mostro_settings = Settings::get_mostro();
+    let mostro_settings = &ctx.settings().mostro;
     let interval = mostro_settings.user_rates_sent_interval_seconds as u64;
-    let client = match get_nostr_client() {
-        Ok(client) => client,
-        Err(e) => return error!("{e}"),
-    };
+    let client = ctx.nostr_client().clone();
 
     tokio::spawn(async move {
         loop {
@@ -310,11 +297,8 @@ async fn notify_users_canceled_order(
     .await;
 }
 
-async fn job_cancel_orders() {
+async fn job_cancel_orders(ctx: AppContext) {
     info!("Create a pool to connect to db");
-
-    // Arc clone db pool to safe use across threads
-    let pool = get_db_pool();
 
     let keys = match get_keys() {
         Ok(keys) => keys,
@@ -328,14 +312,15 @@ async fn job_cancel_orders() {
     } else {
         return error!("Failed to create LND client");
     };
-    let mostro_settings = Settings::get_mostro();
+    let mostro_settings = &ctx.settings().mostro;
     let exp_seconds = mostro_settings.expiration_seconds;
 
     tokio::spawn(async move {
+        let pool = ctx.pool();
         loop {
             info!("Check for order to republish for late actions of users");
 
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(&pool).await {
+            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
                 for order in older_orders_list.into_iter() {
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
@@ -379,7 +364,7 @@ async fn job_cancel_orders() {
                                 | (Status::WaitingPayment, Kind::Buy) => {
                                     // Update order status
                                     let _ = update_order_to_initial_state(
-                                        &pool,
+                                        pool,
                                         order.id,
                                         order.amount,
                                         order.fee,
@@ -393,7 +378,7 @@ async fn job_cancel_orders() {
                                     (
                                         Some(Action::NewOrder),
                                         Status::Pending,
-                                        edit_pubkeys_order(&pool, &order).await,
+                                        edit_pubkeys_order(pool, &order).await,
                                     )
                                 }
                                 (Status::WaitingBuyerInvoice, Kind::Buy)
@@ -406,7 +391,7 @@ async fn job_cancel_orders() {
                                     (
                                         Some(Action::Canceled),
                                         Status::Canceled,
-                                        edit_pubkeys_order(&pool, &order).await,
+                                        edit_pubkeys_order(pool, &order).await,
                                     )
                                 }
                                 _ => {
@@ -440,7 +425,7 @@ async fn job_cancel_orders() {
                                 new_status
                             );
                             // update order on db
-                            let _ = order_updated.update(&pool).await;
+                            let _ = order_updated.update(pool).await;
                         }
                     }
                 }
@@ -459,20 +444,17 @@ async fn job_cancel_orders() {
     });
 }
 
-async fn job_expire_pending_older_orders() {
-    let pool = match connect().await {
-        Ok(p) => p,
-        Err(e) => return error!("{e}"),
-    };
+async fn job_expire_pending_older_orders(ctx: AppContext) {
     let keys = match get_keys() {
         Ok(keys) => keys,
         Err(e) => return error!("{e}"),
     };
 
     tokio::spawn(async move {
+        let pool = ctx.pool();
         loop {
             info!("Check older orders and mark them Expired - check is done every minute");
-            if let Ok(older_orders_list) = crate::db::find_order_by_date(&pool).await {
+            if let Ok(older_orders_list) = crate::db::find_order_by_date(pool).await {
                 for order in older_orders_list.iter() {
                     tracing::info!(
                         "Order id {} - created at {} is expired",
@@ -483,7 +465,7 @@ async fn job_expire_pending_older_orders() {
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
-                        let _ = order_updated.update(&pool).await;
+                        let _ = order_updated.update(pool).await;
                     }
                 }
             }
@@ -518,8 +500,7 @@ async fn job_update_bitcoin_prices() {
 /// Spawns a background task that runs [`run_dev_fee_cycle`] every 60 seconds.
 /// All state-machine logic lives in [`crate::app::dev_fee`].
 #[mutants::skip]
-async fn job_process_dev_fee_payment() {
-    let pool = get_db_pool();
+async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
@@ -532,8 +513,9 @@ async fn job_process_dev_fee_payment() {
     let mut confirmed: HashSet<uuid::Uuid> = HashSet::new();
 
     tokio::spawn(async move {
+        let pool = ctx.pool();
         loop {
-            run_dev_fee_cycle(&pool, &mut ln_client, &mut confirmed).await;
+            run_dev_fee_cycle(pool, &mut ln_client, &mut confirmed).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

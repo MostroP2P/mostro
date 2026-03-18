@@ -77,9 +77,9 @@ Before settings initialization, the daemon performs:
 5) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
 6) Held invoices: `db::find_held_invoices()` → resubscribe via `util::invoice_subscribe`.
 7) RPC: start if `rpc.enabled`.
-8) Scheduler: `scheduler::start_scheduler()`.
-9) Scheduler jobs: Payment retry job configured with `payment_retries_interval`.
-10) Event loop: `app::run(keys, client, ln_client)`.
+8) AppContext: Build `AppContext` with pool, client, settings, message queue, and keys.
+9) Scheduler: `scheduler::start_scheduler(ctx)` — receives `AppContext` for dependency injection.
+10) Event loop: `app::run(ctx, ln_client)` — receives `AppContext` instead of individual dependencies.
 
 ## Settings Structure
 

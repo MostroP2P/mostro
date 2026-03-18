@@ -250,6 +250,7 @@ pub async fn release_action(
 fn handle_buy_child_order(
     child_order: &mut Order,
     order: &Order,
+    normal_buyer_idkey: Option<String>,
 ) -> Result<(Option<String>, Option<i64>), MostroError> {
     let next_buyer_pubkey = order.next_trade_pubkey.clone().ok_or_else(|| {
         MostroInternalErr(ServiceError::UnexpectedError(
@@ -260,12 +261,16 @@ fn handle_buy_child_order(
     child_order.buyer_pubkey = Some(next_buyer_pubkey.clone());
     child_order.trade_index_buyer = order.next_trade_index;
     child_order.creator_pubkey = next_buyer_pubkey.clone();
-    child_order.master_buyer_pubkey = Some(
-        order
-            .get_master_buyer_pubkey()
-            .map_err(MostroInternalErr)?
-            .to_string(),
-    );
+    // if user is in full privacy mode, use the next trade key
+    // if user is in normal mode, use the master buyer pubkey
+    match normal_buyer_idkey {
+        Some(idkey) => {
+            child_order.master_buyer_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_buyer_pubkey = Some(next_buyer_pubkey);
+        }
+    }
 
     // Clear next trade fields for buy order
     child_order.next_trade_index = None;
@@ -281,6 +286,7 @@ fn handle_buy_child_order(
 fn handle_sell_child_order(
     child_order: &mut Order,
     next_trade: Option<(String, u32)>,
+    normal_seller_idkey: Option<String>,
 ) -> Result<(Option<String>, Option<i64>), MostroError> {
     let (next_trade_pubkey, next_trade_index) = next_trade.ok_or_else(|| {
         MostroInternalErr(ServiceError::UnexpectedError(
@@ -294,7 +300,16 @@ fn handle_sell_child_order(
     child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
     child_order.trade_index_seller = Some(next_trade_index as i64);
     child_order.creator_pubkey = next_trade_pubkey.to_string();
-    child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+    // if user is in full privacy mode, use the next trade key as master seller pubkey
+    // if user is in normal mode, use the master seller pubkey as master seller pubkey
+    match normal_seller_idkey {
+        Some(idkey) => {
+            child_order.master_seller_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+        }
+    }
 
     Ok((
         child_order.seller_pubkey.clone(),
@@ -348,14 +363,23 @@ async fn handle_child_order(
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    // Check if users are in rating mode or full privacy mode - if a key is Some the user in in normal mode
+    // if a key is None the user is in full privacy mode
+    let (normal_buyer_idkey, normal_seller_idkey) =
+        order.is_full_privacy_order().map_err(|_| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "Error creating order event".to_string(),
+            ))
+        })?;
+
     let (notification_pubkey, new_trade_index) = if order.is_buy_order().is_ok()
         && order.buyer_pubkey.as_ref() == Some(&order.creator_pubkey)
     {
-        handle_buy_child_order(&mut child_order, order)?
+        handle_buy_child_order(&mut child_order, order, normal_buyer_idkey)?
     } else if order.is_sell_order().is_ok()
         && order.seller_pubkey.as_ref() == Some(&order.creator_pubkey)
     {
-        handle_sell_child_order(&mut child_order, next_trade)?
+        handle_sell_child_order(&mut child_order, next_trade, normal_seller_idkey)?
     } else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(
             "Invalid order type or creator".to_string(),

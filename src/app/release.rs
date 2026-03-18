@@ -612,7 +612,7 @@ async fn create_order_event(
 
     // If user has sent the order with his identity key means that he wants to be rate so we can just
     // check if we have identity key in db - if present we have to send reputation tags otherwise no.
-    let tags = match crate::db::is_user_present(&pool, identity_pubkey.to_string()).await {
+    let tags = match crate::db::is_user_present(pool, identity_pubkey.to_string()).await {
         Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),

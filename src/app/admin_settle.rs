@@ -29,7 +29,7 @@ pub async fn admin_settle_action(
     match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
         Ok(false) => {
             // Check if admin has taken over the dispute
-            if is_dispute_taken_by_admin(pool, order.id).await? {
+            if is_dispute_taken_by_admin(pool, order.id, &my_keys.public_key().to_string()).await? {
                 return Err(MostroCantDo(
                     mostro_core::error::CantDoReason::DisputeTakenByAdmin,
                 ));

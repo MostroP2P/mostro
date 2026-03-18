@@ -898,7 +898,14 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                 let hash = bytes_to_string(msg.hash.as_ref());
                 // If this invoice was paid by the seller
                 if msg.state == InvoiceState::Accepted {
-                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool).await {
+                    let keys = match get_keys() {
+                        Ok(k) => k,
+                        Err(e) => {
+                            info!("Failed to get keys: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool, &keys).await {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");

@@ -93,6 +93,7 @@ impl AdminServiceImpl {
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -152,6 +153,7 @@ impl AdminServiceImpl {
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -210,6 +212,7 @@ impl AdminServiceImpl {
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
         );
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
@@ -268,6 +271,7 @@ impl AdminServiceImpl {
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
         );
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await

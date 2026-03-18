@@ -424,8 +424,8 @@ impl AdminService for AdminServiceImpl {
             remote_addr.ip()
         );
 
-        // Database encryption has been removed (#642).
-        // This endpoint is kept for backward compatibility but always succeeds.
+        // Database encryption is not used. This endpoint is kept for backward
+        // compatibility and always succeeds.
         let _ = req.password;
         self.password_rate_limiter
             .record_success(&remote_addr)

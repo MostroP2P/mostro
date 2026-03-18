@@ -51,30 +51,13 @@ async fn main() -> Result<()> {
         .init();
 
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    let decrypt_db_requested = settings_init()?;
+    settings_init()?;
 
     // Connect to database
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
         exit(1);
     };
-
-    // Handle --decrypt-db command
-    if decrypt_db_requested {
-        match db::decrypt_database(&get_db_pool()).await {
-            Ok(count) => {
-                tracing::info!(
-                    "Successfully decrypted {count} orders. \
-                     You can now remove MOSTRO_DB_PASSWORD from your environment."
-                );
-                exit(0);
-            }
-            Err(e) => {
-                tracing::error!("Failed to decrypt database: {e}");
-                exit(1);
-            }
-        }
-    }
 
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {

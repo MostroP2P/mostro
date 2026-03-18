@@ -102,11 +102,7 @@ pub async fn take_sell_action(
     // Add buyer pubkey to order
     order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
     // Add buyer identity pubkey to order
-    order.master_buyer_pubkey = Some(
-        CryptoUtils::store_encrypted(&event.sender.to_string(), None, None)
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
-    );
-
+    order.master_buyer_pubkey = Some(event.sender.to_string());
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {
@@ -323,18 +319,6 @@ mod tests {
             let maker_pubkey = create_test_keys().public_key();
             let taker_pubkey = create_test_keys().public_key();
             assert_ne!(maker_pubkey, taker_pubkey);
-        }
-
-        #[test]
-        fn test_encryption_logic_structure() {
-            // Test the structure of encryption logic
-            let test_pubkey = create_test_keys().public_key().to_string();
-            let test_password = "test_password";
-
-            // In a real test, we would test CryptoUtils::store_encrypted
-            // For now, we test the logic structure
-            assert!(!test_pubkey.is_empty());
-            assert!(!test_password.is_empty());
         }
 
         #[test]

@@ -73,15 +73,15 @@ Take a dispute for resolution.
 - `error_message`: Optional error message if operation failed
 
 ### 5. Validate Database Password
-Validate the database password for encrypted databases.
+Kept for backward compatibility. Database encryption has been removed; this RPC always succeeds and does not validate a password.
 
 **Request:**
-- `password`: Database password to validate
+- `password`: Ignored
 - `request_id`: Optional request identifier
 
 **Response:**
-- `success`: Boolean indicating password validity
-- `error_message`: Optional error message if validation failed
+- `success`: Always `true`
+- `error_message`: Always `None`
 
 ### 6. Get Version
 Retrieve the Mostro daemon version.

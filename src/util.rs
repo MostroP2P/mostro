@@ -474,18 +474,16 @@ async fn prepare_new_order(
         Some(OrderKind::Buy) => {
             new_order_db.kind = OrderKind::Buy.to_string();
             new_order_db.buyer_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_buyer_pubkey = Some(
-                CryptoUtils::store_encrypted(&identity_pubkey.to_string(), None, None)
-                    .map_err(|e| MostroInternalErr(ServiceError::EncryptionError(e.to_string())))?,
-            );
+            new_order_db.master_buyer_pubkey = Some(identity_pubkey.to_string());
             new_order_db.trade_index_buyer = trade_index;
         }
         Some(OrderKind::Sell) => {
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
             new_order_db.master_seller_pubkey = Some(
-                CryptoUtils::store_encrypted(&identity_pubkey.to_string(), None, None)
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?,
+                PublicKey::from_str(&identity_pubkey.to_string())
+                    .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
+                    .to_string(),
             );
             new_order_db.trade_index_seller = trade_index;
         }
@@ -686,10 +684,10 @@ async fn get_ratings_for_pending_order(
     if status == Status::Pending {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
-                .get_master_seller_pubkey(None)
+                .get_master_seller_pubkey()
                 .map_err(MostroInternalErr)?,
             Err(_) => order_updated
-                .get_master_buyer_pubkey(None)
+                .get_master_buyer_pubkey()
                 .map_err(MostroInternalErr)?,
         };
 
@@ -702,14 +700,14 @@ async fn get_ratings_for_pending_order(
                 .map_err(MostroInternalErr)?,
         };
 
-        match is_user_present(&get_db_pool(), identity_pubkey.clone()).await {
+        match is_user_present(&get_db_pool(), identity_pubkey.to_string()).await {
             Ok(user) => Ok(Some((
                 user.total_rating,
                 user.total_reviews,
                 user.created_at,
             ))),
             Err(_) => {
-                if identity_pubkey == trade_pubkey.to_string() {
+                if identity_pubkey == trade_pubkey {
                     Ok(Some((0.0, 0, 0)))
                 } else {
                     Err(MostroInternalErr(ServiceError::InvalidPubkey))
@@ -1282,7 +1280,9 @@ pub async fn notify_taker_reputation(
 
     let user_decrypted_key = if let Some(user) = user {
         // Get reputation data
-        CryptoUtils::decrypt_data(user, None).map_err(MostroInternalErr)?
+        PublicKey::from_str(&user)
+            .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
+            .to_string()
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     };

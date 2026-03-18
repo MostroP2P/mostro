@@ -44,7 +44,6 @@ use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
 // Core functionality imports
-use crate::config::settings::Settings;
 use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
@@ -299,18 +298,14 @@ async fn handle_message_action(
 /// * `my_keys` - The node's keypair
 /// * `client` - Nostr client instance
 /// * `ln_client` - Lightning network connector
-pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -> Result<()> {
+pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
+    let my_keys = ctx.keys();
+    let client = ctx.nostr_client();
+    let pow = ctx.settings().mostro.pow;
+
     loop {
         let mut notifications = client.notifications();
 
-        // Get pow from config
-        let pow = Settings::get_mostro().pow;
-
-        // Build application context with all dependencies.
-        // NOTE: `ctx` captures `Client` and `Settings` at construction time.
-        // If either is reloaded/replaced at runtime, rebuild `ctx`.
-        let ctx = AppContext::from_globals()
-            .expect("Failed to build AppContext — globals not initialized");
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 // Verify proof of work
@@ -325,7 +320,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                         tracing::warn!("Error in event verification")
                     };
 
-                    let event = match nip59::extract_rumor(&my_keys, &event).await {
+                    let event = match nip59::extract_rumor(my_keys, &event).await {
                         Ok(u) => u,
                         Err(e) => {
                             tracing::warn!("Error unwrapping gift: {}", e);
@@ -392,7 +387,7 @@ pub async fn run(my_keys: Keys, client: &Client, ln_client: &mut LndConnector) -
                                 &action,
                                 message.clone(),
                                 &event,
-                                &my_keys,
+                                my_keys,
                                 ln_client,
                                 &ctx,
                             )

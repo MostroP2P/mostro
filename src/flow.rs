@@ -9,12 +9,11 @@ pub async fn hold_invoice_paid(
     hash: &str,
     request_id: Option<u64>,
     pool: &SqlitePool,
+    my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let order = crate::db::find_order_by_hash(pool, hash)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let my_keys = crate::util::get_keys()
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     let buyer_pubkey = order
         .get_buyer_pubkey()
@@ -114,7 +113,7 @@ pub async fn hold_invoice_paid(
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(updated_order) = crate::util::update_order_event(&my_keys, status, &order).await {
+    if let Ok(updated_order) = crate::util::update_order_event(my_keys, status, &order).await {
         // Update order on db
         let _ = updated_order.update(pool).await;
     }
@@ -165,12 +164,14 @@ mod tests {
         let pool = create_test_pool().await;
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let request_id = Some(1u64);
+        // Valid test nsec
+        let keys = Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd")
+            .expect("valid test nsec");
 
         // This test would require:
         // 1. Setting up database tables and test data
-        // 2. Mocking get_keys()
-        // 3. Creating a valid order in the database
-        let result = hold_invoice_paid(hash, request_id, &pool).await;
+        // 2. Creating a valid order in the database
+        let result = hold_invoice_paid(hash, request_id, &pool, &keys).await;
         // Should fail without proper database setup, but shouldn't panic
         assert!(result.is_ok() || result.is_err());
     }

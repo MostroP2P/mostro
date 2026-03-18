@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
-use util::{enqueue_order_msg, get_keys, get_nostr_relays, send_dm, update_order_event};
+use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
     info!("Creating scheduler");
@@ -32,22 +32,19 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
-    job_flush_messages_queue().await;
+    job_flush_messages_queue(ctx.clone()).await;
 
     info!("Scheduler Started");
 }
 
-async fn job_flush_messages_queue() {
+async fn job_flush_messages_queue(ctx: AppContext) {
     // Clone for closure owning with Arc
     let order_msg_list = MESSAGE_QUEUES.queue_order_msg.clone();
     // Clone for closure owning with Arc
     let cantdo_msg_list = MESSAGE_QUEUES.queue_order_cantdo.clone();
     // Clone for closure owning with Arc
     let restore_session_msg_list = MESSAGE_QUEUES.queue_restore_session_msg.clone();
-    let sender_keys = match get_keys() {
-        Ok(keys) => keys,
-        Err(e) => return error!("{e}"),
-    };
+    let sender_keys = ctx.keys().clone();
 
     // Helper function to send messages
     async fn send_messages(
@@ -108,10 +105,7 @@ async fn job_flush_messages_queue() {
 }
 
 async fn job_relay_list(ctx: AppContext) {
-    let mostro_keys = match get_keys() {
-        Ok(keys) => keys,
-        Err(e) => return error!("{e}"),
-    };
+    let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
     let interval = ctx.settings().mostro.publish_relays_interval as u64;
 
@@ -139,10 +133,7 @@ async fn job_relay_list(ctx: AppContext) {
 }
 
 async fn job_info_event_send(ctx: AppContext) {
-    let mostro_keys = match get_keys() {
-        Ok(keys) => keys,
-        Err(e) => return error!("{e}"),
-    };
+    let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
     let ln_status = LN_STATUS.get().unwrap();
@@ -300,12 +291,7 @@ async fn notify_users_canceled_order(
 async fn job_cancel_orders(ctx: AppContext) {
     info!("Create a pool to connect to db");
 
-    let keys = match get_keys() {
-        Ok(keys) => keys,
-        Err(e) => {
-            return error!("{e}");
-        }
-    };
+    let keys = ctx.keys().clone();
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client
@@ -445,10 +431,7 @@ async fn job_cancel_orders(ctx: AppContext) {
 }
 
 async fn job_expire_pending_older_orders(ctx: AppContext) {
-    let keys = match get_keys() {
-        Ok(keys) => keys,
-        Err(e) => return error!("{e}"),
-    };
+    let keys = ctx.keys().clone();
 
     tokio::spawn(async move {
         let pool = ctx.pool();

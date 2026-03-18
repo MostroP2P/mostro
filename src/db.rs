@@ -947,6 +947,7 @@ pub async fn is_assigned_solver(
 pub async fn is_dispute_taken_by_admin(
     pool: &SqlitePool,
     order_id: Uuid,
+    admin_pubkey: &str,
 ) -> Result<bool, MostroError> {
     // Get the dispute for this order
     let dispute = sqlx::query(
@@ -963,9 +964,7 @@ pub async fn is_dispute_taken_by_admin(
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         {
             // Check if the current solver is the admin (mostro daemon)
-            if let Ok(my_keys) = crate::util::get_keys() {
-                return Ok(solver_pubkey == my_keys.public_key().to_string());
-            }
+            return Ok(solver_pubkey == admin_pubkey);
         }
     }
 

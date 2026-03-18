@@ -3,9 +3,7 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
-use crate::util::{
-    enqueue_order_msg, get_keys, get_order, settle_seller_hold_invoice, update_order_event,
-};
+use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
 use argon2::password_hash::SaltString;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -468,9 +466,8 @@ pub async fn do_payment(
         }
     }
 
-    // Get Mostro keys
-    let my_keys =
-        get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // Get Mostro keys from context
+    let my_keys = ctx.keys().clone();
 
     // Get buyer and seller pubkeys
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;

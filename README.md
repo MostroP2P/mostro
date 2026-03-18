@@ -340,13 +340,13 @@ Mostro supports three deployment methods. For production deployments, see [INSTA
 Ubuntu/Debian:
 ```bash
 sudo apt update
-sudo apt install -y cmake build-essential libsqlite3-dev pkg-config protobuf-compiler
+sudo apt install -y build-essential libsqlite3-dev pkg-config
 ```
 
 macOS:
 ```bash
 brew update
-brew install cmake pkg-config sqlite3 protobuf
+brew install pkg-config sqlite3
 ```
 
 ---
@@ -825,8 +825,8 @@ rustup update stable
 cargo install sqlx-cli --version 0.6.2
 
 # Development dependencies
-sudo apt install protobuf-compiler cmake build-essential  # Ubuntu
-brew install protobuf cmake  # macOS
+sudo apt install build-essential  # Ubuntu
+# macOS: Xcode Command Line Tools provide the C compiler (xcode-select --install)
 ```
 
 3. **Setup local environment**:
@@ -853,6 +853,8 @@ cargo fmt --all -- --check
 # Run linter
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+**Note on Protobuf**: No system-wide `protoc` installation is required. Mostro ships a `.cargo/config.toml` that points all build scripts (including transitive dependencies like `fedimint-tonic-lnd`) at the `protoc-bin-vendored` binary via the `.cargo/protoc-wrapper` script. Everything is handled automatically by `cargo build`.
 
 ---
 

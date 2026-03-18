@@ -3,7 +3,7 @@ FROM rust:1.86 AS builder
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler && \
+    apt-get install -y --no-install-recommends build-essential libsqlite3-dev pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
 

@@ -1,16 +1,12 @@
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
-use crate::config;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{
     enqueue_order_msg, get_keys, get_order, settle_seller_hold_invoice, update_order_event,
 };
-use sqlx::{Pool, Sqlite};
-
 use argon2::password_hash::SaltString;
-use config::settings::*;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
@@ -18,6 +14,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use rand;
 use rand::rngs::OsRng;
+use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -26,16 +23,16 @@ use tracing::info;
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
+    ctx: &AppContext,
     order: &Order,
     request_id: Option<u64>,
 ) -> Result<Order, MostroError> {
     let mut order = order.clone();
 
-    // Arc clone of db pool to use across threads
-    let pool = get_db_pool();
+    let pool = ctx.pool();
 
     // Get max number of retries
-    let ln_settings = Settings::get_ln();
+    let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
 
     let is_first_failure = order.payment_attempts == 0;
@@ -95,7 +92,7 @@ pub async fn check_failure_retries(
 
     order
         .clone()
-        .update(&pool)
+        .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(order)
@@ -213,12 +210,13 @@ pub async fn release_action(
     .await;
 
     // Handle child order for range orders
-    if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
+    if let Ok((Some(child_order), Some(event))) = get_child_order(ctx, order.clone(), my_keys).await
+    {
         let client = ctx.nostr_client();
         if client.send_event(&event).await.is_err() {
             tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
         }
-        handle_child_order(child_order, &order, next_trade, pool, request_id)
+        handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
@@ -247,7 +245,7 @@ pub async fn release_action(
     .await;
 
     // Finally we try to pay buyer's invoice
-    let _ = do_payment(order, request_id).await;
+    let _ = do_payment(ctx, order, request_id).await;
 
     Ok(())
 }
@@ -432,7 +430,11 @@ async fn handle_child_order(
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(), MostroError> {
+pub async fn do_payment(
+    ctx: &AppContext,
+    mut order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
         _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
@@ -458,7 +460,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
+        if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -473,6 +475,9 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     // Get buyer and seller pubkeys
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
+    // Clone ctx for the async closure
+    let ctx = ctx.clone();
+
     let payment = {
         async move {
             // We redeclare vars to use inside this block
@@ -485,8 +490,14 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ = payment_success(&mut order, buyer_pubkey, &my_keys, request_id)
-                                .await;
+                            let _ = payment_success(
+                                &ctx,
+                                &mut order,
+                                buyer_pubkey,
+                                &my_keys,
+                                request_id,
+                            )
+                            .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -496,7 +507,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
 
                             // Mark payment as failed
                             if let Ok(failed_payment) =
-                                check_failure_retries(&order, request_id).await
+                                check_failure_retries(&ctx, &order, request_id).await
                             {
                                 info!(
                                     "Order id {} has {} failed payments retries",
@@ -515,6 +526,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
 }
 
 async fn payment_success(
+    ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
@@ -531,13 +543,12 @@ async fn payment_success(
     )
     .await;
 
-    // Arc clone of db pool to use across threads
-    let pool = get_db_pool();
+    let pool = ctx.pool();
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         order_updated
             .clone()
-            .update(&pool)
+            .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // Send dm to buyer to rate counterpart
@@ -559,6 +570,7 @@ async fn payment_success(
 /// publish a new replaceable kind nostr event with the status updated
 /// and update on local database the status and new event id
 pub async fn get_child_order(
+    ctx: &AppContext,
     order: Order,
     my_keys: &Keys,
 ) -> Result<(Option<Order>, Option<Event>), MostroError> {
@@ -571,11 +583,12 @@ pub async fn get_child_order(
 
         match new_max.cmp(&min_amount) {
             Ordering::Equal => {
-                let (order, event) = order_for_equal(new_max, &mut new_order, my_keys).await?;
+                let (order, event) = order_for_equal(ctx, new_max, &mut new_order, my_keys).await?;
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Greater => {
-                let (order, event) = order_for_greater(new_max, &mut new_order, my_keys).await?;
+                let (order, event) =
+                    order_for_greater(ctx, new_max, &mut new_order, my_keys).await?;
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Less => {
@@ -615,9 +628,12 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     Ok(new_order)
 }
 
-async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
-    // Arc clone db pool to safe use across threads
-    let pool = get_db_pool();
+async fn create_order_event(
+    ctx: &AppContext,
+    new_order: &mut Order,
+    my_keys: &Keys,
+) -> Result<Event, MostroError> {
+    let pool = ctx.pool();
 
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
@@ -631,7 +647,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
 
     // If user has sent the order with his identity key means that he wants to be rate so we can just
     // check if we have identity key in db - if present we have to send reputation tags otherwise no.
-    let tags = match crate::db::is_user_present(&pool, identity_pubkey).await {
+    let tags = match crate::db::is_user_present(pool, identity_pubkey).await {
         Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),
@@ -654,6 +670,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
 }
 
 async fn order_for_equal(
+    ctx: &AppContext,
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
@@ -661,19 +678,20 @@ async fn order_for_equal(
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-    let event = create_order_event(new_order, my_keys).await?;
+    let event = create_order_event(ctx, new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }
 
 async fn order_for_greater(
+    ctx: &AppContext,
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
 ) -> Result<(Order, Event), MostroError> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-    let event = create_order_event(new_order, my_keys).await?;
+    let event = create_order_event(ctx, new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }

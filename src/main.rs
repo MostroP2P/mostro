@@ -13,6 +13,7 @@ pub mod rpc;
 pub mod scheduler;
 pub mod util;
 
+use crate::app::context::AppContext;
 use crate::app::run;
 use crate::cli::settings_init;
 use crate::config::{get_db_pool, Settings, DB_POOL, LN_STATUS, NOSTR_CLIENT};
@@ -169,8 +170,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Build AppContext for scheduler and event loop
+    let ctx =
+        AppContext::from_globals().expect("Failed to build AppContext — globals not initialized");
+
     // Start scheduler for tasks
-    start_scheduler().await;
+    start_scheduler(ctx).await;
 
     // Run the Mostro and be happy!!
     run(mostro_keys, client, &mut ln_client).await

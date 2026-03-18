@@ -21,46 +21,26 @@ gpg: Good signature from "Arkanoider <github.913zc@simplelogin.com>" [ultimate]
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.16.5
-
-### 💼 Other
-
-
-* Adding instance name to "y" tags by [@sergey3bv](https://github.com/sergey3bv) in [#653](https://github.com/MostroP2P/mostro/pull/653)
+## What's Changed in 0.17.0
 
 ### 🚜 Refactor
 
 
-* refactor: complete phase-5 handler DI migration to AppContext (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#657](https://github.com/MostroP2P/mostro/pull/657)
-* refactor: wire AppContext into dispatcher and migrate cancel module (#639 phase 2) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#652](https://github.com/MostroP2P/mostro/pull/652)
-* refactor: add AppContext struct for dependency injection (#639 phase 1) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#651](https://github.com/MostroP2P/mostro/pull/651)
-* refactor: remove password infrastructure and all encryption code paths by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#647](https://github.com/MostroP2P/mostro/pull/647)
-* refactor: remove dual encrypted/unencrypted code paths in db.rs by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#646](https://github.com/MostroP2P/mostro/pull/646)
-* refactor: remove encryption from app layer and util by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#645](https://github.com/MostroP2P/mostro/pull/645)
-* refactor: add --decrypt-db CLI command for database migration by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#644](https://github.com/MostroP2P/mostro/pull/644)
-* refactor: add deprecation warning for MOSTRO_DB_PASSWORD by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#643](https://github.com/MostroP2P/mostro/pull/643)
+* refactor: remove from_globals() and construct AppContext explicitly (#656 PR F) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#672](https://github.com/MostroP2P/mostro/pull/672)
+* refactor: add keys to AppContext (#656 PR E) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#670](https://github.com/MostroP2P/mostro/pull/670)
+* refactor: migrate scheduler to AppContext (#656 PR D) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#667](https://github.com/MostroP2P/mostro/pull/667)
+* refactor: remove global accesses from handler paths (#656 PR C) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#666](https://github.com/MostroP2P/mostro/pull/666)
+* refactor: simplify dispatcher by removing pool parameter (#656 PR B) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#665](https://github.com/MostroP2P/mostro/pull/665)
+* refactor: remove legacy DI wrapper signatures (#656 PR A) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#663](https://github.com/MostroP2P/mostro/pull/663)
 
-### 🧪 Testing
+### 📚 Documentation
 
 
-* test: add phase-4 cancel unit tests using AppContext builder (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#655](https://github.com/MostroP2P/mostro/pull/655)
-* test: add phase-3 mock test context utilities for AppContext (#639) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#654](https://github.com/MostroP2P/mostro/pull/654)
-* test: add 28 mutation testing tests for db module by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#640](https://github.com/MostroP2P/mostro/pull/640)
-
-### ⚙️ Miscellaneous Tasks
-
-
-* ci: make PR mutation testing opt-in via label by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#648](https://github.com/MostroP2P/mostro/pull/648)
-
-### ◀️ Revert
-
-
-* revert: logical revert of PR #617 targeted update behavior by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#659](https://github.com/MostroP2P/mostro/pull/659)
+* docs: update architecture docs for DI migration (#656) by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#673](https://github.com/MostroP2P/mostro/pull/673)
 
 ## Contributors
-* [@sergey3bv](https://github.com/sergey3bv) made their contribution in [#653](https://github.com/MostroP2P/mostro/pull/653)
-* [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) made their contribution in [#659](https://github.com/MostroP2P/mostro/pull/659)
+* [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) made their contribution in [#673](https://github.com/MostroP2P/mostro/pull/673)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.16.4...0.16.5
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.16.5...0.17.0
 
 <!-- generated by git-cliff -->

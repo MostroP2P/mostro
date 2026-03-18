@@ -316,15 +316,6 @@ mod tests {
         }
 
         #[test]
-        fn test_encryption_logic_structure() {
-            // Test that pubkey/password vars are used; database encryption was removed.
-            let test_pubkey = create_test_keys().public_key().to_string();
-            let test_password = "test_password";
-            assert!(!test_pubkey.is_empty());
-            assert!(!test_password.is_empty());
-        }
-
-        #[test]
         fn test_fiat_amount_range_logic() {
             // Test range order amount validation logic
             let requested_amount = 100i64;

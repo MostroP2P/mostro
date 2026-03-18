@@ -324,7 +324,7 @@ fn handle_sell_child_order(
 /// Manages the creation and update of child orders in a range order sequence.
 ///
 /// This function handles the creation and setup of child orders for range orders, which are orders
-/// that can be split into multiple smaller orders. It manages the encryption of pubkeys, sets up
+/// that can be split into multiple smaller orders. It manages assignment of pubkeys, sets up
 /// trade indices, and handles notifications to the next trader in the sequence.
 ///
 /// # Arguments
@@ -347,8 +347,8 @@ fn handle_sell_child_order(
 ///
 /// 1. Determines if users are in rating mode or full privacy mode
 /// 2. Based on order type (buy/sell):
-///    - For buy orders: Sets up buyer-specific fields and encrypts buyer pubkey
-///    - For sell orders: Sets up seller-specific fields and encrypts seller pubkey
+///    - For buy orders: Sets up buyer-specific fields and assigns buyer pubkey
+///    - For sell orders: Sets up seller-specific fields and assigns seller pubkey
 /// 3. Creates a new pending child order
 /// 4. If next trade information is available:
 ///    - Enqueues a notification message to the next trader

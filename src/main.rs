@@ -16,7 +16,9 @@ pub mod util;
 use crate::app::context::AppContext;
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::{get_db_pool, Settings, DB_POOL, LN_STATUS, NOSTR_CLIENT};
+use crate::config::{
+    get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
+};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
@@ -170,15 +172,26 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Build AppContext for scheduler and event loop
-    let ctx =
-        AppContext::from_globals().expect("Failed to build AppContext — globals not initialized");
+    // Build AppContext explicitly with all dependencies
+    let settings = Arc::new(
+        MOSTRO_CONFIG
+            .get()
+            .expect("MOSTRO_CONFIG not initialized")
+            .clone(),
+    );
+    let ctx = AppContext::new(
+        get_db_pool(),
+        client.clone(),
+        settings,
+        MESSAGE_QUEUES.queue_order_msg.clone(),
+        mostro_keys.clone(),
+    );
 
     // Start scheduler for tasks
-    start_scheduler(ctx).await;
+    start_scheduler(ctx.clone()).await;
 
     // Run the Mostro and be happy!!
-    run(mostro_keys, client, &mut ln_client).await
+    run(ctx, &mut ln_client).await
 }
 
 #[cfg(test)]

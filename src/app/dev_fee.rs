@@ -75,7 +75,7 @@ use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── Public entry point ──────────────────────────────────────────────────
 
@@ -174,10 +174,12 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
     }
 
     if stale_count > 0 {
-        warn!(
-            "Reset {} stale PENDING dev fee orders (TTL: {}s)",
+        info!(
+            "Stale PENDING cleanup completed: reset {} orders (TTL: {}s)",
             stale_count, CLEANUP_TTL_SECS
         );
+    } else {
+        debug!("Stale PENDING cleanup: no stale orders found");
     }
 }
 

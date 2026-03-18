@@ -4,14 +4,12 @@ use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
-use argon2::password_hash::SaltString;
+
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use rand;
-use rand::rngs::OsRng;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
@@ -248,15 +246,6 @@ pub async fn release_action(
     Ok(())
 }
 
-/// Helper function to store encrypted pubkey with optional salt
-fn store_encrypted_pubkey(pubkey: &str, salt: Option<SaltString>) -> Result<String, MostroError> {
-    CryptoUtils::store_encrypted(pubkey, None, salt).map_err(|_| {
-        MostroInternalErr(ServiceError::EncryptionError(
-            "Error storing encrypted pubkey".to_string(),
-        ))
-    })
-}
-
 /// Helper function to handle buy order case in child order creation
 fn handle_buy_child_order(
     child_order: &mut Order,
@@ -272,15 +261,16 @@ fn handle_buy_child_order(
     child_order.buyer_pubkey = Some(next_buyer_pubkey.clone());
     child_order.trade_index_buyer = order.next_trade_index;
     child_order.creator_pubkey = next_buyer_pubkey.clone();
-
-    // Generate random salt if normal_buyer_idkey is Some
-    let salt = if normal_buyer_idkey.is_some() {
-        Some(SaltString::generate(&mut OsRng))
-    } else {
-        None
-    };
-
-    child_order.master_buyer_pubkey = Some(store_encrypted_pubkey(&next_buyer_pubkey, salt)?);
+    // if user is in full privacy mode, use the next trade key
+    // if user is in normal mode, use the master buyer pubkey
+    match normal_buyer_idkey {
+        Some(idkey) => {
+            child_order.master_buyer_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_buyer_pubkey = Some(next_buyer_pubkey);
+        }
+    }
 
     // Clear next trade fields for buy order
     child_order.next_trade_index = None;
@@ -310,18 +300,16 @@ fn handle_sell_child_order(
     child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
     child_order.trade_index_seller = Some(next_trade_index as i64);
     child_order.creator_pubkey = next_trade_pubkey.to_string();
-
-    // Generate random salt if normal_seller_idkey is Some
-    let salt = if normal_seller_idkey.is_some() {
-        Some(SaltString::generate(&mut OsRng))
-    } else {
-        None
-    };
-
-    child_order.master_seller_pubkey = Some(store_encrypted_pubkey(
-        &next_trade_pubkey.to_string(),
-        salt,
-    )?);
+    // if user is in full privacy mode, use the next trade key as master seller pubkey
+    // if user is in normal mode, use the master seller pubkey as master seller pubkey
+    match normal_seller_idkey {
+        Some(idkey) => {
+            child_order.master_seller_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+        }
+    }
 
     Ok((
         child_order.seller_pubkey.clone(),
@@ -332,7 +320,7 @@ fn handle_sell_child_order(
 /// Manages the creation and update of child orders in a range order sequence.
 ///
 /// This function handles the creation and setup of child orders for range orders, which are orders
-/// that can be split into multiple smaller orders. It manages the encryption of pubkeys, sets up
+/// that can be split into multiple smaller orders. It manages assignment of pubkeys, sets up
 /// trade indices, and handles notifications to the next trader in the sequence.
 ///
 /// # Arguments
@@ -355,8 +343,8 @@ fn handle_sell_child_order(
 ///
 /// 1. Determines if users are in rating mode or full privacy mode
 /// 2. Based on order type (buy/sell):
-///    - For buy orders: Sets up buyer-specific fields and encrypts buyer pubkey
-///    - For sell orders: Sets up seller-specific fields and encrypts seller pubkey
+///    - For buy orders: Sets up buyer-specific fields and assigns buyer pubkey
+///    - For sell orders: Sets up seller-specific fields and assigns seller pubkey
 /// 3. Creates a new pending child order
 /// 4. If next trade information is available:
 ///    - Enqueues a notification message to the next trader
@@ -375,9 +363,10 @@ async fn handle_child_order(
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    // Check if users are in rating mode or full privacy mode
+    // Check if users are in rating mode or full privacy mode - if a key is Some the user in in normal mode
+    // if a key is None the user is in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) =
-        order.is_full_privacy_order(None).map_err(|_| {
+        order.is_full_privacy_order().map_err(|_| {
             MostroInternalErr(ServiceError::UnexpectedError(
                 "Error creating order event".to_string(),
             ))
@@ -635,16 +624,16 @@ async fn create_order_event(
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey(None)
+            .get_master_seller_pubkey()
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey(None)
+            .get_master_buyer_pubkey()
             .map_err(MostroInternalErr)?,
     };
 
     // If user has sent the order with his identity key means that he wants to be rate so we can just
     // check if we have identity key in db - if present we have to send reputation tags otherwise no.
-    let tags = match crate::db::is_user_present(pool, identity_pubkey).await {
+    let tags = match crate::db::is_user_present(pool, identity_pubkey.to_string()).await {
         Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),

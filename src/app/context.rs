@@ -7,7 +7,6 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::config::settings::Settings;
-use crate::config::MESSAGE_QUEUES;
 use mostro_core::prelude::Message;
 use nostr_sdk::{Client, Keys, PublicKey};
 use sqlx::{Pool, Sqlite};
@@ -42,48 +41,6 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Build an `AppContext` from the current global state.
-    ///
-    /// This is the bridge between the old global-based architecture and the
-    /// new DI-based one. Once all handlers accept `&AppContext`, the globals
-    /// can be removed and this method replaced with explicit construction.
-    pub fn from_globals() -> Result<Self, mostro_core::prelude::MostroError> {
-        use crate::config::settings::get_db_pool;
-        use crate::config::MOSTRO_CONFIG;
-        use crate::util::get_nostr_client;
-        use mostro_core::prelude::{MostroError::MostroInternalErr, ServiceError};
-
-        let pool = get_db_pool();
-        let nostr_client = get_nostr_client()?.clone();
-        let settings = Arc::new(
-            MOSTRO_CONFIG
-                .get()
-                .ok_or_else(|| {
-                    MostroInternalErr(ServiceError::UnexpectedError(
-                        "MOSTRO_CONFIG not initialized".to_string(),
-                    ))
-                })?
-                .clone(),
-        );
-        let order_msg_queue = MESSAGE_QUEUES.queue_order_msg.clone();
-
-        // Parse keys once at startup — early error detection for invalid nsec
-        let keys = Keys::parse(&settings.nostr.nsec_privkey).map_err(|e| {
-            MostroInternalErr(ServiceError::NostrError(format!(
-                "Failed to parse nsec_privkey: {}",
-                e
-            )))
-        })?;
-
-        Ok(Self::new(
-            pool,
-            nostr_client,
-            settings,
-            order_msg_queue,
-            keys,
-        ))
-    }
-
     /// Create a new application context.
     pub fn new(
         pool: Arc<Pool<Sqlite>>,

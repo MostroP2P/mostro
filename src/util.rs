@@ -480,11 +480,7 @@ async fn prepare_new_order(
         Some(OrderKind::Sell) => {
             new_order_db.kind = OrderKind::Sell.to_string();
             new_order_db.seller_pubkey = Some(trade_pubkey.to_string());
-            new_order_db.master_seller_pubkey = Some(
-                PublicKey::from_str(&identity_pubkey.to_string())
-                    .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
-                    .to_string(),
-            );
+            new_order_db.master_seller_pubkey = Some(identity_pubkey.to_string());
             new_order_db.trade_index_seller = trade_index;
         }
         None => {
@@ -1278,13 +1274,9 @@ pub async fn notify_taker_reputation(
         false => order.master_buyer_pubkey.clone(),
     };
 
-    let user_decrypted_key = if let Some(user) = user {
-        // Get reputation data
-        PublicKey::from_str(&user)
-            .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?
-            .to_string()
-    } else {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    let user_decrypted_key = match user {
+        Some(user) => user.to_string(),
+        None => return Err(MostroCantDo(CantDoReason::InvalidPubkey)),
     };
 
     let reputation_data = match is_user_present(pool, user_decrypted_key).await {

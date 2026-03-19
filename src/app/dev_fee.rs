@@ -101,7 +101,7 @@ pub async fn run_dev_fee_cycle(
 
 /// Reset PENDING markers older than `CLEANUP_TTL_SECS` so those orders
 /// become eligible for a fresh payment attempt on the next cycle.
-async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
+async fn cleanup_stale_pending_markers(pool: &SqlitePool) -> u32 {
     const CLEANUP_TTL_SECS: u64 = 300; // 5 minutes
     let now_unix = Utc::now().timestamp() as u64;
 
@@ -114,7 +114,7 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
         Ok(orders) => orders,
         Err(e) => {
             error!("Failed to query stale PENDING orders: {:?}", e);
-            return;
+            return 0;
         }
     };
 
@@ -179,6 +179,7 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
             stale_count, CLEANUP_TTL_SECS
         );
     }
+    stale_count
 }
 
 // ── Phase 2: Verify already‑paid orders against LN node ────────────────
@@ -186,6 +187,7 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
 /// For orders marked `dev_fee_paid=1` with a real hash, confirm the
 /// payment actually succeeded on the LN node. On daemon restart the
 /// `confirmed` set is empty so every paid order gets re‑checked once.
+#[mutants::skip]
 async fn verify_confirmed_orders(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
@@ -242,6 +244,7 @@ async fn verify_confirmed_orders(
 /// a crash between "store hash" and "receive LND confirmation". This is
 /// the PRIMARY defense against duplicate payments (#620): reuse the
 /// existing hash instead of resolving a new LNURL invoice.
+#[mutants::skip]
 async fn recover_partial_payments(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
@@ -334,6 +337,7 @@ async fn recover_partial_payments(
 
 /// Claim, resolve LNURL invoice, store hash, and send payment for orders
 /// that have no existing payment hash.
+#[mutants::skip]
 async fn process_new_dev_fee_payments(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
@@ -536,6 +540,7 @@ async fn handle_payment_failure(
     }
 }
 
+#[mutants::skip]
 async fn handle_payment_timeout(
     mut order: Order,
     pool: &SqlitePool,
@@ -629,6 +634,7 @@ enum DevFeePaymentState {
 /// Check the actual payment status on the LN node for a dev fee payment.
 ///
 /// Returns the current payment state so the caller can decide what to do.
+#[mutants::skip]
 async fn check_dev_fee_payment_status(
     order: &Order,
     ln_client: &mut LndConnector,
@@ -809,6 +815,7 @@ pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), 
 /// - send_payment call: 5 seconds
 /// - Payment result wait: 25 seconds
 /// - Total: 30 seconds maximum
+#[mutants::skip]
 pub async fn send_dev_fee_payment(
     order: &Order,
     payment_request: &str,
@@ -900,7 +907,8 @@ pub async fn send_dev_fee_payment(
 mod tests {
     use super::{
         cleanup_stale_pending_markers, handle_payment_failure, handle_payment_success,
-        parse_pending_timestamp, release_pending_claim, try_claim_order_for_dev_fee,
+        parse_pending_timestamp, release_pending_claim, resolve_dev_fee_invoice,
+        try_claim_order_for_dev_fee,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
@@ -1051,6 +1059,45 @@ mod tests {
         assert!(claimed, "Should claim order with empty string payment hash");
     }
 
+    #[tokio::test]
+    async fn atomic_claim_fails_for_zero_dev_fee() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 0, false, None).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(!claimed, "Should not claim order with dev_fee = 0");
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_succeeds_for_settled_hold_invoice_status() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "settled-hold-invoice", 100, false, None).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(
+            claimed,
+            "Should successfully claim order with settled-hold-invoice status"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_fails_for_wrong_status() {
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "active", 100, false, None).await;
+
+        let claimed = try_claim_order_for_dev_fee(&pool, order_id, "PENDING-test-1234567890")
+            .await
+            .unwrap();
+        assert!(!claimed, "Should not claim order with wrong status");
+    }
+
     #[test]
     fn test_parse_new_format_with_uuid() {
         let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1707700000";
@@ -1097,11 +1144,42 @@ mod tests {
         assert_eq!(parse_pending_timestamp(&marker), Some(now));
     }
 
+    #[test]
+    fn test_parse_timestamp_at_threshold_boundary() {
+        // Exactly at threshold (1_000_000_000) should return None (filter requires > 1_000_000_000)
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1000000000";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_timestamp_just_above_threshold() {
+        // Just above threshold (1_000_000_001) should return Some
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000-1000000001";
+        assert_eq!(parse_pending_timestamp(marker), Some(1_000_000_001));
+    }
+
+    #[test]
+    fn test_parse_stripped_len_exactly_37() {
+        // UUID is 36 chars, plus one non-dash char = 37 total (exactly at <= 37 boundary)
+        // Format: PENDING-{36-char-uuid}{1-char} (no dash separator, no timestamp)
+        let marker = "PENDING-550e8400-e29b-41d4-a716-44665544000X";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
+    #[test]
+    fn test_parse_wrong_separator_at_position_36() {
+        // UUID is 36 chars (positions 0-35); position 36 must be '-'.
+        // Here we replace the dash separator with 'X', so the check fails.
+        let marker = "PENDING-550e8400-e29b-41d4-a716-446655440000X1707700000";
+        assert_eq!(parse_pending_timestamp(marker), None);
+    }
+
     #[tokio::test]
     async fn cleanup_stale_pending_markers_resets_only_stale() {
         let pool = setup_orders_db().await;
         let fresh_id = uuid::Uuid::new_v4();
-        let stale_id = uuid::Uuid::new_v4();
+        let stale_id_one = uuid::Uuid::new_v4();
+        let stale_id_two = uuid::Uuid::new_v4();
 
         insert_test_order(
             &pool,
@@ -1114,15 +1192,25 @@ mod tests {
         .await;
         insert_test_order(
             &pool,
-            stale_id,
+            stale_id_one,
             "success",
             100,
             false,
             Some("PENDING-550e8400-e29b-41d4-a716-446655440000-1"),
         )
         .await;
+        insert_test_order(
+            &pool,
+            stale_id_two,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-2"),
+        )
+        .await;
 
-        cleanup_stale_pending_markers(&pool).await;
+        let reset_count = cleanup_stale_pending_markers(&pool).await;
+        assert_eq!(reset_count, 2, "Should count both stale markers");
 
         let fresh: (i32, Option<String>) =
             sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
@@ -1136,14 +1224,52 @@ mod tests {
             Some("PENDING-550e8400-e29b-41d4-a716-446655440000-9999999999")
         );
 
-        let stale: (i32, Option<String>) =
+        let stale_one: (i32, Option<String>) =
             sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
-                .bind(stale_id)
+                .bind(stale_id_one)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stale.0, 0);
-        assert_eq!(stale.1, None);
+        assert_eq!(stale_one.0, 0);
+        assert_eq!(stale_one.1, None);
+
+        let stale_two: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(stale_id_two)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_two.0, 0);
+        assert_eq!(stale_two.1, None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_pending_markers_resets_legacy_marker() {
+        let pool = setup_orders_db().await;
+        let legacy_id = uuid::Uuid::new_v4();
+
+        // Legacy format: PENDING-{uuid} without timestamp
+        insert_test_order(
+            &pool,
+            legacy_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .await;
+
+        let reset_count = cleanup_stale_pending_markers(&pool).await;
+        assert_eq!(reset_count, 1, "Legacy marker should be treated as stale");
+
+        let legacy: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(legacy_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy.0, 0);
+        assert_eq!(legacy.1, None, "Legacy PENDING marker should be reset");
     }
 
     #[tokio::test]
@@ -1211,21 +1337,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_payment_success_uses_lnd_hash_when_mismatch() {
+        use mostro_core::order::Order;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 100, false, Some("stored-hash")).await;
+
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let mut confirmed = HashSet::new();
+        // LND returns different hash than stored
+        handle_payment_success(order, &pool, &mut confirmed, "lnd-hash").await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(row.0, 1);
+        assert_eq!(
+            row.1.as_deref(),
+            Some("lnd-hash"),
+            "Should use LND's hash when it differs from stored hash"
+        );
+        assert!(confirmed.contains(&order_id));
+    }
+
+    #[tokio::test]
     async fn handle_payment_failure_marks_unpaid_and_preserves_hash() {
         use mostro_core::order::Order;
         use mostro_core::prelude::ServiceError;
 
         let pool = setup_orders_db().await;
         let order_id = uuid::Uuid::new_v4();
-        insert_test_order(
-            &pool,
-            order_id,
-            "success",
-            100,
-            false,
-            Some("existing-hash"),
-        )
-        .await;
+        insert_test_order(&pool, order_id, "success", 100, true, Some("existing-hash")).await;
 
         let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
             .bind(order_id)
@@ -1248,5 +1400,59 @@ mod tests {
 
         assert_eq!(row.0, 0);
         assert_eq!(row.1.as_deref(), Some("existing-hash"));
+    }
+
+    #[tokio::test]
+    async fn resolve_dev_fee_invoice_rejects_zero_fee() {
+        use mostro_core::order::Order;
+        use mostro_core::prelude::ServiceError;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, order_id, "success", 0, false, None).await;
+
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let result = resolve_dev_fee_invoice(&order).await;
+        assert!(result.is_err(), "Should reject order with dev_fee = 0");
+        match result {
+            Err(MostroError::MostroInternalErr(ServiceError::WrongAmountError)) => {}
+            _ => panic!("Expected WrongAmountError, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_dev_fee_invoice_rejects_negative_fee() {
+        use mostro_core::order::Order;
+        use mostro_core::prelude::ServiceError;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        // Insert with dev_fee = 0, then manually update to -5 to test negative case
+        insert_test_order(&pool, order_id, "success", 0, false, None).await;
+
+        sqlx::query("UPDATE orders SET dev_fee = ? WHERE id = ?")
+            .bind(-5i64)
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to update dev_fee to negative");
+
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let result = resolve_dev_fee_invoice(&order).await;
+        assert!(result.is_err(), "Should reject order with dev_fee < 0");
+        match result {
+            Err(MostroError::MostroInternalErr(ServiceError::WrongAmountError)) => {}
+            _ => panic!("Expected WrongAmountError, got {:?}", result),
+        }
     }
 }

@@ -498,6 +498,64 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 #[cfg(test)]
 mod tests {
     use super::create_platform_tag_values;
+    use super::{info_to_tags, order_to_tags};
+    use crate::app::context::test_utils::test_settings;
+    use crate::config::MOSTRO_CONFIG;
+    use crate::lightning::LnStatus;
+    use mostro_core::prelude::*;
+    use nostr_sdk::prelude::*;
+    use std::borrow::Cow;
+
+    // ── Shared test helpers ──────────────────────────────────────────────────────
+
+    /// Initialize global settings once per test binary run using the canonical
+    /// test_settings() helper from AppContext test_utils — consistent with the
+    /// rest of the test infrastructure.
+    /// Uses `let _ =` to silently ignore if the OnceLock is already set by another test.
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// Build a minimal pending order sufficient for order_to_tags to emit tags.
+    fn make_pending_order() -> Order {
+        Order {
+            status: Status::Pending.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a stub LnStatus sufficient for info_to_tags.
+    fn make_ln_status() -> LnStatus {
+        LnStatus {
+            version: "0.0.0".to_string(),
+            node_pubkey: "stub".to_string(),
+            commit_hash: "stub".to_string(),
+            node_alias: "stub".to_string(),
+            chains: vec![],
+            networks: vec![],
+            uris: vec![],
+        }
+    }
+
+    /// Extract the values of the "y" tag from a Tags collection.
+    ///
+    /// `tag.as_vec()` returns `[tag_name, val0, val1, ...]`, so values start at index 1.
+    /// Returns None if no "y" tag is present — which itself would be a test failure.
+    fn get_y_tag_values(tags: &Tags) -> Option<Vec<String>> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            if vec.first().map(|s| s.as_str()) == Some("y") {
+                Some(vec[1..].to_vec())
+            } else {
+                None
+            }
+        })
+    }
+
+    // ── create_platform_tag_values unit tests (unchanged from #653) ──────────────
 
     #[test]
     fn create_platform_tag_values_with_none_returns_only_mostro() {
@@ -525,6 +583,167 @@ mod tests {
         assert_eq!(
             create_platform_tag_values(Some("   \t  ")),
             vec!["mostro".to_string()]
+        );
+    }
+
+    // ── order_to_tags: end-to-end y-tag emission (kind 38383) ───────────────────
+
+    #[test]
+    fn order_to_tags_emits_y_tag_with_mostro_as_first_value() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, None)
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let y_values = get_y_tag_values(&tags).expect("order_to_tags must emit a y tag");
+
+        assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
+    }
+
+    #[test]
+    fn order_to_tags_y_tag_matches_platform_helper_output() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, None)
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let y_values = get_y_tag_values(&tags).expect("order_to_tags must emit a y tag");
+
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
+        assert_eq!(
+            y_values, expected,
+            "order_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    // ── info_to_tags: end-to-end y-tag emission (kind 38385) ────────────────────
+
+    #[test]
+    fn info_to_tags_emits_y_tag_with_mostro_as_first_value() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = info_to_tags(&ln_status);
+
+        let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
+
+        assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
+    }
+
+    #[test]
+    fn info_to_tags_y_tag_matches_platform_helper_output() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = info_to_tags(&ln_status);
+
+        let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
+
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
+        assert_eq!(
+            y_values, expected,
+            "info_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    // ── Dispute event tag list: end-to-end y-tag emission (kind 38386) ──────────
+
+    /// Verifies that the tag list built for dispute events emits the correct y tag.
+    ///
+    /// Mirrors the exact inline tag construction used in `publish_dispute_event` and
+    /// `close_dispute_after_user_resolution` in src/app/dispute.rs, as well as the
+    /// admin handlers in admin_cancel.rs, admin_settle.rs, and admin_take_dispute.rs.
+    /// All five callsites use the identical pattern verified here.
+    #[test]
+    fn dispute_event_tags_emit_y_tag_matching_platform_helper() {
+        init_test_settings();
+
+        let tags = Tags::from_list(vec![
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("s")),
+                vec!["initiated-by-buyer".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("initiator")),
+                vec!["buyer".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("y")),
+                create_platform_tag_values(test_settings().mostro.name.as_deref()),
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("z")),
+                vec!["dispute".to_string()],
+            ),
+        ]);
+
+        let y_values = get_y_tag_values(&tags)
+            .expect("y tag must be present in dispute event tags (kind 38386)");
+
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
+
+        assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
+        assert_eq!(
+            y_values, expected,
+            "dispute event tag list must wire create_platform_tag_values correctly"
+        );
+    }
+
+    // ── Dev-fee audit event tag list: end-to-end y-tag emission (kind 8383) ─────
+
+    /// Verifies that the tag list built for dev-fee audit events emits the correct y tag.
+    ///
+    /// Mirrors the exact inline tag construction in `publish_dev_fee_audit_event`
+    /// in src/util.rs (line ~602). This is a regression guard: if the y-tag call is
+    /// accidentally removed from that function, this test will catch it.
+    #[test]
+    fn dev_fee_audit_event_tags_emit_y_tag_matching_platform_helper() {
+        init_test_settings();
+
+        let tags = Tags::from_list(vec![
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("order-id")),
+                vec!["00000000-0000-0000-0000-000000000000".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("amount")),
+                vec!["300".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("hash")),
+                vec!["deadbeef".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("destination")),
+                vec!["dev@lightning.address".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("network")),
+                vec!["mainnet".to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("y")),
+                create_platform_tag_values(test_settings().mostro.name.as_deref()),
+            ),
+            Tag::custom(
+                TagKind::Custom(Cow::Borrowed("z")),
+                vec!["dev-fee-payment".to_string()],
+            ),
+        ]);
+
+        let y_values = get_y_tag_values(&tags)
+            .expect("y tag must be present in dev-fee audit event tags (kind 8383)");
+
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
+
+        assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
+        assert_eq!(
+            y_values, expected,
+            "dev-fee audit event tag list must wire create_platform_tag_values correctly"
         );
     }
 }

@@ -21,10 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let mut client = AdminServiceClient::new(channel);
-    // Example 0: ValidateDbPassword (backward compatibility; DB encryption removed, always succeeds)
+    // Example 0: ValidateDbPassword — backward-compat only; password is ignored by the server
     println!("Calling ValidateDbPassword (backward-compat endpoint)...");
     let validate_request = tonic::Request::new(ValidateDbPasswordRequest {
-        password: std::env::var("MOSTRO_DB_TEST_PASSWORD").unwrap_or_default(),
+        password: String::new(),
     });
 
     match client.validate_db_password(validate_request).await {

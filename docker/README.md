@@ -69,14 +69,12 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-up
    ```
 
-   Or pass it inline:
+   Or set the variable on one line before `make docker-up`:
    ```sh
    MOSTRO_RELAY_LOCAL_PORT=7000 make docker-up
    ```
 
-5. **Note:** Database encryption has been removed. The `MOSTRO_DB_PASSWORD` environment variable (if set in `compose.yml`) is no longer used for the database; you can omit it. For more details about environment variables, see [ENV_VARIABLES.md](ENV_VARIABLES.md).
-
-6. Run the docker compose file:
+5. Run the docker compose file:
 
    ```sh
    make docker-up

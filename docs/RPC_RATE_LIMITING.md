@@ -2,16 +2,16 @@
 
 ## Overview
 
-The `ValidateDbPassword` RPC endpoint is protected against brute-force attacks
-with an in-memory rate limiter that tracks failed attempts per client IP.
+The `ValidateDbPassword` RPC is a **backward-compatibility** stub: the database is
+not encrypted, the `password` field is **ignored**, and the handler always returns
+success after an initial per-IP check in `validate_db_password` (`src/rpc/service.rs`).
 
-## Problem
+An in-memory rate limiter (`src/rpc/rate_limiter.rs`) runs **before** the handler
+processes the request. It can enforce backoff or lockout for a client IP when the
+limiter’s failure state is used; the current handler path records **success** only
+and does not validate passwords.
 
-The `ValidateDbPassword` endpoint is kept for backward compatibility (database
-encryption was removed, so it always succeeds). The rate limiter remains to
-throttle abuse of this endpoint.
-
-See [Issue #569](https://github.com/MostroP2P/mostro/issues/569) for full details.
+See [Issue #569](https://github.com/MostroP2P/mostro/issues/569) for background.
 
 ## Implementation
 
@@ -34,12 +34,12 @@ After a successful validation, the client's failure state is reset.
 
 ### Integration (`src/rpc/service.rs`)
 
-The `validate_db_password` method now:
+The `validate_db_password` method:
 
 1. Extracts the client's remote address from the gRPC request
-2. Checks the rate limiter — returns `RESOURCE_EXHAUSTED` if locked out
-3. Does not validate a password (database encryption was removed); always succeeds
-4. On success: resets the client's failure state
+2. Runs `check_rate_limit` — may return `RESOURCE_EXHAUSTED` if the limiter denies the IP
+3. Ignores `password` (no database encryption); returns `success: true`
+4. Calls `record_success` on the limiter for that IP
 
 ### Audit Logging
 

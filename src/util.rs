@@ -1274,12 +1274,12 @@ pub async fn notify_taker_reputation(
         false => order.master_buyer_pubkey.clone(),
     };
 
-    let user_decrypted_key = match user {
+    let master_key = match user {
         Some(user) => user.to_string(),
         None => return Err(MostroCantDo(CantDoReason::InvalidPubkey)),
     };
 
-    let reputation_data = match is_user_present(pool, user_decrypted_key).await {
+    let reputation_data = match is_user_present(pool, master_key).await {
         Ok(user) => {
             let now = Timestamp::now().as_u64();
             UserInfo {

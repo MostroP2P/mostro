@@ -499,7 +499,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 mod tests {
     use super::create_platform_tag_values;
     use super::{info_to_tags, order_to_tags};
-    use crate::config::settings::Settings;
+    use crate::app::context::test_utils::test_settings;
     use crate::config::MOSTRO_CONFIG;
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
@@ -508,17 +508,12 @@ mod tests {
 
     // ── Shared test helpers ──────────────────────────────────────────────────────
 
-    /// Initialize global settings once per test binary run.
+    /// Initialize global settings once per test binary run using the canonical
+    /// test_settings() helper from AppContext test_utils — consistent with the
+    /// rest of the test infrastructure.
     /// Uses `let _ =` to silently ignore if the OnceLock is already set by another test.
     fn init_test_settings() {
-        let _ = MOSTRO_CONFIG.set(Settings {
-            database: Default::default(),
-            nostr: Default::default(),
-            mostro: Default::default(),
-            lightning: Default::default(),
-            rpc: Default::default(),
-            expiration: Some(Default::default()),
-        });
+        let _ = MOSTRO_CONFIG.set(test_settings());
     }
 
     /// Build a minimal pending order sufficient for order_to_tags to emit tags.
@@ -618,7 +613,7 @@ mod tests {
 
         let y_values = get_y_tag_values(&tags).expect("order_to_tags must emit a y tag");
 
-        let expected = create_platform_tag_values(Settings::get_mostro().name.as_deref());
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
         assert_eq!(
             y_values, expected,
             "order_to_tags must wire create_platform_tag_values correctly into the y tag"
@@ -648,7 +643,7 @@ mod tests {
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
-        let expected = create_platform_tag_values(Settings::get_mostro().name.as_deref());
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
         assert_eq!(
             y_values, expected,
             "info_to_tags must wire create_platform_tag_values correctly into the y tag"
@@ -678,7 +673,7 @@ mod tests {
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),
-                create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+                create_platform_tag_values(test_settings().mostro.name.as_deref()),
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("z")),
@@ -689,7 +684,7 @@ mod tests {
         let y_values = get_y_tag_values(&tags)
             .expect("y tag must be present in dispute event tags (kind 38386)");
 
-        let expected = create_platform_tag_values(Settings::get_mostro().name.as_deref());
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
 
         assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
         assert_eq!(
@@ -732,7 +727,7 @@ mod tests {
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("y")),
-                create_platform_tag_values(Settings::get_mostro().name.as_deref()),
+                create_platform_tag_values(test_settings().mostro.name.as_deref()),
             ),
             Tag::custom(
                 TagKind::Custom(Cow::Borrowed("z")),
@@ -743,7 +738,7 @@ mod tests {
         let y_values = get_y_tag_values(&tags)
             .expect("y tag must be present in dev-fee audit event tags (kind 8383)");
 
-        let expected = create_platform_tag_values(Settings::get_mostro().name.as_deref());
+        let expected = create_platform_tag_values(test_settings().mostro.name.as_deref());
 
         assert_eq!(y_values[0], "mostro", "y[0] must always be 'mostro'");
         assert_eq!(

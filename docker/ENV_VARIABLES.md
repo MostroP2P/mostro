@@ -18,6 +18,8 @@ These files are copied to `docker/config/lnd/` during the build process.
   - Used in `compose.yml` for port mapping
   - Example: `export MOSTRO_RELAY_LOCAL_PORT=7000`
 
+- `MOSTRO_DB_PASSWORD`: Not used (database encryption was removed). Kept in `compose.yml` for backward compatibility; can be omitted or left empty.
+
 ## Usage Examples
 
 ### Linux/macOS

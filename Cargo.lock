@@ -902,14 +902,13 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 [[package]]
 name = "fedimint-tonic-lnd"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "374d7b804191264442b33656b9d1e2800c38f8431c64644bb0f4419f3c7be4bc"
 dependencies = [
  "hex",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "prost 0.13.5",
+ "protoc-bin-vendored",
  "rustls 0.23.35",
  "rustls-pemfile",
  "tokio",

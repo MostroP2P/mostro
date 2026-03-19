@@ -1,8 +1,0 @@
-[env]
-# Point every build script (including fedimint-tonic-lnd) at the vendored
-# protoc binary.  `relative = true` resolves the path relative to the
-# workspace root (the parent of this .cargo/ directory), so the value must
-# include the ".cargo/" prefix to reach the wrapper script.
-# `force = false` (the default) means an already-set PROTOC env var (e.g. on
-# CI with a system protoc) takes precedence.
-PROTOC = { value = ".cargo/protoc-wrapper", relative = true }

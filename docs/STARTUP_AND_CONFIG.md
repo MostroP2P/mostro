@@ -85,7 +85,8 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 **Database** (`src/config/types.rs:21-26`):
 - `url` (String): Database connection URL (Mostro uses SQLite)
-  - Example: `"sqlite://mostro.db"` or `"sqlite://~/.mostro/mostro.db"`
+  - Example (relative to the process working directory): `"sqlite://mostro.db"`
+  - Example (absolute path; use a real path — **do not** use `~`; SQLx does not expand tilde): `"sqlite:///home/youruser/.mostro/mostro.db"`
   - Default: `"sqlite://mostro.db"`
 
 **Nostr** (`src/config/types.rs:47-54`):

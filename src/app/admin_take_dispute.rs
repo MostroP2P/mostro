@@ -40,7 +40,7 @@ async fn prepare_solver_info_message(
 ) -> Result<SolverDisputeInfo, MostroError> {
     // Check if one or both users are in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) = order
-        .is_full_privacy_order(None)
+        .is_full_privacy_order()
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
     // Get pubkeys of initiator and counterpart and users data if not in full privacy mode
@@ -87,19 +87,18 @@ pub async fn pubkey_event_can_solve(
     pool: &Pool<Sqlite>,
     ev_pubkey: &PublicKey,
     status: DisputeStatus,
+    my_keys: &Keys,
 ) -> bool {
-    if let Ok(my_keys) = crate::util::get_keys() {
-        // Is mostro admin taking dispute?
-        info!(
-            "admin pubkey {} -event pubkey {} ",
-            my_keys.public_key.to_string(),
-            ev_pubkey.to_string()
-        );
-        if ev_pubkey.to_string() == my_keys.public_key().to_string()
-            && matches!(status, DisputeStatus::InProgress | DisputeStatus::Initiated)
-        {
-            return true;
-        }
+    // Is mostro admin taking dispute?
+    info!(
+        "admin pubkey {} -event pubkey {} ",
+        my_keys.public_key().to_string(),
+        ev_pubkey.to_string()
+    );
+    if ev_pubkey.to_string() == my_keys.public_key().to_string()
+        && matches!(status, DisputeStatus::InProgress | DisputeStatus::Initiated)
+    {
+        return true;
     }
 
     // Is a solver taking a dispute
@@ -127,7 +126,7 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = DisputeStatus::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.sender, dispute_status).await {
+        if !pubkey_event_can_solve(pool, &event.sender, dispute_status, mostro_keys).await {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }

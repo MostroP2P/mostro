@@ -1,5 +1,4 @@
 use crate::config::settings::Settings;
-use argon2::PasswordVerifier;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -306,143 +305,6 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         conn
     };
     Ok(Arc::new(conn))
-}
-
-// You'll need to implement these functions to store and verify the password hash
-/// Decrypt all encrypted master pubkeys in the database.
-///
-/// This is a one-time migration tool for operators moving away from full
-/// database encryption. It reads `MOSTRO_DB_PASSWORD` from the environment,
-/// verifies it against the stored admin hash, then decrypts all
-/// `master_buyer_pubkey` / `master_seller_pubkey` values.
-///
-/// The operation is transactional: all-or-nothing.
-///
-/// Returns the number of orders that were decrypted.
-pub async fn decrypt_database(pool: &SqlitePool) -> Result<u64, MostroError> {
-    let password_str = std::env::var("MOSTRO_DB_PASSWORD").map_err(|_| {
-        MostroInternalErr(ServiceError::DbAccessError(
-            "MOSTRO_DB_PASSWORD must be set to decrypt the database. \
-             Set it in your environment and try again."
-                .to_string(),
-        ))
-    })?;
-
-    if password_str.is_empty() {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
-            "MOSTRO_DB_PASSWORD must not be empty.".to_string(),
-        )));
-    }
-
-    let password = secrecy::SecretString::from(password_str);
-
-    tracing::info!("Starting database decryption migration...");
-
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    // Verify provided password against stored admin hash before mutating data
-    if let Some(argon2_hash) = get_admin_password(pool).await? {
-        let parsed_hash = argon2::PasswordHash::new(&argon2_hash)
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        if argon2::Argon2::default()
-            .verify_password(
-                secrecy::ExposeSecret::expose_secret(&password).as_bytes(),
-                &parsed_hash,
-            )
-            .is_err()
-        {
-            return Err(MostroInternalErr(ServiceError::DbAccessError(
-                "Invalid MOSTRO_DB_PASSWORD: password verification failed".to_string(),
-            )));
-        }
-    }
-
-    // Wrap password in Option to match CryptoUtils::decrypt_data signature
-    let password_opt = Some(&password);
-
-    // Fetch all orders that have master pubkeys (inside the transaction)
-    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, master_buyer_pubkey, master_seller_pubkey FROM orders \
-         WHERE master_buyer_pubkey IS NOT NULL OR master_seller_pubkey IS NOT NULL",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    tracing::info!("Found {} orders with master pubkeys to check", rows.len());
-
-    let mut decrypted_count: u64 = 0;
-
-    for (order_id, buyer_key, seller_key) in &rows {
-        let mut updated = false;
-
-        // Try to decrypt buyer key
-        let new_buyer = if let Some(key) = buyer_key {
-            match CryptoUtils::decrypt_data(key.clone(), password_opt) {
-                Ok(decrypted) if decrypted != *key => {
-                    updated = true;
-                    Some(decrypted)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        // Try to decrypt seller key
-        let new_seller = if let Some(key) = seller_key {
-            match CryptoUtils::decrypt_data(key.clone(), password_opt) {
-                Ok(decrypted) if decrypted != *key => {
-                    updated = true;
-                    Some(decrypted)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        if updated {
-            if let Some(ref buyer) = new_buyer {
-                sqlx::query("UPDATE orders SET master_buyer_pubkey = ?1 WHERE id = ?2")
-                    .bind(buyer)
-                    .bind(order_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-            }
-            if let Some(ref seller) = new_seller {
-                sqlx::query("UPDATE orders SET master_seller_pubkey = ?1 WHERE id = ?2")
-                    .bind(seller)
-                    .bind(order_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-            }
-            decrypted_count += 1;
-        }
-    }
-
-    // Clear the admin password hash (no longer needed without encryption)
-    sqlx::query("UPDATE users SET admin_password = NULL WHERE is_admin = 1")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    tracing::info!(
-        "Database decryption complete: {} orders decrypted, admin password hash cleared",
-        decrypted_count
-    );
-
-    Ok(decrypted_count)
 }
 
 /// Retrieve the stored admin password hash from the users table.
@@ -797,7 +659,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Return the public key not encrypted
+    // Return the pubkey as stored (plain)
     Ok(new_user.pubkey)
 }
 
@@ -947,6 +809,7 @@ pub async fn is_assigned_solver(
 pub async fn is_dispute_taken_by_admin(
     pool: &SqlitePool,
     order_id: Uuid,
+    admin_pubkey: &str,
 ) -> Result<bool, MostroError> {
     // Get the dispute for this order
     let dispute = sqlx::query(
@@ -963,18 +826,15 @@ pub async fn is_dispute_taken_by_admin(
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         {
             // Check if the current solver is the admin (mostro daemon)
-            if let Ok(my_keys) = crate::util::get_keys() {
-                return Ok(solver_pubkey == my_keys.public_key().to_string());
-            }
+            return Ok(solver_pubkey == admin_pubkey);
         }
     }
 
     Ok(false)
 }
 
-/// Find all orders for a user by their master key (for restore session)
-/// This function efficiently handles both encrypted and non-encrypted databases
-/// Uses constants for excluded statuses to maintain consistency across queries
+/// Find all orders for a user by their master key (for restore session).
+/// Uses constants for excluded statuses to maintain consistency across queries.
 pub async fn find_user_orders_by_master_key(
     pool: &SqlitePool,
     master_key: &str,
@@ -1055,7 +915,7 @@ pub async fn find_user_disputes_by_master_key(
     Ok(restore_disputes)
 }
 
-/// The actual work function that does the heavy decryption
+/// The actual work function that runs the restore session query.
 async fn process_restore_session_work(
     pool: SqlitePool,
     master_key: String,
@@ -1103,7 +963,7 @@ impl RestoreSessionManager {
     ) -> Result<(), MostroError> {
         let sender = self.sender.clone();
 
-        // Use spawn_blocking for CPU-intensive decryption work
+        // Use spawn_blocking to avoid blocking the async runtime
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             match handle.block_on(process_restore_session_work(pool, master_key)) {
@@ -1139,16 +999,11 @@ impl RestoreSessionManager {
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
-    use argon2::password_hash::SaltString;
-    use mostro_core::prelude::*;
-    use secrecy::SecretString;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use sqlx::Error;
-    use std::collections::HashSet; // Import HashSet for the test
-    use tokio::time::Instant; // Use sqlx::Error for the Result return type
+    use std::collections::HashSet;
 
-    const TEST_DB_URL: &str = "sqlite::memory:"; // In-memory database for tests
-    const SECRET_PASSWORD: &str = "test_password"; // Example password for encryption
+    const TEST_DB_URL: &str = "sqlite::memory:";
 
     // Helper function to set up the database and pool
     async fn setup_db() -> Result<SqlitePool, Error> {
@@ -1268,69 +1123,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_string_column_scalar() {
-        // 1. Setup: Create in-memory DB and table
         let pool = setup_db().await.unwrap();
-        println!("In-memory database and table created for test.");
 
-        // 2. Populate: Insert 100 entries
         let total_entries = 20;
-
-        // Use a SecretString for the password
-        let password = SecretString::from(SECRET_PASSWORD);
-        let mut salt_vec: Vec<SaltString> = vec![];
-        let salt_base = b"1H/aaYsf8&asduA";
-        for i in 0..total_entries {
-            let salt = format!("{}{}", String::from_utf8_lossy(salt_base), i % 5);
-            salt_vec.push(SaltString::encode_b64(salt.as_bytes()).unwrap());
-        }
-
-        println!("Inserting {} entries...", total_entries);
-        // Prepare batch values
         let mut query_builder = String::from("INSERT INTO items (id, value) VALUES ");
-        let mut params = Vec::new();
+        let mut params: Vec<String> = Vec::new();
 
         for i in 0..total_entries {
             let value_string = format!("Entry {}", i % 5);
-            println!("Inserting value : {:?}", value_string);
-            let salt = salt_vec[i % 5].clone();
-            let encrypted_value =
-                CryptoUtils::store_encrypted(&value_string, Some(&password), Some(salt)).unwrap();
-
             if i > 0 {
                 query_builder.push_str(", ");
             }
             query_builder.push_str(&format!("({}, ?)", i));
-            params.push(encrypted_value);
+            params.push(value_string);
         }
 
-        // Execute batch insert
         let mut query = sqlx::query(&query_builder);
-        for param in params {
+        for param in &params {
             query = query.bind(param);
         }
         query.execute(&pool).await.unwrap();
-        println!("Entries inserted.");
 
-        // 3. Fetch: Get the 'value' column using query_scalar
-        println!("Fetching 'value' column...");
-        let sql = "SELECT value FROM items ORDER BY id"; // Order to make assertion predictable
+        let sql = "SELECT value FROM items ORDER BY id";
+        let fetched_values: Vec<String> = sqlx::query_scalar(sql).fetch_all(&pool).await.unwrap();
 
-        let fetched_values: Vec<String> = sqlx::query_scalar(sql)
-            .fetch_all(&pool) // Fetch all results into Vec<String>
-            .await
-            .unwrap();
-
-        let mut hash_set_values: HashSet<String> = HashSet::new();
-        for value in fetched_values {
-            let interval = Instant::now();
-            let value_decrypted = CryptoUtils::decrypt_data(value, Some(&password)).unwrap();
-            println!(
-                "Time taken to decrypt: {:?} ms",
-                interval.elapsed().as_millis()
-            ); // Print elapsed time
-            hash_set_values.insert(value_decrypted);
-        }
-
+        let hash_set_values: HashSet<String> = fetched_values.into_iter().collect();
         assert!(
             hash_set_values.contains("Entry 0"),
             "Should contain Entry 0"

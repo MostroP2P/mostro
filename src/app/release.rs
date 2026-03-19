@@ -1,23 +1,16 @@
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
-use crate::config;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
-use crate::util::{
-    enqueue_order_msg, get_keys, get_order, settle_seller_hold_invoice, update_order_event,
-};
-use sqlx::{Pool, Sqlite};
+use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
 
-use argon2::password_hash::SaltString;
-use config::settings::*;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
-use rand;
-use rand::rngs::OsRng;
+use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -26,16 +19,16 @@ use tracing::info;
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
+    ctx: &AppContext,
     order: &Order,
     request_id: Option<u64>,
 ) -> Result<Order, MostroError> {
     let mut order = order.clone();
 
-    // Arc clone of db pool to use across threads
-    let pool = get_db_pool();
+    let pool = ctx.pool();
 
     // Get max number of retries
-    let ln_settings = Settings::get_ln();
+    let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
 
     let is_first_failure = order.payment_attempts == 0;
@@ -95,7 +88,7 @@ pub async fn check_failure_retries(
 
     order
         .clone()
-        .update(&pool)
+        .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(order)
@@ -213,12 +206,13 @@ pub async fn release_action(
     .await;
 
     // Handle child order for range orders
-    if let Ok((Some(child_order), Some(event))) = get_child_order(order.clone(), my_keys).await {
+    if let Ok((Some(child_order), Some(event))) = get_child_order(ctx, order.clone(), my_keys).await
+    {
         let client = ctx.nostr_client();
         if client.send_event(&event).await.is_err() {
             tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
         }
-        handle_child_order(child_order, &order, next_trade, pool, request_id)
+        handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
@@ -247,18 +241,9 @@ pub async fn release_action(
     .await;
 
     // Finally we try to pay buyer's invoice
-    let _ = do_payment(order, request_id).await;
+    let _ = do_payment(ctx, order, request_id).await;
 
     Ok(())
-}
-
-/// Helper function to store encrypted pubkey with optional salt
-fn store_encrypted_pubkey(pubkey: &str, salt: Option<SaltString>) -> Result<String, MostroError> {
-    CryptoUtils::store_encrypted(pubkey, None, salt).map_err(|_| {
-        MostroInternalErr(ServiceError::EncryptionError(
-            "Error storing encrypted pubkey".to_string(),
-        ))
-    })
 }
 
 /// Helper function to handle buy order case in child order creation
@@ -276,15 +261,16 @@ fn handle_buy_child_order(
     child_order.buyer_pubkey = Some(next_buyer_pubkey.clone());
     child_order.trade_index_buyer = order.next_trade_index;
     child_order.creator_pubkey = next_buyer_pubkey.clone();
-
-    // Generate random salt if normal_buyer_idkey is Some
-    let salt = if normal_buyer_idkey.is_some() {
-        Some(SaltString::generate(&mut OsRng))
-    } else {
-        None
-    };
-
-    child_order.master_buyer_pubkey = Some(store_encrypted_pubkey(&next_buyer_pubkey, salt)?);
+    // if user is in full privacy mode, use the next trade key
+    // if user is in normal mode, use the master buyer pubkey
+    match normal_buyer_idkey {
+        Some(idkey) => {
+            child_order.master_buyer_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_buyer_pubkey = Some(next_buyer_pubkey);
+        }
+    }
 
     // Clear next trade fields for buy order
     child_order.next_trade_index = None;
@@ -314,18 +300,16 @@ fn handle_sell_child_order(
     child_order.seller_pubkey = Some(next_trade_pubkey.to_string());
     child_order.trade_index_seller = Some(next_trade_index as i64);
     child_order.creator_pubkey = next_trade_pubkey.to_string();
-
-    // Generate random salt if normal_seller_idkey is Some
-    let salt = if normal_seller_idkey.is_some() {
-        Some(SaltString::generate(&mut OsRng))
-    } else {
-        None
-    };
-
-    child_order.master_seller_pubkey = Some(store_encrypted_pubkey(
-        &next_trade_pubkey.to_string(),
-        salt,
-    )?);
+    // if user is in full privacy mode, use the next trade key as master seller pubkey
+    // if user is in normal mode, use the master seller pubkey as master seller pubkey
+    match normal_seller_idkey {
+        Some(idkey) => {
+            child_order.master_seller_pubkey = Some(idkey);
+        }
+        None => {
+            child_order.master_seller_pubkey = Some(next_trade_pubkey.to_string());
+        }
+    }
 
     Ok((
         child_order.seller_pubkey.clone(),
@@ -336,7 +320,7 @@ fn handle_sell_child_order(
 /// Manages the creation and update of child orders in a range order sequence.
 ///
 /// This function handles the creation and setup of child orders for range orders, which are orders
-/// that can be split into multiple smaller orders. It manages the encryption of pubkeys, sets up
+/// that can be split into multiple smaller orders. It manages assignment of pubkeys, sets up
 /// trade indices, and handles notifications to the next trader in the sequence.
 ///
 /// # Arguments
@@ -359,8 +343,8 @@ fn handle_sell_child_order(
 ///
 /// 1. Determines if users are in rating mode or full privacy mode
 /// 2. Based on order type (buy/sell):
-///    - For buy orders: Sets up buyer-specific fields and encrypts buyer pubkey
-///    - For sell orders: Sets up seller-specific fields and encrypts seller pubkey
+///    - For buy orders: Sets up buyer-specific fields and assigns buyer pubkey
+///    - For sell orders: Sets up seller-specific fields and assigns seller pubkey
 /// 3. Creates a new pending child order
 /// 4. If next trade information is available:
 ///    - Enqueues a notification message to the next trader
@@ -379,9 +363,10 @@ async fn handle_child_order(
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    // Check if users are in rating mode or full privacy mode
+    // Check if users are in rating mode or full privacy mode - if a key is Some the user in in normal mode
+    // if a key is None the user is in full privacy mode
     let (normal_buyer_idkey, normal_seller_idkey) =
-        order.is_full_privacy_order(None).map_err(|_| {
+        order.is_full_privacy_order().map_err(|_| {
             MostroInternalErr(ServiceError::UnexpectedError(
                 "Error creating order event".to_string(),
             ))
@@ -432,7 +417,11 @@ async fn handle_child_order(
     Ok(())
 }
 
-pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(), MostroError> {
+pub async fn do_payment(
+    ctx: &AppContext,
+    mut order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
         _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
@@ -458,7 +447,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(&order, request_id).await {
+        if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
             info!(
                 "Order id {} has {} failed payments retries",
                 failed_payment.id, failed_payment.payment_attempts
@@ -466,12 +455,14 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
         }
     }
 
-    // Get Mostro keys
-    let my_keys =
-        get_keys().map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // Get Mostro keys from context
+    let my_keys = ctx.keys().clone();
 
     // Get buyer and seller pubkeys
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+
+    // Clone ctx for the async closure
+    let ctx = ctx.clone();
 
     let payment = {
         async move {
@@ -485,8 +476,14 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ = payment_success(&mut order, buyer_pubkey, &my_keys, request_id)
-                                .await;
+                            let _ = payment_success(
+                                &ctx,
+                                &mut order,
+                                buyer_pubkey,
+                                &my_keys,
+                                request_id,
+                            )
+                            .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -496,7 +493,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
 
                             // Mark payment as failed
                             if let Ok(failed_payment) =
-                                check_failure_retries(&order, request_id).await
+                                check_failure_retries(&ctx, &order, request_id).await
                             {
                                 info!(
                                     "Order id {} has {} failed payments retries",
@@ -515,6 +512,7 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<(),
 }
 
 async fn payment_success(
+    ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
@@ -531,13 +529,12 @@ async fn payment_success(
     )
     .await;
 
-    // Arc clone of db pool to use across threads
-    let pool = get_db_pool();
+    let pool = ctx.pool();
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
         order_updated
             .clone()
-            .update(&pool)
+            .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // Send dm to buyer to rate counterpart
@@ -559,6 +556,7 @@ async fn payment_success(
 /// publish a new replaceable kind nostr event with the status updated
 /// and update on local database the status and new event id
 pub async fn get_child_order(
+    ctx: &AppContext,
     order: Order,
     my_keys: &Keys,
 ) -> Result<(Option<Order>, Option<Event>), MostroError> {
@@ -571,11 +569,12 @@ pub async fn get_child_order(
 
         match new_max.cmp(&min_amount) {
             Ordering::Equal => {
-                let (order, event) = order_for_equal(new_max, &mut new_order, my_keys).await?;
+                let (order, event) = order_for_equal(ctx, new_max, &mut new_order, my_keys).await?;
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Greater => {
-                let (order, event) = order_for_greater(new_max, &mut new_order, my_keys).await?;
+                let (order, event) =
+                    order_for_greater(ctx, new_max, &mut new_order, my_keys).await?;
                 return Ok((Some(order), Some(event)));
             }
             Ordering::Less => {
@@ -615,23 +614,26 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     Ok(new_order)
 }
 
-async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Event, MostroError> {
-    // Arc clone db pool to safe use across threads
-    let pool = get_db_pool();
+async fn create_order_event(
+    ctx: &AppContext,
+    new_order: &mut Order,
+    my_keys: &Keys,
+) -> Result<Event, MostroError> {
+    let pool = ctx.pool();
 
     // Extract user for rating tag
     let identity_pubkey = match new_order.is_sell_order() {
         Ok(_) => new_order
-            .get_master_seller_pubkey(None)
+            .get_master_seller_pubkey()
             .map_err(MostroInternalErr)?,
         Err(_) => new_order
-            .get_master_buyer_pubkey(None)
+            .get_master_buyer_pubkey()
             .map_err(MostroInternalErr)?,
     };
 
     // If user has sent the order with his identity key means that he wants to be rate so we can just
     // check if we have identity key in db - if present we have to send reputation tags otherwise no.
-    let tags = match crate::db::is_user_present(&pool, identity_pubkey).await {
+    let tags = match crate::db::is_user_present(pool, identity_pubkey.to_string()).await {
         Ok(user) => order_to_tags(
             new_order,
             Some((user.total_rating, user.total_reviews, user.created_at)),
@@ -654,6 +656,7 @@ async fn create_order_event(new_order: &mut Order, my_keys: &Keys) -> Result<Eve
 }
 
 async fn order_for_equal(
+    ctx: &AppContext,
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
@@ -661,19 +664,20 @@ async fn order_for_equal(
     new_order.fiat_amount = new_max;
     new_order.max_amount = None;
     new_order.min_amount = None;
-    let event = create_order_event(new_order, my_keys).await?;
+    let event = create_order_event(ctx, new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }
 
 async fn order_for_greater(
+    ctx: &AppContext,
     new_max: i64,
     new_order: &mut Order,
     my_keys: &Keys,
 ) -> Result<(Order, Event), MostroError> {
     new_order.max_amount = Some(new_max);
     new_order.fiat_amount = 0;
-    let event = create_order_event(new_order, my_keys).await?;
+    let event = create_order_event(ctx, new_order, my_keys).await?;
 
     Ok((new_order.clone(), event))
 }

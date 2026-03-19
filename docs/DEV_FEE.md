@@ -849,11 +849,11 @@ The actual implementation in `src/scheduler.rs::job_process_dev_fee_payment()` i
 ```rust
 /// Process unpaid development fees for successful orders
 /// Called every 60 seconds by scheduler
-async fn job_process_dev_fee_payment() {
-    let pool = get_db_pool();
+async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64; // Every 60 seconds
 
     tokio::spawn(async move {
+        let pool = ctx.pool(); // Get pool from AppContext
         loop {
             info!("Checking for unpaid development fees");
 

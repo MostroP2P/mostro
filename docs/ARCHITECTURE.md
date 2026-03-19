@@ -36,10 +36,11 @@ flowchart LR
   CFG --> DB
 ```
 
-- Entry: `src/main.rs` initializes settings, DB, Nostr, LND, RPC, scheduler, then calls `app::run`.
+- Entry: `src/main.rs` initializes settings, DB, Nostr, LND, RPC, builds `AppContext`, starts scheduler, then calls `app::run`.
 - Routing: `src/app.rs` unwraps Nostr GiftWrap events, verifies POW/signature/timestamp, parses `mostro_core::Message`, and dispatches to `src/app/*`.
 - Lightning: `src/lightning/mod.rs` provides hold invoices, settle/cancel, and outgoing payments.
 - RPC: `src/rpc/server.rs` serves admin operations when enabled.
+- DI Context: `src/app/context.rs` provides `AppContext` for dependency injection across handlers and scheduler.
 
 ## Action Modules (src/app/*)
 
@@ -72,6 +73,47 @@ New file containing development fee constants:
 
 Referenced by fee calculation logic in order processing.
 
+## Dependency Injection (AppContext)
+
+**File**: `src/app/context.rs`
+
+`AppContext` is the central dependency container passed to all handlers and scheduler jobs. It replaces direct access to global state, enabling better testability and explicit dependencies.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pool` | `Arc<Pool<Sqlite>>` | Database connection pool |
+| `nostr_client` | `Client` | Nostr client for publishing events |
+| `settings` | `Arc<Settings>` | Application configuration |
+| `order_msg_queue` | `OrderMsgQueue` | Shared queue for outbound messages |
+| `keys` | `Keys` | Mostro's Nostr signing keys |
+
+### Accessors
+
+- `ctx.pool()` → `&Pool<Sqlite>`
+- `ctx.nostr_client()` → `&Client`
+- `ctx.settings()` → `&Settings`
+- `ctx.keys()` → `&Keys`
+- `ctx.order_msg_queue()` → `&OrderMsgQueue`
+
+### Construction
+
+`AppContext` is constructed once in `main.rs` and passed to:
+1. `scheduler::start_scheduler(ctx)` — for background jobs
+2. `app::run(ctx, ln_client)` — for the main event loop
+
+### Testing
+
+Use `TestContextBuilder` for unit tests:
+
+```rust
+let ctx = TestContextBuilder::new()
+    .with_pool(test_pool)
+    .with_settings(test_settings())
+    .build();
+```
+
 ## Startup Sequence
 
 ```mermaid
@@ -94,7 +136,9 @@ sequenceDiagram
   alt RPC enabled
     M->>RPC: start(keys, pool, ln)
   end
-  M->>APP: run(keys, client, ln)
+  M->>M: Build AppContext(pool, client, settings, queue, keys)
+  M->>SCHED: start_scheduler(ctx)
+  M->>APP: run(ctx, ln)
 ```
 
 ## Event Intake & Routing

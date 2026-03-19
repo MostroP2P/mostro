@@ -7,9 +7,8 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::config::settings::Settings;
-use crate::config::MESSAGE_QUEUES;
 use mostro_core::prelude::Message;
-use nostr_sdk::{Client, PublicKey};
+use nostr_sdk::{Client, Keys, PublicKey};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -38,49 +37,24 @@ pub struct AppContext {
     nostr_client: Client,
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
+    keys: Keys,
 }
 
 impl AppContext {
-    /// Build an `AppContext` from the current global state.
-    ///
-    /// This is the bridge between the old global-based architecture and the
-    /// new DI-based one. Once all handlers accept `&AppContext`, the globals
-    /// can be removed and this method replaced with explicit construction.
-    pub fn from_globals() -> Result<Self, mostro_core::prelude::MostroError> {
-        use crate::config::settings::get_db_pool;
-        use crate::config::MOSTRO_CONFIG;
-        use crate::util::get_nostr_client;
-        use mostro_core::prelude::{MostroError::MostroInternalErr, ServiceError};
-
-        let pool = get_db_pool();
-        let nostr_client = get_nostr_client()?.clone();
-        let settings = Arc::new(
-            MOSTRO_CONFIG
-                .get()
-                .ok_or_else(|| {
-                    MostroInternalErr(ServiceError::UnexpectedError(
-                        "MOSTRO_CONFIG not initialized".to_string(),
-                    ))
-                })?
-                .clone(),
-        );
-        let order_msg_queue = MESSAGE_QUEUES.queue_order_msg.clone();
-
-        Ok(Self::new(pool, nostr_client, settings, order_msg_queue))
-    }
-
     /// Create a new application context.
     pub fn new(
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Client,
         settings: Arc<Settings>,
         order_msg_queue: OrderMsgQueue,
+        keys: Keys,
     ) -> Self {
         Self {
             pool,
             nostr_client,
             settings,
             order_msg_queue,
+            keys,
         }
     }
 
@@ -107,6 +81,14 @@ impl AppContext {
     /// Shared queue for outbound order messages.
     pub fn order_msg_queue(&self) -> &OrderMsgQueue {
         &self.order_msg_queue
+    }
+
+    /// Mostro's Nostr signing keys.
+    ///
+    /// Parsed once at startup from `settings.nostr.nsec_privkey`.
+    /// Use this instead of `get_keys()` to avoid re-parsing on every call.
+    pub fn keys(&self) -> &Keys {
+        &self.keys
     }
 }
 
@@ -170,6 +152,7 @@ pub mod test_utils {
         settings: Option<Arc<Settings>>,
         order_msg_queue: Option<OrderMsgQueue>,
         mock_order_msg_queue: Option<MockOrderMsgQueue>,
+        keys: Option<Keys>,
     }
 
     impl TestContextBuilder {
@@ -180,6 +163,7 @@ pub mod test_utils {
                 settings: None,
                 order_msg_queue: None,
                 mock_order_msg_queue: None,
+                keys: None,
             }
         }
 
@@ -215,6 +199,12 @@ pub mod test_utils {
             self
         }
 
+        /// Use specific keys for tests.
+        pub fn with_keys(mut self, keys: Keys) -> Self {
+            self.keys = Some(keys);
+            self
+        }
+
         /// Build the test context.
         ///
         /// This is synchronous: callers must provide dependencies explicitly.
@@ -238,7 +228,13 @@ pub mod test_utils {
                 .order_msg_queue
                 .unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
 
-            AppContext::new(pool, nostr_client, settings, order_msg_queue)
+            // Use provided keys or parse from settings
+            let keys = self.keys.unwrap_or_else(|| {
+                Keys::parse(&settings.nostr.nsec_privkey)
+                    .expect("TestContextBuilder: invalid nsec_privkey in settings")
+            });
+
+            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
         }
 
         /// Build context plus mock handles used for assertions.

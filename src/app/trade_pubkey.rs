@@ -25,13 +25,13 @@ pub async fn trade_pubkey_action(
     // Get master keys (already plaintext after phase-3/4 encryption migration)
     let (master_buyer_key, master_seller_key) = if order.master_buyer_pubkey.is_some() {
         let master_buyer_key = order
-            .get_master_buyer_pubkey(None)
+            .get_master_buyer_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
         (Some(master_buyer_key), None)
     } else {
         let master_seller_key = order
-            .get_master_seller_pubkey(None)
+            .get_master_seller_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
         (None, Some(master_seller_key))

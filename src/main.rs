@@ -13,9 +13,12 @@ pub mod rpc;
 pub mod scheduler;
 pub mod util;
 
+use crate::app::context::AppContext;
 use crate::app::run;
 use crate::cli::settings_init;
-use crate::config::{get_db_pool, Settings, DB_POOL, LN_STATUS, NOSTR_CLIENT};
+use crate::config::{
+    get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
+};
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
@@ -48,30 +51,13 @@ async fn main() -> Result<()> {
         .init();
 
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    let decrypt_db_requested = settings_init()?;
+    settings_init()?;
 
     // Connect to database
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
         exit(1);
     };
-
-    // Handle --decrypt-db command
-    if decrypt_db_requested {
-        match db::decrypt_database(&get_db_pool()).await {
-            Ok(count) => {
-                tracing::info!(
-                    "Successfully decrypted {count} orders. \
-                     You can now remove MOSTRO_DB_PASSWORD from your environment."
-                );
-                exit(0);
-            }
-            Err(e) => {
-                tracing::error!("Failed to decrypt database: {e}");
-                exit(1);
-            }
-        }
-    }
 
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
@@ -169,11 +155,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Build AppContext explicitly with all dependencies
+    let settings = Arc::new(
+        MOSTRO_CONFIG
+            .get()
+            .expect("MOSTRO_CONFIG not initialized")
+            .clone(),
+    );
+    let ctx = AppContext::new(
+        get_db_pool(),
+        client.clone(),
+        settings,
+        MESSAGE_QUEUES.queue_order_msg.clone(),
+        mostro_keys.clone(),
+    );
+
     // Start scheduler for tasks
-    start_scheduler().await;
+    start_scheduler(ctx.clone()).await;
 
     // Run the Mostro and be happy!!
-    run(mostro_keys, client, &mut ln_client).await
+    run(ctx, &mut ln_client).await
 }
 
 #[cfg(test)]

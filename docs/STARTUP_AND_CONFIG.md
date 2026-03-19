@@ -43,28 +43,24 @@ Before settings initialization, the daemon performs:
 
 ### Database Connection (db::connect)
 
-**Source**: `src/db.rs:480`
+**Source**: `src/db.rs`, function `connect()`.
 
-**Complex initialization process**:
+**Initialization**:
 
 1. **New database creation**:
    - Detects if database file exists
    - If new: runs all migrations from `migrations/` directory
    - Creates tables, indexes, and schema
 
-2. **Password encryption handling**:
-   - Checks if database is encrypted
-   - If encrypted: prompts for password interactively
-   - Validates password against stored hash
-   - Stores decrypted password in `config::MOSTRO_DB_PASSWORD`
-
-3. **Legacy migrations**:
+2. **Legacy migrations**:
    - Performs column migrations for backwards compatibility
    - Example: disputes table structure updates
 
-4. **Connection pooling**:
+3. **Connection pooling**:
    - Creates `SqlitePool` with configured connection limits
    - Stores in global `config::DB_POOL`
+
+**Note:** Database encryption has been removed; no password is used for the database.
 
 **Error handling**: Database connection errors halt startup
 
@@ -77,9 +73,9 @@ Before settings initialization, the daemon performs:
 5) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
 6) Held invoices: `db::find_held_invoices()` → resubscribe via `util::invoice_subscribe`.
 7) RPC: start if `rpc.enabled`.
-8) Scheduler: `scheduler::start_scheduler()`.
-9) Scheduler jobs: Payment retry job configured with `payment_retries_interval`.
-10) Event loop: `app::run(keys, client, ln_client)`.
+8) AppContext: Build `AppContext` with pool, client, settings, message queue, and keys.
+9) Scheduler: `scheduler::start_scheduler(ctx)` — receives `AppContext` for dependency injection.
+10) Event loop: `app::run(ctx, ln_client)` — receives `AppContext` instead of individual dependencies.
 
 ## Settings Structure
 
@@ -163,7 +159,7 @@ pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
 
-// Security
+// Security (MOSTRO_DB_PASSWORD unused; database encryption was removed)
 pub static MOSTRO_DB_PASSWORD: OnceLock<String> = OnceLock::new();
 
 // Message routing

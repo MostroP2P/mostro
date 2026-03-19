@@ -29,67 +29,84 @@ port = 50051
 The RPC interface supports the following admin operations:
 
 ### 1. Cancel Order
+
 Cancel an order as an admin.
 
 **Request:**
+
 - `order_id`: UUID of the order to cancel
 - `request_id`: Optional request identifier
 
 **Response:**
+
 - `success`: Boolean indicating operation success
 - `error_message`: Optional error message if operation failed
 
 ### 2. Settle Order
+
 Settle a disputed order as an admin.
 
 **Request:**
+
 - `order_id`: UUID of the order to settle
 - `request_id`: Optional request identifier
 
 **Response:**
+
 - `success`: Boolean indicating operation success
 - `error_message`: Optional error message if operation failed
 
 ### 3. Add Solver
+
 Add a new dispute solver.
 
 **Request:**
+
 - `solver_pubkey`: Public key of the solver to add (in bech32 format)
 - `request_id`: Optional request identifier
 
 **Response:**
+
 - `success`: Boolean indicating operation success
 - `error_message`: Optional error message if operation failed
 
 ### 4. Take Dispute
+
 Take a dispute for resolution.
 
 **Request:**
+
 - `dispute_id`: UUID of the dispute to take
 - `request_id`: Optional request identifier
 
 **Response:**
+
 - `success`: Boolean indicating operation success
 - `error_message`: Optional error message if operation failed
 
 ### 5. Validate Database Password
-Kept for backward compatibility. Database encryption has been removed; this RPC always succeeds and does not validate a password.
+
+Kept for backward compatibility with older clients. The SQLite database is **not** encrypted and this RPC does **not** validate any password; it always succeeds.
 
 **Request:**
-- `password`: Ignored
-- `request_id`: Optional request identifier
+
+- `password`: Ignored (kept in the protobuf for compatibility only)
 
 **Response:**
+
 - `success`: Always `true`
 - `error_message`: Always `None`
 
 ### 6. Get Version
+
 Retrieve the Mostro daemon version.
 
 **Request:**
+
 - No parameters required
 
 **Response:**
+
 - `version`: String containing the daemon version (from CARGO_PKG_VERSION)
 
 ## Protocol Details

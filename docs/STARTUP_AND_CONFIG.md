@@ -9,9 +9,7 @@ This guide explains Mostro’s boot sequence and configuration surfaces.
 
 ## Pre-Boot Initialization
 
-**Lines 33-48 in src/main.rs**:
-
-Before settings initialization, the daemon performs:
+Before settings initialization, the daemon performs (see `src/main.rs`):
 
 1. **Screen clearing**: Clears terminal for clean output
 2. **Logging setup**:
@@ -86,8 +84,9 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 ### Configuration Sections:
 
 **Database** (`src/config/types.rs:21-26`):
-- `url` (String): Database connection URL
-  - Example: `"sqlite://mostro.db"` or `"postgres://user:pass@localhost/dbname"`
+- `url` (String): Database connection URL (Mostro uses SQLite)
+  - Example (relative to the process working directory): `"sqlite://mostro.db"`
+  - Example (absolute path; use a real path — **do not** use `~`; SQLx does not expand tilde): `"sqlite:///home/youruser/.mostro/mostro.db"`
   - Default: `"sqlite://mostro.db"`
 
 **Nostr** (`src/config/types.rs:47-54`):
@@ -148,24 +147,21 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 ## Global Variables
 
-**Source**: `src/config/mod.rs:26-48`
+**Source**: `src/config/mod.rs`
 
 ```rust
-// Settings and configuration
 pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
-
-// Infrastructure connections
 pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
 
-// Security (MOSTRO_DB_PASSWORD unused; database encryption was removed)
-pub static MOSTRO_DB_PASSWORD: OnceLock<String> = OnceLock::new();
-
-// Message routing
-pub static MESSAGE_QUEUES: LazyLock<Arc<Mutex<HashMap<String, VecDeque<String>>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+pub static MESSAGE_QUEUES: LazyLock<MessageQueues> =
+    LazyLock::new(MessageQueues::default);
 ```
+
+(`MessageQueues` holds `Arc<RwLock<…>>` queues for order DMs, cant-do messages, rating events, and restore-session messages.)
+
+There is **no** database password or separate global for SQLite; the daemon opens the file URL from `[database]` in `settings.toml` only.
 
 **Access patterns**:
 - `Settings::get_mostro()` → Mostro settings

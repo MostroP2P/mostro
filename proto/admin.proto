@@ -16,7 +16,7 @@ service AdminService {
   // Take a dispute for resolution
   rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
 
-  // Validate database password (kept for backward compatibility; DB encryption removed)
+  // Backward compatibility only: password is ignored; SQLite is not encrypted
   rpc ValidateDbPassword(ValidateDbPasswordRequest) returns (ValidateDbPasswordResponse);
 
   // Get Mostro version
@@ -71,7 +71,7 @@ message TakeDisputeResponse {
   optional string error_message = 2;
 }
 
-// Validate database password (backward compatibility; no longer used for DB encryption)
+// Backward compatibility: `password` is ignored (no DB encryption)
 message ValidateDbPasswordRequest {
   string password = 1;
 }

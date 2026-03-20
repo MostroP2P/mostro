@@ -1,6 +1,6 @@
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
-use crate::util::get_expiration_timestamp_for_kind;
+use crate::util::{get_expiration_timestamp_for_kind, get_keys};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
 use nostr::event::builder::Error;
@@ -237,16 +237,25 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
 /// includes:
 /// - Order ID
 /// - List of relays where the event can be found
+/// - Mostro daemon's pubkey (so clients can identify the instance)
 ///
-/// The resulting reference uses a custom format: `mostro:{order_id}?{relay1,relay2,...}`
+/// The resulting reference uses a custom format:
+/// `mostro:{order_id}?relays={relay1,relay2,...}&mostro={pubkey}`
 ///
 fn create_source_tag(
     order: &Order,
     mostro_relays: &[String],
+    mostro_pubkey: &str,
 ) -> Result<Option<String>, MostroError> {
     if order.status == Status::Pending.to_string() {
         // Create a mostro: custom source reference for pending orders
-        let custom_ref = format!("mostro:{}?relays={}", order.id, mostro_relays.join(","));
+        // Include the Mostro pubkey so clients can identify the instance
+        let custom_ref = format!(
+            "mostro:{}?relays={}&mostro={}",
+            order.id,
+            mostro_relays.join(","),
+            mostro_pubkey
+        );
 
         Ok(Some(custom_ref))
     } else {
@@ -291,7 +300,7 @@ fn create_source_tag(
 /// - `y`: "mostro" platform identifier, plus optional Mostro instance name from settings
 /// - `z`: Always "order" (event type)
 /// - `rating`: User reputation data (if available)
-/// - `source`: mostro: scheme link to pending orders (`mostro:{order_id}?{relay1,relay2,...}`)
+/// - `source`: mostro: scheme link to pending orders (`mostro:{order_id}?relays={...}&mostro={pubkey}`)
 ///
 pub fn order_to_tags(
     order: &Order,
@@ -304,7 +313,9 @@ pub fn order_to_tags(
     // Check if the order is pending/in-progress/success/canceled
     let (create_event, status) = create_status_tags(order)?;
     // Create mostro: scheme link in case of pending order creation
-    let mostro_link = create_source_tag(order, &Settings::get_nostr().relays)?;
+    // Include the Mostro pubkey so clients can identify the instance
+    let mostro_pubkey = get_keys()?.public_key().to_hex();
+    let mostro_link = create_source_tag(order, &Settings::get_nostr().relays, &mostro_pubkey)?;
 
     // Send just in case the order is pending/in-progress/success/canceled
     if create_event {

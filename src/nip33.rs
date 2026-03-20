@@ -302,9 +302,17 @@ fn create_source_tag(
 /// - `rating`: User reputation data (if available)
 /// - `source`: mostro: scheme link to pending orders (`mostro:{order_id}?relays={...}&mostro={pubkey}`)
 ///
+/// # Arguments
+///
+/// * `order` - The order to transform into tags
+/// * `reputation_data` - Optional reputation data for the maker
+/// * `mostro_pubkey` - Optional Mostro pubkey override. If None, derived from get_keys().
+///   Pass Some() in tests to avoid global state dependencies.
+///
 pub fn order_to_tags(
     order: &Order,
     reputation_data: Option<(f64, i64, i64)>,
+    mostro_pubkey: Option<&str>,
 ) -> Result<Option<Tags>, MostroError> {
     // Position of the tags in the list
     const RATING_TAG_INDEX: usize = 7;
@@ -314,8 +322,11 @@ pub fn order_to_tags(
     let (create_event, status) = create_status_tags(order)?;
     // Create mostro: scheme link in case of pending order creation
     // Include the Mostro pubkey so clients can identify the instance
-    let mostro_pubkey = get_keys()?.public_key().to_hex();
-    let mostro_link = create_source_tag(order, &Settings::get_nostr().relays, &mostro_pubkey)?;
+    let pubkey = match mostro_pubkey {
+        Some(pk) => pk.to_string(),
+        None => get_keys()?.public_key().to_hex(),
+    };
+    let mostro_link = create_source_tag(order, &Settings::get_nostr().relays, &pubkey)?;
 
     // Send just in case the order is pending/in-progress/success/canceled
     if create_event {
@@ -519,6 +530,10 @@ mod tests {
 
     // ── Shared test helpers ──────────────────────────────────────────────────────
 
+    /// Test Mostro pubkey (derived from the test nsec in test_settings)
+    const TEST_MOSTRO_PUBKEY: &str =
+        "9a0e40e008c6dcfdb3c608a65ddf1c4e72eed7eeefbe1eb88ea0f1ea8b43dc4d";
+
     /// Initialize global settings once per test binary run using the canonical
     /// test_settings() helper from AppContext test_utils — consistent with the
     /// rest of the test infrastructure.
@@ -604,7 +619,7 @@ mod tests {
         init_test_settings();
         let order = make_pending_order();
 
-        let tags = order_to_tags(&order, None)
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
             .expect("order_to_tags must not error")
             .expect("pending order must produce Some(tags)");
 
@@ -618,7 +633,7 @@ mod tests {
         init_test_settings();
         let order = make_pending_order();
 
-        let tags = order_to_tags(&order, None)
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
             .expect("order_to_tags must not error")
             .expect("pending order must produce Some(tags)");
 
@@ -628,6 +643,46 @@ mod tests {
         assert_eq!(
             y_values, expected,
             "order_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    // ── order_to_tags: source tag with Mostro pubkey (kind 38383) ───────────────
+
+    /// Extract the value of the "source" tag from a Tags collection.
+    fn get_source_tag_value(tags: &Tags) -> Option<String> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            if vec.first().map(|s| s.as_str()) == Some("source") {
+                vec.get(1).cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn order_to_tags_source_tag_includes_mostro_pubkey() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let source = get_source_tag_value(&tags).expect("pending order must have source tag");
+
+        // Verify the source tag format: mostro:{order_id}?relays={...}&mostro={pubkey}
+        assert!(
+            source.starts_with("mostro:"),
+            "source must start with 'mostro:' scheme"
+        );
+        assert!(
+            source.contains("&mostro="),
+            "source must contain '&mostro=' parameter"
+        );
+        assert!(
+            source.contains(&format!("&mostro={}", TEST_MOSTRO_PUBKEY)),
+            "source must contain the correct Mostro pubkey"
         );
     }
 

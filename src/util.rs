@@ -287,7 +287,7 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
 /// let identity_pubkey = PublicKey::from_str("02abcdef...").unwrap();
 /// let trade_pubkey = identity_pubkey.clone();
 ///
-/// let tags = get_tags_for_new_order(&order, &pool, &identity_pubkey, &trade_pubkey).await?;
+/// let tags = get_tags_for_new_order(&order, &pool, &identity_pubkey, &trade_pubkey, &keys).await?;
 /// // Use `tags` for further event processing.
 /// # Ok(())
 /// # }
@@ -296,19 +296,22 @@ pub async fn get_tags_for_new_order(
     pool: &SqlitePool,
     identity_pubkey: &PublicKey,
     trade_pubkey: &PublicKey,
+    mostro_keys: &Keys,
 ) -> Result<Option<Tags>, MostroError> {
+    let mostro_pubkey = mostro_keys.public_key().to_hex();
     match is_user_present(pool, identity_pubkey.to_string()).await {
         Ok(user) => {
             // We transform the order fields to tags to use in the event
             order_to_tags(
                 new_order_db,
                 Some((user.total_rating, user.total_reviews, user.created_at)),
+                Some(&mostro_pubkey),
             )
         }
         Err(_) => {
             // We transform the order fields to tags to use in the event
             if identity_pubkey == trade_pubkey {
-                order_to_tags(new_order_db, Some((0.0, 0, 0)))
+                order_to_tags(new_order_db, Some((0.0, 0, 0)), Some(&mostro_pubkey))
             } else {
                 Err(MostroInternalErr(ServiceError::InvalidPubkey))
             }
@@ -388,7 +391,7 @@ pub async fn publish_order(
     // Get tags for new order in case of full privacy or normal order
     // nip33 kind with order fields as tags and order id as identifier (kind 38383 for orders)
     let event = if let Some(tags) =
-        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey).await?
+        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey, keys).await?
     {
         new_order_event(keys, "", order_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
@@ -728,7 +731,8 @@ pub async fn update_order_event(
     let reputation_data = get_ratings_for_pending_order(&order_updated, status).await?;
 
     // We transform the order fields to tags to use in the event
-    if let Some(tags) = order_to_tags(&order_updated, reputation_data)? {
+    let mostro_pubkey = keys.public_key().to_hex();
+    if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
         // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
         let event = new_order_event(keys, "", order.id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

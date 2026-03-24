@@ -262,6 +262,7 @@ pub mod test_utils {
                 nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
                     .to_string(),
                 relays: vec!["wss://relay.test".to_string()],
+                relay_connection_timeout_secs: 5,
             },
             mostro: MostroSettings::default(),
             lightning: LightningSettings::default(),

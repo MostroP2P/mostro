@@ -129,6 +129,13 @@ pub struct NostrSettings {
     pub nsec_privkey: String,
     /// Nostr relays list
     pub relays: Vec<String>,
+    /// Seconds to wait for relay connections at startup before continuing (default: 5)
+    #[serde(default = "default_relay_connection_timeout_secs")]
+    pub relay_connection_timeout_secs: u64,
+}
+
+fn default_relay_connection_timeout_secs() -> u64 {
+    5
 }
 /// RPC configuration settings
 #[derive(Debug, Deserialize, Clone)]

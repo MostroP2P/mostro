@@ -779,8 +779,24 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     }
 
-    // Connect to relays and keep connection alive
+    let timeout =
+        std::time::Duration::from_secs(nostr_settings.relay_connection_timeout_secs);
     client.connect().await;
+    client.wait_for_connection(timeout).await;
+
+    let connected = client
+        .relays()
+        .await
+        .values()
+        .filter(|r| r.is_connected())
+        .count();
+
+    if connected == 0 {
+        tracing::error!("No Nostr relays connected after timeout of {}s", nostr_settings.relay_connection_timeout_secs);
+        return Err(MostroInternalErr(ServiceError::NostrError(
+            "No relays connected".to_string(),
+        )));
+    }
 
     Ok(client)
 }

@@ -40,14 +40,19 @@ impl BitcoinPriceManager {
             yadio_response.btc.keys().collect::<Vec<&String>>().len()
         );
 
-        let mut prices_write = BITCOIN_PRICES
-            .write()
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        *prices_write = yadio_response.btc.clone();
+        // Clone rates before acquiring lock to avoid holding it across await
+        let rates_clone = yadio_response.btc.clone();
         
-        // Publish rates to Nostr if enabled
+        {
+            let mut prices_write = BITCOIN_PRICES
+                .write()
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            *prices_write = rates_clone.clone();
+        } // Lock is dropped here
+        
+        // Publish rates to Nostr if enabled (after releasing the lock)
         if mostro_settings.publish_exchange_rates_to_nostr {
-            if let Err(e) = Self::publish_rates_to_nostr(&yadio_response.btc).await {
+            if let Err(e) = Self::publish_rates_to_nostr(&rates_clone).await {
                 error!("Failed to publish exchange rates to Nostr: {}", e);
                 // Don't fail the entire update if Nostr publishing fails
             }
@@ -77,7 +82,7 @@ impl BitcoinPriceManager {
             .map_err(|e| MostroInternalErr(ServiceError::MessageSerializationError))?;
         
         let timestamp = Utc::now().timestamp();
-        let tags = Tags::new(vec![
+        let tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom("updated_at".into()),
                 vec![timestamp.to_string()],
@@ -91,17 +96,17 @@ impl BitcoinPriceManager {
                 MostroInternalErr(ServiceError::MessageSerializationError)
             })?;
         
-        let client = get_nostr_client().await.map_err(|e| {
+        let client = get_nostr_client().map_err(|e| {
             error!("Failed to get Nostr client: {}", e);
-            MostroInternalErr(ServiceError::IOError(e.to_string()))
+            e
         })?;
         
-        match client.send_event(event.clone()).await {
-            Ok(event_id) => {
+        match client.send_event(&event).await {
+            Ok(output) => {
                 info!(
-                    "Exchange rates published to Nostr. Event ID: {} ({} currencies)",
-                    event_id,
-                    rates.len()
+                    "Exchange rates published to Nostr ({} currencies). Output: {:?}",
+                    rates.len(),
+                    output
                 );
                 Ok(())
             }

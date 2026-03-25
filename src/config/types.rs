@@ -205,10 +205,17 @@ pub struct MostroSettings {
     /// Publish exchange rates to Nostr (kind 30078, NIP-33)
     #[serde(default = "default_publish_exchange_rates")]
     pub publish_exchange_rates_to_nostr: bool,
+    /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
+    #[serde(default = "default_exchange_rates_update_interval")]
+    pub exchange_rates_update_interval_seconds: u64,
 }
 
 fn default_publish_exchange_rates() -> bool {
     true // Enable by default for censorship resistance
+}
+
+fn default_exchange_rates_update_interval() -> u64 {
+    300 // 5 minutes
 }
 
 impl Default for MostroSettings {
@@ -239,6 +246,7 @@ impl Default for MostroSettings {
             picture: None,
             website: None,
             publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
+            exchange_rates_update_interval_seconds: default_exchange_rates_update_interval(),
         }
     }
 }

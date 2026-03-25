@@ -69,13 +69,25 @@ Add to `settings.toml`:
 
 # Publish exchange rates to Nostr (default: true)
 publish_exchange_rates_to_nostr = true
+
+# Exchange rates update interval in seconds (default: 300 = 5 minutes)
+exchange_rates_update_interval_seconds = 300
 ```
 
-**Default:** `true` (enabled for censorship resistance)
+**Defaults:**
+- `publish_exchange_rates_to_nostr`: `true` (enabled for censorship resistance)
+- `exchange_rates_update_interval_seconds`: `300` (5 minutes)
 
 ### Update Frequency
 
-Exchange rates are fetched from Yadio API and published to Nostr every **5 minutes** (same interval as the existing price update job).
+Exchange rates are fetched from Yadio API and published to Nostr based on the configured `exchange_rates_update_interval_seconds` value.
+
+**Recommended values:**
+- **Production:** `300` (5 minutes) — balances freshness with API rate limits
+- **Development:** `60` (1 minute) — faster testing
+- **Low-volume instances:** `600` (10 minutes) — reduces API calls
+
+**Note:** Very short intervals (&lt;60s) may hit Yadio API rate limits.
 
 ---
 
@@ -168,7 +180,9 @@ echo '<event_content>' | jq .
 ### Production Checklist
 
 - [ ] Verify `publish_exchange_rates_to_nostr` config in `settings.toml`
+- [ ] Set `exchange_rates_update_interval_seconds` (default: 300)
 - [ ] Confirm Nostr relays are reachable from daemon
+- [ ] Monitor logs for "Starting Bitcoin price update job (interval: Xs)" on startup
 - [ ] Monitor logs for "Exchange rates published to Nostr" messages
 - [ ] Test client-side rate fetching from Nostr
 - [ ] Verify fallback to HTTP API works if Nostr unavailable

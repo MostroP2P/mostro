@@ -25,7 +25,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
     ["source", "yadio"],
     ["expiration", "1732550400"]
   ],
-  "content": "{\"USD\": {\"BTC\": 0.000024}, \"EUR\": {\"BTC\": 0.000022}, ...}",
+  "content": "{\"USD\": 50000.0, \"EUR\": 45000.0, ...}",
   "sig": "..."
 }
 ```
@@ -42,20 +42,20 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
 
 ### Content Format
 
-The `content` field contains a JSON object mapping currency codes to BTC rates:
+The `content` field contains a JSON object mapping currency codes to BTC prices:
 
 ```json
 {
-  "USD": { "BTC": 0.000024 },
-  "EUR": { "BTC": 0.000022 },
-  "VES": { "BTC": 0.0000000012 },
-  "ARS": { "BTC": 0.0000000095 }
+  "USD": 50000.0,
+  "EUR": 45000.0,
+  "VES": 850000000.0,
+  "ARS": 105000000.0
 }
 ```
 
-**Rate semantics:** Each value represents how much BTC equals 1 unit of fiat currency.
+**Rate semantics:** Each value represents the price of 1 BTC in that fiat currency.
 
-**Example:** `"USD": {"BTC": 0.000024}` means 1 USD = 0.000024 BTC (≈41,666 USD/BTC).
+**Example:** `"USD": 50000.0` means 1 BTC = 50,000 USD.
 
 ---
 

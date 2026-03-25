@@ -470,12 +470,12 @@ async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
         let mostro_settings = Settings::get_mostro();
         let update_interval = mostro_settings.exchange_rates_update_interval_seconds;
-        
+
         info!(
             "Starting Bitcoin price update job (interval: {}s)",
             update_interval
         );
-        
+
         loop {
             info!("Updating Bitcoin prices");
             if let Err(e) = BitcoinPriceManager::update_prices().await {

@@ -22,7 +22,8 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
   "tags": [
     ["d", "mostro-rates"],
     ["updated_at", "1732546800"],
-    ["source", "yadio"]
+    ["source", "yadio"],
+    ["expiration", "1732550400"]
   ],
   "content": "{\"USD\": {\"BTC\": 0.000024}, \"EUR\": {\"BTC\": 0.000022}, ...}",
   "sig": "..."
@@ -36,6 +37,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
 - **d tag:** `"mostro-rates"` (NIP-33 identifier — replaces previous rate events)
 - **updated_at tag:** Unix timestamp of last update
 - **source tag:** `"yadio"` (indicates rate source)
+- **expiration tag:** Unix timestamp 1 hour after creation (NIP-40) — prevents stale rates
 - **content:** JSON-encoded rates in format `{"CURRENCY": {"BTC": rate}, ...}`
 
 ### Content Format
@@ -132,6 +134,7 @@ See: [Mobile client spec](https://github.com/MostroP2P/app/blob/main/.specify/NO
 
 - Events are signed with Mostro's private key (standard NIP-01 signature verification)
 - NIP-33 addressable events: newer events replace older ones (prevents stale data)
+- **NIP-40 expiration:** Events expire after 1 hour (relays should delete them)
 - No sensitive data in events (all rates are public information)
 
 ---

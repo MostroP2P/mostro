@@ -42,14 +42,14 @@ impl BitcoinPriceManager {
 
         // Clone rates before acquiring lock to avoid holding it across await
         let rates_clone = yadio_response.btc.clone();
-        
+
         {
             let mut prices_write = BITCOIN_PRICES
                 .write()
                 .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
             *prices_write = rates_clone.clone();
         } // Lock is dropped here
-        
+
         // Publish rates to Nostr if enabled (after releasing the lock)
         if mostro_settings.publish_exchange_rates_to_nostr {
             if let Err(e) = Self::publish_rates_to_nostr(&rates_clone).await {
@@ -57,17 +57,17 @@ impl BitcoinPriceManager {
                 // Don't fail the entire update if Nostr publishing fails
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Publishes exchange rates to Nostr as a NIP-33 addressable event (kind 30078)
     async fn publish_rates_to_nostr(rates: &HashMap<String, f64>) -> Result<(), MostroError> {
         let keys = get_keys().map_err(|e| {
             error!("Failed to get Mostro keys: {}", e);
             MostroInternalErr(ServiceError::IOError(e.to_string()))
         })?;
-        
+
         // Transform rates to expected format: {"USD": {"BTC": 0.000024}, ...}
         let formatted_rates: HashMap<String, HashMap<String, f64>> = rates
             .iter()
@@ -77,30 +77,31 @@ impl BitcoinPriceManager {
                 (currency.clone(), rate_map)
             })
             .collect();
-        
+
         let content = serde_json::to_string(&formatted_rates)
-            .map_err(|e| MostroInternalErr(ServiceError::MessageSerializationError))?;
-        
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
         let timestamp = Utc::now().timestamp();
+        let expiration = timestamp + 3600; // Expire after 1 hour
         let tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom("updated_at".into()),
                 vec![timestamp.to_string()],
             ),
             Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+            Tag::expiration(Timestamp::from(expiration as u64)),
         ]);
-        
-        let event = new_exchange_rates_event(&keys, &content, tags)
-            .map_err(|e| {
-                error!("Failed to create exchange rates event: {}", e);
-                MostroInternalErr(ServiceError::MessageSerializationError)
-            })?;
-        
+
+        let event = new_exchange_rates_event(&keys, &content, tags).map_err(|e| {
+            error!("Failed to create exchange rates event: {}", e);
+            MostroInternalErr(ServiceError::MessageSerializationError)
+        })?;
+
         let client = get_nostr_client().map_err(|e| {
             error!("Failed to get Nostr client: {}", e);
             e
         })?;
-        
+
         match client.send_event(&event).await {
             Ok(output) => {
                 info!(
@@ -139,7 +140,7 @@ mod tests {
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 0.000024);
         input_rates.insert("EUR".to_string(), 0.000022);
-        
+
         let formatted: HashMap<String, HashMap<String, f64>> = input_rates
             .iter()
             .map(|(currency, btc_rate)| {
@@ -148,18 +149,18 @@ mod tests {
                 (currency.clone(), rate_map)
             })
             .collect();
-        
+
         assert_eq!(formatted.len(), 2);
         assert_eq!(formatted.get("USD").unwrap().get("BTC"), Some(&0.000024));
         assert_eq!(formatted.get("EUR").unwrap().get("BTC"), Some(&0.000022));
     }
-    
+
     #[test]
     fn test_formatted_rates_json_serialization() {
         // Test that formatted rates can be serialized to expected JSON structure
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 0.000024);
-        
+
         let formatted: HashMap<String, HashMap<String, f64>> = input_rates
             .iter()
             .map(|(currency, btc_rate)| {
@@ -168,7 +169,7 @@ mod tests {
                 (currency.clone(), rate_map)
             })
             .collect();
-        
+
         let json = serde_json::to_string(&formatted).unwrap();
         assert!(json.contains("\"USD\""));
         assert!(json.contains("\"BTC\""));

@@ -25,7 +25,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
     ["source", "yadio"],
     ["expiration", "1732550400"]
   ],
-  "content": "{\"USD\": 50000.0, \"EUR\": 45000.0, ...}",
+  "content": "{\"BTC\": {\"USD\": 50000.0, \"EUR\": 45000.0, \"ARS\": 105000000.0, ...}}",
   "sig": "..."
 }
 ```
@@ -42,20 +42,27 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
 
 ### Content Format
 
-The `content` field contains a JSON object mapping currency codes to BTC prices:
+The `content` field contains the full Yadio API response structure:
 
 ```json
 {
-  "USD": 50000.0,
-  "EUR": 45000.0,
-  "VES": 850000000.0,
-  "ARS": 105000000.0
+  "BTC": {
+    "BTC": 1,
+    "USD": 50000.0,
+    "EUR": 45000.0,
+    "VES": 850000000.0,
+    "ARS": 105000000.0,
+    "AED": 260491.35,
+    "..."
+  }
 }
 ```
 
-**Rate semantics:** Each value represents the price of 1 BTC in that fiat currency.
+**Format:** Identical to Yadio API response (`/exrates/BTC`).
 
-**Example:** `"USD": 50000.0` means 1 BTC = 50,000 USD.
+**Rate semantics:** Each value under `"BTC"` represents the price of 1 BTC in that currency.
+
+**Example:** `"BTC": {"USD": 50000.0}` means 1 BTC = 50,000 USD.
 
 ---
 
@@ -173,7 +180,7 @@ nostcat -sub -k 30078 -a <mostro_pubkey> wss://relay.mostro.network
 
 # Verify content format
 echo '<event_content>' | jq .
-# Should output: {"USD": 50000.0, "EUR": 45000.0, ...}
+# Should output: {"BTC": {"USD": 50000.0, "EUR": 45000.0, ...}}
 ```
 
 ---

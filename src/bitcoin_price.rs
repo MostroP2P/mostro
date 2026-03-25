@@ -68,10 +68,11 @@ impl BitcoinPriceManager {
             MostroInternalErr(ServiceError::IOError(e.to_string()))
         })?;
 
-        // Yadio gives us: {"USD": 50000.0, ...} (price of 1 BTC in fiat)
-        // We publish: {"USD": 50000.0, ...} (same format - price of 1 BTC)
-        // This is what clients expect to see
-        let formatted_rates = rates.clone();
+        // Publish in Yadio's exact format: {"BTC": {"USD": 50000.0, "EUR": 45000.0, ...}}
+        // This matches their API response structure
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), rates.clone());
+        let formatted_rates = wrapper;
 
         let content = serde_json::to_string(&formatted_rates)
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
@@ -145,28 +146,33 @@ mod tests {
 
     #[test]
     fn test_rates_structure() {
-        // Test that Yadio rates are in the expected format
+        // Test that Yadio rates are wrapped correctly
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 50000.0);
         input_rates.insert("EUR".to_string(), 45000.0);
 
-        // Rates are published as-is (price of 1 BTC in fiat)
-        let formatted = input_rates.clone();
+        // Wrap in Yadio format: {"BTC": {...}}
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), input_rates.clone());
 
-        assert_eq!(formatted.len(), 2);
-        assert_eq!(formatted.get("USD"), Some(&50000.0));
-        assert_eq!(formatted.get("EUR"), Some(&45000.0));
+        assert_eq!(wrapper.len(), 1);
+        assert!(wrapper.contains_key("BTC"));
+        assert_eq!(wrapper.get("BTC").unwrap().get("USD"), Some(&50000.0));
+        assert_eq!(wrapper.get("BTC").unwrap().get("EUR"), Some(&45000.0));
     }
 
     #[test]
     fn test_rates_json_serialization() {
-        // Test that rates can be serialized to expected JSON structure
+        // Test that rates can be serialized to Yadio format
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 50000.0);
+        input_rates.insert("BTC".to_string(), 1.0);
 
-        let formatted = input_rates.clone();
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), input_rates);
 
-        let json = serde_json::to_string(&formatted).unwrap();
+        let json = serde_json::to_string(&wrapper).unwrap();
+        assert!(json.contains("\"BTC\""));
         assert!(json.contains("\"USD\""));
         assert!(json.contains("50000"));
     }

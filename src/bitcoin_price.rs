@@ -81,6 +81,8 @@ impl BitcoinPriceManager {
 
         // Expiration should be at least 2x the update interval to allow for delays
         // Cap at 1 hour to prevent stale data
+        // Note: We read settings here (instead of passing from scheduler) to ensure
+        // expiration stays aligned with interval if config is reloaded at runtime
         let mostro_settings = Settings::get_mostro();
         let update_interval = mostro_settings.exchange_rates_update_interval_seconds;
         let expiration_seconds = std::cmp::min(update_interval * 2, 3600);
@@ -164,9 +166,10 @@ mod tests {
     #[test]
     fn test_rates_json_serialization() {
         // Test that rates can be serialized to Yadio format
+        // Use only fiat currencies (Yadio includes BTC in the wrapper, not in the rates map)
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 50000.0);
-        input_rates.insert("BTC".to_string(), 1.0);
+        input_rates.insert("EUR".to_string(), 45000.0);
 
         let mut wrapper = HashMap::new();
         wrapper.insert("BTC".to_string(), input_rates);
@@ -175,6 +178,10 @@ mod tests {
         assert!(json.contains("\"BTC\""));
         assert!(json.contains("\"USD\""));
         assert!(json.contains("50000"));
+        assert!(json.contains("\"EUR\""));
+        assert!(json.contains("45000"));
+        // Ensure we don't have nested BTC key (would be invalid)
+        assert!(!json.contains("\"BTC\":1"));
     }
 
     #[test]

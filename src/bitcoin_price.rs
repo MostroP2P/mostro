@@ -87,7 +87,7 @@ impl BitcoinPriceManager {
 
         let tags = Tags::from_list(vec![
             Tag::custom(
-                TagKind::Custom("updated_at".into()),
+                TagKind::Custom("published_at".into()),
                 vec![timestamp.to_string()],
             ),
             Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
@@ -105,6 +105,7 @@ impl BitcoinPriceManager {
         })?;
 
         // Publish with timeout to avoid blocking the scheduler
+        // Best-effort: log errors but don't fail the update job
         let timeout_duration = std::time::Duration::from_secs(30);
         match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
             Ok(Ok(output)) => {
@@ -113,19 +114,17 @@ impl BitcoinPriceManager {
                     rates.len(),
                     output
                 );
-                Ok(())
             }
             Ok(Err(e)) => {
                 error!("Failed to send exchange rates event to relays: {}", e);
-                Err(MostroInternalErr(ServiceError::IOError(e.to_string())))
             }
             Err(_) => {
                 error!("Timeout publishing exchange rates to Nostr (30s exceeded)");
-                Err(MostroInternalErr(ServiceError::IOError(
-                    "Nostr publish timeout".to_string(),
-                )))
             }
         }
+
+        // Always return Ok - publishing is best-effort
+        Ok(())
     }
 
     pub fn get_price(currency: &str) -> Result<f64, MostroError> {

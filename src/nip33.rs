@@ -148,7 +148,7 @@ pub fn new_dispute_event(
 /// # Arguments
 ///
 /// * `keys` - The keys used to sign the event (Mostro's keypair)
-/// * `content` - JSON-encoded exchange rates (e.g., `{"USD": {"BTC": 0.000024}, ...}`)
+/// * `content` - JSON-encoded exchange rates (e.g., `{"USD": 50000.0, "EUR": 45000.0, ...}`)
 /// * `extra_tags` - Additional tags for the event (e.g., `updated_at`, `source`)
 ///
 /// # Returns
@@ -162,7 +162,7 @@ pub fn new_dispute_event(
 /// let rates: HashMap<String, f64> = bitcoin_prices.clone();
 /// let content = serde_json::to_string(&rates)?;
 /// let tags = Tags::from_list(vec![
-///     Tag::custom(TagKind::Custom("updated_at".into()), vec![timestamp.to_string()]),
+///     Tag::custom(TagKind::Custom("published_at".into()), vec![timestamp.to_string()]),
 ///     Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
 ///     Tag::expiration(Timestamp::from(expiration)),
 /// ]);

@@ -21,7 +21,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
   "created_at": 1732546800,
   "tags": [
     ["d", "mostro-rates"],
-    ["updated_at", "1732546800"],
+    ["published_at", "1732546800"],
     ["source", "yadio"],
     ["expiration", "1732550400"]
   ],
@@ -35,10 +35,10 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
 - **kind:** `30078` (application-specific data, NIP-33 replaceable)
 - **pubkey:** Mostro daemon's public key (same key that signs orders)
 - **d tag:** `"mostro-rates"` (NIP-33 identifier — replaces previous rate events)
-- **updated_at tag:** Unix timestamp of last update
+- **published_at tag:** Unix timestamp when daemon published the event (not source timestamp)
 - **source tag:** `"yadio"` (indicates rate source)
-- **expiration tag:** Unix timestamp 1 hour after creation (NIP-40) — prevents stale rates
-- **content:** JSON-encoded rates in format `{"CURRENCY": {"BTC": rate}, ...}`
+- **expiration tag:** Unix timestamp for event expiration (NIP-40) — prevents stale rates
+- **content:** JSON-encoded rates in format `{"CURRENCY": price, ...}`
 
 ### Content Format
 
@@ -173,7 +173,7 @@ nostcat -sub -k 30078 -a <mostro_pubkey> wss://relay.mostro.network
 
 # Verify content format
 echo '<event_content>' | jq .
-# Should output: {"USD": {"BTC": 0.000024}, ...}
+# Should output: {"USD": 50000.0, "EUR": 45000.0, ...}
 ```
 
 ---

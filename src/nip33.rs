@@ -158,11 +158,13 @@ pub fn new_dispute_event(
 ///
 /// ```ignore
 /// use std::collections::HashMap;
+/// // Rates from Yadio: {"USD": 50000.0, "EUR": 45000.0, ...}
 /// let rates: HashMap<String, f64> = bitcoin_prices.clone();
 /// let content = serde_json::to_string(&rates)?;
-/// let mut tags = Tags::new(vec![
+/// let tags = Tags::from_list(vec![
 ///     Tag::custom(TagKind::Custom("updated_at".into()), vec![timestamp.to_string()]),
 ///     Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+///     Tag::expiration(Timestamp::from(expiration)),
 /// ]);
 /// let event = new_exchange_rates_event(&keys, &content, tags)?;
 /// ```

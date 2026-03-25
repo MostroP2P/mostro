@@ -97,7 +97,7 @@ Exchange rates are fetched from Yadio API and published to Nostr based on the co
 
 ### Code Flow
 
-1. **Scheduler** (`scheduler.rs`): `job_update_bitcoin_prices()` runs every 300 seconds
+1. **Scheduler** (`scheduler.rs`): `job_update_bitcoin_prices()` runs at intervals configured by `exchange_rates_update_interval_seconds` (default: 300 seconds)
 2. **BitcoinPriceManager** (`bitcoin_price.rs`): 
    - Fetches rates from Yadio HTTP API
    - Updates in-memory cache
@@ -193,12 +193,12 @@ echo '<event_content>' | jq .
 ### Monitoring
 
 **Success indicators:**
-```
+```text
 INFO Exchange rates published to Nostr. Event ID: <id> (<N> currencies)
 ```
 
 **Error indicators:**
-```
+```text
 ERROR Failed to publish exchange rates to Nostr: <error>
 ERROR Failed to send exchange rates event to relays: <error>
 ```

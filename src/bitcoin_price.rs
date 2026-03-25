@@ -77,7 +77,14 @@ impl BitcoinPriceManager {
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
         let timestamp = Utc::now().timestamp();
-        let expiration = timestamp + 3600; // Expire after 1 hour
+
+        // Expiration should be at least 2x the update interval to allow for delays
+        // Cap at 1 hour to prevent stale data
+        let mostro_settings = Settings::get_mostro();
+        let update_interval = mostro_settings.exchange_rates_update_interval_seconds;
+        let expiration_seconds = std::cmp::min(update_interval * 2, 3600);
+        let expiration = timestamp + expiration_seconds as i64;
+
         let tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom("updated_at".into()),
@@ -97,8 +104,10 @@ impl BitcoinPriceManager {
             e
         })?;
 
-        match client.send_event(&event).await {
-            Ok(output) => {
+        // Publish with timeout to avoid blocking the scheduler
+        let timeout_duration = std::time::Duration::from_secs(30);
+        match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
+            Ok(Ok(output)) => {
                 info!(
                     "Exchange rates published to Nostr ({} currencies). Output: {:?}",
                     rates.len(),
@@ -106,9 +115,15 @@ impl BitcoinPriceManager {
                 );
                 Ok(())
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Failed to send exchange rates event to relays: {}", e);
                 Err(MostroInternalErr(ServiceError::IOError(e.to_string())))
+            }
+            Err(_) => {
+                error!("Timeout publishing exchange rates to Nostr (30s exceeded)");
+                Err(MostroInternalErr(ServiceError::IOError(
+                    "Nostr publish timeout".to_string(),
+                )))
             }
         }
     }
@@ -135,23 +150,23 @@ mod tests {
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 50000.0);
         input_rates.insert("EUR".to_string(), 45000.0);
-        
+
         // Rates are published as-is (price of 1 BTC in fiat)
         let formatted = input_rates.clone();
-        
+
         assert_eq!(formatted.len(), 2);
         assert_eq!(formatted.get("USD"), Some(&50000.0));
         assert_eq!(formatted.get("EUR"), Some(&45000.0));
     }
-    
+
     #[test]
     fn test_rates_json_serialization() {
         // Test that rates can be serialized to expected JSON structure
         let mut input_rates = HashMap::new();
         input_rates.insert("USD".to_string(), 50000.0);
-        
+
         let formatted = input_rates.clone();
-        
+
         let json = serde_json::to_string(&formatted).unwrap();
         assert!(json.contains("\"USD\""));
         assert!(json.contains("50000"));

@@ -174,7 +174,7 @@ pub fn new_exchange_rates_event(
     create_event(
         keys,
         content,
-        "rates".to_string(), // NIP-33 d tag identifier
+        "mostro-rates".to_string(), // NIP-33 d tag identifier
         extra_tags,
         NOSTR_EXCHANGE_RATES_EVENT_KIND,
     )

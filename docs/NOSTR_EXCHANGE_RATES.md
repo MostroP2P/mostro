@@ -20,7 +20,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
   "pubkey": "82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390",
   "created_at": 1732546800,
   "tags": [
-    ["d", "rates"],
+    ["d", "mostro-rates"],
     ["updated_at", "1732546800"],
     ["source", "yadio"]
   ],
@@ -33,7 +33,7 @@ Mostro daemon publishes Bitcoin/fiat exchange rates to Nostr relays as NIP-33 ad
 
 - **kind:** `30078` (application-specific data, NIP-33 replaceable)
 - **pubkey:** Mostro daemon's public key (same key that signs orders)
-- **d tag:** `"rates"` (NIP-33 identifier — replaces previous rate events)
+- **d tag:** `"mostro-rates"` (NIP-33 identifier — replaces previous rate events)
 - **updated_at tag:** Unix timestamp of last update
 - **source tag:** `"yadio"` (indicates rate source)
 - **content:** JSON-encoded rates in format `{"CURRENCY": {"BTC": rate}, ...}`
@@ -145,7 +145,7 @@ cargo test bitcoin_price
 
 ```bash
 # Using nak CLI
-nak req -k 30078 -a <mostro_pubkey> --tag d=rates wss://relay.mostro.network
+nak req -k 30078 -a <mostro_pubkey> --tag d=mostro-rates wss://relay.mostro.network
 ```
 
 **Expected output:** JSON event with current exchange rates

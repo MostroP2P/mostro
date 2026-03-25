@@ -202,6 +202,13 @@ pub struct MostroSettings {
     pub picture: Option<String>,
     /// NIP-01 kind 0 metadata: operator website URL
     pub website: Option<String>,
+    /// Publish exchange rates to Nostr (kind 30078, NIP-33)
+    #[serde(default = "default_publish_exchange_rates")]
+    pub publish_exchange_rates_to_nostr: bool,
+}
+
+fn default_publish_exchange_rates() -> bool {
+    true // Enable by default for censorship resistance
 }
 
 impl Default for MostroSettings {
@@ -231,6 +238,7 @@ impl Default for MostroSettings {
             about: None,
             picture: None,
             website: None,
+            publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
         }
     }
 }

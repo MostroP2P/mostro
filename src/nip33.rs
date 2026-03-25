@@ -1,3 +1,4 @@
+use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
 use crate::util::{get_expiration_timestamp_for_kind, get_keys};
@@ -136,6 +137,46 @@ pub fn new_dispute_event(
         identifier,
         extra_tags,
         NOSTR_DISPUTE_EVENT_KIND,
+    )
+}
+
+/// Creates a new exchange rates event (kind 30078, NIP-33)
+///
+/// This event publishes Bitcoin/fiat exchange rates to Nostr relays,
+/// enabling censorship-resistant rate fetching for mobile clients.
+///
+/// # Arguments
+///
+/// * `keys` - The keys used to sign the event (Mostro's keypair)
+/// * `content` - JSON-encoded exchange rates (e.g., `{"USD": {"BTC": 0.000024}, ...}`)
+/// * `extra_tags` - Additional tags for the event (e.g., `updated_at`, `source`)
+///
+/// # Returns
+/// Returns a new exchange rates event or an error
+///
+/// # Example
+///
+/// ```ignore
+/// use std::collections::HashMap;
+/// let rates: HashMap<String, f64> = bitcoin_prices.clone();
+/// let content = serde_json::to_string(&rates)?;
+/// let mut tags = Tags::new(vec![
+///     Tag::custom(TagKind::Custom("updated_at".into()), vec![timestamp.to_string()]),
+///     Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+/// ]);
+/// let event = new_exchange_rates_event(&keys, &content, tags)?;
+/// ```
+pub fn new_exchange_rates_event(
+    keys: &Keys,
+    content: &str,
+    extra_tags: Tags,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        "rates".to_string(), // NIP-33 d tag identifier
+        extra_tags,
+        NOSTR_EXCHANGE_RATES_EVENT_KIND,
     )
 }
 

@@ -1,11 +1,15 @@
 use crate::config::settings::Settings;
 use crate::lnurl::HTTP_CLIENT;
+use crate::nip33::new_exchange_rates_event;
+use crate::util::{get_keys, get_nostr_client};
+use chrono::Utc;
 use mostro_core::prelude::*;
+use nostr_sdk::prelude::*;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Debug, Deserialize)]
 struct YadioResponse {
@@ -39,8 +43,73 @@ impl BitcoinPriceManager {
         let mut prices_write = BITCOIN_PRICES
             .write()
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        *prices_write = yadio_response.btc;
+        *prices_write = yadio_response.btc.clone();
+        
+        // Publish rates to Nostr if enabled
+        if mostro_settings.publish_exchange_rates_to_nostr {
+            if let Err(e) = Self::publish_rates_to_nostr(&yadio_response.btc).await {
+                error!("Failed to publish exchange rates to Nostr: {}", e);
+                // Don't fail the entire update if Nostr publishing fails
+            }
+        }
+        
         Ok(())
+    }
+    
+    /// Publishes exchange rates to Nostr as a NIP-33 addressable event (kind 30078)
+    async fn publish_rates_to_nostr(rates: &HashMap<String, f64>) -> Result<(), MostroError> {
+        let keys = get_keys().map_err(|e| {
+            error!("Failed to get Mostro keys: {}", e);
+            MostroInternalErr(ServiceError::IOError(e.to_string()))
+        })?;
+        
+        // Transform rates to expected format: {"USD": {"BTC": 0.000024}, ...}
+        let formatted_rates: HashMap<String, HashMap<String, f64>> = rates
+            .iter()
+            .map(|(currency, btc_rate)| {
+                let mut rate_map = HashMap::new();
+                rate_map.insert("BTC".to_string(), *btc_rate);
+                (currency.clone(), rate_map)
+            })
+            .collect();
+        
+        let content = serde_json::to_string(&formatted_rates)
+            .map_err(|e| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        
+        let timestamp = Utc::now().timestamp();
+        let tags = Tags::new(vec![
+            Tag::custom(
+                TagKind::Custom("updated_at".into()),
+                vec![timestamp.to_string()],
+            ),
+            Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+        ]);
+        
+        let event = new_exchange_rates_event(&keys, &content, tags)
+            .map_err(|e| {
+                error!("Failed to create exchange rates event: {}", e);
+                MostroInternalErr(ServiceError::MessageSerializationError)
+            })?;
+        
+        let client = get_nostr_client().await.map_err(|e| {
+            error!("Failed to get Nostr client: {}", e);
+            MostroInternalErr(ServiceError::IOError(e.to_string()))
+        })?;
+        
+        match client.send_event(event.clone()).await {
+            Ok(event_id) => {
+                info!(
+                    "Exchange rates published to Nostr. Event ID: {} ({} currencies)",
+                    event_id,
+                    rates.len()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to send exchange rates event to relays: {}", e);
+                Err(MostroInternalErr(ServiceError::IOError(e.to_string())))
+            }
+        }
     }
 
     pub fn get_price(currency: &str) -> Result<f64, MostroError> {
@@ -58,6 +127,48 @@ impl BitcoinPriceManager {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_formatted_rates_structure() {
+        // Test that rates are formatted correctly for Nostr event content
+        let mut input_rates = HashMap::new();
+        input_rates.insert("USD".to_string(), 0.000024);
+        input_rates.insert("EUR".to_string(), 0.000022);
+        
+        let formatted: HashMap<String, HashMap<String, f64>> = input_rates
+            .iter()
+            .map(|(currency, btc_rate)| {
+                let mut rate_map = HashMap::new();
+                rate_map.insert("BTC".to_string(), *btc_rate);
+                (currency.clone(), rate_map)
+            })
+            .collect();
+        
+        assert_eq!(formatted.len(), 2);
+        assert_eq!(formatted.get("USD").unwrap().get("BTC"), Some(&0.000024));
+        assert_eq!(formatted.get("EUR").unwrap().get("BTC"), Some(&0.000022));
+    }
+    
+    #[test]
+    fn test_formatted_rates_json_serialization() {
+        // Test that formatted rates can be serialized to expected JSON structure
+        let mut input_rates = HashMap::new();
+        input_rates.insert("USD".to_string(), 0.000024);
+        
+        let formatted: HashMap<String, HashMap<String, f64>> = input_rates
+            .iter()
+            .map(|(currency, btc_rate)| {
+                let mut rate_map = HashMap::new();
+                rate_map.insert("BTC".to_string(), *btc_rate);
+                (currency.clone(), rate_map)
+            })
+            .collect();
+        
+        let json = serde_json::to_string(&formatted).unwrap();
+        assert!(json.contains("\"USD\""));
+        assert!(json.contains("\"BTC\""));
+        assert!(json.contains("0.000024"));
+    }
 
     #[test]
     fn test_yadio_response_deserialization() {

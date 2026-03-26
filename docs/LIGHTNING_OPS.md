@@ -148,7 +148,8 @@ if invoice.amount_milli_satoshis().is_none() {
 **Fee Limit Enforcement**:
 ```rust
 let max_fee = match amount.cmp(&1000) {
-    Ordering::Less | Ordering::Equal => amount as f64 * 0.02,  // 2%
+    // For small amounts, use 1% but ensure minimum of 10 sats
+    Ordering::Less | Ordering::Equal => (amount as f64 * 0.01).max(10.0),
     Ordering::Greater => amount as f64 * mostro_settings.max_routing_fee,
 };
 req.fee_limit_sat = max_fee as i64;

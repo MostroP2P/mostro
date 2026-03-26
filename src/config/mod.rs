@@ -76,7 +76,7 @@ mod tests {
 
     const MOSTRO_SETTINGS: &str = r#"[mostro]
                                             fee = 0
-                                            max_routing_fee = 0.001
+                                            max_routing_fee = 0.002
                                             max_order_amount = 1000000
                                             min_payment_amount = 100
                                             expiration_hours = 24
@@ -208,7 +208,7 @@ mod tests {
         let mostro_settings: StubSettingsMostro =
             toml::from_str(MOSTRO_SETTINGS).expect("Failed to deserialize");
         assert_eq!(mostro_settings.mostro.fee, 0.0);
-        assert_eq!(mostro_settings.mostro.max_routing_fee, 0.001);
+        assert_eq!(mostro_settings.mostro.max_routing_fee, 0.002);
         assert_eq!(mostro_settings.mostro.max_order_amount, 1000000);
         assert_eq!(mostro_settings.mostro.min_payment_amount, 100);
         assert_eq!(mostro_settings.mostro.expiration_hours, 24);

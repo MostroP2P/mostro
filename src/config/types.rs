@@ -222,7 +222,7 @@ impl Default for MostroSettings {
     fn default() -> Self {
         Self {
             fee: 0.0,
-            max_routing_fee: 0.001,
+            max_routing_fee: 0.002,
             max_order_amount: 1000000,
             min_payment_amount: 100,
             expiration_hours: 24,

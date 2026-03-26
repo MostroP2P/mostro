@@ -34,8 +34,8 @@ relays = ['ws://localhost:7000']
 # website = "https://mostro.network"
 # Mostro Fee
 fee = 0
-# Max routing fee that we want to pay to the network, 0.001 = 0.1%
-max_routing_fee = 0.001
+# Max routing fee that we want to pay to the network, 0.002 = 0.2%
+max_routing_fee = 0.002
 # Max order amount (sats)
 max_order_amount = 1000000
 # Minimum amount for a payment in satoshis

@@ -3,11 +3,11 @@ use crate::config::types::{
     DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
     RpcSettings,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Mostro configuration settings struct
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Settings {
     /// Url of database for Mostro
     pub database: DatabaseSettings,

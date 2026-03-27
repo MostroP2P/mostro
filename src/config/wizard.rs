@@ -58,7 +58,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
 
     println!("\n--- Nostr Configuration ---\n");
 
-    let nostr = prompt_nostr_settings()?;
+    let nostr = prompt_nostr_settings(settings_dir)?;
 
     println!("\n--- Mostro Configuration ---\n");
 
@@ -142,14 +142,14 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
     })
 }
 
-fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
+fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroError> {
     let has_nsec = Confirm::new()
         .with_prompt("Do you have an existing nsec key?")
         .default(false)
         .interact()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    let nsec_privkey = if has_nsec {
+    let nsec = if has_nsec {
         Input::new()
             .with_prompt("Enter your nsec private key")
             .validate_with(|input: &String| validate_nsec(input))
@@ -174,6 +174,34 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
         nsec
     };
 
+    // Write the nsec key to a file in the settings directory
+    let nsec_privkey_file = settings_dir.join("nostr-key.nsec");
+    {
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&nsec_privkey_file)
+        };
+        #[cfg(not(unix))]
+        let file = {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&nsec_privkey_file)
+        };
+        let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        file.write_all(nsec.as_bytes())
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
+
+    println!("  Private key saved to {}", nsec_privkey_file.display());
+
     let relays_input: String = Input::new()
         .with_prompt("Nostr relays (comma-separated)")
         .default("wss://relay.mostro.network".to_string())
@@ -188,8 +216,9 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
         .collect();
 
     Ok(NostrSettings {
-        nsec_privkey,
+        nsec_privkey_file: nsec_privkey_file.to_string_lossy().to_string(),
         relays,
+        ..Default::default()
     })
 }
 

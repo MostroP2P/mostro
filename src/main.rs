@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     };
 
     // Get mostro keys
-    let mostro_keys = util::get_keys()?;
+    let mostro_keys = util::get_keys().await?;
 
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())

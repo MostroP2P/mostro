@@ -1,7 +1,7 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
 use crate::lightning::LnStatus;
-use crate::util::{get_expiration_timestamp_for_kind, get_keys};
+use crate::util::{get_expiration_timestamp_for_kind};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
 use nostr::event::builder::Error;
@@ -349,14 +349,24 @@ fn create_source_tag(
 /// # Arguments
 ///
 /// * `order` - The order to transform into tags
-/// * `reputation_data` - Optional reputation data for the maker
-/// * `mostro_pubkey` - Optional Mostro pubkey override. If None, derived from get_keys().
-///   Pass Some() in tests to avoid global state dependencies.
+/// * `reputation_data` - Optional maker reputation data as
+///   `(average_rating, total_reviews, created_at_timestamp)`.
+///   When present, the tuple is encoded into the `rating` tag.
+///   When absent, no `rating` tag is emitted.
+/// * `mostro_pubkey` - Borrowed Mostro public key used to build the `source` tag.
+///   Callers must pass the exact instance key as `&nostr::PublicKey`.
+///   The function does not derive or load this key internally.
+///
+/// # Returns
+///
+/// Returns `Ok(Some(Tags))` when the order status should be represented as a NIP-33 event.
+/// Returns `Ok(None)` when no event should be emitted for the order's current state.
+/// Returns `Err(MostroError)` if required tags cannot be constructed.
 ///
 pub fn order_to_tags(
     order: &Order,
     reputation_data: Option<(f64, i64, i64)>,
-    mostro_pubkey: Option<&str>,
+    mostro_pubkey: &nostr::PublicKey
 ) -> Result<Option<Tags>, MostroError> {
     // Position of the tags in the list
     const RATING_TAG_INDEX: usize = 7;
@@ -366,10 +376,7 @@ pub fn order_to_tags(
     let (create_event, status) = create_status_tags(order)?;
     // Create mostro: scheme link in case of pending order creation
     // Include the Mostro pubkey so clients can identify the instance
-    let pubkey = match mostro_pubkey {
-        Some(pk) => pk.to_string(),
-        None => get_keys()?.public_key().to_hex(),
-    };
+    let pubkey = mostro_pubkey.to_hex().to_string();
     let mostro_link = create_source_tag(order, &Settings::get_nostr().relays, &pubkey)?;
 
     // Send just in case the order is pending/in-progress/success/canceled
@@ -574,10 +581,6 @@ mod tests {
 
     // ── Shared test helpers ──────────────────────────────────────────────────────
 
-    /// Test Mostro pubkey (derived from the test nsec in test_settings)
-    const TEST_MOSTRO_PUBKEY: &str =
-        "9a0e40e008c6dcfdb3c608a65ddf1c4e72eed7eeefbe1eb88ea0f1ea8b43dc4d";
-
     /// Initialize global settings once per test binary run using the canonical
     /// test_settings() helper from AppContext test_utils — consistent with the
     /// rest of the test infrastructure.
@@ -663,7 +666,8 @@ mod tests {
         init_test_settings();
         let order = make_pending_order();
 
-        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+        let default_nostr_pub_key = nostr::Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd").unwrap().public_key();
+        let tags = order_to_tags(&order, None, &default_nostr_pub_key)
             .expect("order_to_tags must not error")
             .expect("pending order must produce Some(tags)");
 
@@ -677,7 +681,8 @@ mod tests {
         init_test_settings();
         let order = make_pending_order();
 
-        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+        let default_nostr_pub_key = nostr::Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd").unwrap().public_key();
+        let tags = order_to_tags(&order, None, &default_nostr_pub_key)
             .expect("order_to_tags must not error")
             .expect("pending order must produce Some(tags)");
 
@@ -709,7 +714,8 @@ mod tests {
         init_test_settings();
         let order = make_pending_order();
 
-        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+        let default_nostr_pub_key = nostr::Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd").unwrap().public_key();
+        let tags = order_to_tags(&order, None, &default_nostr_pub_key)
             .expect("order_to_tags must not error")
             .expect("pending order must produce Some(tags)");
 
@@ -724,9 +730,10 @@ mod tests {
             source.contains("&mostro="),
             "source must contain '&mostro=' parameter"
         );
+        let pubkey_hex = default_nostr_pub_key.to_hex();
         assert!(
-            source.contains(&format!("&mostro={}", TEST_MOSTRO_PUBKEY)),
-            "source must contain the correct Mostro pubkey"
+            source.contains(&format!("&mostro={}", pubkey_hex)),
+            "source must contain the correct Mostro pubkey: {}", source
         );
     }
 

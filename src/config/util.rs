@@ -32,6 +32,19 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
         ))));
     }
 
+    if settings.nostr.nsec_privkey.is_some() {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "nostr.nsec_privkey is no longer supported; move the key to nostr.nsec_privkey_file"
+                .to_string(),
+        )));
+    }
+
+    if settings.nostr.nsec_privkey_file.trim().is_empty() {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "Missing Nostr private key file configuration".to_string(),
+        )));
+    }
+
     Ok(())
 }
 
@@ -99,4 +112,53 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     tracing::info!("Settings correctly loaded!");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{
+        DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    };
+
+    fn make_settings(nostr: NostrSettings) -> Settings {
+        Settings {
+            database: DatabaseSettings::default(),
+            lightning: LightningSettings::default(),
+            nostr,
+            mostro: MostroSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: None,
+        }
+    }
+
+    #[test]
+    fn validate_mostro_settings_rejects_legacy_inline_nsec() {
+        let settings = make_settings(NostrSettings {
+            nsec_privkey: Some(
+                "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd".to_string(),
+            ),
+            relays: vec!["wss://relay.test".to_string()],
+            ..Default::default()
+        });
+
+        let error = validate_mostro_settings(&settings).expect_err("inline nsec must be rejected");
+        assert!(error
+            .to_string()
+            .contains("nostr.nsec_privkey is no longer supported"));
+    }
+
+    #[test]
+    fn validate_mostro_settings_requires_private_key_file() {
+        let settings = make_settings(NostrSettings {
+            relays: vec!["wss://relay.test".to_string()],
+            ..Default::default()
+        });
+
+        let error =
+            validate_mostro_settings(&settings).expect_err("missing key file must be rejected");
+        assert!(error
+            .to_string()
+            .contains("Missing Nostr private key file configuration"));
+    }
 }

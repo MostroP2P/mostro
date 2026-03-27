@@ -125,8 +125,12 @@ pub struct LightningSettings {
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NostrSettings {
-    /// Nostr private key
-    pub nsec_privkey: String,
+    /// Path to file containing the Nostr private key (nsec)
+    #[serde(default)]
+    pub nsec_privkey_file: String,
+    /// Legacy inline Nostr private key kept for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nsec_privkey: Option<String>,
     /// Nostr relays list
     pub relays: Vec<String>,
 }

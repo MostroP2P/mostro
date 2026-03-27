@@ -59,7 +59,7 @@ mod tests {
 
     // Fake settings for the test
     const NOSTR_SETTINGS: &str = r#"[nostr]
-                                    nsec_privkey = 'nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd'
+                                    nsec_privkey_file = '/tmp/mostro-test-nostr-key.nsec'
                                     relays = ['wss://relay.damus.io','wss://relay.mostro.network']"#;
 
     const LIGHTNING_SETTINGS: &str = r#"[lightning]
@@ -194,13 +194,30 @@ mod tests {
         let nostr_settings: StubSettingsNostr =
             toml::from_str(NOSTR_SETTINGS).expect("Failed to deserialize");
         assert_eq!(
-            nostr_settings.nostr.nsec_privkey,
-            "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+            nostr_settings.nostr.nsec_privkey_file,
+            "/tmp/mostro-test-nostr-key.nsec"
         );
+        assert_eq!(nostr_settings.nostr.nsec_privkey, None);
         assert_eq!(
             nostr_settings.nostr.relays,
             vec!["wss://relay.damus.io", "wss://relay.mostro.network"]
         );
+    }
+
+    #[test]
+    fn test_nostr_settings_legacy_inline_key() {
+        let legacy_settings = r#"[nostr]
+                                    nsec_privkey = 'nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd'
+                                    relays = ['wss://relay.damus.io']"#;
+        let nostr_settings: StubSettingsNostr =
+            toml::from_str(legacy_settings).expect("Failed to deserialize");
+
+        assert_eq!(nostr_settings.nostr.nsec_privkey_file, "");
+        assert_eq!(
+            nostr_settings.nostr.nsec_privkey.as_deref(),
+            Some("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd")
+        );
+        assert_eq!(nostr_settings.nostr.relays, vec!["wss://relay.damus.io"]);
     }
 
     #[test]

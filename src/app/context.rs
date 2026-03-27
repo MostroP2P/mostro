@@ -85,7 +85,7 @@ impl AppContext {
 
     /// Mostro's Nostr signing keys.
     ///
-    /// Parsed once at startup from `settings.nostr.nsec_privkey`.
+    /// Parsed once at startup from `settings.nostr.nsec_privkey_file`.
     /// Use this instead of `get_keys()` to avoid re-parsing on every call.
     pub fn keys(&self) -> &Keys {
         &self.keys
@@ -99,6 +99,7 @@ pub mod test_utils {
         DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
         RpcSettings,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
@@ -228,10 +229,17 @@ pub mod test_utils {
                 .order_msg_queue
                 .unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
 
-            // Use provided keys or parse from settings
+            // Use provided keys or load from nsec_privkey_file
             let keys = self.keys.unwrap_or_else(|| {
-                Keys::parse(&settings.nostr.nsec_privkey)
-                    .expect("TestContextBuilder: invalid nsec_privkey in settings")
+                let nsec = std::fs::read_to_string(&settings.nostr.nsec_privkey_file)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "TestContextBuilder: failed to read nsec_privkey_file '{}': {}",
+                            settings.nostr.nsec_privkey_file, e
+                        )
+                    });
+                Keys::parse(nsec.trim())
+                    .expect("TestContextBuilder: invalid nsec in nsec_privkey_file")
             });
 
             AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
@@ -251,17 +259,29 @@ pub mod test_utils {
         }
     }
 
+    static TEST_KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     /// Generate deterministic test settings with sensible defaults.
     pub fn test_settings() -> Settings {
+        let nsec_key = "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd";
+        let counter = TEST_KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nsec_dir = std::env::temp_dir().join(format!(
+            "mostro-test-{}-{}",
+            std::process::id(),
+            counter
+        ));
+        std::fs::create_dir_all(&nsec_dir).expect("failed to create test nsec key directory");
+        let nsec_path = nsec_dir.join("nostr-key.nsec");
+        std::fs::write(&nsec_path, nsec_key).expect("failed to write test nsec key file");
+
         Settings {
             database: DatabaseSettings {
                 url: "sqlite::memory:".to_string(),
             },
             nostr: NostrSettings {
-                // Valid test nsec from src/config/mod.rs tests
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey_file: nsec_path.to_string_lossy().to_string(),
                 relays: vec!["wss://relay.test".to_string()],
+                ..Default::default()
             },
             mostro: MostroSettings::default(),
             lightning: LightningSettings::default(),

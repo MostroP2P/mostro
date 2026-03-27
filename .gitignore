@@ -3,6 +3,7 @@
 mostro.db*
 mostro.log
 lnurl-test-server/target
+vendor
 
 # IDE's
 .idea

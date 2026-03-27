@@ -63,7 +63,7 @@ impl BitcoinPriceManager {
 
     /// Publishes exchange rates to Nostr as a NIP-33 addressable event (kind 30078)
     async fn publish_rates_to_nostr(rates: &HashMap<String, f64>) -> Result<(), MostroError> {
-        let keys = get_keys().map_err(|e| {
+        let keys = get_keys().await.map_err(|e| {
             error!("Failed to get Mostro keys: {}", e);
             MostroInternalErr(ServiceError::IOError(e.to_string()))
         })?;

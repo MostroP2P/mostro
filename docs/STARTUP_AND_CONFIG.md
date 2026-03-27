@@ -89,8 +89,10 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
   - Example (absolute path; use a real path — **do not** use `~`; SQLx does not expand tilde): `"sqlite:///home/youruser/.mostro/mostro.db"`
   - Default: `"sqlite://mostro.db"`
 
-**Nostr** (`src/config/types.rs:47-54`):
-- `nsec_privkey` (String): Mostro's Nostr private key in nsec format
+**Nostr** (`src/config/types.rs`):
+- `nsec_privkey_file` (String): Path to a file containing Mostro's Nostr private key in nsec format
+  - The file should contain only the `nsec` value
+  - Inline `nsec_privkey` is no longer supported and causes startup validation to fail
 - `relays` (Vec<String>): List of Nostr relay URLs for event broadcasting
   - Default: `['ws://localhost:7000']`
   - Note: At least one relay required

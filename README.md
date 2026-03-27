@@ -492,8 +492,8 @@ payment_retries_interval = 60  # seconds between retries
 #### Nostr Configuration
 ```toml
 [nostr]
-# Your Mostro daemon's private key (nsec format)
-nsec_privkey = 'nsec1...'
+# Path to a file containing your Mostro daemon's private key (nsec format)
+nsec_privkey_file = '/home/user/.mostro/nostr-key.nsec'
 
 # Relays to connect to
 relays = [
@@ -508,6 +508,10 @@ relays = [
 # Using rana (https://github.com/grunch/rana)
 rana --vanity mostro
 ```
+
+Save the generated `nsec` in the file referenced by `nsec_privkey_file`.
+Mostro expects that file to contain only the `nsec` value.
+Inline `nostr.nsec_privkey` is no longer supported and startup will fail until you move the key into a file.
 
 **Important**: Never reuse keys between Mostro instances. Each daemon needs a unique identity.
 

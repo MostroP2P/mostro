@@ -19,7 +19,7 @@ payment_attempts = 3
 payment_retries_interval = 60
 
 [nostr]
-nsec_privkey = 'nsec1...'
+nsec_privkey_file = '/home/user/nostr-key.nsec'
 relays = ['ws://localhost:7000']
 
 [mostro]

@@ -109,7 +109,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Fee Configuration:*
 - `fee` (f64): Mostro trading fee percentage (default: 0)
-- `max_routing_fee` (f64): Maximum routing fee percentage; 0.001 = 0.1% (default: 0.001)
+- `max_routing_fee` (f64): Maximum routing fee percentage; 0.002 = 0.2% (default: 0.002)
 
 *Order Limits:*
 - `max_order_amount` (u32): Maximum order amount in satoshis (default: 1000000)

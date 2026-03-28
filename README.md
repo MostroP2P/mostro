@@ -519,8 +519,8 @@ rana --vanity mostro
 # Trading fee (0.006 = 0.6%, charged to both parties)
 fee = 0.006
 
-# Maximum Lightning routing fee tolerance (0.001 = 0.1%)
-max_routing_fee = 0.001
+# Maximum Lightning routing fee tolerance (0.002 = 0.2%)
+max_routing_fee = 0.002
 
 # Order limits (satoshis)
 max_order_amount = 1000000     # 1M sats max per order

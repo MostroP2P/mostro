@@ -88,15 +88,13 @@ pub async fn check_failure_retries(
 
     // Only update payment-retry fields to avoid overwriting fields modified by
     // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
-    sqlx::query(
-        "UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?",
-    )
-    .bind(order.failed_payment)
-    .bind(order.payment_attempts)
-    .bind(order.id)
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
+        .bind(order.failed_payment)
+        .bind(order.payment_attempts)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }

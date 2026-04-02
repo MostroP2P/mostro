@@ -200,11 +200,24 @@ pub async fn release_action(
     // explicit write the settled-hold-invoice status only lived in memory and
     // was persisted as a side-effect of the full-row writes in
     // check_failure_retries / payment_success (now replaced by targeted updates).
-    order
-        .clone()
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
+            .bind(&order.status)
+            .bind(&order.event_id)
+            .bind(order.id)
+            .bind(Status::FiatSent.to_string())
+            .bind(Status::Dispute.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
+            order.id
+        );
+        return Ok(());
+    }
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation.

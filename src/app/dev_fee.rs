@@ -79,6 +79,14 @@ use tracing::{error, info, warn};
 
 // ── Public entry point ──────────────────────────────────────────────────
 
+/// Whether to emit the aggregate log after stale PENDING cleanup.
+///
+/// Split out so `count > 0` is covered by unit tests and caught by
+/// `cargo mutants` (replacing `>` with `==`, `<`, or `>=` breaks the tests).
+fn should_emit_stale_pending_summary(count: u32) -> bool {
+    count > 0
+}
+
 /// Run one full dev‑fee processing cycle.
 ///
 /// Called by the scheduler every tick. Phases run sequentially so each
@@ -101,6 +109,9 @@ pub async fn run_dev_fee_cycle(
 
 /// Reset PENDING markers older than `CLEANUP_TTL_SECS` so those orders
 /// become eligible for a fresh payment attempt on the next cycle.
+///
+/// Returns how many stale markers were processed this run (`0` if the
+/// pending-order query fails).
 async fn cleanup_stale_pending_markers(pool: &SqlitePool) -> u32 {
     const CLEANUP_TTL_SECS: u64 = 300; // 5 minutes
     let now_unix = Utc::now().timestamp() as u64;
@@ -173,7 +184,7 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) -> u32 {
         }
     }
 
-    if stale_count > 0 {
+    if should_emit_stale_pending_summary(stale_count) {
         warn!(
             "Reset {} stale PENDING dev fee orders (TTL: {}s)",
             stale_count, CLEANUP_TTL_SECS
@@ -469,7 +480,7 @@ async fn handle_payment_success(
         );
         order.dev_fee_payment_hash = Some(payment_hash.to_string());
     }
-    // We only set dev_fee_paid to true if the payment hash is correct
+    // We only set dev_fee_paid to true if the payment hash is stored in the database
     order.dev_fee_paid = true;
 
     info!("Payment succeeded for order {}, verifying DB", order_id);
@@ -908,7 +919,7 @@ mod tests {
     use super::{
         cleanup_stale_pending_markers, handle_payment_failure, handle_payment_success,
         parse_pending_timestamp, release_pending_claim, resolve_dev_fee_invoice,
-        try_claim_order_for_dev_fee,
+        should_emit_stale_pending_summary, try_claim_order_for_dev_fee,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
@@ -1454,5 +1465,15 @@ mod tests {
             Err(MostroError::MostroInternalErr(ServiceError::WrongAmountError)) => {}
             _ => panic!("Expected WrongAmountError, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn stale_pending_summary_logged_only_for_positive_count() {
+        assert!(
+            !should_emit_stale_pending_summary(0),
+            "No aggregate summary when nothing was reset"
+        );
+        assert!(should_emit_stale_pending_summary(1));
+        assert!(should_emit_stale_pending_summary(2));
     }
 }

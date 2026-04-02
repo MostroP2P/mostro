@@ -564,15 +564,15 @@ async fn payment_success(
         // Only update status and event_id to avoid overwriting fields modified by
         // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
         // The WHERE guard prevents double success transitions from concurrent tasks.
-        let result = sqlx::query(
-            "UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = 'settled-hold-invoice'",
-        )
-        .bind(&order_updated.status)
-        .bind(&order_updated.event_id)
-        .bind(order_updated.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let result =
+            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+                .bind(&order_updated.status)
+                .bind(&order_updated.event_id)
+                .bind(order_updated.id)
+                .bind(Status::SettledHoldInvoice.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         if result.rows_affected() == 0 {
             tracing::warn!(

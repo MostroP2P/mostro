@@ -74,6 +74,13 @@ pub async fn admin_settle_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Persist the status change to DB before calling do_payment (same reason as release_action)
+    order_updated
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
 

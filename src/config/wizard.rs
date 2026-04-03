@@ -50,10 +50,7 @@ pub fn run_setup_menu(
     }
 }
 
-fn run_setup_wizard(
-    settings_dir: &Path,
-    config_file_path: &Path,
-) -> Result<Settings, MostroError> {
+fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Settings, MostroError> {
     println!("\n--- Lightning (LND) Configuration ---\n");
 
     let lightning = prompt_lightning_settings()?;
@@ -81,17 +78,11 @@ fn run_setup_wizard(
     std::fs::write(config_file_path, toml_content)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    println!(
-        "\nConfiguration saved to {}\n",
-        config_file_path.display()
-    );
+    println!("\nConfiguration saved to {}\n", config_file_path.display());
 
     // Override database URL to use settings directory
     let mut settings = settings;
-    settings.database.url = format!(
-        "sqlite://{}",
-        settings_dir.join("mostro.db").display()
-    );
+    settings.database.url = format!("sqlite://{}", settings_dir.join("mostro.db").display());
 
     Ok(settings)
 }
@@ -142,12 +133,14 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?
     } else {
         let keys = Keys::generate();
-        let nsec = keys.secret_key().to_bech32().map_err(|e| {
-            MostroInternalErr(ServiceError::IOError(e.to_string()))
-        })?;
-        let npub = keys.public_key().to_bech32().map_err(|e| {
-            MostroInternalErr(ServiceError::IOError(e.to_string()))
-        })?;
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
         println!("\nGenerated new Nostr keypair:");
         println!("  nsec: {}", nsec);
@@ -219,26 +212,35 @@ pub fn validate_file_exists(path: &str) -> Result<(), String> {
 }
 
 pub fn validate_nsec(input: &str) -> Result<(), String> {
-    Keys::parse(input.trim()).map(|_| ()).map_err(|e| format!("Invalid nsec key: {}", e))
+    Keys::parse(input.trim())
+        .map(|_| ())
+        .map_err(|e| format!("Invalid nsec key: {}", e))
 }
 
 pub fn validate_relays(input: &str) -> Result<(), String> {
-    let relays: Vec<&str> = input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let relays: Vec<&str> = input
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if relays.is_empty() {
         return Err("At least one relay is required".to_string());
     }
     for relay in &relays {
         if !relay.starts_with("ws://") && !relay.starts_with("wss://") {
-            return Err(format!("Invalid relay URL (must start with ws:// or wss://): {}", relay));
+            return Err(format!(
+                "Invalid relay URL (must start with ws:// or wss://): {}",
+                relay
+            ));
         }
     }
     Ok(())
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
+    if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
+            return home.join(stripped);
         }
     }
     PathBuf::from(path)
@@ -250,7 +252,10 @@ mod tests {
 
     #[test]
     fn test_validate_nsec_valid() {
-        assert!(validate_nsec("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd").is_ok());
+        assert!(
+            validate_nsec("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd")
+                .is_ok()
+        );
     }
 
     #[test]

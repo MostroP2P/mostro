@@ -74,6 +74,25 @@ pub async fn admin_settle_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Persist the status change to DB before calling do_payment (same reason as release_action)
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+            .bind(&order_updated.status)
+            .bind(&order_updated.event_id)
+            .bind(order_updated.id)
+            .bind(Status::Dispute.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
+            order_updated.id
+        );
+        return Ok(());
+    }
+
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
 

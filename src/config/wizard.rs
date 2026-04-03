@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dialoguer::{Confirm, Input, Password, Select};
+use dialoguer::{Confirm, Input, Select};
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
@@ -135,10 +135,10 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     let nsec_privkey = if has_nsec {
-        Password::new()
+        Input::new()
             .with_prompt("Enter your nsec private key")
             .validate_with(|input: &String| validate_nsec(input))
-            .interact()
+            .interact_text()
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?
     } else {
         let keys = Keys::generate();

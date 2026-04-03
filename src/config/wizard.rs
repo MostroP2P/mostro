@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, Select};
@@ -75,8 +76,18 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
     let toml_content = toml::to_string_pretty(&settings)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    std::fs::write(config_file_path, toml_content)
-        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(config_file_path)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        file.write_all(toml_content.as_bytes())
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
 
     println!("\nConfiguration saved to {}\n", config_file_path.display());
 
@@ -93,12 +104,14 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         .validate_with(|input: &String| validate_file_exists(input))
         .interact_text()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    let lnd_cert_file = resolve_file_path(&lnd_cert_file)?;
 
     let lnd_macaroon_file: String = Input::new()
         .with_prompt("Path to LND admin.macaroon file")
         .validate_with(|input: &String| validate_file_exists(input))
         .interact_text()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    let lnd_macaroon_file = resolve_file_path(&lnd_macaroon_file)?;
 
     let lnd_grpc_host: String = Input::new()
         .with_prompt("LND gRPC host")
@@ -204,11 +217,23 @@ fn prompt_mostro_settings() -> Result<MostroSettings, MostroError> {
 
 pub fn validate_file_exists(path: &str) -> Result<(), String> {
     let expanded = expand_tilde(path);
-    if expanded.exists() {
-        Ok(())
-    } else {
-        Err(format!("File not found: {}", expanded.display()))
+    if !expanded.exists() {
+        return Err(format!("File not found: {}", expanded.display()));
     }
+    if !expanded.is_file() {
+        return Err(format!(
+            "Path is not a regular file: {}",
+            expanded.display()
+        ));
+    }
+    Ok(())
+}
+
+pub fn resolve_file_path(path: &str) -> Result<String, MostroError> {
+    let expanded = expand_tilde(path);
+    std::fs::canonicalize(&expanded)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))
 }
 
 pub fn validate_nsec(input: &str) -> Result<(), String> {

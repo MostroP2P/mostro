@@ -72,7 +72,6 @@ use mostro_core::error::MostroError::MostroInternalErr;
 use mostro_core::error::ServiceError;
 use mostro_core::order::Order;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info, warn};
@@ -120,7 +119,7 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
 
     let mut stale_count = 0u32;
 
-    for mut pending_order in pending_orders {
+    for pending_order in pending_orders {
         let order_id = pending_order.id;
         let marker = pending_order
             .dev_fee_payment_hash
@@ -154,15 +153,29 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
             order_id, age_display
         );
 
-        pending_order.dev_fee_paid = false;
-        pending_order.dev_fee_payment_hash = None;
-
-        match pending_order.update(pool).await {
-            Ok(_) => {
-                info!(
-                    "Reset stale PENDING for order {}, will retry payment",
-                    order_id
-                );
+        // Targeted update: only touch dev fee columns, and only if marker still matches.
+        match sqlx::query(
+            "UPDATE orders
+             SET dev_fee_paid = 0, dev_fee_payment_hash = NULL
+             WHERE id = ? AND dev_fee_payment_hash = ?",
+        )
+        .bind(order_id)
+        .bind(marker)
+        .execute(pool)
+        .await
+        {
+            Ok(result) => {
+                if result.rows_affected() > 0 {
+                    info!(
+                        "Reset stale PENDING for order {}, will retry payment",
+                        order_id
+                    );
+                } else {
+                    warn!(
+                        "Skipping stale PENDING reset for order {}: marker changed concurrently",
+                        order_id
+                    );
+                }
             }
             Err(e) => {
                 error!(
@@ -266,7 +279,7 @@ async fn recover_partial_payments(
         }
     };
 
-    for mut hash_order in hash_orders {
+    for hash_order in hash_orders {
         let order_id = hash_order.id;
         let existing_hash = hash_order.dev_fee_payment_hash.clone().unwrap_or_default();
 
@@ -281,16 +294,48 @@ async fn recover_partial_payments(
                     "Order {} payment already succeeded (hash {}), marking as paid",
                     order_id, existing_hash
                 );
-                hash_order.dev_fee_paid = true;
-                match hash_order.update(pool).await {
-                    Ok(updated) => {
-                        confirmed.insert(order_id);
-                        if let Err(e) = publish_dev_fee_audit_event(&updated, &existing_hash).await
-                        {
-                            warn!(
-                                "Failed to publish audit event for recovered order {}: {:?}",
-                                order_id, e
-                            );
+                // Targeted update: mark paid only, without touching unrelated order columns.
+                match sqlx::query(
+                    "UPDATE orders
+                     SET dev_fee_paid = 1
+                     WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+                )
+                .bind(order_id)
+                .bind(&existing_hash)
+                .execute(pool)
+                .await
+                {
+                    Ok(result) => {
+                        if result.rows_affected() > 0 {
+                            confirmed.insert(order_id);
+                            if let Ok(updated) =
+                                sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+                                    .bind(order_id)
+                                    .fetch_one(pool)
+                                    .await
+                            {
+                                if let Err(e) =
+                                    publish_dev_fee_audit_event(&updated, &existing_hash).await
+                                {
+                                    warn!(
+                                        "Failed to publish audit event for recovered order {}: {:?}",
+                                        order_id, e
+                                    );
+                                }
+                            }
+                        } else {
+                            // Already updated (or hash changed). If it's already paid, confirm it.
+                            if let Ok(is_paid) = sqlx::query_scalar::<_, i32>(
+                                "SELECT dev_fee_paid FROM orders WHERE id = ?",
+                            )
+                            .bind(order_id)
+                            .fetch_one(pool)
+                            .await
+                            {
+                                if is_paid != 0 {
+                                    confirmed.insert(order_id);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -306,8 +351,17 @@ async fn recover_partial_payments(
                     "Order {} existing payment failed (hash {}), clearing for retry",
                     order_id, existing_hash
                 );
-                hash_order.dev_fee_payment_hash = None;
-                if let Err(e) = hash_order.update(pool).await {
+                // Targeted update: clear hash only if it still matches the one we checked.
+                if let Err(e) = sqlx::query(
+                    "UPDATE orders
+                     SET dev_fee_payment_hash = NULL
+                     WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+                )
+                .bind(order_id)
+                .bind(&existing_hash)
+                .execute(pool)
+                .await
+                {
                     error!(
                         "Failed to clear failed payment hash for order {}: {:?}",
                         order_id, e
@@ -348,7 +402,7 @@ async fn process_new_dev_fee_payments(
     };
     info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
 
-    for mut order in unpaid_orders {
+    for order in unpaid_orders {
         let order_id = order.id;
 
         // STEP 0: Atomically claim this order to prevent duplicate processing.
@@ -410,15 +464,47 @@ async fn process_new_dev_fee_payments(
             "Storing payment hash {} for order {}",
             payment_hash_hex, order_id
         );
-        order.dev_fee_payment_hash = Some(payment_hash_hex.clone());
-
-        let order = match order.update(pool).await {
+        // Targeted update: store real hash only if we still own the PENDING marker.
+        let updated = match sqlx::query(
+            "UPDATE orders
+             SET dev_fee_payment_hash = ?
+             WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+        )
+        .bind(&payment_hash_hex)
+        .bind(order_id)
+        .bind(&pending_marker)
+        .execute(pool)
+        .await
+        {
             Err(e) => {
                 error!(
                     "Failed to store payment hash for order {}: {:?}",
                     order_id, e
                 );
                 release_pending_claim(pool, order_id, &pending_marker).await;
+                continue;
+            }
+            Ok(result) => result.rows_affected() > 0,
+        };
+
+        if !updated {
+            warn!(
+                "Order {}: cannot store dev fee payment hash; PENDING marker changed concurrently",
+                order_id
+            );
+            continue;
+        }
+
+        let order = match sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await
+        {
+            Err(e) => {
+                error!(
+                    "Failed to reload order {} after storing payment hash: {:?}",
+                    order_id, e
+                );
                 continue;
             }
             Ok(updated_order) => {
@@ -470,7 +556,16 @@ async fn handle_payment_success(
 
     info!("Payment succeeded for order {}, verifying DB", order_id);
 
-    match order.update(pool).await {
+    match sqlx::query(
+        "UPDATE orders
+         SET dev_fee_paid = 1, dev_fee_payment_hash = ?
+         WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(payment_hash)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    {
         Err(e) => {
             error!(
                 "CRITICAL: Dev fee PAID for order {} but DB update FAILED",
@@ -481,7 +576,21 @@ async fn handle_payment_success(
             error!("   Database error: {:?}", e);
             error!("   ACTION REQUIRED: Manual reconciliation");
         }
-        Ok(_) => {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                // Already updated concurrently; still consider it confirmed if DB shows paid.
+                if let Ok(is_paid) =
+                    sqlx::query_scalar::<_, i32>("SELECT dev_fee_paid FROM orders WHERE id = ?")
+                        .bind(order_id)
+                        .fetch_one(pool)
+                        .await
+                {
+                    if is_paid != 0 {
+                        confirmed.insert(order_id);
+                    }
+                }
+                return;
+            }
             info!("Dev fee payment completed for order {}", order_id);
             info!("   Amount: {} sats, Hash: {}", dev_fee_amount, payment_hash);
             confirmed.insert(order_id);
@@ -511,7 +620,7 @@ async fn handle_payment_success(
 }
 
 async fn handle_payment_failure(
-    mut order: Order,
+    _order: Order,
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     e: &MostroError,
@@ -527,8 +636,16 @@ async fn handle_payment_failure(
         "Keeping payment hash for order {} to let idempotency check verify on next cycle",
         order_id
     );
-    order.dev_fee_paid = false;
-    if let Err(db_err) = order.update(pool).await {
+    // Targeted no-op-ish update: never revert paid orders to unpaid.
+    if let Err(db_err) = sqlx::query(
+        "UPDATE orders
+         SET dev_fee_paid = 0
+         WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(order_id)
+    .execute(pool)
+    .await
+    {
         error!(
             "Failed to update order {} after payment failure: {:?}",
             order_id, db_err
@@ -537,7 +654,7 @@ async fn handle_payment_failure(
 }
 
 async fn handle_payment_timeout(
-    mut order: Order,
+    order: Order,
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
@@ -555,8 +672,16 @@ async fn handle_payment_timeout(
                 "Payment actually succeeded for order {} despite timeout",
                 order_id
             );
-            order.dev_fee_paid = true;
-            if let Err(e) = order.update(pool).await {
+            if let Err(e) = sqlx::query(
+                "UPDATE orders
+                 SET dev_fee_paid = 1
+                 WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+            )
+            .bind(order_id)
+            .bind(order.dev_fee_payment_hash.as_deref().unwrap_or_default())
+            .execute(pool)
+            .await
+            {
                 error!(
                     "Payment succeeded but failed to update DB for order {}: {:?}",
                     order_id, e
@@ -575,9 +700,17 @@ async fn handle_payment_timeout(
                 "Payment confirmed failed for order {}, clearing hash for retry",
                 order_id
             );
-            order.dev_fee_paid = false;
-            order.dev_fee_payment_hash = None;
-            if let Err(e) = order.clone().update(pool).await {
+            // Targeted reset: only clear hash if it still matches, and only while unpaid.
+            if let Err(e) = sqlx::query(
+                "UPDATE orders
+                 SET dev_fee_paid = 0, dev_fee_payment_hash = NULL
+                 WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+            )
+            .bind(order_id)
+            .bind(order.dev_fee_payment_hash.as_deref().unwrap_or_default())
+            .execute(pool)
+            .await
+            {
                 error!(
                     "Failed to reset after confirmed failure for order {}: {:?}",
                     order_id, e
@@ -1248,5 +1381,58 @@ mod tests {
 
         assert_eq!(row.0, 0);
         assert_eq!(row.1.as_deref(), Some("existing-hash"));
+    }
+
+    #[tokio::test]
+    async fn targeted_dev_fee_updates_do_not_overwrite_status() {
+        use mostro_core::order::Order;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+
+        // Start in settled-hold-invoice with unpaid dev fee.
+        insert_test_order(
+            &pool,
+            order_id,
+            "settled-hold-invoice",
+            100,
+            false,
+            Some("PENDING-test-marker"),
+        )
+        .await;
+
+        // Stale snapshot (simulates dev-fee loop holding an Order across awaits).
+        let stale_copy = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Concurrently, buyer payment succeeds and status is advanced.
+        sqlx::query("UPDATE orders SET status = 'success' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Dev-fee completion runs with stale copy; should only touch dev-fee fields.
+        let mut confirmed = HashSet::new();
+        handle_payment_success(stale_copy, &pool, &mut confirmed, "deadbeef").await;
+
+        let row: (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT status, dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            row.0, "success",
+            "status must not be overwritten by dev-fee write"
+        );
+        assert_eq!(row.1, 1);
+        assert_eq!(row.2.as_deref(), Some("deadbeef"));
+        assert!(confirmed.contains(&order_id));
     }
 }

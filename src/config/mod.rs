@@ -5,6 +5,7 @@ pub mod settings;
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.
 pub mod types;
 pub mod util;
+pub mod wizard;
 
 // Mostro configuration module
 // This module provides global configuration settings for the Mostro lightning configuration.

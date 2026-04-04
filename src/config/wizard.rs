@@ -77,14 +77,25 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(config_file_path)
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(config_file_path)
+        };
+        #[cfg(not(unix))]
+        let file = {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(config_file_path)
+        };
+        let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
         file.write_all(toml_content.as_bytes())
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
     }

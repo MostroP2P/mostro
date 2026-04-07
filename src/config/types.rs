@@ -3,18 +3,18 @@
 use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Event expiration configuration settings
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExpirationSettings {
-    /// Order events (kind 38383) expiration in days
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_days: Option<u32>,
-    /// Rating events (kind 38384) expiration in days
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rating_days: Option<u32>,
-    /// Dispute events (kind 38386) expiration in days
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dispute_days: Option<u32>,
-    /// Fee audit events (kind 8383) expiration in days
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_audit_days: Option<u32>,
 }
 
@@ -97,13 +97,13 @@ macro_rules! impl_try_from_settings {
     };
 }
 /// Database configuration settings
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct DatabaseSettings {
     /// Database connection URL (e.g., "postgres://user:pass@localhost/dbname")  
     pub url: String,
 }
 /// Lightning configuration settings
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct LightningSettings {
     /// LND certificate file path
     pub lnd_cert_file: String,
@@ -123,7 +123,7 @@ pub struct LightningSettings {
     pub payment_retries_interval: u32,
 }
 /// Nostr configuration settings
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NostrSettings {
     /// Nostr private key
     pub nsec_privkey: String,
@@ -131,7 +131,7 @@ pub struct NostrSettings {
     pub relays: Vec<String>,
 }
 /// RPC configuration settings
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RpcSettings {
     /// Enable RPC server
     pub enabled: bool,
@@ -161,7 +161,7 @@ impl Default for RpcSettings {
 
 /// Mostro configuration settings
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MostroSettings {
     /// Fee percentage for the Mostro
     pub fee: f64,
@@ -194,13 +194,13 @@ pub struct MostroSettings {
     /// Development fee as percentage of Mostro fee (0.10 to 1.0)
     /// Example: 0.30 means 30% of the Mostro fee goes to development
     pub dev_fee_percentage: f64,
-    /// NIP-01 kind 0 metadata: human-readable name for this Mostro instance
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// NIP-01 kind 0 metadata: short description of this Mostro instance
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
-    /// NIP-01 kind 0 metadata: URL to avatar image (recommended max 128x128px)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
-    /// NIP-01 kind 0 metadata: operator website URL
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub website: Option<String>,
     /// Publish exchange rates to Nostr (kind 30078, NIP-33)
     #[serde(default = "default_publish_exchange_rates")]

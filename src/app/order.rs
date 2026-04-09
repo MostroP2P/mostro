@@ -345,7 +345,10 @@ mod tests {
         );
 
         let result = order_action(&ctx, msg, &event, &keys).await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidAmount))
+        ));
     }
 
     #[tokio::test]
@@ -389,7 +392,10 @@ mod tests {
         );
 
         let result = order_action(&ctx, msg, &event, &keys).await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidAmount))
+        ));
     }
 
     mod quote_calculation_tests {

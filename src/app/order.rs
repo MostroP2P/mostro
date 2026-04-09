@@ -88,6 +88,12 @@ pub async fn order_action(
     let request_id = msg.get_inner_message_kind().request_id;
 
     if let Some(order) = msg.get_inner_message_kind().get_order() {
+        // Reject negative fiat_amount always, and zero only for non-range orders
+        let is_range = order.min_amount.is_some() && order.max_amount.is_some();
+        if order.fiat_amount < 0 || (order.fiat_amount == 0 && !is_range) {
+            return Err(MostroCantDo(CantDoReason::InvalidAmount));
+        }
+
         // Validate invoice
         let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
 
@@ -95,12 +101,6 @@ pub async fn order_action(
         let mostro_settings = &ctx.settings().mostro;
         if let Err(cause) = order.check_fiat_currency(&mostro_settings.fiat_currencies_accepted) {
             return Err(MostroCantDo(cause));
-        }
-
-        // Reject negative fiat_amount always, and zero only for non-range orders
-        let is_range = order.min_amount.is_some() && order.max_amount.is_some();
-        if order.fiat_amount < 0 || (order.fiat_amount == 0 && !is_range) {
-            return Err(MostroCantDo(CantDoReason::InvalidAmount));
         }
 
         // Default case single amount

@@ -322,11 +322,11 @@ mod tests {
             None,
             Some(mostro_core::order::Kind::Buy),
             Some(mostro_core::order::Status::Pending),
-            50000,       // sats amount
+            50000, // sats amount
             "USD".to_string(),
-            None,        // no min_amount (not range)
-            None,        // no max_amount (not range)
-            0,           // fiat_amount = 0
+            None, // no min_amount (not range)
+            None, // no max_amount (not range)
+            0,    // fiat_amount = 0
             "cash".to_string(),
             0,
             None,
@@ -368,9 +368,9 @@ mod tests {
             Some(mostro_core::order::Status::Pending),
             0,
             "USD".to_string(),
-            Some(100),   // min_amount
-            Some(500),   // max_amount
-            -10,         // fiat_amount negative
+            Some(100), // min_amount
+            Some(500), // max_amount
+            -10,       // fiat_amount negative
             "cash".to_string(),
             0,
             None,

@@ -97,6 +97,12 @@ pub async fn order_action(
             return Err(MostroCantDo(cause));
         }
 
+        // Reject negative fiat_amount always, and zero only for non-range orders
+        let is_range = order.min_amount.is_some() && order.max_amount.is_some();
+        if order.fiat_amount < 0 || (order.fiat_amount == 0 && !is_range) {
+            return Err(MostroCantDo(CantDoReason::InvalidAmount));
+        }
+
         // Default case single amount
         let mut amount_vec = vec![order.fiat_amount];
         // Get max and and min amount in case of range order
@@ -296,6 +302,94 @@ mod tests {
         // Test case 3: with trade_index
         let msg3 = create_test_message(Some(1));
         let _ = order_action(&ctx, msg3, &event2, &keys).await;
+    }
+
+    #[tokio::test]
+    async fn test_reject_zero_fiat_amount_non_range_order() {
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+
+        let pool = create_test_pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let mut event = create_test_unwrapped_gift();
+        event.sender = event.rumor.pubkey;
+
+        // Order with fiat_amount=0 and amount (sats) != 0, no range
+        let order = SmallOrder::new(
+            None,
+            Some(mostro_core::order::Kind::Buy),
+            Some(mostro_core::order::Status::Pending),
+            50000,       // sats amount
+            "USD".to_string(),
+            None,        // no min_amount (not range)
+            None,        // no max_amount (not range)
+            0,           // fiat_amount = 0
+            "cash".to_string(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let msg = Message::new_order(
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            Some(0),
+            Action::NewOrder,
+            Some(Payload::Order(order)),
+        );
+
+        let result = order_action(&ctx, msg, &event, &keys).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reject_negative_fiat_amount_range_order() {
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+
+        let pool = create_test_pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let mut event = create_test_unwrapped_gift();
+        event.sender = event.rumor.pubkey;
+
+        // Range order with negative fiat_amount
+        let order = SmallOrder::new(
+            None,
+            Some(mostro_core::order::Kind::Buy),
+            Some(mostro_core::order::Status::Pending),
+            0,
+            "USD".to_string(),
+            Some(100),   // min_amount
+            Some(500),   // max_amount
+            -10,         // fiat_amount negative
+            "cash".to_string(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let msg = Message::new_order(
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            Some(0),
+            Action::NewOrder,
+            Some(Payload::Order(order)),
+        );
+
+        let result = order_action(&ctx, msg, &event, &keys).await;
+        assert!(result.is_err());
     }
 
     mod quote_calculation_tests {

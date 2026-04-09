@@ -97,6 +97,16 @@ pub async fn order_action(
             return Err(MostroCantDo(cause));
         }
 
+        // Validate fiat_amount is positive
+        if let Err(cause) = order.check_fiat_amount() {
+            return Err(MostroCantDo(cause));
+        }
+
+        // Validate amount (sats) is non-negative
+        if let Err(cause) = order.check_amount() {
+            return Err(MostroCantDo(cause));
+        }
+
         // Default case single amount
         let mut amount_vec = vec![order.fiat_amount];
         // Get max and and min amount in case of range order

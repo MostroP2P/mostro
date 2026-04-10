@@ -201,6 +201,33 @@ mod tests {
         }
     }
 
+    fn create_test_order_message(fiat_amount: i64, amount: i64) -> Message {
+        let order = mostro_core::order::SmallOrder::new(
+            Some(uuid::Uuid::new_v4()),
+            Some(mostro_core::order::Kind::Sell),
+            Some(mostro_core::order::Status::Pending),
+            amount,
+            "USD".to_string(),
+            None,
+            None,
+            fiat_amount,
+            "BANK".to_string(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Message::new_order(
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            None,
+            Action::NewOrder,
+            Some(Payload::Order(order)),
+        )
+    }
+
     #[tokio::test]
     async fn test_order_action_no_order() {
         let pool = create_test_pool().await;
@@ -224,6 +251,60 @@ mod tests {
 
         let result = order_action(&ctx, msg, &event, &keys).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_order_action_invalid_fiat_amount() {
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let event = create_test_unwrapped_gift();
+
+        // fiat_amount = 0 should be rejected by check_fiat_amount
+        let msg = create_test_order_message(0, 50000);
+        let result = order_action(&ctx, msg, &event, &keys).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MostroCantDo(CantDoReason::InvalidAmount)),
+            "expected InvalidAmount, got: {:?}",
+            err
+        );
+
+        // fiat_amount < 0 should also be rejected with same error
+        let msg = create_test_order_message(-100, 50000);
+        let result = order_action(&ctx, msg, &event, &keys).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MostroCantDo(CantDoReason::InvalidAmount)),
+            "expected InvalidAmount for negative, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_action_invalid_amount() {
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let event = create_test_unwrapped_gift();
+
+        // amount < 0 should be rejected by check_amount
+        let msg = create_test_order_message(100, -50000);
+        let result = order_action(&ctx, msg, &event, &keys).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MostroCantDo(CantDoReason::InvalidAmount)),
+            "expected InvalidAmount, got: {:?}",
+            err
+        );
     }
 
     #[tokio::test]

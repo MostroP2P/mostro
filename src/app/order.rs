@@ -97,9 +97,12 @@ pub async fn order_action(
             return Err(MostroCantDo(cause));
         }
 
-        // Validate fiat_amount is positive
-        if let Err(cause) = order.check_fiat_amount() {
-            return Err(MostroCantDo(cause));
+        // `check_fiat_amount` in mostro-core requires fiat_amount > 0. Range orders set
+        // min/max and use fiat_amount == 0, so only run it for single-amount orders.
+        if order.min_amount.is_none() && order.max_amount.is_none() {
+            if let Err(cause) = order.check_fiat_amount() {
+                return Err(MostroCantDo(cause));
+            }
         }
 
         // Validate amount (sats) is non-negative

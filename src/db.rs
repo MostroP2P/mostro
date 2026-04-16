@@ -781,6 +781,33 @@ pub async fn update_user_rating(
     Ok(rows_affected > 0)
 }
 
+pub async fn solver_has_write_permission(
+    pool: &SqlitePool,
+    solver_pubkey: &str,
+    order_id: Uuid,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM disputes d
+            INNER JOIN users u ON u.pubkey = d.solver_pubkey
+            WHERE d.solver_pubkey = ?1
+              AND d.order_id = ?2
+              AND u.is_solver = true
+              AND u.category = 2
+        )
+        "#,
+    )
+    .bind(solver_pubkey)
+    .bind(order_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result)
+}
+
 pub async fn is_assigned_solver(
     pool: &SqlitePool,
     solver_pubkey: &str,

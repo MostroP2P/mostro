@@ -10,8 +10,8 @@ Admin capabilities and dispute resolution paths.
 
 ## Dispute Lifecycle
 - Open: `src/app/dispute.rs` (Action=Dispute) → mark order as `Dispute` and notify.
-- Admin Take: `src/app/admin_take_dispute.rs` assigns solver.
-- Admin Settle: `src/app/admin_settle.rs` settles/cancels hold or pays out as needed.
+- Admin Take: `src/app/admin_take_dispute.rs` assigns solver. Both `read` and `read-write` solvers may take disputes.
+- Admin Settle: `src/app/admin_settle.rs` settles/cancels hold or pays out as needed. Requires a `read-write` solver.
 
 ## Admin Cancel
 - File: `src/app/admin_cancel.rs`.
@@ -42,5 +42,6 @@ sequenceDiagram
 
 ## Audit and Safety
 - Require admin authentication/authorization at message level.
+- Enforce solver permission levels in the daemon: `read` solvers can assist but cannot execute `admin-settle` or `admin-cancel`.
 - Record solver, timestamps, and decisions in DB for traceability.
 - Avoid leaking sensitive data in logs; scrub invoices and keys.

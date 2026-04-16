@@ -62,7 +62,7 @@ flowchart LR
 - `app/orders.rs` – queries and returns order listings/history.
 - `app/restore_session.rs` – rehydrates context for a client after reconnect.
 - `app/trade_pubkey.rs` – exchanges/updates trade pubkeys for secure comms.
-- Admin modules – force cancel/settle, take disputes, add solvers; guarded and auditable.
+- Admin modules – force cancel/settle, take disputes, add solvers; guarded, auditable, and permission-gated for solver capabilities.
 
 ## Configuration Constants (src/config/constants.rs)
 

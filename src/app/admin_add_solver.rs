@@ -31,9 +31,10 @@ fn parse_solver_payload(payload: &Payload) -> Result<(String, i64), MostroError>
     }
 
     let category = match parts.next().map(str::trim) {
-        None | Some("") | Some("read-write") | Some("write") => SOLVER_CATEGORY_READ_WRITE,
+        None => SOLVER_CATEGORY_READ_WRITE,
         Some("read") => SOLVER_CATEGORY_READ_ONLY,
-        Some(_) => return Err(MostroCantDo(CantDoReason::InvalidParameters)),
+        Some("read-write") | Some("write") => SOLVER_CATEGORY_READ_WRITE,
+        Some("") | Some(_) => return Err(MostroCantDo(CantDoReason::InvalidParameters)),
     };
 
     if parts.next().is_some() {
@@ -71,7 +72,12 @@ pub async fn admin_add_solver_action(
 
     match add_new_user(pool, user).await {
         Ok(r) => info!("Solver added: {} with category {}", r, category),
-        Err(ee) => error!("Error creating solver: {:#?}", ee),
+        Err(ee) => {
+            error!("Error creating solver: {:#?}", ee);
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                ee.to_string(),
+            )));
+        }
     }
 
     let message = Message::new_dispute(None, request_id, None, Action::AdminAddSolver, None);
@@ -123,6 +129,16 @@ mod tests {
     fn parse_solver_payload_rejects_invalid_permission() {
         let err =
             parse_solver_payload(&Payload::TextMessage("npub1test:admin".to_string())).unwrap_err();
+        assert_eq!(
+            err,
+            mostro_core::error::MostroError::MostroCantDo(CantDoReason::InvalidParameters)
+        );
+    }
+
+    #[test]
+    fn parse_solver_payload_rejects_empty_permission_token() {
+        let err =
+            parse_solver_payload(&Payload::TextMessage("npub1test:".to_string())).unwrap_err();
         assert_eq!(
             err,
             mostro_core::error::MostroError::MostroCantDo(CantDoReason::InvalidParameters)

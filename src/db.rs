@@ -781,6 +781,10 @@ pub async fn update_user_rating(
     Ok(rows_affected > 0)
 }
 
+/// Returns true only when the given `solver_pubkey` is assigned to the dispute
+/// identified by `order_id` (`disputes.solver_pubkey` + `disputes.order_id`) and
+/// the matching user row is a solver with read-write permission
+/// (`users.is_solver = true` and `users.category = 2`).
 pub async fn solver_has_write_permission(
     pool: &SqlitePool,
     solver_pubkey: &str,

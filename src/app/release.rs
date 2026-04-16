@@ -86,11 +86,16 @@ pub async fn check_failure_retries(
         .await;
     }
 
-    order
-        .clone()
-        .update(pool)
+    // Only update payment-retry fields to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
+    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
+        .bind(order.failed_payment)
+        .bind(order.payment_attempts)
+        .bind(order.id)
+        .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     Ok(order)
 }
 
@@ -189,6 +194,30 @@ pub async fn release_action(
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Persist the status change to DB before calling do_payment.
+    // do_payment spawns async tasks that capture an Order copy; without this
+    // explicit write the settled-hold-invoice status only lived in memory and
+    // was persisted as a side-effect of the full-row writes in
+    // check_failure_retries / payment_success (now replaced by targeted updates).
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
+            .bind(&order.status)
+            .bind(&order.event_id)
+            .bind(order.id)
+            .bind(Status::FiatSent.to_string())
+            .bind(Status::Dispute.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
+            order.id
+        );
+        return Ok(());
+    }
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation.
@@ -532,11 +561,27 @@ async fn payment_success(
     let pool = ctx.pool();
 
     if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        order_updated
-            .clone()
-            .update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Only update status and event_id to avoid overwriting fields modified by
+        // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
+        // The WHERE guard prevents double success transitions from concurrent tasks.
+        let result =
+            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+                .bind(&order_updated.status)
+                .bind(&order_updated.event_id)
+                .bind(order_updated.id)
+                .bind(Status::SettledHoldInvoice.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        if result.rows_affected() == 0 {
+            tracing::warn!(
+                "Order {} not transitioned to success: already processed by another task",
+                order_updated.id
+            );
+            return Ok(());
+        }
+
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
             request_id,

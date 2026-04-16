@@ -3,10 +3,12 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::config::constants::{MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 const DB_FILENAME: &str = "mostro.db";
@@ -55,17 +57,28 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
     }
     let config_file_path = settings_dir.join("settings.toml");
-    // Check if settings.toml file exists
-    if !config_file_path.exists() {
-        std::fs::write(&config_file_path, include_bytes!("../../settings.tpl.toml"))
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-        println!(
-            "Created settings file from template at {} for Mostro - Edit it to configure your Mostro instance",
-            config_file_path.display()
-        );
-        std::process::exit(0);
+    if !config_file_path.exists() {
+        let settings = if std::io::stdin().is_terminal() {
+            // Interactive: show setup menu (wizard or manual template)
+            wizard::run_setup_menu(&settings_dir, &config_file_path)?
+        } else {
+            // Non-interactive (Docker, CI, systemd): copy template and exit
+            std::fs::write(&config_file_path, include_bytes!("../../settings.tpl.toml"))
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            println!(
+                "Created settings file from template at {} - Edit it to configure your Mostro instance",
+                config_file_path.display()
+            );
+            std::process::exit(0);
+        };
+
+        validate_mostro_settings(&settings)?;
+        init_mostro_settings(settings);
+        tracing::info!("Settings correctly loaded!");
+        return Ok(());
     }
+
     // Read the file content
     let contents = fs::read_to_string(&config_file_path)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;

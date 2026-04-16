@@ -468,12 +468,32 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
 
 async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
+        let mostro_settings = Settings::get_mostro();
+        let configured_interval = mostro_settings.exchange_rates_update_interval_seconds;
+
+        // Validate interval: minimum 60 seconds to avoid API rate limits
+        const MIN_INTERVAL: u64 = 60;
+        let update_interval = if configured_interval < MIN_INTERVAL {
+            error!(
+                "exchange_rates_update_interval_seconds too low: {}s (minimum: {}s). Using minimum.",
+                configured_interval, MIN_INTERVAL
+            );
+            MIN_INTERVAL
+        } else {
+            configured_interval
+        };
+
+        info!(
+            "Starting Bitcoin price update job (interval: {}s)",
+            update_interval
+        );
+
         loop {
             info!("Updating Bitcoin prices");
             if let Err(e) = BitcoinPriceManager::update_prices().await {
                 error!("Failed to update Bitcoin prices: {}", e);
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
         }
     });
 }

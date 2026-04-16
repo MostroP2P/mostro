@@ -21,6 +21,24 @@ All Mostro contributors submit changes via pull requests. The workflow is as fol
 
 Pull requests should be focused on a single change. Do not mix, for example, refactorings with a bug fix or implementation of a new feature. This practice makes it easier for fellow contributors to review each pull request.
 
+### Protocol / Tag Changes
+
+Changes that affect Nostr event tags (e.g. `y` tags, `z` tags) or event kinds are **protocol changes** and deserve extra care:
+
+- **Single-kind PRs preferred** – limit each PR to one event domain (orders, info, dispute, admin, dev-fee) whenever possible.
+- **Cross-kind changes** – if a PR must touch multiple event domains, include a "Scope Declaration" section in the PR body (see template below) and explain why the change cannot be split.
+- **Compatibility statement** – every protocol-tag PR must state the impact on external consumers (indexers, clients, relays).
+
+#### PR Body Template for Protocol Changes
+
+```markdown
+## Scope Declaration
+- **Event domains affected:** (e.g. orders, info, dispute)
+- **Cross-kind change:** yes / no
+- **Reason (if cross-kind):** …
+- **External compatibility impact:** (indexers, clients, relays)
+```
+
 ## Reviewing Pull Requests
 
 Mostro follows the review workflow established by the Bitcoin Core project. The following is adapted from the [Bitcoin Core contributor documentation](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#peer-review):
@@ -32,6 +50,8 @@ Anyone may participate in peer review which is expressed by comments in the pull
 - `utACK` means "I have not tested the code, but I have reviewed it and it looks OK, I agree it can be merged";
 - `Concept ACK` means "I agree in the general principle of this pull request";
 - `Nit` refers to trivial, often non-blocking issues.
+
+Reviewers should also verify **external contract impact** for any PR that modifies event kinds, tags, or message formats — confirm that indexers, clients, and relays are not silently broken by the change.
 
 Please note that Pull Requests marked `NACK` and/or GitHub's `Change requested` are closed after 30 days if not addressed.
 

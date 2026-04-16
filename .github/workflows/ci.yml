@@ -10,7 +10,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo fmt -- --check
         run: cargo fmt --all -- --check
@@ -18,7 +18,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protobuf
         run: |
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protobuf
         run: |
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protobuf
         run: |
@@ -63,13 +63,13 @@ jobs:
         run: cargo build --release
 
   msrv:
-    name: MSRV build (1.86.0)
+    name: MSRV build (1.93.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.86.0
+          toolchain: 1.93.0
       - name: Install protobuf
         run: |
           sudo apt-get update

@@ -1,11 +1,15 @@
 use crate::config::settings::Settings;
 use crate::lnurl::HTTP_CLIENT;
+use crate::nip33::new_exchange_rates_event;
+use crate::util::{get_keys, get_nostr_client};
+use chrono::Utc;
 use mostro_core::prelude::*;
+use nostr_sdk::prelude::*;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Debug, Deserialize)]
 struct YadioResponse {
@@ -36,10 +40,93 @@ impl BitcoinPriceManager {
             yadio_response.btc.keys().collect::<Vec<&String>>().len()
         );
 
-        let mut prices_write = BITCOIN_PRICES
-            .write()
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        *prices_write = yadio_response.btc;
+        // Clone rates before acquiring lock to avoid holding it across await
+        let rates_clone = yadio_response.btc.clone();
+
+        {
+            let mut prices_write = BITCOIN_PRICES
+                .write()
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            *prices_write = rates_clone.clone();
+        } // Lock is dropped here
+
+        // Publish rates to Nostr if enabled (after releasing the lock)
+        if mostro_settings.publish_exchange_rates_to_nostr {
+            if let Err(e) = Self::publish_rates_to_nostr(&rates_clone).await {
+                error!("Failed to publish exchange rates to Nostr: {}", e);
+                // Don't fail the entire update if Nostr publishing fails
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Publishes exchange rates to Nostr as a NIP-33 addressable event (kind 30078)
+    async fn publish_rates_to_nostr(rates: &HashMap<String, f64>) -> Result<(), MostroError> {
+        let keys = get_keys().map_err(|e| {
+            error!("Failed to get Mostro keys: {}", e);
+            MostroInternalErr(ServiceError::IOError(e.to_string()))
+        })?;
+
+        // Publish in Yadio's exact format: {"BTC": {"USD": 50000.0, "EUR": 45000.0, ...}}
+        // This matches their API response structure
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), rates.clone());
+        let formatted_rates = wrapper;
+
+        let content = serde_json::to_string(&formatted_rates)
+            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+        let timestamp = Utc::now().timestamp();
+
+        // Expiration should be at least 2x the update interval to allow for delays
+        // Cap at 1 hour to prevent stale data
+        // Note: We read settings here (instead of passing from scheduler) to ensure
+        // expiration stays aligned with interval if config is reloaded at runtime
+        let mostro_settings = Settings::get_mostro();
+        let update_interval = mostro_settings.exchange_rates_update_interval_seconds;
+        let expiration_seconds = std::cmp::min(update_interval * 2, 3600);
+        let expiration = timestamp + expiration_seconds as i64;
+
+        let tags = Tags::from_list(vec![
+            Tag::custom(
+                TagKind::Custom("published_at".into()),
+                vec![timestamp.to_string()],
+            ),
+            Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+            Tag::expiration(Timestamp::from(expiration as u64)),
+        ]);
+
+        let event = new_exchange_rates_event(&keys, &content, tags).map_err(|e| {
+            error!("Failed to create exchange rates event: {}", e);
+            MostroInternalErr(ServiceError::MessageSerializationError)
+        })?;
+
+        let client = get_nostr_client().map_err(|e| {
+            error!("Failed to get Nostr client: {}", e);
+            e
+        })?;
+
+        // Publish with timeout to avoid blocking the scheduler
+        // Best-effort: log errors but don't fail the update job
+        let timeout_duration = std::time::Duration::from_secs(30);
+        match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
+            Ok(Ok(output)) => {
+                info!(
+                    "Exchange rates published to Nostr ({} currencies). Output: {:?}",
+                    rates.len(),
+                    output
+                );
+            }
+            Ok(Err(e)) => {
+                error!("Failed to send exchange rates event to relays: {}", e);
+            }
+            Err(_) => {
+                error!("Timeout publishing exchange rates to Nostr (30s exceeded)");
+            }
+        }
+
+        // Always return Ok - publishing is best-effort
         Ok(())
     }
 
@@ -58,6 +145,44 @@ impl BitcoinPriceManager {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_rates_structure() {
+        // Test that Yadio rates are wrapped correctly
+        let mut input_rates = HashMap::new();
+        input_rates.insert("USD".to_string(), 50000.0);
+        input_rates.insert("EUR".to_string(), 45000.0);
+
+        // Wrap in Yadio format: {"BTC": {...}}
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), input_rates.clone());
+
+        assert_eq!(wrapper.len(), 1);
+        assert!(wrapper.contains_key("BTC"));
+        assert_eq!(wrapper.get("BTC").unwrap().get("USD"), Some(&50000.0));
+        assert_eq!(wrapper.get("BTC").unwrap().get("EUR"), Some(&45000.0));
+    }
+
+    #[test]
+    fn test_rates_json_serialization() {
+        // Test that rates can be serialized to Yadio format
+        // Use only fiat currencies (Yadio includes BTC in the wrapper, not in the rates map)
+        let mut input_rates = HashMap::new();
+        input_rates.insert("USD".to_string(), 50000.0);
+        input_rates.insert("EUR".to_string(), 45000.0);
+
+        let mut wrapper = HashMap::new();
+        wrapper.insert("BTC".to_string(), input_rates);
+
+        let json = serde_json::to_string(&wrapper).unwrap();
+        assert!(json.contains("\"BTC\""));
+        assert!(json.contains("\"USD\""));
+        assert!(json.contains("50000"));
+        assert!(json.contains("\"EUR\""));
+        assert!(json.contains("45000"));
+        // Ensure we don't have nested BTC key (would be invalid)
+        assert!(!json.contains("\"BTC\":1"));
+    }
 
     #[test]
     fn test_yadio_response_deserialization() {

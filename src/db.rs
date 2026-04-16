@@ -893,7 +893,8 @@ pub async fn find_user_disputes_by_master_key(
                 WHEN o.buyer_dispute = 1 AND o.seller_dispute = 0 THEN 'buyer'
                 WHEN o.seller_dispute = 1 AND o.buyer_dispute = 0 THEN 'seller'
                 ELSE NULL
-            END AS initiator
+            END AS initiator,
+            d.solver_pubkey AS solver_pubkey
         FROM disputes d
         JOIN orders o ON d.order_id = o.id
         WHERE (o.master_buyer_pubkey = ? OR o.master_seller_pubkey = ?)

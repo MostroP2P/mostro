@@ -36,6 +36,7 @@
 - Commit subject: imperative, ≤50 chars; sign with `git commit -S`.
 - Squash fixups before review.
 - PRs: link the motivating issue, include `cargo test` output, and call out schema or config changes to ease verification.
+- **Protocol/tag changes:** prefer single-kind (single event domain) PRs. Cross-kind changes require a scope declaration and compatibility statement in the PR body (see `CONTRIBUTING.md § Protocol / Tag Changes`).
 
 ## Documentation Guidelines
 - Do not hardcode source code line numbers in documentation (e.g., `src/app/take_buy.rs:11`). Line numbers drift as the codebase evolves, misleading developers. Reference file paths (`src/app/take_buy.rs`) or function names (`fn take_buy_action`) instead, which are far more stable and easily searchable.

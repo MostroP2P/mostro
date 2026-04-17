@@ -812,6 +812,33 @@ pub async fn solver_has_write_permission(
     Ok(result)
 }
 
+/// Returns true when `pubkey` corresponds to a solver user with read-write
+/// permission (`users.is_solver = true` and `users.category = 2`), independent
+/// of any dispute assignment. Use this when the caller is a prospective taker
+/// rather than the currently assigned solver.
+pub async fn user_has_solver_write_permission(
+    pool: &SqlitePool,
+    pubkey: &str,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM users
+            WHERE pubkey = ?1
+              AND is_solver = true
+              AND category = 2
+        )
+        "#,
+    )
+    .bind(pubkey)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result)
+}
+
 pub async fn is_assigned_solver(
     pool: &SqlitePool,
     solver_pubkey: &str,

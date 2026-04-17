@@ -1,5 +1,5 @@
 use crate::app::context::AppContext;
-use crate::db::{find_solver_pubkey, is_user_present};
+use crate::db::{find_solver_pubkey, is_user_present, solver_has_write_permission};
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{get_dispute, send_dm};
 use mostro_core::prelude::*;
@@ -87,6 +87,8 @@ pub async fn pubkey_event_can_solve(
     pool: &Pool<Sqlite>,
     ev_pubkey: &PublicKey,
     status: DisputeStatus,
+    current_solver_pubkey: Option<&str>,
+    dispute_order_id: uuid::Uuid,
     my_keys: &Keys,
 ) -> bool {
     // Is mostro admin taking dispute?
@@ -103,8 +105,37 @@ pub async fn pubkey_event_can_solve(
 
     // Is a solver taking a dispute
     if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
-        if solver.is_solver != 0_i64 && status == DisputeStatus::Initiated {
-            return true;
+        if solver.is_solver != 0_i64 {
+            if status == DisputeStatus::Initiated {
+                return true;
+            }
+
+            if status == DisputeStatus::InProgress {
+                let sender_pubkey = ev_pubkey.to_string();
+                if current_solver_pubkey == Some(sender_pubkey.as_str()) {
+                    return true;
+                }
+
+                if let Some(current_solver_pubkey) = current_solver_pubkey {
+                    let sender_can_write =
+                        solver_has_write_permission(pool, sender_pubkey.as_str(), dispute_order_id)
+                            .await
+                            .unwrap_or(false);
+
+                    if sender_can_write {
+                        if let Ok(current_solver) =
+                            find_solver_pubkey(pool, current_solver_pubkey.to_string()).await
+                        {
+                            if current_solver.is_solver != 0_i64
+                                && current_solver.category
+                                    == crate::app::admin_add_solver::SOLVER_CATEGORY_READ_ONLY
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -126,7 +157,16 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = DisputeStatus::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.sender, dispute_status, mostro_keys).await {
+        if !pubkey_event_can_solve(
+            pool,
+            &event.sender,
+            dispute_status,
+            dispute.solver_pubkey.as_deref(),
+            dispute.order_id,
+            mostro_keys,
+        )
+        .await
+        {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }

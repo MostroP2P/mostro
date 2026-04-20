@@ -218,6 +218,158 @@ async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroErr
     }
 }
 
+async fn table_column_exists(
+    pool: &SqlitePool,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, MostroError> {
+    Ok(sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT COUNT(*)
+        FROM pragma_table_info(?1)
+        WHERE name = ?2
+        "#,
+    )
+    .bind(table_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        > 0)
+}
+
+fn parse_duplicate_column_name(err: &sqlx::migrate::MigrateError) -> Option<String> {
+    let error = err.to_string();
+    let marker = "duplicate column name: ";
+    let column = error.split(marker).nth(1)?.trim();
+    Some(column.to_string())
+}
+
+fn normalize_sql_identifier(token: &str) -> String {
+    token
+        .trim()
+        .trim_end_matches(',')
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_string()
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    sql.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_add_column_statements(sql: &str) -> Option<Vec<(String, String)>> {
+    let sql = strip_sql_comments(sql);
+    let mut operations = Vec::new();
+
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+
+        let tokens: Vec<_> = statement.split_whitespace().collect();
+        if tokens.len() < 6
+            || !tokens[0].eq_ignore_ascii_case("ALTER")
+            || !tokens[1].eq_ignore_ascii_case("TABLE")
+            || !tokens[3].eq_ignore_ascii_case("ADD")
+            || !tokens[4].eq_ignore_ascii_case("COLUMN")
+        {
+            return None;
+        }
+
+        let table_name = normalize_sql_identifier(tokens[2]);
+        let column_name = normalize_sql_identifier(tokens[5]);
+
+        if table_name.is_empty() || column_name.is_empty() {
+            return None;
+        }
+
+        operations.push((table_name, column_name));
+    }
+
+    if operations.is_empty() {
+        None
+    } else {
+        Some(operations)
+    }
+}
+
+async fn applied_migration_versions(pool: &SqlitePool) -> Result<Vec<i64>, MostroError> {
+    sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+async fn reconcile_existing_add_column_migration(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+    duplicate_column: &str,
+) -> Result<bool, MostroError> {
+    let applied_versions = applied_migration_versions(pool).await?;
+
+    for migration in migrator.iter() {
+        if applied_versions.contains(&migration.version) {
+            continue;
+        }
+
+        let Some(operations) = parse_add_column_statements(&migration.sql) else {
+            continue;
+        };
+
+        if !operations.iter().any(|(_, column)| column == duplicate_column) {
+            continue;
+        }
+
+        let mut all_columns_exist = true;
+        for (table_name, column_name) in &operations {
+            if !table_column_exists(pool, table_name, column_name).await? {
+                all_columns_exist = false;
+                break;
+            }
+        }
+
+        if !all_columns_exist {
+            continue;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO _sqlx_migrations (
+                version,
+                description,
+                success,
+                checksum,
+                execution_time
+            ) VALUES (?1, ?2, TRUE, ?3, 0)
+            "#,
+        )
+        .bind(migration.version)
+        .bind(&*migration.description)
+        .bind(&*migration.checksum)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        tracing::warn!(
+            version = migration.version,
+            description = %migration.description,
+            duplicate_column,
+            "Recorded existing add-column migration as already applied"
+        );
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
@@ -292,6 +444,33 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         let conn = SqlitePool::connect(db_url)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        // Run migrations for existing databases too
+        let migrator = sqlx::migrate!();
+        if let Err(e) = migrator.run(&conn).await {
+            if let Some(duplicate_column) = parse_duplicate_column_name(&e) {
+                if reconcile_existing_add_column_migration(&conn, &migrator, &duplicate_column)
+                    .await?
+                {
+                    if let Err(e) = migrator.run(&conn).await {
+                        tracing::error!("Failed to run migrations on existing database: {}", e);
+                        return Err(MostroInternalErr(ServiceError::DbAccessError(
+                            e.to_string(),
+                        )));
+                    }
+                } else {
+                    tracing::error!("Failed to run migrations on existing database: {}", e);
+                    return Err(MostroInternalErr(ServiceError::DbAccessError(
+                        e.to_string(),
+                    )));
+                }
+            } else {
+                tracing::error!("Failed to run migrations on existing database: {}", e);
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    e.to_string(),
+                )));
+            }
+        }
 
         // Run legacy column migration for existing databases
         if let Err(e) = migrate_remove_token_columns(&conn).await {

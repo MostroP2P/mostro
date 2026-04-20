@@ -323,7 +323,10 @@ async fn reconcile_existing_add_column_migration(
             continue;
         };
 
-        if !operations.iter().any(|(_, column)| column == duplicate_column) {
+        if !operations
+            .iter()
+            .any(|(_, column)| column == duplicate_column)
+        {
             continue;
         }
 

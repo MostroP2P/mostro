@@ -1,5 +1,6 @@
+use crate::app::admin_add_solver::SOLVER_CATEGORY_READ_ONLY;
 use crate::app::context::AppContext;
-use crate::db::{find_solver_pubkey, is_user_present};
+use crate::db::{find_solver_pubkey, is_user_present, user_has_solver_write_permission};
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{get_dispute, send_dm};
 use mostro_core::prelude::*;
@@ -87,28 +88,63 @@ pub async fn pubkey_event_can_solve(
     pool: &Pool<Sqlite>,
     ev_pubkey: &PublicKey,
     status: DisputeStatus,
+    current_solver_pubkey: Option<&str>,
     my_keys: &Keys,
 ) -> bool {
+    let sender_pubkey = ev_pubkey.to_string();
+
     // Is mostro admin taking dispute?
     info!(
         "admin pubkey {} -event pubkey {} ",
         my_keys.public_key().to_string(),
-        ev_pubkey.to_string()
+        sender_pubkey
     );
-    if ev_pubkey.to_string() == my_keys.public_key().to_string()
+    if sender_pubkey == my_keys.public_key().to_string()
         && matches!(status, DisputeStatus::InProgress | DisputeStatus::Initiated)
     {
         return true;
     }
 
-    // Is a solver taking a dispute
-    if let Ok(solver) = find_solver_pubkey(pool, ev_pubkey.to_string()).await {
-        if solver.is_solver != 0_i64 && status == DisputeStatus::Initiated {
-            return true;
-        }
+    // Sender must be a solver user
+    let Ok(solver) = find_solver_pubkey(pool, sender_pubkey.clone()).await else {
+        return false;
+    };
+    if solver.is_solver == 0_i64 {
+        return false;
     }
 
-    false
+    // Any solver can pick up a freshly initiated dispute
+    if status == DisputeStatus::Initiated {
+        return true;
+    }
+
+    // Takeover only applies to InProgress disputes
+    if status != DisputeStatus::InProgress {
+        return false;
+    }
+
+    // The currently assigned solver can always continue acting on the dispute
+    let Some(current_solver_pubkey) = current_solver_pubkey else {
+        return false;
+    };
+    if current_solver_pubkey == sender_pubkey {
+        return true;
+    }
+
+    // Takeover path: a write-capable solver may take over from a read-only solver
+    let sender_can_write = user_has_solver_write_permission(pool, sender_pubkey.as_str())
+        .await
+        .unwrap_or(false);
+    if !sender_can_write {
+        return false;
+    }
+
+    let Ok(current_solver) = find_solver_pubkey(pool, current_solver_pubkey.to_string()).await
+    else {
+        return false;
+    };
+
+    current_solver.is_solver != 0_i64 && current_solver.category == SOLVER_CATEGORY_READ_ONLY
 }
 
 pub async fn admin_take_dispute_action(
@@ -126,7 +162,15 @@ pub async fn admin_take_dispute_action(
 
     // Check if the pubkey is a solver or admin
     if let Ok(dispute_status) = DisputeStatus::from_str(&dispute.status) {
-        if !pubkey_event_can_solve(pool, &event.sender, dispute_status, mostro_keys).await {
+        if !pubkey_event_can_solve(
+            pool,
+            &event.sender,
+            dispute_status,
+            dispute.solver_pubkey.as_deref(),
+            mostro_keys,
+        )
+        .await
+        {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
@@ -255,4 +299,133 @@ pub async fn admin_take_dispute_action(
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::admin_add_solver::{SOLVER_CATEGORY_READ_ONLY, SOLVER_CATEGORY_READ_WRITE};
+    use crate::db::add_new_user;
+    use mostro_core::user::User;
+    use sqlx::SqlitePool;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_solver(pool: &SqlitePool, pubkey: &str, category: i64) {
+        add_new_user(pool, User::new(pubkey.to_string(), 0, 1, 0, category, 0))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_solver_can_take_over_inprogress_from_read_only_solver() {
+        let pool = create_test_pool().await;
+        let mostro_keys = Keys::generate();
+        let read_only_keys = Keys::generate();
+        let write_keys = Keys::generate();
+
+        insert_solver(
+            &pool,
+            &read_only_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_ONLY,
+        )
+        .await;
+        insert_solver(
+            &pool,
+            &write_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_WRITE,
+        )
+        .await;
+
+        let current_solver_pubkey = read_only_keys.public_key().to_string();
+        let can_solve = pubkey_event_can_solve(
+            &pool,
+            &write_keys.public_key(),
+            DisputeStatus::InProgress,
+            Some(current_solver_pubkey.as_str()),
+            &mostro_keys,
+        )
+        .await;
+
+        assert!(
+            can_solve,
+            "a write-capable solver must be able to take over an InProgress dispute currently assigned to a read-only solver"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_solver_cannot_take_over_inprogress_from_read_only_solver() {
+        let pool = create_test_pool().await;
+        let mostro_keys = Keys::generate();
+        let current_keys = Keys::generate();
+        let other_keys = Keys::generate();
+
+        insert_solver(
+            &pool,
+            &current_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_ONLY,
+        )
+        .await;
+        insert_solver(
+            &pool,
+            &other_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_ONLY,
+        )
+        .await;
+
+        let current_solver_pubkey = current_keys.public_key().to_string();
+        let can_solve = pubkey_event_can_solve(
+            &pool,
+            &other_keys.public_key(),
+            DisputeStatus::InProgress,
+            Some(current_solver_pubkey.as_str()),
+            &mostro_keys,
+        )
+        .await;
+
+        assert!(
+            !can_solve,
+            "a read-only solver must not be able to take over an InProgress dispute from another read-only solver"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_solver_cannot_take_over_inprogress_from_write_solver() {
+        let pool = create_test_pool().await;
+        let mostro_keys = Keys::generate();
+        let current_keys = Keys::generate();
+        let other_keys = Keys::generate();
+
+        insert_solver(
+            &pool,
+            &current_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_WRITE,
+        )
+        .await;
+        insert_solver(
+            &pool,
+            &other_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_WRITE,
+        )
+        .await;
+
+        let current_solver_pubkey = current_keys.public_key().to_string();
+        let can_solve = pubkey_event_can_solve(
+            &pool,
+            &other_keys.public_key(),
+            DisputeStatus::InProgress,
+            Some(current_solver_pubkey.as_str()),
+            &mostro_keys,
+        )
+        .await;
+
+        assert!(
+            !can_solve,
+            "a write-capable solver must not be able to take over an InProgress dispute already held by another write-capable solver"
+        );
+    }
 }

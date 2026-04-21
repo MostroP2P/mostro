@@ -2,7 +2,10 @@ use std::borrow::Cow;
 use std::str::FromStr;
 
 use crate::app::context::AppContext;
-use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
+use crate::db::{
+    find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
+    solver_has_write_permission,
+};
 use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
@@ -68,6 +71,10 @@ pub async fn admin_cancel_action(
             )));
         }
         _ => {}
+    }
+
+    if !solver_has_write_permission(pool, &event.sender.to_string(), order.id).await? {
+        return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
 
     // Was order cooperatively cancelled?

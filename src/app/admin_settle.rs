@@ -1,5 +1,8 @@
 use crate::app::context::AppContext;
-use crate::db::{find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin};
+use crate::db::{
+    find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
+    solver_has_write_permission,
+};
 use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
@@ -45,6 +48,10 @@ pub async fn admin_settle_action(
             )));
         }
         _ => {}
+    }
+
+    if !solver_has_write_permission(pool, &event.sender.to_string(), order.id).await? {
+        return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
 
     // Was order cooperatively cancelled?
@@ -206,7 +213,12 @@ mod tests {
         let admin_error = CantDoReason::DisputeTakenByAdmin;
         assert_eq!(format!("{:?}", admin_error), "DisputeTakenByAdmin");
 
+        // New error for authenticated callers lacking enough permissions
+        let unauthorized_error = CantDoReason::NotAuthorized;
+        assert_eq!(format!("{:?}", unauthorized_error), "NotAuthorized");
+
         // Verify they are different error types
         assert_ne!(regular_error, admin_error);
+        assert_ne!(admin_error, unauthorized_error);
     }
 }

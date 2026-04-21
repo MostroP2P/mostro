@@ -14,3 +14,5 @@ Quick links to architecture and feature guides.
 Tips
 - Run tests and lints before pushing: `cargo test`, `cargo fmt`, `cargo clippy --all-targets --all-features`.
 - Update SQLx offline data after query/schema changes: `cargo sqlx prepare -- --bin mostrod`.
+
+- [Solver Permission Levels](./SOLVER_PERMISSION_LEVELS.md)

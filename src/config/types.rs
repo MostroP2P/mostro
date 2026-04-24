@@ -5,6 +5,105 @@ use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// Scope of the anti-abuse bond enforcement.
+///
+/// `apply_to` in `[anti_abuse_bond]` selects which trade flow(s) must post a
+/// bond. The feature is deliberately scoped so operators can roll it out one
+/// side at a time (taker first, maker later) as successive phases land.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BondApplyTo {
+    #[default]
+    Take,
+    Create,
+    Both,
+}
+
+impl BondApplyTo {
+    /// True when the taker side of a trade must lock a bond.
+    pub fn applies_to_taker(self) -> bool {
+        matches!(self, BondApplyTo::Take | BondApplyTo::Both)
+    }
+
+    /// True when the maker side of a trade must lock a bond.
+    pub fn applies_to_maker(self) -> bool {
+        matches!(self, BondApplyTo::Create | BondApplyTo::Both)
+    }
+}
+
+/// Anti-abuse bond configuration (issue #711).
+///
+/// Opt-in. When `enabled = false` (the default) every code path added by
+/// this feature remains inert — existing orders behave exactly as before.
+/// See `docs/ANTI_ABUSE_BOND.md` for the full phased rollout.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AntiAbuseBondSettings {
+    /// Master switch. When false, no bond is required and no slashing occurs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fraction of the order amount used for the bond (0.01 = 1%). The
+    /// actual bond is `max(amount_pct * order_amount_sats, base_amount_sats)`.
+    ///
+    /// Named `amount_pct` (not `amount_sats`) because the value is a
+    /// unitless fraction, not a sat quantity — the latter would conflict
+    /// with `Bond::amount_sats`, which *is* an integer sat amount.
+    #[serde(default = "default_bond_amount_pct")]
+    pub amount_pct: f64,
+    /// Floor applied to the bond computation, in satoshis.
+    #[serde(default = "default_bond_base_amount")]
+    pub base_amount_sats: i64,
+    /// Which trade flow(s) require the bond.
+    #[serde(default)]
+    pub apply_to: BondApplyTo,
+    /// Slash the bond when the bonded party loses a dispute.
+    #[serde(default)]
+    pub slash_on_lost_dispute: bool,
+    /// Slash the bond when the bonded party lets the waiting-state timeout
+    /// actually elapse. A cancellation before the timeout MUST always
+    /// release the bond regardless of this flag; see §Phase 4 of the spec.
+    #[serde(default)]
+    pub slash_on_waiting_timeout: bool,
+    /// How long (seconds) Mostro waits between payout-invoice retries
+    /// when asking the winning counterparty for a bolt11. Used by Phase 3.
+    #[serde(default = "default_payout_invoice_window_seconds")]
+    pub payout_invoice_window_seconds: u64,
+    /// Maximum number of payout-invoice retries before a bond transitions
+    /// to `failed` state. Used by Phase 3.
+    #[serde(default = "default_payout_max_retries")]
+    pub payout_max_retries: u32,
+}
+
+fn default_bond_amount_pct() -> f64 {
+    0.01
+}
+
+fn default_bond_base_amount() -> i64 {
+    1_000
+}
+
+fn default_payout_invoice_window_seconds() -> u64 {
+    300
+}
+
+fn default_payout_max_retries() -> u32 {
+    5
+}
+
+impl Default for AntiAbuseBondSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            amount_pct: default_bond_amount_pct(),
+            base_amount_sats: default_bond_base_amount(),
+            apply_to: BondApplyTo::default(),
+            slash_on_lost_dispute: false,
+            slash_on_waiting_timeout: false,
+            payout_invoice_window_seconds: default_payout_invoice_window_seconds(),
+            payout_max_retries: default_payout_max_retries(),
+        }
+    }
+}
+
 /// Event expiration configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExpirationSettings {
@@ -259,3 +358,72 @@ impl_try_from_settings!(
     MostroSettings => mostro,
     RpcSettings => rpc
 );
+
+#[cfg(test)]
+mod anti_abuse_bond_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_off() {
+        let cfg = AntiAbuseBondSettings::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.slash_on_lost_dispute);
+        assert!(!cfg.slash_on_waiting_timeout);
+        assert_eq!(cfg.apply_to, BondApplyTo::Take);
+        assert_eq!(cfg.amount_pct, 0.01);
+        assert_eq!(cfg.base_amount_sats, 1_000);
+        assert_eq!(cfg.payout_invoice_window_seconds, 300);
+        assert_eq!(cfg.payout_max_retries, 5);
+    }
+
+    #[test]
+    fn apply_to_predicates() {
+        assert!(BondApplyTo::Take.applies_to_taker());
+        assert!(!BondApplyTo::Take.applies_to_maker());
+        assert!(!BondApplyTo::Create.applies_to_taker());
+        assert!(BondApplyTo::Create.applies_to_maker());
+        assert!(BondApplyTo::Both.applies_to_taker());
+        assert!(BondApplyTo::Both.applies_to_maker());
+    }
+
+    #[test]
+    fn toml_omits_block() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: Option<AntiAbuseBondSettings>,
+        }
+        let parsed: Stub = toml::from_str("").expect("empty toml is valid");
+        assert!(parsed.anti_abuse_bond.is_none());
+    }
+
+    #[test]
+    fn toml_minimal_block_defaults() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let parsed: Stub =
+            toml::from_str("[anti_abuse_bond]\nenabled = true").expect("minimal block parses");
+        assert!(parsed.anti_abuse_bond.enabled);
+        // Unspecified fields fall back to the documented defaults.
+        assert_eq!(parsed.anti_abuse_bond.apply_to, BondApplyTo::Take);
+        assert_eq!(parsed.anti_abuse_bond.base_amount_sats, 1_000);
+    }
+
+    #[test]
+    fn toml_apply_to_both() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let parsed: Stub = toml::from_str(
+            r#"[anti_abuse_bond]
+enabled = true
+apply_to = "both"
+slash_on_lost_dispute = true"#,
+        )
+        .expect("toml parses");
+        assert_eq!(parsed.anti_abuse_bond.apply_to, BondApplyTo::Both);
+        assert!(parsed.anti_abuse_bond.slash_on_lost_dispute);
+    }
+}

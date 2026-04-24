@@ -1,7 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
-    RpcSettings,
+    AntiAbuseBondSettings, DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings,
+    NostrSettings, RpcSettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -21,6 +21,9 @@ pub struct Settings {
     pub rpc: RpcSettings,
     /// Event expiration configuration settings
     pub expiration: Option<ExpirationSettings>,
+    /// Anti-abuse bond configuration (issue #711). Absent section ≡ disabled.
+    #[serde(default)]
+    pub anti_abuse_bond: Option<AntiAbuseBondSettings>,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -77,5 +80,23 @@ impl Settings {
             .expect("No settings found")
             .expiration
             .as_ref()
+    }
+
+    /// This function retrieves the anti-abuse bond configuration from the
+    /// global `MOSTRO_CONFIG`. Returns `None` when the `[anti_abuse_bond]`
+    /// block is absent (treated as disabled).
+    pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
+        MOSTRO_CONFIG
+            .get()
+            .expect("No settings found")
+            .anti_abuse_bond
+            .as_ref()
+    }
+
+    /// True when the feature is configured AND explicitly enabled. This is
+    /// the single gate every bond-related code path must check before
+    /// running. Keeps the opt-in guarantee simple to audit.
+    pub fn is_bond_enabled() -> bool {
+        Self::get_bond().is_some_and(|cfg| cfg.enabled)
     }
 }

@@ -21,7 +21,8 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 pub use settings::{get_db_pool, init_mostro_settings, Settings};
 pub use types::{
-    DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
+    AntiAbuseBondSettings, BondApplyTo, DatabaseSettings, ExpirationSettings, LightningSettings,
+    MostroSettings, NostrSettings,
 };
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool

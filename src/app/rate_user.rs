@@ -240,6 +240,7 @@ mod tests {
             lightning: Default::default(),
             rpc: Default::default(),
             expiration: Some(Default::default()),
+            anti_abuse_bond: None,
         });
     }
 

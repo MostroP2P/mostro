@@ -87,3 +87,20 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+
+# Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
+# require a Lightning hold-invoice bond from takers and/or makers. See
+# docs/ANTI_ABUSE_BOND.md for the full phased rollout.
+#
+# [anti_abuse_bond]
+# enabled = false
+# # bond = max(amount_pct * order_amount_sats, base_amount_sats)
+# # amount_pct is a unitless fraction (0.01 = 1%); base_amount_sats is a sat floor.
+# amount_pct = 0.01
+# base_amount_sats = 1000
+# # "take" | "create" | "both"
+# apply_to = "take"
+# slash_on_lost_dispute = true
+# slash_on_waiting_timeout = false
+# payout_invoice_window_seconds = 300
+# payout_max_retries = 5

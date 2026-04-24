@@ -46,9 +46,9 @@ Add a new optional section to `settings.toml`. Missing section ≡
 # Master switch. When false the bond code paths are dead.
 enabled = false
 
-# Bond amount = max(amount_sats * order_amount_sats, base_amount_sats)
-# amount_sats is a fraction of the order amount (0.01 = 1%).
-amount_sats = 0.01
+# Bond amount = max(amount_pct * order_amount_sats, base_amount_sats)
+# amount_pct is a unitless fraction of the order amount (0.01 = 1%).
+amount_pct = 0.01
 # Floor, in sats. Prevents trivial bonds on small orders.
 base_amount_sats = 1000
 
@@ -109,7 +109,7 @@ Purely additive. Touches no trade flow.
   existing configs behave identically when merged.
 - Pure function `compute_bond_amount(order_amount_sats: i64, cfg: &AntiAbuseBondSettings) -> i64`
   in `src/app/bond/math.rs` (new module). Returns
-  `max((cfg.amount_sats * order_amount_sats).round() as i64, cfg.base_amount_sats)`
+  `max((cfg.amount_pct * order_amount_sats).round() as i64, cfg.base_amount_sats)`
   with saturating arithmetic. Tests for: 0% percentage, floor dominates,
   percentage dominates, huge amount saturation.
 - Enums (new file `src/app/bond/types.rs`):
@@ -123,16 +123,27 @@ Purely additive. Touches no trade flow.
   CREATE TABLE IF NOT EXISTS bonds (
     id               char(36) primary key not null,
     order_id         char(36) not null,
-    range_parent_id  char(36),          -- null unless range-child tracking (Phase 6)
-    pubkey           char(64) not null, -- trade pubkey of the bonded party
+    -- Phase 6: parent maker bond a child slash row belongs to. NULL for
+    -- parent / non-range rows.
+    parent_bond_id   char(36),
+    -- Phase 6: child (range-taken) order id this row represents. NULL for
+    -- parent / non-range rows.
+    child_order_id   char(36),
+    pubkey           char(64) not null,    -- trade pubkey of the bonded party
     role             varchar(8) not null,  -- 'maker' | 'taker'
     amount_sats      integer not null,
+    -- Phase 6: running total of sats already transitioned to a slashed
+    -- child. 0 for child / non-range rows.
+    slashed_share_sats integer not null default 0,
     state            varchar(16) not null, -- BondState
     slashed_reason   varchar(16),          -- BondSlashReason when state=Slashed
     hash             char(64),             -- payment hash of bond hold invoice
     preimage         char(64),             -- preimage retained by Mostro
     payment_request  text,                 -- bolt11 shown to payer
     payout_invoice   text,                 -- payout invoice from winner (Phase 3+)
+    -- Phase 3: routing-fee ceiling actually used for the payout attempt
+    -- (sats). NULL until the scheduler tries to pay the winner.
+    payout_routing_fee_sats integer,
     payout_attempts  integer not null default 0,
     locked_at        integer,
     released_at      integer,
@@ -142,12 +153,19 @@ Purely additive. Touches no trade flow.
   );
   CREATE INDEX IF NOT EXISTS idx_bonds_order_id ON bonds(order_id);
   CREATE INDEX IF NOT EXISTS idx_bonds_state    ON bonds(state);
+  CREATE INDEX IF NOT EXISTS idx_bonds_parent   ON bonds(parent_bond_id);
   ```
 
+  The Phase 0 migration lands the full column set up-front (parent/child
+  range columns, `slashed_share_sats`, `payout_routing_fee_sats`) rather
+  than staging ALTER TABLEs per phase. Later phases only add code, not
+  schema.
+
   Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
-- `Bond` model (sqlx-crud) and repository helpers in `src/db/bonds.rs`:
-  `create_bond`, `find_bond_by_order_and_role`, `find_bonds_by_state`,
-  `update_bond_state`.
+- `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
+  `create_bond`, `find_bond_by_order_and_role` (parent rows only —
+  filters on `parent_bond_id IS NULL`), `find_bonds_by_state`,
+  `update_bond`.
 - Unit tests for each helper.
 
 ### 5.2 Non-goals
@@ -442,7 +460,7 @@ need to slash.
 For a child order with sats amount `child_sats` and parent bond computed
 from `parent_max_sats`:
 
-```
+```text
 share_fraction  = child_sats / parent_max_sats
 slash_amount    = round(parent_bond_amount * share_fraction)
 ```

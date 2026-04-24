@@ -41,10 +41,14 @@ pub struct AntiAbuseBondSettings {
     /// Master switch. When false, no bond is required and no slashing occurs.
     #[serde(default)]
     pub enabled: bool,
-    /// Percentage of the order amount used for the bond (0.01 = 1%). The
-    /// actual bond is `max(amount_sats * order_amount, base_amount_sats)`.
+    /// Fraction of the order amount used for the bond (0.01 = 1%). The
+    /// actual bond is `max(amount_pct * order_amount_sats, base_amount_sats)`.
+    ///
+    /// Named `amount_pct` (not `amount_sats`) because the value is a
+    /// unitless fraction, not a sat quantity — the latter would conflict
+    /// with `Bond::amount_sats`, which *is* an integer sat amount.
     #[serde(default = "default_bond_amount_pct")]
-    pub amount_sats: f64,
+    pub amount_pct: f64,
     /// Floor applied to the bond computation, in satoshis.
     #[serde(default = "default_bond_base_amount")]
     pub base_amount_sats: i64,
@@ -89,7 +93,7 @@ impl Default for AntiAbuseBondSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            amount_sats: default_bond_amount_pct(),
+            amount_pct: default_bond_amount_pct(),
             base_amount_sats: default_bond_base_amount(),
             apply_to: BondApplyTo::default(),
             slash_on_lost_dispute: false,
@@ -366,7 +370,7 @@ mod anti_abuse_bond_tests {
         assert!(!cfg.slash_on_lost_dispute);
         assert!(!cfg.slash_on_waiting_timeout);
         assert_eq!(cfg.apply_to, BondApplyTo::Take);
-        assert_eq!(cfg.amount_sats, 0.01);
+        assert_eq!(cfg.amount_pct, 0.01);
         assert_eq!(cfg.base_amount_sats, 1_000);
         assert_eq!(cfg.payout_invoice_window_seconds, 300);
         assert_eq!(cfg.payout_max_retries, 5);

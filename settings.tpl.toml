@@ -94,8 +94,9 @@ port = 50051
 #
 # [anti_abuse_bond]
 # enabled = false
-# # bond = max(amount_sats * order_amount, base_amount_sats)
-# amount_sats = 0.01
+# # bond = max(amount_pct * order_amount_sats, base_amount_sats)
+# # amount_pct is a unitless fraction (0.01 = 1%); base_amount_sats is a sat floor.
+# amount_pct = 0.01
 # base_amount_sats = 1000
 # # "take" | "create" | "both"
 # apply_to = "take"

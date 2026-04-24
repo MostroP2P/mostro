@@ -21,21 +21,30 @@ pub async fn create_bond(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
-/// Look up the bond row for a given order + role. Returns `None` if no
-/// bond exists for that pair (the normal case when the feature is off or
-/// doesn't apply to the role).
+/// Look up the parent bond row for a given order + role. Returns `None`
+/// if no bond exists for that pair (the normal case when the feature is
+/// off or doesn't apply to the role).
+///
+/// Phase 6 introduces child slash rows that share the parent's `order_id`
+/// and `role`; those rows carry a non-NULL `parent_bond_id`. The
+/// `parent_bond_id IS NULL` predicate keeps this lookup pinned to the
+/// parent bond so state transitions always target the right row.
 pub async fn find_bond_by_order_and_role(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     role: BondRole,
 ) -> Result<Option<Bond>, mostro_core::error::MostroError> {
     let role_str = role.to_string();
-    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE order_id = ? AND role = ? LIMIT 1")
-        .bind(order_id)
-        .bind(role_str)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+    sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds \
+         WHERE order_id = ? AND role = ? AND parent_bond_id IS NULL \
+         LIMIT 1",
+    )
+    .bind(order_id)
+    .bind(role_str)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// List every bond currently in the given state. Used by the Phase 3
@@ -129,6 +138,33 @@ mod tests {
             .expect("row present");
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.role, "taker");
+    }
+
+    #[tokio::test]
+    async fn fetch_by_order_and_role_ignores_child_rows() {
+        // Phase 6 will store child slash rows that share the parent bond's
+        // `order_id` and `role`; the lookup must still return the parent.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        let child_order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+        insert_parent_order(&pool, child_order_id).await;
+
+        let parent = create_bond(&pool, dummy_bond(order_id, BondRole::Maker))
+            .await
+            .expect("insert parent");
+
+        let mut child = dummy_bond(order_id, BondRole::Maker);
+        child.parent_bond_id = Some(parent.id);
+        child.child_order_id = Some(child_order_id);
+        create_bond(&pool, child).await.expect("insert child");
+
+        let fetched = find_bond_by_order_and_role(&pool, order_id, BondRole::Maker)
+            .await
+            .expect("query")
+            .expect("row present");
+        assert_eq!(fetched.id, parent.id);
+        assert!(fetched.parent_bond_id.is_none());
     }
 
     #[tokio::test]

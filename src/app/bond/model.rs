@@ -50,10 +50,24 @@ pub struct Bond {
     pub hash: Option<String>,
     /// Preimage retained by Mostro. `None` on child rows that share the
     /// parent HTLC.
+    ///
+    /// **Secret.** Never serialize: the preimage is the capability that
+    /// settles the bond HTLC, so leaking it to an audit event, Nostr
+    /// payload, or RPC response would let a third party race Mostro to
+    /// claim the bond. `skip_serializing` keeps it out of any serde
+    /// output a later phase might accidentally introduce; the field is
+    /// still loaded from the DB via `sqlx::FromRow` as normal.
+    #[serde(skip_serializing)]
     pub preimage: Option<String>,
     /// bolt11 payment request shown to the bonded party.
     pub payment_request: Option<String>,
     /// bolt11 invoice from the winning counterparty (Phase 3+).
+    ///
+    /// Defense-in-depth: not a capability like `preimage`, but it
+    /// identifies the winner's node and is payable by anyone who sees
+    /// it. Kept out of serde output until a phase has a concrete reason
+    /// to publish it.
+    #[serde(skip_serializing)]
     pub payout_invoice: Option<String>,
     /// Routing-fee ceiling actually used for the payout attempt (sats).
     pub payout_routing_fee_sats: Option<i64>,
@@ -115,5 +129,28 @@ mod tests {
         assert!(b.locked_at.is_none());
         assert!(b.released_at.is_none());
         assert!(b.slashed_at.is_none());
+    }
+
+    #[test]
+    fn serialize_omits_secret_fields() {
+        // The preimage is the capability that settles the bond HTLC;
+        // `payout_invoice` identifies the winner. Both must stay out of
+        // any serde output a future phase accidentally adds.
+        let mut b = Bond::new_requested(Uuid::new_v4(), "a".repeat(64), BondRole::Taker, 1_000);
+        b.preimage = Some("deadbeef".repeat(8));
+        b.payout_invoice = Some("lnbc1pSECRET".to_string());
+        b.hash = Some("c0ffee".repeat(10) + "c0ff");
+
+        let json = serde_json::to_string(&b).expect("serialize");
+        assert!(!json.contains("preimage"), "preimage leaked: {json}");
+        assert!(!json.contains("deadbeef"), "preimage value leaked: {json}");
+        assert!(
+            !json.contains("payout_invoice"),
+            "payout_invoice leaked: {json}"
+        );
+        assert!(!json.contains("lnbc1pSECRET"), "payout_invoice value leaked: {json}");
+        // Non-secret fields still serialize as usual.
+        assert!(json.contains("hash"));
+        assert!(json.contains("order_id"));
     }
 }

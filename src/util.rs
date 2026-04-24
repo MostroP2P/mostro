@@ -1514,7 +1514,10 @@ mod tests {
             .await
             .expect("unwrap result")
             .expect("addressed to receiver");
-        assert!(unwrapped.signature.is_none(), "Mostro-side wrap is unsigned");
+        assert!(
+            unwrapped.signature.is_none(),
+            "Mostro-side wrap is unsigned"
+        );
         assert_eq!(unwrapped.sender, sender_keys.public_key());
         assert_eq!(
             unwrapped.message.as_json().unwrap(),

@@ -58,7 +58,7 @@ pub async fn admin_add_solver_action(
         .as_ref()
         .ok_or(MostroCantDo(CantDoReason::InvalidTextMessage))?;
 
-    if event.identity.to_string() != my_keys.public_key().to_string() {
+    if event.identity != my_keys.public_key() {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     }
 

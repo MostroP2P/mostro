@@ -179,7 +179,7 @@ mod tests {
         )
     }
 
-    fn create_test_unwrapped_gift() -> UnwrappedMessage {
+    fn create_test_unwrapped_message() -> UnwrappedMessage {
         let identity = create_test_keys();
         let trade = create_test_keys();
 
@@ -204,7 +204,7 @@ mod tests {
         let pool = create_test_pool().await;
         let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let msg = create_test_message(Some(1));
 
         // This test would require:
@@ -221,7 +221,7 @@ mod tests {
         let pool = create_test_pool().await;
         let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let msg = create_test_message(Some(1));
 
         // This test would require:
@@ -237,22 +237,22 @@ mod tests {
         let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
 
-        // Test case 1: sender == rumor.pubkey, no trade_index
-        let mut event = create_test_unwrapped_gift();
+        // Test case 1: identity == sender, no trade_index
+        let mut event = create_test_unwrapped_message();
         event.identity = event.sender;
         let msg = create_test_message(None);
 
         let result = take_sell_action(&ctx, msg, &event, &keys).await;
-        // Should use trade_index = 0 when sender == rumor.pubkey
+        // Should use trade_index = 0 when identity == sender
         assert!(result.is_ok() || result.is_err());
 
-        // Test case 2: sender != rumor.pubkey, no trade_index
-        let event2 = create_test_unwrapped_gift();
-        // sender and rumor.pubkey are already different by default
+        // Test case 2: identity != sender, no trade_index
+        let event2 = create_test_unwrapped_message();
+        // identity and sender are already distinct by default
         let msg2 = create_test_message(None);
 
         let result2 = take_sell_action(&ctx, msg2, &event2, &keys).await;
-        // Should fail with InvalidPayload when sender != rumor.pubkey and no trade_index
+        // Should fail with InvalidPayload when identity != sender and no trade_index
         if let Err(MostroInternalErr(ServiceError::InvalidPayload)) = result2 {}
 
         // Test case 3: with trade_index
@@ -266,7 +266,7 @@ mod tests {
         let pool = create_test_pool().await;
         let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let msg = create_test_message(Some(1));
 
         // This test would require:
@@ -281,7 +281,7 @@ mod tests {
         let pool = create_test_pool().await;
         let ctx = build_test_context(pool.clone());
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // Test with no payment request (should update order status)
         let msg1 = create_test_message(Some(1));

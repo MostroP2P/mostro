@@ -185,7 +185,7 @@ mod tests {
         )
     }
 
-    fn create_test_unwrapped_gift() -> UnwrappedMessage {
+    fn create_test_unwrapped_message() -> UnwrappedMessage {
         let identity = create_test_keys();
         let trade = create_test_keys();
 
@@ -234,7 +234,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // Create message without order payload
         let msg = Message::Order(MessageKind {
@@ -259,7 +259,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // fiat_amount = 0 should be rejected by check_fiat_amount
         let msg = create_test_order_message(0, 50000);
@@ -291,7 +291,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // amount < 0 should be rejected by check_amount
         let msg = create_test_order_message(100, -50000);
@@ -313,7 +313,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let msg = create_test_message(Some(1));
 
         // This test would require:
@@ -333,7 +333,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         let msg = create_test_message(Some(1));
 
@@ -349,7 +349,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         let msg = create_test_message(Some(1));
         // Structural check: ensure call does not panic
@@ -366,16 +366,16 @@ mod tests {
             .build();
         let keys = create_test_keys();
 
-        // Test case 1: sender == rumor.pubkey, no trade_index
-        let mut event = create_test_unwrapped_gift();
+        // Test case 1: identity == sender, no trade_index
+        let mut event = create_test_unwrapped_message();
         event.identity = event.sender;
         let msg = create_test_message(None);
 
         let _ = order_action(&ctx, msg, &event, &keys).await;
 
-        // Test case 2: sender != rumor.pubkey, no trade_index
-        let event2 = create_test_unwrapped_gift();
-        // sender and rumor.pubkey are already different by default
+        // Test case 2: identity != sender, no trade_index
+        let event2 = create_test_unwrapped_message();
+        // identity and sender are already distinct by default
         let msg2 = create_test_message(None);
 
         // Structural check: ensure call returns a Result without panicking

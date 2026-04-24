@@ -116,7 +116,8 @@ async fn manage_errors(
 ///
 /// # Arguments
 /// * `ctx` - Application context providing database pool and other dependencies.
-/// * `event` - The unwrapped gift event containing the sender's information.
+/// * `event` - The unwrapped NIP-59 message (`UnwrappedMessage`) containing
+///   the sender's identity and trade keys.
 /// * `msg` - The message containing action details and trade index information.
 async fn check_trade_index(
     ctx: &AppContext,
@@ -322,7 +323,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                         // Outer NIP-44 decrypt failed: not addressed to this node.
                         Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!("Error unwrapping gift: {}", e);
+                            tracing::warn!("Error unwrapping NIP-59 message: {}", e);
                             continue;
                         }
                     };

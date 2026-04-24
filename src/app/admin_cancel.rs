@@ -23,7 +23,9 @@ use tracing::{error, info};
 ///
 /// * `ctx` - Application context containing DB pool, settings, and message queue
 /// * `msg` - Incoming message with the order ID and request metadata
-/// * `event` - Unwrapped gift event with sender verification
+/// * `event` - Unwrapped NIP-59 message exposing `sender` (trade key, rumor
+///   author) and `identity` (long-lived identity key, seal signer); admin
+///   gating is performed against `event.identity`
 /// * `my_keys` - Mostro daemon's signing keys
 /// * `ln_client` - Lightning network client for hold invoice cancellation
 ///

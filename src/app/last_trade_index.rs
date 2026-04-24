@@ -112,7 +112,7 @@ mod tests {
     // Helper function to create UnwrappedMessage for testing. `sender_keys`
     // stands in for the long-lived identity key; the trade key is generated
     // separately so the two fields stay distinguishable.
-    fn create_test_unwrapped_gift(sender_keys: &Keys) -> UnwrappedMessage {
+    fn create_test_unwrapped_message(sender_keys: &Keys) -> UnwrappedMessage {
         let trade = create_test_keys();
         println!(
             "Creating UnwrappedMessage with identity pubkey: {}",
@@ -196,7 +196,7 @@ mod tests {
         let sender_keys = create_test_keys();
 
         // Create test event for non-existent user
-        let event = create_test_unwrapped_gift(&sender_keys);
+        let event = create_test_unwrapped_message(&sender_keys);
 
         // Create test message kind
         let kind = MessageKind::new(None, Some(1234567890), None, Action::LastTradeIndex, None);

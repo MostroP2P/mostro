@@ -517,7 +517,11 @@ mod tests {
     use sqlx_crud::Crud;
     use std::sync::Arc;
 
-    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
+    /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)
+    /// is `pubkey`. The identity key is generated separately so the fixture
+    /// reflects the dual-key flow: handlers that gate on `sender` see the
+    /// caller; handlers that gate on `identity` see an unrelated key.
+    fn create_unwrapped_message_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
         UnwrappedMessage {
             message: Message::Order(MessageKind::new(
                 Some(uuid::Uuid::new_v4()),
@@ -528,7 +532,7 @@ mod tests {
             )),
             signature: None,
             sender: pubkey,
-            identity: pubkey,
+            identity: Keys::generate().public_key(),
             created_at: Timestamp::now(),
         }
     }
@@ -612,7 +616,7 @@ mod tests {
 
         // Event is sent by a third party (neither maker nor taker) to trigger auth guard.
         let intruder = Keys::generate().public_key();
-        let event = create_unwrapped_gift_with_pubkey(intruder);
+        let event = create_unwrapped_message_with_pubkey(intruder);
 
         let msg = Message::new_order(Some(order.id), Some(1), None, Action::Cancel, None);
         let my_keys = Keys::generate();

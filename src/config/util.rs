@@ -247,4 +247,15 @@ mod tests {
 
         assert_eq!(settings.nostr.nsec_privkey, "nsec_from_env");
     }
+
+    #[test]
+    fn toml_parses_without_nsec_privkey_field() {
+        // Operators who rely exclusively on MOSTRO_NSEC_PRIVKEY should be able
+        // to omit nsec_privkey from settings.toml entirely.
+        let toml_without_nsec = r#"relays = ["wss://relay.test"]"#;
+        let nostr: NostrSettings =
+            toml::from_str(toml_without_nsec).expect("nsec_privkey should be optional in TOML");
+        assert_eq!(nostr.nsec_privkey, "");
+        assert_eq!(nostr.relays, vec!["wss://relay.test"]);
+    }
 }

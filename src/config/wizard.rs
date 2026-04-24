@@ -209,7 +209,6 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
     let choices = &[
         "Save to .env (recommended, auto-loaded at startup)",
         "Save inline in settings.toml (legacy, still supported)",
-        "I'll configure MOSTRO_NSEC_PRIVKEY myself",
     ];
 
     let selection = Select::new()
@@ -219,34 +218,22 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
         .interact()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    let nsec_in_toml = match selection {
-        0 => {
-            write_env_file(&env_file_path, nsec)?;
-            println!(
-                "\n  Private key saved to {} (permissions 600).",
-                env_file_path.display()
-            );
-            String::new()
-        }
-        1 => {
-            println!(
-                "\n  Private key will be written inside {}.",
-                settings_dir.join("settings.toml").display()
-            );
-            nsec.to_string()
-        }
-        _ => {
-            println!("\n  Set MOSTRO_NSEC_PRIVKEY before starting Mostro, for example:");
-            println!("    bash/zsh: export MOSTRO_NSEC_PRIVKEY={}", nsec);
-            println!("    systemd:  Environment=\"MOSTRO_NSEC_PRIVKEY={}\"", nsec);
-            println!("    docker:   -e MOSTRO_NSEC_PRIVKEY={}", nsec);
-            println!(
-                "\n  Nothing will be written to {} or {}.",
-                env_file_path.display(),
-                settings_dir.join("settings.toml").display()
-            );
-            String::new()
-        }
+    let nsec_in_toml = if selection == 0 {
+        write_env_file(&env_file_path, nsec)?;
+        // Export the key into the current process so the daemon can use it
+        // immediately after the wizard finishes, without requiring a restart.
+        std::env::set_var("MOSTRO_NSEC_PRIVKEY", nsec);
+        println!(
+            "\n  Private key saved to {} (permissions 600).",
+            env_file_path.display()
+        );
+        String::new()
+    } else {
+        println!(
+            "\n  Private key will be written inside {}.",
+            settings_dir.join("settings.toml").display()
+        );
+        nsec.to_string()
     };
 
     println!(

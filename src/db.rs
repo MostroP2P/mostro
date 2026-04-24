@@ -593,7 +593,7 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
           WHERE expires_at < ?1 AND status == 'pending'
         "#,
     )
-    .bind(expire_time.as_u64() as i64)
+    .bind(expire_time.as_secs() as i64)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -612,7 +612,7 @@ pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, Most
           WHERE taken_at < ?1 AND ( status == 'waiting-buyer-invoice' OR status == 'waiting-payment' )
         "#,
     )
-    .bind(expire_time.as_u64() as i64)
+    .bind(expire_time.as_secs() as i64)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -836,7 +836,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .bind(new_user.last_rating)
     .bind(new_user.max_rating)
     .bind(new_user.min_rating)
-    .bind(created_at.as_u64() as i64)
+    .bind(created_at.as_secs() as i64)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

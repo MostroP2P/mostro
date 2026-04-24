@@ -205,7 +205,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
     let mostro_settings = Settings::get_mostro();
     // We calculate order expiration
     let expire_date: i64;
-    let expires_at_max: i64 = Timestamp::now().as_u64() as i64
+    let expires_at_max: i64 = Timestamp::now().as_secs() as i64
         + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds();
     if let Some(mut exp) = expire {
         if exp > expires_at_max {
@@ -213,7 +213,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
         };
         expire_date = exp;
     } else {
-        expire_date = Timestamp::now().as_u64() as i64
+        expire_date = Timestamp::now().as_secs() as i64
             + Duration::hours(mostro_settings.expiration_hours as i64).num_seconds();
     }
     expire_date
@@ -241,7 +241,7 @@ pub fn get_expiration_date(expire: Option<i64>) -> i64 {
 /// let dispute_expiration = get_expiration_timestamp_for_kind(38386);
 /// ```
 pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
-    let now = Timestamp::now().as_u64() as i64;
+    let now = Timestamp::now().as_secs() as i64;
 
     // Try to get expiration from new configuration first
     if let Some(exp_config) = Settings::get_expiration() {
@@ -468,7 +468,7 @@ async fn prepare_new_order(
         fiat_amount: new_order.fiat_amount,
         premium: new_order.premium,
         buyer_invoice: new_order.buyer_invoice.clone(),
-        created_at: Timestamp::now().as_u64() as i64,
+        created_at: Timestamp::now().as_secs() as i64,
         expires_at: expiry_date,
         ..Default::default()
     };
@@ -1285,7 +1285,7 @@ pub async fn notify_taker_reputation(
 
     let reputation_data = match is_user_present(pool, master_key).await {
         Ok(user) => {
-            let now = Timestamp::now().as_u64();
+            let now = Timestamp::now().as_secs();
             UserInfo {
                 rating: user.total_rating,
                 reviews: user.total_reviews,

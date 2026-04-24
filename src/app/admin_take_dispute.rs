@@ -191,7 +191,7 @@ pub async fn admin_take_dispute_action(
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();
     dispute.solver_pubkey = Some(event.sender.to_string());
-    dispute.taken_at = Timestamp::now().as_u64() as i64;
+    dispute.taken_at = Timestamp::now().as_secs() as i64;
 
     info!("Dispute {} taken by {}", dispute.id, event.sender);
 

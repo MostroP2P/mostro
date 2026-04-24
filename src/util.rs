@@ -509,23 +509,19 @@ pub async fn send_dm(
     );
     let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We compose the content, as this is a message from Mostro
-    // and Mostro don't have trade key, we don't need to sign the payload
-    let content = (message, Option::<String>::None);
-    let content = serde_json::to_string(&content)
-        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We create the rumor
-    let rumor = EventBuilder::text_note(content).build(sender_keys.public_key());
-    let mut tags: Vec<Tag> = Vec::with_capacity(1 + usize::from(expiration.is_some()));
 
-    if let Some(timestamp) = expiration {
-        tags.push(Tag::expiration(timestamp));
-    }
-    let tags = Tags::from_list(tags);
+    // Mostro identity holds no trade keys, so the inner rumor tuple is
+    // `(Message, None)` — `signed = false`. `wrap_message` builds the
+    // rumor, seal, outer gift wrap, ephemeral key, random-timestamp
+    // tweak and `p` tag for us; we only pick the wrap-level knobs.
+    // PoW is deferred to a follow-up (see issue #714, open question 4).
+    let opts = WrapOptions {
+        pow: 0,
+        expiration,
+        signed: false,
+    };
+    let event = wrap_message(&message, sender_keys, receiver_pubkey, opts).await?;
 
-    let event = EventBuilder::gift_wrap(sender_keys, &receiver_pubkey, rumor, tags)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
         "Sending DM, Event ID: {} to {} with payload: {:#?}",
         event.id,
@@ -1481,10 +1477,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_dm() {
+    async fn test_send_dm_outbound_wrap_shape() {
+        // `send_dm` itself can't be exercised here without racing on the
+        // global NOSTR_CLIENT initialized by other tests — under parallel
+        // execution it's nondeterministic whether the client exists. So
+        // instead we pin down the invariant that matters: the wrap shape
+        // `send_dm` emits. Mostro-side traffic must be unsigned (the node
+        // holds no trade keys), the sender must be the Mostro identity,
+        // and the inner message must round-trip byte-for-byte.
         initialize();
-        // Mock the send_dm function
-        let receiver_pubkey = Keys::generate().public_key();
+        let receiver_keys = Keys::generate();
+        let sender_keys = Keys::generate();
         let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
         let message = Message::Order(MessageKind::new(
             Some(uuid),
@@ -1493,12 +1496,30 @@ mod tests {
             Action::FiatSent,
             None,
         ));
-        let payload = message.as_json().unwrap();
-        let sender_keys = Keys::generate();
-        // Now error is well manager this call will fail now, previously test was ok becuse error was not managed
-        // now just make it ok and then will make a better test
-        let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
-        assert!(result.is_err());
+
+        let event = wrap_message(
+            &message,
+            &sender_keys,
+            receiver_keys.public_key(),
+            WrapOptions {
+                pow: 0,
+                expiration: None,
+                signed: false,
+            },
+        )
+        .await
+        .expect("wrap");
+
+        let unwrapped = unwrap_message(&event, &receiver_keys)
+            .await
+            .expect("unwrap result")
+            .expect("addressed to receiver");
+        assert!(unwrapped.signature.is_none(), "Mostro-side wrap is unsigned");
+        assert_eq!(unwrapped.sender, sender_keys.public_key());
+        assert_eq!(
+            unwrapped.message.as_json().unwrap(),
+            message.as_json().unwrap()
+        );
     }
 
     #[tokio::test]

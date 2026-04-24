@@ -119,7 +119,7 @@ pub async fn hold_invoice_paid(
     }
 
     // Update the invoice_held_at field
-    crate::db::update_order_invoice_held_at_time(pool, order.id, Timestamp::now().as_u64() as i64)
+    crate::db::update_order_invoice_held_at_time(pool, order.id, Timestamp::now().as_secs() as i64)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -241,7 +241,7 @@ mod tests {
             let fiat_amount = 100i64;
             let payment_method = "SEPA".to_string();
             let premium = 5;
-            let created_at = Timestamp::now().as_u64() as i64;
+            let created_at = Timestamp::now().as_secs() as i64;
             let expires_at = created_at + 3600;
 
             // Test SmallOrder creation logic
@@ -370,8 +370,8 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(Timestamp::now().as_u64() as i64),
-                Some(Timestamp::now().as_u64() as i64 + 3600),
+                Some(Timestamp::now().as_secs() as i64),
+                Some(Timestamp::now().as_secs() as i64 + 3600),
             );
 
             // Test payload with order data
@@ -451,7 +451,7 @@ mod tests {
             // Test timestamp operations used in the flow
 
             let current_timestamp = Timestamp::now();
-            let timestamp_u64 = current_timestamp.as_u64();
+            let timestamp_u64 = current_timestamp.as_secs();
             let timestamp_i64 = timestamp_u64 as i64;
 
             // Verify timestamp is reasonable (after 2020, before 2050)

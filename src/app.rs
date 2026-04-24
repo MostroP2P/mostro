@@ -333,7 +333,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                         .checked_sub_signed(chrono::Duration::seconds(10))
                         .unwrap()
                         .timestamp() as u64;
-                    if event.rumor.created_at.as_u64() < since_time {
+                    if event.rumor.created_at.as_secs() < since_time {
                         continue;
                     }
                     // Parse message and signature from rumor content put message in Message struct

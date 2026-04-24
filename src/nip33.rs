@@ -196,7 +196,7 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
         // If operating day is 0, it means the user is new and we don't have a valid reputation data
         let days = if data.2 != 0 {
             let now = Timestamp::now();
-            (now.as_secs() - data.2 as u64) / SECONDS_IN_DAY
+            (now.as_u64() - data.2 as u64) / SECONDS_IN_DAY
         } else {
             0
         };

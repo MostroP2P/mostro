@@ -212,7 +212,7 @@ pub async fn update_user_reputation_action(
 /// Calculate the number of days since user creation.
 fn calculate_days_since_creation(created_at: i64) -> u64 {
     const SECONDS_IN_DAY: u64 = 86_400;
-    let now = Timestamp::now().as_secs();
+    let now = Timestamp::now().as_u64();
     u64::try_from(created_at)
         .ok()
         .filter(|ts| *ts > 0)
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_calculate_days_since_creation_normal() {
-        let now = Timestamp::now().as_secs();
+        let now = Timestamp::now().as_u64();
         // User created 10 days ago
         let created_at = (now - 10 * 86_400) as i64;
         let days = calculate_days_since_creation(created_at);
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_calculate_days_since_creation_partial_day() {
-        let now = Timestamp::now().as_secs();
+        let now = Timestamp::now().as_u64();
         // Created 1.5 days ago - should truncate to 1
         let created_at = (now - 86_400 - 43_200) as i64;
         let days = calculate_days_since_creation(created_at);

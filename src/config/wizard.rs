@@ -197,9 +197,7 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
 /// Ask the user where to persist the nsec and return the value that should be
 /// written into `settings.toml` (empty string when the key is stored elsewhere).
 fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, MostroError> {
-    println!(
-        "\nStoring your nsec as an environment variable (instead of settings.toml) keeps"
-    );
+    println!("\nStoring your nsec as an environment variable (instead of settings.toml) keeps");
     println!("secrets separate from config. This helps avoid accidental leaks in logs, backups");
     println!("or bug reports, and makes it easier to integrate with Docker secrets, systemd");
     println!("credentials, or a vault later. You can always move the key to another location");

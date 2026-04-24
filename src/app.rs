@@ -10,6 +10,7 @@ pub mod admin_add_solver; // Admin functionality to add dispute solvers
 pub mod admin_cancel; // Admin order cancellation
 pub mod admin_settle; // Admin dispute settlement
 pub mod admin_take_dispute; // Admin dispute handling
+pub mod bond; // Anti-abuse bond data + helpers (issue #711)
 pub mod cancel; // User order cancellation
 pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling

@@ -267,6 +267,7 @@ pub mod test_utils {
             lightning: LightningSettings::default(),
             rpc: RpcSettings::default(),
             expiration: Some(ExpirationSettings::default()),
+            anti_abuse_bond: None,
         }
     }
 }

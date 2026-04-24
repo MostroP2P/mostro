@@ -4,7 +4,6 @@ use crate::db::{find_solver_pubkey, is_user_present, user_has_solver_write_permi
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{get_dispute, send_dm};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
@@ -150,7 +149,7 @@ pub async fn pubkey_event_can_solve(
 pub async fn admin_take_dispute_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     mostro_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -164,7 +163,7 @@ pub async fn admin_take_dispute_action(
     if let Ok(dispute_status) = DisputeStatus::from_str(&dispute.status) {
         if !pubkey_event_can_solve(
             pool,
-            &event.sender,
+            &event.identity,
             dispute_status,
             dispute.solver_pubkey.as_deref(),
             mostro_keys,
@@ -190,10 +189,10 @@ pub async fn admin_take_dispute_action(
 
     // Update dispute fields
     dispute.status = Status::InProgress.to_string();
-    dispute.solver_pubkey = Some(event.sender.to_string());
+    dispute.solver_pubkey = Some(event.identity.to_string());
     dispute.taken_at = Timestamp::now().as_secs() as i64;
 
-    info!("Dispute {} taken by {}", dispute.id, event.sender);
+    info!("Dispute {} taken by {}", dispute.id, event.identity);
 
     // Save it to DB
     dispute
@@ -217,7 +216,7 @@ pub async fn admin_take_dispute_action(
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     // Send the message to admin
-    send_dm(event.sender, mostro_keys, &message, None)
+    send_dm(event.identity, mostro_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
@@ -229,7 +228,7 @@ pub async fn admin_take_dispute_action(
         None,
         Action::AdminTookDispute,
         Some(Payload::Peer(Peer {
-            pubkey: event.sender.to_hex(),
+            pubkey: event.identity.to_hex(),
             reputation: None,
         })),
     )

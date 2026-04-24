@@ -1,7 +1,6 @@
 use crate::app::context::AppContext;
 use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 /// Handle restore session action
@@ -9,13 +8,13 @@ use nostr_sdk::prelude::*;
 /// and immediately returns, avoiding blocking the main application
 pub async fn restore_session_action(
     ctx: &AppContext,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get user master key from the event sender
-    let master_key = event.sender.to_string();
+    let master_key = event.identity.to_string();
     // Get trade key from the event rumor
-    let trade_key = event.rumor.pubkey.to_string();
+    let trade_key = event.sender.to_string();
 
     // Validate the master key format
     if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {

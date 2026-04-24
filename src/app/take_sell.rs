@@ -5,7 +5,6 @@ use crate::util::{
     set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
 };
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -37,7 +36,7 @@ async fn update_order_status(
 pub async fn take_sell_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -47,7 +46,7 @@ pub async fn take_sell_action(
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Check if the seller has a pending order
-    if buyer_has_pending_order(pool, event.sender.to_string()).await? {
+    if buyer_has_pending_order(pool, event.identity.to_string()).await? {
         return Err(MostroCantDo(CantDoReason::PendingOrderExists));
     }
 
@@ -62,7 +61,7 @@ pub async fn take_sell_action(
 
     // Validate that the order was sent from the correct maker
     order
-        .not_sent_from_maker(event.rumor.pubkey)
+        .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
     // Get seller pubkey
@@ -100,13 +99,13 @@ pub async fn take_sell_action(
     let payment_request = validate_invoice(&msg, &order).await?;
 
     // Add buyer pubkey to order
-    order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
+    order.buyer_pubkey = Some(event.sender.to_string());
     // Add buyer identity pubkey to order
-    order.master_buyer_pubkey = Some(event.sender.to_string());
+    order.master_buyer_pubkey = Some(event.identity.to_string());
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {
-            if event.sender == event.rumor.pubkey {
+            if event.identity == event.sender {
                 0
             } else {
                 return Err(MostroInternalErr(ServiceError::InvalidPayload));
@@ -119,7 +118,7 @@ pub async fn take_sell_action(
     order.set_timestamp_now();
 
     // Update trade index only after all checks are done
-    update_user_trade_index(pool, event.sender.to_string(), trade_index)
+    update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -132,7 +131,7 @@ pub async fn take_sell_action(
         show_hold_invoice(
             my_keys,
             payment_request,
-            &event.rumor.pubkey,
+            &event.sender,
             &seller_pubkey,
             order,
             request_id,
@@ -148,7 +147,7 @@ mod tests {
     use super::*;
 
     use mostro_core::order::{Kind as OrderKind, Status};
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {
@@ -180,21 +179,16 @@ mod tests {
         )
     }
 
-    fn create_test_unwrapped_gift() -> UnwrappedGift {
-        let keys = create_test_keys();
-        let sender_keys = create_test_keys();
+    fn create_test_unwrapped_gift() -> UnwrappedMessage {
+        let identity = create_test_keys();
+        let trade = create_test_keys();
 
-        let unsigned_event = UnsignedEvent::new(
-            keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        UnwrappedGift {
-            sender: sender_keys.public_key(),
-            rumor: unsigned_event,
+        UnwrappedMessage {
+            message: create_test_message(None),
+            signature: None,
+            sender: trade.public_key(),
+            identity: identity.public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -245,7 +239,7 @@ mod tests {
 
         // Test case 1: sender == rumor.pubkey, no trade_index
         let mut event = create_test_unwrapped_gift();
-        event.sender = event.rumor.pubkey;
+        event.identity = event.sender;
         let msg = create_test_message(None);
 
         let result = take_sell_action(&ctx, msg, &event, &keys).await;

@@ -2,7 +2,6 @@ use crate::app::context::AppContext;
 use crate::db::{is_user_present, update_user_rating};
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 pub fn prepare_variables_for_vote(
@@ -71,7 +70,7 @@ pub fn prepare_variables_for_vote(
 pub async fn update_user_reputation_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -80,7 +79,7 @@ pub async fn update_user_reputation_action(
 
     // Prepare variables for vote
     let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
-        prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
+        prepare_variables_for_vote(&event.sender.to_string(), &order)?;
 
     // Check if order is success, but sellers can rate in status settled-hold-invoice
     if !(order.check_status(Status::Success).is_ok()
@@ -200,7 +199,7 @@ pub async fn update_user_reputation_action(
             Some(order.id),
             Action::RateReceived,
             Some(Payload::RatingUser(new_rating)),
-            event.rumor.pubkey,
+            event.sender,
             None,
         )
         .await;
@@ -227,7 +226,7 @@ mod tests {
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use sqlx_crud::Crud;
     use uuid::Uuid;
@@ -255,17 +254,19 @@ mod tests {
         Keys::generate()
     }
 
-    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
-        let unsigned_event = UnsignedEvent::new(
-            pubkey,
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-        UnwrappedGift {
+    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::Order(MessageKind::new(
+                Some(Uuid::new_v4()),
+                Some(1),
+                None,
+                Action::RateUser,
+                None,
+            )),
+            signature: None,
             sender: pubkey,
-            rumor: unsigned_event,
+            identity: pubkey,
+            created_at: Timestamp::now(),
         }
     }
 

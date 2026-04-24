@@ -55,6 +55,7 @@ use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
+use mostro_core::nip59::{unwrap_message, UnwrappedMessage};
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 
@@ -86,7 +87,7 @@ fn warning_msg(action: &Action, err: ServiceError) {
 async fn manage_errors(
     e: MostroError,
     inner_message: Message,
-    event: UnwrappedGift,
+    event: UnwrappedMessage,
     action: &Action,
 ) {
     match e {
@@ -95,7 +96,8 @@ async fn manage_errors(
                 inner_message.get_inner_message_kind().request_id,
                 inner_message.get_inner_message_kind().id,
                 cause,
-                event.rumor.pubkey,
+                // Reply to the trade key that authored the rumor.
+                event.sender,
             )
             .await
         }
@@ -118,7 +120,7 @@ async fn manage_errors(
 /// * `msg` - The message containing action details and trade index information.
 async fn check_trade_index(
     ctx: &AppContext,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     msg: &Message,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -133,24 +135,14 @@ async fn check_trade_index(
     }
 
     // If user is present, we check the trade index and signature
-    match is_user_present(pool, event.sender.to_string()).await {
+    match is_user_present(pool, event.identity.to_string()).await {
         Ok(user) => {
             if let index @ 1.. = message_kind.trade_index() {
-                let content: (Message, Signature) = match serde_json::from_str::<(
-                    Message,
-                    nostr_sdk::secp256k1::schnorr::Signature,
-                )>(&event.rumor.content)
-                {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::error!("Error deserializing content: {}", e);
-                        return Err(MostroError::MostroInternalErr(
-                            ServiceError::MessageSerializationError,
-                        ));
-                    }
-                };
-
-                let (_, sig) = content;
+                // Inner-tuple signature is already decoded by unwrap_message.
+                let sig = event.signature.ok_or_else(|| {
+                    tracing::error!("Trade-index message missing inner signature");
+                    MostroError::MostroCantDo(CantDoReason::InvalidSignature)
+                })?;
 
                 if index <= user.last_trade_index {
                     tracing::info!("Invalid trade index");
@@ -163,7 +155,7 @@ async fn check_trade_index(
                     .await;
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
-                let msg = match msg.as_json() {
+                let msg_json = match msg.as_json() {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::error!(
@@ -175,7 +167,7 @@ async fn check_trade_index(
                         ));
                     }
                 };
-                if !Message::verify_signature(msg, event.rumor.pubkey, sig) {
+                if !Message::verify_signature(msg_json, event.sender, sig) {
                     tracing::info!("Invalid signature");
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature));
                 }
@@ -188,9 +180,9 @@ async fn check_trade_index(
                 if last_trade_index == 0 {
                     return Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex));
                 }
-                if event.sender != event.rumor.pubkey {
+                if event.identity != event.sender {
                     let new_user: User = User {
-                        pubkey: event.sender.to_string(),
+                        pubkey: event.identity.to_string(),
                         last_trade_index,
                         ..Default::default()
                     };
@@ -208,7 +200,7 @@ async fn check_trade_index(
 async fn handle_message_action_no_ln(
     action: &Action,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ctx: &AppContext,
 ) -> Result<()> {
@@ -270,7 +262,7 @@ async fn handle_message_action_no_ln(
 async fn handle_message_action(
     action: &Action,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
     ctx: &AppContext,
@@ -321,8 +313,14 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                         tracing::warn!("Error in event verification")
                     };
 
-                    let event = match nip59::extract_rumor(my_keys, &event).await {
-                        Ok(u) => u,
+                    // Mostro-core's NIP-59 transport handles the dual-key layout
+                    // (identity key signs seal, trade key authors rumor) plus inner
+                    // tuple (message, signature) decoding and signature verification
+                    // in one shot.
+                    let unwrapped = match unwrap_message(&event, my_keys).await {
+                        Ok(Some(u)) => u,
+                        // Outer NIP-44 decrypt failed: not addressed to this node.
+                        Ok(None) => continue,
                         Err(e) => {
                             tracing::warn!("Error unwrapping gift: {}", e);
                             continue;
@@ -333,51 +331,28 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                         .checked_sub_signed(chrono::Duration::seconds(10))
                         .unwrap()
                         .timestamp() as u64;
-                    if event.rumor.created_at.as_secs() < since_time {
+                    if unwrapped.created_at.as_secs() < since_time {
                         continue;
                     }
-                    // Parse message and signature from rumor content put message in Message struct
-                    let (message, sig) = match serde_json::from_str::<(Message, Option<Signature>)>(
-                        &event.rumor.content,
-                    ) {
-                        Ok((message, signature)) => (message, signature),
-                        Err(e) => {
-                            tracing::warn!("Failed to parse message, inner message, and signature from rumor content: {}", e);
-                            continue;
-                        }
-                    };
+                    let message = unwrapped.message.clone();
 
-                    // Serialize message to json
-                    let message_json = match message.clone().as_json() {
-                        Ok(message_json) => message_json,
-                        Err(e) => {
-                            tracing::warn!("Failed to serialize message: {}", e);
-                            continue;
-                        }
-                    };
-                    // Check if sender and rumor pubkey are different
-                    let sender_matches_rumor = event.sender == event.rumor.pubkey;
-                    if let Some(sig) = sig {
-                        // Verify signature only if sender and rumor pubkey are different
-                        if !sender_matches_rumor
-                            && !Message::verify_signature(message_json, event.rumor.pubkey, sig)
-                        {
-                            tracing::warn!(
-                                "Signature verification failed: sender {} does not match rumor pubkey {}",
-                                event.sender,
-                                event.rumor.pubkey
-                            );
-                            continue;
-                        }
-                    } else if !sender_matches_rumor {
-                        // If there is no signature and the sender does not match the rumor pubkey, there is also an error
-                        tracing::warn!("Error in event verification");
+                    // Full-privacy clients reuse the trade key as identity and send
+                    // unsigned rumors. Any other shape must carry a valid inner
+                    // signature — unwrap_message already verified it, so if identity
+                    // and sender differ here without a signature we bail out.
+                    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+                        tracing::warn!(
+                            "Missing inner signature: identity {} differs from trade key {}",
+                            unwrapped.identity,
+                            unwrapped.sender
+                        );
                         continue;
                     }
+
                     // Get inner message kind
                     let inner_message = message.get_inner_message_kind();
                     // Check if message is message with trade index
-                    if let Err(e) = check_trade_index(&ctx, &event, &message).await {
+                    if let Err(e) = check_trade_index(&ctx, &unwrapped, &message).await {
                         tracing::warn!("Error checking trade index: {}", e);
                         continue;
                     }
@@ -387,7 +362,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                             if let Err(e) = handle_message_action(
                                 &action,
                                 message.clone(),
-                                &event,
+                                &unwrapped,
                                 my_keys,
                                 ln_client,
                                 &ctx,
@@ -396,7 +371,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                             {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
-                                        manage_errors(*err, message, event, &action).await;
+                                        manage_errors(*err, message, unwrapped, &action).await;
                                     }
                                     Err(e) => {
                                         tracing::error!("Unexpected error type: {}", e);
@@ -421,7 +396,7 @@ mod tests {
     use mostro_core::message::Action;
 
     use nostr_sdk::secp256k1::schnorr::Signature;
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp};
 
     // Helper function to create test keys
     fn create_test_keys() -> Keys {
@@ -439,22 +414,18 @@ mod tests {
         )
     }
 
-    // Helper function to create UnwrappedGift for testing
-    fn create_test_unwrapped_gift() -> UnwrappedGift {
-        let keys = create_test_keys();
-        let sender_keys = create_test_keys();
+    // Helper function to create an UnwrappedMessage for testing. Identity and
+    // sender (trade key) are distinct to mirror the canonical Mostro flow.
+    fn create_test_unwrapped_message() -> UnwrappedMessage {
+        let identity = create_test_keys();
+        let trade = create_test_keys();
 
-        let unsigned_event = UnsignedEvent::new(
-            keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        UnwrappedGift {
-            sender: sender_keys.public_key(),
-            rumor: unsigned_event,
+        UnwrappedMessage {
+            message: create_test_message(Action::NewOrder, None),
+            signature: None,
+            sender: trade.public_key(),
+            identity: identity.public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -502,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn test_manage_errors_cant_do() {
         let message = create_test_message(Action::NewOrder, None);
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let action = Action::NewOrder;
 
         let error = MostroError::MostroCantDo(CantDoReason::InvalidSignature);
@@ -514,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn test_manage_errors_internal_error() {
         let message = create_test_message(Action::NewOrder, None);
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let action = Action::NewOrder;
 
         let error =
@@ -541,7 +512,7 @@ mod tests {
         #[tokio::test]
         async fn test_check_trade_index_non_trading_action() {
             let ctx = create_test_ctx().await;
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let message = create_test_message(Action::FiatSent, None);
 
             let result = check_trade_index(&ctx, &event, &message).await;
@@ -551,7 +522,7 @@ mod tests {
         #[tokio::test]
         async fn test_check_trade_index_trading_action_no_index() {
             let ctx = create_test_ctx().await;
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let message = create_test_message(Action::NewOrder, None);
 
             let result = check_trade_index(&ctx, &event, &message).await;
@@ -561,7 +532,7 @@ mod tests {
         #[tokio::test]
         async fn test_check_trade_index_with_valid_index() {
             let ctx = create_test_ctx().await;
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let message = create_test_message(Action::NewOrder, Some(1));
 
             // This test would require database setup and user creation
@@ -596,7 +567,7 @@ mod tests {
                 .build();
 
             let my_keys = create_test_keys();
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let msg = create_test_message(Action::LastTradeIndex, None);
 
             let result =
@@ -622,7 +593,7 @@ mod tests {
                 .build();
 
             let my_keys = create_test_keys();
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let msg = create_restore_session_message();
 
             let result =
@@ -646,7 +617,7 @@ mod tests {
                 .build();
 
             let my_keys = create_test_keys();
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let msg = create_test_message(Action::Orders, None);
 
             let result =
@@ -671,7 +642,7 @@ mod tests {
                 .build();
 
             let my_keys = create_test_keys();
-            let event = create_test_unwrapped_gift();
+            let event = create_test_unwrapped_message();
             let msg = create_test_message(Action::PayInvoice, None);
 
             let result =

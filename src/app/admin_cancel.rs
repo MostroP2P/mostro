@@ -10,7 +10,6 @@ use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tracing::{error, info};
@@ -46,7 +45,7 @@ use tracing::{error, info};
 pub async fn admin_cancel_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
@@ -56,7 +55,7 @@ pub async fn admin_cancel_action(
     // Get order
     let order = get_order(&msg, pool).await?;
     // Check if the solver is assigned to the order
-    match is_assigned_solver(pool, &event.sender.to_string(), order.id).await {
+    match is_assigned_solver(pool, &event.identity.to_string(), order.id).await {
         Ok(false) => {
             // Check if admin has taken over the dispute
             if is_dispute_taken_by_admin(pool, order.id, &my_keys.public_key().to_string()).await? {
@@ -73,7 +72,7 @@ pub async fn admin_cancel_action(
         _ => {}
     }
 
-    if !solver_has_write_permission(pool, &event.sender.to_string(), order.id).await? {
+    if !solver_has_write_permission(pool, &event.identity.to_string(), order.id).await? {
         return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
 
@@ -84,7 +83,7 @@ pub async fn admin_cancel_action(
             Some(order.id),
             Action::CooperativeCancelAccepted,
             None,
-            event.sender,
+            event.identity,
             msg.get_inner_message_kind().trade_index,
         )
         .await;
@@ -177,7 +176,7 @@ pub async fn admin_cancel_action(
         .as_json()
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     // Message to admin
-    send_dm(event.rumor.pubkey, my_keys, &message, None)
+    send_dm(event.sender, my_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

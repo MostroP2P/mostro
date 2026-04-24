@@ -1,7 +1,6 @@
 use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 
@@ -9,7 +8,7 @@ use sqlx_crud::Crud;
 pub async fn fiat_sent_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -23,7 +22,7 @@ pub async fn fiat_sent_action(
 
     // Check if the pubkey is the buyer pubkey - Only the buyer can send fiat
     // if someone else tries to send fiat, we return an error
-    if order.get_buyer_pubkey().ok() != Some(event.rumor.pubkey) {
+    if order.get_buyer_pubkey().ok() != Some(event.sender) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
@@ -43,7 +42,7 @@ pub async fn fiat_sent_action(
 
     // Create peer
     let peer = Peer {
-        pubkey: event.rumor.pubkey.to_string(),
+        pubkey: event.sender.to_string(),
         reputation: None,
     };
 
@@ -69,7 +68,7 @@ pub async fn fiat_sent_action(
         Some(order_updated.id),
         Action::FiatSentOk,
         Some(Payload::Peer(peer)),
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;

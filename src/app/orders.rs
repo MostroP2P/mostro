@@ -7,7 +7,7 @@ use nostr_sdk::prelude::*;
 pub async fn orders_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get order
@@ -29,7 +29,7 @@ pub async fn orders_action(
     }
 
     // Get orders
-    let orders = get_user_orders_by_id(pool, ids, &event.sender.to_string()).await?;
+    let orders = get_user_orders_by_id(pool, ids, &event.identity.to_string()).await?;
     if orders.is_empty() {
         return Err(MostroCantDo(CantDoReason::NotFound));
     }
@@ -49,7 +49,7 @@ pub async fn orders_action(
         None,
         Action::Orders,
         Some(response_payload),
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;

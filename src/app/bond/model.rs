@@ -148,7 +148,10 @@ mod tests {
             !json.contains("payout_invoice"),
             "payout_invoice leaked: {json}"
         );
-        assert!(!json.contains("lnbc1pSECRET"), "payout_invoice value leaked: {json}");
+        assert!(
+            !json.contains("lnbc1pSECRET"),
+            "payout_invoice value leaked: {json}"
+        );
         // Non-secret fields still serialize as usual.
         assert!(json.contains("hash"));
         assert!(json.contains("order_id"));

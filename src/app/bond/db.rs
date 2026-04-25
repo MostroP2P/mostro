@@ -61,6 +61,60 @@ pub async fn find_bonds_by_state(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Look up a bond row by its Lightning payment hash. The hash uniquely
+/// identifies the bond hold invoice, so this is what the LND subscriber
+/// uses to correlate incoming invoice events back to a `Bond`.
+pub async fn find_bond_by_hash(
+    pool: &Pool<Sqlite>,
+    hash: &str,
+) -> Result<Option<Bond>, mostro_core::error::MostroError> {
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE hash = ? LIMIT 1")
+        .bind(hash)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// List every bond row that still has an outstanding LND HTLC, i.e. is in
+/// `Requested` or `Locked`. Used on daemon startup to resubscribe to
+/// in-flight bond hold invoices, and as the Phase 1 workhorse for the
+/// "always release" exits — we filter further on `order_id` in
+/// [`find_active_bonds_for_order`].
+pub async fn find_active_bonds(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<Bond>, mostro_core::error::MostroError> {
+    let requested = BondState::Requested.to_string();
+    let locked = BondState::Locked.to_string();
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE state IN (?, ?) ORDER BY created_at ASC")
+        .bind(requested)
+        .bind(locked)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// List the still-outstanding bonds attached to a single order. Phase 1
+/// uses this to release every bond on any order exit path (cancel,
+/// release, admin actions, scheduler timeouts).
+pub async fn find_active_bonds_for_order(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+) -> Result<Vec<Bond>, mostro_core::error::MostroError> {
+    let requested = BondState::Requested.to_string();
+    let locked = BondState::Locked.to_string();
+    sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds \
+         WHERE order_id = ? AND state IN (?, ?) \
+         ORDER BY created_at ASC",
+    )
+    .bind(order_id)
+    .bind(requested)
+    .bind(locked)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Update a bond row by primary key. Returns the persisted `Bond`.
 pub async fn update_bond(
     pool: &Pool<Sqlite>,
@@ -174,6 +228,57 @@ mod tests {
             .await
             .expect("query");
         assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_hash_returns_match() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+
+        let mut bond = dummy_bond(order_id, BondRole::Taker);
+        bond.hash = Some("c".repeat(64));
+        let created = create_bond(&pool, bond).await.expect("insert");
+
+        let found = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .expect("query")
+            .expect("row present");
+        assert_eq!(found.id, created.id);
+
+        let missing = find_bond_by_hash(&pool, &"f".repeat(64))
+            .await
+            .expect("query");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_bonds_filter_terminal_states() {
+        let pool = setup_pool().await;
+        let order_a = Uuid::new_v4();
+        let order_b = Uuid::new_v4();
+        insert_parent_order(&pool, order_a).await;
+        insert_parent_order(&pool, order_b).await;
+        let bond_a = create_bond(&pool, dummy_bond(order_a, BondRole::Taker))
+            .await
+            .unwrap();
+        let bond_b = create_bond(&pool, dummy_bond(order_b, BondRole::Taker))
+            .await
+            .unwrap();
+
+        // Bond B → Released (terminal): must drop out of active set.
+        let mut released = bond_b.clone();
+        released.state = BondState::Released.to_string();
+        update_bond(&pool, released).await.unwrap();
+
+        let active = find_active_bonds(&pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, bond_a.id);
+
+        let active_a = find_active_bonds_for_order(&pool, order_a).await.unwrap();
+        assert_eq!(active_a.len(), 1);
+        let active_b = find_active_bonds_for_order(&pool, order_b).await.unwrap();
+        assert!(active_b.is_empty());
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
+use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::db::{
     find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
@@ -198,6 +199,10 @@ pub async fn admin_cancel_action(
     send_dm(buyer_pubkey, my_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Phase 1: admin cancellation always releases any taker bond. The
+    // dispute slash path lands in Phase 2.
+    bond::release_bonds_for_order_or_warn(pool, order.id, "admin_cancel").await;
 
     Ok(())
 }

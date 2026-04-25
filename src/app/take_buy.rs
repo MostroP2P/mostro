@@ -1,3 +1,5 @@
+use crate::app::bond;
+use crate::app::bond::db::find_active_bonds_for_order;
 use crate::app::context::AppContext;
 use crate::util::{
     get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
@@ -6,6 +8,7 @@ use crate::util::{
 use crate::db::{seller_has_pending_order, update_user_trade_index};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use sqlx_crud::Crud;
 
 pub async fn take_buy_action(
     ctx: &AppContext,
@@ -91,6 +94,41 @@ pub async fn take_buy_action(
     update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Anti-abuse bond (Phase 1): if the operator opted into a taker bond,
+    // intercept the take here. We persist the partially-populated order
+    // (status stays `Pending`) and request the bond. The trade hold
+    // invoice is created later — once the bond locks — by the bond
+    // subscriber's continuation in `bond::flow::resume_take_after_bond`.
+    if bond::taker_bond_required() {
+        // Defend against concurrent takes for the same order: if another
+        // taker already has an active bond on this order, the second take
+        // must back off rather than create a duplicate bond row.
+        let existing = find_active_bonds_for_order(pool, order.id).await?;
+        if !existing.is_empty() {
+            return Err(MostroCantDo(CantDoReason::PendingOrderExists));
+        }
+
+        // Stash the seller (taker) trade pubkey so the post-bond
+        // continuation can resume `show_hold_invoice` with the same
+        // arguments the legacy path would have used.
+        order.seller_pubkey = Some(seller_pubkey.to_string());
+
+        let persisted = order
+            .update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        bond::request_taker_bond(
+            pool,
+            &persisted,
+            seller_pubkey,
+            request_id,
+            Some(trade_index),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

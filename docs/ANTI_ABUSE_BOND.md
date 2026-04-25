@@ -79,24 +79,24 @@ The issue proposes three phases. We split them further so each PR is small
 enough to review without a marathon session. Data-model and payout plumbing
 come early (Phase 0 & 3) and are reused by every subsequent slash path.
 
-| Phase | PR scope | Depends on |
-|------:|----------|------------|
-| 0 | Foundation: config schema, `bonds` table, pure helpers, types | — |
-| 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 |
-| 2 | Taker bond: slash on **lost dispute** | 1 |
-| 3 | Payout flow: `add-invoice` to winner, routing-fee estimation, retries, audit event | 2 |
-| 4 | Taker bond: slash on **timeout** (apply_to=take, slash_on_waiting_timeout) | 3 |
-| 5 | Maker bond (non-range): lock + dispute slash reusing phase 3 payout | 3 |
-| 6 | Maker bond for **range orders** with proportional slashes | 5 |
-| 7 | Maker bond: slash on **timeout** | 5 |
-| 8 | Public config exposure (Mostro info event) + operator docs polish | 7 |
+| Phase | PR scope | Depends on | Status |
+|------:|----------|------------|--------|
+| 0 | Foundation: config schema, `bonds` table, pure helpers, types | — | ✅ shipped (PR #712) |
+| 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped |
+| 2 | Taker bond: slash on **lost dispute** | 1 | pending |
+| 3 | Payout flow: `add-invoice` to winner, routing-fee estimation, retries, audit event | 2 | pending |
+| 4 | Taker bond: slash on **timeout** (apply_to=take, slash_on_waiting_timeout) | 3 | pending |
+| 5 | Maker bond (non-range): lock + dispute slash reusing phase 3 payout | 3 | pending |
+| 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |
+| 7 | Maker bond: slash on **timeout** | 5 | pending |
+| 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | pending |
 
 Phases 4, 5, 6, 7 can partially overlap in time but must land in this order on
 `main` to keep review scope honest.
 
 ---
 
-## 5. Phase 0 — Foundation
+## 5. Phase 0 — Foundation ✅ Completed
 
 Purely additive. Touches no trade flow.
 
@@ -183,11 +183,33 @@ Purely additive. Touches no trade flow.
 
 ---
 
-## 6. Phase 1 — Taker bond: lock + always release
+## 6. Phase 1 — Taker bond: lock + always release ✅ Completed
 
 Wire the bond into the take flow but **never slash**. This lets operators
 turn the feature on in staging to exercise hold-invoice custody with zero risk
 to users.
+
+**Implementation notes (as shipped):**
+
+- The phase took the §6.2 "Alternative" path: orders stay in `Status::Pending`
+  while the bond is outstanding, and the bond bolt11 is delivered to the
+  taker via the existing `Action::PayInvoice` (the bond's payment hash
+  uniquely distinguishes it from the trade hold invoice that follows). The
+  dedicated `Status::WaitingTakerBond` / `Action::AddBondInvoice` will be
+  introduced in the matching `mostro-core` release alongside a later
+  phase, at which point this can be migrated transparently.
+- Bond release is wired into every Phase 1 exit:
+  `release_action`, `cancel_action` (cooperative + unilateral, taker- and
+  maker-side, including pending-order maker cancels), `admin_settle_action`,
+  `admin_cancel_action`, and `scheduler::job_cancel_orders`. Slashing
+  hooks are intentionally absent and land in Phase 2+.
+- A guard in `take_buy_action` / `take_sell_action` rejects a take with
+  `PendingOrderExists` when an active bond row already exists for the
+  order, preventing duplicate bonds when two takers race.
+- On daemon startup, `bond::resubscribe_active_bonds` re-attaches LND
+  invoice subscribers for any bond rows still in `Requested` / `Locked`,
+  so a restart never strands a taker who paid the bond just before the
+  daemon went down.
 
 ### 6.1 Scope
 

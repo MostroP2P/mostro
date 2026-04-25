@@ -1,3 +1,4 @@
+use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
@@ -145,6 +146,10 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     )
     .await;
 
+    // Phase 1: cooperative cancel always releases any taker bond. The
+    // dispute slash path lands in Phase 2.
+    bond::release_bonds_for_order_or_warn(pool, order.id, "cooperative_cancel").await;
+
     Ok(())
 }
 
@@ -249,6 +254,10 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     // Notify the creator about the republished order after the taker-side cancellation flow completes
     notify_creator(&order_updated, request_id).await?;
 
+    // Phase 1: the taker cancelled before activating the trade — always
+    // release the bond. Slashing for timeout-based cancels is Phase 4.
+    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "taker_cancel").await;
+
     Ok(())
 }
 
@@ -300,6 +309,10 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     )
     .await;
 
+    // Phase 1: maker cancelled before the trade went active — release any
+    // taker bond that had already been locked.
+    bond::release_bonds_for_order_or_warn(pool, order.id, "maker_cancel").await;
+
     Ok(())
 }
 
@@ -342,6 +355,10 @@ async fn cancel_pending_order_from_maker(
         None,
     )
     .await;
+    // Phase 1: a maker cancelling a still-Pending order may be racing
+    // with a taker who just locked a bond. Release any active bond so
+    // the taker is made whole.
+    bond::release_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
     Ok(())
 }
 

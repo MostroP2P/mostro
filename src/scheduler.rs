@@ -1,3 +1,4 @@
+use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::do_payment;
@@ -410,8 +411,20 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 &order_updated.id,
                                 new_status
                             );
+                            let order_id = order_updated.id;
                             // update order on db
                             let _ = order_updated.update(pool).await;
+                            // Phase 1: scheduler-driven cancels (waiting-state
+                            // timeouts) always release the bond. Slashing on
+                            // timeout lands in Phase 4 — and crucially MUST
+                            // gate on the cause being a real timeout, not a
+                            // user-driven cancel beforehand.
+                            bond::release_bonds_for_order_or_warn(
+                                pool,
+                                order_id,
+                                "scheduler_timeout",
+                            )
+                            .await;
                         }
                     }
                 }

@@ -419,13 +419,12 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // timeout lands in Phase 4 — and crucially MUST
                             // gate on the cause being a real timeout, not a
                             // user-driven cancel beforehand.
-                            if let Err(e) = bond::release_bonds_for_order(pool, order_id).await {
-                                tracing::warn!(
-                                    "scheduler: bond release failed for {}: {}",
-                                    order_id,
-                                    e
-                                );
-                            }
+                            bond::release_bonds_for_order_or_warn(
+                                pool,
+                                order_id,
+                                "scheduler_timeout",
+                            )
+                            .await;
                         }
                     }
                 }

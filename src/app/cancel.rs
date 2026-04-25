@@ -148,13 +148,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
 
     // Phase 1: cooperative cancel always releases any taker bond. The
     // dispute slash path lands in Phase 2.
-    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
-        tracing::warn!(
-            "cooperative_cancel: bond release failed for {}: {}",
-            order.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order.id, "cooperative_cancel").await;
 
     Ok(())
 }
@@ -262,13 +256,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
 
     // Phase 1: the taker cancelled before activating the trade — always
     // release the bond. Slashing for timeout-based cancels is Phase 4.
-    if let Err(e) = bond::release_bonds_for_order(pool, order_updated.id).await {
-        tracing::warn!(
-            "taker_cancel: bond release failed for {}: {}",
-            order_updated.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "taker_cancel").await;
 
     Ok(())
 }
@@ -323,13 +311,7 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
 
     // Phase 1: maker cancelled before the trade went active — release any
     // taker bond that had already been locked.
-    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
-        tracing::warn!(
-            "maker_cancel: bond release failed for {}: {}",
-            order.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order.id, "maker_cancel").await;
 
     Ok(())
 }
@@ -376,13 +358,7 @@ async fn cancel_pending_order_from_maker(
     // Phase 1: a maker cancelling a still-Pending order may be racing
     // with a taker who just locked a bond. Release any active bond so
     // the taker is made whole.
-    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
-        tracing::warn!(
-            "pending_maker_cancel: bond release failed for {}: {}",
-            order.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
     Ok(())
 }
 

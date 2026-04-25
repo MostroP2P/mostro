@@ -191,13 +191,7 @@ pub async fn admin_settle_action(
     }
     // Phase 1: admin-settled disputes always release any taker bond.
     // Slashing on lost dispute lands in Phase 2.
-    if let Err(e) = bond::release_bonds_for_order(pool, order_updated.id).await {
-        tracing::warn!(
-            "admin_settle: bond release failed for {}: {}",
-            order_updated.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "admin_settle").await;
 
     let _ = do_payment(ctx, order_updated, request_id).await;
 

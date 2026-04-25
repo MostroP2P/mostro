@@ -202,13 +202,7 @@ pub async fn admin_cancel_action(
 
     // Phase 1: admin cancellation always releases any taker bond. The
     // dispute slash path lands in Phase 2.
-    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
-        tracing::warn!(
-            "admin_cancel: bond release failed for {}: {}",
-            order.id,
-            e
-        );
-    }
+    bond::release_bonds_for_order_or_warn(pool, order.id, "admin_cancel").await;
 
     Ok(())
 }

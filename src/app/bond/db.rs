@@ -83,12 +83,14 @@ pub async fn find_bond_by_hash(
 pub async fn find_active_bonds(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<Bond>, mostro_core::error::MostroError> {
-    sqlx::query_as::<_, Bond>(
-        "SELECT * FROM bonds WHERE state IN ('requested', 'locked') ORDER BY created_at ASC",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+    let requested = BondState::Requested.to_string();
+    let locked = BondState::Locked.to_string();
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE state IN (?, ?) ORDER BY created_at ASC")
+        .bind(requested)
+        .bind(locked)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// List the still-outstanding bonds attached to a single order. Phase 1
@@ -98,12 +100,16 @@ pub async fn find_active_bonds_for_order(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<Vec<Bond>, mostro_core::error::MostroError> {
+    let requested = BondState::Requested.to_string();
+    let locked = BondState::Locked.to_string();
     sqlx::query_as::<_, Bond>(
         "SELECT * FROM bonds \
-         WHERE order_id = ? AND state IN ('requested', 'locked') \
+         WHERE order_id = ? AND state IN (?, ?) \
          ORDER BY created_at ASC",
     )
     .bind(order_id)
+    .bind(requested)
+    .bind(locked)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))

@@ -104,9 +104,7 @@ pub async fn take_buy_action(
         // Defend against concurrent takes for the same order: if another
         // taker already has an active bond on this order, the second take
         // must back off rather than create a duplicate bond row.
-        let existing = find_active_bonds_for_order(pool, order.id)
-            .await
-            .map_err(|_| MostroCantDo(CantDoReason::PendingOrderExists))?;
+        let existing = find_active_bonds_for_order(pool, order.id).await?;
         if !existing.is_empty() {
             return Err(MostroCantDo(CantDoReason::PendingOrderExists));
         }

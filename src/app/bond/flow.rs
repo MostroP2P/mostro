@@ -23,6 +23,7 @@
 //! status will land alongside the corresponding `mostro-core` release in a
 //! later phase.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -43,9 +44,7 @@ use crate::util::{
     bytes_to_string, enqueue_order_msg, get_keys, set_waiting_invoice_status, show_hold_invoice,
 };
 
-use super::db::{
-    create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash,
-};
+use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
 use super::math::compute_bond_amount;
 use super::model::Bond;
 use super::types::{BondRole, BondState};
@@ -90,12 +89,7 @@ pub async fn request_taker_bond(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
-    let mut bond = Bond::new_requested(
-        order.id,
-        taker_pubkey.to_string(),
-        BondRole::Taker,
-        amount,
-    );
+    let mut bond = Bond::new_requested(order.id, taker_pubkey.to_string(), BondRole::Taker, amount);
     bond.hash = Some(bytes_to_string(&hash));
     bond.preimage = Some(bytes_to_string(&preimage));
     bond.payment_request = Some(invoice_resp.payment_request.clone());
@@ -158,10 +152,16 @@ pub async fn request_taker_bond(
 /// more than one path (e.g. cooperative cancel after the LND subscriber
 /// already saw `Canceled`).
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
-    if matches!(
-        bond.state.as_str(),
-        "released" | "slashed" | "failed"
-    ) {
+    // Parse `state` once into the enum so callers don't depend on the
+    // `Display` form for control flow (and a malformed value short-
+    // circuits to "no-op" instead of falsely transitioning).
+    let state = BondState::from_str(&bond.state).map_err(|e| {
+        MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "Bond {} has unparseable state {:?}: {}",
+            bond.id, bond.state, e
+        )))
+    })?;
+    if state.is_terminal() {
         return Ok(());
     }
 
@@ -226,6 +226,23 @@ pub async fn release_bonds_for_order(
         }
     }
     Ok(())
+}
+
+/// Best-effort release helper for the Phase 1 exit paths.
+///
+/// Every order-exit flow (release, cancel, admin actions, scheduler
+/// timeouts) wants the same shape: try to release the bond, and on
+/// failure log a warning tagged with the call site — never propagate.
+/// Centralising the pattern keeps each call site to a single line and
+/// guarantees consistent log structure for operators.
+pub async fn release_bonds_for_order_or_warn(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    context: &'static str,
+) {
+    if let Err(e) = release_bonds_for_order(pool, order_id).await {
+        warn!("{context}: bond release failed for {}: {}", order_id, e);
+    }
 }
 
 /// Spawn the LND subscriber for a bond hold invoice. The subscriber
@@ -311,7 +328,7 @@ async fn on_bond_invoice_accepted(
     pool: &Pool<Sqlite>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    let mut bond = match find_bond_by_hash(pool, hash).await? {
+    let bond = match find_bond_by_hash(pool, hash).await? {
         Some(b) => b,
         None => {
             warn!("Bond invoice accepted for unknown hash {hash}");
@@ -319,24 +336,37 @@ async fn on_bond_invoice_accepted(
         }
     };
 
-    if bond.state == BondState::Locked.to_string() {
-        // Subscriber may emit Accepted more than once on reconnect; idempotent.
-        return Ok(());
-    }
-    if bond.state != BondState::Requested.to_string() {
-        warn!(
-            "Bond {} accepted but state was {} — ignoring",
-            bond.id, bond.state
-        );
-        return Ok(());
-    }
+    // Concurrent subscriber firings (LND can emit Accepted more than once
+    // on reconnect, and the restart-time resubscriber re-attaches another
+    // listener) must not both run the take continuation. The conditional
+    // UPDATE is the single point of synchronisation: only the row that
+    // actually wins the `requested` → `locked` race continues here.
+    let now = Utc::now().timestamp();
+    let result =
+        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::Locked.to_string())
+            .bind(now)
+            .bind(bond.id)
+            .bind(BondState::Requested.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    bond.state = BondState::Locked.to_string();
-    bond.locked_at = Some(Utc::now().timestamp());
-    let bond = bond
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if result.rows_affected() == 0 {
+        // Either another subscriber already locked the bond (idempotent
+        // — nothing to do), or the row moved to a non-Requested state
+        // through a concurrent release path (also fine: the take won't
+        // resume on a released bond). Log only when surprising.
+        if !matches!(bond.state.as_str(), s if s == BondState::Requested.to_string()
+            || s == BondState::Locked.to_string())
+        {
+            warn!(
+                "Bond {} accepted but state was {} — ignoring",
+                bond.id, bond.state
+            );
+        }
+        return Ok(());
+    }
 
     info!("Bond {} locked for order {}", bond.id, bond.order_id);
 
@@ -368,7 +398,10 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
         None => return Ok(()),
     };
 
-    if matches!(bond.state.as_str(), "released" | "slashed" | "failed") {
+    if BondState::from_str(&bond.state)
+        .map(|s| s.is_terminal())
+        .unwrap_or(false)
+    {
         return Ok(());
     }
 

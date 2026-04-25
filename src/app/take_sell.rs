@@ -131,9 +131,7 @@ pub async fn take_sell_action(
     // `bond::flow::resume_take_after_bond` resumes the trade once the
     // bond locks.
     if bond::taker_bond_required() {
-        let existing = find_active_bonds_for_order(pool, order.id)
-            .await
-            .map_err(|_| MostroCantDo(CantDoReason::PendingOrderExists))?;
+        let existing = find_active_bonds_for_order(pool, order.id).await?;
         if !existing.is_empty() {
             return Err(MostroCantDo(CantDoReason::PendingOrderExists));
         }

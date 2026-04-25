@@ -273,9 +273,7 @@ pub async fn release_action(
     // hand off to the buyer payment task. Slashing is intentionally not
     // wired in yet — that's Phase 2+. A failed bond release is logged but
     // does not block trade finalization.
-    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
-        tracing::warn!("release_action: bond release failed for {}: {}", order.id, e);
-    }
+    bond::release_bonds_for_order_or_warn(pool, order.id, "release_action").await;
 
     // Finally we try to pay buyer's invoice
     let _ = do_payment(ctx, order, request_id).await;

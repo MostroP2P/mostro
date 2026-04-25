@@ -16,8 +16,8 @@ pub mod model;
 pub mod types;
 
 pub use flow::{
-    release_bond, release_bonds_for_order, request_taker_bond, resubscribe_active_bonds,
-    taker_bond_required,
+    release_bond, release_bonds_for_order, release_bonds_for_order_or_warn, request_taker_bond,
+    resubscribe_active_bonds, taker_bond_required,
 };
 pub use math::compute_bond_amount;
 pub use model::Bond;

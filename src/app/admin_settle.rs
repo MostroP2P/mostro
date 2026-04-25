@@ -1,3 +1,4 @@
+use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::db::{
     find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
@@ -188,6 +189,16 @@ pub async fn admin_settle_action(
         )
         .await;
     }
+    // Phase 1: admin-settled disputes always release any taker bond.
+    // Slashing on lost dispute lands in Phase 2.
+    if let Err(e) = bond::release_bonds_for_order(pool, order_updated.id).await {
+        tracing::warn!(
+            "admin_settle: bond release failed for {}: {}",
+            order_updated.id,
+            e
+        );
+    }
+
     let _ = do_payment(ctx, order_updated, request_id).await;
 
     Ok(())

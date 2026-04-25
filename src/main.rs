@@ -140,6 +140,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Resubscribe to any in-flight anti-abuse bond hold invoices so a
+    // restart doesn't strand a taker who paid the bond just before the
+    // daemon went down. Inert when the feature is disabled.
+    let bond_pool = get_db_pool();
+    if let Err(e) = app::bond::resubscribe_active_bonds(&bond_pool).await {
+        tracing::warn!("Failed to resubscribe active bonds: {e}");
+    }
+
     // Start RPC server if enabled
     if RpcServer::is_enabled() {
         let rpc_server = RpcServer::new();

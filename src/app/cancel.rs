@@ -1,3 +1,4 @@
+use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
@@ -145,6 +146,16 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     )
     .await;
 
+    // Phase 1: cooperative cancel always releases any taker bond. The
+    // dispute slash path lands in Phase 2.
+    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
+        tracing::warn!(
+            "cooperative_cancel: bond release failed for {}: {}",
+            order.id,
+            e
+        );
+    }
+
     Ok(())
 }
 
@@ -249,6 +260,16 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     // Notify the creator about the republished order after the taker-side cancellation flow completes
     notify_creator(&order_updated, request_id).await?;
 
+    // Phase 1: the taker cancelled before activating the trade — always
+    // release the bond. Slashing for timeout-based cancels is Phase 4.
+    if let Err(e) = bond::release_bonds_for_order(pool, order_updated.id).await {
+        tracing::warn!(
+            "taker_cancel: bond release failed for {}: {}",
+            order_updated.id,
+            e
+        );
+    }
+
     Ok(())
 }
 
@@ -300,6 +321,16 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     )
     .await;
 
+    // Phase 1: maker cancelled before the trade went active — release any
+    // taker bond that had already been locked.
+    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
+        tracing::warn!(
+            "maker_cancel: bond release failed for {}: {}",
+            order.id,
+            e
+        );
+    }
+
     Ok(())
 }
 
@@ -342,6 +373,16 @@ async fn cancel_pending_order_from_maker(
         None,
     )
     .await;
+    // Phase 1: a maker cancelling a still-Pending order may be racing
+    // with a taker who just locked a bond. Release any active bond so
+    // the taker is made whole.
+    if let Err(e) = bond::release_bonds_for_order(pool, order.id).await {
+        tracing::warn!(
+            "pending_maker_cancel: bond release failed for {}: {}",
+            order.id,
+            e
+        );
+    }
     Ok(())
 }
 

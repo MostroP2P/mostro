@@ -1,3 +1,5 @@
+use crate::app::bond;
+use crate::app::bond::db::find_active_bonds_for_order;
 use crate::app::context::AppContext;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
@@ -121,6 +123,40 @@ pub async fn take_sell_action(
     update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Anti-abuse bond (Phase 1): when enabled for the taker side, defer
+    // the trade hold-invoice / `WaitingBuyerInvoice` step. We persist the
+    // populated order (status stays `Pending`), stash the buyer payout
+    // invoice if the taker provided one, and request the taker's bond.
+    // `bond::flow::resume_take_after_bond` resumes the trade once the
+    // bond locks.
+    if bond::taker_bond_required() {
+        let existing = find_active_bonds_for_order(pool, order.id)
+            .await
+            .map_err(|_| MostroCantDo(CantDoReason::PendingOrderExists))?;
+        if !existing.is_empty() {
+            return Err(MostroCantDo(CantDoReason::PendingOrderExists));
+        }
+
+        if let Some(invoice) = payment_request.as_ref() {
+            order.buyer_invoice = Some(invoice.clone());
+        }
+
+        let persisted = order
+            .update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        bond::request_taker_bond(
+            pool,
+            &persisted,
+            event.sender,
+            request_id,
+            Some(trade_index),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

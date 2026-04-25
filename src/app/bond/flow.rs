@@ -143,14 +143,81 @@ pub async fn request_taker_bond(
     Ok(bond)
 }
 
-/// Release a single bond: cancel the hold invoice (best-effort) and
-/// transition the row to `Released`.
+/// Outcome of a `cancel_hold_invoice` attempt against LND, classified
+/// from the structured gRPC error so the caller can decide whether the
+/// HTLC is verifiably no longer encumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelOutcome {
+    /// The cancel landed at LND (or didn't need to: the invoice was
+    /// already canceled / never existed). The HTLC, if there ever was
+    /// one, is no longer encumbered. Safe to mark `Released`.
+    AlreadyDone,
+    /// Transport / server error from LND, including LND being
+    /// unreachable. The HTLC **may still be encumbered**. Leave the bond
+    /// in its current active state so a future code path retries.
+    Transient,
+}
+
+/// Classify the error returned by `LndConnector::cancel_hold_invoice`.
 ///
-/// **Idempotent.** A bond already in a terminal state (`Released`,
-/// `Slashed`, `Failed`) is a no-op. This matters because Phase 1 wires
-/// release into every exit, and the same bond can plausibly be hit by
-/// more than one path (e.g. cooperative cancel after the LND subscriber
-/// already saw `Canceled`).
+/// We rely on the `code=<grpc::Code>` prefix `cancel_hold_invoice`
+/// embeds, plus message-text patterns LND emits when an invoice is
+/// already canceled / unknown (those typically come back as
+/// `code=Unknown` with a recognisable message, so message inspection is
+/// load-bearing — not just defensive).
+///
+/// Anything we can't classify confidently maps to `Transient`: the
+/// safer side is to delay cleanup until the next exit path or CLTV
+/// expiry, never to falsely report a release on an HTLC LND still has.
+fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
+    let s = err.to_string().to_lowercase();
+
+    // gRPC codes that mean the cancel was idempotent / target wasn't there.
+    if s.contains("code=notfound") || s.contains("code=alreadyexists") {
+        return CancelOutcome::AlreadyDone;
+    }
+    // LND-specific message patterns that come back under `code=Unknown`.
+    if s.contains("already cancelled")
+        || s.contains("already canceled")
+        || s.contains("unable to locate invoice")
+        || s.contains("invoice not found")
+        || s.contains("no such invoice")
+    {
+        return CancelOutcome::AlreadyDone;
+    }
+    // Everything else — Unavailable, DeadlineExceeded, transport errors,
+    // unexpected Internal, codes we don't recognise — is conservatively
+    // treated as transient. The bond stays active and gets retried on
+    // the next exit path / CLTV expiry / daemon restart.
+    CancelOutcome::Transient
+}
+
+/// Release a single bond: cancel the hold invoice and transition the
+/// row to `Released` **only if** the HTLC is verifiably no longer
+/// encumbered.
+///
+/// **Idempotent for terminal states.** A bond already in `Released`,
+/// `Slashed`, or `Failed` is a no-op.
+///
+/// **Safety contract for transient LND failures.** When
+/// `cancel_hold_invoice` fails with a transport / server error (LND
+/// unreachable, deadline exceeded, etc.), the bond is left in its
+/// current active state and the error is propagated to the caller.
+/// Marking `Released` here would drop the bond out of
+/// `find_active_bonds*` (which filters on `state IN ('requested',
+/// 'locked')`), stranding the taker's funds in LND with no retry path
+/// — the [issue raised in the Phase 1 review](#).
+///
+/// The recovery path for a left-active bond is implicit:
+/// - The LND subscriber spawned by `bond_invoice_subscribe` (and
+///   re-attached by `resubscribe_active_bonds` on restart) catches the
+///   eventual `InvoiceState::Canceled` — emitted either when LND
+///   recovers and we retry, or when the hold invoice's CLTV expires
+///   and LND auto-cancels — and `on_bond_invoice_canceled` then marks
+///   the bond `Released`.
+/// - Operators see a structured `warn` event with `bond_id`, `order_id`,
+///   and the classified outcome so they can spot and intervene if a
+///   bond stays stuck.
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
     // Parse `state` once into the enum so callers don't depend on the
     // `Display` form for control flow (and a malformed value short-
@@ -169,20 +236,44 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
         match LndConnector::new().await {
             Ok(mut ln) => {
                 if let Err(e) = ln.cancel_hold_invoice(hash).await {
-                    // Hold invoice already canceled / unknown to LND is the
-                    // common race with the subscriber; we still want the row
-                    // to land in `Released` so callers can move on.
-                    warn!(
-                        "Bond {} cancel_hold_invoice failed: {} — marking Released anyway",
-                        bond.id, e
-                    );
+                    match classify_cancel_error(&e) {
+                        CancelOutcome::AlreadyDone => {
+                            // Common race with the subscriber, or the
+                            // invoice was never created in the first place
+                            // (request_taker_bond bailed before the row got
+                            // a hash). HTLC is verifiably gone — fall
+                            // through to mark Released.
+                            info!(
+                                bond_id = %bond.id,
+                                order_id = %bond.order_id,
+                                "cancel_hold_invoice reports already-done ({}); marking Released",
+                                e
+                            );
+                        }
+                        CancelOutcome::Transient => {
+                            warn!(
+                                bond_id = %bond.id,
+                                order_id = %bond.order_id,
+                                outcome = "transient",
+                                "cancel_hold_invoice failed transiently ({}); leaving bond {} for retry",
+                                e, bond.state
+                            );
+                            return Err(e);
+                        }
+                    }
                 }
             }
             Err(e) => {
+                // LND unreachable: definitionally transient. Don't pretend
+                // the HTLC is gone.
                 warn!(
-                    "Bond {} could not connect to LND for cancel: {} — marking Released anyway",
-                    bond.id, e
+                    bond_id = %bond.id,
+                    order_id = %bond.order_id,
+                    outcome = "transient",
+                    "could not connect to LND for cancel ({}); leaving bond {} for retry",
+                    e, bond.state
                 );
+                return Err(e);
             }
         }
     }
@@ -634,5 +725,61 @@ mod tests {
         // Guarantees that all bond touchpoints are inert in the absence
         // of an `[anti_abuse_bond]` block.
         assert!(!taker_bond_required());
+    }
+
+    fn ln_err(msg: &str) -> MostroError {
+        MostroInternalErr(ServiceError::LnNodeError(msg.to_string()))
+    }
+
+    #[test]
+    fn classify_already_done_by_grpc_code() {
+        // The `code=NotFound` / `code=AlreadyExists` prefix is what the
+        // updated `cancel_hold_invoice` emits for benign outcomes.
+        assert_eq!(
+            classify_cancel_error(&ln_err("code=NotFound message=...")),
+            CancelOutcome::AlreadyDone
+        );
+        assert_eq!(
+            classify_cancel_error(&ln_err("code=AlreadyExists message=duplicate")),
+            CancelOutcome::AlreadyDone
+        );
+    }
+
+    #[test]
+    fn classify_already_done_by_lnd_message() {
+        // LND returns these under `code=Unknown`, so message inspection
+        // is load-bearing.
+        for msg in [
+            "code=Unknown message=invoice with that hash already cancelled",
+            "code=Unknown message=invoice with that hash already canceled",
+            "code=Unknown message=unable to locate invoice",
+            "code=Unknown message=invoice not found for hash",
+            "code=Unknown message=no such invoice",
+        ] {
+            assert_eq!(
+                classify_cancel_error(&ln_err(msg)),
+                CancelOutcome::AlreadyDone,
+                "expected AlreadyDone for: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_transient_for_transport_and_unknown() {
+        // Transport / server errors must NOT be treated as already-done:
+        // marking Released here would strand the HTLC.
+        for msg in [
+            "code=Unavailable message=connection refused",
+            "code=DeadlineExceeded message=timeout",
+            "code=Internal message=server crashed",
+            "code=Unknown message=something we don't recognise",
+            "transport error",
+        ] {
+            assert_eq!(
+                classify_cancel_error(&ln_err(msg)),
+                CancelOutcome::Transient,
+                "expected Transient for: {msg}"
+            );
+        }
     }
 }

@@ -3,7 +3,6 @@ use crate::db::add_new_user;
 use crate::util::send_dm;
 use mostro_core::prelude::*;
 use mostro_core::user::User;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use tracing::{error, info};
 
@@ -47,7 +46,7 @@ fn parse_solver_payload(payload: &Payload) -> Result<(String, i64), MostroError>
 pub async fn admin_add_solver_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -59,7 +58,7 @@ pub async fn admin_add_solver_action(
         .as_ref()
         .ok_or(MostroCantDo(CantDoReason::InvalidTextMessage))?;
 
-    if event.sender.to_string() != my_keys.public_key().to_string() {
+    if event.identity != my_keys.public_key() {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     }
 
@@ -85,7 +84,7 @@ pub async fn admin_add_solver_action(
         .as_json()
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
-    send_dm(event.rumor.pubkey, my_keys, &message, None)
+    send_dm(event.sender, my_keys, &message, None)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 

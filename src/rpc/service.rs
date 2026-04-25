@@ -9,7 +9,8 @@ use crate::rpc::admin::{
     TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use crate::rpc::rate_limiter::RateLimiter;
-use nostr_sdk::{nips::nip59::UnwrappedGift, Keys};
+use mostro_core::nip59::UnwrappedMessage;
+use nostr_sdk::Keys;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +49,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_cancel::admin_cancel_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::{Kind as NostrKind, Timestamp, UnsignedEvent};
+        use nostr_sdk::Timestamp;
         use uuid::Uuid;
 
         // Create a mock message for the admin cancel action
@@ -60,18 +61,20 @@ impl AdminServiceImpl {
             None,
         );
 
-        // Create a mock UnwrappedGift event
-        let unsigned_event = UnsignedEvent::new(
-            self.keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        let event = UnwrappedGift {
+        // Admin RPC flows synthesize the inbound event with the node's own
+        // pubkey in both `identity` and `sender` slots. Authorization is then
+        // enforced downstream by the handlers, which check `event.identity`
+        // against `is_assigned_solver` / `solver_has_write_permission` (and
+        // for cancel/settle, fall back to `is_dispute_taken_by_admin`). For
+        // these flows to succeed, the operator must register the daemon's own
+        // pubkey as an admin/solver with write permission. Authentication of
+        // the gRPC caller itself happens at the transport layer, not here.
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
             sender: self.keys.public_key(),
-            rumor: unsigned_event,
+            identity: self.keys.public_key(),
+            created_at: Timestamp::now(),
         };
 
         use crate::app::context::AppContext;
@@ -110,7 +113,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_settle::admin_settle_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::{Kind as NostrKind, Timestamp, UnsignedEvent};
+        use nostr_sdk::Timestamp;
         use uuid::Uuid;
 
         let msg = Message::new_order(
@@ -121,17 +124,12 @@ impl AdminServiceImpl {
             None,
         );
 
-        let unsigned_event = UnsignedEvent::new(
-            self.keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        let event = UnwrappedGift {
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
             sender: self.keys.public_key(),
-            rumor: unsigned_event,
+            identity: self.keys.public_key(),
+            created_at: Timestamp::now(),
         };
 
         use crate::app::context::AppContext;
@@ -170,7 +168,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_add_solver::admin_add_solver_action;
         use mostro_core::message::{Action, Message, Payload};
-        use nostr_sdk::{Kind as NostrKind, Timestamp, UnsignedEvent};
+        use nostr_sdk::Timestamp;
 
         let msg = Message::new_dispute(
             None,
@@ -180,17 +178,12 @@ impl AdminServiceImpl {
             Some(Payload::TextMessage(solver_pubkey)),
         );
 
-        let unsigned_event = UnsignedEvent::new(
-            self.keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        let event = UnwrappedGift {
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
             sender: self.keys.public_key(),
-            rumor: unsigned_event,
+            identity: self.keys.public_key(),
+            created_at: Timestamp::now(),
         };
 
         use crate::app::context::AppContext;
@@ -228,7 +221,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_take_dispute::admin_take_dispute_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::{Kind as NostrKind, Timestamp, UnsignedEvent};
+        use nostr_sdk::Timestamp;
         use uuid::Uuid;
 
         let msg = Message::new_dispute(
@@ -239,17 +232,12 @@ impl AdminServiceImpl {
             None,
         );
 
-        let unsigned_event = UnsignedEvent::new(
-            self.keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        let event = UnwrappedGift {
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
             sender: self.keys.public_key(),
-            rumor: unsigned_event,
+            identity: self.keys.public_key(),
+            created_at: Timestamp::now(),
         };
 
         use crate::app::context::AppContext;

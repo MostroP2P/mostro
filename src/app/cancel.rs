@@ -4,7 +4,6 @@ use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -76,7 +75,7 @@ async fn notify_creator(order: &Order, request_id: Option<u64>) -> Result<(), Mo
 /// - Publishes a new replaceable nostr event and notifies both parties
 async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     ctx: &AppContext,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     request_id: Option<u64>,
     mut order: Order,
     counterparty_pubkey: String,
@@ -86,7 +85,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     let pool = ctx.pool();
     // Guard: the same party cannot both initiate and confirm the cooperative cancel.
     if let Some(initiator) = &order.cancel_initiator_pubkey {
-        if *initiator == event.rumor.pubkey.to_string() {
+        if *initiator == event.sender.to_string() {
             // We create a Message
             return Err(MostroCantDo(CantDoReason::InvalidPubkey));
         }
@@ -118,7 +117,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
         Some(order.id),
         Action::CooperativeCancelAccepted,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;
@@ -155,12 +154,12 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
 /// - Notifies both parties so the counterparty can confirm (step 2)
 async fn cancel_cooperative_execution_step_1(
     pool: &Pool<Sqlite>,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     mut order: Order,
     counterparty_pubkey: String,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    order.cancel_initiator_pubkey = Some(event.rumor.pubkey.to_string());
+    order.cancel_initiator_pubkey = Some(event.sender.to_string());
     // update db
     let order = order
         .update(pool)
@@ -173,7 +172,7 @@ async fn cancel_cooperative_execution_step_1(
         Some(order.id),
         Action::CooperativeCancelInitiatedByYou,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;
@@ -201,7 +200,7 @@ async fn cancel_cooperative_execution_step_1(
 /// - Notify the maker/creator that the order is republished
 async fn cancel_order_by_taker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     mut order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
@@ -220,7 +219,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
         Some(order.id),
         Action::Canceled,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;
@@ -261,7 +260,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
 /// - Notifies both parties
 async fn cancel_order_by_maker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     order: Order,
     taker_pubkey: PublicKey,
     my_keys: &Keys,
@@ -286,7 +285,7 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
         Some(order.id),
         Action::Canceled,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;
@@ -310,14 +309,14 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
 /// notifies the maker. No invoice is involved yet in this state.
 async fn cancel_pending_order_from_maker(
     pool: &Pool<Sqlite>,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     order: &mut Order,
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     // Validates if this user is the order creator
     order
-        .sent_from_maker(event.rumor.pubkey)
+        .sent_from_maker(event.sender)
         .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
     // Publish a replaceable nostr event with updated status and persist it.
     match update_order_event(my_keys, Status::Canceled, order).await {
@@ -339,7 +338,7 @@ async fn cancel_pending_order_from_maker(
         Some(order.id),
         Action::Canceled,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;
@@ -353,7 +352,7 @@ async fn cancel_pending_order_from_maker(
 pub async fn cancel_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
@@ -363,7 +362,7 @@ pub async fn cancel_action(
 async fn cancel_action_generic<L: CancelLightning + Send>(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
@@ -408,7 +407,7 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
 /// (step 1) or completes it (step 2) when both sides have acknowledged.
 async fn cancel_active_order<L: CancelLightning + Send>(
     ctx: &AppContext,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     mut order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
@@ -420,7 +419,7 @@ async fn cancel_active_order<L: CancelLightning + Send>(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     let counterparty_pubkey: String;
-    if buyer_pubkey == event.rumor.pubkey {
+    if buyer_pubkey == event.sender {
         order.buyer_cooperativecancel = true;
         counterparty_pubkey = seller_pubkey.to_string();
     } else {
@@ -462,7 +461,7 @@ async fn cancel_active_order<L: CancelLightning + Send>(
 /// can cancel. This ensures the correct party authorization for early cancels.
 async fn cancel_not_active_order<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     order: Order,
     my_keys: &Keys,
     request_id: Option<u64>,
@@ -481,7 +480,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     };
 
-    if order.sent_from_maker(event.rumor.pubkey).is_ok() {
+    if order.sent_from_maker(event.sender).is_ok() {
         cancel_order_by_maker(
             pool,
             event,
@@ -492,7 +491,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
             ln_client,
         )
         .await?;
-    } else if event.rumor.pubkey == taker_pubkey {
+    } else if event.sender == taker_pubkey {
         cancel_order_by_taker(
             pool,
             event,
@@ -513,23 +512,28 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use sqlx_crud::Crud;
     use std::sync::Arc;
 
-    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
-        let unsigned_event = UnsignedEvent::new(
-            pubkey,
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        UnwrappedGift {
+    /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)
+    /// is `pubkey`. The identity key is generated separately so the fixture
+    /// reflects the dual-key flow: handlers that gate on `sender` see the
+    /// caller; handlers that gate on `identity` see an unrelated key.
+    fn create_unwrapped_message_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::Order(MessageKind::new(
+                Some(uuid::Uuid::new_v4()),
+                Some(1),
+                None,
+                Action::Cancel,
+                None,
+            )),
+            signature: None,
             sender: pubkey,
-            rumor: unsigned_event,
+            identity: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -612,7 +616,7 @@ mod tests {
 
         // Event is sent by a third party (neither maker nor taker) to trigger auth guard.
         let intruder = Keys::generate().public_key();
-        let event = create_unwrapped_gift_with_pubkey(intruder);
+        let event = create_unwrapped_message_with_pubkey(intruder);
 
         let msg = Message::new_order(Some(order.id), Some(1), None, Action::Cancel, None);
         let my_keys = Keys::generate();

@@ -5,13 +5,12 @@ use crate::util::{
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 pub async fn take_buy_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -23,7 +22,7 @@ pub async fn take_buy_action(
     let request_id = msg.get_inner_message_kind().request_id;
 
     // Check if the buyer has a pending order
-    if seller_has_pending_order(pool, event.sender.to_string()).await? {
+    if seller_has_pending_order(pool, event.identity.to_string()).await? {
         return Err(MostroCantDo(CantDoReason::PendingOrderExists));
     }
 
@@ -38,7 +37,7 @@ pub async fn take_buy_action(
 
     // Validate that the order was sent from the correct maker
     order
-        .not_sent_from_maker(event.rumor.pubkey)
+        .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
     // Get the fiat amount requested by the user for range orders
@@ -68,15 +67,15 @@ pub async fn take_buy_action(
     }
 
     // Get seller and buyer public keys
-    let seller_pubkey = event.rumor.pubkey;
+    let seller_pubkey = event.sender;
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Add seller identity and trade index to the order
-    order.master_seller_pubkey = Some(event.sender.to_string());
+    order.master_seller_pubkey = Some(event.identity.to_string());
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {
-            if event.sender == event.rumor.pubkey {
+            if event.identity == event.sender {
                 0
             } else {
                 return Err(MostroInternalErr(ServiceError::InvalidPayload));
@@ -89,7 +88,7 @@ pub async fn take_buy_action(
     order.set_timestamp_now();
 
     // Update trade index only after all checks are done
-    update_user_trade_index(pool, event.sender.to_string(), trade_index)
+    update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

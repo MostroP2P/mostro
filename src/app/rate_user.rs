@@ -2,7 +2,6 @@ use crate::app::context::AppContext;
 use crate::db::{is_user_present, update_user_rating};
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 pub fn prepare_variables_for_vote(
@@ -71,7 +70,7 @@ pub fn prepare_variables_for_vote(
 pub async fn update_user_reputation_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -80,7 +79,7 @@ pub async fn update_user_reputation_action(
 
     // Prepare variables for vote
     let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
-        prepare_variables_for_vote(&event.rumor.pubkey.to_string(), &order)?;
+        prepare_variables_for_vote(&event.sender.to_string(), &order)?;
 
     // Check if order is success, but sellers can rate in status settled-hold-invoice
     if !(order.check_status(Status::Success).is_ok()
@@ -200,7 +199,7 @@ pub async fn update_user_reputation_action(
             Some(order.id),
             Action::RateReceived,
             Some(Payload::RatingUser(new_rating)),
-            event.rumor.pubkey,
+            event.sender,
             None,
         )
         .await;
@@ -227,7 +226,7 @@ mod tests {
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use sqlx_crud::Crud;
     use uuid::Uuid;
@@ -255,17 +254,23 @@ mod tests {
         Keys::generate()
     }
 
-    fn create_unwrapped_gift_with_pubkey(pubkey: PublicKey) -> UnwrappedGift {
-        let unsigned_event = UnsignedEvent::new(
-            pubkey,
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-        UnwrappedGift {
+    /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)
+    /// is `pubkey` — these tests gate on `event.sender` to identify
+    /// buyer/seller — and whose identity key is generated separately so the
+    /// fixture exercises the dual-key flow rather than full-privacy mode.
+    fn create_unwrapped_message_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::Order(MessageKind::new(
+                Some(Uuid::new_v4()),
+                Some(1),
+                None,
+                Action::RateUser,
+                None,
+            )),
+            signature: None,
             sender: pubkey,
-            rumor: unsigned_event,
+            identity: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -312,7 +317,7 @@ mod tests {
         let buyer_pk = buyer_keys.public_key();
 
         // Event where the sender is the seller (so seller_rating = true)
-        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+        let event = create_unwrapped_message_with_pubkey(seller_pk);
 
         // Insert Success order in DB
         let order = create_test_order(Status::Success, seller_pk, buyer_pk);
@@ -345,7 +350,7 @@ mod tests {
         let buyer_pk = buyer_keys.public_key();
 
         // Event where the sender is the buyer (so buyer_rating = true)
-        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
 
         // SettledHoldInvoice order in DB
         let order = create_test_order(Status::SettledHoldInvoice, seller_pk, buyer_pk);
@@ -400,7 +405,7 @@ mod tests {
         let order = order.create(&pool).await.unwrap();
 
         // Event where sender is the buyer (buyer_rating = true)
-        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
         let msg = create_rate_user_message(order.id, 5);
 
         let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
@@ -459,7 +464,7 @@ mod tests {
         let order = order.create(&pool).await.unwrap();
 
         // Buyer tries to rate again
-        let event = create_unwrapped_gift_with_pubkey(buyer_pk);
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
         let msg = create_rate_user_message(order.id, 5);
 
         let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
@@ -509,7 +514,7 @@ mod tests {
         let order = order.create(&pool).await.unwrap();
 
         // Event where sender is the seller (seller_rating = true)
-        let event = create_unwrapped_gift_with_pubkey(seller_pk);
+        let event = create_unwrapped_message_with_pubkey(seller_pk);
         let msg = create_rate_user_message(order.id, 4);
 
         let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;

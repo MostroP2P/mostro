@@ -8,7 +8,6 @@ use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, upda
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -157,7 +156,7 @@ pub async fn check_failure_retries(
 pub async fn release_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
@@ -172,7 +171,7 @@ pub async fn release_action(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Check if the pubkey is the seller pubkey - Only the seller can release funds
-    if seller_pubkey != event.rumor.pubkey {
+    if seller_pubkey != event.sender {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
 

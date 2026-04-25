@@ -2,14 +2,13 @@ use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_order};
 
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 
 pub async fn trade_pubkey_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get request id
@@ -38,15 +37,15 @@ pub async fn trade_pubkey_action(
     };
 
     match (master_buyer_key, master_seller_key) {
-        (Some(master_buyer_pubkey), _) if master_buyer_pubkey == event.sender.to_string() => {
-            order.buyer_pubkey = Some(event.rumor.pubkey.to_string());
+        (Some(master_buyer_pubkey), _) if master_buyer_pubkey == event.identity.to_string() => {
+            order.buyer_pubkey = Some(event.sender.to_string());
         }
-        (_, Some(master_seller_pubkey)) if master_seller_pubkey == event.sender.to_string() => {
-            order.seller_pubkey = Some(event.rumor.pubkey.to_string());
+        (_, Some(master_seller_pubkey)) if master_seller_pubkey == event.identity.to_string() => {
+            order.seller_pubkey = Some(event.sender.to_string());
         }
         _ => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
-    order.creator_pubkey = event.rumor.pubkey.to_string();
+    order.creator_pubkey = event.sender.to_string();
 
     // We a message to the seller
     enqueue_order_msg(
@@ -54,7 +53,7 @@ pub async fn trade_pubkey_action(
         Some(order.id),
         Action::TradePubkey,
         None,
-        event.rumor.pubkey,
+        event.sender,
         None,
     )
     .await;

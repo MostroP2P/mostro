@@ -7,7 +7,6 @@ use crate::db::find_dispute_by_order_id;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 use sqlx_crud::traits::Crud;
@@ -153,7 +152,7 @@ async fn notify_dispute_to_users(
 pub async fn dispute_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -175,7 +174,7 @@ pub async fn dispute_action(
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
     // Get message sender
-    let message_sender = event.rumor.pubkey.to_string();
+    let message_sender = event.sender.to_string();
     // Get counterpart info
     let is_buyer_dispute = match get_counterpart_info(&message_sender, &buyer, &seller) {
         Ok(is_buyer_dispute) => is_buyer_dispute,

@@ -2,7 +2,6 @@ use crate::app::context::AppContext;
 use crate::db::is_user_present;
 use crate::util::send_dm;
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 
 /// Handles a `last_trade_index` action request from a user.
@@ -44,14 +43,14 @@ use nostr_sdk::prelude::*;
 pub async fn last_trade_index(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get requester pubkey (sender of the message)
-    let requester_pubkey = event.sender.to_string();
+    let requester_pubkey = event.identity.to_string();
     // Get trade key from the event rumor
-    let trade_key = event.rumor.pubkey;
+    let trade_key = event.sender;
 
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
@@ -101,7 +100,7 @@ pub async fn last_trade_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
 
@@ -110,25 +109,28 @@ mod tests {
         Keys::generate()
     }
 
-    // Helper function to create UnwrappedGift for testing
-    fn create_test_unwrapped_gift(sender_keys: &Keys) -> UnwrappedGift {
-        let keys = create_test_keys();
-
-        let unsigned_event = UnsignedEvent::new(
-            keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
+    // Helper function to create UnwrappedMessage for testing. `sender_keys`
+    // stands in for the long-lived identity key; the trade key is generated
+    // separately so the two fields stay distinguishable.
+    fn create_test_unwrapped_message(sender_keys: &Keys) -> UnwrappedMessage {
+        let trade = create_test_keys();
         println!(
-            "Creating UnwrappedGift with sender pubkey: {}",
+            "Creating UnwrappedMessage with identity pubkey: {}",
             sender_keys.public_key()
         );
 
-        UnwrappedGift {
-            sender: sender_keys.public_key(),
-            rumor: unsigned_event,
+        UnwrappedMessage {
+            message: Message::Restore(MessageKind::new(
+                None,
+                Some(1),
+                None,
+                Action::LastTradeIndex,
+                None,
+            )),
+            signature: None,
+            sender: trade.public_key(),
+            identity: sender_keys.public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -194,7 +196,7 @@ mod tests {
         let sender_keys = create_test_keys();
 
         // Create test event for non-existent user
-        let event = create_test_unwrapped_gift(&sender_keys);
+        let event = create_test_unwrapped_message(&sender_keys);
 
         // Create test message kind
         let kind = MessageKind::new(None, Some(1234567890), None, Action::LastTradeIndex, None);

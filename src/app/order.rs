@@ -2,7 +2,6 @@ use crate::app::context::AppContext;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
 
@@ -65,11 +64,11 @@ async fn calculate_and_check_quote(
 /// # Examples
 ///
 /// ```rust,ignore
-/// # use your_crate::{order_action, Message, UnwrappedGift, Keys, AppContext};
+/// # use your_crate::{order_action, Message, UnwrappedMessage, Keys, AppContext};
 /// # async fn run_example(ctx: &AppContext) -> Result<(), MostroError> {
 /// // Initialize dummy instances; in a real application, replace these with actual values.
 /// let msg = Message::default();
-/// let event = UnwrappedGift::default();
+/// let event = UnwrappedMessage::default();
 /// let my_keys = Keys::default();
 ///
 /// // Process the order if present in the message.
@@ -80,7 +79,7 @@ async fn calculate_and_check_quote(
 pub async fn order_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -131,7 +130,7 @@ pub async fn order_action(
         let trade_index = match msg.get_inner_message_kind().trade_index {
             Some(trade_index) => trade_index,
             None => {
-                if event.sender == event.rumor.pubkey {
+                if event.identity == event.sender {
                     0
                 } else {
                     return Err(MostroInternalErr(ServiceError::InvalidPayload));
@@ -140,7 +139,7 @@ pub async fn order_action(
         };
 
         // Update trade index only after all checks are done
-        update_user_trade_index(pool, event.sender.to_string(), trade_index)
+        update_user_trade_index(pool, event.identity.to_string(), trade_index)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -149,9 +148,9 @@ pub async fn order_action(
             pool,
             my_keys,
             order,
-            event.rumor.pubkey,
             event.sender,
-            event.rumor.pubkey,
+            event.identity,
+            event.sender,
             request_id,
             msg.get_inner_message_kind().trade_index,
         )
@@ -165,7 +164,7 @@ mod tests {
     use super::*;
     use mostro_core::message::MessageKind;
 
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {
@@ -186,21 +185,16 @@ mod tests {
         )
     }
 
-    fn create_test_unwrapped_gift() -> UnwrappedGift {
-        let keys = create_test_keys();
-        let sender_keys = create_test_keys();
+    fn create_test_unwrapped_message() -> UnwrappedMessage {
+        let identity = create_test_keys();
+        let trade = create_test_keys();
 
-        let unsigned_event = UnsignedEvent::new(
-            keys.public_key(),
-            Timestamp::now(),
-            NostrKind::GiftWrap,
-            Vec::new(),
-            "",
-        );
-
-        UnwrappedGift {
-            sender: sender_keys.public_key(),
-            rumor: unsigned_event,
+        UnwrappedMessage {
+            message: create_test_message(None),
+            signature: None,
+            sender: trade.public_key(),
+            identity: identity.public_key(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -240,7 +234,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // Create message without order payload
         let msg = Message::Order(MessageKind {
@@ -265,7 +259,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // fiat_amount = 0 should be rejected by check_fiat_amount
         let msg = create_test_order_message(0, 50000);
@@ -297,7 +291,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         // amount < 0 should be rejected by check_amount
         let msg = create_test_order_message(100, -50000);
@@ -319,7 +313,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
         let msg = create_test_message(Some(1));
 
         // This test would require:
@@ -339,7 +333,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         let msg = create_test_message(Some(1));
 
@@ -355,7 +349,7 @@ mod tests {
             .with_settings(test_settings())
             .build();
         let keys = create_test_keys();
-        let event = create_test_unwrapped_gift();
+        let event = create_test_unwrapped_message();
 
         let msg = create_test_message(Some(1));
         // Structural check: ensure call does not panic
@@ -372,16 +366,16 @@ mod tests {
             .build();
         let keys = create_test_keys();
 
-        // Test case 1: sender == rumor.pubkey, no trade_index
-        let mut event = create_test_unwrapped_gift();
-        event.sender = event.rumor.pubkey;
+        // Test case 1: identity == sender, no trade_index
+        let mut event = create_test_unwrapped_message();
+        event.identity = event.sender;
         let msg = create_test_message(None);
 
         let _ = order_action(&ctx, msg, &event, &keys).await;
 
-        // Test case 2: sender != rumor.pubkey, no trade_index
-        let event2 = create_test_unwrapped_gift();
-        // sender and rumor.pubkey are already different by default
+        // Test case 2: identity != sender, no trade_index
+        let event2 = create_test_unwrapped_message();
+        // identity and sender are already distinct by default
         let msg2 = create_test_message(None);
 
         // Structural check: ensure call returns a Result without panicking

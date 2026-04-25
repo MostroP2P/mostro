@@ -4,7 +4,6 @@ use crate::util::{
     validate_invoice,
 };
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
@@ -35,7 +34,7 @@ pub async fn pay_new_invoice(
 pub async fn add_invoice_action(
     ctx: &AppContext,
     msg: Message,
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
@@ -48,7 +47,7 @@ pub async fn add_invoice_action(
     // Get buyer pubkey
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
     // Only the buyer can add an invoice
-    if buyer_pubkey != event.rumor.pubkey {
+    if buyer_pubkey != event.sender {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
     // We save the invoice on db

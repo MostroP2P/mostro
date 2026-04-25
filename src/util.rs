@@ -17,7 +17,6 @@ use crate::NOSTR_CLIENT;
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::prelude::*;
-use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
@@ -509,23 +508,23 @@ pub async fn send_dm(
     );
     let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We compose the content, as this is a message from Mostro
-    // and Mostro don't have trade key, we don't need to sign the payload
-    let content = (message, Option::<String>::None);
-    let content = serde_json::to_string(&content)
-        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-    // We create the rumor
-    let rumor = EventBuilder::text_note(content).build(sender_keys.public_key());
-    let mut tags: Vec<Tag> = Vec::with_capacity(1 + usize::from(expiration.is_some()));
 
-    if let Some(timestamp) = expiration {
-        tags.push(Tag::expiration(timestamp));
-    }
-    let tags = Tags::from_list(tags);
+    // Mostro node holds a single keypair: it doubles as identity and trade key.
+    // Server-originated messages are unsigned because clients don't track a
+    // trade_index for the node.
+    let event = wrap_message(
+        &message,
+        sender_keys,
+        sender_keys,
+        receiver_pubkey,
+        WrapOptions {
+            signed: false,
+            expiration,
+            ..WrapOptions::default()
+        },
+    )
+    .await?;
 
-    let event = EventBuilder::gift_wrap(sender_keys, &receiver_pubkey, rumor, tags)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!(
         "Sending DM, Event ID: {} to {} with payload: {:#?}",
         event.id,
@@ -1032,7 +1031,7 @@ pub async fn rate_counterpart(
 /// Settle a seller hold invoice
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
-    event: &UnwrappedGift,
+    event: &UnwrappedMessage,
     ln_client: &mut LndConnector,
     action: Action,
     is_admin: bool,
@@ -1043,8 +1042,8 @@ pub async fn settle_seller_hold_invoice(
         .get_seller_pubkey()
         .map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?
         .to_string();
-    // Get sender pubkey
-    let sender_pubkey = event.rumor.pubkey.to_string();
+    // Get sender pubkey (trade key that authored the rumor)
+    let sender_pubkey = event.sender.to_string();
     // Check if the pubkey is right
     if !is_admin && sender_pubkey != seller_pubkey {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));

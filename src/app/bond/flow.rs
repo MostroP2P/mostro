@@ -206,19 +206,22 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
 
 /// Release every active (`Requested` or `Locked`) bond attached to an
 /// order. Designed to be the **single** call sites use from each exit
-/// path — the gate, the lookup, and the per-row release are all here.
+/// path — the lookup and the per-row release are both here.
 ///
-/// Returns `Ok(())` when the feature is disabled or no active bonds
-/// exist; never fails the caller for individual bond failures (those
-/// are logged and the loop continues).
+/// **Not gated on `Settings::is_bond_enabled()`.** An operator can flip
+/// the feature off (or remove the `[anti_abuse_bond]` block) while bonds
+/// are still locked in LND from a prior enabled period; gating release
+/// on the *current* config would strand those funds. The lookup is a
+/// single indexed SELECT that returns zero rows for nodes that never
+/// enabled the feature, so the cost of always running is negligible.
+///
+/// Returns `Ok(())` when no active bonds exist; never fails the caller
+/// for individual bond failures (those are logged and the loop
+/// continues).
 pub async fn release_bonds_for_order(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<(), MostroError> {
-    if !Settings::is_bond_enabled() {
-        return Ok(());
-    }
-
     let bonds = find_active_bonds_for_order(pool, order_id).await?;
     for bond in bonds.iter() {
         if let Err(e) = release_bond(pool, bond).await {
@@ -295,10 +298,13 @@ pub async fn bond_invoice_subscribe(
 
 /// Restart hook: re-subscribe to every bond that was still active when
 /// the daemon stopped. Called from `main` next to `find_held_invoices`.
+///
+/// Like [`release_bonds_for_order`], this is **not gated on the current
+/// feature flag**: bonds locked under a previous enabled period must
+/// continue to flow through state transitions even after an operator
+/// disables the feature, otherwise their hold invoices stay stranded
+/// in LND.
 pub async fn resubscribe_active_bonds(pool: &Arc<Pool<Sqlite>>) -> Result<(), MostroError> {
-    if !Settings::is_bond_enabled() {
-        return Ok(());
-    }
     let bonds = find_active_bonds(pool.as_ref()).await?;
     for bond in bonds.into_iter() {
         if let Some(hash) = bond.hash.as_ref() {
@@ -320,9 +326,19 @@ pub async fn resubscribe_active_bonds(pool: &Arc<Pool<Sqlite>>) -> Result<(), Mo
 
 /// Subscriber callback for `InvoiceState::Accepted`: bond is locked.
 ///
-/// Transitions the row to `Locked` and resumes the original take flow
-/// (creates the trade hold invoice / asks the buyer for a payout
-/// invoice, depending on the side).
+/// Drives the bond from `Requested` to `Locked` via a conditional
+/// `UPDATE`, then — independently of whether *this* call won the
+/// transition — attempts to resume the take flow if (a) the bond is
+/// `Locked` and (b) the order is still `Pending`.
+///
+/// Decoupling the bond-state transition from the resume retry means a
+/// transient resume failure (LND/DB/Nostr blip while creating the
+/// trade hold invoice) doesn't leave the order stuck: the next
+/// `Accepted` delivery — or the restart resubscriber — will retry the
+/// continuation as long as both conditions still hold. Conversely,
+/// if the order has moved out of `Pending` (resume already succeeded,
+/// or maker/admin canceled in the meantime) the resume is skipped, so
+/// we never reactivate a canceled order.
 async fn on_bond_invoice_accepted(
     hash: &str,
     pool: &Pool<Sqlite>,
@@ -336,11 +352,10 @@ async fn on_bond_invoice_accepted(
         }
     };
 
-    // Concurrent subscriber firings (LND can emit Accepted more than once
-    // on reconnect, and the restart-time resubscriber re-attaches another
-    // listener) must not both run the take continuation. The conditional
-    // UPDATE is the single point of synchronisation: only the row that
-    // actually wins the `requested` → `locked` race continues here.
+    // Atomic Requested → Locked transition. Concurrent firings — LND
+    // reconnect, the restart-time resubscriber, etc. — race here and
+    // exactly one wins; the others see `rows_affected == 0` and fall
+    // through to the post-transition retry logic below.
     let now = Utc::now().timestamp();
     let result =
         sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
@@ -352,33 +367,53 @@ async fn on_bond_invoice_accepted(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    if result.rows_affected() == 0 {
-        // Either another subscriber already locked the bond (idempotent
-        // — nothing to do), or the row moved to a non-Requested state
-        // through a concurrent release path (also fine: the take won't
-        // resume on a released bond). Log only when surprising.
-        if !matches!(bond.state.as_str(), s if s == BondState::Requested.to_string()
-            || s == BondState::Locked.to_string())
-        {
+    if result.rows_affected() == 1 {
+        info!("Bond {} locked for order {}", bond.id, bond.order_id);
+    }
+
+    // Re-read the bond so a concurrent release (Locked → Released) is
+    // visible: in that case there's nothing to resume.
+    let current = match find_bond_by_hash(pool, hash).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let current_state = match BondState::from_str(&current.state) {
+        Ok(s) => s,
+        Err(e) => {
             warn!(
-                "Bond {} accepted but state was {} — ignoring",
-                bond.id, bond.state
+                "Bond {} has unparseable state {:?}: {} — skipping resume",
+                current.id, current.state, e
             );
+            return Ok(());
         }
+    };
+    if current_state != BondState::Locked {
+        // Released / Slashed / Failed / Requested-still-but-something-
+        // else-is-wrong: nothing to resume on this firing.
         return Ok(());
     }
 
-    info!("Bond {} locked for order {}", bond.id, bond.order_id);
-
-    let order = Order::by_id(pool, bond.order_id)
+    let order = Order::by_id(pool, current.order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
         .ok_or_else(|| {
             MostroInternalErr(ServiceError::UnexpectedError(format!(
                 "Bond {} references missing order {}",
-                bond.id, bond.order_id
+                current.id, current.order_id
             )))
         })?;
+
+    // Defense-in-depth: only drive the take forward when the order is
+    // still in the pre-trade state we left it in. If it's already moved
+    // on (resume succeeded on a previous firing) or been canceled by a
+    // maker / admin / scheduler path, do not re-trigger the take.
+    if order.status != Status::Pending.to_string() {
+        info!(
+            "Bond {} accepted but order {} is in status {} — skipping resume",
+            current.id, order.id, order.status
+        );
+        return Ok(());
+    }
 
     let my_keys = get_keys()?;
     resume_take_after_bond(pool, order, &my_keys, request_id).await
@@ -551,26 +586,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_bonds_for_order_no_op_when_disabled() {
+    async fn release_bonds_for_order_runs_regardless_of_feature_flag() {
         // No `[anti_abuse_bond]` block in test settings → feature off.
-        // Function must succeed without touching LND or DB beyond a
-        // configuration check.
+        // Even so, an outstanding bond row from a prior enabled period
+        // MUST still be released; otherwise an operator who toggles the
+        // feature off strands taker funds in LND.
         let pool = setup_pool().await;
-        // Even with active bonds in the DB, the gate keeps us out.
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id).await;
-        let _ = create_bond(&pool, make_bond(order_id, BondState::Locked))
-            .await
-            .unwrap();
+        // Use a hash-less Requested bond so release_bond skips LND in
+        // the unit-test harness (no Lightning settings configured).
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        create_bond(&pool, bond).await.unwrap();
 
-        // Settings::is_bond_enabled() reads MOSTRO_CONFIG which is unset
-        // in the unit-test harness → returns false. Verify the call path
-        // is a clean no-op.
         release_bonds_for_order(&pool, order_id).await.unwrap();
 
-        // Bond untouched.
         let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
-        assert_eq!(active.len(), 1);
+        assert!(
+            active.is_empty(),
+            "bond must be released even with feature disabled"
+        );
     }
 
     #[tokio::test]

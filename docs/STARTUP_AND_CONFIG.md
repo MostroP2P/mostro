@@ -105,6 +105,14 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `payment_attempts` (u32): Max payment retry attempts (default: 3)
 - `payment_retries_interval` (u32): Retry interval in seconds (default: 60)
 
+*BOLT12 via LNDK (experimental, opt-in). See `docs/LNDK_SETUP.md`.*
+- `lndk_enabled` (bool): Accept BOLT12 offers as buyer payout destinations (default: false)
+- `lndk_grpc_host` (String): LNDK gRPC endpoint, must be `https://` (default: `https://127.0.0.1:7000`)
+- `lndk_cert_file` (String): Path to LNDK self-signed TLS certificate
+- `lndk_macaroon_file` (String): Path to the LND macaroon LNDK uses
+- `lndk_fetch_invoice_timeout` (u32): Seconds to wait for the offer issuer's invoice reply (default: 60)
+- `lndk_fee_limit_percent` (Option<f64>): Fee cap as a fraction; falls back to `mostro.max_routing_fee`
+
 **Mostro** (`src/config/types.rs:76-108`):
 
 *Fee Configuration:*

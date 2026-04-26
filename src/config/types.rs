@@ -203,6 +203,7 @@ pub struct DatabaseSettings {
 }
 /// Lightning configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(default)]
 pub struct LightningSettings {
     /// LND certificate file path
     pub lnd_cert_file: String,
@@ -220,6 +221,28 @@ pub struct LightningSettings {
     pub payment_attempts: u32,
     /// Payment retries interval in seconds
     pub payment_retries_interval: u32,
+    /// Enable BOLT12 offer payout via LNDK (experimental)
+    pub lndk_enabled: bool,
+    /// LNDK gRPC host (must start with https://)
+    #[serde(default = "default_lndk_grpc_host")]
+    pub lndk_grpc_host: String,
+    /// Path to LNDK TLS certificate (self-signed, generated on first run)
+    pub lndk_cert_file: String,
+    /// Path to the LND macaroon LNDK uses for payment authorization
+    pub lndk_macaroon_file: String,
+    /// Timeout for BOLT12 invoice fetch from the offer issuer (seconds)
+    #[serde(default = "default_lndk_fetch_timeout")]
+    pub lndk_fetch_invoice_timeout: u32,
+    /// Fee limit for BOLT12 payments as percent. Falls back to mostro.max_routing_fee.
+    pub lndk_fee_limit_percent: Option<f64>,
+}
+
+fn default_lndk_grpc_host() -> String {
+    "https://127.0.0.1:7000".to_string()
+}
+
+fn default_lndk_fetch_timeout() -> u32 {
+    60
 }
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]

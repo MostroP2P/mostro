@@ -1,5 +1,7 @@
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::config::settings::Settings;
+use crate::lightning::offers::{classify, InvoiceFormat};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -445,9 +447,16 @@ async fn handle_child_order(
     Ok(())
 }
 
+/// Pays the buyer their portion of a released order.
+///
+/// Classifies `order.buyer_invoice` and routes to either [`do_payment_lnd`]
+/// (BOLT11 / LNURL / Lightning Address, via LND) or [`do_payment_bolt12`]
+/// (BOLT12 offer, via LNDK). The two paths are kept separate because LND's
+/// streaming payment API and LNDK's synchronous RPC have different
+/// plumbing and unifying them would only obscure both.
 pub async fn do_payment(
     ctx: &AppContext,
-    mut order: Order,
+    order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
@@ -455,13 +464,35 @@ pub async fn do_payment(
         _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
     };
 
-    let ln_addr = LightningAddress::from_str(&payment_request);
     // Calculate buyer's portion after subtracting only the Mostro fee
     // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
     let amount = (order.amount as u64).saturating_sub(order.fee as u64);
     if amount == 0 {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
+
+    match classify(&payment_request) {
+        InvoiceFormat::Bolt12Offer => {
+            do_payment_bolt12(ctx, order, payment_request, amount, request_id).await
+        }
+        InvoiceFormat::Bolt12Invoice => {
+            // Pre-fetched BOLT12 invoices are rejected at `validate_invoice`
+            // time, so reaching here would mean a legacy row. Fail closed.
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        }
+        _ => do_payment_lnd(ctx, order, payment_request, amount, request_id).await,
+    }
+}
+
+/// Pays via LND directly — BOLT11, LNURL, or Lightning Address.
+async fn do_payment_lnd(
+    ctx: &AppContext,
+    mut order: Order,
+    payment_request: String,
+    amount: u64,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let ln_addr = LightningAddress::from_str(&payment_request);
     let payment_request = if let Ok(addr) = ln_addr {
         resolv_ln_address(&addr.to_string(), amount)
             .await
@@ -536,6 +567,77 @@ pub async fn do_payment(
         }
     };
     tokio::spawn(payment);
+    Ok(())
+}
+
+/// Pays a BOLT12 offer via LNDK.
+///
+/// Unlike the LND streaming path, LNDK's `GetInvoice` + `PayInvoice` flow
+/// is synchronous: one RPC round-trip per step, a preimage (or error) at
+/// the end. We spawn the whole sequence on a background task so the
+/// caller returns immediately, matching the behavior of the LND path.
+async fn do_payment_bolt12(
+    ctx: &AppContext,
+    mut order: Order,
+    offer: String,
+    amount_sats: u64,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let Some(lndk) = ctx.lndk().cloned() else {
+        // An offer string was stored but LNDK is disabled at payout time.
+        // This can happen if `lndk_enabled` was flipped off after the order
+        // was created. Fail the payment and let retries surface the issue.
+        tracing::error!(
+            "Order {}: BOLT12 offer in buyer_invoice but LNDK is disabled",
+            order.id
+        );
+        let _ = check_failure_retries(ctx, &order, request_id).await;
+        return Err(MostroInternalErr(ServiceError::LnPaymentError(
+            "BOLT12 offer received but LNDK is disabled".into(),
+        )));
+    };
+
+    let my_keys = ctx.keys().clone();
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+    let order_id = order.id;
+    let ctx_spawn = ctx.clone();
+    let min_expiry = Settings::get_ln().invoice_expiration_window as u64;
+    let amount_msats = amount_sats.saturating_mul(1000);
+
+    tokio::spawn(async move {
+        let mut lndk = lndk;
+        let result = lndk
+            .pay_offer_validated(
+                &offer,
+                amount_msats,
+                Some(format!("mostro:{order_id}")),
+                min_expiry,
+            )
+            .await;
+
+        match result {
+            Ok(preimage) => {
+                info!(
+                    "Order {}: BOLT12 offer paid, preimage={}",
+                    order_id, preimage
+                );
+                let _ = payment_success(&ctx_spawn, &mut order, buyer_pubkey, &my_keys, request_id)
+                    .await;
+            }
+            Err(e) => {
+                info!("Order {}: BOLT12 offer payment failed: {}", order_id, e);
+                if let Ok(failed_payment) =
+                    check_failure_retries(&ctx_spawn, &order, request_id).await
+                {
+                    info!(
+                        "Order id {} has {} failed payments retries",
+                        failed_payment.id, failed_payment.payment_attempts
+                    );
+                }
+            }
+        }
+    });
+
     Ok(())
 }
 

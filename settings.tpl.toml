@@ -33,6 +33,17 @@ lndk_fetch_invoice_timeout = 60
 # Fee limit for BOLT12 payments as percent. If unset, falls back to mostro.max_routing_fee.
 # lndk_fee_limit_percent = 0.2
 
+# --- BIP-353 DNS resolution ---
+# Resolves `user@domain` to BOLT12 offers via DNSSEC-validated DNS TXT
+# records. Falls back to LNURL if resolution fails. Requires LNDK.
+bip353_enabled = false
+# DNS-over-HTTPS resolver (must support RFC 8484 JSON API)
+bip353_doh_resolver = "https://1.1.1.1/dns-query"
+
+# Skip DNSSEC validation for BIP-353. DANGER: regtest only — without
+# DNSSEC an attacker controlling DNS can redirect payouts.
+bip353_skip_dnssec = false
+
 [nostr]
 nsec_privkey = 'nsec1...'
 relays = ['ws://localhost:7000']

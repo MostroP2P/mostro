@@ -146,6 +146,9 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         lndk_macaroon_file: String::new(),
         lndk_fetch_invoice_timeout: 60,
         lndk_fee_limit_percent: None,
+        bip353_enabled: false,
+        bip353_doh_resolver: "https://1.1.1.1/dns-query".to_string(),
+        bip353_skip_dnssec: false,
     })
 }
 

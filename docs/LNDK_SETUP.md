@@ -138,15 +138,43 @@ When a buyer sends a BOLT12 offer string as their payout destination:
    order to `Success`. On failure the order enters the normal failed-payment
    retry loop.
 
+## BIP-353 resolution (`user@domain` → BOLT12 offer)
+
+When `bip353_enabled = true`, Mostro resolves human-readable
+`user@domain.tld` payout targets to BOLT12 offers via DNSSEC-validated DNS
+TXT records (BIP-353 / `_bitcoin-payment` zone). On a successful resolve,
+the original address is replaced with the resolved offer at order creation
+time and the BOLT12 payout path described above takes over. On any failure
+(no record, DNSSEC fails, malformed URI), Mostro falls back to the LNURL
+path so existing Lightning Addresses keep working.
+
+Configuration:
+
+```toml
+[lightning]
+bip353_enabled = true
+# Any DoH resolver supporting RFC 8484's JSON API works. Default below.
+bip353_doh_resolver = "https://1.1.1.1/dns-query"
+# Skip DNSSEC AD-flag check. DANGER: regtest only.
+bip353_skip_dnssec = false
+```
+
+Notes:
+
+- BIP-353 requires `lndk_enabled = true`; otherwise resolution is skipped
+  silently because the resolved offer would be unpayable.
+- DNSSEC validation is enforced via the resolver's `AD` flag. Disabling
+  `bip353_skip_dnssec` in production lets DNS-level attackers redirect
+  payouts.
+- Resolution is best-effort: a DoH timeout or non-DNSSEC response is
+  treated as "no record" so the LNURL path can still serve the request.
+
 ## Limitations
 
 - **BOLT12 invoices (`lni1…`) as direct inputs are rejected.** Users must
   send the offer, not a pre-fetched invoice.
 - **Offer creation is not supported.** Mostro does not issue BOLT12 offers
   for dev-fee receipt; dev fees still use a BOLT11 destination from config.
-- **BIP-353 resolution is not supported.** Human-readable BOLT12 addresses
-  (`user@domain.tld` resolving to an offer) are treated as Lightning
-  Addresses and routed through the LNURL-pay path.
 - **No background retries for BOLT12 yet.** Offer reusability makes this
   trivial to add in a follow-up, but for now BOLT12 payment failures follow
   the same retry cadence as BOLT11 and still surface an `AddInvoice`

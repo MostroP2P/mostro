@@ -1,3 +1,4 @@
+pub mod bip353;
 pub mod invoice;
 pub mod lndk;
 pub mod offers;

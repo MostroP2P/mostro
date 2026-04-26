@@ -113,6 +113,11 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `lndk_fetch_invoice_timeout` (u32): Seconds to wait for the offer issuer's invoice reply (default: 60)
 - `lndk_fee_limit_percent` (Option<f64>): Fee cap as a fraction; falls back to `mostro.max_routing_fee`
 
+*BIP-353 DNS resolution. Requires `lndk_enabled = true`.*
+- `bip353_enabled` (bool): Resolve `user@domain` payouts to BOLT12 offers via DoH (default: false)
+- `bip353_doh_resolver` (String): DoH resolver URL, JSON API (default: `https://1.1.1.1/dns-query`)
+- `bip353_skip_dnssec` (bool): Skip the AD-flag DNSSEC check; **regtest only** (default: false)
+
 **Mostro** (`src/config/types.rs:76-108`):
 
 *Fee Configuration:*

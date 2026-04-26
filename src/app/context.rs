@@ -7,6 +7,7 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::config::settings::Settings;
+use crate::lightning::lndk::LndkConnector;
 use mostro_core::prelude::Message;
 use nostr_sdk::{Client, Keys, PublicKey};
 use sqlx::{Pool, Sqlite};
@@ -38,6 +39,7 @@ pub struct AppContext {
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
     keys: Keys,
+    lndk: Option<LndkConnector>,
 }
 
 impl AppContext {
@@ -48,6 +50,7 @@ impl AppContext {
         settings: Arc<Settings>,
         order_msg_queue: OrderMsgQueue,
         keys: Keys,
+        lndk: Option<LndkConnector>,
     ) -> Self {
         Self {
             pool,
@@ -55,6 +58,7 @@ impl AppContext {
             settings,
             order_msg_queue,
             keys,
+            lndk,
         }
     }
 
@@ -89,6 +93,15 @@ impl AppContext {
     /// Use this instead of `get_keys()` to avoid re-parsing on every call.
     pub fn keys(&self) -> &Keys {
         &self.keys
+    }
+
+    /// Optional LNDK client for BOLT12 offer payouts.
+    ///
+    /// Returns `None` when `lightning.lndk_enabled = false`, in which case
+    /// BOLT12 offers are rejected at validation time before ever reaching
+    /// payout.
+    pub fn lndk(&self) -> Option<&LndkConnector> {
+        self.lndk.as_ref()
     }
 }
 
@@ -234,7 +247,7 @@ pub mod test_utils {
                     .expect("TestContextBuilder: invalid nsec_privkey in settings")
             });
 
-            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
+            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys, None)
         }
 
         /// Build context plus mock handles used for assertions.

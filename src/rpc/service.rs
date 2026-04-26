@@ -2,6 +2,7 @@
 
 use crate::config::settings::Settings;
 
+use crate::lightning::lndk::LndkConnector;
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
@@ -22,6 +23,7 @@ pub struct AdminServiceImpl {
     keys: Keys,
     pool: Arc<Pool<Sqlite>>,
     ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
+    lndk: Option<LndkConnector>,
     password_rate_limiter: Arc<RateLimiter>,
 }
 
@@ -30,12 +32,14 @@ impl AdminServiceImpl {
         keys: Keys,
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
+        lndk: Option<LndkConnector>,
     ) -> Self {
         let retention_secs = Settings::get_rpc().rate_limiter_stale_duration;
         Self {
             keys,
             pool,
             ln_client,
+            lndk,
             password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
         }
     }
@@ -97,6 +101,7 @@ impl AdminServiceImpl {
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            self.lndk.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -152,6 +157,7 @@ impl AdminServiceImpl {
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            self.lndk.clone(),
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -206,6 +212,7 @@ impl AdminServiceImpl {
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            self.lndk.clone(),
         );
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
@@ -260,6 +267,7 @@ impl AdminServiceImpl {
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            self.lndk.clone(),
         );
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await

@@ -220,6 +220,55 @@ pub struct LightningSettings {
     pub payment_attempts: u32,
     /// Payment retries interval in seconds
     pub payment_retries_interval: u32,
+    /// Enable BOLT12 offer payout via LNDK (experimental).
+    /// Field-level `#[serde(default)]` so older `settings.toml` files that
+    /// pre-date the BOLT12 block still parse cleanly; the legacy LND keys
+    /// above remain required at parse time.
+    #[serde(default)]
+    pub lndk_enabled: bool,
+    /// LNDK gRPC host (must start with https://)
+    #[serde(default = "default_lndk_grpc_host")]
+    pub lndk_grpc_host: String,
+    /// TLS SNI / verification domain to present to LNDK. LNDK's self-signed
+    /// cert is issued for `localhost` by default; remote deployments must
+    /// override this with the cert's CN/SAN.
+    #[serde(default = "default_lndk_tls_domain")]
+    pub lndk_tls_domain: String,
+    /// Path to LNDK TLS certificate (self-signed, generated on first run)
+    #[serde(default)]
+    pub lndk_cert_file: String,
+    /// Path to the LND macaroon LNDK uses for payment authorization
+    #[serde(default)]
+    pub lndk_macaroon_file: String,
+    /// Timeout for BOLT12 invoice fetch from the offer issuer (seconds)
+    #[serde(default = "default_lndk_fetch_timeout")]
+    pub lndk_fetch_invoice_timeout: u32,
+    /// Minimum remaining lifetime, in seconds, accepted on a fetched BOLT12
+    /// invoice. BOLT12 invoices are short-lived by design, so this floor is
+    /// kept small (default 60s) rather than reused from the long hold-invoice
+    /// window.
+    #[serde(default = "default_lndk_min_invoice_expiry")]
+    pub lndk_min_invoice_expiry: u64,
+    /// Fee limit for BOLT12 payments as a fraction (0.002 = 0.2%). Falls
+    /// back to `mostro.max_routing_fee` when unset.
+    #[serde(default)]
+    pub lndk_fee_limit_percent: Option<f64>,
+}
+
+fn default_lndk_grpc_host() -> String {
+    "https://127.0.0.1:7000".to_string()
+}
+
+fn default_lndk_tls_domain() -> String {
+    "localhost".to_string()
+}
+
+fn default_lndk_fetch_timeout() -> u32 {
+    60
+}
+
+fn default_lndk_min_invoice_expiry() -> u64 {
+    60
 }
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]

@@ -1,6 +1,7 @@
 //! RPC server implementation for admin operations
 
 use crate::config::settings::Settings;
+use crate::lightning::lndk::LndkConnector;
 use crate::lightning::LndConnector;
 use crate::rpc::service::AdminServiceImpl;
 use nostr_sdk::Keys;
@@ -33,12 +34,13 @@ impl RpcServer {
         my_keys: Keys,
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
+        lndk: Option<LndkConnector>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.listen_address, self.port)
             .parse()
             .map_err(|e| format!("Invalid address: {}", e))?;
 
-        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client);
+        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client, lndk);
 
         info!("Starting RPC server on {}", addr);
 

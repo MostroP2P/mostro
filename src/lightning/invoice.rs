@@ -1,4 +1,5 @@
 use crate::config::settings::Settings;
+use crate::lightning::offers::{classify, validate_offer, InvoiceFormat};
 use crate::lnurl::ln_exists;
 
 use chrono::prelude::*;
@@ -183,15 +184,39 @@ pub async fn is_valid_invoice(
     amount: Option<u64>,
     fee: Option<u64>,
 ) -> Result<(), MostroError> {
-    // Try Lightning address or LNURL first
-    if LightningAddress::from_str(&payment_request).is_ok()
-        || LnUrl::from_str(&payment_request).is_ok()
-    {
-        return validate_lightning_address(&payment_request).await;
+    match classify(&payment_request) {
+        InvoiceFormat::Bolt12Offer => {
+            let ln_settings = Settings::get_ln();
+            validate_offer(
+                &payment_request,
+                amount,
+                fee.unwrap_or(0),
+                ln_settings.lndk_enabled,
+            )
+        }
+        InvoiceFormat::Bolt12Invoice => {
+            // Pre-fetched BOLT12 invoices are not supported — buyers should
+            // send their offer (`lno1…`) so Mostro can fetch a fresh invoice
+            // at payout time. Rejecting here gives a clear error rather than
+            // surfacing a late failure in `do_payment`.
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        }
+        InvoiceFormat::LnAddress | InvoiceFormat::Lnurl => {
+            validate_lightning_address(&payment_request).await
+        }
+        InvoiceFormat::Bolt11 => validate_bolt11_invoice(&payment_request, amount, fee).await,
+        InvoiceFormat::Unknown => {
+            // Fall through to the loose detectors for backwards compatibility
+            // with anything the prefix classifier doesn't recognise.
+            if LightningAddress::from_str(&payment_request).is_ok()
+                || LnUrl::from_str(&payment_request).is_ok()
+            {
+                validate_lightning_address(&payment_request).await
+            } else {
+                validate_bolt11_invoice(&payment_request, amount, fee).await
+            }
+        }
     }
-
-    // Fall back to BOLT11 invoice
-    validate_bolt11_invoice(&payment_request, amount, fee).await
 }
 
 #[cfg(test)]

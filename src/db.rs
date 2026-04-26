@@ -1180,8 +1180,8 @@ async fn process_restore_session_work(
 
 /// Background task manager for restore sessions
 pub struct RestoreSessionManager {
-    sender: tokio::sync::mpsc::Sender<RestoreSessionInfo>,
-    receiver: tokio::sync::mpsc::Receiver<RestoreSessionInfo>,
+    sender: tokio::sync::mpsc::Sender<Result<RestoreSessionInfo, MostroError>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<RestoreSessionInfo, MostroError>>,
 }
 
 impl Default for RestoreSessionManager {
@@ -1210,7 +1210,7 @@ impl RestoreSessionManager {
             match handle.block_on(process_restore_session_work(pool, master_key)) {
                 Ok(restore_data) => {
                     // No need for an async context just to send; this is a blocking thread.
-                    if let Err(e) = sender.blocking_send(restore_data) {
+                    if let Err(e) = sender.blocking_send(Ok(restore_data)) {
                         tracing::warn!(
                             "RestoreSessionManager: receiver dropped before sending result: {}",
                             e
@@ -1219,6 +1219,12 @@ impl RestoreSessionManager {
                 }
                 Err(e) => {
                     tracing::error!("Failed to process restore session work: {}", e);
+                    if let Err(send_err) = sender.blocking_send(Err(e)) {
+                        tracing::warn!(
+                            "RestoreSessionManager: receiver dropped before sending error: {}",
+                            send_err
+                        );
+                    }
                 }
             }
         });
@@ -1227,12 +1233,12 @@ impl RestoreSessionManager {
     }
 
     /// Check for completed restore session results
-    pub async fn check_results(&mut self) -> Option<RestoreSessionInfo> {
+    pub async fn check_results(&mut self) -> Option<Result<RestoreSessionInfo, MostroError>> {
         self.receiver.try_recv().ok()
     }
 
     /// Wait for the next restore session result
-    pub async fn wait_for_result(&mut self) -> Option<RestoreSessionInfo> {
+    pub async fn wait_for_result(&mut self) -> Option<Result<RestoreSessionInfo, MostroError>> {
         self.receiver.recv().await
     }
 }

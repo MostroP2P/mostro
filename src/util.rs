@@ -1242,6 +1242,28 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     let mut payment_request = None;
     // if payment request is present
     if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
+        // BIP-353 resolution: a `user@domain` address may map to a BOLT12
+        // offer via DNS (`user.user._bitcoin-payment.domain` TXT record).
+        // On success, replace the address with the resolved offer so the
+        // downstream BOLT12 payout path runs unchanged. On failure, leave
+        // the address in place — `is_valid_invoice` will fall through to
+        // LNURL for it.
+        let pr = if pr.contains('@') && !pr.contains(' ') {
+            match crate::lightning::bip353::resolve_bip353(&pr).await {
+                Ok(Some(offer)) => {
+                    tracing::info!("BIP-353 DNS: {pr} → bolt12 offer");
+                    offer
+                }
+                Ok(None) => pr,
+                Err(e) => {
+                    tracing::warn!("BIP-353 DNS error for {pr}: {e}");
+                    pr
+                }
+            }
+        } else {
+            pr
+        };
+
         // Calculate total buyer fees (only Mostro fee)
         // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
         let total_buyer_fees = order.fee;

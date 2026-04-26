@@ -45,6 +45,7 @@ mutants = "0.0.3" # For #[mutants::skip] annotations
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
 lightning-invoice = { version = "0.33.1", features = ["std"] }
+lightning = { version = "0.2.2", default-features = false, features = ["std"] }
 nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
 serde = { version = "1.0.210" }
 toml = "0.9.5"
@@ -80,9 +81,10 @@ bitcoin = "0.32.5"
 dialoguer = "0.11"
 dirs = "6.0.0"
 clearscreen = "4.0.1"
-tonic = "0.14.2"
+tonic = { version = "0.14.2", features = ["tls-ring"] }
 prost = "0.14.1"
 tonic-prost = "0.14.1"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }

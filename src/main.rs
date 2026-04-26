@@ -20,6 +20,7 @@ use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
+use crate::lightning::lndk::LndkConnector;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use crate::rpc::RpcServer;
@@ -129,6 +130,32 @@ async fn main() -> Result<()> {
         panic!("No connection to LND node - shutting down Mostro!");
     };
 
+    // Connect to LNDK for BOLT12 offer payouts (optional, experimental).
+    // Failure when `lndk_enabled=true` is fatal: the operator explicitly
+    // asked for BOLT12 support, so silently dropping it would be worse
+    // than refusing to start.
+    let lndk_client = LndkConnector::new_from_settings().await.map_err(|e| {
+        tracing::error!("LNDK initialization failed: {}", e);
+        e
+    })?;
+    if lndk_client.is_some() {
+        tracing::info!("LNDK connector initialized for BOLT12 offer payouts");
+        // Warn loudly if LND does not advertise the onion-message feature
+        // bit LNDK needs. This catches missing `--protocol.custom-*` flags
+        // before the first BOLT12 payout fails mysteriously.
+        let info = ln_client.get_node_info().await.ok();
+        if let Some(info) = info {
+            let has_onion_msg = info.features.keys().any(|bit| *bit == 38 || *bit == 39);
+            if !has_onion_msg {
+                tracing::warn!(
+                    "LNDK is enabled but LND does not advertise onion-message support; \
+                     start lnd with --protocol.custom-message=513 \
+                     --protocol.custom-nodeann=39 --protocol.custom-init=39"
+                );
+            }
+        }
+    }
+
     if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
@@ -168,6 +195,7 @@ async fn main() -> Result<()> {
         settings,
         MESSAGE_QUEUES.queue_order_msg.clone(),
         mostro_keys.clone(),
+        lndk_client,
     );
 
     // Start scheduler for tasks

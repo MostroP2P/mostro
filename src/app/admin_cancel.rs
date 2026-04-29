@@ -200,9 +200,14 @@ pub async fn admin_cancel_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // Phase 1: admin cancellation always releases any taker bond. The
-    // dispute slash path lands in Phase 2.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "admin_cancel").await;
+    // Phase 2: `admin_cancel` means the buyer won the dispute (seller
+    // refund is reverted, buyer is paid out). The taker's identity
+    // follows from order kind (Sell-order taker = buyer, Buy-order
+    // taker = seller); when the taker lost AND the operator enabled
+    // `slash_on_lost_dispute`, the active taker bond moves to
+    // `pending-payout` for the Phase 3 payout job. Otherwise the bond
+    // is released — the Phase 1 behaviour preserved by default.
+    bond::apply_taker_dispute_outcome_or_warn(pool, &order, false, "admin_cancel").await;
 
     Ok(())
 }

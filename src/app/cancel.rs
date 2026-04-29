@@ -9,7 +9,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{info, warn};
 
 pub trait CancelLightning {
     fn cancel_hold_invoice<'a>(
@@ -203,7 +203,38 @@ async fn cancel_cooperative_execution_step_1(
 /// - Notify the taker
 /// - Reset quote-derived amounts (if any) and return order to initial state
 /// - Notify the maker/creator that the order is republished
+///
+/// The trailing bond release runs on every exit path (including early
+/// `?` returns from the inner steps) so a mid-flow failure can never
+/// leave a `Requested`/`Locked` bond row stranded for this taker.
+/// `release_bonds_for_order_or_warn` is idempotent — it only acts on
+/// rows still in active states — so re-entering it after the inner
+/// flow already released is a safe no-op.
 async fn cancel_order_by_taker<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedMessage,
+    order: Order,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+    ln_client: &mut L,
+    taker_pubkey: PublicKey,
+) -> Result<(), MostroError> {
+    let order_id = order.id;
+    let result = cancel_order_by_taker_inner(
+        pool,
+        event,
+        order,
+        my_keys,
+        request_id,
+        ln_client,
+        taker_pubkey,
+    )
+    .await;
+    bond::release_bonds_for_order_or_warn(pool, order_id, "taker_cancel").await;
+    result
+}
+
+async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedMessage,
     mut order: Order,
@@ -253,10 +284,6 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
 
     // Notify the creator about the republished order after the taker-side cancellation flow completes
     notify_creator(&order_updated, request_id).await?;
-
-    // Phase 1: the taker cancelled before activating the trade — always
-    // release the bond. Slashing for timeout-based cancels is Phase 4.
-    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "taker_cancel").await;
 
     Ok(())
 }
@@ -362,16 +389,34 @@ async fn cancel_pending_order_from_maker(
     // pubkey is the canonical source of who has a stake here — for a
     // fresh Pending order with no taker yet, the lookup returns empty
     // and this is a no-op.
-    if let Ok(active_bonds) =
-        crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await
-    {
-        for active in active_bonds.iter() {
-            if let Ok(taker_pk) = PublicKey::from_str(&active.pubkey) {
-                if taker_pk != event.sender {
-                    enqueue_order_msg(None, Some(order.id), Action::Canceled, None, taker_pk, None)
+    //
+    // A DB error here must not silently drop bonded-taker notifications:
+    // log it with order context, then still run the bond release below
+    // so cleanup happens regardless of the lookup outcome.
+    match crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await {
+        Ok(active_bonds) => {
+            for active in active_bonds.iter() {
+                if let Ok(taker_pk) = PublicKey::from_str(&active.pubkey) {
+                    if taker_pk != event.sender {
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            Action::Canceled,
+                            None,
+                            taker_pk,
+                            None,
+                        )
                         .await;
+                    }
                 }
             }
+        }
+        Err(err) => {
+            warn!(
+                order_id = %order.id,
+                "pending_maker_cancel: failed to look up active bonds for taker notification: {}",
+                err
+            );
         }
     }
     bond::release_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
@@ -423,13 +468,36 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
         // yet leaves the order in `Pending` (the taker fields are
         // populated; the bond row sits in `Requested`). Allow that taker
         // to back out — release the bond, clear the taker fields, and
-        // republish the order so other takers can take it. We identify
-        // the bonded taker by matching `event.sender` against an active
-        // bond's `pubkey`.
-        let active_bonds =
-            crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await?;
+        // republish the order so other takers can take it.
+        //
+        // Prefer matching `event.sender` against an active bond row
+        // (the canonical signal). A transient DB failure on that
+        // lookup must not block a legitimate taker self-cancel: log
+        // it and fall back to the in-memory taker pubkey on the order
+        // (whichever side does not match `creator_pubkey`). For a
+        // fresh Pending order with no taker yet, neither check
+        // matches and we still return `IsNotYourOrder`.
         let sender_str = event.sender.to_string();
-        if active_bonds.iter().any(|b| b.pubkey == sender_str) {
+        let bond_match =
+            match crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await {
+                Ok(active_bonds) => active_bonds.iter().any(|b| b.pubkey == sender_str),
+                Err(e) => {
+                    warn!(
+                        order_id = %order.id,
+                        "cancel: bond lookup failed for pending taker self-cancel: {}", e
+                    );
+                    false
+                }
+            };
+        let order_taker_match = order
+            .buyer_pubkey
+            .as_deref()
+            .is_some_and(|p| p == sender_str && p != order.creator_pubkey)
+            || order
+                .seller_pubkey
+                .as_deref()
+                .is_some_and(|p| p == sender_str && p != order.creator_pubkey);
+        if bond_match || order_taker_match {
             cancel_order_by_taker(
                 pool,
                 event,

@@ -189,9 +189,13 @@ pub async fn admin_settle_action(
         )
         .await;
     }
-    // Phase 1: admin-settled disputes always release any taker bond.
-    // Slashing on lost dispute lands in Phase 2.
-    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "admin_settle").await;
+    // Phase 2: `admin_settle` means the seller won the dispute. The
+    // taker's identity follows from order kind (Sell-order taker = buyer,
+    // Buy-order taker = seller); when the taker lost AND the operator
+    // enabled `slash_on_lost_dispute`, the active taker bond moves to
+    // `pending-payout` for the Phase 3 payout job. Otherwise the bond
+    // is released — the Phase 1 behaviour preserved by default.
+    bond::apply_taker_dispute_outcome_or_warn(pool, &order_updated, true, "admin_settle").await;
 
     let _ = do_payment(ctx, order_updated, request_id).await;
 

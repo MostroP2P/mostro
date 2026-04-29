@@ -47,7 +47,7 @@ use crate::util::{
 use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
 use super::math::compute_bond_amount;
 use super::model::Bond;
-use super::types::{BondRole, BondState};
+use super::types::{BondRole, BondSlashReason, BondState};
 
 /// True when the configuration requires the **taker** to post a bond.
 ///
@@ -359,6 +359,166 @@ pub async fn release_bonds_for_order_or_warn(
     }
 }
 
+/// Phase 2: did the taker lose this dispute?
+///
+/// `seller_won` reflects which side the admin/solver favoured:
+/// - `true` for `admin_settle` (seller keeps escrow)
+/// - `false` for `admin_cancel` (buyer is refunded)
+///
+/// The taker's identity is implicit in the order kind: on a `Sell`
+/// order the taker is the buyer, on a `Buy` order the taker is the
+/// seller. Combining the two gives the truth table below.
+///
+/// | Order kind | seller_won | Taker side | Taker lost? |
+/// |------------|------------|------------|-------------|
+/// | Sell       | true       | buyer      | yes         |
+/// | Sell       | false      | buyer      | no          |
+/// | Buy        | true       | seller     | no          |
+/// | Buy        | false      | seller     | yes         |
+fn taker_lost_dispute(kind: mostro_core::order::Kind, seller_won: bool) -> bool {
+    match kind {
+        mostro_core::order::Kind::Sell => seller_won,
+        mostro_core::order::Kind::Buy => !seller_won,
+    }
+}
+
+/// Phase 2 slash gate. True only when the operator has explicitly
+/// opted into both the bond feature for the taker side AND the
+/// dispute-loss slash. Defaults to off.
+fn slash_on_lost_dispute_enabled() -> bool {
+    Settings::get_bond().is_some_and(|cfg| {
+        cfg.enabled && cfg.apply_to.applies_to_taker() && cfg.slash_on_lost_dispute
+    })
+}
+
+/// Phase 2: apply the dispute outcome to the taker's bond.
+///
+/// Drop-in replacement for `release_bonds_for_order_or_warn` at the
+/// `admin_settle_action` / `admin_cancel_action` tails. Behaviour:
+///
+/// - **Slash gate off** (feature disabled, `apply_to` excludes takers,
+///   or `slash_on_lost_dispute = false`): Phase 1 release behaviour
+///   preserved.
+/// - **Gate on, taker won**: release.
+/// - **Gate on, taker lost**: transition the active taker bond to
+///   `PendingPayout` with reason `LostDispute`. The bond hold invoice
+///   stays Locked at LND — Phase 3 will `settle_hold_invoice` it as
+///   part of the payout flow. Other bonds attached to the order
+///   (e.g. a Released prior-taker row from `supersede_prior_taker_bonds`)
+///   are unaffected.
+///
+/// Best-effort: errors are logged and swallowed so a bond hiccup never
+/// fails the trade-resolution path.
+pub async fn apply_taker_dispute_outcome_or_warn(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    seller_won: bool,
+    context: &'static str,
+) {
+    let kind = match order.get_order_kind() {
+        Ok(k) => k,
+        Err(e) => {
+            // Unparseable order kind → fall back to Phase 1 release.
+            // Better to release a bond we can't classify than to slash
+            // the wrong side.
+            warn!(
+                order_id = %order.id,
+                "{}: cannot determine order kind ({}); falling back to bond release",
+                context, e
+            );
+            release_bonds_for_order_or_warn(pool, order.id, context).await;
+            return;
+        }
+    };
+
+    if !slash_on_lost_dispute_enabled() || !taker_lost_dispute(kind, seller_won) {
+        // Phase 1 behaviour preserved: gate is off, or the taker won.
+        release_bonds_for_order_or_warn(pool, order.id, context).await;
+        return;
+    }
+
+    if let Err(e) = slash_taker_bond_for_lost_dispute(pool, order.id, context).await {
+        warn!(
+            order_id = %order.id,
+            "{}: bond slash for lost dispute failed: {}", context, e
+        );
+    }
+}
+
+/// Transition the active taker parent bond to
+/// `PendingPayout` / `LostDispute`. No LND interaction here — the
+/// Phase 3 payout job owns settlement of the bond hold invoice.
+///
+/// The conditional `UPDATE` is keyed on the active states only
+/// (`Requested` / `Locked`). Rows already in `PendingPayout`,
+/// `Released`, `Slashed`, or `Failed` are skipped: a concurrent
+/// release / payout / earlier slash has already moved the row, and
+/// re-driving it would be wrong.
+async fn slash_taker_bond_for_lost_dispute(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    context: &'static str,
+) -> Result<(), MostroError> {
+    // `find_active_bonds_for_order` filters to `Requested`/`Locked`
+    // already. Pick the parent taker row deterministically: a Phase 6
+    // child row wouldn't be a parent (`parent_bond_id` set), and
+    // there is at most one active parent taker bond per order
+    // (enforced by `supersede_prior_taker_bonds` + the new-take gate).
+    let bonds = find_active_bonds_for_order(pool, order_id).await?;
+    let taker_bond = bonds
+        .into_iter()
+        .find(|b| b.role == BondRole::Taker.to_string() && b.parent_bond_id.is_none());
+    let bond = match taker_bond {
+        Some(b) => b,
+        None => {
+            // No active taker bond: feature was off when the trade
+            // started, or the bond was already released. Phase 2 is a
+            // no-op in that case.
+            info!(
+                order_id = %order_id,
+                "{}: no active taker bond for lost-dispute slash; nothing to do",
+                context
+            );
+            return Ok(());
+        }
+    };
+
+    let result = sqlx::query(
+        "UPDATE bonds SET state = ?, slashed_reason = ? \
+         WHERE id = ? AND state IN (?, ?)",
+    )
+    .bind(BondState::PendingPayout.to_string())
+    .bind(BondSlashReason::LostDispute.to_string())
+    .bind(bond.id)
+    .bind(BondState::Requested.to_string())
+    .bind(BondState::Locked.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 1 {
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            reason = %BondSlashReason::LostDispute,
+            "{}: taker bond transitioned to pending-payout",
+            context
+        );
+    } else {
+        // Lost the race against a release/slash. The other path's
+        // `info!` already logged the transition, so we just note the
+        // skip for operator visibility.
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "{}: taker bond state changed concurrently; slash skipped",
+            context
+        );
+    }
+
+    Ok(())
+}
+
 /// Make the order takeable again when a prior taker hasn't paid their
 /// bond yet.
 ///
@@ -599,10 +759,31 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
         None => return Ok(()),
     };
 
-    if BondState::from_str(&bond.state)
-        .map(|s| s.is_terminal())
-        .unwrap_or(false)
-    {
+    let state = match BondState::from_str(&bond.state) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Bond {} has unparseable state {:?}: {} — skipping cancel handler",
+                bond.id, bond.state, e
+            );
+            return Ok(());
+        }
+    };
+    if state.is_terminal() {
+        return Ok(());
+    }
+    if matches!(state, BondState::PendingPayout) {
+        // Phase 2: a slashed bond is owned by the Phase 3 payout job.
+        // LND-cancel events here are typically the CLTV-expiry path
+        // that Phase 3 must beat with `settle_hold_invoice`. Don't
+        // touch the row from this subscriber: marking it `Released`
+        // would silently drop the slashed claim.
+        warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "Bond invoice canceled while in pending-payout — leaving row untouched. \
+             Phase 3 payout job owns this transition."
+        );
         return Ok(());
     }
 
@@ -924,5 +1105,327 @@ mod tests {
                 "expected Transient for: {msg}"
             );
         }
+    }
+
+    // -- Phase 2: taker dispute slash --------------------------------
+
+    /// Pure-function truth table for the taker-lost decision. The four
+    /// rows match the `Order kind × seller_won` matrix documented on
+    /// [`taker_lost_dispute`].
+    #[test]
+    fn taker_lost_dispute_truth_table() {
+        use mostro_core::order::Kind;
+        // Sell order: taker is buyer.
+        assert!(taker_lost_dispute(Kind::Sell, true)); // admin_settle → seller wins → buyer (taker) loses.
+        assert!(!taker_lost_dispute(Kind::Sell, false)); // admin_cancel → buyer (taker) wins.
+                                                         // Buy order: taker is seller.
+        assert!(!taker_lost_dispute(Kind::Buy, true)); // admin_settle → seller (taker) wins.
+        assert!(taker_lost_dispute(Kind::Buy, false)); // admin_cancel → buyer wins → seller (taker) loses.
+    }
+
+    /// Inertness guarantee: with no `[anti_abuse_bond]` block and no
+    /// initialized global, the slash gate must be off.
+    #[test]
+    fn slash_on_lost_dispute_enabled_is_false_without_config() {
+        assert!(!slash_on_lost_dispute_enabled());
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_transitions_locked_to_pending_payout() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let bond = create_bond(&pool, make_bond(order_id, BondState::Locked))
+            .await
+            .unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .expect("slash should succeed");
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, bond.id);
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+        assert_eq!(
+            after.slashed_reason,
+            Some(BondSlashReason::LostDispute.to_string())
+        );
+        // Phase 3 stamps `slashed_at`; Phase 2 only routes the row.
+        assert!(after.slashed_at.is_none());
+        assert!(after.released_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_transitions_requested_to_pending_payout() {
+        // In practice a bond is `Locked` by the time a dispute is
+        // resolved, but the slash transition must accept any active
+        // state — both rows still have an outstanding HTLC.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        create_bond(&pool, make_bond(order_id, BondState::Requested))
+            .await
+            .unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_skips_already_pending_payout() {
+        // A second slash on the same row must NOT bump it (e.g. retry
+        // or duplicate dispute resolution paths). The conditional
+        // UPDATE is keyed on the active states only, so the row stays
+        // as-is and the call returns Ok.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut bond = make_bond(order_id, BondState::PendingPayout);
+        bond.slashed_reason = Some(BondSlashReason::LostDispute.to_string());
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        // The lookup uses `find_active_bonds_for_order` which excludes
+        // pending-payout. Slash becomes a no-op via "no taker bond".
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, bond.state);
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_skips_terminal() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let bond = create_bond(&pool, make_bond(order_id, BondState::Released))
+            .await
+            .unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, bond.state);
+        assert!(after.slashed_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_no_bond_is_noop() {
+        // Feature off when the trade started → no bond row. The slash
+        // path must succeed silently rather than fail the dispute.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .expect("no-op when there is no taker bond");
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_picks_active_parent_among_prior_released() {
+        // After `supersede_prior_taker_bonds`, the prior taker bond row
+        // is `Released` and a new active row exists. The slash must
+        // target the active row, not the released one.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut prior = make_bond(order_id, BondState::Released);
+        prior.hash = Some("d".repeat(64));
+        prior.pubkey = "b".repeat(64);
+        create_bond(&pool, prior).await.unwrap();
+
+        let active = create_bond(&pool, make_bond(order_id, BondState::Locked))
+            .await
+            .unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let active_after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_after.id, active.id);
+        assert_eq!(active_after.state, BondState::PendingPayout.to_string());
+
+        let prior_after = find_bond_by_hash(&pool, &"d".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prior_after.state,
+            BondState::Released.to_string(),
+            "prior released bond must NOT be touched by the slash"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_ignores_maker_bond() {
+        // Phase 5+ will introduce maker bonds. The taker dispute slash
+        // path must never touch a maker row, even when one shares the
+        // order id.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = make_bond(order_id, BondState::Locked);
+        maker.role = BondRole::Maker.to_string();
+        maker.hash = Some("e".repeat(64));
+        let maker = create_bond(&pool, maker).await.unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let maker_after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(maker_after.id, maker.id);
+        assert_eq!(maker_after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn slash_taker_bond_ignores_phase6_child_rows() {
+        // Phase 6 child slash rows share `order_id` and `role` with
+        // the parent. The Phase 2 slash must scope to the parent row
+        // only (`parent_bond_id IS NULL`).
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let parent = create_bond(&pool, make_bond(order_id, BondState::Locked))
+            .await
+            .unwrap();
+
+        let mut child = make_bond(order_id, BondState::Locked);
+        child.parent_bond_id = Some(parent.id);
+        child.hash = Some("f".repeat(64));
+        let child = create_bond(&pool, child).await.unwrap();
+
+        slash_taker_bond_for_lost_dispute(&pool, order_id, "test")
+            .await
+            .unwrap();
+
+        let parent_after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent_after.id, parent.id);
+        assert_eq!(parent_after.state, BondState::PendingPayout.to_string());
+
+        let child_after = find_bond_by_hash(&pool, &"f".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_after.id, child.id);
+        assert_eq!(
+            child_after.state,
+            BondState::Locked.to_string(),
+            "child row must be left alone by the parent slash path"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_dispute_outcome_releases_with_flag_off() {
+        // Phase 2 acceptance (flag off): an `admin_settle` on a Sell
+        // order with a Locked taker bond MUST release the bond — the
+        // Phase 1 contract — when the slash gate is off. The unit-test
+        // harness has no `[anti_abuse_bond]` config, which is exactly
+        // the off case operators see by default.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut bond = make_bond(order_id, BondState::Locked);
+        bond.hash = None; // skip LND in the unit-test harness
+        create_bond(&pool, bond).await.unwrap();
+
+        let order = Order {
+            id: order_id,
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            ..Default::default()
+        };
+
+        // seller_won = true → would slash if the gate were on. Gate is
+        // off → fall through to release.
+        apply_taker_dispute_outcome_or_warn(&pool, &order, true, "test").await;
+
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(
+            active.is_empty(),
+            "with the slash gate off, dispute resolution must release the bond"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_bond_invoice_canceled_leaves_pending_payout_untouched() {
+        // Phase 2 defense: once a bond is in `pending-payout`, an
+        // LND-cancel event (e.g. CLTV expiry of the bond hold invoice)
+        // must NOT be auto-converted to `released`. Phase 3's payout
+        // job owns this transition; flipping it here would silently
+        // drop the slashed claim.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut bond = make_bond(order_id, BondState::PendingPayout);
+        bond.slashed_reason = Some(BondSlashReason::LostDispute.to_string());
+        create_bond(&pool, bond).await.unwrap();
+
+        on_bond_invoice_canceled(&"c".repeat(64), &pool)
+            .await
+            .unwrap();
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+        assert!(after.released_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_bond_invoice_canceled_still_releases_active_bond() {
+        // Regression guard for the Phase 1 contract: a Locked bond
+        // whose hold invoice LND cancels (taker abandoned, CLTV
+        // expired) must still transition to `Released`.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        create_bond(&pool, make_bond(order_id, BondState::Locked))
+            .await
+            .unwrap();
+
+        on_bond_invoice_canceled(&"c".repeat(64), &pool)
+            .await
+            .unwrap();
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert!(after.released_at.is_some());
     }
 }

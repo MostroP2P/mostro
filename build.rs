@@ -3,7 +3,7 @@ fn main() {
     // Compile protobuf definitions
     tonic_prost_build::configure()
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/admin.proto"], &["proto"])
+        .compile_protos(&["proto/admin.proto", "proto/lndkrpc.proto"], &["proto"])
         .unwrap_or_else(|e| panic!("Failed to compile protos {:?}", e));
 
     // note: add error checking yourself.

@@ -140,6 +140,15 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         hold_invoice_expiration_window: 300,
         payment_attempts: 3,
         payment_retries_interval: 60,
+        lndk_enabled: false,
+        lndk_grpc_host: "https://127.0.0.1:7000".to_string(),
+        lndk_cert_file: String::new(),
+        lndk_macaroon_file: String::new(),
+        lndk_fetch_invoice_timeout: 60,
+        lndk_fee_limit_percent: None,
+        bip353_enabled: false,
+        bip353_doh_resolver: "https://1.1.1.1/dns-query".to_string(),
+        bip353_skip_dnssec: false,
     })
 }
 

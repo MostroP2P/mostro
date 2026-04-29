@@ -1,4 +1,7 @@
+pub mod bip353;
 pub mod invoice;
+pub mod lndk;
+pub mod offers;
 
 use crate::config::settings::Settings;
 use crate::lightning::invoice::decode_invoice;

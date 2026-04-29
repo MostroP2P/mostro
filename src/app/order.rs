@@ -87,8 +87,18 @@ pub async fn order_action(
     let request_id = msg.get_inner_message_kind().request_id;
 
     if let Some(order) = msg.get_inner_message_kind().get_order() {
-        // Validate invoice
-        let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
+        // Validate invoice AND apply any BIP-353 override so the stored
+        // buyer_invoice is the resolved BOLT12 offer rather than the raw
+        // `user@domain` alias. `validate_invoice` returns the (possibly
+        // rewritten) payment request; shadow `order` with a mutated clone
+        // so the rest of the flow — `publish_order` and the DB row it
+        // writes — sees the resolved value.
+        let resolved_invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
+        let mut order_with_resolved = order.clone();
+        if resolved_invoice.is_some() {
+            order_with_resolved.buyer_invoice = resolved_invoice;
+        }
+        let order = &order_with_resolved;
 
         // Check if fiat currency is accepted
         let mostro_settings = &ctx.settings().mostro;

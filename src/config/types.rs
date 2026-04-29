@@ -203,6 +203,7 @@ pub struct DatabaseSettings {
 }
 /// Lightning configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(default)]
 pub struct LightningSettings {
     /// LND certificate file path
     pub lnd_cert_file: String,
@@ -220,6 +221,44 @@ pub struct LightningSettings {
     pub payment_attempts: u32,
     /// Payment retries interval in seconds
     pub payment_retries_interval: u32,
+    /// Enable BOLT12 offer payout via LNDK (experimental)
+    pub lndk_enabled: bool,
+    /// LNDK gRPC host (must start with https://)
+    #[serde(default = "default_lndk_grpc_host")]
+    pub lndk_grpc_host: String,
+    /// Path to LNDK TLS certificate (self-signed, generated on first run)
+    pub lndk_cert_file: String,
+    /// Path to the LND macaroon LNDK uses for payment authorization
+    pub lndk_macaroon_file: String,
+    /// Timeout for BOLT12 invoice fetch from the offer issuer (seconds)
+    #[serde(default = "default_lndk_fetch_timeout")]
+    pub lndk_fetch_invoice_timeout: u32,
+    /// Fee limit for BOLT12 payments as percent. Falls back to mostro.max_routing_fee.
+    pub lndk_fee_limit_percent: Option<f64>,
+    /// Enable BIP-353 DNS resolution for `user@domain` payment addresses.
+    /// Resolves via DNS-over-HTTPS to a DNSSEC-validated BOLT12 offer.
+    /// Falls back to LNURL if resolution fails. Requires LNDK to be enabled.
+    pub bip353_enabled: bool,
+    /// DNS-over-HTTPS resolver URL for BIP-353 lookups.
+    /// Must support the JSON API (RFC 8484). Default: Cloudflare.
+    #[serde(default = "default_bip353_doh_resolver")]
+    pub bip353_doh_resolver: String,
+    /// Skip DNSSEC validation (AD flag check) for BIP-353 lookups.
+    /// DANGER: only for regtest/dev. An attacker can redirect payments
+    /// without DNSSEC validation.
+    pub bip353_skip_dnssec: bool,
+}
+
+fn default_lndk_grpc_host() -> String {
+    "https://127.0.0.1:7000".to_string()
+}
+
+fn default_lndk_fetch_timeout() -> u32 {
+    60
+}
+
+fn default_bip353_doh_resolver() -> String {
+    "https://1.1.1.1/dns-query".to_string()
 }
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]

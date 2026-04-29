@@ -412,19 +412,36 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 new_status
                             );
                             let order_id = order_updated.id;
-                            // update order on db
-                            let _ = order_updated.update(pool).await;
-                            // Phase 1: scheduler-driven cancels (waiting-state
-                            // timeouts) always release the bond. Slashing on
-                            // timeout lands in Phase 4 — and crucially MUST
-                            // gate on the cause being a real timeout, not a
-                            // user-driven cancel beforehand.
-                            bond::release_bonds_for_order_or_warn(
-                                pool,
-                                order_id,
-                                "scheduler_timeout",
-                            )
-                            .await;
+                            // Persist the new status before releasing
+                            // bonds: a release on top of a failed
+                            // persist would leave the order in its
+                            // pre-cancel status while the bond is
+                            // gone, so the next scheduler tick keeps
+                            // re-publishing cancels with no funds to
+                            // refund. Skip release on persist failure
+                            // — the next tick retries persist, and
+                            // the bond's CLTV expiry is the safety
+                            // net.
+                            match order_updated.update(pool).await {
+                                Ok(_) => {
+                                    // Phase 1: scheduler-driven cancels
+                                    // (waiting-state timeouts) always
+                                    // release the bond. Slashing on
+                                    // timeout lands in Phase 4.
+                                    bond::release_bonds_for_order_or_warn(
+                                        pool,
+                                        order_id,
+                                        "scheduler_timeout",
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler_timeout: persist failed for order {} ({}); skipping bond release — will retry next tick",
+                                        order_id, e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -462,21 +479,37 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
                         let order_id = order_updated.id;
-                        let _ = order_updated.update(pool).await;
-                        // Phase 1: a Pending order may be carrying a
-                        // still-active taker bond (Phase 1 keeps the
-                        // order in `Pending` while the taker funds the
-                        // bond hold invoice). Without this hook the
-                        // bond stays in `Requested`/`Locked` and the
-                        // HTLC sits in LND until CLTV expiry — Phase 1
-                        // promises "always release" on every exit
-                        // path, expiry included.
-                        bond::release_bonds_for_order_or_warn(
-                            pool,
-                            order_id,
-                            "pending_expiry",
-                        )
-                        .await;
+                        // Same gate as the timeout job: only release
+                        // bonds when the Expired status was actually
+                        // persisted. On persist failure the next tick
+                        // reprocesses the still-Pending order; CLTV
+                        // expiry is the eventual safety net.
+                        match order_updated.update(pool).await {
+                            Ok(_) => {
+                                // Phase 1: a Pending order may be
+                                // carrying a still-active taker bond
+                                // (Phase 1 keeps the order in `Pending`
+                                // while the taker funds the bond hold
+                                // invoice). Without this hook the bond
+                                // stays in `Requested`/`Locked` and
+                                // the HTLC sits in LND until CLTV
+                                // expiry — Phase 1 promises "always
+                                // release" on every exit path,
+                                // expiry included.
+                                bond::release_bonds_for_order_or_warn(
+                                    pool,
+                                    order_id,
+                                    "pending_expiry",
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "pending_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
+                                    order_id, e
+                                );
+                            }
+                        }
                     }
                 }
             }

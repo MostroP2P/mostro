@@ -124,6 +124,28 @@ pub async fn request_taker_bond(
         None,
     );
 
+    // Arm the LND subscriber BEFORE shipping the bolt11 to the taker.
+    // If we emit the invoice first and the taker pays before the
+    // subscriber is attached, we miss the `Accepted` event and the
+    // take never resumes (the HTLC eventually unwinds via CLTV but
+    // the trade is dead in the meantime). On subscribe failure, undo
+    // the persisted bond so we don't strand a `Requested` row with
+    // no listener — and keep the invoice unsent so the taker can
+    // retry the take cleanly.
+    if let Err(e) = bond_invoice_subscribe(hash, request_id).await {
+        warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "request_taker_bond: subscribe failed ({}); rolling back bond row",
+            e
+        );
+        // Best-effort cleanup: cancel the LND hold invoice and mark
+        // the row Released. Mirrors the "always release" exit path
+        // contract.
+        let _ = release_bond(pool, &bond).await;
+        return Err(e);
+    }
+
     enqueue_order_msg(
         request_id,
         Some(order.id),
@@ -137,8 +159,6 @@ pub async fn request_taker_bond(
         trade_index,
     )
     .await;
-
-    bond_invoice_subscribe(hash, request_id).await?;
 
     Ok(bond)
 }

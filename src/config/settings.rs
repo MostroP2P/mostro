@@ -84,18 +84,19 @@ impl Settings {
 
     /// This function retrieves the anti-abuse bond configuration from the
     /// global `MOSTRO_CONFIG`. Returns `None` when the `[anti_abuse_bond]`
-    /// block is absent (treated as disabled).
+    /// block is absent (treated as disabled), and also when the global
+    /// settings haven't been initialized yet — unlike the other accessors
+    /// in this file, the bond gate is on the hot path of the take flow and
+    /// must never panic in unit tests that don't bring up the full
+    /// configuration.
     pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
-        MOSTRO_CONFIG
-            .get()
-            .expect("No settings found")
-            .anti_abuse_bond
-            .as_ref()
+        MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
     }
 
     /// True when the feature is configured AND explicitly enabled. This is
     /// the single gate every bond-related code path must check before
-    /// running. Keeps the opt-in guarantee simple to audit.
+    /// running. Keeps the opt-in guarantee simple to audit. Returns
+    /// `false` when settings haven't been initialized.
     pub fn is_bond_enabled() -> bool {
         Self::get_bond().is_some_and(|cfg| cfg.enabled)
     }

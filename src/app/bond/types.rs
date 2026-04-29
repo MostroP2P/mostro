@@ -65,6 +65,29 @@ pub enum BondState {
     Failed,
 }
 
+impl BondState {
+    /// True for states that should not be transitioned out of by Phase 1
+    /// release paths: the bond is already done with from the operator's
+    /// perspective. Used so call sites don't have to enumerate the trio
+    /// of `Released | Slashed | Failed` manually (and so the daemon
+    /// doesn't grow to depend on the [`Display`] string form for control
+    /// flow).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            BondState::Released | BondState::Slashed | BondState::Failed
+        )
+    }
+
+    /// True for states that still have an outstanding LND HTLC and are
+    /// candidates for release / slash. Inverse of [`BondState::is_terminal`]
+    /// minus `PendingPayout`, which is owned by the Phase 3 payout job
+    /// rather than the release flow.
+    pub fn is_active(self) -> bool {
+        matches!(self, BondState::Requested | BondState::Locked)
+    }
+}
+
 impl fmt::Display for BondState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -184,5 +207,20 @@ mod tests {
         assert!(BondRole::from_str("solver").is_err());
         assert!(BondState::from_str("in-progress").is_err());
         assert!(BondSlashReason::from_str("whatever").is_err());
+    }
+
+    #[test]
+    fn terminal_and_active_helpers() {
+        for s in [BondState::Released, BondState::Slashed, BondState::Failed] {
+            assert!(s.is_terminal(), "{s} should be terminal");
+            assert!(!s.is_active(), "{s} should not be active");
+        }
+        for s in [BondState::Requested, BondState::Locked] {
+            assert!(s.is_active(), "{s} should be active");
+            assert!(!s.is_terminal(), "{s} should not be terminal");
+        }
+        // `PendingPayout` is neither: it's owned by the payout job.
+        assert!(!BondState::PendingPayout.is_terminal());
+        assert!(!BondState::PendingPayout.is_active());
     }
 }

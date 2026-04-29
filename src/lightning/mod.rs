@@ -149,16 +149,22 @@ impl LndConnector {
         let payment_hash = FromHex::from_hex(hash).expect("Wrong payment hash");
 
         let cancel_message = CancelInvoiceMsg { payment_hash };
-        let cancel = self
-            .client
-            .invoices()
-            .cancel_invoice(cancel_message)
-            .await
-            .map_err(|e| e.to_string());
+        let cancel = self.client.invoices().cancel_invoice(cancel_message).await;
 
         match cancel {
             Ok(cancel) => Ok(cancel.into_inner()),
-            Err(e) => Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string()))),
+            Err(status) => {
+                // Preserve the gRPC code in the error string with a stable
+                // `code=<Code>` prefix. Bond release uses this to tell
+                // benign "already canceled / not found" outcomes from
+                // transient transport failures so it can avoid marking a
+                // bond Released while the HTLC may still be encumbered.
+                Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))))
+            }
         }
     }
 

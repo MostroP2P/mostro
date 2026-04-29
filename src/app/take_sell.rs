@@ -1,3 +1,5 @@
+use crate::app::bond;
+use crate::app::bond::supersede_prior_taker_bonds;
 use crate::app::context::AppContext;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
@@ -64,6 +66,23 @@ pub async fn take_sell_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
+    // Anti-abuse bond (Phase 1): release any prior taker's still-
+    // `Requested` bond before this take proceeds. A `Locked` prior bond
+    // means the trade is already committed and the helper returns
+    // `PendingOrderExists`. Done before the market-price recomputation
+    // below so re-takes of API-priced orders see a fresh quote.
+    let bond_required = bond::taker_bond_required();
+    let superseded = if bond_required {
+        supersede_prior_taker_bonds(pool, order.id, event.sender).await?
+    } else {
+        0
+    };
+    if superseded > 0 && order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+        order.dev_fee = 0;
+    }
+
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
@@ -121,6 +140,35 @@ pub async fn take_sell_action(
     update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Anti-abuse bond (Phase 1): when enabled for the taker side, defer
+    // the trade hold-invoice / `WaitingBuyerInvoice` step. We persist the
+    // populated order (status stays `Pending`), stash the buyer payout
+    // invoice if the taker provided one, and request the taker's bond.
+    // `bond::flow::resume_take_after_bond` resumes the trade once the
+    // bond locks.
+    if bond_required {
+        // Always set `buyer_invoice` from this take's `payment_request`
+        // (including back to `None`): otherwise a prior taker's invoice
+        // would persist into this take when the new taker did not
+        // provide one.
+        order.buyer_invoice = payment_request.clone();
+
+        let persisted = order
+            .update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        bond::request_taker_bond(
+            pool,
+            &persisted,
+            event.sender,
+            request_id,
+            Some(trade_index),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

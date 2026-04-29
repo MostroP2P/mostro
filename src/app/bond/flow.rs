@@ -406,15 +406,8 @@ pub async fn supersede_prior_taker_bonds(
         superseded += 1;
         if bond.pubkey != new_taker_str {
             if let Ok(prior_pk) = PublicKey::from_str(&bond.pubkey) {
-                enqueue_order_msg(
-                    None,
-                    Some(order_id),
-                    Action::Canceled,
-                    None,
-                    prior_pk,
-                    None,
-                )
-                .await;
+                enqueue_order_msg(None, Some(order_id), Action::Canceled, None, prior_pk, None)
+                    .await;
             }
         }
     }

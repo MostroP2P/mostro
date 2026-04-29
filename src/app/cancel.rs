@@ -368,15 +368,8 @@ async fn cancel_pending_order_from_maker(
         for active in active_bonds.iter() {
             if let Ok(taker_pk) = PublicKey::from_str(&active.pubkey) {
                 if taker_pk != event.sender {
-                    enqueue_order_msg(
-                        None,
-                        Some(order.id),
-                        Action::Canceled,
-                        None,
-                        taker_pk,
-                        None,
-                    )
-                    .await;
+                    enqueue_order_msg(None, Some(order.id), Action::Canceled, None, taker_pk, None)
+                        .await;
                 }
             }
         }

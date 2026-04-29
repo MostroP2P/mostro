@@ -1,5 +1,5 @@
 use crate::app::bond;
-use crate::app::bond::db::find_active_bonds_for_order;
+use crate::app::bond::supersede_prior_taker_bonds;
 use crate::app::context::AppContext;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
@@ -66,6 +66,23 @@ pub async fn take_sell_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
+    // Anti-abuse bond (Phase 1): release any prior taker's still-
+    // `Requested` bond before this take proceeds. A `Locked` prior bond
+    // means the trade is already committed and the helper returns
+    // `PendingOrderExists`. Done before the market-price recomputation
+    // below so re-takes of API-priced orders see a fresh quote.
+    let bond_required = bond::taker_bond_required();
+    let superseded = if bond_required {
+        supersede_prior_taker_bonds(pool, order.id, event.sender).await?
+    } else {
+        0
+    };
+    if superseded > 0 && order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+        order.dev_fee = 0;
+    }
+
     // Get seller pubkey
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
@@ -130,15 +147,12 @@ pub async fn take_sell_action(
     // invoice if the taker provided one, and request the taker's bond.
     // `bond::flow::resume_take_after_bond` resumes the trade once the
     // bond locks.
-    if bond::taker_bond_required() {
-        let existing = find_active_bonds_for_order(pool, order.id).await?;
-        if !existing.is_empty() {
-            return Err(MostroCantDo(CantDoReason::PendingOrderExists));
-        }
-
-        if let Some(invoice) = payment_request.as_ref() {
-            order.buyer_invoice = Some(invoice.clone());
-        }
+    if bond_required {
+        // Always set `buyer_invoice` from this take's `payment_request`
+        // (including back to `None`): otherwise a prior taker's invoice
+        // would persist into this take when the new taker did not
+        // provide one.
+        order.buyer_invoice = payment_request.clone();
 
         let persisted = order
             .update(pool)

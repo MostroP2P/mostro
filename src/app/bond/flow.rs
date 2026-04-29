@@ -339,6 +339,68 @@ pub async fn release_bonds_for_order_or_warn(
     }
 }
 
+/// Make the order takeable again when a prior taker hasn't paid their
+/// bond yet.
+///
+/// Called from `take_buy_action` / `take_sell_action` when a new taker
+/// arrives for an order that still carries an active bond from a
+/// previous take. Without this, a malicious user could keep an order
+/// in `Pending` indefinitely by taking it and never paying — see issue
+/// in <https://github.com/MostroP2P/mostro> (taker can DoS orders by
+/// abandoning the bond invoice).
+///
+/// Behaviour:
+/// - If any active bond is `Locked`, the trade is already committed to
+///   that taker — return `PendingOrderExists`.
+/// - Otherwise (only `Requested` bonds), cancel each prior bond's hold
+///   invoice and notify the prior taker that their take was
+///   superseded.
+///
+/// Bonds belonging to the new taker themselves (same `pubkey`) are
+/// also released here: a single user retaking should also start with a
+/// fresh bond invoice.
+pub async fn supersede_prior_taker_bonds(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    new_taker: PublicKey,
+) -> Result<usize, MostroError> {
+    let existing = find_active_bonds_for_order(pool, order_id).await?;
+    if existing
+        .iter()
+        .any(|b| b.state == BondState::Locked.to_string())
+    {
+        return Err(MostroCantDo(CantDoReason::PendingOrderExists));
+    }
+    let new_taker_str = new_taker.to_string();
+    let mut superseded = 0usize;
+    for bond in existing.iter() {
+        if let Err(e) = release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "supersede_prior_taker_bonds: failed to release bond ({}); aborting new take",
+                e
+            );
+            return Err(e);
+        }
+        superseded += 1;
+        if bond.pubkey != new_taker_str {
+            if let Ok(prior_pk) = PublicKey::from_str(&bond.pubkey) {
+                enqueue_order_msg(
+                    None,
+                    Some(order_id),
+                    Action::Canceled,
+                    None,
+                    prior_pk,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+    Ok(superseded)
+}
+
 /// Spawn the LND subscriber for a bond hold invoice. The subscriber
 /// transitions the bond row through `Locked` / `Released` based on the
 /// invoice state and, on `Locked`, resumes the original take flow.
@@ -725,6 +787,74 @@ mod tests {
         // Guarantees that all bond touchpoints are inert in the absence
         // of an `[anti_abuse_bond]` block.
         assert!(!taker_bond_required());
+    }
+
+    fn fake_pubkey() -> PublicKey {
+        Keys::generate().public_key()
+    }
+
+    #[tokio::test]
+    async fn supersede_releases_prior_requested_bond() {
+        // A new taker arriving while a prior taker has only requested
+        // (not yet locked) the bond must release the prior bond and
+        // return the count, so the order is takeable again.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut prior = make_bond(order_id, BondState::Requested);
+        prior.hash = None; // skip LND in the unit-test harness
+        prior.pubkey = "b".repeat(64);
+        create_bond(&pool, prior).await.unwrap();
+
+        let count = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey())
+            .await
+            .expect("supersede should succeed");
+        assert_eq!(count, 1);
+
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(
+            active.is_empty(),
+            "prior Requested bond must be released so the order is takeable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersede_rejects_when_prior_bond_locked() {
+        // A `Locked` prior bond means the trade is already committed to
+        // that taker; a new take must back off rather than strand the
+        // committed taker's funds.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut prior = make_bond(order_id, BondState::Locked);
+        prior.hash = None;
+        prior.pubkey = "b".repeat(64);
+        create_bond(&pool, prior).await.unwrap();
+
+        let result = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey()).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::PendingOrderExists))
+        ));
+
+        // The locked bond must NOT be touched.
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn supersede_with_no_prior_bonds_is_noop() {
+        // The first taker must not be charged a "supersede" cost: when
+        // no prior bonds exist, the helper returns 0 cleanly.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let count = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     fn ln_err(msg: &str) -> MostroError {

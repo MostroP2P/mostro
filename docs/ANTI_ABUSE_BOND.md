@@ -203,9 +203,20 @@ to users.
   maker-side, including pending-order maker cancels), `admin_settle_action`,
   `admin_cancel_action`, and `scheduler::job_cancel_orders`. Slashing
   hooks are intentionally absent and land in Phase 2+.
-- A guard in `take_buy_action` / `take_sell_action` rejects a take with
-  `PendingOrderExists` when an active bond row already exists for the
-  order, preventing duplicate bonds when two takers race.
+- `take_buy_action` / `take_sell_action` call
+  `bond::supersede_prior_taker_bonds` before persisting the new take.
+  A still-`Requested` prior bond is released (its hold invoice
+  cancelled) so a malicious taker can't keep an order in `Pending`
+  by abandoning the bond invoice — anyone may re-take and the first
+  bond to lock wins. A `Locked` prior bond is treated as committed
+  and the new take is rejected with `PendingOrderExists`.
+- `cancel_action` recognises a bonded taker as authorised to cancel a
+  still-`Pending` order: when `event.sender` matches the `pubkey` of an
+  active bond on the order, the cancel routes through the existing
+  `cancel_order_by_taker` flow (release the bond, clear the taker
+  fields, republish the order). This lets a taker who took the order
+  but no longer wants to proceed back out cleanly instead of getting
+  `IsNotYourOrder`.
 - On daemon startup, `bond::resubscribe_active_bonds` re-attaches LND
   invoice subscribers for any bond rows still in `Requested` / `Locked`,
   so a restart never strands a taker who paid the bond just before the

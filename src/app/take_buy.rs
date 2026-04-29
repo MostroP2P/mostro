@@ -1,5 +1,5 @@
 use crate::app::bond;
-use crate::app::bond::db::find_active_bonds_for_order;
+use crate::app::bond::supersede_prior_taker_bonds;
 use crate::app::context::AppContext;
 use crate::util::{
     get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
@@ -42,6 +42,25 @@ pub async fn take_buy_action(
     order
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
+
+    // Anti-abuse bond (Phase 1): release any prior taker's still-
+    // `Requested` bond before this take proceeds, so a malicious user
+    // can't block the order by abandoning the bond invoice. A `Locked`
+    // prior bond means the trade is already committed and the helper
+    // returns `PendingOrderExists`. Done before the market-price
+    // recomputation below so re-takes of API-priced orders see a fresh
+    // quote.
+    let bond_required = bond::taker_bond_required();
+    let superseded = if bond_required {
+        supersede_prior_taker_bonds(pool, order.id, event.sender).await?
+    } else {
+        0
+    };
+    if superseded > 0 && order.price_from_api {
+        order.amount = 0;
+        order.fee = 0;
+        order.dev_fee = 0;
+    }
 
     // Get the fiat amount requested by the user for range orders
     if let Some(am) = get_fiat_amount_requested(&order, &msg) {
@@ -100,15 +119,7 @@ pub async fn take_buy_action(
     // (status stays `Pending`) and request the bond. The trade hold
     // invoice is created later — once the bond locks — by the bond
     // subscriber's continuation in `bond::flow::resume_take_after_bond`.
-    if bond::taker_bond_required() {
-        // Defend against concurrent takes for the same order: if another
-        // taker already has an active bond on this order, the second take
-        // must back off rather than create a duplicate bond row.
-        let existing = find_active_bonds_for_order(pool, order.id).await?;
-        if !existing.is_empty() {
-            return Err(MostroCantDo(CantDoReason::PendingOrderExists));
-        }
-
+    if bond_required {
         // Stash the seller (taker) trade pubkey so the post-bond
         // continuation can resume `show_hold_invoice` with the same
         // arguments the legacy path would have used.

@@ -399,8 +399,34 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
 
     // Pending: maker can revert to Canceled state and republish without cooperative steps.
     if order.check_status(Status::Pending).is_ok() {
-        cancel_pending_order_from_maker(pool, event, &mut order, my_keys, request_id).await?;
-        return Ok(());
+        if order.sent_from_maker(event.sender).is_ok() {
+            cancel_pending_order_from_maker(pool, event, &mut order, my_keys, request_id).await?;
+            return Ok(());
+        }
+        // Phase 1: a taker who took the order but hasn't paid the bond
+        // yet leaves the order in `Pending` (the taker fields are
+        // populated; the bond row sits in `Requested`). Allow that taker
+        // to back out — release the bond, clear the taker fields, and
+        // republish the order so other takers can take it. We identify
+        // the bonded taker by matching `event.sender` against an active
+        // bond's `pubkey`.
+        let active_bonds =
+            crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await?;
+        let sender_str = event.sender.to_string();
+        if active_bonds.iter().any(|b| b.pubkey == sender_str) {
+            cancel_order_by_taker(
+                pool,
+                event,
+                order,
+                my_keys,
+                request_id,
+                ln_client,
+                event.sender,
+            )
+            .await?;
+            return Ok(());
+        }
+        return Err(MostroCantDo(CantDoReason::IsNotYourOrder));
     }
 
     // Do the appropriate cancellation flow based on the order status
@@ -645,5 +671,65 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::IsNotYourOrder))
         ));
+    }
+
+    /// Phase 1 fix: a taker who took a `Pending` order but hasn't paid
+    /// the bond yet must be able to cancel and back out, even though
+    /// the order is still `Pending`. Before this fix, `cancel_action`
+    /// routed every cancel on a `Pending` order through the maker path
+    /// and returned `IsNotYourOrder` for the bonded taker.
+    ///
+    /// We assert the routing change at the *decision* layer: an active
+    /// bond row whose `pubkey` matches `event.sender` switches the
+    /// cancel out of the maker-only path. The full cancel side-effects
+    /// (`update_order_event`, `notify_creator`) reach into globals
+    /// (`get_db_pool`, etc.) that aren't initialized in unit tests, so
+    /// they're covered by integration tests rather than asserted here.
+    #[tokio::test]
+    async fn pending_taker_with_active_bond_is_not_routed_as_intruder() {
+        use crate::app::bond::db::find_active_bonds_for_order;
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let order = create_pending_order(maker, taker)
+            .create(pool.as_ref())
+            .await
+            .unwrap();
+
+        // Insert a Requested bond row whose pubkey matches the taker's.
+        let mut bond = crate::app::bond::Bond::new_requested(
+            order.id,
+            taker.to_string(),
+            crate::app::bond::BondRole::Taker,
+            1_500,
+        );
+        bond.hash = None;
+        bond.create(pool.as_ref()).await.unwrap();
+
+        // Sanity: the helper finds the bond by sender match — this is
+        // exactly the predicate `cancel_action_generic` uses to decide
+        // whether to route to the taker-cancel path.
+        let active = find_active_bonds_for_order(pool.as_ref(), order.id)
+            .await
+            .unwrap();
+        let sender_str = taker.to_string();
+        assert!(
+            active.iter().any(|b| b.pubkey == sender_str),
+            "the taker must be recognised as a bonded sender"
+        );
+
+        // And the intruder (non-maker, no bond) must still NOT match,
+        // so the routing falls through to `IsNotYourOrder`.
+        let intruder = Keys::generate().public_key();
+        let intruder_str = intruder.to_string();
+        assert!(
+            !active.iter().any(|b| b.pubkey == intruder_str),
+            "an intruder with no bond row must not be routed to the taker-cancel path"
+        );
     }
 }

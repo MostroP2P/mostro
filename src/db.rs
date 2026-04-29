@@ -568,29 +568,6 @@ pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Orde
     Ok(order)
 }
 
-/// Returns orders with `failed_payment = true` and `status = "settled-hold-invoice"`
-/// for the given `master_buyer_pubkey`. Used during restore-session to re-send
-/// `Action::AddInvoice` to buyers whose payment failed and need to provide a new invoice.
-pub async fn find_failed_payment_for_master_key(
-    pool: &SqlitePool,
-    master_key: &str,
-) -> Result<Vec<Order>, MostroError> {
-    let orders = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE failed_payment = true
-            AND status = 'settled-hold-invoice'
-            AND master_buyer_pubkey = ?1
-        "#,
-    )
-    .bind(master_key)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(orders)
-}
-
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -1680,89 +1657,6 @@ mod tests {
         assert!(
             result.is_empty(),
             "Should not find orders with wrong status"
-        );
-    }
-
-    // -- Tests for find_failed_payment_for_master_key --
-    #[tokio::test]
-    async fn test_find_failed_payment_for_master_key_returns_matching() {
-        let pool = setup_orders_db().await.unwrap();
-        let master_key = "a".repeat(64);
-        // Insert matching order: correct master_buyer_pubkey, failed_payment=true, correct status
-        sqlx::query(
-            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
-                    amount, fiat_code, fiat_amount, created_at, expires_at,
-                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
-                    master_buyer_pubkey)
-            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
-                    100000, 'USD', 100, 1700000000, 1700086400,
-                    1, 3, 0, 0, ?2)"#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(&master_key)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let result = super::find_failed_payment_for_master_key(&pool, &master_key)
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1, "Should find matching failed payment order");
-    }
-
-    #[tokio::test]
-    async fn test_find_failed_payment_for_master_key_ignores_different_key() {
-        let pool = setup_orders_db().await.unwrap();
-        let master_key = "a".repeat(64);
-        let other_key = "b".repeat(64);
-        // Insert order for a different master key
-        sqlx::query(
-            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
-                    amount, fiat_code, fiat_amount, created_at, expires_at,
-                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
-                    master_buyer_pubkey)
-            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
-                    100000, 'USD', 100, 1700000000, 1700086400,
-                    1, 3, 0, 0, ?2)"#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(&other_key)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let result = super::find_failed_payment_for_master_key(&pool, &master_key)
-            .await
-            .unwrap();
-        assert!(
-            result.is_empty(),
-            "Should not return orders for different master key"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_failed_payment_for_master_key_ignores_non_failed() {
-        let pool = setup_orders_db().await.unwrap();
-        let master_key = "a".repeat(64);
-        // Insert order with failed_payment = false
-        sqlx::query(
-            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
-                    amount, fiat_code, fiat_amount, created_at, expires_at,
-                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
-                    master_buyer_pubkey)
-            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
-                    100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, 0, 0, ?2)"#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(&master_key)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let result = super::find_failed_payment_for_master_key(&pool, &master_key)
-            .await
-            .unwrap();
-        assert!(
-            result.is_empty(),
-            "Should not return orders where failed_payment is false"
         );
     }
 

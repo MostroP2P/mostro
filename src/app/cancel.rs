@@ -356,8 +356,31 @@ async fn cancel_pending_order_from_maker(
     )
     .await;
     // Phase 1: a maker cancelling a still-Pending order may be racing
-    // with a taker who just locked a bond. Release any active bond so
-    // the taker is made whole.
+    // with a taker who just locked (or only requested) a bond. Notify
+    // every bonded taker so they don't keep waiting on a cancelled
+    // order, and release the bonds so they're made whole. The bond
+    // pubkey is the canonical source of who has a stake here — for a
+    // fresh Pending order with no taker yet, the lookup returns empty
+    // and this is a no-op.
+    if let Ok(active_bonds) =
+        crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await
+    {
+        for active in active_bonds.iter() {
+            if let Ok(taker_pk) = PublicKey::from_str(&active.pubkey) {
+                if taker_pk != event.sender {
+                    enqueue_order_msg(
+                        None,
+                        Some(order.id),
+                        Action::Canceled,
+                        None,
+                        taker_pk,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     bond::release_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
     Ok(())
 }

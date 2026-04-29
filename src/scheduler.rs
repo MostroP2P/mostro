@@ -461,7 +461,22 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
+                        let order_id = order_updated.id;
                         let _ = order_updated.update(pool).await;
+                        // Phase 1: a Pending order may be carrying a
+                        // still-active taker bond (Phase 1 keeps the
+                        // order in `Pending` while the taker funds the
+                        // bond hold invoice). Without this hook the
+                        // bond stays in `Requested`/`Locked` and the
+                        // HTLC sits in LND until CLTV expiry — Phase 1
+                        // promises "always release" on every exit
+                        // path, expiry included.
+                        bond::release_bonds_for_order_or_warn(
+                            pool,
+                            order_id,
+                            "pending_expiry",
+                        )
+                        .await;
                     }
                 }
             }

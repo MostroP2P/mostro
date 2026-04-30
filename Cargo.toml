@@ -92,3 +92,7 @@ bech32 = "0.11.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14.1"
+protoc-bin-vendored = "3"
+
+[patch.crates-io]
+fedimint-tonic-lnd = { path = "vendor/fedimint-tonic-lnd" }

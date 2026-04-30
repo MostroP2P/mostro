@@ -224,7 +224,9 @@ pub struct LightningSettings {
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NostrSettings {
-    /// Nostr private key
+    /// Nostr private key. Optional when `MOSTRO_NSEC_PRIVKEY` is provided via
+    /// environment variable or `<settings_dir>/.env`.
+    #[serde(default)]
     pub nsec_privkey: String,
     /// Nostr relays list
     pub relays: Vec<String>,

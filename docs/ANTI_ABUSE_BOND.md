@@ -53,6 +53,23 @@ change.
 7. **Tests accompany every phase.** Rust unit tests co-located with the
    module; `cargo test`, `cargo clippy --all-targets --all-features`, and
    `cargo sqlx prepare -- --bin mostrod` must stay green.
+8. **Bonds must not block the order book.** While a taker's bond is
+   outstanding (between `Requested` and `Locked`), the order **must
+   remain visible and takeable** to other potential takers — the
+   published NIP-33 event continues to advertise it as `pending`
+   under [NIP-69](https://nips.nostr.com/69)'s four-bucket model
+   (`pending` / `canceled` / `in-progress` / `success`). A malicious
+   or absent taker cannot indefinitely hold an order off the book by
+   initiating a take and then never paying the bond. The
+   `supersede_prior_taker_bonds` mechanism (Phase 1) cancels stale
+   `Requested` bonds when a fresh take arrives; the **first bond to
+   reach `Locked` wins**, and only then does the order transition to
+   a trade-flow status (`WaitingPayment` / `WaitingBuyerInvoice`,
+   which map to NIP-69 `in-progress`). Any internal status the daemon
+   adds to distinguish "matched, awaiting bond" from "advertised, no
+   taker yet" (e.g. `Status::WaitingTakerBond` in §6.5) must map to
+   NIP-69 `pending` in `nip33::create_status_tags`, so external
+   observers still see an available order.
 
 ## 3. Configuration surface (final shape)
 
@@ -364,6 +381,27 @@ The two cases:
   amount). They are emitted **sequentially, never simultaneously** —
   Mostro waits for the bond to lock before triggering the trade flow.
 
+**Non-blockability invariant — important for UX.** Between the take
+request and the bond locking, the order's published NIP-33 status
+stays `pending` (per §2 principle 8). This is deliberate: a taker who
+never pays the bond bolt11 cannot park the order off the book. Other
+users browsing the order book continue to see it as available, and
+any of them may attempt a fresh take. Whichever bond reaches `Locked`
+first wins; prior `Requested` bonds are cancelled by
+`supersede_prior_taker_bonds`, and the prior taker is notified with
+`Action::Canceled`.
+
+What this means for clients in practice:
+
+- A client that sent `take-buy` / `take-sell` and is waiting for
+  `pay-bond-invoice` may receive `Action::Canceled` instead — meaning
+  someone else paid their bond first. Surface this clearly: "Order
+  was taken by another user before you locked the bond." Don't retry
+  the take silently; the order may not be available anymore.
+- Don't gray out / hide the order from the local order-book view just
+  because the user initiated a take. Until `Locked`, the order is
+  still genuinely available to everyone.
+
 Until Phase 1.5 lands, clients have four ways to distinguish bond
 from trade invoice (in order of authoritativeness):
 
@@ -424,9 +462,14 @@ never has to lean on memo parsing in the wild.
 ### 6.5.1 Scope
 
 - **`mostro-core` release** introducing two additive variants:
-  - `Status::WaitingTakerBond` — order is awaiting a bond payment from
-    the taker. Distinct from `Pending` (which means "advertised, no
-    taker yet").
+  - `Status::WaitingTakerBond` — daemon-level status meaning "this
+    order has a taker mid-bond". Distinguishes "matched, awaiting
+    bond" from `Pending` ("advertised, no taker yet") for the
+    daemon's own routing/persistence. Per NIP-69 only the four
+    public buckets (`pending` / `canceled` / `in-progress` /
+    `success`) appear in published order events anyway, so the
+    mapping is what matters: `WaitingTakerBond` must map to NIP-69
+    `pending` in `nip33::create_status_tags` (§2 principle 8).
   - `Action::PayBondInvoice` — Mostro is delivering a bond bolt11 for
     the taker to pay. Wire format identical to `Action::PayInvoice`,
     only the action discriminator differs. Name is deliberately
@@ -436,17 +479,32 @@ never has to lean on memo parsing in the wild.
     → Mostro, "here's my payout bolt11").
   - Minor version bump; serde-additive so clients that ignore unknown
     variants stay compatible.
-- **`mostrod` change** in `src/app/bond/flow.rs::request_taker_bond`:
+- **`mostrod` changes** in `src/app/bond/flow.rs::request_taker_bond`
+  and the take handlers:
   - Replace `Action::PayInvoice` with `Action::PayBondInvoice` when
     enqueuing the bond DM.
-  - Set the order to `Status::WaitingTakerBond` while the bond is
-    outstanding (instead of leaving it in `Pending`); republish the
-    NIP-33 order event with the new status so observers see the
-    transition.
-  - On bond `Locked`, clear `WaitingTakerBond` and continue into the
-    existing trade flow (which sets `WaitingPayment` /
-    `WaitingBuyerInvoice` as before). The trade hold invoice keeps
-    using `Action::PayInvoice` — only the bond switches.
+  - Set the order's status to `Status::WaitingTakerBond` while the
+    bond is outstanding (instead of leaving it in `Pending`). Add
+    the NIP-69 mapping in `nip33::create_status_tags`:
+    `WaitingTakerBond` → `(true, Status::Pending)` — same bucket as
+    `Pending` itself, so the published event keeps advertising the
+    order as available. This is the load-bearing piece for the
+    non-blockability invariant; tests must lock it down.
+  - `take_buy_action` / `take_sell_action` must accept takes against
+    orders in **either** `Pending` or `WaitingTakerBond` — both are
+    pre-trade states from the take-validation perspective.
+    `supersede_prior_taker_bonds` continues to gate "is anyone
+    already locked?" the same way it does today, independent of the
+    order status column.
+  - On bond `Locked`, transition `WaitingTakerBond` →
+    `WaitingPayment` / `WaitingBuyerInvoice` as the existing trade
+    flow does (and republish NIP-33 with the real new status — at
+    that point the order is genuinely no longer takeable).
+  - On bond release before lock (taker abandons, supersede,
+    cancellation): transition `WaitingTakerBond` → `Pending` and
+    republish so any internal/external state stays consistent.
+  - The trade hold invoice continues to ship as `Action::PayInvoice`
+    — only the bond switches.
 - **Pin `mostro-core`** to the new minor version in this repo's
   `Cargo.toml`.
 
@@ -470,9 +528,22 @@ never has to lean on memo parsing in the wild.
 ### 6.5.3 Tests
 
 - Bond DM enqueues with `Action::PayBondInvoice`, not `PayInvoice`.
-- Order status flips to `WaitingTakerBond` while the bond is
-  outstanding, flips out (to `WaitingPayment` or
-  `WaitingBuyerInvoice` per the existing flow) once the bond locks.
+- Order's **DB** status flips to `WaitingTakerBond` while the bond is
+  outstanding, flips out to `WaitingPayment` /
+  `WaitingBuyerInvoice` (per the existing trade flow) once the bond
+  locks, and falls back to `Pending` on bond release before lock.
+- **Non-blockability test (load-bearing).** With order in status
+  `WaitingTakerBond`:
+  - `nip33::create_status_tags` returns `(true, Status::Pending)` —
+    i.e. the order publishes in NIP-69's `pending` bucket, identical
+    to the wire output for an order in `Pending`.
+  - A second `take-buy` / `take-sell` from a different pubkey is
+    accepted: `supersede_prior_taker_bonds` cancels the prior
+    `Requested` bond, the prior taker receives `Action::Canceled`,
+    the new bond is created, and the order's status remains
+    `WaitingTakerBond` (now reflecting the new taker).
+  - Repeating the cycle N times never causes the order's NIP-69
+    bucket to leave `pending` until a bond actually `Locked`.
 - Seller-as-taker case: one `PayBondInvoice` followed by one
   `PayInvoice` on the same order, both visible on the wire as
   distinct action types — no memo parsing needed by the client.
@@ -487,6 +558,9 @@ never has to lean on memo parsing in the wild.
   bonds.
 - The §6.3 client-side memo parsing recommendation becomes
   unnecessary; clients dispatch on action type alone.
+- The §2 non-blockability invariant is preserved: orders in
+  `WaitingTakerBond` map to NIP-69 `pending` and re-take from a
+  different pubkey works exactly as it does in Phase 1.
 - Phase 2 can rely on the clean API when it ships.
 
 ---

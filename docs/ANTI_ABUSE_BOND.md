@@ -157,7 +157,8 @@ slash path.
 |------:|----------|------------|--------|
 | 0 | Foundation: config schema, `bonds` table, pure helpers, types | — | ✅ shipped (PR #712) |
 | 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped (PR #719) |
-| 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1 | pending |
+| 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | pending |
+| 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | pending |
 | 3 | Payout flow: `add-invoice` to winner, routing-fee estimation, retries, audit event | 2 | pending |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) | 3 | pending |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
@@ -282,10 +283,11 @@ risk to users.
 - Orders stay in `Status::Pending` while the bond is outstanding, and the
   bond bolt11 is delivered to the taker via the existing
   `Action::PayInvoice` (the bond's payment hash uniquely distinguishes it
-  from the trade hold invoice that follows). A dedicated
-  `Status::WaitingTakerBond` / `Action::AddBondInvoice` will be introduced
-  in the matching `mostro-core` release alongside a later phase, at which
-  point this can be migrated transparently.
+  from the trade hold invoice that follows). The dedicated
+  `Status::WaitingTakerBond` / `Action::PayBondInvoice` lands in
+  Phase 1.5 (§6.5) — that is the migration path; clients should treat
+  the Phase 1 reuse as transitional. See §6.3 for the contract clients
+  must respect during the Phase 1 window.
 - Bond release is wired into every Phase 1 exit:
   `release_action`, `cancel_action` (cooperative + unilateral, taker- and
   maker-side, including pending-order maker cancels), `admin_settle_action`,
@@ -340,6 +342,152 @@ risk to users.
   order with `enabled=false` passes identically.
 - Feature enabled, apply_to=take: taker must fund a second hold invoice;
   all exits release it.
+
+### 6.3 Client UX considerations (Phase 1 reality)
+
+Because Phase 1 reuses `Action::PayInvoice` for the bond bolt11 (the
+trade hold invoice that follows uses the same action), clients must
+deliberately handle two cases this creates. Phase 1.5 (§6.5) replaces
+this with a dedicated action type — until then, this section is the
+contract.
+
+The two cases:
+
+- **Taker is the buyer (sell-order taken).** The taker receives a
+  single `PayInvoice` (the bond) — they don't lock a trade hold
+  invoice because they're receiving sats, not sending them. No
+  ambiguity.
+- **Taker is the seller (buy-order taken).** The taker receives **two
+  `PayInvoice` actions in sequence on the same order**: the bond
+  (typically ~1% of the trade, ≥ `base_amount_sats`) first, and once
+  the bond HTLC is `Accepted`, the trade hold invoice (the full trade
+  amount). They are emitted **sequentially, never simultaneously** —
+  Mostro waits for the bond to lock before triggering the trade flow.
+
+Until Phase 1.5 lands, clients have four ways to distinguish bond
+from trade invoice (in order of authoritativeness):
+
+1. **bolt11 memo.** The bond is created with memo
+   `"mostro bond order_id=<uuid>"` (§6.1). Authoritative but requires
+   the client to decode the bolt11.
+2. **Local state.** A client that already issued a `PayInvoice` for an
+   order knows the next one is the trade escrow.
+3. **Order status transition.** While the bond is outstanding the
+   order remains in `Status::Pending`; once the bond locks, the order
+   transitions to `WaitingPayment` (buy-order) or `WaitingBuyerInvoice`
+   (sell-order — irrelevant here since the taker is buyer in that
+   case). Clients subscribed to the order's NIP-33 events can use the
+   transition as a boundary.
+4. **Amount heuristic.** Bond = `max(amount_pct * order, base_amount_sats)`,
+   typically ~1–2% of the trade. Useful as a sanity check, not
+   authoritative.
+
+Recommended client behaviour during the Phase 1 window:
+
+- On take, if the operator's node has bonds enabled (visible once
+  Phase 8 ships info-event tags; until then, out-of-band), surface to
+  the user *before* they commit that this trade may require two hold
+  invoices and what each one represents.
+- On the first `PayInvoice` for an order, decode the memo and label
+  the bond explicitly ("Anti-abuse bond: <amount> sats — locked, not
+  spent"). Do not optimistically merge the two `PayInvoice` messages
+  into a single UI flow; they are independent HTLCs and the user
+  must approve each.
+- If the bond invoice is paid but the daemon never sends the trade
+  hold invoice (e.g. relay loss, daemon restart), the bond is
+  released by `bond::resubscribe_active_bonds` on restart or by the
+  scheduler timeout. Clients should treat the take as "stalled, will
+  resolve" rather than retrying take-buy/take-sell, which would race
+  with `supersede_prior_taker_bonds`.
+
+These behaviours stay correct after Phase 1.5; the new action type
+just means method (1) becomes "match on `Action::PayBondInvoice`"
+instead of memo parsing.
+
+---
+
+## 6.5. Phase 1.5 — Dedicated `PayBondInvoice` + `WaitingTakerBond`
+
+Small, protocol-only phase. Lands the dedicated `Action` and `Status`
+variants that Phase 1 deferred (§6 implementation note) so clients can
+route bond invoices by action type instead of by memo or status
+heuristics. No new behaviour, no new slashing, no database schema
+changes — pure ergonomics.
+
+Lands **before Phase 2 on purpose**. Phase 2 introduces dispute
+slashes and the `BondResolution` payload; once that ships and
+operators flip `enabled = true` in production, every taker on every
+bond-enabled node sees the bond DM. We want clients to have already
+adopted the clean API by then so the seller-as-taker case (§6.3)
+never has to lean on memo parsing in the wild.
+
+### 6.5.1 Scope
+
+- **`mostro-core` release** introducing two additive variants:
+  - `Status::WaitingTakerBond` — order is awaiting a bond payment from
+    the taker. Distinct from `Pending` (which means "advertised, no
+    taker yet").
+  - `Action::PayBondInvoice` — Mostro is delivering a bond bolt11 for
+    the taker to pay. Wire format identical to `Action::PayInvoice`,
+    only the action discriminator differs. Name is deliberately
+    `Pay…` not `Add…`: it follows the existing `PayInvoice`
+    convention (Mostro → user, "pay this bolt11"); `Add…` would
+    conflict with `Action::AddInvoice`'s established direction (user
+    → Mostro, "here's my payout bolt11").
+  - Minor version bump; serde-additive so clients that ignore unknown
+    variants stay compatible.
+- **`mostrod` change** in `src/app/bond/flow.rs::request_taker_bond`:
+  - Replace `Action::PayInvoice` with `Action::PayBondInvoice` when
+    enqueuing the bond DM.
+  - Set the order to `Status::WaitingTakerBond` while the bond is
+    outstanding (instead of leaving it in `Pending`); republish the
+    NIP-33 order event with the new status so observers see the
+    transition.
+  - On bond `Locked`, clear `WaitingTakerBond` and continue into the
+    existing trade flow (which sets `WaitingPayment` /
+    `WaitingBuyerInvoice` as before). The trade hold invoice keeps
+    using `Action::PayInvoice` — only the bond switches.
+- **Pin `mostro-core`** to the new minor version in this repo's
+  `Cargo.toml`.
+
+### 6.5.2 Client compatibility
+
+- A client that only knows `Action::PayInvoice` will silently ignore
+  the bond DM after this phase ships, the bond will never lock, and
+  the take will time out and release. No funds at risk, but the take
+  fails. This is the expected behaviour for unknown-action handling
+  per §14.2 ("Clients must handle unknown statuses gracefully") — it
+  is also why Phase 1.5 lands before Phase 2: operators who flipped
+  `enabled = true` *only after* Phase 1.5 see fail-fast behaviour
+  rather than ambiguous `PayInvoice` mishandling.
+- Operators are responsible for not flipping `enabled = true` in
+  production until clients in the wild have adopted the new
+  `mostro-core`. Phase 8 (§13.1) gives clients the
+  `bond = enabled | disabled` info-event tag so they can warn users
+  ("this node requires a bond your client doesn't support") instead
+  of silently failing takes.
+
+### 6.5.3 Tests
+
+- Bond DM enqueues with `Action::PayBondInvoice`, not `PayInvoice`.
+- Order status flips to `WaitingTakerBond` while the bond is
+  outstanding, flips out (to `WaitingPayment` or
+  `WaitingBuyerInvoice` per the existing flow) once the bond locks.
+- Seller-as-taker case: one `PayBondInvoice` followed by one
+  `PayInvoice` on the same order, both visible on the wire as
+  distinct action types — no memo parsing needed by the client.
+- With `enabled = false`, neither the new action nor the new status
+  is emitted; backward compatibility is preserved.
+
+### 6.5.4 Acceptance
+
+- The Phase 1 `Action::PayInvoice`-for-bond workaround is retired in
+  this PR's diff. After this lands, mostrod only ever emits
+  `PayInvoice` for trade hold invoices and `PayBondInvoice` for
+  bonds.
+- The §6.3 client-side memo parsing recommendation becomes
+  unnecessary; clients dispatch on action type alone.
+- Phase 2 can rely on the clean API when it ships.
 
 ---
 
@@ -973,11 +1121,12 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
 Per `CONTRIBUTING.md § Protocol / Tag Changes`, each PR introducing
 these requires a compatibility statement:
 
+- New `Action::PayBondInvoice` + `Status::WaitingTakerBond` in
+  mostro-core (Phase 1.5). Minor version bump. Retires the Phase 1
+  reuse of `Action::PayInvoice` / `Status::Pending` for bonds.
 - New `Payload::BondResolution` variant in mostro-core (Phase 2). Minor
   version bump.
-- New status `WaitingMakerBond` (Phase 5). The taker-side equivalent
-  (`WaitingTakerBond`) is deferred per the Phase 1 implementation note;
-  the current shipped code reuses `Pending`.
+- New status `WaitingMakerBond` (Phase 5).
 - New info-event tags (Phase 8).
 
 ### 14.4 Testing discipline

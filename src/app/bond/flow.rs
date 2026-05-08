@@ -12,7 +12,7 @@
 //! the situation.
 //!
 //! Protocol note: `mostro-core` 0.10.0 does not yet expose
-//! `Action::AddBondInvoice` / `Status::WaitingTakerBond`. Phase 1 takes the
+//! `Action::PayBondInvoice` / `Status::WaitingTakerBond`. Phase 1 takes the
 //! "Alternative" path documented in §6.2 of `docs/ANTI_ABUSE_BOND.md`:
 //! orders stay in `Status::Pending` while waiting for the bond, and the
 //! bond bolt11 ships to the taker as a regular `Action::PayInvoice` (the

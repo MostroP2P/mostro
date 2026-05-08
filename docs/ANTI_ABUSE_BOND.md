@@ -852,7 +852,17 @@ trade finalization must never wait on the payout.
   `src/app/bond/payout.rs` module. Receives an `Action::AddInvoice` reply
   from a bond-payout candidate (distinct from the buyer-invoice
   `add_invoice_action` — disambiguated by the presence of a bond row in
-  `PendingPayout` for the order / sender pair).
+  `PendingPayout` for the order / sender pair). On accepting a valid
+  invoice it persists `payout_invoice` and **resets
+  `invoice_request_attempts = 0`** in the same DB write, marking a
+  clean transition from the invoice-request phase to the
+  `send_payment` phase. The reset isn't load-bearing for correctness
+  (step 1's guard is `payout_invoice IS NULL`, so the counter
+  naturally stops growing once an invoice is persisted), but keeps
+  the row tidy and lets operators distinguish "nudges before
+  invoice" from "nudges after a hypothetical re-prompt" if a future
+  phase ever introduces one. Any "took N nudges to respond" logging
+  for observability should capture the value *before* the reset.
 - Audit event: new Nostr kind (reusing the dev-fee style: custom kind
   number, registered in `src/config/constants.rs`). Tags:
   `order-id`, `role` (maker/taker — which posted the bond),

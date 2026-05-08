@@ -100,7 +100,14 @@ port = 50051
 # base_amount_sats = 1000
 # # "take" | "create" | "both"
 # apply_to = "take"
-# slash_on_lost_dispute = true
+# # Note: there is no `slash_on_lost_dispute` flag — dispute slashes are
+# # solver-directed via the `BondResolution` payload (Phase 2).
 # slash_on_waiting_timeout = false
+# # Fraction of a slashed bond that the node retains (the rest goes to the
+# # winning counterparty). Funds solver compensation for dispute work.
+# slash_node_share_pct = 0.5
 # payout_invoice_window_seconds = 300
 # payout_max_retries = 5
+# # Days the winner has to claim their share by submitting a bolt11; after
+# # this the bond closes as `forfeited` and the node retains everything.
+# payout_claim_window_days = 15

@@ -53,10 +53,33 @@ CREATE TABLE IF NOT EXISTS bonds (
   -- Routing-fee ceiling actually used for the payout attempt (sats). NULL
   -- until the scheduler tries to pay the winner.
   payout_routing_fee_sats integer,
-  -- Number of payout invoice requests attempted so far.
+  -- Phase 3: portion of `amount_sats` that the node retains on slash. Frozen
+  -- at the moment the bond enters `pending-payout` so a later config change
+  -- or daemon restart cannot re-balance the split. NULL for any bond that
+  -- never reached `pending-payout`. The counterparty share is always derived
+  -- as `amount_sats - node_share_sats` so they cannot drift.
+  node_share_sats  integer,
+  -- Phase 3: counts ONLY `send_payment` retries against an invoice the
+  -- counterparty has already submitted. `payout_max_retries` is checked
+  -- against this counter alone — invoice-request DMs do NOT count here
+  -- (see `invoice_request_attempts` below).
   payout_attempts  integer not null default 0,
+  -- Phase 3: counts how many `Action::AddInvoice` DMs the scheduler has
+  -- sent asking the counterparty for a payout invoice. Bounded by the
+  -- forfeit window (`payout_claim_window_days`), not by `payout_max_retries`,
+  -- so a slow-responding counterparty cannot prematurely flip the bond to
+  -- `failed`. Reset to 0 when the invoice is finally received.
+  invoice_request_attempts integer not null default 0,
+  -- Phase 3: timestamp of the last `AddInvoice` DM. Drives the
+  -- `payout_invoice_window_seconds` cadence check ("don't re-DM before the
+  -- window has elapsed"). Persisted so a daemon restart doesn't trigger an
+  -- immediate re-DM.
+  last_invoice_request_at integer,
   locked_at        integer,
   released_at      integer,
+  -- Set on entry to `pending-payout` (i.e. when the slash decision is
+  -- made), not on the later `slashed` transition. Anchors the
+  -- `payout_claim_window_days` forfeit deadline (see Phase 3).
   slashed_at       integer,
   created_at       integer not null,
   FOREIGN KEY(order_id) REFERENCES orders(id)

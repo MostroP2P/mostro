@@ -13,8 +13,10 @@ locks a Lightning hold invoice when entering a trade. The bond is:
 - **Released** on normal completion, on any cancellation that happens before
   a waiting-state timeout elapses, and on dispute resolutions where the
   solver does not direct otherwise.
-- **Slashed** (claimed by Mostro and paid to the counterparty) under two
-  unambiguous conditions:
+- **Slashed** (claimed by Mostro and split between the node and the
+  winning counterparty per `slash_node_share_pct`; the node share funds
+  solver compensation, the remainder is paid out to the counterparty as
+  before — see §15.4) under two unambiguous conditions:
   1. **Solver directive on dispute resolution.** The solver explicitly
      instructs Mostro to slash one or both bonds via the `BondResolution`
      payload of `admin-settle` / `admin-cancel`. The slash decision is
@@ -82,10 +84,26 @@ apply_to = "take"
 # cancels never trigger this path.
 slash_on_waiting_timeout = false
 
+# Fraction of a slashed bond that the node retains. The remainder is
+# paid out to the winning counterparty as before. The node share is
+# meant to fund solver compensation for dispute work (see §15.4).
+# 0.0 = full payout to counterparty (legacy behaviour);
+# 1.0 = node keeps everything.
+slash_node_share_pct = 0.5
+
 # Bond payout retries (applies once a bond is slashed and Mostro needs
-# a payout invoice from the winning counterparty).
+# a payout invoice from the winning counterparty for its share).
 payout_invoice_window_seconds = 300
 payout_max_retries           = 5
+
+# How many days the winning counterparty has, from the moment the bond
+# is slashed, to claim their share by submitting a payout bolt11. If
+# the window elapses without an invoice ever being received, the bond
+# transitions to `Forfeited` and the node retains the counterparty
+# share too (long-stop forfeiture; see §15.4). Independent from
+# `payout_max_retries`, which only governs `send_payment` attempts
+# *once an invoice has been received*.
+payout_claim_window_days = 15
 ```
 
 Note: there is **no `slash_on_lost_dispute` flag**. Dispute slashes are
@@ -170,7 +188,11 @@ Purely additive. Touches no trade flow.
   percentage dominates, huge amount saturation.
 - Enums (new file `src/app/bond/types.rs`):
   - `BondRole { Maker, Taker }` — *posting-timing* role; see §3.1.
-  - `BondState { Requested, Locked, Released, PendingPayout, Slashed, Failed }`
+  - `BondState { Requested, Locked, Released, PendingPayout, Slashed, Forfeited, Failed }`
+    — `Forfeited` is the long-stop terminal state for a slash whose
+    counterparty never claimed their share within
+    `payout_claim_window_days` (§8.1). Distinct from `Failed`, which
+    is reserved for technical errors (e.g. `send_payment` never routes).
   - `BondSlashReason { LostDispute, Timeout }`
 - Database migration
   `migrations/<ts>_anti_abuse_bond.sql` creating:
@@ -200,9 +222,19 @@ Purely additive. Touches no trade flow.
     -- Phase 3: routing-fee ceiling actually used for the payout attempt
     -- (sats). NULL until the scheduler tries to pay the winner.
     payout_routing_fee_sats integer,
+    -- Phase 3: portion of `amount_sats` that the node retains on slash
+    -- (frozen at the moment the bond enters `PendingPayout` so a later
+    -- config change or daemon restart cannot re-balance the split).
+    -- NULL for any bond that never reached `PendingPayout`. The
+    -- counterparty share is always derived as
+    -- `amount_sats - node_share_sats` so they cannot drift.
+    node_share_sats  integer,
     payout_attempts  integer not null default 0,
     locked_at        integer,
     released_at      integer,
+    -- Set on entry to `PendingPayout` (i.e. when the slash decision is
+    -- made), not on the later `Slashed` transition. Anchors the
+    -- `payout_claim_window_days` forfeit deadline (§8.1).
     slashed_at       integer,
     created_at       integer not null,
     FOREIGN KEY(order_id) REFERENCES orders(id)
@@ -213,9 +245,9 @@ Purely additive. Touches no trade flow.
   ```
 
   The Phase 0 migration lands the full column set up-front (parent/child
-  range columns, `slashed_share_sats`, `payout_routing_fee_sats`) rather
-  than staging ALTER TABLEs per phase. Later phases only add code, not
-  schema.
+  range columns, `slashed_share_sats`, `payout_routing_fee_sats`,
+  `node_share_sats`) rather than staging ALTER TABLEs per phase. Later
+  phases only add code, not schema.
 
   Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
 - `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
@@ -420,9 +452,11 @@ or a legacy admin client):
    `apply_to`.
 4. On a valid payload: perform the trade resolution (settle or cancel)
    first, then for each bond marked for slash transition
-   `state = PendingPayout, slashed_reason = LostDispute`. Bonds not
-   marked for slash are cancelled (`cancel_hold_invoice`) and marked
-   `Released` immediately.
+   `state = PendingPayout, slashed_reason = LostDispute, slashed_at = now`,
+   and persist the split per §8.1 (compute `node_share_sats` from the
+   current `slash_node_share_pct` and write it in the same DB update).
+   Bonds not marked for slash are cancelled (`cancel_hold_invoice`) and
+   marked `Released` immediately.
 
 The actual Lightning payout to the counterparty is asynchronous and
 handled by Phase 3.
@@ -466,27 +500,78 @@ trade finalization must never wait on the payout.
 
 ### 8.1 Scope
 
+- Split computation, applied **once** at the moment a bond transitions
+  to `PendingPayout` (`admin_settle_action` / `admin_cancel_action`
+  in Phase 2; `job_cancel_orders` in Phase 4 / 7). The value is
+  written to the `node_share_sats` column (declared in Phase 0's
+  schema, NULL until first use) in the same DB write that flips the
+  state, so it is genuinely frozen across daemon restarts and
+  subsequent config changes:
+  ```text
+  node_share_sats          = floor(amount_sats * slash_node_share_pct)
+  counterparty_share_sats  = amount_sats - node_share_sats
+  ```
+  Floor + subtraction guarantees the two shares sum exactly to
+  `amount_sats` (no rounding leaks). `counterparty_share_sats` is
+  never persisted — it is always derived as
+  `amount_sats - node_share_sats` so the two cannot drift.
+
 - New scheduler job `job_process_bond_payouts` in `src/scheduler.rs`,
   mirroring `job_process_dev_fee_payment`:
   - Polls `PendingPayout` bonds at a fixed interval (default 60s).
-  - For each:
+  - Reads `node_share_sats` from the row (never re-reads
+    `slash_node_share_pct` from config — that lookup happens only at
+    the slash transition above).
+  - For each, **first check the forfeit window**:
+    - If `now - slashed_at >= payout_claim_window_days * 86400` and
+      `payout_invoice IS NULL` (the counterparty never submitted a
+      bolt11): `settle_hold_invoice(preimage)`, transition the bond
+      to `state = Forfeited`, publish the audit event with
+      `outcome = forfeited`, and stop. The node retains the full
+      `amount_sats`. No further DMs or `send_payment` runs.
+    - Otherwise, proceed with the normal payout steps below.
+  - Normal payout steps:
     1. If no `payout_invoice` yet, and either no outstanding DM to the
        winning counterparty or the window has elapsed: enqueue an
        `Action::AddInvoice` DM to the counterparty (the buyer when
        `slash_seller`, the seller when `slash_buyer`) asking for a
-       bolt11 for `amount_sats - estimated_routing_fee`. Increment
-       `payout_attempts`.
+       bolt11 for `counterparty_share_sats - estimated_routing_fee`.
+       The DM **must include the forfeit deadline** (e.g. "claim by
+       <ISO timestamp> or your share will be forfeited") so the user
+       knows the clock is running. Increment `payout_attempts`. The
+       node share never leaves Mostro's wallet, so it has no separate
+       invoice step.
     2. If an invoice was received (see handler below), **estimate the
        routing fee** via `LndConnector::query_routes(dest, amount)`
        (thin wrapper over LND `router::query_routes`); fall back to
        `amount * max_routing_fee` if the RPC fails.
     3. `settle_hold_invoice(preimage)` on the bond hash to claim the
-       forfeited sats into Mostro's wallet.
+       forfeited sats into Mostro's wallet. After this call,
+       `node_share_sats` is implicitly retained (it just stays in
+       Mostro's wallet).
     4. `send_payment` to the counterparty invoice with capped fee.
-    5. On success → `state = Slashed`, `slashed_at = now`, publish audit
-       event.
-    6. On failure → bump `payout_attempts`; once `payout_max_retries`
-       reached, transition to `Failed` and leave a tracing error.
+       Only `counterparty_share_sats - routing_fee` leaves Mostro.
+    5. On success → `state = Slashed`, publish audit event with
+       `outcome = paid`. (`slashed_at` is **not** touched here — it
+       was set at the `PendingPayout` transition; see Phase 2 §7.3.)
+    6. On `send_payment` failure → bump `payout_attempts`; once
+       `payout_max_retries` reached, transition to `Failed` and leave
+       a tracing error. `Failed` is reserved for *technical* failure
+       (we have an invoice but can't route to it) and is distinct
+       from `Forfeited` (the user never gave us an invoice).
+
+  When `slash_node_share_pct = 1.0` the counterparty leg is skipped
+  entirely (no `AddInvoice` DM, no `send_payment`, no forfeit window
+  to wait for); the bond goes straight from `PendingPayout` → settle →
+  `Slashed` after step 3.
+
+- Late-invoice race: the `add_bond_invoice_action` handler (below)
+  must check the bond is still in `PendingPayout` before persisting
+  the `payout_invoice`. If the scheduler already transitioned the
+  row to `Forfeited`, the late invoice is rejected with a localised
+  message ("the claim window expired on <date>"). This is a clean
+  per-row decision, no locks needed — the state column is the
+  arbiter.
 - New action handler `add_bond_invoice_action` in a new
   `src/app/bond/payout.rs` module. Receives an `Action::AddInvoice` reply
   from a bond-payout candidate (distinct from the buyer-invoice
@@ -496,7 +581,17 @@ trade finalization must never wait on the payout.
   number, registered in `src/config/constants.rs`). Tags:
   `order-id`, `role` (maker/taker — which posted the bond),
   `reason` (`lost-dispute` | `timeout`),
-  `amount`, `hash` (bond payout hash, **not** the trade payment hash),
+  `outcome` (`paid` | `forfeited`) — `paid` means the counterparty
+  received their share; `forfeited` means the claim window expired
+  and the node retained `amount_sats` in full. (`Failed` does **not**
+  emit an audit event — it is an operator-attention state, not a
+  normal outcome.)
+  `amount` (total slashed sats, == `node_share + counterparty_share`),
+  `node-share`, `counterparty-share` (the originally-decided split,
+  in sats; on `outcome = forfeited` the node's actual retention is
+  `amount`, but the original split is preserved here for audit so
+  observers can reconstruct what *would* have been paid),
+  `hash` (bond payout hash, **not** the trade payment hash),
   `y`, `z = bond-slash`. No counterparty pubkeys, consistent with
   dev-fee audit privacy. Expiration uses `ExpirationSettings` with a new
   optional `bond_slash_days` field.
@@ -508,24 +603,66 @@ trade finalization must never wait on the payout.
 - **`settle` must succeed before `send_payment`.** If settle fails we
   leave the bond in `PendingPayout` and retry on the next tick; the
   bonded party's HTLC stays held, which is the correct safety posture.
-- **Partial success: settle OK, send_payment failed.** The bond state
-  moves to `PendingPayout` with a best-effort retry. The winner is kept
-  informed via periodic DMs. If retries exhaust, state becomes `Failed`;
-  at that point Mostro keeps the sats (unavoidable with the HTLC
-  settled) and logs loudly. This is a known limitation to be addressed
-  only if it shows up in practice; node operators can manually pay the
-  winner from logs.
+- **Node share is retained unconditionally on settle.** Once
+  `settle_hold_invoice` succeeds, `node_share_sats` is in Mostro's
+  wallet and the node leg is done. The only thing the retry loop is
+  driving from that point on is the counterparty payout.
+- **Partial success: settle OK, counterparty `send_payment` failed.**
+  The bond state stays in `PendingPayout` with a best-effort retry. The
+  winner is kept informed via periodic DMs. If retries exhaust, state
+  becomes `Failed`; at that point Mostro is holding the counterparty
+  share (unavoidable with the HTLC already settled) and logs loudly.
+  The node share is unaffected — it was always going to stay. This is
+  a known limitation; node operators can manually pay the winner from
+  logs.
+- **Counterparty never claims (forfeit path).** Distinct from
+  `Failed`: there is no `payout_invoice` because the counterparty
+  never sent one. After `payout_claim_window_days` from `slashed_at`,
+  the scheduler settles the HTLC and transitions to `Forfeited`. No
+  manual operator action is needed — this is a normal terminal
+  state, designed-in. Default 15 days gives even users with sporadic
+  Nostr presence ample time to see the DM and respond.
 - **Non-blocking:** `release_action`, `admin_settle_action`, etc. return
   success the moment the trade escrow resolves. Bond payout happens
   later.
 
 ### 8.3 Acceptance
 
-- End-to-end test: dispute resolved with `slash_buyer=true` → buyer-side
-  counterparty (the seller) gets a DM → submits bolt11 → bond payout
-  settles → Nostr audit event published.
-- Retry test: counterparty never answers → scheduler keeps retrying up
-  to `payout_max_retries`, then `Failed`.
+- End-to-end test: dispute resolved with `slash_buyer=true` and
+  `slash_node_share_pct = 0.5` → buyer-side counterparty (the seller)
+  is asked for a bolt11 sized at `floor(amount/2) − routing_fee`,
+  submits it → bond payout settles → Nostr audit event publishes
+  matching `amount`, `node-share`, `counterparty-share` tags
+  (split sums exactly to `amount`, no rounding leak).
+- Edge case `slash_node_share_pct = 0.0` → behaviour identical to the
+  pre-split design (full counterparty payout).
+- Edge case `slash_node_share_pct = 1.0` → settle the HTLC, no
+  `AddInvoice` DM is enqueued, no `send_payment` runs, bond goes
+  straight to `Slashed`.
+- **Persistence test**: a bond enters `PendingPayout` under
+  `slash_node_share_pct = 0.5`; before payout completes, simulate a
+  daemon restart with `slash_node_share_pct = 0.9` in the new
+  config; payout still uses the original 0.5 split (read from
+  `node_share_sats`). Same shape: change config back and forth
+  during `PendingPayout` ticks → split is unaffected.
+- **Forfeit window test**: bond enters `PendingPayout`, counterparty
+  never replies; advance the test clock by
+  `payout_claim_window_days + 1`; on the next scheduler tick the bond
+  settles and transitions to `Forfeited`; audit event publishes with
+  `outcome = forfeited`. Node retains `amount_sats` in full. No
+  `send_payment` was ever attempted.
+- **Late-invoice rejection**: bond is `Forfeited`; counterparty
+  submits a bolt11 after the deadline; `add_bond_invoice_action`
+  rejects it with a "claim window expired" message; bond stays
+  `Forfeited`.
+- **`Failed` vs. `Forfeited` distinction**: counterparty submits a
+  valid invoice on day 1 but it never routes; after
+  `payout_max_retries` the bond goes to `Failed` (not `Forfeited`,
+  even though the 15-day window is still open). `Failed` requires
+  operator attention; `Forfeited` does not.
+- Retry test: counterparty submits an invoice that never routes →
+  scheduler keeps retrying up to `payout_max_retries`, then `Failed`.
+  Node share already retained; only the counterparty share is stuck.
 
 ---
 
@@ -694,15 +831,18 @@ it. The workable strategies:
    cancellation):
    - If `slashed_share_sats == 0` → `cancel_hold_invoice(parent)` and
      release.
-   - If `slashed_share_sats == parent_bond_amount` → `settle` and payout
-     the accumulated winnings (multiple counterparties supported by
-     keeping child rows with their own `payout_invoice`).
+   - If `slashed_share_sats == parent_bond_amount` → `settle`, retain
+     `node_share_pct` of every accumulated child slash in Mostro's
+     wallet and pay out the counterparty share to each child's winner
+     (multiple counterparties supported by keeping child rows with
+     their own `payout_invoice`).
    - If partial → there is no way to claim exactly the slashed sats from
      a single HTLC; we must choose between:
-     - **(a)** Claim the whole bond, pay out the slashed share to
-       counterparties, and refund the unslashed share back to the
-       maker via `add-invoice` (maker becomes a counterparty here).
-       Reuses Phase 3 plumbing.
+     - **(a)** Claim the whole bond, pay out the per-child counterparty
+       shares (each `floor(child_slash * (1 - node_share_pct))`), retain
+       the per-child node shares, and refund the unslashed share
+       back to the maker via `add-invoice` (maker becomes a
+       counterparty here). Reuses Phase 3 plumbing.
      - **(b)** Never lock a parent bond; require a per-child bond at
        take time. Simpler to reason about but breaks the issue's
        requirement that the maker bond exists **before** the order is
@@ -710,6 +850,13 @@ it. The workable strategies:
 
 We recommend **(a)**. Acceptable cost: maker sees one extra `add-invoice`
 DM at range-close if there were partial slashes.
+
+The split is applied **per child** (each child's `slashed_share_sats`
+is split independently), so the audit event for each child carries its
+own `node-share` and `counterparty-share` tags and the maker refund is
+exactly `parent_bond_amount - sum_of_child_slashes` — the node share
+of slashed children stays in Mostro's wallet, never gets refunded to
+the maker.
 
 2. **Fallback on HTLC expiry.** If the range order is still active when
    the hold invoice CLTV is about to expire, the scheduler must settle
@@ -771,6 +918,12 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
   - `bond-apply-to` (`take` | `create` | `both`)
   - `bond-slash-timeout` (`true` | `false`)
   - `bond-amount-pct` / `bond-amount-floor`
+  - `bond-slash-node-share-pct` (the operator's `slash_node_share_pct`,
+    so users know up-front how a slashed bond is split between the node
+    and the winning counterparty).
+  - `bond-payout-claim-window-days` (the operator's
+    `payout_claim_window_days`, so users know how long they have to
+    submit a payout invoice before forfeiting their share).
   - **No `bond-slash-dispute` tag**: dispute slashes are solver-driven
     per resolution, not a node-policy switch.
 - Update `docs/admin_settle_order.html` and `admin_cancel_order.html`
@@ -907,6 +1060,61 @@ the action that the waiting-state names. There is no investigation
 step. The §9.2 table produces the slash decision automatically and
 correctly without solver involvement, so `slash_on_waiting_timeout`
 remains a node-policy boolean.
+
+### 15.4 Why slashes are split between node and counterparty
+
+A pure "winner-takes-all" payout (the original §1 design — 100% to the
+counterparty) doesn't fund the work that produced the slash decision
+in the first place. Solvers spend real time reading evidence on a
+dispute path; node operators carry hosting and Lightning liquidity
+costs on the timeout path. If neither is funded, both roles are
+volunteer-only, which doesn't scale.
+
+The split solves this without introducing a new payment rail: the
+slash already routes through Mostro's wallet (the HTLC must be settled
+before any payout can happen — §8.1 step 3), so retaining a fraction
+is free. `slash_node_share_pct` is the knob that decides what fraction
+that is. Defaults to **0.5** as a reasonable starting point — half to
+the wronged counterparty (preserves the deterrent: the cheater still
+funds their victim), half to the node (funds solver compensation and
+operations). Operators are free to set it elsewhere:
+
+- `0.0` — legacy "winner takes all" behaviour. Choose this if solver
+  compensation is handled out of band (e.g. a separate fee, donations,
+  or volunteer solvers).
+- `1.0` — node retains the entire slash. Only sensible when the bond
+  is intended purely as a sybil/abuse cost and the operator does not
+  want any redistributive component.
+- `0.5` — recommended default; balances victim restitution against
+  funding the dispute-handling work the bond exists to motivate.
+
+The split being **public** (exposed in the Mostro info event per §13.1)
+is important: a user must be able to see the policy before they
+choose to lock a bond on a given node. A node that quietly raises
+`slash_node_share_pct` after the fact would be visible to clients on
+the next info refresh.
+
+This change does not weaken the deterrent. The cheater still loses
+the full bond; only the destination of the sats changes. From the
+slashed party's perspective the cost is identical at any value of
+`slash_node_share_pct`, which is what makes the bond function as a
+disincentive in the first place (§2 principle 5: the threat must be
+unambiguous to the *bonded* party; how Mostro then divides the
+forfeited sats is an internal accounting decision).
+
+The forfeit window (`payout_claim_window_days`, default 15) is the
+long-stop tail of the same logic. If the wronged counterparty never
+submits a payout invoice — because they lost their key, gave up on
+the platform, or simply forgot — the sats cannot sit in
+`PendingPayout` forever (the HTLC has a CLTV, and the node has a
+real liability tracking unclaimed funds). After the window expires
+the node retains the counterparty share too; the bond closes as
+`Forfeited`. This keeps the on-chain accounting deterministic and
+removes the "Mostro mysteriously holds X sats" failure mode without
+manual intervention. From the cheater's side the deterrent is again
+unaffected — they lost their bond either way. From the wronged
+counterparty's side the message is clear (and surfaced in the info
+event per §13.1): claim within N days or forfeit.
 
 ---
 

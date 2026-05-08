@@ -247,7 +247,24 @@ Purely additive. Touches no trade flow.
     -- counterparty share is always derived as
     -- `amount_sats - node_share_sats` so they cannot drift.
     node_share_sats  integer,
+    -- Phase 3: counts ONLY `send_payment` retries against an invoice
+    -- the counterparty has already submitted. Bumped only by step 6
+    -- of the §8.1 scheduler loop. `payout_max_retries` is checked
+    -- against this counter alone — invoice-request DMs do NOT count
+    -- here (see `invoice_request_attempts` below).
     payout_attempts  integer not null default 0,
+    -- Phase 3: counts how many `Action::AddInvoice` DMs the scheduler
+    -- has sent asking the counterparty for a payout invoice. Bumped
+    -- by step 1 of §8.1. Bounded by the forfeit window
+    -- (`payout_claim_window_days`), not by `payout_max_retries`, so
+    -- a slow-responding counterparty cannot prematurely flip the
+    -- bond to `Failed`.
+    invoice_request_attempts integer not null default 0,
+    -- Phase 3: timestamp of the last `AddInvoice` DM. Drives the
+    -- `payout_invoice_window_seconds` cadence check ("don't re-DM
+    -- before the window has elapsed"). Persisted so a daemon restart
+    -- doesn't trigger an immediate re-DM.
+    last_invoice_request_at integer,
     locked_at        integer,
     released_at      integer,
     -- Set on entry to `PendingPayout` (i.e. when the slash decision is
@@ -264,8 +281,9 @@ Purely additive. Touches no trade flow.
 
   The Phase 0 migration lands the full column set up-front (parent/child
   range columns, `slashed_share_sats`, `payout_routing_fee_sats`,
-  `node_share_sats`) rather than staging ALTER TABLEs per phase. Later
-  phases only add code, not schema.
+  `node_share_sats`, `invoice_request_attempts`,
+  `last_invoice_request_at`) rather than staging ALTER TABLEs per
+  phase. Later phases only add code, not schema.
 
   Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
 - `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
@@ -753,15 +771,23 @@ trade finalization must never wait on the payout.
       `amount_sats`. No further DMs or `send_payment` runs.
     - Otherwise, proceed with the normal payout steps below.
   - Normal payout steps:
-    1. If no `payout_invoice` yet, and either no outstanding DM to the
-       winning counterparty or the window has elapsed: enqueue an
-       `Action::AddInvoice` DM to the counterparty (the buyer when
-       `slash_seller`, the seller when `slash_buyer`) asking for a
-       bolt11 for `counterparty_share_sats - estimated_routing_fee`.
-       The DM **must include the forfeit deadline** (e.g. "claim by
-       <ISO timestamp> or your share will be forfeited") so the user
-       knows the clock is running. Increment `payout_attempts`. The
-       node share never leaves Mostro's wallet, so it has no separate
+    1. If no `payout_invoice` yet, and the cadence window has elapsed
+       (i.e. `last_invoice_request_at IS NULL` or
+       `now - last_invoice_request_at >= payout_invoice_window_seconds`):
+       enqueue an `Action::AddInvoice` DM to the recipient (see
+       "Recipient resolution" below) asking for a bolt11 for
+       `counterparty_share_sats - estimated_routing_fee`. The DM
+       **must include the forfeit deadline** (e.g. "claim by <ISO
+       timestamp> or your share will be forfeited") so the user knows
+       the clock is running. Bump `invoice_request_attempts` and set
+       `last_invoice_request_at = now`. **Do not touch
+       `payout_attempts`** — that counter only governs `send_payment`
+       retries (step 6); mixing the two would let a slow-responding
+       counterparty exhaust `payout_max_retries` on invoice-request
+       DMs alone and prematurely flip the bond to `Failed`. Bounding
+       invoice requests is the forfeit window's job
+       (`payout_claim_window_days`), not the retry budget's. The node
+       share never leaves Mostro's wallet, so it has no separate
        invoice step.
     2. If an invoice was received (see handler below), **estimate the
        routing fee** via `LndConnector::query_routes(dest, amount)`
@@ -776,16 +802,44 @@ trade finalization must never wait on the payout.
     5. On success → `state = Slashed`, publish audit event with
        `outcome = paid`. (`slashed_at` is **not** touched here — it
        was set at the `PendingPayout` transition; see Phase 2 §7.3.)
-    6. On `send_payment` failure → bump `payout_attempts`; once
-       `payout_max_retries` reached, transition to `Failed` and leave
-       a tracing error. `Failed` is reserved for *technical* failure
-       (we have an invoice but can't route to it) and is distinct
-       from `Forfeited` (the user never gave us an invoice).
+    6. On `send_payment` failure → bump `payout_attempts` (this is
+       the *only* place that increments it); once `payout_max_retries`
+       reached, transition to `Failed` and leave a tracing error.
+       `Failed` is reserved for *technical* failure (we have an
+       invoice but can't route to it) and is distinct from
+       `Forfeited` (the user never gave us an invoice).
 
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
   entirely (no `AddInvoice` DM, no `send_payment`, no forfeit window
   to wait for); the bond goes straight from `PendingPayout` → settle →
   `Slashed` after step 3.
+
+- **Recipient resolution.** Step 1 above sends `Action::AddInvoice` to
+  the *non-slashed counterparty* of the trade — the party who is
+  neither the bonded user (`bond.pubkey`) nor a co-slashed party.
+  Because `BondResolution` flags are dispute-only and `bond.pubkey`
+  is not enough on its own to recover the trade-flow side
+  (buyer/seller), the rule is keyed on `slashed_reason`:
+  - **`LostDispute` (Phase 2 / 5).** The solver's `BondResolution`
+    flag named the side: `slash_seller=true` → seller's bond is in
+    `PendingPayout`, recipient = buyer; `slash_buyer=true` →
+    recipient = seller. Mapping buyer/seller → maker/taker → concrete
+    pubkey uses the §3.1 order-kind table.
+  - **`Timeout` (Phase 4 / 7).** No `BondResolution` payload exists.
+    The slashed party is the one responsible for the elapsed waiting
+    state per the §9.2 table: `WaitingBuyerInvoice` → buyer was
+    responsible (and was slashed), recipient = seller;
+    `WaitingPayment` → seller was responsible, recipient = buyer.
+    Mapping uses the same §3.1 table.
+  - **Both bonds slashed in a single dispute (Phase 5+ only).** When
+    the solver's `BondResolution` sets both flags and both maker and
+    taker have active bonds, neither party deserves restitution
+    (§15.2 — "both behaved badly"). For each row, treat as
+    `slash_node_share_pct = 1.0` for that payout: skip the
+    `AddInvoice` DM, retain `amount_sats` in full, settle the HTLC
+    in step 3, transition to `Slashed` with the audit event tagged
+    accordingly. (Phase 5+ wires this; Phase 2's taker-only world
+    cannot reach this branch.)
 
 - Late-invoice race: the `add_bond_invoice_action` handler (below)
   must check the bond is still in `PendingPayout` before persisting
@@ -936,7 +990,11 @@ adding maker bond rows to the lookup.
   elapses on an order in `WaitingBuyerInvoice` / `WaitingPayment`, run
   the §9.2 lookup. If a bond exists for the responsible party, set
   `state = PendingPayout, slashed_reason = Timeout` (Phase 3 picks it
-  up). Continue the existing cancel-escrow + republish work.
+  up). Continue the existing cancel-escrow + republish work. The
+  payout recipient is then resolved by Phase 3 per the "Recipient
+  resolution" rule in §8.1: `slashed_reason = Timeout` plus the §9.2
+  responsibility entry uniquely names the non-slashed counterparty
+  (`WaitingBuyerInvoice` → seller; `WaitingPayment` → buyer).
 - Localised message to the slashed user explaining forfeiture.
 - Tests:
   - "Cancel at minute 5 of a 15-minute timeout" → bond released, no

@@ -516,6 +516,32 @@ never has to lean on memo parsing in the wild.
     `supersede_prior_taker_bonds` continues to gate "is anyone
     already locked?" the same way it does today, independent of the
     order status column.
+  - `cancel_action` must treat `WaitingTakerBond` as an alias of
+    `Pending` for routing decisions. The bond is outstanding but the
+    trade flow has **not** started, so the cooperative-cancel logic
+    used for `WaitingPayment` / `WaitingBuyerInvoice` does NOT apply.
+    Concretely, `cancel_action_generic` in `src/app/cancel.rs`
+    today opens with `if order.check_status(Status::Pending).is_ok()
+    { … }`; that guard widens to `if status ∈ { Pending,
+    WaitingTakerBond }`. Inside the branch the existing two-route
+    logic stays:
+    - **Maker self-cancel.** `cancel_pending_order_from_maker` runs
+      and the order publishes as `Status::Canceled`. Any active
+      bond row on the order (the prospective taker's bond, still in
+      `Requested`) is released as part of this — the release hook
+      is already wired into the maker-cancel path in Phase 1; only
+      the status guard needs to widen.
+    - **Taker self-cancel.** `cancel_order_by_taker` releases the
+      taker's bond, clears the taker fields, and re-publishes the
+      order. External observers see no change in NIP-33 status (it
+      was `pending` throughout per §2 principle 8); the prospective
+      taker is gone and someone else may take.
+    Without this widening the daemon falls through to the default
+    `_ => NotAllowedByStatus` arm and rejects every cancel during
+    the bond window — a regression vs. Phase 1, where the same
+    flows work because the order is still in `Pending`. Tests for
+    both routes must land alongside the status-guard widening so
+    this stays locked down.
   - On bond `Locked`, transition `WaitingTakerBond` →
     `WaitingPayment` / `WaitingBuyerInvoice` as the existing trade
     flow does (and republish NIP-33 with the real new status — at
@@ -569,6 +595,27 @@ never has to lean on memo parsing in the wild.
 - Seller-as-taker case: one `PayBondInvoice` followed by one
   `PayInvoice` on the same order, both visible on the wire as
   distinct action types — no memo parsing needed by the client.
+- **Cancel during `WaitingTakerBond` — taker self-cancel.** With the
+  order in `WaitingTakerBond` and the prospective taker's bond in
+  `Requested`, the taker sends a `cancel` action. The daemon
+  releases the bond, clears the taker fields, transitions the
+  order back to `Pending`, and republishes — `cancel_action`
+  returns `Ok(())` (not `NotAllowedByStatus`). The published
+  NIP-33 status was `pending` throughout, so external observers
+  see no transition; the order remains takeable.
+- **Cancel during `WaitingTakerBond` — maker self-cancel.** With the
+  order in `WaitingTakerBond` (a prospective taker is mid-bond),
+  the maker sends a `cancel` action. The daemon runs
+  `cancel_pending_order_from_maker`: the order transitions to
+  `Status::Canceled`, the prospective taker's `Requested` bond is
+  released, and the NIP-33 event republishes with
+  `s = canceled`. Confirms maker-side cancel is not blocked by a
+  pending bond.
+- **Cancel during `WaitingTakerBond` — third-party rejected.** A
+  pubkey that is neither the maker nor a bonded taker on the
+  order receives `IsNotYourOrder`. Same rejection semantics as the
+  existing `Pending` branch; widening the status guard must not
+  weaken the authorisation check.
 - With `enabled = false`, neither the new action nor the new status
   is emitted; backward compatibility is preserved.
 

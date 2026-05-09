@@ -679,7 +679,12 @@ async fn get_ratings_for_pending_order(
     order_updated: &Order,
     status: Status,
 ) -> Result<Option<(f64, i64, i64)>, MostroError> {
-    if status == Status::Pending {
+    // `WaitingTakerBond` is the daemon-internal "matched, awaiting
+    // bond" state, but on the wire it publishes as NIP-69 `pending`
+    // (non-blockability invariant). Attach the rating tag the same
+    // way as for `Pending` so a re-take during the bond window has
+    // the same reputation context.
+    if status == Status::Pending || status == Status::WaitingTakerBond {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
                 .get_master_seller_pubkey()

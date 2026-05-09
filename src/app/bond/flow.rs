@@ -1,27 +1,32 @@
-//! Bond lifecycle wiring (Phase 1).
+//! Bond lifecycle wiring (Phase 1 + Phase 1.5).
 //!
-//! Phase 1 adds a single guarantee: when the feature is enabled and the
-//! taker side is in scope (`apply_to ∈ {take, both}`), a taker is asked to
-//! lock a Lightning hold invoice as a bond before the trade flow starts;
-//! and on **every** exit — happy path, unilateral cancel, cooperative
-//! cancel, admin action, scheduler timeout — the bond is **released**.
+//! Phase 1 added a single guarantee: when the feature is enabled and the
+//! taker side is in scope (`apply_to ∈ {take, both}`), a taker is asked
+//! to lock a Lightning hold invoice as a bond before the trade flow
+//! starts; and on **every** exit — happy path, unilateral cancel,
+//! cooperative cancel, admin action, scheduler timeout — the bond is
+//! **released**.
 //!
-//! Slashing is intentionally absent: it lands in Phase 2+. This means
-//! operators can flip `enabled = true` in staging and exercise hold-invoice
-//! custody end-to-end without any user funds at risk if Mostro mis-judges
-//! the situation.
+//! Slashing is intentionally absent: it lands in Phase 2+. Operators can
+//! flip `enabled = true` and exercise hold-invoice custody end-to-end
+//! without any user funds at risk if Mostro mis-judges the situation.
 //!
-//! Protocol note: `mostro-core` 0.10.0 does not yet expose
-//! `Action::PayBondInvoice` / `Status::WaitingTakerBond`. Phase 1 takes the
-//! "Alternative" path documented in §6.2 of `docs/ANTI_ABUSE_BOND.md`:
-//! orders stay in `Status::Pending` while waiting for the bond, and the
-//! bond bolt11 ships to the taker as a regular `Action::PayInvoice` (the
-//! semantics — "pay this Lightning invoice" — are an exact match). Bond
-//! state lives entirely in the `bonds` table; clients identify the
-//! invoice as a bond by its hash, which differs from the trade hold
-//! invoice that follows once the bond is locked. The dedicated action /
-//! status will land alongside the corresponding `mostro-core` release in a
-//! later phase.
+//! Phase 1.5 retired Phase 1's "alternative path" (which reused
+//! `Action::PayInvoice` and kept the order in `Status::Pending`). The
+//! bond bolt11 now ships as the dedicated `Action::PayBondInvoice` and
+//! the order's status flips to `Status::WaitingTakerBond` while the
+//! bond is outstanding. Both variants are introduced in `mostro-core`
+//! 0.11.0; clients route bond invoices by action type instead of memo
+//! parsing.
+//!
+//! Non-blockability invariant (`docs/ANTI_ABUSE_BOND.md` §2 principle 8):
+//! the order's NIP-33 published status remains `pending` while internal
+//! status is `WaitingTakerBond`. The mapping lives in
+//! `nip33::create_status_tags`. Other potential takers continue to see
+//! the order as available; whichever bond locks first wins, and
+//! `supersede_prior_taker_bonds` below releases stale `Requested`
+//! bonds so a malicious or absent taker cannot park the order
+//! off-market.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -101,15 +106,15 @@ pub async fn request_taker_bond(
         bond.id, order.id, bond.role, bond.amount_sats
     );
 
-    // Phase-1 alternative path (see module-level doc): the bond bolt11
-    // ships as a regular `PayInvoice`. The `SmallOrder` echoes the order
-    // id so a bond-aware client can correlate — and a non-bond-aware
-    // client just sees an extra invoice to pay before the trade.
+    // The `SmallOrder` echo lets the client correlate this bond DM to
+    // the order. Status carries `WaitingTakerBond` so a bond-aware
+    // client can render the bond-payment phase distinctly from the
+    // trade hold invoice that may follow.
     let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
     let bond_small = SmallOrder::new(
         Some(order.id),
         Some(order_kind),
-        Some(Status::Pending),
+        Some(Status::WaitingTakerBond),
         amount,
         order.fiat_code.clone(),
         order.min_amount,
@@ -149,7 +154,7 @@ pub async fn request_taker_bond(
     enqueue_order_msg(
         request_id,
         Some(order.id),
-        Action::PayInvoice,
+        Action::PayBondInvoice,
         Some(Payload::PaymentRequest(
             Some(bond_small),
             invoice_resp.payment_request,
@@ -570,10 +575,15 @@ async fn on_bond_invoice_accepted(
         })?;
 
     // Defense-in-depth: only drive the take forward when the order is
-    // still in the pre-trade state we left it in. If it's already moved
-    // on (resume succeeded on a previous firing) or been canceled by a
-    // maker / admin / scheduler path, do not re-trigger the take.
-    if order.status != Status::Pending.to_string() {
+    // still in the pre-trade state we left it in. Both `Pending` and
+    // `WaitingTakerBond` are pre-trade (after Phase 1.5 the take
+    // handlers flip to `WaitingTakerBond`; resume transitions out of
+    // either back into the trade flow). If the order has moved on
+    // (resume already succeeded on a previous firing) or been canceled
+    // by a maker / admin / scheduler path, do not re-trigger the take.
+    if order.status != Status::Pending.to_string()
+        && order.status != Status::WaitingTakerBond.to_string()
+    {
         info!(
             "Bond {} accepted but order {} is in status {} — skipping resume",
             current.id, order.id, order.status
@@ -588,11 +598,12 @@ async fn on_bond_invoice_accepted(
 /// Subscriber callback for `InvoiceState::Canceled`: bond never locked
 /// (taker abandoned the invoice, or LND auto-canceled on expiration).
 ///
-/// Phase 1 keeps the order untouched: it stays `Pending` with the taker
-/// fields populated. The maker's order remains discoverable via the
-/// existing Nostr event. A follow-up phase (or operator action) can
-/// reset the order if needed; for Phase 1, "always release" is the only
-/// guarantee we owe.
+/// Marks the bond as `Released`. If this was the only active bond on
+/// the order and the order is still in `WaitingTakerBond`, transition
+/// it back to `Pending` and republish so the daemon's internal view
+/// matches reality. Taker fields (`seller_pubkey` / `buyer_invoice`)
+/// are deliberately left stale: a new take overwrites them, and
+/// "always release" is the only guarantee we owe on this path.
 async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(), MostroError> {
     let bond = match find_bond_by_hash(pool, hash).await? {
         Some(b) => b,
@@ -618,6 +629,62 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
         "Bond {} marked Released after LND cancel (order {})",
         bond.id, bond.order_id
     );
+
+    // Phase 1.5 cleanup: if the order is in `WaitingTakerBond` and no
+    // other active bond remains (i.e. this was a lone taker who
+    // abandoned, not a supersede where a new bond is already in
+    // flight), flip back to `Pending`. Otherwise leave the order
+    // alone — `Canceled` (maker self-cancel ran), an active new bond
+    // (supersede), or any post-trade-flow status all mean someone
+    // else owns the order's status now.
+    let order_id = bond.order_id;
+    let bond_id = bond.id;
+    let order = match Order::by_id(pool, order_id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            warn!(
+                bond_id = %bond_id,
+                order_id = %order_id,
+                "could not load order to reset status after bond cancel: {}", e
+            );
+            return Ok(());
+        }
+    };
+    if order.status != Status::WaitingTakerBond.to_string() {
+        return Ok(());
+    }
+    let active = find_active_bonds_for_order(pool, order_id)
+        .await
+        .unwrap_or_default();
+    if !active.is_empty() {
+        return Ok(());
+    }
+
+    let my_keys = match get_keys() {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(
+                order_id = %order_id,
+                "could not load Mostro keys to republish after bond cancel: {}", e
+            );
+            return Ok(());
+        }
+    };
+    match crate::util::update_order_event(&my_keys, Status::Pending, &order).await {
+        Ok(order_updated) => {
+            if let Err(e) = order_updated.update(pool).await {
+                warn!(
+                    order_id = %order_id,
+                    "failed to persist Pending status after bond cancel: {}", e
+                );
+            }
+        }
+        Err(e) => warn!(
+            order_id = %order_id,
+            "failed to republish Pending status after bond cancel: {}", e
+        ),
+    }
     Ok(())
 }
 

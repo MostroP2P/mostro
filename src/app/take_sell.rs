@@ -56,9 +56,16 @@ pub async fn take_sell_action(
     if let Err(cause) = order.is_sell_order() {
         return Err(MostroCantDo(cause));
     };
-    // Check if the order status is pending
-    if let Err(cause) = order.check_status(Status::Pending) {
-        return Err(MostroCantDo(cause));
+    // Check if the order status is pre-trade. After Phase 1.5,
+    // `WaitingTakerBond` is the daemon-internal "matched, awaiting
+    // bond" state; it remains takeable on the wire (NIP-69 `pending`)
+    // per the non-blockability invariant, and `supersede_prior_taker_bonds`
+    // below rejects only when a prior bond is already `Locked`. Both
+    // statuses are pre-trade; either is a valid entry point for take.
+    if order.check_status(Status::Pending).is_err()
+        && order.check_status(Status::WaitingTakerBond).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Validate that the order was sent from the correct maker
@@ -141,12 +148,13 @@ pub async fn take_sell_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Anti-abuse bond (Phase 1): when enabled for the taker side, defer
-    // the trade hold-invoice / `WaitingBuyerInvoice` step. We persist the
-    // populated order (status stays `Pending`), stash the buyer payout
-    // invoice if the taker provided one, and request the taker's bond.
-    // `bond::flow::resume_take_after_bond` resumes the trade once the
-    // bond locks.
+    // Anti-abuse bond (Phase 1.5): when enabled for the taker side,
+    // defer the trade hold-invoice / `WaitingBuyerInvoice` step. The
+    // order's status flips to `WaitingTakerBond` while we wait for the
+    // taker to lock the bond hold invoice. The wire-published NIP-33
+    // status stays `pending` per the non-blockability invariant (see
+    // `nip33::create_status_tags`); `bond::flow::resume_take_after_bond`
+    // resumes the trade once the bond locks.
     if bond_required {
         // Always set `buyer_invoice` from this take's `payment_request`
         // (including back to `None`): otherwise a prior taker's invoice
@@ -154,7 +162,13 @@ pub async fn take_sell_action(
         // provide one.
         order.buyer_invoice = payment_request.clone();
 
-        let persisted = order
+        // Republish NIP-33 with `WaitingTakerBond` (which maps back
+        // to NIP-69 `pending` for the wire), then persist.
+        let order_updated = update_order_event(my_keys, Status::WaitingTakerBond, &order)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        let persisted = order_updated
             .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

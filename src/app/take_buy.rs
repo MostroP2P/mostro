@@ -2,7 +2,8 @@ use crate::app::bond;
 use crate::app::bond::supersede_prior_taker_bonds;
 use crate::app::context::AppContext;
 use crate::util::{
-    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
+    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order,
+    show_hold_invoice, update_order_event,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -33,9 +34,16 @@ pub async fn take_buy_action(
     if let Err(cause) = order.is_buy_order() {
         return Err(MostroCantDo(cause));
     };
-    // Check if the order status is pending
-    if let Err(cause) = order.check_status(Status::Pending) {
-        return Err(MostroCantDo(cause));
+    // Check if the order status is pre-trade. After Phase 1.5,
+    // `WaitingTakerBond` is the daemon-internal "matched, awaiting
+    // bond" state; it remains takeable on the wire (NIP-69 `pending`)
+    // per the non-blockability invariant, and `supersede_prior_taker_bonds`
+    // below rejects only when a prior bond is already `Locked`. Both
+    // statuses are pre-trade; either is a valid entry point for take.
+    if order.check_status(Status::Pending).is_err()
+        && order.check_status(Status::WaitingTakerBond).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Validate that the order was sent from the correct maker
@@ -114,18 +122,26 @@ pub async fn take_buy_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Anti-abuse bond (Phase 1): if the operator opted into a taker bond,
-    // intercept the take here. We persist the partially-populated order
-    // (status stays `Pending`) and request the bond. The trade hold
-    // invoice is created later — once the bond locks — by the bond
-    // subscriber's continuation in `bond::flow::resume_take_after_bond`.
+    // Anti-abuse bond (Phase 1.5): if the operator opted into a taker
+    // bond, intercept the take here. The order's status flips to
+    // `WaitingTakerBond` while we wait for the taker to lock the bond
+    // hold invoice. The wire-published NIP-33 status stays `pending`
+    // per the non-blockability invariant (see
+    // `nip33::create_status_tags`); the trade hold invoice is created
+    // later — once the bond locks — by `bond::flow::resume_take_after_bond`.
     if bond_required {
         // Stash the seller (taker) trade pubkey so the post-bond
         // continuation can resume `show_hold_invoice` with the same
         // arguments the legacy path would have used.
         order.seller_pubkey = Some(seller_pubkey.to_string());
 
-        let persisted = order
+        // Republish NIP-33 with `WaitingTakerBond` (which maps back
+        // to NIP-69 `pending` for the wire), then persist.
+        let order_updated = update_order_event(my_keys, Status::WaitingTakerBond, &order)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        let persisted = order_updated
             .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

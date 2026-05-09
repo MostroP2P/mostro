@@ -213,7 +213,15 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    if order.status == Status::Pending.to_string() {
+    // `WaitingTakerBond` publishes as NIP-69 `pending` per
+    // `create_status_tags` and the non-blockability invariant
+    // (`docs/ANTI_ABUSE_BOND.md` §2 principle 8), so it must emit the
+    // same fiat-amount tag a `Pending` order would — otherwise an
+    // observer who is browsing the order book to re-take during the
+    // bond window would see a degraded view.
+    if order.status == Status::Pending.to_string()
+        || order.status == Status::WaitingTakerBond.to_string()
+    {
         match (order.min_amount, order.max_amount) {
             (Some(min), Some(max)) => {
                 vec![min.to_string(), max.to_string()]
@@ -254,6 +262,17 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
         | Status::Expired => Ok((true, Status::Canceled)),
         Status::Success | Status::CompletedByAdmin => Ok((true, status)),
         Status::Pending => Ok((true, status)),
+        // Anti-abuse bond non-blockability invariant
+        // (`docs/ANTI_ABUSE_BOND.md` §2 principle 8): a taker has been
+        // matched on this order and is in the middle of paying their
+        // bond. Internally the row is `WaitingTakerBond`, but on the
+        // wire it MUST keep advertising as NIP-69 `pending` so other
+        // takers continue to see the order in the public book and a
+        // malicious / absent taker cannot park it off-market by
+        // initiating a take and never paying. The first bond to lock
+        // wins; only at that point does the order publish a
+        // post-trade-flow status.
+        Status::WaitingTakerBond => Ok((true, Status::Pending)),
         _ => Ok((false, status)),
     }
 }
@@ -291,7 +310,13 @@ fn create_source_tag(
     mostro_relays: &[String],
     mostro_pubkey: &str,
 ) -> Result<Option<String>, MostroError> {
-    if order.status == Status::Pending.to_string() {
+    // Mirror `create_fiat_amt_array`: a `WaitingTakerBond` order
+    // publishes as NIP-69 `pending` and must remain discoverable to
+    // other potential takers (re-takeability invariant); without the
+    // source tag, clients cannot reach back to the original event.
+    if order.status == Status::Pending.to_string()
+        || order.status == Status::WaitingTakerBond.to_string()
+    {
         // Create a mostro: custom source reference for pending orders
         // Include the Mostro pubkey so clients can identify the instance
         let custom_ref = format!(
@@ -727,6 +752,72 @@ mod tests {
         assert!(
             source.contains(&format!("&mostro={}", TEST_MOSTRO_PUBKEY)),
             "source must contain the correct Mostro pubkey"
+        );
+    }
+
+    // ── Non-blockability invariant (anti-abuse bond Phase 1.5) ─────────────────
+    //
+    // `docs/ANTI_ABUSE_BOND.md` §2 principle 8: an order with a taker
+    // mid-bond is internally `WaitingTakerBond` but MUST publish on the
+    // wire as NIP-69 `pending`. Without this, an attacker could park
+    // the order off the public book by initiating a take and never
+    // paying the bond.
+
+    /// Extract the value of the "s" (status) tag from a Tags collection.
+    fn get_status_tag_value(tags: &Tags) -> Option<String> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            if vec.first().map(|s| s.as_str()) == Some("s") {
+                vec.get(1).cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Build an order in the daemon-internal `WaitingTakerBond` status.
+    fn make_waiting_taker_bond_order() -> Order {
+        Order {
+            status: Status::WaitingTakerBond.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn waiting_taker_bond_publishes_as_pending_on_the_wire() {
+        init_test_settings();
+        let order = make_waiting_taker_bond_order();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("WaitingTakerBond order must publish (Some tags)");
+
+        let s = get_status_tag_value(&tags).expect("WaitingTakerBond order must emit an `s` tag");
+        assert_eq!(
+            s, "pending",
+            "non-blockability invariant: a WaitingTakerBond order MUST \
+             advertise as `pending` on the wire so other potential takers \
+             can still see it on the order book"
+        );
+    }
+
+    #[test]
+    fn waiting_taker_bond_keeps_source_tag_for_re_takeability() {
+        init_test_settings();
+        let order = make_waiting_taker_bond_order();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("WaitingTakerBond order must publish (Some tags)");
+
+        // If the source tag is missing, clients cannot find the order
+        // event to re-take it during the bond window.
+        get_source_tag_value(&tags).expect(
+            "WaitingTakerBond order must keep its source tag so other takers \
+             can still discover and re-take it",
         );
     }
 

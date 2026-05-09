@@ -41,13 +41,18 @@ impl FromStr for BondRole {
 ///
 /// ```text
 ///  Requested ──► Locked ──┬──► Released (happy / cancelled-before-timeout)
-///                         └──► PendingPayout ──┬──► Slashed   (winner paid)
-///                                              └──► Failed    (retries exhausted)
+///                         └──► PendingPayout ──┬──► Slashed    (winner paid)
+///                                              ├──► Forfeited  (winner never claimed in window)
+///                                              └──► Failed     (retries exhausted)
 /// ```
 ///
 /// A bond never goes back to an earlier state. `Failed` is a terminal,
-/// operator-intervention-required state and is deliberately distinct from
-/// `Slashed` so dashboards can alarm on it.
+/// operator-intervention-required state (we have an invoice but
+/// `send_payment` keeps failing). `Forfeited` is the long-stop terminal
+/// state for a slash whose counterparty never submitted a payout invoice
+/// within `payout_claim_window_days`; it is a *normal* outcome by design
+/// (no operator action required), distinct from `Failed` so dashboards
+/// can alarm correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BondState {
     /// Hold invoice created; waiting for the bonded party to pay it so LND
@@ -61,21 +66,26 @@ pub enum BondState {
     PendingPayout,
     /// Winner paid successfully. Terminal.
     Slashed,
-    /// Payout retries exhausted. Terminal, requires operator attention.
+    /// `payout_claim_window_days` elapsed without the counterparty ever
+    /// submitting a payout invoice; the node retains `amount_sats` in
+    /// full. Terminal — designed-in long-stop, no operator action needed.
+    Forfeited,
+    /// `send_payment` retries exhausted. Terminal, requires operator
+    /// attention.
     Failed,
 }
 
 impl BondState {
     /// True for states that should not be transitioned out of by Phase 1
     /// release paths: the bond is already done with from the operator's
-    /// perspective. Used so call sites don't have to enumerate the trio
-    /// of `Released | Slashed | Failed` manually (and so the daemon
-    /// doesn't grow to depend on the [`Display`] string form for control
-    /// flow).
+    /// perspective. Used so call sites don't have to enumerate the four
+    /// of `Released | Slashed | Forfeited | Failed` manually (and so the
+    /// daemon doesn't grow to depend on the [`Display`] string form for
+    /// control flow).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            BondState::Released | BondState::Slashed | BondState::Failed
+            BondState::Released | BondState::Slashed | BondState::Forfeited | BondState::Failed
         )
     }
 
@@ -96,6 +106,7 @@ impl fmt::Display for BondState {
             BondState::Released => "released",
             BondState::PendingPayout => "pending-payout",
             BondState::Slashed => "slashed",
+            BondState::Forfeited => "forfeited",
             BondState::Failed => "failed",
         };
         f.write_str(s)
@@ -112,6 +123,7 @@ impl FromStr for BondState {
             "released" => Ok(BondState::Released),
             "pending-payout" => Ok(BondState::PendingPayout),
             "slashed" => Ok(BondState::Slashed),
+            "forfeited" => Ok(BondState::Forfeited),
             "failed" => Ok(BondState::Failed),
             other => Err(BondParseError::UnknownState(other.to_string())),
         }
@@ -189,6 +201,7 @@ mod tests {
             BondState::Released,
             BondState::PendingPayout,
             BondState::Slashed,
+            BondState::Forfeited,
             BondState::Failed,
         ] {
             assert_eq!(BondState::from_str(&s.to_string()).unwrap(), s);
@@ -211,7 +224,12 @@ mod tests {
 
     #[test]
     fn terminal_and_active_helpers() {
-        for s in [BondState::Released, BondState::Slashed, BondState::Failed] {
+        for s in [
+            BondState::Released,
+            BondState::Slashed,
+            BondState::Forfeited,
+            BondState::Failed,
+        ] {
             assert!(s.is_terminal(), "{s} should be terminal");
             assert!(!s.is_active(), "{s} should not be active");
         }

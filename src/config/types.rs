@@ -55,22 +55,49 @@ pub struct AntiAbuseBondSettings {
     /// Which trade flow(s) require the bond.
     #[serde(default)]
     pub apply_to: BondApplyTo,
-    /// Slash the bond when the bonded party loses a dispute.
-    #[serde(default)]
-    pub slash_on_lost_dispute: bool,
     /// Slash the bond when the bonded party lets the waiting-state timeout
     /// actually elapse. A cancellation before the timeout MUST always
     /// release the bond regardless of this flag; see §Phase 4 of the spec.
+    ///
+    /// Note: there is intentionally no `slash_on_lost_dispute` flag.
+    /// Dispute slashes are expressed by the solver per-resolution via the
+    /// `BondResolution` payload (see §3 / Phase 2 of the spec).
     #[serde(default)]
     pub slash_on_waiting_timeout: bool,
+    /// Fraction of a slashed bond that the node retains. The remainder is
+    /// paid out to the winning counterparty. The node share is meant to
+    /// fund solver compensation for dispute work; see §15.4 of the spec.
+    /// `0.0` = full payout to counterparty (legacy behaviour);
+    /// `1.0` = node keeps everything. Used by Phase 3.
+    ///
+    /// Validated at deserialization: rejected if outside `[0.0, 1.0]`.
+    /// Out-of-range values would corrupt the
+    /// `node_share_sats = floor(amount_sats * pct)` math (negative
+    /// counterparty share, or node retention exceeding the bond), so the
+    /// daemon refuses to start rather than silently misbehave.
+    #[serde(
+        default = "default_slash_node_share_pct",
+        deserialize_with = "deserialize_slash_node_share_pct"
+    )]
+    pub slash_node_share_pct: f64,
     /// How long (seconds) Mostro waits between payout-invoice retries
     /// when asking the winning counterparty for a bolt11. Used by Phase 3.
     #[serde(default = "default_payout_invoice_window_seconds")]
     pub payout_invoice_window_seconds: u64,
-    /// Maximum number of payout-invoice retries before a bond transitions
-    /// to `failed` state. Used by Phase 3.
+    /// Maximum number of `send_payment` retries against an invoice the
+    /// counterparty has already submitted before a bond transitions to
+    /// `failed`. Independent from how long we wait for the invoice itself
+    /// (that is governed by `payout_claim_window_days`). Used by Phase 3.
     #[serde(default = "default_payout_max_retries")]
     pub payout_max_retries: u32,
+    /// How many days the winning counterparty has, from the moment the
+    /// bond is slashed, to claim their share by submitting a payout
+    /// bolt11. If the window elapses without an invoice ever being
+    /// received, the bond transitions to `forfeited` and the node retains
+    /// the counterparty share too (long-stop forfeiture; see §15.4).
+    /// Used by Phase 3.
+    #[serde(default = "default_payout_claim_window_days")]
+    pub payout_claim_window_days: u32,
 }
 
 fn default_bond_amount_pct() -> f64 {
@@ -89,6 +116,32 @@ fn default_payout_max_retries() -> u32 {
     5
 }
 
+fn default_slash_node_share_pct() -> f64 {
+    0.5
+}
+
+/// Validating deserializer for `slash_node_share_pct`. Rejects anything
+/// outside `[0.0, 1.0]` (including NaN) with a descriptive serde error
+/// so a typo in the operator's `settings.toml` fails fast at startup
+/// rather than producing nonsense math at slash time.
+fn deserialize_slash_node_share_pct<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = f64::deserialize(deserializer)?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(D::Error::custom(format!(
+            "slash_node_share_pct must be in [0.0, 1.0], got {v}"
+        )));
+    }
+    Ok(v)
+}
+
+fn default_payout_claim_window_days() -> u32 {
+    15
+}
+
 impl Default for AntiAbuseBondSettings {
     fn default() -> Self {
         Self {
@@ -96,10 +149,11 @@ impl Default for AntiAbuseBondSettings {
             amount_pct: default_bond_amount_pct(),
             base_amount_sats: default_bond_base_amount(),
             apply_to: BondApplyTo::default(),
-            slash_on_lost_dispute: false,
             slash_on_waiting_timeout: false,
+            slash_node_share_pct: default_slash_node_share_pct(),
             payout_invoice_window_seconds: default_payout_invoice_window_seconds(),
             payout_max_retries: default_payout_max_retries(),
+            payout_claim_window_days: default_payout_claim_window_days(),
         }
     }
 }
@@ -367,13 +421,14 @@ mod anti_abuse_bond_tests {
     fn defaults_are_off() {
         let cfg = AntiAbuseBondSettings::default();
         assert!(!cfg.enabled);
-        assert!(!cfg.slash_on_lost_dispute);
         assert!(!cfg.slash_on_waiting_timeout);
         assert_eq!(cfg.apply_to, BondApplyTo::Take);
         assert_eq!(cfg.amount_pct, 0.01);
         assert_eq!(cfg.base_amount_sats, 1_000);
         assert_eq!(cfg.payout_invoice_window_seconds, 300);
         assert_eq!(cfg.payout_max_retries, 5);
+        assert_eq!(cfg.slash_node_share_pct, 0.5);
+        assert_eq!(cfg.payout_claim_window_days, 15);
     }
 
     #[test]
@@ -420,10 +475,100 @@ mod anti_abuse_bond_tests {
             r#"[anti_abuse_bond]
 enabled = true
 apply_to = "both"
-slash_on_lost_dispute = true"#,
+slash_on_waiting_timeout = true"#,
         )
         .expect("toml parses");
         assert_eq!(parsed.anti_abuse_bond.apply_to, BondApplyTo::Both);
-        assert!(parsed.anti_abuse_bond.slash_on_lost_dispute);
+        assert!(parsed.anti_abuse_bond.slash_on_waiting_timeout);
+    }
+
+    #[test]
+    fn toml_slash_node_share_pct_and_claim_window_override() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let parsed: Stub = toml::from_str(
+            r#"[anti_abuse_bond]
+enabled = true
+slash_node_share_pct = 0.25
+payout_claim_window_days = 30"#,
+        )
+        .expect("toml parses");
+        assert_eq!(parsed.anti_abuse_bond.slash_node_share_pct, 0.25);
+        assert_eq!(parsed.anti_abuse_bond.payout_claim_window_days, 30);
+    }
+
+    #[test]
+    fn toml_slash_node_share_pct_boundaries_accepted() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        for (pct, expected) in [("0.0", 0.0), ("1.0", 1.0)] {
+            let toml_str = format!("[anti_abuse_bond]\nslash_node_share_pct = {pct}");
+            let parsed: Stub = toml::from_str(&toml_str).expect("boundary value should parse");
+            assert_eq!(parsed.anti_abuse_bond.slash_node_share_pct, expected);
+        }
+    }
+
+    #[test]
+    fn toml_slash_node_share_pct_below_zero_rejected() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Stub {
+            #[allow(dead_code)]
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let err = toml::from_str::<Stub>("[anti_abuse_bond]\nslash_node_share_pct = -0.1")
+            .expect_err("negative pct must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slash_node_share_pct") && msg.contains("[0.0, 1.0]"),
+            "error message should name the field and the valid range, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn toml_slash_node_share_pct_above_one_rejected() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Stub {
+            #[allow(dead_code)]
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let err = toml::from_str::<Stub>("[anti_abuse_bond]\nslash_node_share_pct = 1.5")
+            .expect_err("pct above 1.0 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slash_node_share_pct") && msg.contains("[0.0, 1.0]"),
+            "error message should name the field and the valid range, got: {msg}"
+        );
+    }
+
+    /// Backward compatibility: an operator who upgrades from a pre-spec-cleanup
+    /// build may still have `slash_on_lost_dispute = true` in their
+    /// `settings.toml`. The field has been removed from `AntiAbuseBondSettings`,
+    /// but `deny_unknown_fields` is intentionally NOT set on the struct so the
+    /// legacy line is silently ignored — no operator action required at upgrade
+    /// time. This test locks that contract down so a future
+    /// `#[serde(deny_unknown_fields)]` addition cannot accidentally break
+    /// existing configs without an explicit migration.
+    #[test]
+    fn toml_legacy_slash_on_lost_dispute_parses() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let parsed: Stub = toml::from_str(
+            r#"[anti_abuse_bond]
+enabled = true
+slash_on_lost_dispute = true
+slash_node_share_pct = 0.25
+payout_claim_window_days = 30"#,
+        )
+        .expect("legacy slash_on_lost_dispute should be silently ignored");
+        assert!(parsed.anti_abuse_bond.enabled);
+        // Other fields on the same block must still deserialize correctly.
+        assert_eq!(parsed.anti_abuse_bond.slash_node_share_pct, 0.25);
+        assert_eq!(parsed.anti_abuse_bond.payout_claim_window_days, 30);
     }
 }

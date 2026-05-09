@@ -71,13 +71,34 @@ pub struct Bond {
     pub payout_invoice: Option<String>,
     /// Routing-fee ceiling actually used for the payout attempt (sats).
     pub payout_routing_fee_sats: Option<i64>,
-    /// Number of payout invoice requests attempted so far.
+    /// Phase 3: portion of `amount_sats` that the node retains on slash.
+    /// Frozen at the moment the bond enters `PendingPayout`. `None` until
+    /// then; the counterparty share is always derived as
+    /// `amount_sats - node_share_sats` so they cannot drift.
+    pub node_share_sats: Option<i64>,
+    /// Number of `send_payment` retries against an invoice the counterparty
+    /// has already submitted. Bumped only on Phase 3 step 6 (send_payment
+    /// failure); `payout_max_retries` is checked against this counter
+    /// alone. Invoice-request DMs do NOT increment this — see
+    /// `invoice_request_attempts`.
     pub payout_attempts: i64,
+    /// Phase 3: number of `Action::AddInvoice` DMs sent to the counterparty
+    /// asking for a payout invoice. Bounded by the forfeit window
+    /// (`payout_claim_window_days`), not by `payout_max_retries`. Reset to
+    /// 0 when the counterparty finally submits an invoice.
+    pub invoice_request_attempts: i64,
+    /// Phase 3: timestamp of the last `Action::AddInvoice` DM. Drives the
+    /// `payout_invoice_window_seconds` cadence check; persisted so a
+    /// daemon restart doesn't trigger an immediate re-DM.
+    pub last_invoice_request_at: Option<i64>,
     /// Timestamp when the bond hold invoice reached `Accepted`.
     pub locked_at: Option<i64>,
     /// Timestamp when the bond transitioned to `Released`.
     pub released_at: Option<i64>,
-    /// Timestamp when the bond transitioned to `Slashed`.
+    /// Timestamp when the bond transitioned to `PendingPayout` (i.e. when
+    /// the slash decision was made). Anchors the
+    /// `payout_claim_window_days` forfeit deadline. Not touched on the
+    /// later `Slashed` / `Forfeited` / `Failed` transitions.
     pub slashed_at: Option<i64>,
     /// Timestamp when the row was created.
     pub created_at: i64,
@@ -103,7 +124,10 @@ impl Bond {
             payment_request: None,
             payout_invoice: None,
             payout_routing_fee_sats: None,
+            node_share_sats: None,
             payout_attempts: 0,
+            invoice_request_attempts: 0,
+            last_invoice_request_at: None,
             locked_at: None,
             released_at: None,
             slashed_at: None,
@@ -126,6 +150,10 @@ mod tests {
         assert_eq!(b.amount_sats, 1_000);
         assert_eq!(b.slashed_share_sats, 0);
         assert!(b.hash.is_none());
+        assert!(b.node_share_sats.is_none());
+        assert_eq!(b.payout_attempts, 0);
+        assert_eq!(b.invoice_request_attempts, 0);
+        assert!(b.last_invoice_request_at.is_none());
         assert!(b.locked_at.is_none());
         assert!(b.released_at.is_none());
         assert!(b.slashed_at.is_none());

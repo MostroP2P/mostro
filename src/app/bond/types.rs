@@ -85,10 +85,7 @@ impl BondState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            BondState::Released
-                | BondState::Slashed
-                | BondState::Forfeited
-                | BondState::Failed
+            BondState::Released | BondState::Slashed | BondState::Forfeited | BondState::Failed
         )
     }
 

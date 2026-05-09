@@ -38,8 +38,9 @@ CREATE TABLE IF NOT EXISTS bonds (
   -- BondState serialization: 'requested' | 'locked' | 'released' |
   -- 'pending-payout' | 'slashed' | 'forfeited' | 'failed'
   state            varchar(16) not null,
-  -- BondSlashReason: 'lost-dispute' | 'timeout'. NULL unless state in
-  -- ('pending-payout', 'slashed').
+  -- BondSlashReason: 'lost-dispute' | 'timeout'. Set on entry to
+  -- 'pending-payout' and never cleared, so non-NULL while state is
+  -- 'pending-payout', 'slashed', 'forfeited', or 'failed'.
   slashed_reason   varchar(16),
   -- Bond hold invoice hash (hex). NULL until the hold invoice is created.
   hash             char(64),

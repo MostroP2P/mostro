@@ -654,9 +654,24 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
     if order.status != Status::WaitingTakerBond.to_string() {
         return Ok(());
     }
-    let active = find_active_bonds_for_order(pool, order_id)
-        .await
-        .unwrap_or_default();
+    // Transient DB errors must NOT be coerced into "no active bonds":
+    // doing so would let a supersede race (where a fresh bond is
+    // already in flight on the same order) get clobbered back to
+    // `Pending`, violating the supersede guard. Log and bail
+    // instead — the order stays in `WaitingTakerBond`, the wire
+    // still publishes as `pending` (non-blockability invariant), and
+    // the next event on this order can re-run the cleanup.
+    let active = match find_active_bonds_for_order(pool, order_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                bond_id = %bond_id,
+                order_id = %order_id,
+                "could not check for other active bonds after release: {} — leaving order status alone", e
+            );
+            return Ok(());
+        }
+    };
     if !active.is_empty() {
         return Ok(());
     }

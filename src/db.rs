@@ -586,11 +586,21 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, 
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let expire_time = Timestamp::now();
+    // `waiting-taker-bond` is included so the pending-expiry path
+    // also catches orders that were matched to a taker who never
+    // locked their anti-abuse bond. Both statuses publish as NIP-69
+    // `pending` on the wire (see `nip33::create_status_tags`); an
+    // order whose `expires_at` has passed must be expired regardless
+    // of which internal pre-trade state it sits in, otherwise it
+    // would linger publicly on the order book past its own deadline
+    // and the Phase 1 "always release on every exit path" guarantee
+    // for bonds would not run on the expiry path.
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE expires_at < ?1 AND status == 'pending'
+          WHERE expires_at < ?1
+            AND status IN ('pending', 'waiting-taker-bond')
         "#,
     )
     .bind(expire_time.as_secs() as i64)
@@ -1513,6 +1523,69 @@ mod tests {
             result.len(),
             1,
             "Empty string hash should be treated as no hash"
+        );
+    }
+
+    // -- Tests for find_order_by_date (pending-expiry path) --
+
+    /// `insert_test_order` already sets `expires_at` to a 2023 timestamp,
+    /// so any order it creates is past `Timestamp::now()` and qualifies
+    /// as expired.
+    #[tokio::test]
+    async fn find_order_by_date_includes_pending_and_waiting_taker_bond() {
+        let pool = setup_orders_db().await.unwrap();
+        let pending_id = uuid::Uuid::new_v4();
+        let bond_id = uuid::Uuid::new_v4();
+
+        insert_test_order(&pool, pending_id, "pending", 0, false, None).await;
+        insert_test_order(&pool, bond_id, "waiting-taker-bond", 0, false, None).await;
+
+        let result = super::find_order_by_date(&pool).await.unwrap();
+        let ids: std::collections::HashSet<_> = result.iter().map(|o| o.id).collect();
+        assert!(
+            ids.contains(&pending_id),
+            "expired pending order must be returned"
+        );
+        assert!(
+            ids.contains(&bond_id),
+            "expired waiting-taker-bond order must be returned — same NIP-69 \
+             bucket as pending, must hit the pending-expiry path so the order \
+             cannot linger publicly past expires_at while a taker stalls on the bond"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_order_by_date_excludes_post_trade_states() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Post-trade-flow statuses: not eligible for the pending-expiry
+        // path (they have their own lifecycle / scheduler hooks).
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "active", 0, false, None).await;
+        insert_test_order(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "waiting-payment",
+            0,
+            false,
+            None,
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "waiting-buyer-invoice",
+            0,
+            false,
+            None,
+        )
+        .await;
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "success", 0, false, None).await;
+        insert_test_order(&pool, uuid::Uuid::new_v4(), "canceled", 0, false, None).await;
+
+        let result = super::find_order_by_date(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "find_order_by_date must only return pending / waiting-taker-bond"
         );
     }
 

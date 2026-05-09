@@ -479,7 +479,8 @@ never has to lean on memo parsing in the wild.
 
 ### 6.5.1 Scope
 
-- **`mostro-core` release** introducing two additive variants:
+- **`mostro-core` 0.11.0** ships the two additive variants this phase
+  needs (released — no further upstream work required):
   - `Status::WaitingTakerBond` — daemon-level status meaning "this
     order has a taker mid-bond". Distinguishes "matched, awaiting
     bond" from `Pending` ("advertised, no taker yet") for the
@@ -495,8 +496,9 @@ never has to lean on memo parsing in the wild.
     convention (Mostro → user, "pay this bolt11"); `Add…` would
     conflict with `Action::AddInvoice`'s established direction (user
     → Mostro, "here's my payout bolt11").
-  - Minor version bump; serde-additive so clients that ignore unknown
-    variants stay compatible.
+  - Both variants are serde-additive — older clients (still on
+    `mostro-core` 0.10.x) that ignore unknown variants stay
+    backward-compatible at the protocol layer.
 - **`mostrod` changes** in `src/app/bond/flow.rs::request_taker_bond`
   and the take handlers:
   - Replace `Action::PayInvoice` with `Action::PayBondInvoice` when
@@ -523,8 +525,9 @@ never has to lean on memo parsing in the wild.
     republish so any internal/external state stays consistent.
   - The trade hold invoice continues to ship as `Action::PayInvoice`
     — only the bond switches.
-- **Pin `mostro-core`** to the new minor version in this repo's
-  `Cargo.toml`.
+- **Bump the `mostro-core` pin** in this repo's `Cargo.toml` from
+  `0.10.0` to `0.11.0` so the new variants are reachable from
+  `mostrod`. The Phase 1.5 PR is the natural place for this bump.
 
 ### 6.5.2 Client compatibility
 
@@ -537,8 +540,9 @@ never has to lean on memo parsing in the wild.
   `enabled = true` *only after* Phase 1.5 see fail-fast behaviour
   rather than ambiguous `PayInvoice` mishandling.
 - Operators are responsible for not flipping `enabled = true` in
-  production until clients in the wild have adopted the new
-  `mostro-core`. Phase 8 (§13.1) gives clients the
+  production until clients in the wild have adopted `mostro-core`
+  0.11.0 (the release that ships `Action::PayBondInvoice` /
+  `Status::WaitingTakerBond`). Phase 8 (§13.1) gives clients the
   `bond = enabled | disabled` info-event tag so they can warn users
   ("this node requires a bond your client doesn't support") instead
   of silently failing takes.
@@ -600,9 +604,10 @@ Earlier drafts of this spec coupled these two decisions ("the loser of
 the dispute is the loser of the bond") and the resulting ambiguities are
 catalogued in §15. The decoupled model is what this phase ships.
 
-### 7.1 New `BondResolution` payload variant in `mostro-core`
+### 7.1 `BondResolution` payload variant in `mostro-core`
 
-In `mostro-core::message::Payload`:
+`mostro-core` 0.11.0 ships `Payload::BondResolution`. From
+`mostro-core::message::Payload`:
 
 ```rust
 /// Bond resolution carried by [`Action::AdminSettle`] / [`Action::AdminCancel`].
@@ -627,9 +632,10 @@ pub struct BondResolution {
 and `Action::AdminCancel`. Any other action carrying it returns
 `ServiceError::InvalidPayload`.
 
-This is a new payload variant, not a breaking change to the wire format
-(serde additive). It does require a minor version bump of `mostro-core`
-and a pinned dependency in this repo's `Cargo.toml`. See §14.3.
+This is a serde-additive payload variant — not a breaking change to
+the wire format. It is delivered as part of the `mostro-core` 0.11.0
+bump that Phase 1.5 (§6.5.1) pulls into `Cargo.toml`; Phase 2 itself
+adds no further upstream dependency change. See §14.3.
 
 ### 7.2 Wire format examples
 
@@ -1250,9 +1256,13 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
 - Database migration is purely additive; existing orders are unaffected.
 - Default config is `enabled = false`; old `settings.toml` files work as
   is.
-- New `Status` / `Action` / `Payload` variants in `mostro-core` (Phases
-  1, 2, 5) must ship in that crate first and be pinned to a version in
-  this repo's `Cargo.toml`. Clients must handle unknown statuses
+- New `Status` / `Action` / `Payload` variants in `mostro-core` must
+  ship in that crate first and be pinned to a version in this repo's
+  `Cargo.toml`. As of `mostro-core` **0.11.0**, the variants for
+  Phases 1.5 and 2 (`Status::WaitingTakerBond`,
+  `Action::PayBondInvoice`, `Payload::BondResolution`) are released
+  and ready to pin. Phase 5's `Status::WaitingMakerBond` is still
+  pending in `mostro-core`. Clients must handle unknown statuses
   gracefully — this is already the case.
 - An admin/solver client that does not yet know about `BondResolution`
   sends `payload: null`, which the daemon interprets as
@@ -1263,13 +1273,15 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
 Per `CONTRIBUTING.md § Protocol / Tag Changes`, each PR introducing
 these requires a compatibility statement:
 
-- New `Action::PayBondInvoice` + `Status::WaitingTakerBond` in
-  mostro-core (Phase 1.5). Minor version bump. Retires the Phase 1
-  reuse of `Action::PayInvoice` / `Status::Pending` for bonds.
-- New `Payload::BondResolution` variant in mostro-core (Phase 2). Minor
-  version bump.
-- New status `WaitingMakerBond` (Phase 5).
-- New info-event tags (Phase 8).
+- `Action::PayBondInvoice` + `Status::WaitingTakerBond` in mostro-core
+  (Phase 1.5). **Released in `mostro-core` 0.11.0.** Retires the Phase
+  1 reuse of `Action::PayInvoice` / `Status::Pending` for bonds.
+- `Payload::BondResolution` variant in mostro-core (Phase 2).
+  **Released in `mostro-core` 0.11.0** (same release).
+- `Status::WaitingMakerBond` (Phase 5). Not yet shipped upstream;
+  needs a follow-up `mostro-core` minor release before Phase 5 can
+  land here.
+- Info-event tags (Phase 8). No upstream dependency — daemon-side only.
 
 ### 14.4 Testing discipline
 

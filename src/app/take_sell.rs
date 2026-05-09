@@ -73,17 +73,21 @@ pub async fn take_sell_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
-    // Anti-abuse bond (Phase 1): release any prior taker's still-
-    // `Requested` bond before this take proceeds. A `Locked` prior bond
-    // means the trade is already committed and the helper returns
-    // `PendingOrderExists`. Done before the market-price recomputation
-    // below so re-takes of API-priced orders see a fresh quote.
+    // Anti-abuse bond reconciliation: always run the supersede pass
+    // before this take proceeds, regardless of the current
+    // `taker_bond_required()` flag. Bonds may have been enabled at
+    // the time a *prior* taker took this order — leaving a
+    // `Requested` or `Locked` bond row attached — and then disabled
+    // before the current take arrives. Gating on
+    // `taker_bond_required()` would silently skip that
+    // reconciliation: a `Locked` prior bond would no longer block
+    // the take, and a `Requested` prior bond would be orphaned in
+    // the DB. The helper is a no-op (returns `Ok(0)`) when no
+    // active bond exists for the order, so always-calling is safe
+    // and cheap. Done before the market-price recomputation below
+    // so re-takes of API-priced orders see a fresh quote.
     let bond_required = bond::taker_bond_required();
-    let superseded = if bond_required {
-        supersede_prior_taker_bonds(pool, order.id, event.sender).await?
-    } else {
-        0
-    };
+    let superseded = supersede_prior_taker_bonds(pool, order.id, event.sender).await?;
     if superseded > 0 && order.price_from_api {
         order.amount = 0;
         order.fee = 0;

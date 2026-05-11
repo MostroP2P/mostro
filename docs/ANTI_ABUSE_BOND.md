@@ -282,6 +282,18 @@ Purely additive. Touches no trade flow.
     -- `payout_claim_window_days` forfeit deadline (§8.1).
     slashed_at       integer,
     created_at       integer not null,
+    -- Phase 1 concurrent-bonds taker context. Stashed here while
+    -- multiple `Requested` taker bonds race to `Locked`; the winner's
+    -- columns are copied onto the `orders` row at lock-time. All
+    -- nullable: maker bonds (Phase 5+) and child slash rows (Phase 6)
+    -- leave them at NULL.
+    taker_identity    char(64),
+    taker_trade_index integer,
+    taker_invoice     text,
+    taker_fiat_amount integer,
+    taker_amount      integer,
+    taker_fee         integer,
+    taker_dev_fee     integer,
     FOREIGN KEY(order_id) REFERENCES orders(id)
   );
   CREATE INDEX IF NOT EXISTS idx_bonds_order_id ON bonds(order_id);
@@ -289,11 +301,15 @@ Purely additive. Touches no trade flow.
   CREATE INDEX IF NOT EXISTS idx_bonds_parent   ON bonds(parent_bond_id);
   ```
 
-  The Phase 0 migration lands the full column set up-front (parent/child
-  range columns, `slashed_share_sats`, `payout_routing_fee_sats`,
-  `node_share_sats`, `invoice_request_attempts`,
-  `last_invoice_request_at`) rather than staging ALTER TABLEs per
-  phase. Later phases only add code, not schema.
+  The Phase 0 migration lands the full column set up-front
+  (parent/child range columns, `slashed_share_sats`,
+  `payout_routing_fee_sats`, `node_share_sats`,
+  `invoice_request_attempts`, `last_invoice_request_at`, and the
+  Phase 1 concurrent-bonds `taker_*` columns
+  — `taker_identity`, `taker_trade_index`, `taker_invoice`,
+  `taker_fiat_amount`, `taker_amount`, `taker_fee`, `taker_dev_fee`)
+  rather than staging ALTER TABLEs per phase. Later phases only add
+  code, not schema.
 
   Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
 - `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
@@ -566,12 +582,15 @@ never has to lean on memo parsing in the wild.
     `buyer_invoice`, `trade_index_*`, range-order `fiat_amount` /
     `amount` / `fee` / `dev_fee`) directly to the `orders` row
     while the order is in `WaitingTakerBond`. Those fields go on
-    the bond row instead (new columns: `taker_invoice`,
-    `taker_trade_index`, `taker_identity`, `taker_fiat_amount`,
-    `taker_amount`, `taker_fee`, `taker_dev_fee`). They are copied
-    into the `orders` row by `resume_take_after_bond` at the moment
-    the winning bond locks, so the order has no "ghost" taker
-    while N concurrent bonds are racing.
+    the bond row instead, in the `taker_*` columns of the `bonds`
+    table (folded into the Phase 0 `CREATE TABLE`):
+    `taker_invoice`, `taker_trade_index`, `taker_identity`,
+    `taker_fiat_amount`, `taker_amount`, `taker_fee`,
+    `taker_dev_fee` — all nullable so maker bonds (Phase 5+) and
+    child slash rows (Phase 6) leave them at `NULL`. They are
+    copied into the `orders` row by `resume_take_after_bond` at
+    the moment the winning bond locks, so the order has no "ghost"
+    taker while N concurrent bonds are racing.
   - **First-to-lock-wins resolution.** `on_bond_invoice_accepted`
     becomes the cancel-the-losers chokepoint. The `Requested → Locked`
     UPDATE gains a `NOT EXISTS (SELECT 1 FROM bonds WHERE order_id = ?
@@ -587,11 +606,11 @@ never has to lean on memo parsing in the wild.
     each loser an `Action::Canceled`. Only after this cleanup does
     it copy the winning bond's `taker_*` context onto the order
     and call `resume_take_after_bond`.
-  - **Migration (additive).** New migration
-    `migrations/<ts>_bond_taker_context.sql` adds the columns above
-    to the `bonds` table. All nullable, no backfill needed (Phase 0
-    bonds will not have take context; Phase 1.5 bonds always will).
-    Refresh `sqlx-data.json`.
+  - **Schema.** The `taker_*` columns above live directly in the
+    Phase 0 `bonds` `CREATE TABLE` (no follow-up migration). The
+    bond feature is not yet in production, so the schema is
+    declared in its final shape at the Phase 0 migration rather
+    than evolved by ALTER TABLEs across phases.
   - **New DB helper.** `find_active_bond_by_taker(pool, order_id,
     taker_pubkey) -> Option<Bond>` filtering on `state IN
     ('Requested', 'Locked')` and `pubkey = ?`. Used by the

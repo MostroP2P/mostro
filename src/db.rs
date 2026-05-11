@@ -586,11 +586,19 @@ pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, 
 
 pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let expire_time = Timestamp::now();
+    // Phase 1.5: `waiting-taker-bond` is a daemon-internal pre-trade
+    // status (a prospective taker is mid-bond). On the wire it publishes
+    // as `pending`, so from the orderbook's perspective both buckets are
+    // equivalent — and so the expiry job must cover both. Without
+    // `waiting-taker-bond` here, an order parked at that status past its
+    // `expires_at` would never expire and the bond HTLCs would tie up
+    // taker funds in LND until CLTV expiry.
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE expires_at < ?1 AND status == 'pending'
+          WHERE expires_at < ?1
+            AND status IN ('pending', 'waiting-taker-bond')
         "#,
     )
     .bind(expire_time.as_secs() as i64)
@@ -1692,6 +1700,88 @@ mod tests {
 
         let result = super::find_order_by_hash(&pool, "nonexistent_hash").await;
         assert!(result.is_err(), "Should error when hash not found");
+    }
+
+    // -- Tests for find_order_by_date --
+
+    /// Phase 1.5 regression: `WaitingTakerBond` is a daemon-internal
+    /// pre-trade status; on the wire it publishes as `pending`. The
+    /// expiry job must cover both buckets — otherwise an order parked
+    /// at `WaitingTakerBond` past its `expires_at` would never expire
+    /// and its bond HTLCs would tie up taker funds in LND until CLTV.
+    #[tokio::test]
+    async fn test_find_order_by_date_includes_waiting_taker_bond() {
+        let pool = setup_orders_db().await.unwrap();
+        let now = nostr_sdk::Timestamp::now().as_secs() as i64;
+        let past = now - 3600;
+        let future = now + 3600;
+
+        // Helper to insert an order with a specific status + expires_at.
+        async fn insert(pool: &SqlitePool, id: uuid::Uuid, status: &str, expires_at: i64) {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev', ?2, 0, 'lightning',
+                    1000, 'USD', 10, ?3, ?4,
+                    0, 0, 0, 0)"#,
+            )
+            .bind(id)
+            .bind(status)
+            .bind(expires_at - 3600)
+            .bind(expires_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let pending_expired = uuid::Uuid::new_v4();
+        let waiting_taker_bond_expired = uuid::Uuid::new_v4();
+        let pending_fresh = uuid::Uuid::new_v4();
+        let waiting_taker_bond_fresh = uuid::Uuid::new_v4();
+        let active_expired = uuid::Uuid::new_v4(); // out-of-bucket; must not match
+
+        insert(&pool, pending_expired, "pending", past).await;
+        insert(
+            &pool,
+            waiting_taker_bond_expired,
+            "waiting-taker-bond",
+            past,
+        )
+        .await;
+        insert(&pool, pending_fresh, "pending", future).await;
+        insert(
+            &pool,
+            waiting_taker_bond_fresh,
+            "waiting-taker-bond",
+            future,
+        )
+        .await;
+        insert(&pool, active_expired, "active", past).await;
+
+        let expired = super::find_order_by_date(&pool).await.unwrap();
+        let ids: std::collections::HashSet<uuid::Uuid> = expired.iter().map(|o| o.id).collect();
+
+        assert!(
+            ids.contains(&pending_expired),
+            "expired Pending must be returned"
+        );
+        assert!(
+            ids.contains(&waiting_taker_bond_expired),
+            "expired WaitingTakerBond must be returned (Phase 1.5)"
+        );
+        assert!(
+            !ids.contains(&pending_fresh),
+            "non-expired Pending must NOT be returned"
+        );
+        assert!(
+            !ids.contains(&waiting_taker_bond_fresh),
+            "non-expired WaitingTakerBond must NOT be returned"
+        );
+        assert!(
+            !ids.contains(&active_expired),
+            "expired but non-pre-trade orders (e.g. active) must NOT be returned"
+        );
     }
 
     // -- Tests for update_order_to_initial_state --

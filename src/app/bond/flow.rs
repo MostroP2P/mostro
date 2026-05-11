@@ -221,26 +221,57 @@ pub async fn request_taker_bond(
     .await;
 
     // Phase 1.5: park the order at `WaitingTakerBond` while the bond is
-    // outstanding. Concurrent takers race here — subsequent calls see
-    // the order already in `WaitingTakerBond` and skip the republish
-    // (idempotent). The status flip happens *after* the DM ships so a
-    // failure earlier in this function leaves the order at `Pending`
-    // for the caller to retry.
-    if order.status == Status::Pending.to_string() {
+    // outstanding. The bond subscriber is armed before the DM is sent
+    // (a few lines up), so a fast `Accepted` callback can have already
+    // transitioned this order to `WaitingPayment` / `WaitingBuyerInvoice`
+    // by the time we get here; a concurrent maker cancel can have moved
+    // it to `Canceled`; and a sibling take from a different pubkey can
+    // have already flipped it to `WaitingTakerBond` itself. We must NOT
+    // blindly write back our stale `order: &Order` snapshot — that
+    // would revert any of those transitions.
+    //
+    // Atomically claim the `Pending → WaitingTakerBond` transition with
+    // a compare-and-swap UPDATE. If `rows_affected == 0`, another path
+    // already owns the order's status; we skip the Nostr republish and
+    // exit cleanly. If we win, we then republish the NIP-33 event and
+    // patch the persisted `event_id` only (not the full row) so we
+    // never clobber concurrent field updates.
+    let cas = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
+        .bind(Status::WaitingTakerBond.to_string())
+        .bind(order.id)
+        .bind(Status::Pending.to_string())
+        .execute(pool)
+        .await;
+    let claimed = match &cas {
+        Ok(r) => r.rows_affected() == 1,
+        Err(e) => {
+            warn!(
+                order_id = %order.id,
+                "request_taker_bond: WaitingTakerBond compare-and-swap failed: {}", e
+            );
+            false
+        }
+    };
+    if claimed {
         let my_keys = get_keys()?;
         match crate::util::update_order_event(&my_keys, Status::WaitingTakerBond, order).await {
             Ok(updated) => {
-                if let Err(e) = updated.update(pool).await {
+                if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+                    .bind(&updated.event_id)
+                    .bind(order.id)
+                    .execute(pool)
+                    .await
+                {
                     warn!(
                         order_id = %order.id,
-                        "request_taker_bond: failed to persist WaitingTakerBond status: {}", e
+                        "request_taker_bond: failed to persist event_id after WaitingTakerBond republish: {}", e
                     );
                 }
             }
             Err(e) => {
                 warn!(
                     order_id = %order.id,
-                    "request_taker_bond: failed to republish WaitingTakerBond: {}", e
+                    "request_taker_bond: WaitingTakerBond republish failed: {}", e
                 );
             }
         }
@@ -1192,6 +1223,72 @@ mod tests {
 
         let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
         assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// Phase 1.5 P1 regression: the `Pending → WaitingTakerBond` CAS
+    /// in `request_taker_bond` must only flip when the live row is
+    /// still `Pending`. If the bond subscriber wins the race (taker
+    /// pays instantly) and transitions the order to `WaitingPayment`
+    /// before our CAS runs, the CAS must refuse to overwrite. We can't
+    /// invoke `request_taker_bond` directly in a unit test (LND), but
+    /// we can exercise the exact CAS SQL it issues.
+    #[tokio::test]
+    async fn pending_to_waiting_taker_bond_cas_refuses_to_overwrite_concurrent_transition() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        // Simulate a concurrent transition (e.g. `on_bond_invoice_accepted`
+        // racing past us): the order is no longer `Pending`.
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingPayment.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The CAS that `request_taker_bond` issues:
+        let result = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .bind(Status::Pending.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.rows_affected(),
+            0,
+            "CAS must refuse to flip a no-longer-Pending order"
+        );
+
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(
+            order.status,
+            Status::WaitingPayment.to_string(),
+            "the concurrent transition must NOT be reverted"
+        );
+    }
+
+    /// Companion to the CAS test: when the row is still `Pending`,
+    /// the same SQL flips it cleanly.
+    #[tokio::test]
+    async fn pending_to_waiting_taker_bond_cas_flips_when_status_unchanged() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // inserted as 'pending'
+
+        let result = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .bind(Status::Pending.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_affected(), 1);
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
     }
 
     #[tokio::test]

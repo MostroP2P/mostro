@@ -115,6 +115,38 @@ pub async fn find_active_bonds_for_order(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Look up the active (`Requested` or `Locked`) bond row for a given
+/// `(order_id, taker_pubkey)` pair. Used by the take handlers'
+/// idempotent-retry check (a taker re-emitting `take-buy` / `take-sell`
+/// while their bond is still `Requested` must get back the same
+/// `payment_request`, not a fresh row) and by `cancel_order_by_taker`
+/// to scope the cancel to the sender's own bond under concurrent
+/// taker bonds.
+///
+/// Filters on `parent_bond_id IS NULL` to ignore Phase 6 child slash
+/// rows, mirroring `find_bond_by_order_and_role`.
+pub async fn find_active_bond_by_taker(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    taker_pubkey: &str,
+) -> Result<Option<Bond>, mostro_core::error::MostroError> {
+    let requested = BondState::Requested.to_string();
+    let locked = BondState::Locked.to_string();
+    sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds \
+         WHERE order_id = ? AND pubkey = ? AND state IN (?, ?) \
+           AND parent_bond_id IS NULL \
+         LIMIT 1",
+    )
+    .bind(order_id)
+    .bind(taker_pubkey)
+    .bind(requested)
+    .bind(locked)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Update a bond row by primary key. Returns the persisted `Bond`.
 pub async fn update_bond(
     pool: &Pool<Sqlite>,
@@ -151,6 +183,24 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
+        // The taker-context migration is multi-statement; split on `;`
+        // so each ALTER TABLE runs as its own sqlx query. Leading `--`
+        // comment lines on a chunk are tolerated by sqlite as long as
+        // an SQL statement follows.
+        for stmt in include_str!("../../../migrations/20260511180000_bond_taker_context.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && s.lines()
+                        .any(|l| !l.trim_start().starts_with("--") && !l.trim().is_empty())
+            })
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("bond taker context migration");
+        }
         // SQLite doesn't enforce FKs unless asked. Turn them on so the FK to
         // `orders` is a real constraint in tests (mirrors production).
         sqlx::query("PRAGMA foreign_keys = ON")
@@ -310,5 +360,87 @@ mod tests {
         let locked = find_bonds_by_state(&pool, BondState::Locked).await.unwrap();
         assert_eq!(locked.len(), 1);
         assert_eq!(locked[0].order_id, order_a);
+    }
+
+    #[tokio::test]
+    async fn taker_context_columns_roundtrip() {
+        // Concurrent-bonds rework adds taker_* columns that stash the
+        // deferred take context until the bond locks. Make sure the
+        // additive migration is applied and the columns round-trip
+        // through insert / fetch.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+
+        let mut bond = dummy_bond(order_id, BondRole::Taker);
+        bond.taker_identity = Some("d".repeat(64));
+        bond.taker_trade_index = Some(42);
+        bond.taker_invoice = Some("lnbc1pTAKER".to_string());
+        bond.taker_fiat_amount = Some(123);
+        bond.taker_amount = Some(45_678);
+        bond.taker_fee = Some(89);
+        bond.taker_dev_fee = Some(7);
+        let created = create_bond(&pool, bond).await.unwrap();
+
+        let fetched = find_bond_by_order_and_role(&pool, order_id, BondRole::Taker)
+            .await
+            .unwrap()
+            .expect("bond present");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(
+            fetched.taker_identity.as_deref(),
+            Some("d".repeat(64).as_str())
+        );
+        assert_eq!(fetched.taker_trade_index, Some(42));
+        assert_eq!(fetched.taker_invoice.as_deref(), Some("lnbc1pTAKER"));
+        assert_eq!(fetched.taker_fiat_amount, Some(123));
+        assert_eq!(fetched.taker_amount, Some(45_678));
+        assert_eq!(fetched.taker_fee, Some(89));
+        assert_eq!(fetched.taker_dev_fee, Some(7));
+    }
+
+    #[tokio::test]
+    async fn find_active_bond_by_taker_scopes_to_pubkey() {
+        // Two concurrent prospective takers on the same order each get
+        // their own `Requested` bond. The lookup must return exactly
+        // the bond belonging to the queried pubkey.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+
+        let mut bond_a = dummy_bond(order_id, BondRole::Taker);
+        bond_a.pubkey = "a".repeat(64);
+        let created_a = create_bond(&pool, bond_a).await.unwrap();
+
+        let mut bond_b = dummy_bond(order_id, BondRole::Taker);
+        bond_b.pubkey = "b".repeat(64);
+        let created_b = create_bond(&pool, bond_b).await.unwrap();
+
+        let found_a = find_active_bond_by_taker(&pool, order_id, &"a".repeat(64))
+            .await
+            .unwrap()
+            .expect("bond A present");
+        assert_eq!(found_a.id, created_a.id);
+
+        let found_b = find_active_bond_by_taker(&pool, order_id, &"b".repeat(64))
+            .await
+            .unwrap()
+            .expect("bond B present");
+        assert_eq!(found_b.id, created_b.id);
+
+        // Unrelated pubkey returns None.
+        let missing = find_active_bond_by_taker(&pool, order_id, &"c".repeat(64))
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        // Released (terminal) bonds drop out of the lookup.
+        let mut released = created_a.clone();
+        released.state = BondState::Released.to_string();
+        update_bond(&pool, released).await.unwrap();
+        let after_release = find_active_bond_by_taker(&pool, order_id, &"a".repeat(64))
+            .await
+            .unwrap();
+        assert!(after_release.is_none());
     }
 }

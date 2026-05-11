@@ -102,6 +102,33 @@ pub struct Bond {
     pub slashed_at: Option<i64>,
     /// Timestamp when the row was created.
     pub created_at: i64,
+    /// Concurrent-bonds taker context — the master (identity) pubkey of
+    /// the prospective taker. Stashed here while the bond races to
+    /// `Locked` because the order's `master_buyer_pubkey` /
+    /// `master_seller_pubkey` would otherwise flicker between concurrent
+    /// takers. Copied onto the order at lock-time.
+    pub taker_identity: Option<String>,
+    /// Concurrent-bonds taker context — the trade index from the take
+    /// message. Copied onto the order's `trade_index_buyer` /
+    /// `trade_index_seller` at lock-time.
+    pub taker_trade_index: Option<i64>,
+    /// Concurrent-bonds taker context — the buyer payout invoice
+    /// supplied by the taker (sell-order takes only). Copied onto
+    /// `order.buyer_invoice` at lock-time.
+    pub taker_invoice: Option<String>,
+    /// Concurrent-bonds taker context — fiat amount this take committed
+    /// to for range orders. Copied onto `order.fiat_amount` at lock-time.
+    pub taker_fiat_amount: Option<i64>,
+    /// Concurrent-bonds taker context — the per-bond pricing snapshot
+    /// for market-priced range orders. Copied onto `order.amount` at
+    /// lock-time so the winner's quote is the one the trade uses.
+    pub taker_amount: Option<i64>,
+    /// Concurrent-bonds taker context — per-bond Mostro fee snapshot.
+    /// Copied onto `order.fee` at lock-time.
+    pub taker_fee: Option<i64>,
+    /// Concurrent-bonds taker context — per-bond dev-fee snapshot.
+    /// Copied onto `order.dev_fee` at lock-time.
+    pub taker_dev_fee: Option<i64>,
 }
 
 impl Bond {
@@ -132,6 +159,13 @@ impl Bond {
             released_at: None,
             slashed_at: None,
             created_at: Utc::now().timestamp(),
+            taker_identity: None,
+            taker_trade_index: None,
+            taker_invoice: None,
+            taker_fiat_amount: None,
+            taker_amount: None,
+            taker_fee: None,
+            taker_dev_fee: None,
         }
     }
 }

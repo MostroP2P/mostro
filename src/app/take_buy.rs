@@ -1,14 +1,14 @@
 use crate::app::bond;
-use crate::app::bond::supersede_prior_taker_bonds;
+use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
 use crate::util::{
-    get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee, get_order, show_hold_invoice,
+    enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
+    get_order, show_hold_invoice,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx_crud::Crud;
 
 pub async fn take_buy_action(
     ctx: &AppContext,
@@ -43,23 +43,62 @@ pub async fn take_buy_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
-    // Anti-abuse bond (Phase 1): release any prior taker's still-
-    // `Requested` bond before this take proceeds, so a malicious user
-    // can't block the order by abandoning the bond invoice. A `Locked`
-    // prior bond means the trade is already committed and the helper
-    // returns `PendingOrderExists`. Done before the market-price
-    // recomputation below so re-takes of API-priced orders see a fresh
-    // quote.
+    // Anti-abuse bond (Phase 1, concurrent-bonds model). The take
+    // handler doesn't release prior bonds at retake-time anymore —
+    // multiple `Requested` taker bonds coexist on the order and the
+    // first to reach `Locked` wins. We still need three guards here:
+    //   1. A `Locked` bond already on the order means the trade is
+    //      committed; reject with `PendingOrderExists`.
+    //   2. The sender's own pubkey already has a `Requested` bond on
+    //      this order → idempotent retry: re-send the same
+    //      `PayInvoice` DM and return.
+    //   3. Otherwise fall through and create a fresh bond row.
+    // We do *not* mutate the order's taker fields under the bond
+    // path; that context lives on the bond row's `taker_*` columns
+    // until the winning bond locks and
+    // `on_bond_invoice_accepted` promotes it onto the order.
     let bond_required = bond::taker_bond_required();
-    let superseded = if bond_required {
-        supersede_prior_taker_bonds(pool, order.id, event.sender).await?
-    } else {
-        0
-    };
-    if superseded > 0 && order.price_from_api {
-        order.amount = 0;
-        order.fee = 0;
-        order.dev_fee = 0;
+    if bond_required {
+        let active = crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await?;
+        if active
+            .iter()
+            .any(|b| b.state == crate::app::bond::BondState::Locked.to_string())
+        {
+            return Err(MostroCantDo(CantDoReason::PendingOrderExists));
+        }
+        let sender_str = event.sender.to_string();
+        if let Some(existing) = active.iter().find(|b| b.pubkey == sender_str) {
+            if let Some(bolt11) = existing.payment_request.clone() {
+                let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
+                let bond_small = SmallOrder::new(
+                    Some(order.id),
+                    Some(order_kind),
+                    Some(Status::Pending),
+                    existing.amount_sats,
+                    order.fiat_code.clone(),
+                    order.min_amount,
+                    order.max_amount,
+                    existing.taker_fiat_amount.unwrap_or(order.fiat_amount),
+                    order.payment_method.clone(),
+                    order.premium,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                enqueue_order_msg(
+                    request_id,
+                    Some(order.id),
+                    Action::PayInvoice,
+                    Some(Payload::PaymentRequest(Some(bond_small), bolt11, None)),
+                    event.sender,
+                    existing.taker_trade_index,
+                )
+                .await;
+            }
+            return Ok(());
+        }
     }
 
     // Get the fiat amount requested by the user for range orders
@@ -92,8 +131,7 @@ pub async fn take_buy_action(
     let seller_pubkey = event.sender;
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-    // Add seller identity and trade index to the order
-    order.master_seller_pubkey = Some(event.identity.to_string());
+    // Resolve the trade index for this take (or 0 when identity == sender).
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
         None => {
@@ -104,42 +142,37 @@ pub async fn take_buy_action(
             }
         }
     };
-    order.trade_index_seller = Some(trade_index);
 
-    // Timestamp the order take time
-    order.set_timestamp_now();
-
-    // Update trade index only after all checks are done
+    // Update trade index only after all checks are done. We bump
+    // per-take (regardless of who wins the bond race) so the user's
+    // monotonic trade-index counter stays consistent across attempts.
     update_user_trade_index(pool, event.identity.to_string(), trade_index)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Anti-abuse bond (Phase 1): if the operator opted into a taker bond,
-    // intercept the take here. We persist the partially-populated order
-    // (status stays `Pending`) and request the bond. The trade hold
-    // invoice is created later — once the bond locks — by the bond
-    // subscriber's continuation in `bond::flow::resume_take_after_bond`.
+    // Concurrent-bonds path: stash this take's context on the bond
+    // row, leave the order untouched. The winning bond's
+    // `on_bond_invoice_accepted` callback will copy the `taker_*`
+    // snapshot onto the order at lock-time and drive the trade flow.
     if bond_required {
-        // Stash the seller (taker) trade pubkey so the post-bond
-        // continuation can resume `show_hold_invoice` with the same
-        // arguments the legacy path would have used.
-        order.seller_pubkey = Some(seller_pubkey.to_string());
-
-        let persisted = order
-            .update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        bond::request_taker_bond(
-            pool,
-            &persisted,
-            seller_pubkey,
-            request_id,
-            Some(trade_index),
-        )
-        .await?;
+        let taker_ctx = TakerContext {
+            identity: event.identity.to_string(),
+            trade_index,
+            buyer_invoice: None,
+            fiat_amount: order.fiat_amount,
+            amount: order.amount,
+            fee: order.fee,
+            dev_fee: order.dev_fee,
+        };
+        bond::request_taker_bond(pool, &order, seller_pubkey, request_id, taker_ctx).await?;
         return Ok(());
     }
+
+    // Non-bond path: legacy take. Persist the taker fields on the
+    // order before driving the trade hold invoice.
+    order.master_seller_pubkey = Some(event.identity.to_string());
+    order.trade_index_seller = Some(trade_index);
+    order.set_timestamp_now();
 
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(

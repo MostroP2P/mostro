@@ -11,6 +11,19 @@
 //! custody end-to-end without any user funds at risk if Mostro mis-judges
 //! the situation.
 //!
+//! Concurrent taker bonds (see `docs/ANTI_ABUSE_BOND.md`). Multiple
+//! `Requested` taker bonds may coexist on a single order. Each take
+//! creates a new bond row alongside any prior `Requested` rows; the
+//! take handler does **not** mutate the order's taker fields
+//! (`buyer_pubkey` / `seller_pubkey`, identities, per-take pricing,
+//! buyer_invoice). That deferred context lives in the bond row's
+//! `taker_*` columns until one bond wins the lock race —
+//! [`on_bond_invoice_accepted`] promotes the winner's columns onto the
+//! order, cancels every other still-`Requested` bond on the order,
+//! and DMs each loser `Action::Canceled`. A malicious taker who never
+//! pays their bond does not block the order book: their HTLC expires
+//! on its own LND-side TTL and the bond is released.
+//!
 //! Protocol note: `mostro-core` 0.10.0 does not yet expose
 //! `Action::PayBondInvoice` / `Status::WaitingTakerBond`. Phase 1 takes the
 //! "Alternative" path documented in §6.2 of `docs/ANTI_ABUSE_BOND.md`:
@@ -60,6 +73,35 @@ pub fn taker_bond_required() -> bool {
         .is_some_and(|cfg| cfg.apply_to.applies_to_taker())
 }
 
+/// Per-take context that the take handler computed locally and now
+/// stashes on the bond row instead of mutating the order.
+///
+/// Under concurrent taker bonds (see `docs/ANTI_ABUSE_BOND.md`), N
+/// prospective takers may have outstanding `Requested` bonds on the
+/// same order. The order row therefore can't carry "this take's"
+/// pubkey / invoice / per-take pricing until exactly one bond wins
+/// the lock race — `on_bond_invoice_accepted` copies the winning
+/// bond's `taker_*` columns onto the order at that point.
+#[derive(Debug, Clone)]
+pub struct TakerContext {
+    /// Identity (master) pubkey of the taker.
+    pub identity: String,
+    /// Trade index from the take message.
+    pub trade_index: i64,
+    /// Buyer payout invoice supplied by the taker (sell-order takes
+    /// only; `None` for buy-order takes).
+    pub buyer_invoice: Option<String>,
+    /// Fiat amount this take committed to (matters for range orders).
+    pub fiat_amount: i64,
+    /// Sats amount this take committed to. For market-priced range
+    /// orders this is the per-bond quote snapshot.
+    pub amount: i64,
+    /// Mostro fee snapshot for this take.
+    pub fee: i64,
+    /// Dev fee snapshot for this take.
+    pub dev_fee: i64,
+}
+
 /// Create a hold invoice for the taker's bond, persist a `Bond` row in
 /// `Requested`, ship the bolt11 to the taker, and start the LND
 /// subscriber that flips the row to `Locked` once the taker pays.
@@ -67,12 +109,17 @@ pub fn taker_bond_required() -> bool {
 /// On any failure inside this function the bond row may exist in
 /// `Requested` with no LND counterpart — that's fine: Phase 1's
 /// "always release" guarantee covers it on the next exit.
+///
+/// Under concurrent taker bonds, `taker_ctx` carries the per-take
+/// context (taker pubkey is already on the bond row; identity, trade
+/// index, per-bond pricing, etc. live in `taker_*` columns) so the
+/// order row stays unmutated until the winning bond locks.
 pub async fn request_taker_bond(
     pool: &Pool<Sqlite>,
     order: &Order,
     taker_pubkey: PublicKey,
     request_id: Option<u64>,
-    trade_index: Option<i64>,
+    taker_ctx: TakerContext,
 ) -> Result<Bond, MostroError> {
     let cfg = Settings::get_bond().ok_or_else(|| {
         MostroInternalErr(ServiceError::UnexpectedError(
@@ -80,7 +127,10 @@ pub async fn request_taker_bond(
         ))
     })?;
 
-    let amount = compute_bond_amount(order.amount, cfg);
+    // Bond amount is derived from the per-take sats amount (not
+    // `order.amount`), so concurrent takers on a market-priced range
+    // order each post a bond sized to their own quote.
+    let amount = compute_bond_amount(taker_ctx.amount, cfg);
     let memo = format!("Bond for Mostro order {}", order.id);
 
     let mut ln_client = LndConnector::new().await?;
@@ -93,6 +143,13 @@ pub async fn request_taker_bond(
     bond.hash = Some(bytes_to_string(&hash));
     bond.preimage = Some(bytes_to_string(&preimage));
     bond.payment_request = Some(invoice_resp.payment_request.clone());
+    bond.taker_identity = Some(taker_ctx.identity.clone());
+    bond.taker_trade_index = Some(taker_ctx.trade_index);
+    bond.taker_invoice = taker_ctx.buyer_invoice.clone();
+    bond.taker_fiat_amount = Some(taker_ctx.fiat_amount);
+    bond.taker_amount = Some(taker_ctx.amount);
+    bond.taker_fee = Some(taker_ctx.fee);
+    bond.taker_dev_fee = Some(taker_ctx.dev_fee);
 
     let bond = create_bond(pool, bond).await?;
 
@@ -114,7 +171,7 @@ pub async fn request_taker_bond(
         order.fiat_code.clone(),
         order.min_amount,
         order.max_amount,
-        order.fiat_amount,
+        taker_ctx.fiat_amount,
         order.payment_method.clone(),
         order.premium,
         None,
@@ -156,7 +213,7 @@ pub async fn request_taker_bond(
             None,
         )),
         taker_pubkey,
-        trade_index,
+        Some(taker_ctx.trade_index),
     )
     .await;
 
@@ -359,61 +416,6 @@ pub async fn release_bonds_for_order_or_warn(
     }
 }
 
-/// Make the order takeable again when a prior taker hasn't paid their
-/// bond yet.
-///
-/// Called from `take_buy_action` / `take_sell_action` when a new taker
-/// arrives for an order that still carries an active bond from a
-/// previous take. Without this, a malicious user could keep an order
-/// in `Pending` indefinitely by taking it and never paying — see issue
-/// in <https://github.com/MostroP2P/mostro> (taker can DoS orders by
-/// abandoning the bond invoice).
-///
-/// Behaviour:
-/// - If any active bond is `Locked`, the trade is already committed to
-///   that taker — return `PendingOrderExists`.
-/// - Otherwise (only `Requested` bonds), cancel each prior bond's hold
-///   invoice and notify the prior taker that their take was
-///   superseded.
-///
-/// Bonds belonging to the new taker themselves (same `pubkey`) are
-/// also released here: a single user retaking should also start with a
-/// fresh bond invoice.
-pub async fn supersede_prior_taker_bonds(
-    pool: &Pool<Sqlite>,
-    order_id: Uuid,
-    new_taker: PublicKey,
-) -> Result<usize, MostroError> {
-    let existing = find_active_bonds_for_order(pool, order_id).await?;
-    if existing
-        .iter()
-        .any(|b| b.state == BondState::Locked.to_string())
-    {
-        return Err(MostroCantDo(CantDoReason::PendingOrderExists));
-    }
-    let new_taker_str = new_taker.to_string();
-    let mut superseded = 0usize;
-    for bond in existing.iter() {
-        if let Err(e) = release_bond(pool, bond).await {
-            warn!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "supersede_prior_taker_bonds: failed to release bond ({}); aborting new take",
-                e
-            );
-            return Err(e);
-        }
-        superseded += 1;
-        if bond.pubkey != new_taker_str {
-            if let Ok(prior_pk) = PublicKey::from_str(&bond.pubkey) {
-                enqueue_order_msg(None, Some(order_id), Action::Canceled, None, prior_pk, None)
-                    .await;
-            }
-        }
-    }
-    Ok(superseded)
-}
-
 /// Spawn the LND subscriber for a bond hold invoice. The subscriber
 /// transitions the bond row through `Locked` / `Released` based on the
 /// invoice state and, on `Locked`, resumes the original take flow.
@@ -490,21 +492,41 @@ pub async fn resubscribe_active_bonds(pool: &Arc<Pool<Sqlite>>) -> Result<(), Mo
     Ok(())
 }
 
-/// Subscriber callback for `InvoiceState::Accepted`: bond is locked.
+/// Subscriber callback for `InvoiceState::Accepted`: a taker has just
+/// locked their bond hold invoice.
 ///
-/// Drives the bond from `Requested` to `Locked` via a conditional
-/// `UPDATE`, then — independently of whether *this* call won the
-/// transition — attempts to resume the take flow if (a) the bond is
-/// `Locked` and (b) the order is still `Pending`.
+/// Under concurrent taker bonds N prospective takers may have
+/// outstanding `Requested` rows on the same order. The first bond to
+/// reach `Locked` wins; this function is the chokepoint that decides
+/// the winner and tears down the losers.
 ///
-/// Decoupling the bond-state transition from the resume retry means a
+/// Algorithm:
+/// 1. Atomically attempt `Requested → Locked` for this bond, **guarded
+///    by `NOT EXISTS (… another bond on the same order already
+///    Locked)`**. Exactly one concurrent firing can win per order; if
+///    two `Accepted` events arrive in the same window, only one
+///    UPDATE will affect a row.
+/// 2. On `rows_affected == 0`, re-read the bond's current state to
+///    distinguish a *duplicate firing for the already-`Locked` bond*
+///    (LND reconnect / restart resubscriber, where we should fall
+///    through and retry the resume) from a *lost race* (another bond
+///    on this order locked first, where we cancel our own HTLC,
+///    notify our taker, and exit).
+/// 3. On `rows_affected == 1` (we won), iterate every other still-
+///    `Requested` bond on the order, release each (cancels the LND
+///    hold invoice + marks `Released`), and DM `Action::Canceled` to
+///    each losing taker.
+/// 4. Copy the winning bond's `taker_*` columns onto the order row
+///    (pubkeys, identity, trade index, per-bond pricing, optional
+///    buyer invoice), then call `resume_take_after_bond` to drive
+///    the take into the trade-flow status.
+///
+/// The state transition and the resume are decoupled (as before), so a
 /// transient resume failure (LND/DB/Nostr blip while creating the
-/// trade hold invoice) doesn't leave the order stuck: the next
-/// `Accepted` delivery — or the restart resubscriber — will retry the
-/// continuation as long as both conditions still hold. Conversely,
-/// if the order has moved out of `Pending` (resume already succeeded,
-/// or maker/admin canceled in the meantime) the resume is skipped, so
-/// we never reactivate a canceled order.
+/// trade hold invoice) doesn't leave the order stuck — the next
+/// `Accepted` redelivery, or the restart resubscriber, retries the
+/// continuation as long as the bond is still `Locked` and the order is
+/// still `Pending`.
 async fn on_bond_invoice_accepted(
     hash: &str,
     pool: &Pool<Sqlite>,
@@ -518,27 +540,31 @@ async fn on_bond_invoice_accepted(
         }
     };
 
-    // Atomic Requested → Locked transition. Concurrent firings — LND
-    // reconnect, the restart-time resubscriber, etc. — race here and
-    // exactly one wins; the others see `rows_affected == 0` and fall
-    // through to the post-transition retry logic below.
+    // Atomic Requested → Locked with concurrent-bonds guard. Exactly
+    // one bond can win per order — if two `Accepted` events arrive in
+    // the same window, the loser's UPDATE returns `rows_affected = 0`.
     let now = Utc::now().timestamp();
-    let result =
-        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Locked.to_string())
-            .bind(now)
-            .bind(bond.id)
-            .bind(BondState::Requested.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    if result.rows_affected() == 1 {
-        info!("Bond {} locked for order {}", bond.id, bond.order_id);
-    }
+    let result = sqlx::query(
+        "UPDATE bonds SET state = ?, locked_at = ? \
+         WHERE id = ? AND state = ? \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM bonds b2 \
+             WHERE b2.order_id = ? AND b2.state = ? AND b2.id != ? \
+           )",
+    )
+    .bind(BondState::Locked.to_string())
+    .bind(now)
+    .bind(bond.id)
+    .bind(BondState::Requested.to_string())
+    .bind(bond.order_id)
+    .bind(BondState::Locked.to_string())
+    .bind(bond.id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Re-read the bond so a concurrent release (Locked → Released) is
-    // visible: in that case there's nothing to resume.
+    // visible.
     let current = match find_bond_by_hash(pool, hash).await? {
         Some(b) => b,
         None => return Ok(()),
@@ -553,9 +579,63 @@ async fn on_bond_invoice_accepted(
             return Ok(());
         }
     };
+
+    if result.rows_affected() == 0 && current_state != BondState::Locked {
+        // We did not win the lock. Either another bond on this order
+        // beat us to it, or our row was released between the UPDATE
+        // and the re-read. Cancel our own HTLC, notify our taker, and
+        // exit. `release_bond` is idempotent for terminal states, so
+        // safe even if a parallel path already marked us Released.
+        info!(
+            "Bond {} lost concurrent-bonds race (current state={}) — releasing and notifying taker",
+            current.id, current.state
+        );
+        if !current_state.is_terminal() {
+            if let Err(e) = release_bond(pool, &current).await {
+                warn!(
+                    bond_id = %current.id,
+                    "release_bond on race-loser failed: {}", e
+                );
+            }
+        }
+        notify_loser(&current).await;
+        return Ok(());
+    }
+
+    if result.rows_affected() == 1 {
+        info!("Bond {} locked for order {}", bond.id, bond.order_id);
+
+        // We just won. Tear down every other still-`Requested` bond on
+        // this order: cancel the LND hold invoice (so the loser
+        // taker's funds aren't held) and DM them `Action::Canceled`.
+        let losers = match find_active_bonds_for_order(pool, current.order_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    order_id = %current.order_id,
+                    "could not enumerate losing bonds after lock: {}", e
+                );
+                Vec::new()
+            }
+        };
+        for loser in losers
+            .iter()
+            .filter(|b| b.id != current.id && b.state == BondState::Requested.to_string())
+        {
+            if let Err(e) = release_bond(pool, loser).await {
+                warn!(
+                    bond_id = %loser.id,
+                    "failed to release losing concurrent bond: {}", e
+                );
+            }
+            notify_loser(loser).await;
+        }
+    }
+
+    // current_state == Locked at this point: either we just won, or a
+    // duplicate firing for our already-locked bond. Fall through to
+    // the resume retry.
     if current_state != BondState::Locked {
-        // Released / Slashed / Failed / Requested-still-but-something-
-        // else-is-wrong: nothing to resume on this firing.
         return Ok(());
     }
 
@@ -581,18 +661,91 @@ async fn on_bond_invoice_accepted(
         return Ok(());
     }
 
+    // Promote the winning bond's `taker_*` context onto the order row.
+    // Under concurrent bonds the take handler deliberately did not
+    // touch these fields (so racing takers couldn't clobber each
+    // other); now that we know the winner, copy their snapshot.
+    let order = promote_taker_context_to_order(pool, order, &current).await?;
+
     let my_keys = get_keys()?;
     resume_take_after_bond(pool, order, &my_keys, request_id).await
 }
 
-/// Subscriber callback for `InvoiceState::Canceled`: bond never locked
-/// (taker abandoned the invoice, or LND auto-canceled on expiration).
+/// DM the taker of a losing concurrent bond that their take was
+/// cancelled because another taker locked their bond first.
+async fn notify_loser(bond: &Bond) {
+    if let Ok(taker_pk) = PublicKey::from_str(&bond.pubkey) {
+        enqueue_order_msg(
+            None,
+            Some(bond.order_id),
+            Action::Canceled,
+            None,
+            taker_pk,
+            None,
+        )
+        .await;
+    }
+}
+
+/// Copy the winning bond's deferred taker context onto the order row.
 ///
-/// Phase 1 keeps the order untouched: it stays `Pending` with the taker
-/// fields populated. The maker's order remains discoverable via the
-/// existing Nostr event. A follow-up phase (or operator action) can
-/// reset the order if needed; for Phase 1, "always release" is the only
-/// guarantee we owe.
+/// Called from `on_bond_invoice_accepted` once a bond wins the
+/// `Requested → Locked` race. The take handler did not touch the
+/// order's taker fields at take-time (under concurrent bonds the
+/// "owner" is undefined until the lock), so we populate them here
+/// from the bond's `taker_*` columns and persist before
+/// `resume_take_after_bond` reads them back via
+/// `order.get_buyer_pubkey()` / `order.get_seller_pubkey()`.
+async fn promote_taker_context_to_order(
+    pool: &Pool<Sqlite>,
+    mut order: Order,
+    bond: &Bond,
+) -> Result<Order, MostroError> {
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    match kind {
+        mostro_core::order::Kind::Buy => {
+            // Taker is the seller side of a buy order.
+            order.seller_pubkey = Some(bond.pubkey.clone());
+            order.master_seller_pubkey = bond.taker_identity.clone();
+            order.trade_index_seller = bond.taker_trade_index;
+        }
+        mostro_core::order::Kind::Sell => {
+            // Taker is the buyer side of a sell order.
+            order.buyer_pubkey = Some(bond.pubkey.clone());
+            order.master_buyer_pubkey = bond.taker_identity.clone();
+            order.trade_index_buyer = bond.taker_trade_index;
+            order.buyer_invoice = bond.taker_invoice.clone();
+        }
+    }
+    if let Some(v) = bond.taker_fiat_amount {
+        order.fiat_amount = v;
+    }
+    if let Some(v) = bond.taker_amount {
+        order.amount = v;
+    }
+    if let Some(v) = bond.taker_fee {
+        order.fee = v;
+    }
+    if let Some(v) = bond.taker_dev_fee {
+        order.dev_fee = v;
+    }
+    order.set_timestamp_now();
+    order
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Subscriber callback for `InvoiceState::Canceled`: bond never locked
+/// (taker abandoned the invoice, LND auto-canceled on expiration, or
+/// the bond was cancelled by `release_bond` because another concurrent
+/// taker locked first).
+///
+/// Marks the bond `Released`. The order row carries no taker fields
+/// during the bond window under concurrent bonds, so there's nothing
+/// to clear on the order — it stays `Pending` and discoverable via
+/// the existing Nostr event, takeable by anyone who still has an
+/// outstanding bond or by a fresh taker.
 async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(), MostroError> {
     let bond = match find_bond_by_hash(pool, hash).await? {
         Some(b) => b,
@@ -621,11 +774,14 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
     Ok(())
 }
 
-/// Resume the take flow after the bond locks.
+/// Resume the take flow after the winning bond locks.
 ///
-/// The taker side already populated all trade fields on the order before
-/// requesting the bond, so this function only needs to drive the trade
-/// hold invoice / payout-invoice request that `take_*_action` deferred.
+/// The take handler deferred the trade hold-invoice step under
+/// concurrent bonds; the winning bond's `taker_*` columns have just
+/// been promoted onto the order by `promote_taker_context_to_order`,
+/// so the order now has its `buyer_pubkey` / `seller_pubkey` /
+/// `buyer_invoice` / per-take pricing in place and we can drive the
+/// trade flow exactly as the legacy path would have.
 async fn resume_take_after_bond(
     pool: &Pool<Sqlite>,
     mut order: Order,
@@ -707,6 +863,20 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
+        for stmt in include_str!("../../../migrations/20260511180000_bond_taker_context.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && s.lines()
+                        .any(|l| !l.trim_start().starts_with("--") && !l.trim().is_empty())
+            })
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("bond taker context migration");
+        }
         pool
     }
 
@@ -802,72 +972,88 @@ mod tests {
         assert!(!taker_bond_required());
     }
 
-    fn fake_pubkey() -> PublicKey {
-        Keys::generate().public_key()
-    }
-
     #[tokio::test]
-    async fn supersede_releases_prior_requested_bond() {
-        // A new taker arriving while a prior taker has only requested
-        // (not yet locked) the bond must release the prior bond and
-        // return the count, so the order is takeable again.
+    async fn lock_race_guard_admits_only_one_winner() {
+        // With bonds A and B both Requested on the same order, the
+        // first conditional UPDATE that runs flips A to Locked; the
+        // second UPDATE for B sees the `NOT EXISTS … Locked` guard
+        // fail and affects zero rows. This is the concurrent-bonds
+        // chokepoint: exactly one bond per order may transition to
+        // Locked.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id).await;
-        let mut prior = make_bond(order_id, BondState::Requested);
-        prior.hash = None; // skip LND in the unit-test harness
-        prior.pubkey = "b".repeat(64);
-        create_bond(&pool, prior).await.unwrap();
 
-        let count = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey())
+        let mut a = make_bond(order_id, BondState::Requested);
+        a.hash = Some("a".repeat(64));
+        a.pubkey = "a".repeat(64);
+        let bond_a = create_bond(&pool, a).await.unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.hash = Some("b".repeat(64));
+        b.pubkey = "b".repeat(64);
+        let bond_b = create_bond(&pool, b).await.unwrap();
+
+        // Helper that runs the same SQL as `on_bond_invoice_accepted`.
+        async fn try_lock(pool: &Pool<Sqlite>, bond: &Bond) -> u64 {
+            sqlx::query(
+                "UPDATE bonds SET state = ?, locked_at = ? \
+                 WHERE id = ? AND state = ? \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM bonds b2 \
+                     WHERE b2.order_id = ? AND b2.state = ? AND b2.id != ? \
+                   )",
+            )
+            .bind(BondState::Locked.to_string())
+            .bind(Utc::now().timestamp())
+            .bind(bond.id)
+            .bind(BondState::Requested.to_string())
+            .bind(bond.order_id)
+            .bind(BondState::Locked.to_string())
+            .bind(bond.id)
+            .execute(pool)
             .await
-            .expect("supersede should succeed");
-        assert_eq!(count, 1);
+            .unwrap()
+            .rows_affected()
+        }
+
+        // A goes first and wins.
+        assert_eq!(try_lock(&pool, &bond_a).await, 1);
+        // B's UPDATE sees A already Locked → guarded out.
+        assert_eq!(try_lock(&pool, &bond_b).await, 0);
 
         let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
-        assert!(
-            active.is_empty(),
-            "prior Requested bond must be released so the order is takeable again"
-        );
+        let states: Vec<_> = active.iter().map(|b| (b.id, b.state.clone())).collect();
+        assert!(states
+            .iter()
+            .any(|(id, s)| *id == bond_a.id && s == &BondState::Locked.to_string()));
+        assert!(states
+            .iter()
+            .any(|(id, s)| *id == bond_b.id && s == &BondState::Requested.to_string()));
     }
 
     #[tokio::test]
-    async fn supersede_rejects_when_prior_bond_locked() {
-        // A `Locked` prior bond means the trade is already committed to
-        // that taker; a new take must back off rather than strand the
-        // committed taker's funds.
+    async fn concurrent_requested_bonds_coexist() {
+        // Multiple Requested bonds on the same order coexist — they
+        // are not released at retake-time (that was the Phase 1
+        // supersede behaviour, now removed). Cancellation of the
+        // losers happens at lock-time via on_bond_invoice_accepted.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id).await;
-        let mut prior = make_bond(order_id, BondState::Locked);
-        prior.hash = None;
-        prior.pubkey = "b".repeat(64);
-        create_bond(&pool, prior).await.unwrap();
 
-        let result = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey()).await;
-        assert!(matches!(
-            result,
-            Err(MostroCantDo(CantDoReason::PendingOrderExists))
-        ));
+        for tag in ['a', 'b', 'c'] {
+            let mut bond = make_bond(order_id, BondState::Requested);
+            bond.pubkey = tag.to_string().repeat(64);
+            bond.hash = Some(tag.to_string().repeat(64));
+            create_bond(&pool, bond).await.unwrap();
+        }
 
-        // The locked bond must NOT be touched.
         let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].state, BondState::Locked.to_string());
-    }
-
-    #[tokio::test]
-    async fn supersede_with_no_prior_bonds_is_noop() {
-        // The first taker must not be charged a "supersede" cost: when
-        // no prior bonds exist, the helper returns 0 cleanly.
-        let pool = setup_pool().await;
-        let order_id = Uuid::new_v4();
-        insert_order(&pool, order_id).await;
-
-        let count = supersede_prior_taker_bonds(&pool, order_id, fake_pubkey())
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(active.len(), 3);
+        assert!(active
+            .iter()
+            .all(|b| b.state == BondState::Requested.to_string()));
     }
 
     fn ln_err(msg: &str) -> MostroError {

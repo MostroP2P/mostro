@@ -60,16 +60,23 @@ change.
    under [NIP-69](https://nips.nostr.com/69)'s four-bucket model
    (`pending` / `canceled` / `in-progress` / `success`). A malicious
    or absent taker cannot indefinitely hold an order off the book by
-   initiating a take and then never paying the bond. The
-   `supersede_prior_taker_bonds` mechanism (Phase 1) cancels stale
-   `Requested` bonds when a fresh take arrives; the **first bond to
-   reach `Locked` wins**, and only then does the order transition to
-   a trade-flow status (`WaitingPayment` / `WaitingBuyerInvoice`,
-   which map to NIP-69 `in-progress`). Any internal status the daemon
-   adds to distinguish "matched, awaiting bond" from "advertised, no
-   taker yet" (e.g. `Status::WaitingTakerBond` in §6.5) must map to
-   NIP-69 `pending` in `nip33::create_status_tags`, so external
-   observers still see an available order.
+   initiating a take and then never paying the bond. **Multiple
+   `Requested` bonds may coexist on a single order** — each fresh
+   take creates a new bond row alongside any prior `Requested`
+   rows, and the **first bond to reach `Locked` wins**. At the
+   moment of the winning lock, every other `Requested` bond on the
+   order is cancelled (its hold invoice is released and the prior
+   taker is notified with `Action::Canceled`) and only then does
+   the order transition to a trade-flow status (`WaitingPayment` /
+   `WaitingBuyerInvoice`, which map to NIP-69 `in-progress`). A
+   malicious taker who never pays does not block anyone: their
+   bond invoice expires on the LND-side timeout, and any
+   concurrent taker can still race them by paying their own bond.
+   Any internal status the daemon adds to distinguish "matched,
+   awaiting bond" from "advertised, no taker yet" (e.g.
+   `Status::WaitingTakerBond` in §6.5) must map to NIP-69
+   `pending` in `nip33::create_status_tags`, so external observers
+   still see an available order.
 
 ## 3. Configuration surface (final shape)
 
@@ -140,10 +147,13 @@ This feature touches two distinct axes that must not be conflated:
 - **Maker / taker — *who posted the bond, and when.*** The bond is
   requested at order-creation time (maker) or at take time (taker).
   `apply_to` is a maker/taker switch. `BondRole` in the data model is a
-  maker/taker enum. Phase 1's "supersede on retake" and Phase 5's
-  "publish-after-bond-locks" gating are genuinely maker/taker concerns
-  because they are about *order-flow* actions that only one role can
-  perform.
+  maker/taker enum. Phase 1's "concurrent taker bonds, first-to-lock
+  wins" semantics and Phase 5's "publish-after-bond-locks" gating are
+  genuinely maker/taker concerns because they are about *order-flow*
+  actions that only one role can perform. The maker bond is 1-to-1
+  with the order (there is only ever one maker); the taker side
+  admits N concurrent `Requested` bond rows per order until one
+  locks.
 - **Buyer / seller — *whose action triggers a slash.*** All trade-flow
   duties (paying the hold invoice, providing the buyer invoice, sending
   fiat, releasing) are buyer/seller duties. Timeout responsibility maps
@@ -328,20 +338,29 @@ risk to users.
   maker-side, including pending-order maker cancels), `admin_settle_action`,
   `admin_cancel_action`, and `scheduler::job_cancel_orders`. Slashing
   hooks are intentionally absent and land in Phase 2+.
-- `take_buy_action` / `take_sell_action` call
-  `bond::supersede_prior_taker_bonds` before persisting the new take. A
-  still-`Requested` prior bond is released (its hold invoice cancelled)
-  so a malicious taker can't keep an order in `Pending` by abandoning the
-  bond invoice — anyone may re-take and the first bond to lock wins. A
-  `Locked` prior bond is treated as committed and the new take is
-  rejected with `PendingOrderExists`.
+- `take_buy_action` / `take_sell_action` originally shipped with
+  `bond::supersede_prior_taker_bonds`, which cancelled any prior
+  `Requested` bond at retake time. Phase 1.5 (§6.5) replaces that
+  with **concurrent taker bonds**: a fresh take creates a new bond
+  row alongside any prior `Requested` rows; the **first bond to
+  reach `Locked` wins** and the cancellation of the losers happens
+  at lock-time, not at retake-time. A `Locked` prior bond still
+  blocks new takes with `PendingOrderExists`. This implementation
+  note is preserved for historical context — once Phase 1.5 ships,
+  `supersede_prior_taker_bonds` is removed and the take handler's
+  only pre-persist check is "is any bond on this order already
+  `Locked`?".
 - `cancel_action` recognises a bonded taker as authorised to cancel a
-  still-`Pending` order: when `event.sender` matches the `pubkey` of an
-  active bond on the order, the cancel routes through the existing
-  `cancel_order_by_taker` flow (release the bond, clear the taker
-  fields, republish the order). This lets a taker who took the order but
-  no longer wants to proceed back out cleanly instead of getting
-  `IsNotYourOrder`.
+  still-pre-trade order: when `event.sender` matches the `pubkey` of an
+  active `Requested` bond on the order, the cancel routes through the
+  existing `cancel_order_by_taker` flow. Under Phase 1's
+  one-bond-at-a-time invariant this releases the sole bond and resets
+  the taker fields; under Phase 1.5's concurrent-bonds semantics it
+  releases **only the sender's own bond** (other concurrent takers'
+  bonds keep their HTLCs alive — they did not cancel) and the order
+  stays in `WaitingTakerBond` if other `Requested` bonds remain. This
+  lets a taker who took the order but no longer wants to proceed back
+  out cleanly instead of getting `IsNotYourOrder`.
 - On daemon startup, `bond::resubscribe_active_bonds` re-attaches LND
   invoice subscribers for any bond rows still in `Requested` / `Locked`,
   so a restart never strands a taker who paid the bond just before the
@@ -404,18 +423,33 @@ request and the bond locking, the order's published NIP-33 status
 stays `pending` (per §2 principle 8). This is deliberate: a taker who
 never pays the bond bolt11 cannot park the order off the book. Other
 users browsing the order book continue to see it as available, and
-any of them may attempt a fresh take. Whichever bond reaches `Locked`
-first wins; prior `Requested` bonds are cancelled by
-`supersede_prior_taker_bonds`, and the prior taker is notified with
-`Action::Canceled`.
+any of them may attempt a fresh take.
+
+Under Phase 1's original semantics, a fresh take cancelled prior
+`Requested` bonds immediately via `supersede_prior_taker_bonds`, so
+a slow taker received `Action::Canceled` as soon as anyone else
+pressed "take". Phase 1.5 (§6.5) switches to **concurrent taker
+bonds**: prior bonds stay alive — every concurrent taker keeps a
+valid, payable bond invoice — and the first to actually pay (reach
+`Locked`) wins. Only at that point are the losing concurrent
+`Requested` bonds cancelled and their takers notified with
+`Action::Canceled`. The TTL on each LND hold invoice still ensures
+a malicious taker who never pays cannot block the order book
+indefinitely.
 
 What this means for clients in practice:
 
 - A client that sent `take-buy` / `take-sell` and is waiting for
   `pay-bond-invoice` may receive `Action::Canceled` instead — meaning
-  someone else paid their bond first. Surface this clearly: "Order
-  was taken by another user before you locked the bond." Don't retry
-  the take silently; the order may not be available anymore.
+  another concurrent taker locked their bond first. Surface this
+  clearly: "Order was taken by another user before your bond was
+  paid." Don't retry the take silently; the order may not be
+  available anymore.
+- Re-emitting `take-buy` / `take-sell` from the same pubkey while
+  the client's bond is still `Requested` is idempotent: the daemon
+  returns the same bolt11 instead of creating a second row for the
+  same taker. Treat duplicate `pay-bond-invoice` messages on the
+  same order as a re-send of the original, not a new bond.
 - Don't gray out / hide the order from the local order-book view just
   because the user initiated a take. Until `Locked`, the order is
   still genuinely available to everyone.
@@ -453,8 +487,10 @@ Recommended client behaviour during the Phase 1 window:
   hold invoice (e.g. relay loss, daemon restart), the bond is
   released by `bond::resubscribe_active_bonds` on restart or by the
   scheduler timeout. Clients should treat the take as "stalled, will
-  resolve" rather than retrying take-buy/take-sell, which would race
-  with `supersede_prior_taker_bonds`.
+  resolve" rather than retrying take-buy/take-sell — under
+  Phase 1.5 a re-emit from the same pubkey returns the same bolt11
+  (idempotent), under Phase 1 it would have raced with
+  `supersede_prior_taker_bonds` and reset the bond.
 
 These behaviours stay correct after Phase 1.5; the new action type
 just means method (1) becomes "match on `Action::PayBondInvoice`"
@@ -513,9 +549,54 @@ never has to lean on memo parsing in the wild.
   - `take_buy_action` / `take_sell_action` must accept takes against
     orders in **either** `Pending` or `WaitingTakerBond` — both are
     pre-trade states from the take-validation perspective.
-    `supersede_prior_taker_bonds` continues to gate "is anyone
-    already locked?" the same way it does today, independent of the
-    order status column.
+  - **Switch from supersede to concurrent bonds.** Phase 1's
+    `bond::supersede_prior_taker_bonds` helper is removed. The take
+    handler's pre-persist check shrinks to:
+    1. If `find_active_bonds_for_order` returns any bond in
+       `BondState::Locked`, reject the take with `PendingOrderExists`
+       (someone has already paid; the order is committed).
+    2. If the sender's own pubkey already has a `Requested` bond on
+       this order, return the existing `payment_request` instead of
+       creating a new row — idempotent retry.
+    3. Otherwise, create a fresh `Requested` bond row alongside any
+       prior `Requested` rows from *other* pubkeys. The other rows
+       are **not** touched.
+    The take handler must also stop persisting taker-flow fields
+    (`buyer_pubkey` / `seller_pubkey`, `master_*_pubkey`,
+    `buyer_invoice`, `trade_index_*`, range-order `fiat_amount` /
+    `amount` / `fee` / `dev_fee`) directly to the `orders` row
+    while the order is in `WaitingTakerBond`. Those fields go on
+    the bond row instead (new columns: `taker_invoice`,
+    `taker_trade_index`, `taker_identity`, `taker_fiat_amount`,
+    `taker_amount`, `taker_fee`, `taker_dev_fee`). They are copied
+    into the `orders` row by `resume_take_after_bond` at the moment
+    the winning bond locks, so the order has no "ghost" taker
+    while N concurrent bonds are racing.
+  - **First-to-lock-wins resolution.** `on_bond_invoice_accepted`
+    becomes the cancel-the-losers chokepoint. The `Requested → Locked`
+    UPDATE gains a `NOT EXISTS (SELECT 1 FROM bonds WHERE order_id = ?
+    AND state = 'Locked' AND id != ?)` guard so exactly one bond
+    can win per order — if two `Accepted` events arrive in the same
+    window, the losing UPDATE returns `rows_affected = 0` and the
+    handler cancels its own HTLC with `cancel_hold_invoice` (the
+    hold invoice is still cancelable: Mostro has not released the
+    preimage yet) and notifies its taker with `Action::Canceled`.
+    Once a bond does win, the handler iterates every other still-
+    `Requested` bond on the order, calls `release_bond` on each
+    (LND hold-invoice cancel + `BondState::Released`), and DMs
+    each loser an `Action::Canceled`. Only after this cleanup does
+    it copy the winning bond's `taker_*` context onto the order
+    and call `resume_take_after_bond`.
+  - **Migration (additive).** New migration
+    `migrations/<ts>_bond_taker_context.sql` adds the columns above
+    to the `bonds` table. All nullable, no backfill needed (Phase 0
+    bonds will not have take context; Phase 1.5 bonds always will).
+    Refresh `sqlx-data.json`.
+  - **New DB helper.** `find_active_bond_by_taker(pool, order_id,
+    taker_pubkey) -> Option<Bond>` filtering on `state IN
+    ('Requested', 'Locked')` and `pubkey = ?`. Used by the
+    idempotent retry check above and by `cancel_action` (next
+    bullet).
   - `cancel_action` must treat `WaitingTakerBond` as an alias of
     `Pending` for routing decisions. The bond is outstanding but the
     trade flow has **not** started, so the cooperative-cancel logic
@@ -526,16 +607,23 @@ never has to lean on memo parsing in the wild.
     WaitingTakerBond }`. Inside the branch the existing two-route
     logic stays:
     - **Maker self-cancel.** `cancel_pending_order_from_maker` runs
-      and the order publishes as `Status::Canceled`. Any active
-      bond row on the order (the prospective taker's bond, still in
-      `Requested`) is released as part of this — the release hook
-      is already wired into the maker-cancel path in Phase 1; only
-      the status guard needs to widen.
-    - **Taker self-cancel.** `cancel_order_by_taker` releases the
-      taker's bond, clears the taker fields, and re-publishes the
-      order. External observers see no change in NIP-33 status (it
-      was `pending` throughout per §2 principle 8); the prospective
-      taker is gone and someone else may take.
+      and the order publishes as `Status::Canceled`. **Every** active
+      bond row on the order (all concurrent prospective takers) is
+      released as part of this — the release hook is already wired
+      into the maker-cancel path in Phase 1; only the status guard
+      needs to widen.
+    - **Taker self-cancel.** `cancel_order_by_taker` releases
+      **only the sender's own bond** (looked up with
+      `find_active_bond_by_taker`). If other prospective takers
+      still have `Requested` bonds on the order, the order stays
+      in `WaitingTakerBond` and is re-published. If the cancelling
+      taker was the last one, the order drops back to `Pending`.
+      External observers see no change in NIP-33 status either way
+      (it was `pending` throughout per §2 principle 8). Since no
+      taker fields are persisted on the order during
+      `WaitingTakerBond` (per the concurrent-bonds rework above),
+      there are no "taker fields to clear" — the cancel only
+      releases the bond and republishes status.
     Without this widening the daemon falls through to the default
     `_ => NotAllowedByStatus` arm and rejects every cancel during
     the bond window — a regression vs. Phase 1, where the same
@@ -545,10 +633,15 @@ never has to lean on memo parsing in the wild.
   - On bond `Locked`, transition `WaitingTakerBond` →
     `WaitingPayment` / `WaitingBuyerInvoice` as the existing trade
     flow does (and republish NIP-33 with the real new status — at
-    that point the order is genuinely no longer takeable).
-  - On bond release before lock (taker abandons, supersede,
-    cancellation): transition `WaitingTakerBond` → `Pending` and
-    republish so any internal/external state stays consistent.
+    that point the order is genuinely no longer takeable). The
+    winning bond's `taker_*` columns are copied onto the order
+    row in the same DB transaction so the trade flow sees a
+    consistent snapshot.
+  - On bond release before lock (taker abandons, taker self-cancel,
+    or losing the lock race): if **no** other active bond remains on
+    the order, transition `WaitingTakerBond` → `Pending` and
+    republish. If other `Requested` bonds remain (a fresh concurrent
+    taker is still in flight), leave the order in `WaitingTakerBond`.
   - The trade hold invoice continues to ship as `Action::PayInvoice`
     — only the bond switches.
 - **Bump the `mostro-core` pin** in this repo's `Cargo.toml` from
@@ -580,37 +673,84 @@ never has to lean on memo parsing in the wild.
   outstanding, flips out to `WaitingPayment` /
   `WaitingBuyerInvoice` (per the existing trade flow) once the bond
   locks, and falls back to `Pending` on bond release before lock.
-- **Non-blockability test (load-bearing).** With order in status
-  `WaitingTakerBond`:
+- **Non-blockability test (load-bearing) — concurrent bonds.** With
+  order in status `WaitingTakerBond` and bond A in `Requested`:
   - `nip33::create_status_tags` returns `(true, Status::Pending)` —
     i.e. the order publishes in NIP-69's `pending` bucket, identical
     to the wire output for an order in `Pending`.
   - A second `take-buy` / `take-sell` from a different pubkey is
-    accepted: `supersede_prior_taker_bonds` cancels the prior
-    `Requested` bond, the prior taker receives `Action::Canceled`,
-    the new bond is created, and the order's status remains
-    `WaitingTakerBond` (now reflecting the new taker).
-  - Repeating the cycle N times never causes the order's NIP-69
-    bucket to leave `pending` until a bond actually `Locked`.
+    accepted: bond A **remains** in `Requested` (its hold invoice
+    is *not* cancelled), bond B is created in `Requested`,
+    `find_active_bonds_for_order` returns `[A, B]`, and bond A's
+    taker receives **no** `Action::Canceled` at this point.
+  - A third concurrent take from a third pubkey is also accepted,
+    producing bond C. `find_active_bonds_for_order` returns
+    `[A, B, C]`. The order's status remains `WaitingTakerBond`
+    throughout.
+  - Re-emitting `take-sell` from bond A's pubkey while A is still
+    `Requested` is idempotent: no new row is created, the same
+    `payment_request` is re-sent on `Action::PayBondInvoice`.
+  - When bond A's hash receives `InvoiceState::Accepted`: A
+    transitions to `Locked`; bonds B and C transition to
+    `Released` with their hold invoices cancelled via
+    `cancel_hold_invoice`; B's and C's takers each receive
+    `Action::Canceled`; A's `taker_*` columns are copied onto the
+    `orders` row; the order transitions to `WaitingPayment` /
+    `WaitingBuyerInvoice` as the existing trade flow does.
+  - The order's NIP-69 bucket never leaves `pending` until a
+    bond actually `Locked` (regardless of how many concurrent
+    takers come and go).
+- **Locked-bond gate.** Once any bond on an order reaches `Locked`,
+  any subsequent `take-buy` / `take-sell` (from any pubkey,
+  including the locking taker's) is rejected with
+  `PendingOrderExists`. Concurrent `Requested` bonds are no longer
+  permitted at that point — the trade is committed.
+- **Range order: per-bond pricing.** For a range order with
+  `price_from_api = true`, taker A takes at quote X. 30 seconds
+  later, taker B takes at quote Y (Y ≠ X because the rate moved).
+  Both bonds are `Requested`. When A's bond locks, the order's
+  `amount` / `fee` / `dev_fee` / `fiat_amount` are populated from
+  A's `taker_*` columns — i.e. quote X. Y is discarded along with
+  bond B. Confirms each bond carries its own pricing snapshot
+  rather than racing to mutate the `orders` row at take time.
+- **Lock-race: two `Accepted` events in the same window.** With
+  bonds A and B both in `Requested`, fire `on_bond_invoice_accepted`
+  for both back-to-back. The conditional UPDATE's `NOT EXISTS`
+  guard ensures exactly one transition to `Locked` succeeds. The
+  loser's handler observes `rows_affected = 0`, calls
+  `cancel_hold_invoice` on its own hash to release its taker's
+  HTLC without settling, and DMs `Action::Canceled` to its taker.
+  Net effect is identical to the staggered case; no double-lock
+  and no settled HTLC for the loser.
 - Seller-as-taker case: one `PayBondInvoice` followed by one
   `PayInvoice` on the same order, both visible on the wire as
   distinct action types — no memo parsing needed by the client.
-- **Cancel during `WaitingTakerBond` — taker self-cancel.** With the
-  order in `WaitingTakerBond` and the prospective taker's bond in
-  `Requested`, the taker sends a `cancel` action. The daemon
-  releases the bond, clears the taker fields, transitions the
-  order back to `Pending`, and republishes — `cancel_action`
-  returns `Ok(())` (not `NotAllowedByStatus`). The published
-  NIP-33 status was `pending` throughout, so external observers
-  see no transition; the order remains takeable.
+- **Cancel during `WaitingTakerBond` — taker self-cancel, lone
+  taker.** With the order in `WaitingTakerBond` and exactly one
+  prospective taker's bond in `Requested`, the taker sends a
+  `cancel` action. The daemon releases that single bond,
+  transitions the order back to `Pending`, and republishes —
+  `cancel_action` returns `Ok(())` (not `NotAllowedByStatus`).
+  The published NIP-33 status was `pending` throughout, so
+  external observers see no transition; the order remains
+  takeable.
+- **Cancel during `WaitingTakerBond` — taker self-cancel, others
+  still active.** With the order in `WaitingTakerBond` and bonds
+  A and B both in `Requested`, A's taker sends `cancel`. Bond A
+  is released; bond B remains in `Requested` and continues racing.
+  The order **stays** in `WaitingTakerBond` (does not drop to
+  `Pending` because B is still active). No `Action::Canceled` is
+  sent to B's taker. Confirms taker self-cancel is scoped to the
+  sender's own bond only.
 - **Cancel during `WaitingTakerBond` — maker self-cancel.** With the
-  order in `WaitingTakerBond` (a prospective taker is mid-bond),
-  the maker sends a `cancel` action. The daemon runs
-  `cancel_pending_order_from_maker`: the order transitions to
-  `Status::Canceled`, the prospective taker's `Requested` bond is
-  released, and the NIP-33 event republishes with
-  `s = canceled`. Confirms maker-side cancel is not blocked by a
-  pending bond.
+  order in `WaitingTakerBond` and one or more concurrent prospective
+  takers mid-bond, the maker sends a `cancel` action. The daemon
+  runs `cancel_pending_order_from_maker`: the order transitions to
+  `Status::Canceled`, **every** active prospective taker's
+  `Requested` bond is released, every prospective taker receives
+  `Action::Canceled`, and the NIP-33 event republishes with
+  `s = canceled`. Confirms maker-side cancel is not blocked by
+  pending bonds and fans out cancellation to all concurrent takers.
 - **Cancel during `WaitingTakerBond` — third-party rejected.** A
   pubkey that is neither the maker nor a bonded taker on the
   order receives `IsNotYourOrder`. Same rejection semantics as the
@@ -629,7 +769,13 @@ never has to lean on memo parsing in the wild.
   unnecessary; clients dispatch on action type alone.
 - The §2 non-blockability invariant is preserved: orders in
   `WaitingTakerBond` map to NIP-69 `pending` and re-take from a
-  different pubkey works exactly as it does in Phase 1.
+  different pubkey is accepted. The mechanics change from Phase 1
+  (immediate supersede of the prior `Requested` bond) to
+  concurrent bonds (the prior `Requested` bond stays alive; the
+  first to `Locked` wins and cancels the losers at lock-time).
+- `bond::supersede_prior_taker_bonds` is removed from
+  `src/app/bond/flow.rs`. The take handler's only pre-persist
+  check is "is any bond on this order already `Locked`?".
 - Phase 2 can rely on the clean API when it ships.
 
 ---

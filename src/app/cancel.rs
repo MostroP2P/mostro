@@ -199,17 +199,13 @@ async fn cancel_cooperative_execution_step_1(
 /// Cancel an order by the taker
 /// Cancellation path when the taker cancels a not-yet-active order.
 ///
-/// - If a hold invoice exists, cancel it (refund to seller)
-/// - Notify the taker
-/// - Reset quote-derived amounts (if any) and return order to initial state
-/// - Notify the maker/creator that the order is republished
-///
-/// The trailing bond release runs on every exit path (including early
-/// `?` returns from the inner steps) so a mid-flow failure can never
-/// leave a `Requested`/`Locked` bond row stranded for this taker.
-/// `release_bonds_for_order_or_warn` is idempotent — it only acts on
-/// rows still in active states — so re-entering it after the inner
-/// flow already released is a safe no-op.
+/// Under the concurrent-bonds model, this releases **only the sender's
+/// own bond** — other concurrent prospective takers' `Requested` bonds
+/// keep racing. The order's republish / pubkey reset / quote reset
+/// only runs when this was the **last** active bond on the order
+/// (no other bonds remain after the release); otherwise the order
+/// stays in `Pending` with the surviving bonds still in flight and
+/// the cancel is effectively scoped to a per-taker release + DM.
 async fn cancel_order_by_taker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedMessage,
@@ -220,7 +216,43 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
     let order_id = order.id;
-    let result = cancel_order_by_taker_inner(
+    let sender_str = event.sender.to_string();
+
+    // Release exactly this taker's bond. If no bond row matches (e.g.
+    // legacy non-bond order), fall through to the full taker-cancel
+    // flow — that path predates the bond and still works.
+    let sender_bond =
+        crate::app::bond::db::find_active_bond_by_taker(pool, order_id, &sender_str).await?;
+    if let Some(bond) = sender_bond.as_ref() {
+        if let Err(e) = bond::release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
+                "taker_cancel: failed to release sender's bond: {}", e
+            );
+        }
+    }
+
+    // Look at what's left on the order. If other concurrent takers
+    // still have active bonds, do NOT reset the order — they are
+    // still racing. Just DM the sender that their take is cancelled.
+    let remaining = crate::app::bond::db::find_active_bonds_for_order(pool, order_id).await?;
+    let others_remain = remaining.iter().any(|b| b.pubkey != sender_str);
+    if others_remain {
+        enqueue_order_msg(
+            request_id,
+            Some(order_id),
+            Action::Canceled,
+            None,
+            event.sender,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // No surviving bonds: run the full reset-and-republish path so
+    // the order goes back into the book exactly as before.
+    cancel_order_by_taker_inner(
         pool,
         event,
         order,
@@ -229,9 +261,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
         ln_client,
         taker_pubkey,
     )
-    .await;
-    bond::release_bonds_for_order_or_warn(pool, order_id, "taker_cancel").await;
-    result
+    .await
 }
 
 async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(

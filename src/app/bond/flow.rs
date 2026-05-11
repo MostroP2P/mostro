@@ -864,32 +864,85 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
 /// in `cancel.rs` (when the sender was the last bonded taker). Both
 /// call sites need the same "drop back to Pending if empty" logic;
 /// extracting it keeps them consistent.
+///
+/// Race-free: the status check, active-bond check, and status update
+/// run in a single conditional `UPDATE … WHERE … AND NOT EXISTS (…)`
+/// statement. A concurrent `on_bond_invoice_accepted` that flips a
+/// bond to `Locked` between our last check and the write would make
+/// the `NOT EXISTS` clause false → `rows_affected == 0` → we skip
+/// the republish. Likewise a concurrent transition out of
+/// `WaitingTakerBond` (winner promotes to `WaitingPayment`, maker
+/// cancels, etc.) is caught by the `status = 'waiting-taker-bond'`
+/// predicate.
 pub(crate) async fn maybe_drop_waiting_taker_bond(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<(), MostroError> {
-    let order = match Order::by_id(pool, order_id)
+    // Atomic compare-and-swap on (status, no active bonds). A single
+    // statement so SQLite snapshots both predicates at the same point
+    // in time.
+    let cas = sqlx::query(
+        "UPDATE orders SET status = ? \
+         WHERE id = ? AND status = ? \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM bonds \
+             WHERE order_id = ? AND state IN (?, ?) \
+           )",
+    )
+    .bind(Status::Pending.to_string())
+    .bind(order_id)
+    .bind(Status::WaitingTakerBond.to_string())
+    .bind(order_id)
+    .bind(BondState::Requested.to_string())
+    .bind(BondState::Locked.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if cas.rows_affected() == 0 {
+        // Either the order is no longer in `WaitingTakerBond`
+        // (winner / maker-cancel / admin already moved it on), or a
+        // concurrent bond is still racing. Either way we have no
+        // status transition to publish.
+        return Ok(());
+    }
+
+    // We won the transition. Republish the NIP-33 event so the
+    // orderbook reflects the new status. `update_order_event` re-reads
+    // the current row state via the supplied `&Order`, so we fetch a
+    // fresh snapshot first to avoid sending tags built from data that
+    // changed mid-flight under us. Errors are non-fatal: the DB is
+    // already at `Pending`, and the next genuine transition will
+    // refresh the published event.
+    let fresh = match Order::by_id(pool, order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
     {
         Some(o) => o,
         None => return Ok(()),
     };
-    if order.status != Status::WaitingTakerBond.to_string() {
-        return Ok(());
-    }
-    let active = find_active_bonds_for_order(pool, order_id).await?;
-    if !active.is_empty() {
-        return Ok(());
-    }
     let my_keys = get_keys()?;
-    let updated = crate::util::update_order_event(&my_keys, Status::Pending, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    match crate::util::update_order_event(&my_keys, Status::Pending, &fresh).await {
+        Ok(updated) => {
+            if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+                .bind(&updated.event_id)
+                .bind(order_id)
+                .execute(pool)
+                .await
+            {
+                warn!(
+                    order_id = %order_id,
+                    "maybe_drop_waiting_taker_bond: failed to persist event_id after Pending republish: {}", e
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                order_id = %order_id,
+                "maybe_drop_waiting_taker_bond: Pending republish failed: {}", e
+            );
+        }
+    }
     info!(
         "Order {} dropped back to Pending after last bond released",
         order_id
@@ -1223,6 +1276,40 @@ mod tests {
 
         let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
         assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// Phase 1.5 P2 regression: `maybe_drop_waiting_taker_bond` must
+    /// not flip a `WaitingTakerBond` order back to `Pending` if a
+    /// concurrent bond has just become `Locked`. The single conditional
+    /// UPDATE checks both predicates (status + no active bonds) in one
+    /// statement, so the race window is closed at the SQL layer.
+    #[tokio::test]
+    async fn maybe_drop_does_not_revert_concurrent_lock() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A `Locked` bond is the "concurrent winner racing past us"
+        // scenario.
+        let mut locked = make_bond(order_id, BondState::Locked);
+        locked.hash = None;
+        create_bond(&pool, locked).await.unwrap();
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("noop in the presence of a Locked bond");
+
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(
+            order.status,
+            Status::WaitingTakerBond.to_string(),
+            "the CAS must NOT flip back to Pending while a Locked bond races"
+        );
     }
 
     /// Phase 1.5 P1 regression: the `Pending → WaitingTakerBond` CAS

@@ -183,24 +183,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
-        // The taker-context migration is multi-statement; split on `;`
-        // so each ALTER TABLE runs as its own sqlx query. Leading `--`
-        // comment lines on a chunk are tolerated by sqlite as long as
-        // an SQL statement follows.
-        for stmt in include_str!("../../../migrations/20260511180000_bond_taker_context.sql")
-            .split(';')
-            .map(str::trim)
-            .filter(|s| {
-                !s.is_empty()
-                    && s.lines()
-                        .any(|l| !l.trim_start().starts_with("--") && !l.trim().is_empty())
-            })
-        {
-            sqlx::query(stmt)
-                .execute(&pool)
-                .await
-                .expect("bond taker context migration");
-        }
         // SQLite doesn't enforce FKs unless asked. Turn them on so the FK to
         // `orders` is a real constraint in tests (mirrors production).
         sqlx::query("PRAGMA foreign_keys = ON")

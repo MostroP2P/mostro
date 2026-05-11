@@ -863,20 +863,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
-        for stmt in include_str!("../../../migrations/20260511180000_bond_taker_context.sql")
-            .split(';')
-            .map(str::trim)
-            .filter(|s| {
-                !s.is_empty()
-                    && s.lines()
-                        .any(|l| !l.trim_start().starts_with("--") && !l.trim().is_empty())
-            })
-        {
-            sqlx::query(stmt)
-                .execute(&pool)
-                .await
-                .expect("bond taker context migration");
-        }
         pool
     }
 

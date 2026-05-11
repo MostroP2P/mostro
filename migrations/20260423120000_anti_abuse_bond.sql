@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS bonds (
   -- `payout_claim_window_days` forfeit deadline (see Phase 3).
   slashed_at       integer,
   created_at       integer not null,
+  -- Phase 1 concurrent-bonds taker context. Under the concurrent-bonds
+  -- model (see `docs/ANTI_ABUSE_BOND.md`), multiple `Requested` taker
+  -- bonds may coexist on a single order while the takers race to lock.
+  -- Until one bond actually locks, the order's taker-flow fields are
+  -- ambiguous (which racer "owns" them?), so the take handlers stash
+  -- the deferred context here and `on_bond_invoice_accepted` promotes
+  -- the winning bond's `taker_*` columns onto the order row.
+  --
+  -- Nullable so maker bonds (Phase 5+) and child slash rows (Phase 6)
+  -- — neither of which carries take context — leave them at `NULL`.
+  taker_identity     char(64),
+  taker_trade_index  integer,
+  taker_invoice      text,
+  taker_fiat_amount  integer,
+  taker_amount       integer,
+  taker_fee          integer,
+  taker_dev_fee      integer,
   FOREIGN KEY(order_id) REFERENCES orders(id)
 );
 

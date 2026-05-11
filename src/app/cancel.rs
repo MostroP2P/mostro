@@ -488,8 +488,16 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
         return Err(MostroCantDo(CantDoReason::OrderAlreadyCanceled));
     }
 
-    // Pending: maker can revert to Canceled state and republish without cooperative steps.
-    if order.check_status(Status::Pending).is_ok() {
+    // Pending / WaitingTakerBond: maker can revert to Canceled state and
+    // republish without cooperative steps. Phase 1.5 parks pre-trade
+    // orders at `WaitingTakerBond` while a taker is mid-bond; per
+    // `docs/ANTI_ABUSE_BOND.md` §6.5.1, both statuses must route
+    // through the same pre-trade cancel logic. Without this widening
+    // the daemon would fall through to `NotAllowedByStatus` for every
+    // cancel during the bond window.
+    if order.check_status(Status::Pending).is_ok()
+        || order.check_status(Status::WaitingTakerBond).is_ok()
+    {
         if order.sent_from_maker(event.sender).is_ok() {
             cancel_pending_order_from_maker(pool, event, &mut order, my_keys, request_id).await?;
             return Ok(());

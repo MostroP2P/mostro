@@ -1,4 +1,4 @@
-//! Bond lifecycle wiring (Phase 1).
+//! Bond lifecycle wiring (Phase 1 + Phase 1.5).
 //!
 //! Phase 1 adds a single guarantee: when the feature is enabled and the
 //! taker side is in scope (`apply_to ∈ {take, both}`), a taker is asked to
@@ -24,17 +24,19 @@
 //! pays their bond does not block the order book: their HTLC expires
 //! on its own LND-side TTL and the bond is released.
 //!
-//! Protocol note: `mostro-core` 0.10.0 does not yet expose
-//! `Action::PayBondInvoice` / `Status::WaitingTakerBond`. Phase 1 takes the
-//! "Alternative" path documented in §6.2 of `docs/ANTI_ABUSE_BOND.md`:
-//! orders stay in `Status::Pending` while waiting for the bond, and the
-//! bond bolt11 ships to the taker as a regular `Action::PayInvoice` (the
-//! semantics — "pay this Lightning invoice" — are an exact match). Bond
-//! state lives entirely in the `bonds` table; clients identify the
-//! invoice as a bond by its hash, which differs from the trade hold
-//! invoice that follows once the bond is locked. The dedicated action /
-//! status will land alongside the corresponding `mostro-core` release in a
-//! later phase.
+//! Phase 1.5 protocol layer. Mostro now emits the bond bolt11 as a
+//! dedicated [`Action::PayBondInvoice`] (not the generic
+//! [`Action::PayInvoice`] reused in Phase 1) and parks the order at
+//! [`Status::WaitingTakerBond`] while the bond is outstanding. The
+//! wire-published NIP-33 status still maps to NIP-69 `pending`
+//! (`nip33::create_status_tags`) so the order keeps advertising as
+//! available — `WaitingTakerBond` is purely a daemon-internal
+//! distinction between "matched, awaiting bond" and "advertised, no
+//! taker yet". On `Locked` the status transitions out to
+//! `WaitingPayment` / `WaitingBuyerInvoice` via `resume_take_after_bond`;
+//! on bond release before lock (taker abandons, taker self-cancel, or
+//! losing the lock race), if no other active bond remains on the
+//! order, the status flips back to `Pending`.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -158,10 +160,11 @@ pub async fn request_taker_bond(
         bond.id, order.id, bond.role, bond.amount_sats
     );
 
-    // Phase-1 alternative path (see module-level doc): the bond bolt11
-    // ships as a regular `PayInvoice`. The `SmallOrder` echoes the order
-    // id so a bond-aware client can correlate — and a non-bond-aware
-    // client just sees an extra invoice to pay before the trade.
+    // Phase 1.5: the bond bolt11 ships as a dedicated
+    // `Action::PayBondInvoice` (see module-level doc). The `SmallOrder`
+    // payload mirrors what the order looks like to clients on the wire,
+    // so its `status` field stays `Pending` — matching the NIP-69 bucket
+    // that `WaitingTakerBond` maps to in `nip33::create_status_tags`.
     let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
     let bond_small = SmallOrder::new(
         Some(order.id),
@@ -206,7 +209,7 @@ pub async fn request_taker_bond(
     enqueue_order_msg(
         request_id,
         Some(order.id),
-        Action::PayInvoice,
+        Action::PayBondInvoice,
         Some(Payload::PaymentRequest(
             Some(bond_small),
             invoice_resp.payment_request,
@@ -216,6 +219,32 @@ pub async fn request_taker_bond(
         Some(taker_ctx.trade_index),
     )
     .await;
+
+    // Phase 1.5: park the order at `WaitingTakerBond` while the bond is
+    // outstanding. Concurrent takers race here — subsequent calls see
+    // the order already in `WaitingTakerBond` and skip the republish
+    // (idempotent). The status flip happens *after* the DM ships so a
+    // failure earlier in this function leaves the order at `Pending`
+    // for the caller to retry.
+    if order.status == Status::Pending.to_string() {
+        let my_keys = get_keys()?;
+        match crate::util::update_order_event(&my_keys, Status::WaitingTakerBond, order).await {
+            Ok(updated) => {
+                if let Err(e) = updated.update(pool).await {
+                    warn!(
+                        order_id = %order.id,
+                        "request_taker_bond: failed to persist WaitingTakerBond status: {}", e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    order_id = %order.id,
+                    "request_taker_bond: failed to republish WaitingTakerBond: {}", e
+                );
+            }
+        }
+    }
 
     Ok(bond)
 }
@@ -650,10 +679,15 @@ async fn on_bond_invoice_accepted(
         })?;
 
     // Defense-in-depth: only drive the take forward when the order is
-    // still in the pre-trade state we left it in. If it's already moved
-    // on (resume succeeded on a previous firing) or been canceled by a
-    // maker / admin / scheduler path, do not re-trigger the take.
-    if order.status != Status::Pending.to_string() {
+    // still in a pre-trade state we left it in. Phase 1.5 parks the
+    // order at `WaitingTakerBond` during the bond window; Phase 1 left
+    // it at `Pending`. Both are valid pre-trade entry points. If the
+    // order has already moved on (resume succeeded on a previous
+    // firing, or maker / admin / scheduler canceled), do not re-trigger
+    // the take.
+    if order.status != Status::Pending.to_string()
+        && order.status != Status::WaitingTakerBond.to_string()
+    {
         info!(
             "Bond {} accepted but order {} is in status {} — skipping resume",
             current.id, order.id, order.status
@@ -741,11 +775,12 @@ async fn promote_taker_context_to_order(
 /// the bond was cancelled by `release_bond` because another concurrent
 /// taker locked first).
 ///
-/// Marks the bond `Released`. The order row carries no taker fields
-/// during the bond window under concurrent bonds, so there's nothing
-/// to clear on the order — it stays `Pending` and discoverable via
-/// the existing Nostr event, takeable by anyone who still has an
-/// outstanding bond or by a fresh taker.
+/// Marks the bond `Released`. Under Phase 1.5, if no other active bond
+/// remains on the order and the order is in `WaitingTakerBond`, the
+/// status flips back to `Pending` and is republished so the orderbook
+/// reflects the empty-bond state. If other bonds are still racing,
+/// the order stays in `WaitingTakerBond` (its NIP-69 wire bucket
+/// remains `pending` either way).
 async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(), MostroError> {
     let bond = match find_bond_by_hash(pool, hash).await? {
         Some(b) => b,
@@ -770,6 +805,63 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
     info!(
         "Bond {} marked Released after LND cancel (order {})",
         bond.id, bond.order_id
+    );
+
+    // Phase 1.5: if this was the last active bond on the order and the
+    // order is parked at `WaitingTakerBond`, flip it back to `Pending`
+    // and republish so the orderbook reflects "no taker mid-bond".
+    // Other active bonds (e.g. a Locked winner mid-resume, or a fresh
+    // concurrent taker) keep the order at `WaitingTakerBond` — their
+    // own paths own the next transition. Errors are warn-logged but
+    // do not propagate: the bond is already marked Released, which is
+    // the load-bearing invariant of this callback.
+    if let Err(e) = maybe_drop_waiting_taker_bond(pool, bond.order_id).await {
+        warn!(
+            order_id = %bond.order_id,
+            "on_bond_invoice_canceled: failed to flip status back to Pending: {}", e
+        );
+    }
+    Ok(())
+}
+
+/// If `order_id` is currently in `Status::WaitingTakerBond` and has no
+/// remaining active bond rows, transition it back to `Status::Pending`
+/// and republish the NIP-33 event. No-op otherwise.
+///
+/// Used by `on_bond_invoice_canceled` (when LND cancels the only
+/// outstanding bond's hold invoice) and by the taker self-cancel path
+/// in `cancel.rs` (when the sender was the last bonded taker). Both
+/// call sites need the same "drop back to Pending if empty" logic;
+/// extracting it keeps them consistent.
+pub(crate) async fn maybe_drop_waiting_taker_bond(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+) -> Result<(), MostroError> {
+    let order = match Order::by_id(pool, order_id)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+    {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    if order.status != Status::WaitingTakerBond.to_string() {
+        return Ok(());
+    }
+    let active = find_active_bonds_for_order(pool, order_id).await?;
+    if !active.is_empty() {
+        return Ok(());
+    }
+    let my_keys = get_keys()?;
+    let updated = crate::util::update_order_event(&my_keys, Status::Pending, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    info!(
+        "Order {} dropped back to Pending after last bond released",
+        order_id
     );
     Ok(())
 }
@@ -857,6 +949,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("orders migration");
+        // dev_fee columns were added by a later migration but
+        // `Order::by_id` SELECTs them. Apply each ALTER as a separate
+        // statement (sqlx::query treats the whole string as one).
+        for stmt in include_str!("../../../migrations/20251126120000_dev_fee.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("dev_fee migration");
+        }
         sqlx::query(include_str!(
             "../../../migrations/20260423120000_anti_abuse_bond.sql"
         ))
@@ -1040,6 +1145,69 @@ mod tests {
         assert!(active
             .iter()
             .all(|b| b.state == BondState::Requested.to_string()));
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_noop_when_other_bonds_active() {
+        // Phase 1.5: dropping the order back to Pending only fires when
+        // *no* other active bond remains. With one bond still Requested,
+        // the helper must short-circuit before touching the order (so
+        // even without Nostr globals it never errors).
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        // Mark order as WaitingTakerBond.
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        create_bond(&pool, bond).await.unwrap();
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("noop when other bonds active");
+
+        // Status must NOT have flipped — Pending would imply the helper
+        // ran the transition path despite the surviving bond.
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_noop_when_order_not_in_waiting_status() {
+        // If the order is somehow not in `WaitingTakerBond` (e.g. Phase 1
+        // legacy state, or a parallel path already flipped it), the
+        // helper must no-op rather than blindly republish.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // inserted as 'pending' by default
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("noop on non-WaitingTakerBond order");
+
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_noop_when_order_missing() {
+        // If the order row vanished between callsite and lookup, the
+        // helper must no-op rather than propagate a hard error — the
+        // bond is already marked Released by the time we get here, so
+        // failing this best-effort cleanup would corrupt the call site's
+        // error semantics.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        // No INSERT — the order does not exist.
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("noop on missing order");
     }
 
     fn ln_err(msg: &str) -> MostroError {

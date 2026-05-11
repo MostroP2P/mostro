@@ -283,7 +283,7 @@ fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
 /// Marking `Released` here would drop the bond out of
 /// `find_active_bonds*` (which filters on `state IN ('requested',
 /// 'locked')`), stranding the taker's funds in LND with no retry path
-/// — the [issue raised in the Phase 1 review](#).
+/// — the issue raised in the Phase 1 review.
 ///
 /// The recovery path for a left-active bond is implicit:
 /// - The LND subscriber spawned by `bond_invoice_subscribe` (and

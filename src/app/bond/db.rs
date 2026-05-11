@@ -136,6 +136,7 @@ pub async fn find_active_bond_by_taker(
         "SELECT * FROM bonds \
          WHERE order_id = ? AND pubkey = ? AND state IN (?, ?) \
            AND parent_bond_id IS NULL \
+         ORDER BY created_at ASC \
          LIMIT 1",
     )
     .bind(order_id)

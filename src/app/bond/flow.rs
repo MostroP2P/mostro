@@ -131,7 +131,7 @@ pub async fn request_taker_bond(
     // `order.amount`), so concurrent takers on a market-priced range
     // order each post a bond sized to their own quote.
     let amount = compute_bond_amount(taker_ctx.amount, cfg);
-    let memo = format!("Bond for Mostro order {}", order.id);
+    let memo = format!("mostro bond order_id={}", order.id);
 
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client

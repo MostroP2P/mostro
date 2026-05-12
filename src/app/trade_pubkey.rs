@@ -16,9 +16,15 @@ pub async fn trade_pubkey_action(
     // Get order
     let mut order = get_order(&msg, pool).await?;
 
-    // Check if the order status is pending
-    if let Err(cause) = order.check_status(Status::Pending) {
-        return Err(MostroCantDo(cause));
+    // Phase 1.5: accept both `Pending` and `WaitingTakerBond` as
+    // pre-trade entry points. The trade pubkey is a maker-only piece of
+    // state, unaffected by which (if any) prospective taker happens to
+    // be mid-bond; gating on `Pending` alone would block legitimate
+    // maker rotation during the bond window.
+    if order.check_status(Status::Pending).is_err()
+        && order.check_status(Status::WaitingTakerBond).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Get master keys (already plaintext after phase-3/4 encryption migration)

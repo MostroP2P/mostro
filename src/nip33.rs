@@ -213,7 +213,15 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
 }
 
 fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    if order.status == Status::Pending.to_string() {
+    // `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
+    // state (Phase 1.5). On the wire it publishes as `pending` (per
+    // `create_status_tags`), so range-order min/max advertising must
+    // mirror the `Pending` branch — otherwise the bond window would
+    // expose a single `fiat_amount` and clients would think the order
+    // had moved out of the range-takeable state.
+    if order.status == Status::Pending.to_string()
+        || order.status == Status::WaitingTakerBond.to_string()
+    {
         match (order.min_amount, order.max_amount) {
             (Some(min), Some(max)) => {
                 vec![min.to_string(), max.to_string()]
@@ -254,6 +262,13 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
         | Status::Expired => Ok((true, Status::Canceled)),
         Status::Success | Status::CompletedByAdmin => Ok((true, status)),
         Status::Pending => Ok((true, status)),
+        // Phase 1.5: an order with a prospective taker mid-bond is
+        // daemon-internally `WaitingTakerBond`, but on the wire it must
+        // still publish as `pending` so it stays advertised under
+        // NIP-69's four-bucket model (`docs/ANTI_ABUSE_BOND.md` §2
+        // principle 8). A malicious taker who never pays cannot park
+        // the order off the book — concurrent takers race to lock.
+        Status::WaitingTakerBond => Ok((true, Status::Pending)),
         _ => Ok((false, status)),
     }
 }
@@ -291,7 +306,13 @@ fn create_source_tag(
     mostro_relays: &[String],
     mostro_pubkey: &str,
 ) -> Result<Option<String>, MostroError> {
-    if order.status == Status::Pending.to_string() {
+    // Source tag is also emitted while the order is in `WaitingTakerBond`
+    // (Phase 1.5). The wire-published status maps to `pending`, so
+    // clients discovering the order must still be able to construct
+    // the reference URL.
+    if order.status == Status::Pending.to_string()
+        || order.status == Status::WaitingTakerBond.to_string()
+    {
         // Create a mostro: custom source reference for pending orders
         // Include the Mostro pubkey so clients can identify the instance
         let custom_ref = format!(
@@ -564,6 +585,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 #[cfg(test)]
 mod tests {
     use super::create_platform_tag_values;
+    use super::create_status_tags;
     use super::{info_to_tags, order_to_tags};
     use crate::app::context::test_utils::test_settings;
     use crate::config::MOSTRO_CONFIG;
@@ -855,5 +877,47 @@ mod tests {
             y_values, expected,
             "dev-fee audit event tag list must wire create_platform_tag_values correctly"
         );
+    }
+
+    // ── Phase 1.5 NIP-69 mapping tests ───────────────────────────────────
+
+    /// Load-bearing for the non-blockability invariant
+    /// (`docs/ANTI_ABUSE_BOND.md` §2 principle 8): an order whose
+    /// daemon-internal status is `WaitingTakerBond` must publish on
+    /// the wire with status `Pending`, identical to a no-taker order,
+    /// so it stays advertised in NIP-69's `pending` bucket and other
+    /// takers can race for it.
+    #[test]
+    fn waiting_taker_bond_maps_to_pending_on_wire() {
+        let mut order = make_pending_order();
+        order.status = Status::WaitingTakerBond.to_string();
+
+        let (emit, mapped) = create_status_tags(&order).expect("status tags");
+        assert!(
+            emit,
+            "WaitingTakerBond must emit the order event so the orderbook keeps showing it"
+        );
+        assert_eq!(
+            mapped,
+            Status::Pending,
+            "WaitingTakerBond must publish as Pending on the wire (NIP-69 invariant)"
+        );
+    }
+
+    /// Sanity: the existing `Pending` mapping behaves identically. If
+    /// somebody refactors `create_status_tags` the bucket-equivalence
+    /// between `Pending` and `WaitingTakerBond` must not drift.
+    #[test]
+    fn pending_and_waiting_taker_bond_publish_the_same_wire_status() {
+        let mut pending = make_pending_order();
+        pending.status = Status::Pending.to_string();
+        let mut wtb = make_pending_order();
+        wtb.status = Status::WaitingTakerBond.to_string();
+
+        let (emit_p, status_p) = create_status_tags(&pending).expect("status tags pending");
+        let (emit_w, status_w) = create_status_tags(&wtb).expect("status tags wtb");
+
+        assert_eq!(emit_p, emit_w);
+        assert_eq!(status_p, status_w);
     }
 }

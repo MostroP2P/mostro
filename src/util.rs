@@ -679,7 +679,11 @@ async fn get_ratings_for_pending_order(
     order_updated: &Order,
     status: Status,
 ) -> Result<Option<(f64, i64, i64)>, MostroError> {
-    if status == Status::Pending {
+    // Phase 1.5: `WaitingTakerBond` publishes on the wire as `pending`
+    // (see `nip33::create_status_tags`), so the maker rating must travel
+    // with both buckets — otherwise clients browsing the orderbook would
+    // see the order without ratings during the bond window.
+    if status == Status::Pending || status == Status::WaitingTakerBond {
         let identity_pubkey = match order_updated.is_sell_order() {
             Ok(_) => order_updated
                 .get_master_seller_pubkey()

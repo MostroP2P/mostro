@@ -56,9 +56,15 @@ pub async fn take_sell_action(
     if let Err(cause) = order.is_sell_order() {
         return Err(MostroCantDo(cause));
     };
-    // Check if the order status is pending
-    if let Err(cause) = order.check_status(Status::Pending) {
-        return Err(MostroCantDo(cause));
+    // Accept takes against orders in either `Pending` (no taker yet) or
+    // `WaitingTakerBond` (Phase 1.5: a prior concurrent taker is
+    // mid-bond). Both are pre-trade from the take-validation
+    // perspective; the locked-bond gate inside the bond block below
+    // catches the genuine post-trade case.
+    if order.check_status(Status::Pending).is_err()
+        && order.check_status(Status::WaitingTakerBond).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Validate that the order was sent from the correct maker
@@ -114,7 +120,7 @@ pub async fn take_sell_action(
                 enqueue_order_msg(
                     request_id,
                     Some(order.id),
-                    Action::PayInvoice,
+                    Action::PayBondInvoice,
                     Some(Payload::PaymentRequest(Some(bond_small), bolt11, None)),
                     event.sender,
                     existing.taker_trade_index,

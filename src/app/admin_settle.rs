@@ -1,4 +1,4 @@
-use crate::app::bond;
+use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
 use crate::db::{
     find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
@@ -53,6 +53,18 @@ pub async fn admin_settle_action(
     if !solver_has_write_permission(pool, &event.identity.to_string(), order.id).await? {
         return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
+
+    // Phase 2: extract the optional `BondResolution` payload and validate
+    // it BEFORE any trade-side mutation. If the solver asks us to slash
+    // a side with no `Locked` bond row (e.g. `slash_seller=true` on a
+    // sell-order with `apply_to=take` — seller is the maker, no bond),
+    // we refuse the directive and leave the trade unchanged. The solver
+    // resends a corrected payload. See `docs/ANTI_ABUSE_BOND.md` §7.3.
+    //
+    // Absent payload ≡ `BondResolution { false, false }` ≡ Phase 1
+    // behaviour (release all active bonds, slash none).
+    let bond_resolution = bond::extract_bond_resolution(&msg);
+    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
     // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {
@@ -189,9 +201,23 @@ pub async fn admin_settle_action(
         )
         .await;
     }
-    // Phase 1: admin-settled disputes always release any taker bond.
-    // Slashing on lost dispute lands in Phase 2.
-    bond::release_bonds_for_order_or_warn(pool, order_updated.id, "admin_settle").await;
+    // Phase 2: apply the solver's `BondResolution` (release-by-default
+    // when absent, otherwise slash the flagged sides). The actual
+    // Lightning payout to the wronged counterparty is Phase 3's job;
+    // here we only transition the bond rows.
+    if let Err(e) = bond::apply_bond_resolution(
+        pool,
+        &order_updated,
+        &bond_resolution,
+        BondSlashReason::LostDispute,
+    )
+    .await
+    {
+        tracing::warn!(
+            order_id = %order_updated.id,
+            "admin_settle: bond resolution apply failed: {}", e
+        );
+    }
 
     let _ = do_payment(ctx, order_updated, request_id).await;
 

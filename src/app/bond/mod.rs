@@ -13,12 +13,14 @@ pub mod db;
 pub mod flow;
 pub mod math;
 pub mod model;
+pub mod slash;
 pub mod types;
 
 pub use flow::{
     release_bond, release_bonds_for_order, release_bonds_for_order_or_warn, request_taker_bond,
     resubscribe_active_bonds, taker_bond_required, TakerContext,
 };
-pub use math::compute_bond_amount;
+pub use math::{compute_bond_amount, compute_node_share};
 pub use model::Bond;
+pub use slash::{apply_bond_resolution, extract_bond_resolution, validate_bond_resolution};
 pub use types::{BondRole, BondSlashReason, BondState};

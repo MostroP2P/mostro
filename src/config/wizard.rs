@@ -197,16 +197,16 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
 /// Ask the user where to persist the nsec and return the value that should be
 /// written into `settings.toml` (empty string when the key is stored elsewhere).
 fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, MostroError> {
-    println!("\nStoring your nsec as an environment variable (instead of settings.toml) keeps");
-    println!("secrets separate from config. This helps avoid accidental leaks in logs, backups");
-    println!("or bug reports, and makes it easier to integrate with Docker secrets, systemd");
-    println!("credentials, or a vault later. You can always move the key to another location");
-    println!("afterwards — Mostro only requires MOSTRO_NSEC_PRIVKEY to be readable at startup.\n");
+    println!("\nMostro supports two storage locations for your nsec. Both are fully supported;");
+    println!("pick the one that fits your threat model and deployment setup. You can also");
+    println!("provide MOSTRO_NSEC_PRIVKEY via the real process environment (systemd, Docker,");
+    println!("shell, secrets manager) instead — in that case either option below works as a");
+    println!("starting point and you can move the key elsewhere afterwards.\n");
 
     let env_file_path = settings_dir.join(".env");
     let choices = &[
-        "Save to .env (recommended, auto-loaded at startup)",
-        "Save inline in settings.toml (legacy, still supported)",
+        "Save to .env (auto-loaded at startup, chmod 600)",
+        "Save inline in settings.toml",
     ];
 
     let selection = Select::new()

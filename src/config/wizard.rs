@@ -6,6 +6,7 @@ use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
 
+use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -203,7 +204,7 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
     println!("shell, secrets manager) instead — in that case either option below works as a");
     println!("starting point and you can move the key elsewhere afterwards.\n");
 
-    let env_file_path = settings_dir.join(".env");
+    let env_file_path = settings_dir.join(ENV_FILENAME);
     let choices = &[
         "Save to .env (auto-loaded at startup, chmod 600)",
         "Save inline in settings.toml",
@@ -220,7 +221,7 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
         write_env_file(&env_file_path, nsec)?;
         // Export the key into the current process so the daemon can use it
         // immediately after the wizard finishes, without requiring a restart.
-        std::env::set_var("MOSTRO_NSEC_PRIVKEY", nsec);
+        std::env::set_var(NSEC_ENV_VAR, nsec);
         println!(
             "\n  Private key saved to {} (permissions 600).",
             env_file_path.display()
@@ -275,7 +276,7 @@ fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
     }
 
-    writeln!(file, "MOSTRO_NSEC_PRIVKEY={}", nsec)
+    writeln!(file, "{}={}", NSEC_ENV_VAR, nsec)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
     Ok(())
 }

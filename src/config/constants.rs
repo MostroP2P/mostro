@@ -17,3 +17,11 @@ pub const DEV_FEE_AUDIT_EVENT_KIND: u16 = 8383;
 /// Kind 30078 is in the replaceable events range (30000-39999) per NIP-33
 /// This allows the same Mostro instance to publish updated rates that replace previous events
 pub const NOSTR_EXCHANGE_RATES_EVENT_KIND: u16 = 30078;
+
+/// Filename of the environment file auto-loaded from the settings directory at
+/// startup. Shared between the wizard (writes it) and the loader (reads it).
+pub const ENV_FILENAME: &str = ".env";
+
+/// Environment variable name used to override the Nostr private key from the
+/// process environment. Shared between the wizard and the loader.
+pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";

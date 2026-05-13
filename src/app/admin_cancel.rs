@@ -79,14 +79,6 @@ pub async fn admin_cancel_action(
         return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
 
-    // Phase 2: extract and validate the optional `BondResolution`
-    // payload BEFORE any trade-side mutation (the LND `cancel_hold_invoice`
-    // on the escrow further down would otherwise be irreversible). If
-    // validation fails, refuse the directive; the solver corrects and
-    // resends. See `docs/ANTI_ABUSE_BOND.md` §7.3.
-    let bond_resolution = bond::extract_bond_resolution(&msg);
-    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
-
     // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
@@ -106,6 +98,18 @@ pub async fn admin_cancel_action(
     if order.check_status(Status::Dispute).is_err() {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
+
+    // Phase 2: extract and validate the optional `BondResolution` payload
+    // here — after the status guards above (which are non-destructive
+    // early returns, so an admin retry against an already-cooperatively-
+    // cancelled or out-of-dispute order still gets the prior status-
+    // driven response) and before the LND `cancel_hold_invoice` on the
+    // escrow below, which would otherwise be irreversible. On a
+    // `slash_*=true` for a side with no `Locked` bond row we return
+    // `CantDo(InvalidPayload)` and the trade does not cancel; the solver
+    // resends a corrected directive. See `docs/ANTI_ABUSE_BOND.md` §7.3.
+    let bond_resolution = bond::extract_bond_resolution(&msg);
+    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
     if order.hash.is_some() {
         // We return funds to seller

@@ -54,18 +54,6 @@ pub async fn admin_settle_action(
         return Err(MostroCantDo(CantDoReason::NotAuthorized));
     }
 
-    // Phase 2: extract the optional `BondResolution` payload and validate
-    // it BEFORE any trade-side mutation. If the solver asks us to slash
-    // a side with no `Locked` bond row (e.g. `slash_seller=true` on a
-    // sell-order with `apply_to=take` — seller is the maker, no bond),
-    // we refuse the directive and leave the trade unchanged. The solver
-    // resends a corrected payload. See `docs/ANTI_ABUSE_BOND.md` §7.3.
-    //
-    // Absent payload ≡ `BondResolution { false, false }` ≡ Phase 1
-    // behaviour (release all active bonds, slash none).
-    let bond_resolution = bond::extract_bond_resolution(&msg);
-    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
-
     // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {
         enqueue_order_msg(
@@ -84,6 +72,21 @@ pub async fn admin_settle_action(
     if let Err(cause) = order.check_status(Status::Dispute) {
         return Err(MostroCantDo(cause));
     }
+
+    // Phase 2: extract and validate the optional `BondResolution` payload
+    // here — after the status guards above (which are non-destructive
+    // early returns, so an admin retry against an already-cooperatively-
+    // cancelled or out-of-dispute order still gets the prior status-
+    // driven response) and before any trade-side mutation
+    // (`settle_seller_hold_invoice` / `update_order_event` below). On a
+    // `slash_*=true` for a side with no `Locked` bond row we return
+    // `CantDo(InvalidPayload)` and the trade does not settle; the solver
+    // resends a corrected directive. Absent payload ≡
+    // `BondResolution { false, false }` ≡ Phase 1 behaviour (release all
+    // active bonds, slash none). See `docs/ANTI_ABUSE_BOND.md` §7.3.
+    let bond_resolution = bond::extract_bond_resolution(&msg);
+    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
+
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)
         .await

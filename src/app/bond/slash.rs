@@ -566,27 +566,37 @@ mod tests {
         apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
             .await
             .unwrap();
-        let first: (Option<i64>, Option<i64>) =
-            sqlx::query_as("SELECT slashed_at, node_share_sats FROM bonds WHERE id = ?")
+        let first: (String, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT state, slashed_at, node_share_sats FROM bonds WHERE id = ?")
                 .bind(bond.id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(first.0, BondState::PendingPayout.to_string());
 
         // Pretend a duplicate admin DM arrived a second later.
         std::thread::sleep(std::time::Duration::from_secs(1));
         apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
             .await
             .unwrap();
-        let second: (Option<i64>, Option<i64>) =
-            sqlx::query_as("SELECT slashed_at, node_share_sats FROM bonds WHERE id = ?")
+        let second: (String, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT state, slashed_at, node_share_sats FROM bonds WHERE id = ?")
                 .bind(bond.id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        // The state must not flip back to `Released` or anything else —
+        // a regression in `find_active_bonds_for_order`'s state filter
+        // could route the row through `release_bond` on the second pass
+        // without this assertion catching it.
+        assert_eq!(
+            second.0,
+            BondState::PendingPayout.to_string(),
+            "second apply must not transition the bond out of PendingPayout"
+        );
         assert_eq!(
             first, second,
-            "second apply must not rebump slashed_at / node_share_sats"
+            "second apply must not rebump state / slashed_at / node_share_sats"
         );
     }
 

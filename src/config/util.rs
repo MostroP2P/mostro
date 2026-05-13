@@ -18,10 +18,22 @@ const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
 /// Loads the optional `<settings_dir>/.env` file so that values placed there
 /// become available through `std::env::var`. Variables already set in the
 /// process environment take precedence and are never overwritten.
+///
+/// Loading errors (malformed file, permission denied, ...) are logged as
+/// warnings instead of being silently swallowed, so misconfigured deployments
+/// surface the real root cause at startup rather than failing later with an
+/// unrelated empty-key error.
 fn load_env_file(settings_dir: &std::path::Path) {
     let env_file = settings_dir.join(ENV_FILENAME);
-    if env_file.exists() {
-        let _ = dotenvy::from_path(&env_file);
+    if !env_file.exists() {
+        return;
+    }
+    if let Err(e) = dotenvy::from_path(&env_file) {
+        tracing::warn!(
+            "Failed to load environment file {}: {}. Falling back to settings.toml.",
+            env_file.display(),
+            e
+        );
     }
 }
 

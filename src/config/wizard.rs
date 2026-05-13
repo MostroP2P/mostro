@@ -242,6 +242,10 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
 }
 
 /// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path with 0o600 permissions on Unix.
+///
+/// `OpenOptionsExt::mode(0o600)` only applies when the file is created, so for
+/// preexisting files we must explicitly tighten permissions after opening to
+/// avoid leaving a previously-broader mode in place.
 fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
     #[cfg(unix)]
     let file = {
@@ -262,6 +266,15 @@ fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
             .open(path)
     };
     let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        file.set_permissions(permissions)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
+
     writeln!(file, "MOSTRO_NSEC_PRIVKEY={}", nsec)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
     Ok(())

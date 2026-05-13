@@ -1740,6 +1740,7 @@ dependencies = [
  "clearscreen",
  "dialoguer",
  "dirs",
+ "dotenvy",
  "easy-hasher",
  "fedimint-tonic-lnd",
  "lightning-invoice",

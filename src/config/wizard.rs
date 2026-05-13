@@ -6,6 +6,7 @@ use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
 
+use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -58,7 +59,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
 
     println!("\n--- Nostr Configuration ---\n");
 
-    let nostr = prompt_nostr_settings()?;
+    let nostr = prompt_nostr_settings(settings_dir)?;
 
     println!("\n--- Mostro Configuration ---\n");
 
@@ -143,14 +144,14 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
     })
 }
 
-fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
+fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroError> {
     let has_nsec = Confirm::new()
         .with_prompt("Do you have an existing nsec key?")
         .default(false)
         .interact()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    let nsec_privkey = if has_nsec {
+    let nsec = if has_nsec {
         Input::new()
             .with_prompt("Enter your nsec private key")
             .validate_with(|input: &String| validate_nsec(input))
@@ -170,10 +171,11 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
         println!("\nGenerated new Nostr keypair:");
         println!("  nsec: {}", nsec);
         println!("  npub: {}", npub);
-        println!("\n  IMPORTANT: Save your nsec in a secure place. You will need it to recover your Mostro identity.\n");
 
         nsec
     };
+
+    let nsec_privkey = prompt_nsec_storage(settings_dir, &nsec)?;
 
     let relays_input: String = Input::new()
         .with_prompt("Nostr relays (comma-separated)")
@@ -192,6 +194,92 @@ fn prompt_nostr_settings() -> Result<NostrSettings, MostroError> {
         nsec_privkey,
         relays,
     })
+}
+
+/// Ask the user where to persist the nsec and return the value that should be
+/// written into `settings.toml` (empty string when the key is stored elsewhere).
+fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, MostroError> {
+    println!("\nMostro supports two storage locations for your nsec. Both are fully supported;");
+    println!("pick the one that fits your threat model and deployment setup. You can also");
+    println!("provide MOSTRO_NSEC_PRIVKEY via the real process environment (systemd, Docker,");
+    println!("shell, secrets manager) instead — in that case either option below works as a");
+    println!("starting point and you can move the key elsewhere afterwards.\n");
+
+    let env_file_path = settings_dir.join(ENV_FILENAME);
+    let choices = &[
+        "Save to .env (auto-loaded at startup, chmod 600)",
+        "Save inline in settings.toml",
+    ];
+
+    let selection = Select::new()
+        .with_prompt("Where do you want to store your Nostr private key?")
+        .items(choices)
+        .default(0)
+        .interact()
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    let nsec_in_toml = if selection == 0 {
+        write_env_file(&env_file_path, nsec)?;
+        // Export the key into the current process so the daemon can use it
+        // immediately after the wizard finishes, without requiring a restart.
+        std::env::set_var(NSEC_ENV_VAR, nsec);
+        println!(
+            "\n  Private key saved to {} (permissions 600).",
+            env_file_path.display()
+        );
+        String::new()
+    } else {
+        println!(
+            "\n  Private key will be written inside {}.",
+            settings_dir.join("settings.toml").display()
+        );
+        nsec.to_string()
+    };
+
+    println!(
+        "\n  IMPORTANT: Back up your nsec in a secure place. If you lose it, you lose control of this Mostro instance's identity.\n"
+    );
+
+    Ok(nsec_in_toml)
+}
+
+/// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path with 0o600 permissions on Unix.
+///
+/// `OpenOptionsExt::mode(0o600)` only applies when the file is created, so for
+/// preexisting files we must explicitly tighten permissions after opening to
+/// avoid leaving a previously-broader mode in place.
+fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    };
+    let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        file.set_permissions(permissions)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
+
+    writeln!(file, "{}={}", NSEC_ENV_VAR, nsec)
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    Ok(())
 }
 
 fn prompt_mostro_settings() -> Result<MostroSettings, MostroError> {

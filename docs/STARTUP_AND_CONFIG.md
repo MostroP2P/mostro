@@ -89,8 +89,14 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
   - Example (absolute path; use a real path — **do not** use `~`; SQLx does not expand tilde): `"sqlite:///home/youruser/.mostro/mostro.db"`
   - Default: `"sqlite://mostro.db"`
 
-**Nostr** (`src/config/types.rs:47-54`):
-- `nsec_privkey` (String): Mostro's Nostr private key in nsec format
+**Nostr** (`src/config/types.rs`):
+- `nsec_privkey` (String): Mostro's Nostr private key in nsec format.
+  - Can be overridden by the `MOSTRO_NSEC_PRIVKEY` environment variable
+    (env var takes precedence; whitespace-only values are ignored).
+  - Mostro also auto-loads `<settings_dir>/.env` at startup (e.g.
+    `~/.mostro/.env`) so the variable can live in a separate file with
+    restricted permissions.
+  - Precedence: real env var > `<settings_dir>/.env` > `settings.toml`.
 - `relays` (Vec<String>): List of Nostr relay URLs for event broadcasting
   - Default: `['ws://localhost:7000']`
   - Note: At least one relay required

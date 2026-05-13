@@ -492,7 +492,8 @@ payment_retries_interval = 60  # seconds between retries
 #### Nostr Configuration
 ```toml
 [nostr]
-# Your Mostro daemon's private key (nsec format)
+# Your Mostro daemon's private key (nsec format). Optional if MOSTRO_NSEC_PRIVKEY
+# is set via environment variable or ~/.mostro/.env (see below).
 nsec_privkey = 'nsec1...'
 
 # Relays to connect to
@@ -510,6 +511,37 @@ rana --vanity mostro
 ```
 
 **Important**: Never reuse keys between Mostro instances. Each daemon needs a unique identity.
+
+##### Providing the nsec via environment variable
+
+For better separation of secrets from config, Mostro can read the nsec from the
+`MOSTRO_NSEC_PRIVKEY` environment variable. When set, it takes precedence over
+`nsec_privkey` in `settings.toml`.
+
+Three common ways to provide it:
+
+1. **`~/.mostro/.env`** (auto-loaded at startup, `chmod 600` recommended):
+   ```
+   MOSTRO_NSEC_PRIVKEY=nsec1...
+   ```
+   The interactive setup wizard can create this file for you.
+
+2. **systemd service**:
+   ```ini
+   [Service]
+   Environment="MOSTRO_NSEC_PRIVKEY=nsec1..."
+   # or, better, with LoadCredential and a credential file:
+   # LoadCredential=mostro_nsec:/etc/mostro/nsec
+   ```
+
+3. **Docker**:
+   ```bash
+   docker run -e MOSTRO_NSEC_PRIVKEY=nsec1... mostro
+   # or via Docker secrets / compose env_file
+   ```
+
+Precedence is: real env var > `~/.mostro/.env` > `settings.toml`. Leaving
+`nsec_privkey` in `settings.toml` is still supported for existing installations.
 
 ---
 

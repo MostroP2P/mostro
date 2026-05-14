@@ -198,6 +198,7 @@ mod tests {
             mostro: MostroSettings::default(),
             rpc: RpcSettings::default(),
             expiration: None,
+            anti_abuse_bond: None,
         }
     }
 

@@ -30,6 +30,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_cancel_orders(ctx.clone()).await;
     job_retry_failed_payments(ctx.clone()).await;
     job_process_dev_fee_payment(ctx.clone()).await;
+    job_process_bond_payouts(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
@@ -580,6 +581,36 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
         let pool = ctx.pool();
         loop {
             run_dev_fee_cycle(pool, &mut ln_client, &mut confirmed).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Processes bonds left in `PendingPayout` by Phase 2 / 4 / 5+.
+///
+/// Spawns a background task that runs
+/// [`bond::run_bond_payout_cycle`] every 60 seconds, mirroring the
+/// dev-fee scheduler. Not gated on `Settings::is_bond_enabled()`:
+/// bonds left over from a prior enabled period must still drain when
+/// an operator flips the feature off, otherwise their HTLCs sit in
+/// LND with no driver. The cycle is a single indexed SELECT on
+/// `bonds.state = 'pending-payout'`, which is empty for any node
+/// that never enabled the feature, so the constant overhead is
+/// negligible.
+#[mutants::skip]
+async fn job_process_bond_payouts(ctx: AppContext) {
+    let interval = 60u64;
+
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client for bond payout job");
+    };
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            bond::run_bond_payout_cycle(pool, &mut ln_client).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

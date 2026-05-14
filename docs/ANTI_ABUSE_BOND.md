@@ -186,7 +186,7 @@ slash path.
 | 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped (PR #719) |
 | 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | pending |
 | 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | pending |
-| 3 | Payout flow: `add-invoice` to winner, routing-fee estimation, retries, audit event | 2 | pending |
+| 3 | Payout flow: `add-bond-invoice` to winner, routing-fee estimation, retries | 2 | pending |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) | 3 | pending |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |
@@ -992,13 +992,14 @@ trade finalization must never wait on the payout.
     1. If no `payout_invoice` yet, and the cadence window has elapsed
        (i.e. `last_invoice_request_at IS NULL` or
        `now - last_invoice_request_at >= payout_invoice_window_seconds`):
-       enqueue an `Action::AddInvoice` DM to the recipient (see
-       "Recipient resolution" below) asking for a bolt11 for
-       `counterparty_share_sats - estimated_routing_fee`. The DM
-       **must include the forfeit deadline** (e.g. "claim by <ISO
-       timestamp> or your share will be forfeited") so the user knows
-       the clock is running. Bump `invoice_request_attempts` and set
-       `last_invoice_request_at = now`. **Do not touch
+       enqueue an `Action::AddBondInvoice` DM (mostro-core 0.11.2+)
+       to the recipient (see "Recipient resolution" below) asking for
+       a bolt11 for `counterparty_share_sats - estimated_routing_fee`.
+       The DM **must include the forfeit deadline** (e.g. "claim by
+       <ISO timestamp> or your share will be forfeited") via a
+       `Payload::TextMessage` body alongside the action, so the user
+       knows the clock is running. Bump `invoice_request_attempts`
+       and set `last_invoice_request_at = now`. **Do not touch
        `payout_attempts`** — that counter only governs `send_payment`
        retries (step 6); mixing the two would let a slow-responding
        counterparty exhaust `payout_max_retries` on invoice-request
@@ -1017,9 +1018,9 @@ trade finalization must never wait on the payout.
        Mostro's wallet).
     4. `send_payment` to the counterparty invoice with capped fee.
        Only `counterparty_share_sats - routing_fee` leaves Mostro.
-    5. On success → `state = Slashed`, publish audit event with
-       `outcome = paid`. (`slashed_at` is **not** touched here — it
-       was set at the `PendingPayout` transition; see Phase 2 §7.3.)
+    5. On success → `state = Slashed`. (`slashed_at` is **not**
+       touched here — it was set at the `PendingPayout` transition;
+       see Phase 2 §7.3.)
     6. On `send_payment` failure → bump `payout_attempts` (this is
        the *only* place that increments it); once `payout_max_retries`
        reached, transition to `Failed` and leave a tracing error.
@@ -1028,12 +1029,12 @@ trade finalization must never wait on the payout.
        `Forfeited` (the user never gave us an invoice).
 
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
-  entirely (no `AddInvoice` DM, no `send_payment`, no forfeit window
-  to wait for); the bond goes straight from `PendingPayout` → settle →
-  `Slashed` after step 3.
+  entirely (no `AddBondInvoice` DM, no `send_payment`, no forfeit
+  window to wait for); the bond goes straight from `PendingPayout` →
+  settle → `Slashed` after step 3.
 
-- **Recipient resolution.** Step 1 above sends `Action::AddInvoice` to
-  the *non-slashed counterparty* of the trade — the party who is
+- **Recipient resolution.** Step 1 above sends `Action::AddBondInvoice`
+  to the *non-slashed counterparty* of the trade — the party who is
   neither the bonded user (`bond.pubkey`) nor a co-slashed party.
   Because `BondResolution` flags are dispute-only and `bond.pubkey`
   is not enough on its own to recover the trade-flow side
@@ -1054,10 +1055,9 @@ trade finalization must never wait on the payout.
     taker have active bonds, neither party deserves restitution
     (§15.2 — "both behaved badly"). For each row, treat as
     `slash_node_share_pct = 1.0` for that payout: skip the
-    `AddInvoice` DM, retain `amount_sats` in full, settle the HTLC
-    in step 3, transition to `Slashed` with the audit event tagged
-    accordingly. (Phase 5+ wires this; Phase 2's taker-only world
-    cannot reach this branch.)
+    `AddBondInvoice` DM, retain `amount_sats` in full, settle the
+    HTLC in step 3, transition to `Slashed`. (Phase 5+ wires this;
+    Phase 2's taker-only world cannot reach this branch.)
 
 - Late-invoice race: the `add_bond_invoice_action` handler (below)
   must check the bond is still in `PendingPayout` before persisting
@@ -1067,10 +1067,11 @@ trade finalization must never wait on the payout.
   per-row decision, no locks needed — the state column is the
   arbiter.
 - New action handler `add_bond_invoice_action` in a new
-  `src/app/bond/payout.rs` module. Receives an `Action::AddInvoice` reply
-  from a bond-payout candidate (distinct from the buyer-invoice
-  `add_invoice_action` — disambiguated by the presence of a bond row in
-  `PendingPayout` for the order / sender pair). On accepting a valid
+  `src/app/bond/payout.rs` module. Receives an `Action::AddBondInvoice`
+  reply from a bond-payout candidate. The dedicated action type
+  (mostro-core 0.11.2+) keeps it disjoint from the buyer-invoice
+  `add_invoice_action` at the routing layer rather than relying on
+  ambient DB state. On accepting a valid
   invoice it persists `payout_invoice` and **resets
   `invoice_request_attempts = 0`** in the same DB write, marking a
   clean transition from the invoice-request phase to the
@@ -1081,24 +1082,6 @@ trade finalization must never wait on the payout.
   invoice" from "nudges after a hypothetical re-prompt" if a future
   phase ever introduces one. Any "took N nudges to respond" logging
   for observability should capture the value *before* the reset.
-- Audit event: new Nostr kind (reusing the dev-fee style: custom kind
-  number, registered in `src/config/constants.rs`). Tags:
-  `order-id`, `role` (maker/taker — which posted the bond),
-  `reason` (`lost-dispute` | `timeout`),
-  `outcome` (`paid` | `forfeited`) — `paid` means the counterparty
-  received their share; `forfeited` means the claim window expired
-  and the node retained `amount_sats` in full. (`Failed` does **not**
-  emit an audit event — it is an operator-attention state, not a
-  normal outcome.)
-  `amount` (total slashed sats, == `node_share + counterparty_share`),
-  `node-share`, `counterparty-share` (the originally-decided split,
-  in sats; on `outcome = forfeited` the node's actual retention is
-  `amount`, but the original split is preserved here for audit so
-  observers can reconstruct what *would* have been paid),
-  `hash` (bond payout hash, **not** the trade payment hash),
-  `y`, `z = bond-slash`. No counterparty pubkeys, consistent with
-  dev-fee audit privacy. Expiration uses `ExpirationSettings` with a new
-  optional `bond_slash_days` field.
 - Unit tests: routing-fee fallback, retries exhaustion, settle-then-pay
   ordering.
 
@@ -1135,9 +1118,8 @@ trade finalization must never wait on the payout.
 - End-to-end test: dispute resolved with `slash_buyer=true` and
   `slash_node_share_pct = 0.5` → buyer-side counterparty (the seller)
   is asked for a bolt11 sized at `floor(amount/2) − routing_fee`,
-  submits it → bond payout settles → Nostr audit event publishes
-  matching `amount`, `node-share`, `counterparty-share` tags
-  (split sums exactly to `amount`, no rounding leak).
+  submits it → bond payout settles (split sums exactly to `amount`,
+  no rounding leak).
 - Edge case `slash_node_share_pct = 0.0` → behaviour identical to the
   pre-split design (full counterparty payout).
 - Edge case `slash_node_share_pct = 1.0` → settle the HTLC, no
@@ -1152,9 +1134,8 @@ trade finalization must never wait on the payout.
 - **Forfeit window test**: bond enters `PendingPayout`, counterparty
   never replies; advance the test clock by
   `payout_claim_window_days + 1`; on the next scheduler tick the bond
-  settles and transitions to `Forfeited`; audit event publishes with
-  `outcome = forfeited`. Node retains `amount_sats` in full. No
-  `send_payment` was ever attempted.
+  settles and transitions to `Forfeited`. Node retains `amount_sats`
+  in full. No `send_payment` was ever attempted.
 - **Late-invoice rejection**: bond is `Forfeited`; counterparty
   submits a bolt11 after the deadline; `add_bond_invoice_action`
   rejects it with a "claim window expired" message; bond stays
@@ -1490,6 +1471,11 @@ these requires a compatibility statement:
   1 reuse of `Action::PayInvoice` / `Status::Pending` for bonds.
 - `Payload::BondResolution` variant in mostro-core (Phase 2).
   **Released in `mostro-core` 0.11.0** (same release).
+- `Action::AddBondInvoice` in mostro-core (Phase 3). **Released in
+  `mostro-core` 0.11.2.** Counterparty-direction dual of
+  `Action::PayBondInvoice`; keeps the bond-payout reply disjoint from
+  the buyer-invoice `Action::AddInvoice` so the daemon can route on
+  action type alone.
 - `Status::WaitingMakerBond` (Phase 5). Not yet shipped upstream;
   needs a follow-up `mostro-core` minor release before Phase 5 can
   land here.

@@ -971,7 +971,7 @@ pub async fn set_waiting_invoice_status(
         None,
         None,
         None,
-        None,
+        Some(order.created_at),
         None,
     );
     // We create a Message

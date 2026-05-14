@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
-use crate::app::bond;
+use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
 use crate::db::{
     find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
@@ -98,6 +98,18 @@ pub async fn admin_cancel_action(
     if order.check_status(Status::Dispute).is_err() {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
+
+    // Phase 2: extract and validate the optional `BondResolution` payload
+    // here — after the status guards above (which are non-destructive
+    // early returns, so an admin retry against an already-cooperatively-
+    // cancelled or out-of-dispute order still gets the prior status-
+    // driven response) and before the LND `cancel_hold_invoice` on the
+    // escrow below, which would otherwise be irreversible. On a
+    // `slash_*=true` for a side with no `Locked` bond row we return
+    // `CantDo(InvalidPayload)` and the trade does not cancel; the solver
+    // resends a corrected directive. See `docs/ANTI_ABUSE_BOND.md` §7.3.
+    let bond_resolution = bond::extract_bond_resolution(&msg);
+    bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
     if order.hash.is_some() {
         // We return funds to seller
@@ -200,9 +212,20 @@ pub async fn admin_cancel_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // Phase 1: admin cancellation always releases any taker bond. The
-    // dispute slash path lands in Phase 2.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "admin_cancel").await;
+    // Phase 2: apply the solver's `BondResolution` to the bond rows
+    // (release-by-default when absent). The buyer/seller pubkeys on
+    // the order row are immutable through the dispute cycle, so the
+    // original `order` snapshot is the right context for resolving
+    // sides to bonds. The Lightning payout side is Phase 3.
+    if let Err(e) =
+        bond::apply_bond_resolution(pool, &order, &bond_resolution, BondSlashReason::LostDispute)
+            .await
+    {
+        tracing::warn!(
+            order_id = %order.id,
+            "admin_cancel: bond resolution apply failed: {}", e
+        );
+    }
 
     Ok(())
 }

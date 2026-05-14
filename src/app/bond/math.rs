@@ -42,6 +42,38 @@ pub fn compute_bond_amount(order_amount_sats: i64, cfg: &AntiAbuseBondSettings) 
     pct_sats.max(base)
 }
 
+/// Compute the node's share of a slashed bond, in sats.
+///
+/// `pct` is the operator's `slash_node_share_pct`, already validated by
+/// the config deserializer to be in `[0.0, 1.0]`. The counterparty share
+/// is always derived as `amount_sats - node_share_sats` by the caller,
+/// so the two cannot drift and always sum exactly to `amount_sats` (the
+/// spec's "no rounding leaks" invariant in §8.1).
+///
+/// Frozen at the moment the bond enters `PendingPayout`: Phase 2 writes
+/// the result to the `node_share_sats` column in the same DB update
+/// that flips the bond state, so a later config change or daemon restart
+/// can never rebalance the split.
+pub fn compute_node_share(amount_sats: i64, pct: f64) -> i64 {
+    if amount_sats <= 0 {
+        return 0;
+    }
+    // The config deserializer rejects values outside [0.0, 1.0], but be
+    // defensive against a future call site that builds settings in code.
+    let pct = pct.clamp(0.0, 1.0);
+    let raw = (amount_sats as f64) * pct;
+    // `floor` so the counterparty share, computed as `amount_sats - share`,
+    // is never negative even at pct=1.0 and never strands a sat at pct<1.0.
+    let floored = raw.floor();
+    if floored <= 0.0 {
+        0
+    } else if floored >= amount_sats as f64 {
+        amount_sats
+    } else {
+        floored as i64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +150,46 @@ mod tests {
         // No overflow; clamps to i64::MAX. Not a realistic config but
         // the guard prevents a panic.
         assert_eq!(compute_bond_amount(i64::MAX, &cfg), i64::MAX);
+    }
+
+    #[test]
+    fn node_share_half_default() {
+        // 10_000 sats at 50% → 5_000 node / 5_000 counterparty.
+        assert_eq!(compute_node_share(10_000, 0.5), 5_000);
+    }
+
+    #[test]
+    fn node_share_zero_pct_goes_to_counterparty() {
+        // Legacy winner-takes-all: pct=0 → node keeps nothing.
+        assert_eq!(compute_node_share(10_000, 0.0), 0);
+    }
+
+    #[test]
+    fn node_share_one_pct_keeps_all() {
+        // pct=1.0 → counterparty leg is empty; full amount stays with node.
+        assert_eq!(compute_node_share(10_000, 1.0), 10_000);
+    }
+
+    #[test]
+    fn node_share_floors_no_rounding_leak() {
+        // 333 * 0.5 = 166.5 → floor 166. Counterparty gets 333 - 166 = 167.
+        // The two sum exactly to amount_sats (spec §8.1 invariant).
+        let share = compute_node_share(333, 0.5);
+        assert_eq!(share, 166);
+        assert_eq!(333 - share, 167);
+    }
+
+    #[test]
+    fn node_share_zero_or_negative_amount() {
+        assert_eq!(compute_node_share(0, 0.5), 0);
+        assert_eq!(compute_node_share(-100, 0.5), 0);
+    }
+
+    #[test]
+    fn node_share_clamps_out_of_range_pct() {
+        // Config deserializer rejects out-of-range pct; clamp defensively
+        // anyway so a future programmatic caller can't underflow.
+        assert_eq!(compute_node_share(10_000, -0.1), 0);
+        assert_eq!(compute_node_share(10_000, 1.5), 10_000);
     }
 }

@@ -1105,13 +1105,17 @@ trade finalization must never wait on the payout.
   wallet and the node leg is done. The only thing the retry loop is
   driving from that point on is the counterparty payout.
 - **Partial success: settle OK, counterparty `send_payment` failed.**
-  The bond state stays in `PendingPayout` with a best-effort retry. The
-  winner is kept informed via periodic messages. If retries exhaust, state
-  becomes `Failed`; at that point Mostro is holding the counterparty
-  share (unavoidable with the HTLC already settled) and logs loudly.
-  The node share is unaffected — it was always going to stay. This is
-  a known limitation; node operators can manually pay the winner from
-  logs.
+  The bond state stays in `PendingPayout` with a best-effort retry on
+  the next scheduler tick. Periodic `Action::AddBondInvoice` messages
+  are **only** scheduled by §8.1 step 1, whose precondition is
+  `payout_invoice IS NULL` — once the winner has already submitted a
+  bolt11, that branch is skipped and the retry loop runs silently
+  (tracing logs only, no wire notification to the winner). If retries
+  exhaust, state becomes `Failed`; at that point Mostro is holding the
+  counterparty share (unavoidable with the HTLC already settled) and
+  logs loudly. The node share is unaffected — it was always going to
+  stay. This is a known limitation; node operators can manually pay
+  the winner from logs.
 - **Counterparty never claims (forfeit path).** Distinct from
   `Failed`: there is no `payout_invoice` because the counterparty
   never sent one. After `payout_claim_window_days` from `slashed_at`,

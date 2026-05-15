@@ -601,13 +601,28 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
 async fn job_process_bond_payouts(ctx: AppContext) {
     let interval = 60u64;
 
-    let mut ln_client = if let Ok(client) = LndConnector::new().await {
-        client
-    } else {
-        return error!("Failed to create LND client for bond payout job");
-    };
-
     tokio::spawn(async move {
+        // Retry LndConnector::new() with capped exponential backoff so a
+        // transient LND startup failure (e.g. LND not yet listening when
+        // mostrod boots, or a brief restart) does not permanently halt
+        // PendingPayout draining. Without this, every bond stuck in
+        // PendingPayout would sit there until the operator restarts
+        // mostrod — losing any chance of forfeit / payout for the
+        // duration. Backoff caps at 60s to keep retry pressure modest.
+        let mut backoff_secs: u64 = 2;
+        let mut ln_client = loop {
+            match LndConnector::new().await {
+                Ok(client) => break client,
+                Err(e) => {
+                    error!(
+                        "bond payout: LndConnector::new failed: {e} — retrying in {backoff_secs}s"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            }
+        };
+
         let pool = ctx.pool();
         loop {
             bond::run_bond_payout_cycle(pool, &mut ln_client).await;

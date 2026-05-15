@@ -994,7 +994,12 @@ trade finalization must never wait on the payout.
        `now - last_invoice_request_at >= payout_invoice_window_seconds`):
        enqueue an `Action::AddBondInvoice` DM (mostro-core 0.11.2+)
        to the recipient (see "Recipient resolution" below) asking for
-       a bolt11 for `counterparty_share_sats - estimated_routing_fee`.
+       a bolt11 for the full `counterparty_share_sats` — the handler
+       validates the invoice principal against `counterparty_share_sats`
+       with fee = 0, so the routing fee must come out of Mostro's
+       wallet, not the invoice principal. (The bonded user may use
+       the estimated routing fee as guidance when choosing a recipient
+       node, but it is not subtracted from the requested amount.)
        The DM **must include the forfeit deadline** (e.g. "claim by
        <ISO timestamp> or your share will be forfeited") via a
        `Payload::TextMessage` body alongside the action, so the user

@@ -186,7 +186,7 @@ slash path.
 | 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped (PR #719) |
 | 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | pending |
 | 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | pending |
-| 3 | Payout flow: `add-bond-invoice` to winner, routing-fee estimation, retries | 2 | pending |
+| 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | pending |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) | 3 | pending |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |

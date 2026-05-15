@@ -6,14 +6,22 @@
 //!
 //! - [`run_bond_payout_cycle`] — called once per scheduler tick. Walks
 //!   every `PendingPayout` bond and drives it forward by one step: ask
-//!   the non-slashed counterparty for a bolt11 if we haven't yet,
-//!   `settle_hold_invoice` once we have one, then `send_payment` for
-//!   the counterparty share. Settles + transitions to `Forfeited`
-//!   instead when `payout_claim_window_days` has elapsed with no
+//!   the non-slashed counterparty for a bolt11 if we haven't yet, then
+//!   `send_payment` for the counterparty share. Transitions to
+//!   `Forfeited` when `payout_claim_window_days` has elapsed with no
 //!   invoice.
 //! - [`add_bond_invoice_action`] — the action handler that consumes the
 //!   counterparty's `Action::AddBondInvoice` reply, validates it, and
 //!   persists the bolt11 onto the bond row.
+//!
+//! ## Slashed HTLC already claimed
+//!
+//! The bond hold invoice is **settled at slash time** in
+//! [`super::slash::apply_bond_resolution`], not here. By the time this
+//! module sees a `PendingPayout` row, the sats are already in Mostro's
+//! wallet — this scheduler only drives the counterparty payout
+//! (request bolt11 → `send_payment` → retries / forfeiture). Phase 3
+//! never calls `settle_hold_invoice`.
 //!
 //! ## Why a dedicated action type
 //!
@@ -117,18 +125,19 @@ pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConne
 
 /// Drive a single bond forward by one step.
 ///
-/// The state machine inside `PendingPayout` is:
+/// The bond HTLC was already settled at slash time (Phase 2 §7.3); this
+/// state machine only governs the counterparty payout leg:
 ///
 /// ```text
-///                          ┌── forfeit window elapsed AND no invoice ─► settle ─► Forfeited
+///                          ┌── forfeit window elapsed AND no invoice ──► Forfeited
 ///                          │
-///   PendingPayout ─────────┤── no invoice yet AND cadence ok ───► AddBondInvoice message
+///   PendingPayout ─────────┤── no invoice yet AND cadence ok ──► AddBondInvoice message
 ///                          │
-///                          │── invoice present (or node_share_pct=1.0) ─► settle ─► [send_payment]
-///                          │                                                              │
-///                          └──── send_payment success ─► Slashed                          │
-///                                                                                         │
-///                                            send_payment failure ─► retry (or Failed) ◄──┘
+///                          │── invoice present (or node_share_pct=1.0) ──► [send_payment]
+///                          │                                                      │
+///                          └──── send_payment success ─► Slashed                  │
+///                                                                                 │
+///                                    send_payment failure ─► retry (or Failed) ◄──┘
 /// ```
 ///
 /// Each call advances by at most one of these arms; the scheduler
@@ -160,27 +169,28 @@ async fn process_one_bond(
     })?;
 
     // Forfeit window has elapsed and counterparty never submitted a
-    // bolt11: settle the HTLC into Mostro's wallet and transition to
-    // `Forfeited`. The node retains `amount_sats` in full. No further
-    // messages or `send_payment` attempts.
+    // bolt11: transition to `Forfeited`. The HTLC was already settled
+    // at slash time, so the sats are already in Mostro's wallet — no
+    // further LND interaction, no `send_payment` attempts. The node
+    // retains `amount_sats` in full.
     if bond.payout_invoice.is_none() && now - slashed_at >= claim_window_seconds {
-        return forfeit_bond(pool, ln_client, bond).await;
+        return forfeit_bond(pool, bond).await;
     }
 
     // Normal payout: either request an invoice (counterparty leg), or
-    // settle + pay (HTLC and counterparty leg).
+    // pay the counterparty from the already-settled HTLC funds.
     let counterparty_share = counterparty_share_sats(bond)?;
 
     if counterparty_share <= 0 {
         // `slash_node_share_pct = 1.0` (or full retention) — there's no
-        // counterparty leg. Settle the HTLC and transition straight to
-        // `Slashed`. No `AddBondInvoice` message, no `send_payment`.
-        return settle_node_only(pool, ln_client, bond).await;
+        // counterparty leg. Transition straight to `Slashed`. No
+        // `AddBondInvoice` message, no `send_payment`.
+        return finalize_node_only(pool, bond).await;
     }
 
     match bond.payout_invoice.as_deref() {
         None => request_payout_invoice(pool, bond, invoice_window_seconds).await,
-        Some(invoice) => settle_and_pay(pool, ln_client, bond, invoice, max_retries).await,
+        Some(invoice) => pay_counterparty(pool, ln_client, bond, invoice, max_retries).await,
     }
 }
 
@@ -212,53 +222,17 @@ fn counterparty_share_sats(bond: &Bond) -> Result<i64, MostroError> {
     Ok(bond.amount_sats - node_share)
 }
 
-/// Return the bond's preimage, erroring if absent. A `PendingPayout`
-/// row without a preimage cannot have its HTLC settled, so the payout
-/// state machine must fail closed: not advance to `Forfeited` /
-/// `Slashed`, and not attempt `send_payment` from sats it does not yet
-/// hold. `request_taker_bond` populates the preimage at bond creation,
-/// so a `None` here is an invariant violation.
-fn preimage_or_err<'a>(bond: &'a Bond, op: &'static str) -> Result<&'a str, MostroError> {
-    bond.preimage.as_deref().ok_or_else(|| {
-        MostroInternalErr(ServiceError::UnexpectedError(format!(
-            "bond {} (order {}) in PendingPayout missing preimage — {op} cannot proceed",
-            bond.id, bond.order_id
-        )))
-    })
-}
-
-/// Settle the HTLC into Mostro's wallet and transition to `Forfeited`.
-async fn forfeit_bond(
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-    bond: &Bond,
-) -> Result<(), MostroError> {
-    let preimage = preimage_or_err(bond, "forfeit")?;
-    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
-        if is_already_settled_error(&e) {
-            info!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "forfeit: bond HTLC already settled; proceeding to state transition"
-            );
-        } else {
-            warn!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "forfeit: settle_hold_invoice failed: {e} — will retry on next tick"
-            );
-            return Err(e);
-        }
-    }
-
-    // `AND payout_invoice IS NULL` closes the race against
-    // `add_bond_invoice_action`: if the counterparty's late invoice landed
-    // between this scheduler's `bond.payout_invoice.is_none()` snapshot
-    // and the UPDATE below, we must not flip the row to `Forfeited` and
-    // silently discard their bolt11. The HTLC is already settled (above),
-    // so on the next tick `settle_and_pay` will take over — its own
-    // `settle_hold_invoice` call will short-circuit on
-    // `is_already_settled_error` and proceed to `send_payment`.
+/// Transition a `PendingPayout` row to `Forfeited`.
+///
+/// The HTLC was settled at slash time, so the sats are already in
+/// Mostro's wallet; this function only flips the state. The
+/// `AND payout_invoice IS NULL` predicate closes the race against
+/// `add_bond_invoice_action`: if the counterparty's late invoice
+/// landed between this scheduler's `bond.payout_invoice.is_none()`
+/// snapshot and the UPDATE below, we must not flip the row to
+/// `Forfeited` and silently discard their bolt11 — on the next tick
+/// `pay_counterparty` will take over and route the funds.
+async fn forfeit_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
     let result = sqlx::query(
         "UPDATE bonds SET state = ? WHERE id = ? AND state = ? AND payout_invoice IS NULL",
     )
@@ -286,31 +260,11 @@ async fn forfeit_bond(
     Ok(())
 }
 
-/// Counterparty share is empty (`slash_node_share_pct = 1.0`): settle
-/// the HTLC and transition to `Slashed`. No messages, no `send_payment`.
-async fn settle_node_only(
-    pool: &Pool<Sqlite>,
-    ln_client: &mut LndConnector,
-    bond: &Bond,
-) -> Result<(), MostroError> {
-    let preimage = preimage_or_err(bond, "node-only payout")?;
-    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
-        if is_already_settled_error(&e) {
-            info!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "node-only payout: bond HTLC already settled; proceeding to state transition"
-            );
-        } else {
-            warn!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "node-only payout: settle_hold_invoice failed: {e} — will retry on next tick"
-            );
-            return Err(e);
-        }
-    }
-
+/// Counterparty share is empty (`slash_node_share_pct = 1.0`): the
+/// HTLC was already settled at slash time, so there is nothing left
+/// for the scheduler to do beyond flipping the row to `Slashed`. No
+/// messages, no `send_payment`.
+async fn finalize_node_only(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
     let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
         .bind(BondState::Slashed.to_string())
         .bind(bond.id)
@@ -449,11 +403,12 @@ async fn request_payout_invoice(
     Ok(())
 }
 
-/// Settle the bond HTLC into Mostro's wallet, then `send_payment` the
-/// counterparty share to the bolt11 they submitted. Order matters:
-/// settle must succeed before send_payment, otherwise we'd be paying
-/// from sats we don't yet hold.
-async fn settle_and_pay(
+/// `send_payment` the counterparty share to the bolt11 they
+/// submitted. The bond HTLC was already settled at slash time, so the
+/// sats are already in Mostro's wallet — this function only drives
+/// the counterparty leg and on success transitions the row to
+/// `Slashed`.
+async fn pay_counterparty(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
     bond: &Bond,
@@ -461,31 +416,6 @@ async fn settle_and_pay(
     max_retries: i64,
 ) -> Result<(), MostroError> {
     let counterparty_share = counterparty_share_sats(bond)?;
-
-    // Settle the bond HTLC. If settle fails, the row stays in
-    // `PendingPayout` and the scheduler retries on the next tick.
-    // The bonded user's HTLC stays held — the correct safety posture
-    // when we cannot confirm we have the sats yet.
-    let preimage = preimage_or_err(bond, "settle_and_pay")?;
-    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
-        // Distinguish "already settled" (idempotent retry) from
-        // genuine transport failures the same way release_bond
-        // distinguishes already-canceled.
-        let already = is_already_settled_error(&e);
-        if !already {
-            warn!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                "settle_and_pay: settle_hold_invoice failed: {e} — retrying on next tick"
-            );
-            return Err(e);
-        }
-        info!(
-            bond_id = %bond.id,
-            order_id = %bond.order_id,
-            "settle_and_pay: bond HTLC already settled; proceeding to send_payment"
-        );
-    }
 
     // Routing-fee ceiling: derived from MostroSettings::max_routing_fee
     // applied to the counterparty share. The spec mentions
@@ -618,17 +548,6 @@ async fn on_send_payment_failure(
         );
     }
     Ok(())
-}
-
-/// Classify an error string from `settle_hold_invoice` as a benign
-/// "already settled" outcome (idempotent retry) vs. a transport
-/// failure that warrants leaving the bond in `PendingPayout` for the
-/// next tick.
-fn is_already_settled_error(err: &MostroError) -> bool {
-    let s = err.to_string().to_lowercase();
-    s.contains("already settled")
-        || s.contains("invoice already settled")
-        || s.contains("code=alreadyexists")
 }
 
 /// Map `(order, bond, reason)` to the non-slashed counterparty's
@@ -967,42 +886,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forfeit_bond_sql_transition_is_cas_guarded() {
-        // `forfeit_bond` calls settle_hold_invoice (which needs an
-        // LndConnector, unavailable here) and then runs a CAS-guarded
-        // SQL transition `PendingPayout -> Forfeited`. We can't drive
-        // the LND half from a unit test, so this test exercises the
-        // SQL half directly — that's the load-bearing piece. The
-        // function itself now fails closed when preimage is missing
-        // (see `preimage_or_err`), so the equivalent end-to-end call
-        // with `preimage = None` returns an error rather than running
-        // the SQL we exercise here.
+    async fn forfeit_bond_transitions_pending_to_forfeited() {
+        // The HTLC is settled at slash time (Phase 2), so `forfeit_bond`
+        // is now a pure SQL transition with the `payout_invoice IS NULL`
+        // CAS guard. No LND dependency.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
         let now = Utc::now().timestamp();
-        let mut bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
-        bond.preimage = None;
-        bond.hash = None;
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
         let bond = create_bond(&pool, bond).await.unwrap();
 
-        // We can't easily call `forfeit_bond` without an LndConnector,
-        // so exercise the SQL transition path used inside it directly
-        // — this is the load-bearing piece of the forfeit branch.
-        let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Forfeited.to_string())
-            .bind(bond.id)
-            .bind(BondState::PendingPayout.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert_eq!(result.rows_affected(), 1);
+        forfeit_bond(&pool, &bond).await.unwrap();
+
         let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(bond.id)
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(after.0, BondState::Forfeited.to_string());
+    }
+
+    #[tokio::test]
+    async fn forfeit_bond_skips_when_invoice_landed_concurrently() {
+        // If a late `add_bond_invoice_action` persisted a `payout_invoice`
+        // between the scheduler's snapshot and the forfeit UPDATE, the
+        // CAS predicate (`AND payout_invoice IS NULL`) must hold the row
+        // in `PendingPayout` so the next tick can route to
+        // `pay_counterparty` instead of discarding the bolt11.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pCONCURRENT"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        forfeit_bond(&pool, &bond).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, BondState::PendingPayout.to_string());
     }
 
     #[tokio::test]
@@ -1061,16 +995,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_payout_no_counterparty_share_is_node_only() {
-        // `slash_node_share_pct = 1.0` style row: counterparty share
-        // is 0. `process_one_bond` must route to the node-only branch
-        // (settle_node_only) and not enqueue an AddBondInvoice. We
-        // can't easily exercise the LND call here, but we can verify
-        // the state filter on the SQL transition.
+    async fn finalize_node_only_transitions_to_slashed() {
+        // `slash_node_share_pct = 1.0` style row: counterparty share is
+        // 0. `process_one_bond` routes to `finalize_node_only`, which is
+        // now pure SQL — the HTLC was settled at slash time, so this
+        // function just flips the state.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
-        let mut bond = pending_payout_bond(
+        let bond = pending_payout_bond(
             order_id,
             taker_pk(),
             10_000,
@@ -1079,17 +1012,15 @@ mod tests {
             None,
             None,
         );
-        bond.preimage = None;
         let bond = create_bond(&pool, bond).await.unwrap();
 
-        // Direct CAS that node-only path issues post-settle.
-        let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Slashed.to_string())
+        finalize_node_only(&pool, &bond).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(bond.id)
-            .bind(BondState::PendingPayout.to_string())
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(result.rows_affected(), 1);
+        assert_eq!(after.0, BondState::Slashed.to_string());
     }
 }

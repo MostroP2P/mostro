@@ -62,7 +62,10 @@ pub enum BondState {
     Locked,
     /// Hold invoice was cancelled (not slashed). Terminal happy exit.
     Released,
-    /// A slash condition was hit; Mostro is working on paying the winner.
+    /// A slash condition was hit. The bond hold invoice has already been
+    /// **settled** (claimed into Mostro's wallet at slash time by Phase 2);
+    /// Phase 3 is asynchronously driving the recipient payout
+    /// (`AddBondInvoice` → `send_payment` → retries / forfeiture).
     PendingPayout,
     /// Winner paid successfully. Terminal.
     Slashed,

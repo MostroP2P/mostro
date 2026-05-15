@@ -13,10 +13,12 @@ locks a Lightning hold invoice when entering a trade. The bond is:
 - **Released** on normal completion, on any cancellation that happens before
   a waiting-state timeout elapses, and on dispute resolutions where the
   solver does not direct otherwise.
-- **Slashed** (claimed by Mostro and split between the node and the
-  winning counterparty per `slash_node_share_pct`; the node share funds
-  solver compensation, the remainder is paid out to the counterparty as
-  before — see §15.4) under two unambiguous conditions:
+- **Slashed** (claimed by Mostro **immediately at slash time** via
+  `settle_hold_invoice`, then split between the node and the winning
+  counterparty per `slash_node_share_pct`; the node share funds
+  solver compensation, the remainder is paid out to the counterparty
+  asynchronously by the Phase 3 scheduler — see §15.4) under two
+  unambiguous conditions:
   1. **Solver directive on dispute resolution.** The solver explicitly
      instructs Mostro to slash one or both bonds via the `BondResolution`
      payload of `admin-settle` / `admin-cancel`. The slash decision is
@@ -258,7 +260,7 @@ Purely additive. Touches no trade flow.
     -- `amount_sats - node_share_sats` so they cannot drift.
     node_share_sats  integer,
     -- Phase 3: counts ONLY `send_payment` retries against an invoice
-    -- the counterparty has already submitted. Bumped only by step 6
+    -- the counterparty has already submitted. Bumped only by step 5
     -- of the §8.1 scheduler loop. `payout_max_retries` is checked
     -- against this counter alone — invoice-request messages do NOT
     -- count here (see `invoice_request_attempts` below).
@@ -909,15 +911,36 @@ or a legacy admin client):
    and has no bond) so the operator can decide whether to widen
    `apply_to`.
 4. On a valid payload: perform the trade resolution (settle or cancel)
-   first, then for each bond marked for slash transition
-   `state = PendingPayout, slashed_reason = LostDispute, slashed_at = now`,
-   and persist the split per §8.1 (compute `node_share_sats` from the
-   current `slash_node_share_pct` and write it in the same DB update).
-   Bonds not marked for slash are cancelled (`cancel_hold_invoice`) and
-   marked `Released` immediately.
+   first, then for each bond marked for slash:
+   1. **Settle the bond hold invoice immediately** via
+      `settle_hold_invoice(preimage)`. This claims the bonded sats into
+      Mostro's wallet at slash time — the HTLC is no longer encumbered
+      by the time the slash step returns. The settle is the
+      load-bearing side effect of the slash decision; the row
+      transition that follows is bookkeeping.
+   2. CAS the row `state = PendingPayout, slashed_reason =
+      LostDispute, slashed_at = now`, and persist the split per §8.1
+      (compute `node_share_sats` from the current
+      `slash_node_share_pct` and write it in the same DB update).
+   3. **Settle MUST succeed before the CAS runs.** If
+      `settle_hold_invoice` fails with a transient transport error,
+      the row stays `Locked` so a future admin retry can re-attempt
+      the slash. LND's idempotent "already settled" response (admin
+      retry after a partial failure where settle succeeded but the
+      CAS lost a race) is treated as success and the CAS proceeds.
 
-The actual Lightning payout to the counterparty is asynchronous and
-handled by Phase 3.
+   Bonds not marked for slash are cancelled (`cancel_hold_invoice`)
+   and marked `Released` immediately.
+
+   When both bonds are slashed in a single dispute, this loop runs
+   `settle_hold_invoice` **once per bond** — two HTLCs claimed before
+   the slash step returns.
+
+The recipient payout (asking the winning counterparty for a bolt11,
+`send_payment`, retries, forfeiture on the long-stop window) is
+asynchronous and handled by Phase 3. Phase 3 never calls
+`settle_hold_invoice` — by the time it sees a `PendingPayout` row, the
+sats are already in Mostro's wallet.
 
 ### 7.4 Validation rules summary
 
@@ -954,7 +977,11 @@ handled by Phase 3.
 ## 8. Phase 3 — Payout flow
 
 Shared infrastructure used by every slash path afterwards. Non-blocking:
-trade finalization must never wait on the payout.
+trade finalization must never wait on the **counterparty** payout
+(asking for a bolt11, `send_payment`, retries, forfeiture). The
+slashed HTLC itself is **already settled** by the slash step before
+this phase runs (see Phase 2 §7.3); Phase 3 only drives the recipient
+payout from sats Mostro already holds.
 
 ### 8.1 Scope
 
@@ -983,9 +1010,13 @@ trade finalization must never wait on the payout.
   - For each, **first check the forfeit window**:
     - If `now - slashed_at >= payout_claim_window_days * 86400` and
       `payout_invoice IS NULL` (the counterparty never submitted a
-      bolt11): `settle_hold_invoice(preimage)`, transition the bond
-      to `state = Forfeited`, publish the audit event with
-      `outcome = forfeited`, and stop. The node retains the full
+      bolt11): CAS the row to `state = Forfeited` with `AND
+      payout_invoice IS NULL` (so a late `add_bond_invoice_action`
+      arrival doesn't get silently discarded), publish the audit
+      event with `outcome = forfeited`, and stop. The HTLC was
+      already settled at slash time, so the sats are already in
+      Mostro's wallet — Phase 3 does **not** call
+      `settle_hold_invoice` here. The node retains the full
       `amount_sats`. No further messages or `send_payment` runs.
     - Otherwise, proceed with the normal payout steps below.
   - Normal payout steps:
@@ -1011,7 +1042,7 @@ trade finalization must never wait on the payout.
        baking English copy into the daemon. Bump
        `invoice_request_attempts` and set `last_invoice_request_at =
        now`. **Do not touch `payout_attempts`** — that counter only
-       governs `send_payment` retries (step 6); mixing the two would
+       governs `send_payment` retries (step 4); mixing the two would
        let a slow-responding counterparty exhaust `payout_max_retries`
        on invoice-request messages alone and prematurely flip the bond to
        `Failed`. Bounding invoice requests is the forfeit window's job
@@ -1022,16 +1053,14 @@ trade finalization must never wait on the payout.
        routing fee** via `LndConnector::query_routes(dest, amount)`
        (thin wrapper over LND `router::query_routes`); fall back to
        `amount * max_routing_fee` if the RPC fails.
-    3. `settle_hold_invoice(preimage)` on the bond hash to claim the
-       forfeited sats into Mostro's wallet. After this call,
-       `node_share_sats` is implicitly retained (it just stays in
-       Mostro's wallet).
-    4. `send_payment` to the counterparty invoice with capped fee.
-       Only `counterparty_share_sats - routing_fee` leaves Mostro.
-    5. On success → `state = Slashed`. (`slashed_at` is **not**
+    3. `send_payment` to the counterparty invoice with capped fee.
+       Only `counterparty_share_sats - routing_fee` leaves Mostro;
+       the sats are drawn from the slash-time settle (the HTLC was
+       claimed in Phase 2 §7.3 step 4.1).
+    4. On success → `state = Slashed`. (`slashed_at` is **not**
        touched here — it was set at the `PendingPayout` transition;
        see Phase 2 §7.3.)
-    6. On `send_payment` failure → bump `payout_attempts` (this is
+    5. On `send_payment` failure → bump `payout_attempts` (this is
        the *only* place that increments it); once `payout_max_retries`
        reached, transition to `Failed` and leave a tracing error.
        `Failed` is reserved for *technical* failure (we have an
@@ -1041,7 +1070,8 @@ trade finalization must never wait on the payout.
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
   entirely (no `AddBondInvoice` message, no `send_payment`, no forfeit
   window to wait for); the bond goes straight from `PendingPayout` →
-  settle → `Slashed` after step 3.
+  `Slashed` (a single state-flip; the HTLC was already settled at
+  slash time, so there is nothing left for the scheduler to do).
 
 - **Recipient resolution.** Step 1 above sends `Action::AddBondInvoice`
   to the *non-slashed counterparty* of the trade — the party who is
@@ -1063,11 +1093,12 @@ trade finalization must never wait on the payout.
   - **Both bonds slashed in a single dispute (Phase 5+ only).** When
     the solver's `BondResolution` sets both flags and both maker and
     taker have active bonds, neither party deserves restitution
-    (§15.2 — "both behaved badly"). For each row, treat as
-    `slash_node_share_pct = 1.0` for that payout: skip the
-    `AddBondInvoice` message, retain `amount_sats` in full, settle the
-    HTLC in step 3, transition to `Slashed`. (Phase 5+ wires this;
-    Phase 2's taker-only world cannot reach this branch.)
+    (§15.2 — "both behaved badly"). Both HTLCs are settled at slash
+    time (Phase 2 §7.3 step 4.1 runs once per slashed bond). For each
+    row, treat as `slash_node_share_pct = 1.0` for that payout: skip
+    the `AddBondInvoice` message, retain `amount_sats` in full, and
+    transition straight to `Slashed`. (Phase 5+ wires this; Phase 2's
+    taker-only world cannot reach this branch.)
 
 - Late-invoice race: the `add_bond_invoice_action` handler (below)
   must check the bond is still in `PendingPayout` before persisting
@@ -1092,40 +1123,52 @@ trade finalization must never wait on the payout.
   invoice" from "nudges after a hypothetical re-prompt" if a future
   phase ever introduces one. Any "took N nudges to respond" logging
   for observability should capture the value *before* the reset.
-- Unit tests: routing-fee fallback, retries exhaustion, settle-then-pay
-  ordering.
+- Unit tests: routing-fee fallback, retries exhaustion, forfeit CAS
+  race against late `add_bond_invoice_action`.
 
 ### 8.2 Failure modes & invariants
 
-- **`settle` must succeed before `send_payment`.** If settle fails we
-  leave the bond in `PendingPayout` and retry on the next tick; the
-  bonded party's HTLC stays held, which is the correct safety posture.
-- **Node share is retained unconditionally on settle.** Once
-  `settle_hold_invoice` succeeds, `node_share_sats` is in Mostro's
-  wallet and the node leg is done. The only thing the retry loop is
-  driving from that point on is the counterparty payout.
-- **Partial success: settle OK, counterparty `send_payment` failed.**
+- **Slashed HTLC is settled at slash time, not by the scheduler.**
+  Phase 2 §7.3 step 4.1 runs `settle_hold_invoice(preimage)` before
+  the row is flipped to `PendingPayout`. By the time Phase 3 sees the
+  row the sats are already in Mostro's wallet. The scheduler never
+  calls `settle_hold_invoice`; failure modes that previously hinged
+  on "settle before send_payment" ordering are now impossible by
+  construction.
+- **Node share is retained unconditionally.** The slash-time settle
+  delivers the full `amount_sats` into Mostro's wallet; the node
+  share is whatever the `send_payment` step doesn't pay out
+  (forfeiture leaves the whole `amount_sats` in the node).
+- **Partial failure on the counterparty leg: `send_payment` failed.**
   The bond state stays in `PendingPayout` with a best-effort retry on
   the next scheduler tick. Periodic `Action::AddBondInvoice` messages
   are **only** scheduled by §8.1 step 1, whose precondition is
   `payout_invoice IS NULL` — once the winner has already submitted a
   bolt11, that branch is skipped and the retry loop runs silently
   (tracing logs only, no wire notification to the winner). If retries
-  exhaust, state becomes `Failed`; at that point Mostro is holding the
-  counterparty share (unavoidable with the HTLC already settled) and
-  logs loudly. The node share is unaffected — it was always going to
-  stay. This is a known limitation; node operators can manually pay
-  the winner from logs.
+  exhaust, state becomes `Failed`; at that point Mostro is holding
+  the counterparty share (unavoidable: the HTLC was settled at slash
+  time, so the sats are already on hand but unroutable) and logs
+  loudly. The node share is unaffected — it was always going to stay.
+  This is a known limitation; node operators can manually pay the
+  winner from logs.
 - **Counterparty never claims (forfeit path).** Distinct from
   `Failed`: there is no `payout_invoice` because the counterparty
   never sent one. After `payout_claim_window_days` from `slashed_at`,
-  the scheduler settles the HTLC and transitions to `Forfeited`. No
-  manual operator action is needed — this is a normal terminal
-  state, designed-in. Default 15 days gives even users with sporadic
+  the scheduler CAS-transitions the row to `Forfeited` (no LND call,
+  the HTLC was already claimed at slash time). The CAS predicate
+  includes `AND payout_invoice IS NULL` so a late invoice landing
+  between the scheduler's snapshot and the UPDATE keeps the row in
+  `PendingPayout` for the next tick to route through
+  `send_payment`. Default 15 days gives even users with sporadic
   Nostr presence ample time to see the message and respond.
-- **Non-blocking:** `release_action`, `admin_settle_action`, etc. return
-  success the moment the trade escrow resolves. Bond payout happens
-  later.
+- **Non-blocking on the counterparty leg.** `admin_settle_action` /
+  `admin_cancel_action` return success as soon as both (a) the trade
+  escrow resolves and (b) the slashed bond HTLCs are settled by
+  Phase 2. The counterparty payout (`AddBondInvoice` →
+  `send_payment` → retries / forfeiture) happens later under the
+  scheduler. Trade finalization waits on slash-time settle but never
+  on the recipient payout.
 
 ### 8.3 Acceptance
 
@@ -1141,20 +1184,34 @@ trade finalization must never wait on the payout.
   exactly to `amount_sats` (no rounding leak).
 - Edge case `slash_node_share_pct = 0.0` → behaviour identical to the
   pre-split design (full counterparty payout).
-- Edge case `slash_node_share_pct = 1.0` → settle the HTLC, no
-  `AddBondInvoice` message is enqueued, no `send_payment` runs, bond goes
-  straight to `Slashed`.
+- Edge case `slash_node_share_pct = 1.0` → the HTLC was settled at
+  slash time; the scheduler does **not** call `settle_hold_invoice`.
+  No `AddBondInvoice` message is enqueued, no `send_payment` runs;
+  the bond is CAS-transitioned straight from `PendingPayout` to
+  `Slashed`.
 - **Persistence test**: a bond enters `PendingPayout` under
   `slash_node_share_pct = 0.5`; before payout completes, simulate a
   daemon restart with `slash_node_share_pct = 0.9` in the new
   config; payout still uses the original 0.5 split (read from
   `node_share_sats`). Same shape: change config back and forth
   during `PendingPayout` ticks → split is unaffected.
-- **Forfeit window test**: bond enters `PendingPayout`, counterparty
-  never replies; advance the test clock by
-  `payout_claim_window_days + 1`; on the next scheduler tick the bond
-  settles and transitions to `Forfeited`. Node retains `amount_sats`
-  in full. No `send_payment` was ever attempted.
+- **Slash-time settle (Phase 2 contract)**: dispute resolution with
+  `slash_buyer=true` → `settle_hold_invoice` runs exactly once for
+  the slashed bond before `apply_bond_resolution` returns; the row
+  enters `PendingPayout` only after the HTLC is claimed. Verify the
+  call count from the LND stub and the row state in one go.
+- **Slash-both settles two HTLCs**: both `slash_seller=true` and
+  `slash_buyer=true` with bonds on each side → `settle_hold_invoice`
+  runs twice (once per bond) and both rows reach `PendingPayout`.
+- **Non-slashed release stays release-only**: `BondResolution` with
+  both flags `false` → `settle_hold_invoice` is **not** called; the
+  bond moves to `Released` via the Phase 1 cancel path.
+- **Forfeit window test**: bond enters `PendingPayout` (HTLC already
+  settled at slash time), counterparty never replies; advance the
+  test clock by `payout_claim_window_days + 1`; on the next
+  scheduler tick the row transitions to `Forfeited` via a pure SQL
+  CAS — no `settle_hold_invoice` or `send_payment` is attempted by
+  the scheduler. Node retains `amount_sats` in full.
 - **Late-invoice rejection**: bond is `Forfeited`; counterparty
   submits a bolt11 after the deadline; `add_bond_invoice_action`
   rejects it with a "claim window expired" message; bond stays
@@ -1216,13 +1273,16 @@ adding maker bond rows to the lookup.
 
 - Modify `scheduler::job_cancel_orders`: when the waiting-state timeout
   elapses on an order in `WaitingBuyerInvoice` / `WaitingPayment`, run
-  the §9.2 lookup. If a bond exists for the responsible party, set
-  `state = PendingPayout, slashed_reason = Timeout` (Phase 3 picks it
-  up). Continue the existing cancel-escrow + republish work. The
-  payout recipient is then resolved by Phase 3 per the "Recipient
-  resolution" rule in §8.1: `slashed_reason = Timeout` plus the §9.2
-  responsibility entry uniquely names the non-slashed counterparty
-  (`WaitingBuyerInvoice` → seller; `WaitingPayment` → buyer).
+  the §9.2 lookup. If a bond exists for the responsible party, reuse
+  the Phase 2 slash primitive: **settle the bond hold invoice
+  immediately** (`settle_hold_invoice(preimage)`) and CAS the row to
+  `state = PendingPayout, slashed_reason = Timeout` (Phase 3 then
+  picks it up for the asynchronous counterparty payout). Continue
+  the existing cancel-escrow + republish work. The payout recipient
+  is resolved by Phase 3 per the "Recipient resolution" rule in
+  §8.1: `slashed_reason = Timeout` plus the §9.2 responsibility entry
+  uniquely names the non-slashed counterparty (`WaitingBuyerInvoice`
+  → seller; `WaitingPayment` → buyer).
 - Localised message to the slashed user explaining forfeiture.
 - Tests:
   - "Cancel at minute 5 of a 15-minute timeout" → bond released, no
@@ -1611,8 +1671,8 @@ costs on the timeout path. If neither is funded, both roles are
 volunteer-only, which doesn't scale.
 
 The split solves this without introducing a new payment rail: the
-slash already routes through Mostro's wallet (the HTLC must be settled
-before any payout can happen — §8.1 step 3), so retaining a fraction
+slash already routes through Mostro's wallet (the HTLC is settled at
+slash time, Phase 2 §7.3 step 4.1), so retaining a fraction
 is free. `slash_node_share_pct` is the knob that decides what fraction
 that is. Defaults to **0.5** as a reasonable starting point — half to
 the wronged counterparty (preserves the deterrent: the cheater still
@@ -1643,18 +1703,22 @@ unambiguous to the *bonded* party; how Mostro then divides the
 forfeited sats is an internal accounting decision).
 
 The forfeit window (`payout_claim_window_days`, default 15) is the
-long-stop tail of the same logic. If the wronged counterparty never
-submits a payout invoice — because they lost their key, gave up on
-the platform, or simply forgot — the sats cannot sit in
-`PendingPayout` forever (the HTLC has a CLTV, and the node has a
-real liability tracking unclaimed funds). After the window expires
-the node retains the counterparty share too; the bond closes as
-`Forfeited`. This keeps the on-chain accounting deterministic and
-removes the "Mostro mysteriously holds X sats" failure mode without
-manual intervention. From the cheater's side the deterrent is again
-unaffected — they lost their bond either way. From the wronged
-counterparty's side the message is clear (and surfaced in the info
-event per §13.1): claim within N days or forfeit.
+long-stop tail of the same logic. The slash-time settle already
+deposited the full `amount_sats` into Mostro's wallet, but the
+counterparty share is still owed to the wronged party as a
+`send_payment` whenever they submit a bolt11. If they never do —
+because they lost their key, gave up on the platform, or simply
+forgot — the row cannot sit in `PendingPayout` forever (operators
+would have a growing pile of "owed" sats with no resolution path).
+After the window expires the row CAS-transitions to `Forfeited` and
+the node retains the counterparty share too; the bond closes
+cleanly. This keeps accounting deterministic and removes the
+"Mostro mysteriously holds X sats" failure mode without manual
+intervention. From the cheater's side the deterrent is again
+unaffected — they lost their bond either way (the HTLC was claimed
+at slash time). From the wronged counterparty's side the message is
+clear (and surfaced in the info event per §13.1): claim within N
+days or forfeit.
 
 ---
 

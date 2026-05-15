@@ -205,11 +205,14 @@ pub async fn admin_settle_action(
         .await;
     }
     // Phase 2: apply the solver's `BondResolution` (release-by-default
-    // when absent, otherwise slash the flagged sides). The actual
-    // Lightning payout to the wronged counterparty is Phase 3's job;
-    // here we only transition the bond rows.
+    // when absent, otherwise slash the flagged sides). Slashed bonds
+    // have their hold invoices settled immediately; the recipient
+    // payout (asking the winning counterparty for a bolt11,
+    // `send_payment`, retries, forfeiture on the long-stop window) is
+    // still Phase 3's job.
     if let Err(e) = bond::apply_bond_resolution(
         pool,
+        ln_client,
         &order_updated,
         &bond_resolution,
         BondSlashReason::LostDispute,

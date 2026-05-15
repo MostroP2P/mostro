@@ -98,7 +98,7 @@ port = 50051
 # # amount_pct is a unitless fraction (0.01 = 1%); base_amount_sats is a sat floor.
 # amount_pct = 0.01
 # base_amount_sats = 1000
-# # "take" | "create" | "both"
+# # "take" | "make" | "both"
 # apply_to = "take"
 # # Note: there is no `slash_on_lost_dispute` flag — dispute slashes are
 # # solver-directed via the `BondResolution` payload (Phase 2).

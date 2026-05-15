@@ -82,12 +82,12 @@ pub struct Bond {
     /// alone. Invoice-request messages do NOT increment this — see
     /// `invoice_request_attempts`.
     pub payout_attempts: i64,
-    /// Phase 3: number of `Action::AddInvoice` messages sent to the
+    /// Phase 3: number of `Action::AddBondInvoice` messages sent to the
     /// counterparty asking for a payout invoice. Bounded by the forfeit
     /// window (`payout_claim_window_days`), not by `payout_max_retries`.
     /// Reset to 0 when the counterparty finally submits an invoice.
     pub invoice_request_attempts: i64,
-    /// Phase 3: timestamp of the last `Action::AddInvoice` message. Drives
+    /// Phase 3: timestamp of the last `Action::AddBondInvoice` message. Drives
     /// the `payout_invoice_window_seconds` cadence check; persisted so a
     /// daemon restart doesn't trigger an immediate re-send.
     pub last_invoice_request_at: Option<i64>,

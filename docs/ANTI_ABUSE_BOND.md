@@ -98,9 +98,9 @@ base_amount_sats = 1000
 # because it is a *posting-timing* distinction — the bond is requested at
 # maker-create-time or taker-take-time. The party's role in the trade
 # flow (buyer or seller) is derived from the order kind (§3.1).
-#   "take"   → only the taker posts a bond
-#   "create" → only the maker posts a bond
-#   "both"   → both sides
+#   "take" → only the taker posts a bond
+#   "make" → only the maker posts a bond
+#   "both" → both sides
 apply_to = "take"
 
 # Automatic slash on waiting-state timeout. Only applies when the
@@ -263,14 +263,14 @@ Purely additive. Touches no trade flow.
     -- against this counter alone — invoice-request messages do NOT
     -- count here (see `invoice_request_attempts` below).
     payout_attempts  integer not null default 0,
-    -- Phase 3: counts how many `Action::AddInvoice` messages the
+    -- Phase 3: counts how many `Action::AddBondInvoice` messages the
     -- scheduler has sent asking the counterparty for a payout invoice.
     -- Bumped by step 1 of §8.1. Bounded by the forfeit window
     -- (`payout_claim_window_days`), not by `payout_max_retries`, so
     -- a slow-responding counterparty cannot prematurely flip the
     -- bond to `Failed`.
     invoice_request_attempts integer not null default 0,
-    -- Phase 3: timestamp of the last `AddInvoice` message. Drives the
+    -- Phase 3: timestamp of the last `Action::AddBondInvoice` message. Drives the
     -- `payout_invoice_window_seconds` cadence check ("don't re-send
     -- before the window has elapsed"). Persisted so a daemon restart
     -- doesn't trigger an immediate re-send.
@@ -1127,13 +1127,18 @@ trade finalization must never wait on the payout.
 
 - End-to-end test: dispute resolved with `slash_buyer=true` and
   `slash_node_share_pct = 0.5` → buyer-side counterparty (the seller)
-  is asked for a bolt11 sized at `floor(amount/2) − routing_fee`,
-  submits it → bond payout settles (split sums exactly to `amount`,
-  no rounding leak).
+  is asked for a bolt11 sized at the full counterparty share
+  (`amount_sats − floor(amount_sats * slash_node_share_pct)` =
+  `floor(amount/2)`). The payout-invoice principal carries the
+  counterparty share **only**; routing fee is paid separately from
+  Mostro's own wallet (capped at `max_routing_fee` and recorded into
+  `payout_routing_fee_sats`), not deducted from the requested
+  principal. Submits it → bond payout settles, the two shares sum
+  exactly to `amount_sats` (no rounding leak).
 - Edge case `slash_node_share_pct = 0.0` → behaviour identical to the
   pre-split design (full counterparty payout).
 - Edge case `slash_node_share_pct = 1.0` → settle the HTLC, no
-  `AddInvoice` message is enqueued, no `send_payment` runs, bond goes
+  `AddBondInvoice` message is enqueued, no `send_payment` runs, bond goes
   straight to `Slashed`.
 - **Persistence test**: a bond enters `PendingPayout` under
   `slash_node_share_pct = 0.5`; before payout completes, simulate a
@@ -1200,7 +1205,7 @@ Worked rows for `apply_to = "take"`:
 | `buy`      | `WaitingBuyerInvoice`  | buyer = maker  | no     | no slash |
 | `buy`      | `WaitingPayment`       | seller = taker | yes    | slash taker bond |
 
-Phase 7 fills the "no slash" rows for `apply_to ∈ { create, both }` by
+Phase 7 fills the "no slash" rows for `apply_to ∈ { make, both }` by
 adding maker bond rows to the lookup.
 
 ### 9.3 Scope
@@ -1237,7 +1242,7 @@ adding maker bond rows to the lookup.
 
 ## 10. Phase 5 — Maker bond (non-range) + dispute slash
 
-Gate: `enabled && apply_to ∈ { create, both }`.
+Gate: `enabled && apply_to ∈ { make, both }`.
 
 ### 10.1 Bond lifecycle (maker-specific)
 
@@ -1282,7 +1287,7 @@ publication time and is not repriced.
 ### 10.4 Acceptance
 
 - Feature disabled: no change.
-- Feature enabled, apply_to=create: order is not visible in the book
+- Feature enabled, apply_to=make: order is not visible in the book
   until bond locks. A client that abandons the bond invoice → order
   never shows up; no ghost book entry.
 - Phase 2 dispute slashes targeting the maker (e.g. `slash_seller=true`
@@ -1389,7 +1394,7 @@ the maker.
 
 ## 12. Phase 7 — Maker timeout slash
 
-Gate: `enabled && slash_on_waiting_timeout && apply_to ∈ { create, both }`.
+Gate: `enabled && slash_on_waiting_timeout && apply_to ∈ { make, both }`.
 
 Symmetric to Phase 4. Reuses §9.2's buyer/seller responsibility table —
 this phase simply makes the lookup find a maker bond when the
@@ -1427,7 +1432,7 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
     daemon that doesn't speak bond at all": the latter omits the tag
     entirely, the former emits `false`. All remaining bond tags are
     emitted only when this is `true`.
-  - `bond_apply_to` (`take` | `create` | `both`) — whether the user
+  - `bond_apply_to` (`take` | `make` | `both`) — whether the user
     needs to lock a bond as maker, taker, or both.
   - `bond_slash_on_waiting_timeout` (`true` | `false`) — node policy:
     can a bond be slashed for missing a waiting-state timeout, or

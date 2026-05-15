@@ -41,6 +41,7 @@
 //! validator uses on the way *in* applies here on the way *out*.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use chrono::Utc;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
@@ -56,6 +57,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use tokio::sync::mpsc::channel;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -68,6 +70,15 @@ use crate::util::enqueue_order_msg;
 use super::db::find_bonds_by_state;
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
+
+/// Per-message ceiling for the `send_payment` status stream. LND
+/// streams periodic InFlight updates while a payment is routing; if no
+/// update lands inside this window the channel is treated as dead and
+/// the attempt is routed through `on_send_payment_failure`. Picked to
+/// be longer than the typical InFlight cadence (a few seconds) but
+/// short enough to keep a single bond from blocking a scheduler task
+/// indefinitely.
+const PAYMENT_STATUS_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One full pass over every bond in [`BondState::PendingPayout`].
 ///
@@ -174,11 +185,17 @@ async fn process_one_bond(
 }
 
 /// Compute `amount_sats - node_share_sats`, erroring if the row is
-/// missing `node_share_sats`. Phase 2's slash CAS writes the column
-/// atomically with the transition to `PendingPayout`, so a `None` here
-/// is an invariant violation that should not be defaulted to 0 —
-/// silently treating node share as 0 would pay the entire bond to the
-/// counterparty.
+/// missing `node_share_sats` or carries an out-of-range value. Phase 2's
+/// slash CAS writes the column atomically with the transition to
+/// `PendingPayout`, so a `None` here is an invariant violation that
+/// should not be defaulted to 0 — silently treating node share as 0
+/// would pay the entire bond to the counterparty. The same goes for
+/// values outside `0..=amount_sats`: a negative share would corrupt the
+/// invoice principal, and a share above the bond would imply Mostro
+/// retains more than the user locked. The config's
+/// `slash_node_share_pct` validator already rejects out-of-range
+/// fractions at startup, but we re-check here as a belt-and-braces
+/// guard against a corrupted DB row.
 fn counterparty_share_sats(bond: &Bond) -> Result<i64, MostroError> {
     let node_share = bond.node_share_sats.ok_or_else(|| {
         MostroInternalErr(ServiceError::UnexpectedError(format!(
@@ -186,6 +203,12 @@ fn counterparty_share_sats(bond: &Bond) -> Result<i64, MostroError> {
             bond.id
         )))
     })?;
+    if !(0..=bond.amount_sats).contains(&node_share) {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "bond {} in PendingPayout has node_share_sats {node_share} outside [0, {}] (invariant violation)",
+            bond.id, bond.amount_sats
+        ))));
+    }
     Ok(bond.amount_sats - node_share)
 }
 
@@ -212,21 +235,39 @@ async fn forfeit_bond(
 ) -> Result<(), MostroError> {
     let preimage = preimage_or_err(bond, "forfeit")?;
     if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
-        warn!(
-            bond_id = %bond.id,
-            order_id = %bond.order_id,
-            "forfeit: settle_hold_invoice failed: {e} — will retry on next tick"
-        );
-        return Err(e);
+        if is_already_settled_error(&e) {
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "forfeit: bond HTLC already settled; proceeding to state transition"
+            );
+        } else {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "forfeit: settle_hold_invoice failed: {e} — will retry on next tick"
+            );
+            return Err(e);
+        }
     }
 
-    let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
-        .bind(BondState::Forfeited.to_string())
-        .bind(bond.id)
-        .bind(BondState::PendingPayout.to_string())
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // `AND payout_invoice IS NULL` closes the race against
+    // `add_bond_invoice_action`: if the counterparty's late invoice landed
+    // between this scheduler's `bond.payout_invoice.is_none()` snapshot
+    // and the UPDATE below, we must not flip the row to `Forfeited` and
+    // silently discard their bolt11. The HTLC is already settled (above),
+    // so on the next tick `settle_and_pay` will take over — its own
+    // `settle_hold_invoice` call will short-circuit on
+    // `is_already_settled_error` and proceed to `send_payment`.
+    let result = sqlx::query(
+        "UPDATE bonds SET state = ? WHERE id = ? AND state = ? AND payout_invoice IS NULL",
+    )
+    .bind(BondState::Forfeited.to_string())
+    .bind(bond.id)
+    .bind(BondState::PendingPayout.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 1 {
         info!(
@@ -234,6 +275,12 @@ async fn forfeit_bond(
             order_id = %bond.order_id,
             amount_sats = bond.amount_sats,
             "bond forfeited: claim window elapsed, node retains full amount"
+        );
+    } else {
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "forfeit: counterparty invoice landed concurrently; payout will continue on next tick"
         );
     }
     Ok(())
@@ -248,12 +295,20 @@ async fn settle_node_only(
 ) -> Result<(), MostroError> {
     let preimage = preimage_or_err(bond, "node-only payout")?;
     if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
-        warn!(
-            bond_id = %bond.id,
-            order_id = %bond.order_id,
-            "node-only payout: settle_hold_invoice failed: {e} — will retry on next tick"
-        );
-        return Err(e);
+        if is_already_settled_error(&e) {
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "node-only payout: bond HTLC already settled; proceeding to state transition"
+            );
+        } else {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "node-only payout: settle_hold_invoice failed: {e} — will retry on next tick"
+            );
+            return Err(e);
+        }
     }
 
     let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
@@ -458,24 +513,41 @@ async fn settle_and_pay(
     }
 
     // Collect the first terminal status from the stream. Mirrors
-    // dev_fee::send_dev_fee_payment.
+    // dev_fee::send_dev_fee_payment, but each recv is bounded by
+    // `PAYMENT_STATUS_RECV_TIMEOUT` so a wedged LND stream (no terminal
+    // update, no EOF, no InFlight churn) does not pin the scheduler
+    // task forever. A timeout and a clean EOF are both routed through
+    // `on_send_payment_failure` so the retry budget governs the
+    // recovery path uniformly.
     let mut succeeded = false;
     let mut failure: Option<String> = None;
-    while let Some(msg) = rx.recv().await {
-        if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-            match status {
-                PaymentStatus::Succeeded => {
-                    succeeded = true;
-                    break;
+    loop {
+        match timeout(PAYMENT_STATUS_RECV_TIMEOUT, rx.recv()).await {
+            Err(_) => {
+                failure = Some(format!(
+                    "payment status stream timed out after {}s without a terminal update",
+                    PAYMENT_STATUS_RECV_TIMEOUT.as_secs()
+                ));
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(msg)) => {
+                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                    match status {
+                        PaymentStatus::Succeeded => {
+                            succeeded = true;
+                            break;
+                        }
+                        PaymentStatus::Failed => {
+                            failure = Some(format!(
+                                "payment failed: reason {}",
+                                msg.payment.failure_reason
+                            ));
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                PaymentStatus::Failed => {
-                    failure = Some(format!(
-                        "payment failed: reason {}",
-                        msg.payment.failure_reason
-                    ));
-                    break;
-                }
-                _ => {}
             }
         }
     }

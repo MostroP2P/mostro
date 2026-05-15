@@ -985,6 +985,52 @@ payout from sats Mostro already holds.
 
 ### 8.1 Scope
 
+**`Payload::BondPayoutRequest` variant in `mostro-core` 0.11.3+.**
+
+The `Action::AddBondInvoice` message Mostro sends to the winning
+counterparty must carry the original slash anchor (`slashed_at`), not
+just the order context. If the recipient is offline or the relay is
+down for several days, a deadline derived from "now + window" at the
+client *receive time* would silently drift past the real forfeit
+moment; the client would tell the user they have N days left when in
+reality they have far fewer. Shipping `slashed_at` on every retry of
+the message guarantees the client always computes the deadline from
+the same fixed anchor the daemon uses, regardless of when the
+message lands.
+
+From `mostro-core::message::Payload`:
+
+```rust
+/// Bond payout invoice request carried by [`Action::AddBondInvoice`].
+/// Asks the winning counterparty for a bolt11 sized at the order's
+/// `amount` (= counterparty share) and ships the slash anchor so the
+/// client can render the forfeit deadline locally as
+/// `slashed_at + bond_payout_claim_window_days * 86_400`, even if the
+/// message arrives days after it was emitted.
+BondPayoutRequest(BondPayoutRequest)
+```
+
+```rust
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BondPayoutRequest {
+    /// Order context (id, kind, amount = counterparty_share_sats,
+    /// fiat metadata, etc.) — the same `SmallOrder` shape the client
+    /// already renders for other order-bearing actions.
+    pub order: SmallOrder,
+    /// Unix timestamp (seconds, UTC) when the slash decision was
+    /// recorded. Frozen at the `Locked → PendingPayout` CAS and
+    /// re-shipped verbatim on every cadence retry of the request.
+    pub slashed_at: i64,
+}
+```
+
+`MessageKind::verify` accepts this variant only on
+`Action::AddBondInvoice`. Any other action carrying it returns
+`ServiceError::InvalidPayload`. The variant is serde-additive: clients
+on `mostro-core` 0.11.2 (which only knows `Payload::Order` for this
+action) will reject the message, so the daemon-side bump to 0.11.3
+must land hand-in-hand with the client adoption. See §14.3.
+
 - Split computation, applied **once** at the moment a bond transitions
   to `PendingPayout` (`admin_settle_action` / `admin_cancel_action`
   in Phase 2; `job_cancel_orders` in Phase 4 / 7). The value is
@@ -1023,29 +1069,31 @@ payout from sats Mostro already holds.
     1. If no `payout_invoice` yet, and the cadence window has elapsed
        (i.e. `last_invoice_request_at IS NULL` or
        `now - last_invoice_request_at >= payout_invoice_window_seconds`):
-       enqueue an `Action::AddBondInvoice` message (mostro-core 0.11.2+)
+       enqueue an `Action::AddBondInvoice` message (mostro-core 0.11.3+)
        to the recipient (see "Recipient resolution" below) asking for
-       a bolt11 for the full `counterparty_share_sats` — the handler
-       validates the invoice principal against `counterparty_share_sats`
-       with fee = 0, so the routing fee must come out of Mostro's
-       wallet, not the invoice principal. (The bonded user may use
-       the estimated routing fee as guidance when choosing a recipient
-       node, but it is not subtracted from the requested amount.)
-       The message carries **only the structured request payload** — no
-       hardcoded human-readable text. The forfeit deadline is not
-       shipped inline: the client computes it locally from the slash
-       moment (observable on the order's audit trail) plus
-       `bond_payout_claim_window_days`, which Mostro advertises on the
-       kind-38385 info event (§13.1). Keeping the wire payload
-       text-free lets clients render the warning ("your share will be
-       forfeited in N days") in the user's own locale, and avoids
-       baking English copy into the daemon. Bump
-       `invoice_request_attempts` and set `last_invoice_request_at =
-       now`. **Do not touch `payout_attempts`** — that counter only
-       governs `send_payment` retries (step 4); mixing the two would
-       let a slow-responding counterparty exhaust `payout_max_retries`
-       on invoice-request messages alone and prematurely flip the bond to
-       `Failed`. Bounding invoice requests is the forfeit window's job
+       a bolt11 for the full `counterparty_share_sats`. The message
+       body is a `Payload::BondPayoutRequest { order, slashed_at }`
+       (see the variant contract above): `order.amount` carries the
+       counterparty share so the handler can validate the invoice
+       principal with fee = 0 (the routing fee comes out of Mostro's
+       wallet, not the invoice principal), and `slashed_at` carries
+       the slash anchor so the client can render the forfeit deadline
+       locally as `slashed_at + bond_payout_claim_window_days *
+       86_400` — accurate even if the message lands days after Mostro
+       emitted it. (The bonded user may use the estimated routing fee
+       as guidance when choosing a recipient node, but it is not
+       subtracted from the requested amount.) The message carries no
+       hardcoded human-readable text; clients render the warning
+       ("your share will be forfeited in N days") in the user's own
+       locale using `slashed_at` from this payload and
+       `bond_payout_claim_window_days` from the kind-38385 info event
+       (§13.1). Bump `invoice_request_attempts` and set
+       `last_invoice_request_at = now`. **Do not touch
+       `payout_attempts`** — that counter only governs `send_payment`
+       retries (step 4); mixing the two would let a slow-responding
+       counterparty exhaust `payout_max_retries` on invoice-request
+       messages alone and prematurely flip the bond to `Failed`.
+       Bounding invoice requests is the forfeit window's job
        (`payout_claim_window_days`), not the retry budget's. The node
        share never leaves Mostro's wallet, so it has no separate
        invoice step.
@@ -1575,6 +1623,18 @@ these requires a compatibility statement:
   `Action::PayBondInvoice`; keeps the bond-payout reply disjoint from
   the buyer-invoice `Action::AddInvoice` so the daemon can route on
   action type alone.
+- `Payload::BondPayoutRequest` variant in mostro-core (Phase 3).
+  **Targets `mostro-core` 0.11.3** (not yet released). Carries
+  `{ order: SmallOrder, slashed_at: i64 }` on `Action::AddBondInvoice`
+  so the client can compute the forfeit deadline from the slash
+  anchor instead of from message receipt time. Without this anchor a
+  recipient offline for several days would see a deadline silently
+  shifted into the future; with it, the deadline is fixed and
+  identical across every cadence retry. The variant is serde-additive
+  but a client on 0.11.2 will reject the message (it expects
+  `Payload::Order`), so the daemon-side bump and the client update
+  must land together. `MessageKind::verify` accepts this variant only
+  on `Action::AddBondInvoice`.
 - `Status::WaitingMakerBond` (Phase 5). Not yet shipped upstream;
   needs a follow-up `mostro-core` minor release before Phase 5 can
   land here.

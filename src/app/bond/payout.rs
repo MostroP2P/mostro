@@ -58,7 +58,7 @@ use mostro_core::error::{
     MostroError::{self, MostroCantDo, MostroInternalErr},
     ServiceError,
 };
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::message::{Action, BondPayoutRequest, Message, Payload};
 use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::order::{Order, SmallOrder};
 use nostr_sdk::prelude::*;
@@ -343,6 +343,17 @@ async fn request_payout_invoice(
     let counterparty_share = counterparty_share_sats(bond)?;
     let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
 
+    // `process_one_bond` already errored out on a missing `slashed_at`
+    // before dispatching here, but re-check rather than `.unwrap()` so
+    // the invariant holds at every emission point — every cadence retry
+    // ships the same fixed anchor.
+    let slashed_at = bond.slashed_at.ok_or_else(|| {
+        MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "bond {} in PendingPayout missing slashed_at (invariant violation)",
+            bond.id
+        )))
+    })?;
+
     let small = SmallOrder::new(
         Some(order.id),
         Some(order_kind),
@@ -366,22 +377,28 @@ async fn request_payout_invoice(
         order_id = %bond.order_id,
         amount_sats = counterparty_share,
         recipient = %recipient_pubkey,
+        slashed_at,
         attempt = bond.invoice_request_attempts + 1,
         "bond payout: requesting invoice from counterparty"
     );
 
-    // The notification carries only the structured request payload. The
-    // client computes the forfeit deadline from `slashed_at` (the slash
-    // moment is observable on-chain via the audit event the dispute /
-    // timeout path publishes) plus `bond_payout_claim_window_days` from
-    // the kind-38385 info event, and presents it to the user in their own
-    // locale. Mostro intentionally ships no hardcoded human-readable
-    // text.
+    // Ship the structured `BondPayoutRequest` payload (mostro-core
+    // 0.11.3): `order.amount` carries the counterparty share and
+    // `slashed_at` is the slash anchor the client uses to render the
+    // forfeit deadline locally (`slashed_at +
+    // bond_payout_claim_window_days * 86_400`). The same anchor is
+    // re-shipped verbatim on every cadence retry, so a recipient
+    // offline for days still gets a correct deadline once their relay
+    // catches up. No human-readable text is bundled — clients render
+    // the warning in the user's own locale from these two values.
     enqueue_order_msg(
         None,
         Some(order.id),
         Action::AddBondInvoice,
-        Some(Payload::Order(small)),
+        Some(Payload::BondPayoutRequest(BondPayoutRequest {
+            order: small,
+            slashed_at,
+        })),
         recipient_pubkey,
         None,
     )

@@ -111,7 +111,7 @@ pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConne
 /// ```text
 ///                          ┌── forfeit window elapsed AND no invoice ─► settle ─► Forfeited
 ///                          │
-///   PendingPayout ─────────┤── no invoice yet AND cadence ok ───► AddBondInvoice DM
+///   PendingPayout ─────────┤── no invoice yet AND cadence ok ───► AddBondInvoice message
 ///                          │
 ///                          │── invoice present (or node_share_pct=1.0) ─► settle ─► [send_payment]
 ///                          │                                                              │
@@ -151,7 +151,7 @@ async fn process_one_bond(
     // Forfeit window has elapsed and counterparty never submitted a
     // bolt11: settle the HTLC into Mostro's wallet and transition to
     // `Forfeited`. The node retains `amount_sats` in full. No further
-    // DMs or `send_payment` attempts.
+    // messages or `send_payment` attempts.
     if bond.payout_invoice.is_none() && now - slashed_at >= claim_window_seconds {
         return forfeit_bond(pool, ln_client, bond).await;
     }
@@ -163,14 +163,12 @@ async fn process_one_bond(
     if counterparty_share <= 0 {
         // `slash_node_share_pct = 1.0` (or full retention) — there's no
         // counterparty leg. Settle the HTLC and transition straight to
-        // `Slashed`. No `AddBondInvoice` DM, no `send_payment`.
+        // `Slashed`. No `AddBondInvoice` message, no `send_payment`.
         return settle_node_only(pool, ln_client, bond).await;
     }
 
     match bond.payout_invoice.as_deref() {
-        None => {
-            request_payout_invoice(pool, bond, invoice_window_seconds, claim_window_seconds).await
-        }
+        None => request_payout_invoice(pool, bond, invoice_window_seconds).await,
         Some(invoice) => settle_and_pay(pool, ln_client, bond, invoice, max_retries).await,
     }
 }
@@ -242,7 +240,7 @@ async fn forfeit_bond(
 }
 
 /// Counterparty share is empty (`slash_node_share_pct = 1.0`): settle
-/// the HTLC and transition to `Slashed`. No DMs, no `send_payment`.
+/// the HTLC and transition to `Slashed`. No messages, no `send_payment`.
 async fn settle_node_only(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -282,12 +280,11 @@ async fn settle_node_only(
 /// within `payout_invoice_window_seconds`. Bumps
 /// `invoice_request_attempts` and `last_invoice_request_at` only — the
 /// retry budget (`payout_max_retries`) is for `send_payment` failures
-/// once an invoice is in hand, not for invoice-request DMs.
+/// once an invoice is in hand, not for invoice-request messages.
 async fn request_payout_invoice(
     pool: &Pool<Sqlite>,
     bond: &Bond,
     invoice_window_seconds: i64,
-    claim_window_seconds: i64,
 ) -> Result<(), MostroError> {
     let now = Utc::now().timestamp();
     if let Some(last) = bond.last_invoice_request_at {
@@ -355,53 +352,27 @@ async fn request_payout_invoice(
         None,
     );
 
-    // `process_one_bond` already errored out on a missing `slashed_at`
-    // before dispatching here, but route the absence through an error
-    // path rather than defaulting to `now` so the invariant holds end
-    // to end and we never DM a deadline computed from a synthetic
-    // anchor.
-    let slashed_at = bond.slashed_at.ok_or_else(|| {
-        MostroInternalErr(ServiceError::UnexpectedError(format!(
-            "bond {} in PendingPayout missing slashed_at (invariant violation)",
-            bond.id
-        )))
-    })?;
-    let deadline_unix = slashed_at + claim_window_seconds;
-    let deadline = chrono::DateTime::<Utc>::from_timestamp(deadline_unix, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| deadline_unix.to_string());
-
     info!(
         bond_id = %bond.id,
         order_id = %bond.order_id,
         amount_sats = counterparty_share,
         recipient = %recipient_pubkey,
-        deadline = %deadline,
         attempt = bond.invoice_request_attempts + 1,
         "bond payout: requesting invoice from counterparty"
     );
 
-    // The notification carries the request payload. The deadline is
-    // shipped as a separate `SendDm` text message so the user sees a
-    // human-readable claim window alongside the structured request.
+    // The notification carries only the structured request payload. The
+    // client computes the forfeit deadline from `slashed_at` (the slash
+    // moment is observable on-chain via the audit event the dispute /
+    // timeout path publishes) plus `bond_payout_claim_window_days` from
+    // the kind-38385 info event, and presents it to the user in their own
+    // locale. Mostro intentionally ships no hardcoded human-readable
+    // text.
     enqueue_order_msg(
         None,
         Some(order.id),
         Action::AddBondInvoice,
         Some(Payload::Order(small)),
-        recipient_pubkey,
-        None,
-    )
-    .await;
-
-    let deadline_msg = format!(
-        "Bond payout pending. Submit a Lightning invoice for {counterparty_share} sats via add-bond-invoice before {deadline} or your share will be forfeited."
-    );
-    enqueue_order_msg(
-        None,
-        Some(order.id),
-        Action::SendDm,
-        Some(Payload::TextMessage(deadline_msg)),
         recipient_pubkey,
         None,
     )
@@ -535,7 +506,7 @@ async fn settle_and_pay(
 
 /// Bump `payout_attempts`; on `payout_max_retries` reached, transition
 /// the bond to `Failed`. This counter only increments on real
-/// `send_payment` failures, not on invoice-request DMs.
+/// `send_payment` failures, not on invoice-request messages.
 async fn on_send_payment_failure(
     pool: &Pool<Sqlite>,
     bond: &Bond,
@@ -908,9 +879,7 @@ mod tests {
         );
         let bond = create_bond(&pool, bond).await.unwrap();
 
-        request_payout_invoice(&pool, &bond, 300, 86_400)
-            .await
-            .unwrap();
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
 
         let row: (i64, Option<i64>) = sqlx::query_as(
             "SELECT invoice_request_attempts, last_invoice_request_at FROM bonds WHERE id = ?",

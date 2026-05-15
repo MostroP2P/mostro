@@ -574,7 +574,7 @@ mod tests {
                 .unwrap();
         assert_eq!(first.0, BondState::PendingPayout.to_string());
 
-        // Pretend a duplicate admin DM arrived a second later.
+        // Pretend a duplicate admin message arrived a second later.
         std::thread::sleep(std::time::Duration::from_secs(1));
         apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
             .await

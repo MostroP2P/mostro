@@ -20,7 +20,7 @@
 //! `taker_*` columns until one bond wins the lock race —
 //! [`on_bond_invoice_accepted`] promotes the winner's columns onto the
 //! order, cancels every other still-`Requested` bond on the order,
-//! and DMs each loser `Action::Canceled`. A malicious taker who never
+//! and messages each loser `Action::Canceled`. A malicious taker who never
 //! pays their bond does not block the order book: their HTLC expires
 //! on its own LND-side TTL and the bond is released.
 //!
@@ -221,7 +221,7 @@ pub async fn request_taker_bond(
     .await;
 
     // Phase 1.5: park the order at `WaitingTakerBond` while the bond is
-    // outstanding. The bond subscriber is armed before the DM is sent
+    // outstanding. The bond subscriber is armed before the message is sent
     // (a few lines up), so a fast `Accepted` callback can have already
     // transitioned this order to `WaitingPayment` / `WaitingBuyerInvoice`
     // by the time we get here; a concurrent maker cancel can have moved
@@ -574,8 +574,8 @@ pub async fn resubscribe_active_bonds(pool: &Arc<Pool<Sqlite>>) -> Result<(), Mo
 ///    notify our taker, and exit).
 /// 3. On `rows_affected == 1` (we won), iterate every other still-
 ///    `Requested` bond on the order, release each (cancels the LND
-///    hold invoice + marks `Released`), and DM `Action::Canceled` to
-///    each losing taker.
+///    hold invoice + marks `Released`), and message `Action::Canceled`
+///    to each losing taker.
 /// 4. Copy the winning bond's `taker_*` columns onto the order row
 ///    (pubkeys, identity, trade index, per-bond pricing, optional
 ///    buyer invoice), then call `resume_take_after_bond` to drive
@@ -667,7 +667,7 @@ async fn on_bond_invoice_accepted(
 
         // We just won. Tear down every other still-`Requested` bond on
         // this order: cancel the LND hold invoice (so the loser
-        // taker's funds aren't held) and DM them `Action::Canceled`.
+        // taker's funds aren't held) and message them `Action::Canceled`.
         let losers = match find_active_bonds_for_order(pool, current.order_id).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -736,7 +736,7 @@ async fn on_bond_invoice_accepted(
     resume_take_after_bond(pool, order, &my_keys, request_id).await
 }
 
-/// DM the taker of a losing concurrent bond that their take was
+/// Message the taker of a losing concurrent bond that their take was
 /// cancelled because another taker locked their bond first.
 async fn notify_loser(bond: &Bond) {
     if let Ok(taker_pk) = PublicKey::from_str(&bond.pubkey) {

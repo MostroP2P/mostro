@@ -38,7 +38,7 @@ use nostr_sdk::prelude::*;
 ///
 /// # Errors
 ///
-/// Errors are logged but not propagated for DM sending failures. All other errors are returned
+/// Errors are logged but not propagated for message sending failures. All other errors are returned
 /// to the caller.
 pub async fn last_trade_index(
     ctx: &AppContext,
@@ -89,9 +89,9 @@ pub async fn last_trade_index(
     );
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
-    // Send DM back to the requester
+    // Send message back to the requester
     if let Err(e) = send_dm(trade_key, my_keys, &message_json, None).await {
-        tracing::error!("Error sending DM with last trade index: {:?}", e);
+        tracing::error!("Error sending message with last trade index: {:?}", e);
     }
 
     Ok(())

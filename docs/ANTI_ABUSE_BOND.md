@@ -260,20 +260,20 @@ Purely additive. Touches no trade flow.
     -- Phase 3: counts ONLY `send_payment` retries against an invoice
     -- the counterparty has already submitted. Bumped only by step 6
     -- of the §8.1 scheduler loop. `payout_max_retries` is checked
-    -- against this counter alone — invoice-request DMs do NOT count
-    -- here (see `invoice_request_attempts` below).
+    -- against this counter alone — invoice-request messages do NOT
+    -- count here (see `invoice_request_attempts` below).
     payout_attempts  integer not null default 0,
-    -- Phase 3: counts how many `Action::AddInvoice` DMs the scheduler
-    -- has sent asking the counterparty for a payout invoice. Bumped
-    -- by step 1 of §8.1. Bounded by the forfeit window
+    -- Phase 3: counts how many `Action::AddInvoice` messages the
+    -- scheduler has sent asking the counterparty for a payout invoice.
+    -- Bumped by step 1 of §8.1. Bounded by the forfeit window
     -- (`payout_claim_window_days`), not by `payout_max_retries`, so
     -- a slow-responding counterparty cannot prematurely flip the
     -- bond to `Failed`.
     invoice_request_attempts integer not null default 0,
-    -- Phase 3: timestamp of the last `AddInvoice` DM. Drives the
-    -- `payout_invoice_window_seconds` cadence check ("don't re-DM
+    -- Phase 3: timestamp of the last `AddInvoice` message. Drives the
+    -- `payout_invoice_window_seconds` cadence check ("don't re-send
     -- before the window has elapsed"). Persisted so a daemon restart
-    -- doesn't trigger an immediate re-DM.
+    -- doesn't trigger an immediate re-send.
     last_invoice_request_at integer,
     locked_at        integer,
     released_at      integer,
@@ -525,7 +525,7 @@ changes — pure ergonomics.
 Lands **before Phase 2 on purpose**. Phase 2 introduces dispute
 slashes and the `BondResolution` payload; once that ships and
 operators flip `enabled = true` in production, every taker on every
-bond-enabled node sees the bond DM. We want clients to have already
+bond-enabled node sees the bond message. We want clients to have already
 adopted the clean API by then so the seller-as-taker case (§6.3)
 never has to lean on memo parsing in the wild.
 
@@ -554,7 +554,7 @@ never has to lean on memo parsing in the wild.
 - **`mostrod` changes** in `src/app/bond/flow.rs::request_taker_bond`
   and the take handlers:
   - Replace `Action::PayInvoice` with `Action::PayBondInvoice` when
-    enqueuing the bond DM.
+    enqueuing the bond message.
   - Set the order's status to `Status::WaitingTakerBond` while the
     bond is outstanding (instead of leaving it in `Pending`). Add
     the NIP-69 mapping in `nip33::create_status_tags`:
@@ -602,7 +602,7 @@ never has to lean on memo parsing in the wild.
     preimage yet) and notifies its taker with `Action::Canceled`.
     Once a bond does win, the handler iterates every other still-
     `Requested` bond on the order, calls `release_bond` on each
-    (LND hold-invoice cancel + `BondState::Released`), and DMs
+    (LND hold-invoice cancel + `BondState::Released`), and messages
     each loser an `Action::Canceled`. Only after this cleanup does
     it copy the winning bond's `taker_*` context onto the order
     and call `resume_take_after_bond`.
@@ -670,7 +670,7 @@ never has to lean on memo parsing in the wild.
 ### 6.5.2 Client compatibility
 
 - A client that only knows `Action::PayInvoice` will silently ignore
-  the bond DM after this phase ships, the bond will never lock, and
+  the bond message after this phase ships, the bond will never lock, and
   the take will time out and release. No funds at risk, but the take
   fails. This is the expected behaviour for unknown-action handling
   per §14.2 ("Clients must handle unknown statuses gracefully") — it
@@ -687,7 +687,7 @@ never has to lean on memo parsing in the wild.
 
 ### 6.5.3 Tests
 
-- Bond DM enqueues with `Action::PayBondInvoice`, not `PayInvoice`.
+- Bond message enqueues with `Action::PayBondInvoice`, not `PayInvoice`.
 - Order's **DB** status flips to `WaitingTakerBond` while the bond is
   outstanding, flips out to `WaitingPayment` /
   `WaitingBuyerInvoice` (per the existing trade flow) once the bond
@@ -738,7 +738,7 @@ never has to lean on memo parsing in the wild.
   guard ensures exactly one transition to `Locked` succeeds. The
   loser's handler observes `rows_affected = 0`, calls
   `cancel_hold_invoice` on its own hash to release its taker's
-  HTLC without settling, and DMs `Action::Canceled` to its taker.
+  HTLC without settling, and messages `Action::Canceled` to its taker.
   Net effect is identical to the staggered case; no double-lock
   and no settled HTLC for the loser.
 - Seller-as-taker case: one `PayBondInvoice` followed by one
@@ -986,13 +986,13 @@ trade finalization must never wait on the payout.
       bolt11): `settle_hold_invoice(preimage)`, transition the bond
       to `state = Forfeited`, publish the audit event with
       `outcome = forfeited`, and stop. The node retains the full
-      `amount_sats`. No further DMs or `send_payment` runs.
+      `amount_sats`. No further messages or `send_payment` runs.
     - Otherwise, proceed with the normal payout steps below.
   - Normal payout steps:
     1. If no `payout_invoice` yet, and the cadence window has elapsed
        (i.e. `last_invoice_request_at IS NULL` or
        `now - last_invoice_request_at >= payout_invoice_window_seconds`):
-       enqueue an `Action::AddBondInvoice` DM (mostro-core 0.11.2+)
+       enqueue an `Action::AddBondInvoice` message (mostro-core 0.11.2+)
        to the recipient (see "Recipient resolution" below) asking for
        a bolt11 for the full `counterparty_share_sats` — the handler
        validates the invoice principal against `counterparty_share_sats`
@@ -1000,16 +1000,21 @@ trade finalization must never wait on the payout.
        wallet, not the invoice principal. (The bonded user may use
        the estimated routing fee as guidance when choosing a recipient
        node, but it is not subtracted from the requested amount.)
-       The DM **must include the forfeit deadline** (e.g. "claim by
-       <ISO timestamp> or your share will be forfeited") via a
-       `Payload::TextMessage` body alongside the action, so the user
-       knows the clock is running. Bump `invoice_request_attempts`
-       and set `last_invoice_request_at = now`. **Do not touch
-       `payout_attempts`** — that counter only governs `send_payment`
-       retries (step 6); mixing the two would let a slow-responding
-       counterparty exhaust `payout_max_retries` on invoice-request
-       DMs alone and prematurely flip the bond to `Failed`. Bounding
-       invoice requests is the forfeit window's job
+       The message carries **only the structured request payload** — no
+       hardcoded human-readable text. The forfeit deadline is not
+       shipped inline: the client computes it locally from the slash
+       moment (observable on the order's audit trail) plus
+       `bond_payout_claim_window_days`, which Mostro advertises on the
+       kind-38385 info event (§13.1). Keeping the wire payload
+       text-free lets clients render the warning ("your share will be
+       forfeited in N days") in the user's own locale, and avoids
+       baking English copy into the daemon. Bump
+       `invoice_request_attempts` and set `last_invoice_request_at =
+       now`. **Do not touch `payout_attempts`** — that counter only
+       governs `send_payment` retries (step 6); mixing the two would
+       let a slow-responding counterparty exhaust `payout_max_retries`
+       on invoice-request messages alone and prematurely flip the bond to
+       `Failed`. Bounding invoice requests is the forfeit window's job
        (`payout_claim_window_days`), not the retry budget's. The node
        share never leaves Mostro's wallet, so it has no separate
        invoice step.
@@ -1034,7 +1039,7 @@ trade finalization must never wait on the payout.
        `Forfeited` (the user never gave us an invoice).
 
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
-  entirely (no `AddBondInvoice` DM, no `send_payment`, no forfeit
+  entirely (no `AddBondInvoice` message, no `send_payment`, no forfeit
   window to wait for); the bond goes straight from `PendingPayout` →
   settle → `Slashed` after step 3.
 
@@ -1060,7 +1065,7 @@ trade finalization must never wait on the payout.
     taker have active bonds, neither party deserves restitution
     (§15.2 — "both behaved badly"). For each row, treat as
     `slash_node_share_pct = 1.0` for that payout: skip the
-    `AddBondInvoice` DM, retain `amount_sats` in full, settle the
+    `AddBondInvoice` message, retain `amount_sats` in full, settle the
     HTLC in step 3, transition to `Slashed`. (Phase 5+ wires this;
     Phase 2's taker-only world cannot reach this branch.)
 
@@ -1101,7 +1106,7 @@ trade finalization must never wait on the payout.
   driving from that point on is the counterparty payout.
 - **Partial success: settle OK, counterparty `send_payment` failed.**
   The bond state stays in `PendingPayout` with a best-effort retry. The
-  winner is kept informed via periodic DMs. If retries exhaust, state
+  winner is kept informed via periodic messages. If retries exhaust, state
   becomes `Failed`; at that point Mostro is holding the counterparty
   share (unavoidable with the HTLC already settled) and logs loudly.
   The node share is unaffected — it was always going to stay. This is
@@ -1113,7 +1118,7 @@ trade finalization must never wait on the payout.
   the scheduler settles the HTLC and transitions to `Forfeited`. No
   manual operator action is needed — this is a normal terminal
   state, designed-in. Default 15 days gives even users with sporadic
-  Nostr presence ample time to see the DM and respond.
+  Nostr presence ample time to see the message and respond.
 - **Non-blocking:** `release_action`, `admin_settle_action`, etc. return
   success the moment the trade escrow resolves. Bond payout happens
   later.
@@ -1128,7 +1133,7 @@ trade finalization must never wait on the payout.
 - Edge case `slash_node_share_pct = 0.0` → behaviour identical to the
   pre-split design (full counterparty payout).
 - Edge case `slash_node_share_pct = 1.0` → settle the HTLC, no
-  `AddInvoice` DM is enqueued, no `send_payment` runs, bond goes
+  `AddInvoice` message is enqueued, no `send_payment` runs, bond goes
   straight to `Slashed`.
 - **Persistence test**: a bond enters `PendingPayout` under
   `slash_node_share_pct = 0.5`; before payout completes, simulate a
@@ -1343,7 +1348,7 @@ it. The workable strategies:
        visible.
 
 We recommend **(a)**. Acceptable cost: maker sees one extra `add-invoice`
-DM at range-close if there were partial slashes.
+message at range-close if there were partial slashes.
 
 The split is applied **per child** (each child's `slashed_share_sats`
 is split independently), so the audit event for each child carries its
@@ -1405,20 +1410,40 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
 
 ### 13.1 Scope
 
-- Extend the Mostro info event (`src/nip33.rs::info_to_tags`) with the
-  bond config snapshot so clients can show users what the node enforces
-  before they trade:
-  - `bond` (`enabled` | `disabled`)
-  - `bond-apply-to` (`take` | `create` | `both`)
-  - `bond-slash-timeout` (`true` | `false`)
-  - `bond-amount-pct` / `bond-amount-floor`
-  - `bond-slash-node-share-pct` (the operator's `slash_node_share_pct`,
-    so users know up-front how a slashed bond is split between the node
-    and the winning counterparty).
-  - `bond-payout-claim-window-days` (the operator's
-    `payout_claim_window_days`, so users know how long they have to
-    submit a payout invoice before forfeiting their share).
-  - **No `bond-slash-dispute` tag**: dispute slashes are solver-driven
+- The Mostro info event (`src/nip33.rs::info_to_tags`) carries the
+  bond config snapshot so clients can show users what the node
+  enforces before they trade. **The full set below is shipped in
+  Phase 3** alongside the payout flow itself — the
+  `Action::AddBondInvoice` message intentionally carries no
+  human-readable deadline text, so the wire payload alone is not
+  enough for a client to warn the user; the kind-38385 tags close
+  that gap and let every warning render in the user's locale. Tag
+  naming follows the snake_case convention used elsewhere in
+  `info_to_tags` (`mostro_version`, `hold_invoice_expiration_window`,
+  etc.). The set:
+  - `bond_enabled` (`true` | `false`) — **always emitted**, including
+    on nodes where `[anti_abuse_bond]` is absent or `enabled =
+    false`. Disambiguates "feature off on this node" from "older
+    daemon that doesn't speak bond at all": the latter omits the tag
+    entirely, the former emits `false`. All remaining bond tags are
+    emitted only when this is `true`.
+  - `bond_apply_to` (`take` | `create` | `both`) — whether the user
+    needs to lock a bond as maker, taker, or both.
+  - `bond_slash_on_waiting_timeout` (`true` | `false`) — node policy:
+    can a bond be slashed for missing a waiting-state timeout, or
+    only by solver directive in a dispute?
+  - `bond_amount_pct` / `bond_base_amount_sats` — bond economics:
+    `max(amount_pct * order_amount, base_amount_sats)`.
+  - `bond_slash_node_share_pct` — fraction of a slashed bond retained
+    by the node (the rest goes to the winning counterparty). Lets the
+    user see up-front what they would actually receive.
+  - `bond_payout_claim_window_days` — number of days the winning
+    counterparty has, from `slashed_at`, to submit a payout invoice
+    before forfeiting their share. Clients add this to `slashed_at`
+    to render the deadline ("you have N days to claim") in the user's
+    own locale; Mostro never ships that text inline on the
+    `AddBondInvoice` message itself.
+  - **No `bond_slash_dispute` tag**: dispute slashes are solver-driven
     per resolution, not a node-policy switch.
 - Update `docs/admin_settle_order.html` and `admin_cancel_order.html`
   upstream (`mostro.network/protocol/`) with an "Optional payload —

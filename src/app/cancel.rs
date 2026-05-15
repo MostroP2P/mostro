@@ -205,7 +205,7 @@ async fn cancel_cooperative_execution_step_1(
 /// only runs when this was the **last** active bond on the order
 /// (no other bonds remain after the release); otherwise the order
 /// stays in `Pending` with the surviving bonds still in flight and
-/// the cancel is effectively scoped to a per-taker release + DM.
+/// the cancel is effectively scoped to a per-taker release + message.
 async fn cancel_order_by_taker<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     event: &UnwrappedMessage,
@@ -234,7 +234,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
 
     // Look at what's left on the order. If other concurrent takers
     // still have active bonds, do NOT reset the order — they are
-    // still racing. Just DM the sender that their take is cancelled.
+    // still racing. Just message the sender that their take is cancelled.
     let remaining = crate::app::bond::db::find_active_bonds_for_order(pool, order_id).await?;
     let others_remain = remaining.iter().any(|b| b.pubkey != sender_str);
     if others_remain {

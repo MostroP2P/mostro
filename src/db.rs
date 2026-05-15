@@ -377,6 +377,12 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
     let db_url = &db_settings.url;
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
     let tmp = db_url.replace("sqlite://", "");
     let db_path = Path::new(&tmp);
 

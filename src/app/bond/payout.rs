@@ -685,7 +685,7 @@ pub async fn add_bond_invoice_action(
         bond_id = %bond.id,
         order_id = %bond.order_id,
         sender = %sender,
-        "bond payout: invoice accepted; awaiting scheduler tick for settle+pay"
+        "bond payout: invoice accepted; awaiting scheduler tick for payout"
     );
 
     Ok(())

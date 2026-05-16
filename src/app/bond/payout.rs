@@ -601,14 +601,51 @@ fn resolve_recipient(
 
 // ── Inbound action handler ──────────────────────────────────────────────
 
+/// Outcome of [`apply_payout_invoice`]: distinguishes the three terminal
+/// branches so the caller can log appropriately without re-reading the
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvoiceApplyOutcome {
+    /// CAS persisted the invoice onto a `PendingPayout` row that had
+    /// `payout_invoice IS NULL`. The scheduler will route on its next
+    /// tick.
+    Persisted,
+    /// CAS flipped a `Failed` row back to `PendingPayout`, overwriting
+    /// the stale `payout_invoice` and resetting both attempt counters.
+    /// The scheduler will retry `send_payment` against the fresh
+    /// invoice on its next tick.
+    Resurrected,
+    /// CAS did not apply: either the bond's state changed under us
+    /// (forfeited, slashed, or another concurrent submission landed
+    /// first), `payout_invoice` was already set on a `PendingPayout`
+    /// row, or the `Failed` resurrection request landed past the
+    /// claim window. The caller maps this to
+    /// `CantDo(NotAllowedByStatus)` uniformly.
+    Rejected,
+}
+
 /// `Action::AddBondInvoice` handler: the counterparty replies with the
-/// payout bolt11. Persists `payout_invoice` and resets
-/// `invoice_request_attempts` to 0 in the same UPDATE.
+/// payout bolt11. Validates the bolt11 against the counterparty share,
+/// then routes to one of two CAS branches:
 ///
-/// Rejects with `CantDo(NotAllowedByStatus)` if the bond has already
-/// moved out of `PendingPayout` — most importantly the `Forfeited`
-/// case, which is the "claim window expired" path. The CAS predicate
-/// is the arbiter; no clocks are read here.
+/// - **`PendingPayout` + no `payout_invoice` yet.** The first-time
+///   submission. Persists the invoice and resets
+///   `invoice_request_attempts` to 0.
+/// - **`Failed` (within `payout_claim_window_days`).** Resurrection:
+///   flips the row back to `PendingPayout`, overwrites the stale
+///   `payout_invoice`, resets `payout_attempts` and
+///   `invoice_request_attempts` to 0. Gives the user another full
+///   retry budget against the fresh bolt11.
+///
+/// Rejects with `CantDo(NotAllowedByStatus)` for `Forfeited`,
+/// `Slashed`, `Released`, or `Failed`-past-claim-window — all the
+/// states from which we cannot accept further user-side recovery. The
+/// CAS predicate is the arbiter for the in-window cases; the
+/// claim-window check is the only piece of clock logic, and it is
+/// asymmetric: PendingPayout still admits a late invoice that beats
+/// the scheduler's forfeit CAS (§8.2), but `Failed` resurrection is
+/// strictly inside the window — `Failed` past the window is operator
+/// territory.
 pub async fn add_bond_invoice_action(
     ctx: &AppContext,
     msg: Message,
@@ -624,16 +661,17 @@ pub async fn add_bond_invoice_action(
     };
 
     let sender = event.sender;
-    let bond = find_active_bond_in_pending_payout(pool, order_id, &sender.to_string()).await?;
+    let bond = find_recoverable_bond_for_recipient(pool, order_id, &sender.to_string()).await?;
     let bond = match bond {
         Some(b) => b,
         None => {
-            // No `PendingPayout` bond for this sender on this order.
-            // Two natural reasons: the bond was never slashed (and so
-            // there is nothing to invoice for), or the claim window
-            // already expired and the row moved to `Forfeited`. From
-            // the user's perspective both look the same — they sent
-            // us an invoice we cannot route.
+            // No bond on this order is in a state that accepts an
+            // invoice from this sender. Could be: the bond was never
+            // slashed (nothing to invoice for); the claim window
+            // already expired with no invoice and the row moved to
+            // `Forfeited`; the bond was already paid (`Slashed`); or
+            // some other state. From the user's perspective they look
+            // the same — we cannot route their bolt11.
             return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
         }
     };
@@ -661,54 +699,172 @@ pub async fn add_bond_invoice_action(
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
 
-    // CAS the row: only persist the invoice if the bond is *still* in
-    // `PendingPayout` and *still* has no `payout_invoice`. Both
-    // predicates close the obvious races (the scheduler racing to
-    // Forfeited; a concurrent duplicate AddBondInvoice).
-    let result = sqlx::query(
-        "UPDATE bonds \
-           SET payout_invoice = ?, invoice_request_attempts = 0 \
-         WHERE id = ? AND state = ? AND payout_invoice IS NULL",
-    )
-    .bind(&payment_request)
-    .bind(bond.id)
-    .bind(BondState::PendingPayout.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let cfg = Settings::get_bond();
+    let claim_window_seconds = cfg
+        .map(|c| c.payout_claim_window_days as i64 * 86_400)
+        .unwrap_or(15 * 86_400);
+    let now = Utc::now().timestamp();
 
-    if result.rows_affected() == 0 {
-        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    match apply_payout_invoice(pool, &bond, &payment_request, now, claim_window_seconds).await? {
+        InvoiceApplyOutcome::Persisted => {
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                sender = %sender,
+                "bond payout: invoice accepted; awaiting scheduler tick for payout"
+            );
+            Ok(())
+        }
+        InvoiceApplyOutcome::Resurrected => {
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                sender = %sender,
+                "bond payout: Failed -> PendingPayout (user submitted fresh invoice within claim window); payout_attempts reset, awaiting scheduler tick for payout"
+            );
+            Ok(())
+        }
+        InvoiceApplyOutcome::Rejected => Err(MostroCantDo(CantDoReason::NotAllowedByStatus)),
     }
-
-    info!(
-        bond_id = %bond.id,
-        order_id = %bond.order_id,
-        sender = %sender,
-        "bond payout: invoice accepted; awaiting scheduler tick for payout"
-    );
-
-    Ok(())
 }
 
-/// Find a `PendingPayout` bond on `order_id` whose recipient (the
-/// non-slashed side) matches `sender_pubkey`.
+/// Persist `invoice` onto `bond` via one of two state-specific CAS
+/// branches. See [`InvoiceApplyOutcome`] for the result shape.
+///
+/// Race-safety: every transition is a single guarded `UPDATE` against
+/// the state column. Two concurrent callers can race, but at most one
+/// `UPDATE` matches.
+///
+/// - `PendingPayout` path uses `WHERE state = 'pending-payout' AND
+///   payout_invoice IS NULL`. A second caller that found the row
+///   `PendingPayout` but lost the race will see `rows_affected = 0`
+///   (either because the invoice is now set or because the row moved
+///   on) and gets `Rejected`.
+/// - `Failed` path uses `WHERE state = 'failed'`. A second caller that
+///   found the row `Failed` but lost the resurrection race will see
+///   the row as `PendingPayout` at CAS time, so the predicate fails
+///   and they get `Rejected`. The claim-window check is in Rust
+///   *before* the CAS; a tiny window-edge race is benign because the
+///   CAS itself does not gate on time.
+async fn apply_payout_invoice(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    invoice: &str,
+    now: i64,
+    claim_window_seconds: i64,
+) -> Result<InvoiceApplyOutcome, MostroError> {
+    let state = match BondState::from_str(&bond.state) {
+        Ok(s) => s,
+        Err(_) => return Ok(InvoiceApplyOutcome::Rejected),
+    };
+
+    match state {
+        BondState::PendingPayout => {
+            let result = sqlx::query(
+                "UPDATE bonds \
+                   SET payout_invoice = ?, invoice_request_attempts = 0 \
+                 WHERE id = ? AND state = ? AND payout_invoice IS NULL",
+            )
+            .bind(invoice)
+            .bind(bond.id)
+            .bind(BondState::PendingPayout.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+            if result.rows_affected() == 0 {
+                Ok(InvoiceApplyOutcome::Rejected)
+            } else {
+                Ok(InvoiceApplyOutcome::Persisted)
+            }
+        }
+        BondState::Failed => {
+            // `slashed_at` is the anchor for the claim window. A
+            // `Failed` row that reached this state via the normal
+            // flow always has `slashed_at` set (Phase 2's slash CAS
+            // writes it atomically with the transition to
+            // `PendingPayout`, and the row never leaves that anchor
+            // afterwards). A `None` here would be an invariant
+            // violation; reject conservatively rather than treat it
+            // as "infinitely recoverable".
+            let slashed_at = match bond.slashed_at {
+                Some(t) => t,
+                None => return Ok(InvoiceApplyOutcome::Rejected),
+            };
+            if now.saturating_sub(slashed_at) >= claim_window_seconds {
+                return Ok(InvoiceApplyOutcome::Rejected);
+            }
+
+            // Resurrection CAS. The `state = 'failed'` predicate is
+            // the arbiter: two concurrent calls can both pass the
+            // Rust claim-window check, but only one matches `state =
+            // 'failed'` at execution time. The loser sees
+            // `rows_affected = 0` and gets `Rejected`. The scheduler
+            // does not race here because it only enumerates
+            // `PendingPayout` (Failed is invisible to it), and the
+            // row reads consistent on the next tick because we set
+            // state + invoice + counters in the same UPDATE.
+            let result = sqlx::query(
+                "UPDATE bonds \
+                   SET state = ?, \
+                       payout_invoice = ?, \
+                       payout_attempts = 0, \
+                       invoice_request_attempts = 0 \
+                 WHERE id = ? AND state = ?",
+            )
+            .bind(BondState::PendingPayout.to_string())
+            .bind(invoice)
+            .bind(bond.id)
+            .bind(BondState::Failed.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+            if result.rows_affected() == 0 {
+                Ok(InvoiceApplyOutcome::Rejected)
+            } else {
+                Ok(InvoiceApplyOutcome::Resurrected)
+            }
+        }
+        // Any other state — `Requested`, `Locked`, `Released`,
+        // `Slashed`, `Forfeited` — is not user-recoverable via this
+        // path. The finder normally never returns these (it filters
+        // on `pending-payout` / `failed`), but we treat unexpected
+        // input defensively.
+        _ => Ok(InvoiceApplyOutcome::Rejected),
+    }
+}
+
+/// Find a bond on `order_id` whose recipient (the non-slashed side)
+/// matches `sender_pubkey` *and* whose state still accepts a new
+/// payout invoice from the user.
+///
+/// "Accepts a new invoice" means either:
+/// - `PendingPayout` — the normal path, the user is responding to an
+///   `AddBondInvoice` request for the first time (or replacing a
+///   submission that hadn't yet landed against a CAS-set row).
+/// - `Failed` — the user-recoverable resurrection path. The row's
+///   `payout_invoice` is set from a prior failed delivery; the
+///   handler will overwrite it and reset the retry counters, subject
+///   to the claim window enforced at CAS time.
 ///
 /// The bond row stores `bond.pubkey` = slashed user's trade pubkey,
 /// not the recipient's. So we look up the order, compute the
 /// recipient via [`resolve_recipient`], and confirm it matches the
 /// sender of the AddBondInvoice reply.
-async fn find_active_bond_in_pending_payout(
+async fn find_recoverable_bond_for_recipient(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     sender_pubkey: &str,
 ) -> Result<Option<Bond>, MostroError> {
     let bonds: Vec<Bond> = sqlx::query_as::<_, Bond>(
-        "SELECT * FROM bonds WHERE order_id = ? AND state = ? \
-         ORDER BY slashed_at DESC",
+        "SELECT * FROM bonds \
+          WHERE order_id = ? AND (state = ? OR state = ?) \
+          ORDER BY slashed_at DESC",
     )
     .bind(order_id)
     .bind(BondState::PendingPayout.to_string())
+    .bind(BondState::Failed.to_string())
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1039,5 +1195,377 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.0, BondState::Slashed.to_string());
+    }
+
+    // ── apply_payout_invoice / resurrection ───────────────────────────
+
+    const CLAIM_WINDOW_SECONDS: i64 = 15 * 86_400;
+
+    #[tokio::test]
+    async fn apply_payout_invoice_persists_on_pending_payout_null_invoice() {
+        // First-time submission: PendingPayout with no prior invoice.
+        // CAS lands, invoice is persisted, invoice_request_attempts
+        // reset to 0.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        bond.invoice_request_attempts = 2;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pNEW", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Persisted);
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+        assert_eq!(after.payout_invoice.as_deref(), Some("lnbc1pNEW"));
+        assert_eq!(after.invoice_request_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_rejects_pending_payout_when_invoice_already_set() {
+        // PendingPayout with `payout_invoice` already populated: the
+        // CAS `AND payout_invoice IS NULL` guard fires and the helper
+        // returns `Rejected`. No clobbering of the existing bolt11.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pOLD"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pNEW", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Rejected);
+
+        let after: (String, Option<String>) =
+            sqlx::query_as("SELECT state, payout_invoice FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.0, BondState::PendingPayout.to_string());
+        assert_eq!(after.1.as_deref(), Some("lnbc1pOLD"));
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_resurrects_failed_within_window() {
+        // Failed bond, slash anchor 1 day ago, fresh invoice: the
+        // resurrection CAS flips state back to PendingPayout,
+        // overwrites the stale bolt11, and resets *both* attempt
+        // counters so the user gets a full retry budget against the
+        // new invoice.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let slashed_at = now - 86_400; // 1 day ago
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            slashed_at,
+            Some("lnbc1pBAD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        bond.invoice_request_attempts = 3;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Resurrected);
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+        assert_eq!(after.payout_invoice.as_deref(), Some("lnbc1pFRESH"));
+        assert_eq!(after.payout_attempts, 0);
+        assert_eq!(after.invoice_request_attempts, 0);
+        // Slash anchor is *not* extended — the claim window remains
+        // bounded by the original slash time.
+        assert_eq!(after.slashed_at, Some(slashed_at));
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_rejects_failed_past_claim_window() {
+        // 1 second past the window: rejected. Row stays Failed with
+        // the original counters intact (no clobber of operator
+        // diagnostics).
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let slashed_at = now - CLAIM_WINDOW_SECONDS - 1;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            slashed_at,
+            Some("lnbc1pBAD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Rejected);
+
+        let after: (String, Option<String>, i64) =
+            sqlx::query_as("SELECT state, payout_invoice, payout_attempts FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.0, BondState::Failed.to_string());
+        assert_eq!(after.1.as_deref(), Some("lnbc1pBAD"));
+        assert_eq!(after.2, 5);
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_rejects_failed_at_exact_window_boundary() {
+        // Exactly at the window edge (`now - slashed_at ==
+        // claim_window_seconds`): rejected. The check is `>=`, not
+        // `>`, so the boundary belongs to operator territory.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let slashed_at = now - CLAIM_WINDOW_SECONDS;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            slashed_at,
+            Some("lnbc1pBAD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Rejected);
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_rejects_failed_without_slashed_at() {
+        // Defensive guard against an invariant violation: a `Failed`
+        // row with NULL `slashed_at` has no claim-window anchor and
+        // must not be treated as infinitely recoverable. Reject and
+        // leave for operator inspection.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pBAD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.slashed_at = None;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Rejected);
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_concurrent_resurrections_only_one_wins() {
+        // Models two concurrent resurrection attempts on a Failed
+        // bond. Both callers hold the same stale snapshot (state =
+        // Failed). The first CAS wins; the second sees `state =
+        // 'pending-payout'` at execution time, predicate misses,
+        // `rows_affected = 0` → `Rejected`. The winner's invoice is
+        // the one that persists.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pBAD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome_a =
+            apply_payout_invoice(&pool, &bond, "lnbc1pFRESH_A", now, CLAIM_WINDOW_SECONDS)
+                .await
+                .unwrap();
+        assert_eq!(outcome_a, InvoiceApplyOutcome::Resurrected);
+
+        // Second call operates on the *same* stale `Bond` snapshot
+        // (state still reads Failed in this Rust struct).
+        let outcome_b =
+            apply_payout_invoice(&pool, &bond, "lnbc1pFRESH_B", now, CLAIM_WINDOW_SECONDS)
+                .await
+                .unwrap();
+        assert_eq!(outcome_b, InvoiceApplyOutcome::Rejected);
+
+        let after: (String, Option<String>) =
+            sqlx::query_as("SELECT state, payout_invoice FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.0, BondState::PendingPayout.to_string());
+        assert_eq!(after.1.as_deref(), Some("lnbc1pFRESH_A"));
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_resurrects_after_re_failure() {
+        // End-to-end cycle: Failed → resurrect with B → drive back to
+        // Failed via on_send_payment_failure → resurrect with C. Each
+        // resurrection independently resets the retry budget; the
+        // user can absorb multiple bad invoices so long as they are
+        // still inside the claim window.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pA"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        // First resurrection.
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pB", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Resurrected);
+
+        let bond_after_b: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(bond_after_b.state, BondState::PendingPayout.to_string());
+        assert_eq!(bond_after_b.payout_attempts, 0);
+
+        // Drive back to Failed via three consecutive send_payment
+        // failures with retry budget = 3. Each call re-reads the row
+        // so the counter math is exercised against fresh state.
+        let mut current = bond_after_b;
+        for _ in 0..3 {
+            on_send_payment_failure(&pool, &current, 3, "transient")
+                .await
+                .unwrap();
+            current = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(current.state, BondState::Failed.to_string());
+
+        // Second resurrection with a different invoice.
+        let outcome = apply_payout_invoice(&pool, &current, "lnbc1pC", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Resurrected);
+
+        let final_bond: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_bond.state, BondState::PendingPayout.to_string());
+        assert_eq!(final_bond.payout_invoice.as_deref(), Some("lnbc1pC"));
+        assert_eq!(final_bond.payout_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_rejects_other_states() {
+        // Defensive guard for the unexpected-input case: the finder
+        // already filters to {PendingPayout, Failed}, but if a caller
+        // hands the helper a row in any other state we must refuse
+        // to mutate it.
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        for state in [
+            BondState::Slashed,
+            BondState::Released,
+            BondState::Forfeited,
+            BondState::Locked,
+            BondState::Requested,
+        ] {
+            let order_id = Uuid::new_v4();
+            insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+            let mut bond = pending_payout_bond(
+                order_id,
+                taker_pk(),
+                10_000,
+                5_000,
+                now,
+                Some("lnbc1p"),
+                None,
+            );
+            bond.state = state.to_string();
+            let bond = create_bond(&pool, bond).await.unwrap();
+
+            let outcome =
+                apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+                    .await
+                    .unwrap();
+            assert_eq!(outcome, InvoiceApplyOutcome::Rejected, "state {state}");
+
+            let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(after.0, state.to_string());
+        }
     }
 }

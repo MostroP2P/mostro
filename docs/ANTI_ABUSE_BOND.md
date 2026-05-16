@@ -1113,7 +1113,12 @@ must land hand-in-hand with the client adoption. See §14.3.
        reached, transition to `Failed` and leave a tracing error.
        `Failed` is reserved for *technical* failure (we have an
        invoice but can't route to it) and is distinct from
-       `Forfeited` (the user never gave us an invoice).
+       `Forfeited` (the user never gave us an invoice). `Failed` is
+       *user-recoverable inside the claim window*: a fresh
+       `AddBondInvoice` from the recipient transitions the row back
+       to `PendingPayout`, overwrites `payout_invoice`, and resets
+       `payout_attempts` to 0 (see `add_bond_invoice_action` below).
+       Past the claim window, `Failed` requires operator attention.
 
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
   entirely (no `AddBondInvoice` message, no `send_payment`, no forfeit
@@ -1194,12 +1199,39 @@ must land hand-in-hand with the client adoption. See §14.3.
   `payout_invoice IS NULL` — once the winner has already submitted a
   bolt11, that branch is skipped and the retry loop runs silently
   (tracing logs only, no wire notification to the winner). If retries
-  exhaust, state becomes `Failed`; at that point Mostro is holding
-  the counterparty share (unavoidable: the HTLC was settled at slash
-  time, so the sats are already on hand but unroutable) and logs
-  loudly. The node share is unaffected — it was always going to stay.
-  This is a known limitation; node operators can manually pay the
-  winner from logs.
+  exhaust, state becomes `Failed` and Mostro logs loudly. The node
+  share is unaffected — it was always going to stay.
+- **User-side recovery from `Failed`.** `Failed` is *not* a hard
+  terminal state from the recipient's perspective. A fresh
+  `AddBondInvoice` from the same recipient resurrects the bond via a
+  guarded CAS:
+  `UPDATE bonds SET state='pending-payout', payout_invoice=?,
+   payout_attempts=0, invoice_request_attempts=0
+   WHERE id=? AND state='failed'`, gated in Rust by `now -
+   slashed_at < payout_claim_window_days * 86_400`. The scheduler
+  then routes the new bolt11 on its next tick with a fresh retry
+  budget. Race safety:
+  - **Scheduler vs. resurrection.** The scheduler enumerates
+    `PendingPayout` rows only and never sees `Failed`, so no
+    `send_payment` runs against a row mid-resurrection.
+  - **Concurrent `AddBondInvoice` calls.** The `WHERE state='failed'`
+    predicate matches at most once; the second caller observes
+    `state='pending-payout'` at execution time, gets `rows_affected
+    = 0`, and is rejected with `CantDo(NotAllowedByStatus)`. The
+    winner's invoice is the one that persists.
+  - **`on_send_payment_failure` racing the user's resubmission.**
+    The PendingPayout CAS guards on `payout_invoice IS NULL`, so a
+    user submission against a row that still has the in-flight
+    invoice is rejected (not silently swapped). Once the row
+    transitions to `Failed`, the resurrection path takes over.
+  - **Claim-window edge.** The check is `>=` (`now - slashed_at >=
+    claim_window_seconds` rejects); the boundary belongs to operator
+    territory. A submission landing one second inside the window is
+    accepted even if a re-failure later finishes outside it — the
+    scheduler does not re-evaluate the window once the bond is back
+    in `PendingPayout` with an invoice.
+  Past the claim window, `Failed` requires operator attention; the
+  operator can pay the winner manually from logs.
 - **Counterparty never claims (forfeit path).** Distinct from
   `Failed`: there is no `payout_invoice` because the counterparty
   never sent one. After `payout_claim_window_days` from `slashed_at`,
@@ -1267,11 +1299,33 @@ must land hand-in-hand with the client adoption. See §14.3.
 - **`Failed` vs. `Forfeited` distinction**: counterparty submits a
   valid invoice on day 1 but it never routes; after
   `payout_max_retries` the bond goes to `Failed` (not `Forfeited`,
-  even though the 15-day window is still open). `Failed` requires
-  operator attention; `Forfeited` does not.
+  even though the 15-day window is still open). `Failed` is
+  user-recoverable inside the claim window (next test); past the
+  window it requires operator attention. `Forfeited` is never
+  recoverable.
 - Retry test: counterparty submits an invoice that never routes →
   scheduler keeps retrying up to `payout_max_retries`, then `Failed`.
   Node share already retained; only the counterparty share is stuck.
+- **`Failed` resurrection inside the claim window**: bond is `Failed`
+  on day 2 of a 15-day window; counterparty submits a fresh, routable
+  bolt11 via `AddBondInvoice`. Row transitions back to
+  `PendingPayout`, `payout_invoice` is overwritten, `payout_attempts`
+  and `invoice_request_attempts` reset to 0, `slashed_at` is **not**
+  touched. The next scheduler tick routes the new bolt11
+  successfully → bond → `Slashed`. Repeat the cycle (resurrect → fail
+  → resurrect) within the window and verify each resurrection
+  delivers a full retry budget.
+- **`Failed` past the claim window stays `Failed`**: bond is `Failed`
+  on day 16 (1 day past the 15-day window); counterparty's
+  `AddBondInvoice` is rejected with `CantDo(NotAllowedByStatus)`. The
+  row remains `Failed` with original `payout_attempts` and
+  `payout_invoice` intact so operator diagnostics are preserved.
+- **Concurrent-resurrection race**: two `AddBondInvoice` messages
+  land against a `Failed` bond near-simultaneously. Exactly one
+  resurrection CAS lands (the bolt11 of the winner is the one
+  persisted); the loser receives `CantDo(NotAllowedByStatus)`. No
+  in-flight `send_payment` overlaps because the scheduler does not
+  enumerate `Failed` rows.
 
 ---
 

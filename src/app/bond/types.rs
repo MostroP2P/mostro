@@ -43,16 +43,24 @@ impl FromStr for BondRole {
 ///  Requested ──► Locked ──┬──► Released (happy / cancelled-before-timeout)
 ///                         └──► PendingPayout ──┬──► Slashed    (winner paid)
 ///                                              ├──► Forfeited  (winner never claimed in window)
-///                                              └──► Failed     (retries exhausted)
+///                                              └──► Failed ──► (back to PendingPayout
+///                                                              on fresh AddBondInvoice
+///                                                              within claim window)
 /// ```
 ///
-/// A bond never goes back to an earlier state. `Failed` is a terminal,
-/// operator-intervention-required state (we have an invoice but
-/// `send_payment` keeps failing). `Forfeited` is the long-stop terminal
-/// state for a slash whose counterparty never submitted a payout invoice
-/// within `payout_claim_window_days`; it is a *normal* outcome by design
-/// (no operator action required), distinct from `Failed` so dashboards
-/// can alarm correctly.
+/// `Forfeited` is a hard terminal state — the counterparty never
+/// submitted a payout invoice within `payout_claim_window_days`, the
+/// node retains `amount_sats` in full, no operator action needed.
+///
+/// `Failed` is reachable when `send_payment` exhausts `payout_max_retries`
+/// against a delivered invoice. Unlike the other "terminal" states it
+/// is *user-recoverable*: a fresh [`Action::AddBondInvoice`] from the
+/// recipient resurrects the bond back to `PendingPayout` (resets
+/// `payout_attempts` / `invoice_request_attempts`, overwrites
+/// `payout_invoice`) so long as `now - slashed_at <
+/// payout_claim_window_days * 86_400`. Past the claim window, the row
+/// stays `Failed` and requires operator attention to pay the
+/// counterparty manually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BondState {
     /// Hold invoice created; waiting for the bonded party to pay it so LND
@@ -73,18 +81,30 @@ pub enum BondState {
     /// submitting a payout invoice; the node retains `amount_sats` in
     /// full. Terminal — designed-in long-stop, no operator action needed.
     Forfeited,
-    /// `send_payment` retries exhausted. Terminal, requires operator
-    /// attention.
+    /// `send_payment` retries exhausted on a delivered payout invoice.
+    /// User-recoverable: a fresh [`Action::AddBondInvoice`] from the
+    /// recipient transitions the row back to `PendingPayout` while
+    /// `now - slashed_at < payout_claim_window_days * 86_400`. Past
+    /// the claim window, requires operator attention to pay the
+    /// counterparty manually.
     Failed,
 }
 
 impl BondState {
-    /// True for states that should not be transitioned out of by Phase 1
-    /// release paths: the bond is already done with from the operator's
-    /// perspective. Used so call sites don't have to enumerate the four
-    /// of `Released | Slashed | Forfeited | Failed` manually (and so the
-    /// daemon doesn't grow to depend on the [`Display`] string form for
-    /// control flow).
+    /// True for states that the Phase 1 release / cancel paths must
+    /// not transition out of: the LND HTLC has already been settled or
+    /// cancelled, so any further release attempt is at best a no-op
+    /// and at worst a double-action against LND. Used so call sites
+    /// don't have to enumerate `Released | Slashed | Forfeited |
+    /// Failed` manually.
+    ///
+    /// Scope is intentionally release-flow only. `Failed` is included
+    /// because, like the other three, its HTLC has been disposed of
+    /// (settled at slash time) — but Phase 3's `add_bond_invoice_action`
+    /// can still flip a `Failed` row back to `PendingPayout` on a
+    /// fresh user invoice within the claim window. That recovery path
+    /// works on the DB row directly and does not go through these
+    /// release/cancel helpers.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,

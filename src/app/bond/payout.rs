@@ -372,6 +372,41 @@ async fn request_payout_invoice(
         None,
     );
 
+    // Persist the cadence bump *before* enqueuing the outbound
+    // message. Order matters: `enqueue_order_msg` mutates an
+    // in-process queue that the Nostr publisher flushes
+    // asynchronously, so if we enqueued first and then crashed (or
+    // the UPDATE itself failed) the durable state would still read
+    // "no nudge sent" while the recipient (or relays, after flush)
+    // may already have seen one — the next scheduler tick would then
+    // emit a duplicate `Action::AddBondInvoice`. Persisting first
+    // makes the DB the source of truth: in the worst case (crash
+    // between UPDATE and enqueue) the recipient misses *this* nudge
+    // and is re-prompted on the next tick after
+    // `invoice_window_seconds` elapses — never double-prompted.
+    //
+    // The `state = 'pending-payout'` predicate also guards against
+    // the row having moved out from under us (Forfeited, Slashed, or
+    // via the Phase-3 resurrection path). If the UPDATE matches zero
+    // rows, abort entirely instead of nudging a bond we can no
+    // longer route against.
+    let result = sqlx::query(
+        "UPDATE bonds \
+           SET invoice_request_attempts = invoice_request_attempts + 1, \
+               last_invoice_request_at = ? \
+         WHERE id = ? AND state = ?",
+    )
+    .bind(now)
+    .bind(bond.id)
+    .bind(BondState::PendingPayout.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        return Ok(());
+    }
+
     info!(
         bond_id = %bond.id,
         order_id = %bond.order_id,
@@ -403,19 +438,6 @@ async fn request_payout_invoice(
         None,
     )
     .await;
-
-    sqlx::query(
-        "UPDATE bonds \
-           SET invoice_request_attempts = invoice_request_attempts + 1, \
-               last_invoice_request_at = ? \
-         WHERE id = ? AND state = ?",
-    )
-    .bind(now)
-    .bind(bond.id)
-    .bind(BondState::PendingPayout.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }
@@ -1056,6 +1078,107 @@ mod tests {
         // untouched.
         assert_eq!(row.0, 0);
         assert_eq!(row.1, Some(now - 10));
+    }
+
+    /// Count queued `Action::AddBondInvoice` messages targeting
+    /// `order_id`. Used to verify enqueue ordering against the
+    /// global `MESSAGE_QUEUES` without conflicting with concurrent
+    /// tests — each test's `order_id` is a fresh `Uuid::new_v4()`
+    /// so filtering by it makes the count deterministic.
+    async fn count_add_bond_invoice_msgs(order_id: Uuid) -> usize {
+        use crate::config::MESSAGE_QUEUES;
+        MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| {
+                let kind = m.get_inner_message_kind();
+                kind.id == Some(order_id) && kind.action == Action::AddBondInvoice
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn request_payout_invoice_persists_before_enqueue_happy_path() {
+        // Happy path: a PendingPayout bond with no prior request lands
+        // in the UPDATE branch. The UPDATE bumps the counter and
+        // timestamp atomically *before* the enqueue, and the enqueue
+        // then publishes exactly one `Action::AddBondInvoice` message
+        // to the recipient. Both halves must be observable post-call.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = count_add_bond_invoice_msgs(order_id).await;
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
+        let after = count_add_bond_invoice_msgs(order_id).await;
+
+        // Durable state advanced.
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT invoice_request_attempts, last_invoice_request_at FROM bonds WHERE id = ?",
+        )
+        .bind(bond.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1);
+        assert!(row.1.is_some_and(|t| t >= now));
+
+        // Exactly one outbound message for this order_id.
+        assert_eq!(after - before, 1);
+    }
+
+    #[tokio::test]
+    async fn request_payout_invoice_skips_enqueue_when_state_moved_off_pending_payout() {
+        // Persist-first guarantee: if the row's state moved out of
+        // `PendingPayout` between the scheduler snapshot and the
+        // CAS UPDATE (Forfeited, Failed via the resurrection path,
+        // Slashed, etc.), the `WHERE state = 'pending-payout'`
+        // predicate yields `rows_affected = 0` and we must abort
+        // *without* enqueuing. Otherwise the recipient would get a
+        // nudge for a bond we cannot route against, and the cadence
+        // bookkeeping would stay out of sync with what was sent.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        // Snapshot says PendingPayout — the in-memory `bond` we'll
+        // pass to the function carries that state.
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+        // Simulate the row having moved on under us: flip it to
+        // Forfeited in the DB *after* the scheduler's snapshot
+        // captured it as PendingPayout.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Forfeited.to_string())
+            .bind(bond.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let before = count_add_bond_invoice_msgs(order_id).await;
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
+        let after = count_add_bond_invoice_msgs(order_id).await;
+
+        // Durable state unchanged (CAS rejected by state predicate).
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT invoice_request_attempts, last_invoice_request_at FROM bonds WHERE id = ?",
+        )
+        .bind(bond.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, None);
+
+        // Crucially: no message was enqueued. This is what
+        // persist-first guarantees — the UPDATE failure short-circuits
+        // before the enqueue.
+        assert_eq!(after, before);
     }
 
     #[tokio::test]

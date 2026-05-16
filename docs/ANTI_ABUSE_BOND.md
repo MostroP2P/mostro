@@ -1096,7 +1096,22 @@ must land hand-in-hand with the client adoption. See §14.3.
        Bounding invoice requests is the forfeit window's job
        (`payout_claim_window_days`), not the retry budget's. The node
        share never leaves Mostro's wallet, so it has no separate
-       invoice step.
+       invoice step. **Persist-first ordering invariant:** the DB
+       UPDATE that bumps `invoice_request_attempts` /
+       `last_invoice_request_at` must commit *before*
+       `Action::AddBondInvoice` is enqueued for outbound delivery,
+       and is conditioned on `WHERE state = 'pending-payout'`. If
+       the UPDATE matches zero rows (row has moved on to `Forfeited`
+       / `Slashed` / `Failed` between the scheduler snapshot and
+       this write), the message is **not** enqueued. Enqueue-first
+       would let a crash or DB failure between enqueue and UPDATE
+       leave the durable state unchanged while the recipient (or
+       relays, after publisher flush) has already seen a nudge,
+       producing duplicate `Action::AddBondInvoice` messages on the
+       next tick. Persist-first makes the DB the source of truth:
+       the worst-case failure mode loses *one* nudge (re-prompted on
+       the next tick once the cadence window elapses); a
+       duplicate-nudge mode is impossible.
     2. If an invoice was received (see handler below), **estimate the
        routing fee** via `LndConnector::query_routes(dest, amount)`
        (thin wrapper over LND `router::query_routes`); fall back to

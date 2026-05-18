@@ -71,9 +71,9 @@ use uuid::Uuid;
 
 use crate::app::context::AppContext;
 use crate::config::settings::Settings;
-use crate::lightning::invoice::is_valid_invoice;
+use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
 use crate::lightning::LndConnector;
-use crate::util::enqueue_order_msg;
+use crate::util::{bytes_to_string, enqueue_order_msg};
 
 use super::db::find_bonds_by_state;
 use super::model::Bond;
@@ -442,11 +442,51 @@ async fn request_payout_invoice(
     Ok(())
 }
 
+/// Maximum number of times the success-path `state = Slashed` CAS will
+/// retry on a transient sqlx error before giving up. The payment has
+/// already been delivered by the time this CAS runs, so we want a few
+/// retries to absorb a brief DB blip — but the persisted
+/// `payout_payment_hash` makes the operation idempotent, so it is safe
+/// to bail out and let the next scheduler tick reconcile via LND.
+const SLASH_CAS_MAX_ATTEMPTS: u32 = 5;
+
 /// `send_payment` the counterparty share to the bolt11 they
 /// submitted. The bond HTLC was already settled at slash time, so the
 /// sats are already in Mostro's wallet — this function only drives
 /// the counterparty leg and on success transitions the row to
 /// `Slashed`.
+///
+/// ## Idempotency
+///
+/// `send_payment` and the follow-up `state = 'slashed'` CAS are *not*
+/// atomic, and the success path is the dangerous one: a payment that
+/// reaches LND but whose CAS fails (transient sqlx error, process
+/// crash) would leave the row in `PendingPayout` while the sats are
+/// already in flight. The next scheduler tick would re-enter here,
+/// LND would reject the duplicate `send_payment` against an already-paid
+/// invoice, `on_send_payment_failure` would burn the retry budget, and
+/// in the worst case the row would flip to `Failed` despite a
+/// successful delivery.
+///
+/// Defense (in order of execution):
+///
+/// 1. **Reconcile on entry.** If a `payout_payment_hash` is already
+///    persisted on the row *and* it matches the current invoice's
+///    hash, ask LND `track_payment_v2` what it knows. `Succeeded` →
+///    skip the send and CAS straight to `Slashed`. `Failed` → route
+///    through `on_send_payment_failure`. `InFlight` → defer to the
+///    next tick. `Unknown`/`NotFound`/transport error → fall through
+///    to a fresh send (LND will reject re-pay via its own checks).
+/// 2. **Persist hash before send.** The routing-fee ceiling and the
+///    payment_hash are written in a single CAS guarded on
+///    `state = 'pending-payout'`. If the row has moved (e.g.,
+///    concurrent `forfeit_bond`), the CAS misses zero rows and we
+///    abort the send. If the CAS succeeds, every subsequent entry
+///    will see the hash and use the reconciliation path.
+/// 3. **Bounded retry on the success CAS.** Up to
+///    [`SLASH_CAS_MAX_ATTEMPTS`] attempts with short backoff. If they
+///    all fail, the persisted hash means the next tick will reconcile
+///    cleanly; we surface the error loudly so operators see it.
 async fn pay_counterparty(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -456,20 +496,111 @@ async fn pay_counterparty(
 ) -> Result<(), MostroError> {
     let counterparty_share = counterparty_share_sats(bond)?;
 
-    // Routing-fee ceiling: derived from MostroSettings::max_routing_fee
-    // applied to the counterparty share. The spec mentions
-    // `query_routes` as a finer estimate, but `send_payment` already
-    // accepts a `fee_limit_sat` and the existing helper computes that.
-    // We record what we used into `payout_routing_fee_sats` so
-    // operators can read the cap from logs.
+    // Decode the invoice so we can derive the BOLT11 `payment_hash`.
+    // `add_bond_invoice_action::is_valid_invoice` already accepted this
+    // bolt11; a decode failure here is an invariant violation, so we
+    // route it through `on_send_payment_failure` rather than panic.
+    let decoded = match decode_invoice(invoice) {
+        Ok(d) => d,
+        Err(e) => {
+            return on_send_payment_failure(
+                pool,
+                bond,
+                max_retries,
+                &format!("payout invoice decode failed: {e}"),
+            )
+            .await;
+        }
+    };
+    // `Bolt11Invoice::payment_hash` returns `&sha256::Hash`; the
+    // underlying `bitcoin_hashes::sha256::Hash` is `AsRef<[u8]>` so we
+    // can take a slice without pulling in the `Hash` trait.
+    let payment_hash_ref: &[u8] = decoded.payment_hash().as_ref();
+    let payment_hash_hex = bytes_to_string(payment_hash_ref);
+
+    // Step 1 — reconcile on entry. Only meaningful when a hash was
+    // previously persisted *and* it matches the current invoice; the
+    // mismatch case happens when the counterparty rotated their
+    // invoice via `apply_payout_invoice` (resurrection), in which the
+    // old hash is irrelevant.
+    if let Some(persisted_hash) = bond.payout_payment_hash.as_deref() {
+        if persisted_hash == payment_hash_hex {
+            match ln_client.lookup_payment_status(payment_hash_ref).await {
+                Ok(Some(PaymentStatus::Succeeded)) => {
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "bond payout: reconciled — LND already paid this invoice; finalizing Slashed without re-sending"
+                    );
+                    return slash_after_success(pool, bond, counterparty_share).await;
+                }
+                Ok(Some(PaymentStatus::Failed)) => {
+                    return on_send_payment_failure(
+                        pool,
+                        bond,
+                        max_retries,
+                        "tracked payment reported Failed on reconciliation",
+                    )
+                    .await;
+                }
+                Ok(Some(PaymentStatus::InFlight)) => {
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "bond payout: prior send_payment still in flight; deferring to next tick"
+                    );
+                    return Ok(());
+                }
+                Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
+                    // LND has no record (pruned, or the prior send
+                    // never reached it). Safe to attempt a fresh send;
+                    // `send_payment`'s own pre-send check will reject
+                    // any payment LND does already know about.
+                }
+                Err(e) => {
+                    warn!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "bond payout: reconciliation lookup failed ({e}); falling through to fresh send"
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 2 — persist routing-fee cap + payment_hash *before*
+    // `send_payment`. The CAS is the idempotency anchor: from this
+    // point on, every re-entry into this function for this bond will
+    // take the reconciliation branch above instead of issuing a
+    // duplicate send.
     let max_routing_fee = Settings::get_mostro().max_routing_fee;
     let routing_fee_cap = ((counterparty_share as f64) * max_routing_fee).ceil() as i64;
-    let _ = sqlx::query("UPDATE bonds SET payout_routing_fee_sats = ? WHERE id = ? AND state = ?")
-        .bind(routing_fee_cap)
-        .bind(bond.id)
-        .bind(BondState::PendingPayout.to_string())
-        .execute(pool)
-        .await;
+    let persisted = sqlx::query(
+        "UPDATE bonds \
+           SET payout_routing_fee_sats = ?, payout_payment_hash = ? \
+         WHERE id = ? AND state = ?",
+    )
+    .bind(routing_fee_cap)
+    .bind(&payment_hash_hex)
+    .bind(bond.id)
+    .bind(BondState::PendingPayout.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if persisted.rows_affected() == 0 {
+        // The row moved off `PendingPayout` between the scheduler's
+        // snapshot and this CAS (e.g., concurrent forfeit, manual
+        // operator intervention). Skip the send so we never deliver
+        // sats against a stale state. The next tick — if any — will
+        // re-evaluate.
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: row no longer PendingPayout at hash-persist CAS; skipping send_payment"
+        );
+        return Ok(());
+    }
 
     // send_payment. The helper internally caps the fee at
     // `counterparty_share * max_routing_fee`.
@@ -522,27 +653,78 @@ async fn pay_counterparty(
     }
 
     if succeeded {
-        let result = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
+        return slash_after_success(pool, bond, counterparty_share).await;
+    }
+
+    let msg = failure.unwrap_or_else(|| "payment stream ended without terminal status".to_string());
+    on_send_payment_failure(pool, bond, max_retries, &msg).await
+}
+
+/// Flip a `PendingPayout` row to `Slashed` after a confirmed payment.
+///
+/// Bounded retry: the payment has already been delivered, so a residual
+/// DB blip should not leave the row stuck in `PendingPayout` if we can
+/// help it. After [`SLASH_CAS_MAX_ATTEMPTS`] failed attempts we bail out
+/// with `Err`; the persisted `payout_payment_hash` guarantees the next
+/// scheduler tick will reconcile via LND and re-attempt this CAS rather
+/// than re-issuing `send_payment`.
+async fn slash_after_success(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    counterparty_share: i64,
+) -> Result<(), MostroError> {
+    let mut last_err: Option<String> = None;
+    for attempt in 0..SLASH_CAS_MAX_ATTEMPTS {
+        if attempt > 0 {
+            // 50ms, 100ms, 200ms, 400ms — short enough to keep the
+            // scheduler tick brisk, long enough to give sqlite a chance
+            // to clear a BUSY lock.
+            let backoff_ms = 50u64 << (attempt - 1);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+        match sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
             .bind(BondState::Slashed.to_string())
             .bind(bond.id)
             .bind(BondState::PendingPayout.to_string())
             .execute(pool)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        if result.rows_affected() == 1 {
-            info!(
-                bond_id = %bond.id,
-                order_id = %bond.order_id,
-                amount_sats = bond.amount_sats,
-                counterparty_share_sats = counterparty_share,
-                "bond payout: send_payment succeeded; bond transitioned to Slashed"
-            );
+        {
+            Ok(result) => {
+                if result.rows_affected() == 1 {
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        amount_sats = bond.amount_sats,
+                        counterparty_share_sats = counterparty_share,
+                        "bond payout: send_payment succeeded; bond transitioned to Slashed"
+                    );
+                } else {
+                    // The row moved off `PendingPayout` between the
+                    // send_payment and this CAS — only legitimate path
+                    // is a parallel reconciliation already promoted the
+                    // row to `Slashed`. Log at info and treat as
+                    // success.
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "bond payout: Slashed CAS missed (concurrent transition); treating as already-finalized"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e.to_string()),
         }
-        return Ok(());
     }
-
-    let msg = failure.unwrap_or_else(|| "payment stream ended without terminal status".to_string());
-    on_send_payment_failure(pool, bond, max_retries, &msg).await
+    let cause = last_err.unwrap_or_else(|| "<no underlying error captured>".to_string());
+    error!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        counterparty_share_sats = counterparty_share,
+        attempts = SLASH_CAS_MAX_ATTEMPTS,
+        "bond payout: send_payment SUCCEEDED but state=Slashed CAS failed after retries — \
+         next tick will reconcile via persisted payout_payment_hash. last db error: {cause}"
+    );
+    Err(MostroInternalErr(ServiceError::DbAccessError(cause)))
 }
 
 /// Bump `payout_attempts`; on `payout_max_retries` reached, transition
@@ -826,12 +1008,26 @@ async fn apply_payout_invoice(
             // `PendingPayout` (Failed is invisible to it), and the
             // row reads consistent on the next tick because we set
             // state + invoice + counters in the same UPDATE.
+            //
+            // `payout_payment_hash` is also cleared: a row in `Failed`
+            // carries the hash of the *previous* invoice's failed
+            // payment attempts, and on the next scheduler tick
+            // `pay_counterparty` would otherwise compare that stale
+            // hash against the freshly-submitted invoice's hash and
+            // skip the reconciliation branch. The comparison would
+            // mismatch and fall through correctly, but clearing the
+            // column here makes the invariant explicit ("a hash on the
+            // row always refers to the *current* `payout_invoice`")
+            // and gives defense-in-depth against any future code path
+            // that reads the hash without re-validating it against the
+            // invoice.
             let result = sqlx::query(
                 "UPDATE bonds \
                    SET state = ?, \
                        payout_invoice = ?, \
                        payout_attempts = 0, \
-                       invoice_request_attempts = 0 \
+                       invoice_request_attempts = 0, \
+                       payout_payment_hash = NULL \
                  WHERE id = ? AND state = ?",
             )
             .bind(BondState::PendingPayout.to_string())
@@ -957,6 +1153,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260518120000_bond_payout_payment_hash.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_payment_hash migration");
         pool
     }
 
@@ -1690,5 +1892,142 @@ mod tests {
                 .unwrap();
             assert_eq!(after.0, state.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_resurrection_clears_payout_payment_hash() {
+        // Failed → PendingPayout resurrection must NULL out the
+        // `payout_payment_hash` column so the reconciliation branch in
+        // `pay_counterparty` doesn't compare a fresh invoice against the
+        // hash of a prior (failed) attempt's send. The defensive
+        // invoice/hash-mismatch check in `pay_counterparty` would catch
+        // it even if the hash leaked through, but the invariant we want
+        // to hold across the codebase is "a non-NULL
+        // `payout_payment_hash` always refers to the *current*
+        // `payout_invoice`".
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pOLD"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        bond.payout_payment_hash = Some("a".repeat(64));
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Resurrected);
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+        assert_eq!(after.payout_invoice.as_deref(), Some("lnbc1pFRESH"));
+        assert!(
+            after.payout_payment_hash.is_none(),
+            "resurrection must clear stale payout_payment_hash, got {:?}",
+            after.payout_payment_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_payout_invoice_persists_leaves_payout_payment_hash_untouched() {
+        // First-time invoice submission on a PendingPayout row with no
+        // hash yet: the helper only writes `payout_invoice` and the
+        // attempt counter — the hash column stays NULL and is filled
+        // later by `pay_counterparty`'s pre-send CAS.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Persisted);
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(after.payout_payment_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn slash_after_success_transitions_pending_to_slashed() {
+        // Happy path for the post-`send_payment` CAS helper.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("lnbc1pPAID"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        slash_after_success(&pool, &bond, 5_000).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, BondState::Slashed.to_string());
+    }
+
+    #[tokio::test]
+    async fn slash_after_success_is_idempotent_when_already_slashed() {
+        // If the row has already advanced past PendingPayout — e.g., a
+        // concurrent reconciliation tick beat us to the CAS — the
+        // helper must NOT return Err and must NOT mutate state. The
+        // row's terminal state stays as it was.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("lnbc1pPAID"),
+            None,
+        );
+        bond.state = BondState::Slashed.to_string();
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        // Caller still holds a snapshot showing PendingPayout in the
+        // Rust struct; the CAS misses in SQL and the helper logs +
+        // returns Ok.
+        let mut snapshot = bond.clone();
+        snapshot.state = BondState::PendingPayout.to_string();
+        slash_after_success(&pool, &snapshot, 5_000).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, BondState::Slashed.to_string());
     }
 }

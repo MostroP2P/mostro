@@ -184,6 +184,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260518120000_bond_payout_payment_hash.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_payment_hash migration");
         // SQLite doesn't enforce FKs unless asked. Turn them on so the FK to
         // `orders` is a real constraint in tests (mirrors production).
         sqlx::query("PRAGMA foreign_keys = ON")

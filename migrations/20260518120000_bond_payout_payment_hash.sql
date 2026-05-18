@@ -1,0 +1,20 @@
+-- Phase 3 follow-up: persist the bolt11 payment_hash of the counterparty
+-- payout invoice so `pay_counterparty` is idempotent across crash/restart
+-- and transient DB failures.
+--
+-- Without this anchor, a successful `send_payment` followed by a failed
+-- "state = Slashed" CAS would leave the row in `PendingPayout` with the
+-- sats already in flight. The next scheduler tick would call
+-- `send_payment` again, LND would reject the duplicate (invoice already
+-- paid), and `on_send_payment_failure` would burn the retry budget — in
+-- the worst case flipping the row to `Failed` despite a successful
+-- delivery.
+--
+-- The column is written via a CAS guarded on `state = 'pending-payout'`
+-- right before each `send_payment` attempt. On the next entry to
+-- `pay_counterparty`, if this column is set, the scheduler reconciles
+-- with LND's `track_payment_v2` for this hash before invoking a fresh
+-- send. The `apply_payout_invoice` Failed→PendingPayout resurrection
+-- clears this column so the new invoice's hash is not shadowed by the
+-- stale one.
+ALTER TABLE bonds ADD COLUMN payout_payment_hash char(64);

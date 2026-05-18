@@ -71,6 +71,24 @@ pub struct Bond {
     pub payout_invoice: Option<String>,
     /// Routing-fee ceiling actually used for the payout attempt (sats).
     pub payout_routing_fee_sats: Option<i64>,
+    /// bolt11 payment_hash of the counterparty's payout invoice (hex,
+    /// 64 chars). Written via a CAS guarded on
+    /// `state = 'pending-payout'` *before* every `send_payment` attempt,
+    /// so it acts as the idempotency anchor for the counterparty payout
+    /// leg: if a `send_payment` succeeds but the subsequent
+    /// `state = 'slashed'` CAS fails (transient DB error, process
+    /// crash), the next scheduler tick re-enters `pay_counterparty`,
+    /// sees this hash, reconciles against LND's `track_payment_v2`, and
+    /// avoids re-invoking `send_payment` against an invoice LND has
+    /// already paid. Cleared by `apply_payout_invoice` on
+    /// Failed→PendingPayout resurrection so the new invoice's hash is
+    /// not shadowed by a stale one.
+    ///
+    /// Defense-in-depth: not a capability like `preimage`, but it
+    /// identifies the payment. Kept out of serde output until a phase
+    /// has a concrete reason to publish it.
+    #[serde(skip_serializing)]
+    pub payout_payment_hash: Option<String>,
     /// Phase 3: portion of `amount_sats` that the node retains on slash.
     /// Frozen at the moment the bond enters `PendingPayout`. `None` until
     /// then; the counterparty share is always derived as
@@ -79,17 +97,17 @@ pub struct Bond {
     /// Number of `send_payment` retries against an invoice the counterparty
     /// has already submitted. Bumped only on Phase 3 step 6 (send_payment
     /// failure); `payout_max_retries` is checked against this counter
-    /// alone. Invoice-request DMs do NOT increment this — see
+    /// alone. Invoice-request messages do NOT increment this — see
     /// `invoice_request_attempts`.
     pub payout_attempts: i64,
-    /// Phase 3: number of `Action::AddInvoice` DMs sent to the counterparty
-    /// asking for a payout invoice. Bounded by the forfeit window
-    /// (`payout_claim_window_days`), not by `payout_max_retries`. Reset to
-    /// 0 when the counterparty finally submits an invoice.
+    /// Phase 3: number of `Action::AddBondInvoice` messages sent to the
+    /// counterparty asking for a payout invoice. Bounded by the forfeit
+    /// window (`payout_claim_window_days`), not by `payout_max_retries`.
+    /// Reset to 0 when the counterparty finally submits an invoice.
     pub invoice_request_attempts: i64,
-    /// Phase 3: timestamp of the last `Action::AddInvoice` DM. Drives the
-    /// `payout_invoice_window_seconds` cadence check; persisted so a
-    /// daemon restart doesn't trigger an immediate re-DM.
+    /// Phase 3: timestamp of the last `Action::AddBondInvoice` message. Drives
+    /// the `payout_invoice_window_seconds` cadence check; persisted so a
+    /// daemon restart doesn't trigger an immediate re-send.
     pub last_invoice_request_at: Option<i64>,
     /// Timestamp when the bond hold invoice reached `Accepted`.
     pub locked_at: Option<i64>,
@@ -151,6 +169,7 @@ impl Bond {
             payment_request: None,
             payout_invoice: None,
             payout_routing_fee_sats: None,
+            payout_payment_hash: None,
             node_share_sats: None,
             payout_attempts: 0,
             invoice_request_attempts: 0,
@@ -196,12 +215,14 @@ mod tests {
     #[test]
     fn serialize_omits_secret_fields() {
         // The preimage is the capability that settles the bond HTLC;
-        // `payout_invoice` identifies the winner. Both must stay out of
-        // any serde output a future phase accidentally adds.
+        // `payout_invoice` identifies the winner; `payout_payment_hash`
+        // identifies the payment. All three must stay out of any serde
+        // output a future phase accidentally adds.
         let mut b = Bond::new_requested(Uuid::new_v4(), "a".repeat(64), BondRole::Taker, 1_000);
         b.preimage = Some("deadbeef".repeat(8));
         b.payout_invoice = Some("lnbc1pSECRET".to_string());
         b.hash = Some("c0ffee".repeat(10) + "c0ff");
+        b.payout_payment_hash = Some("ba5eba11".repeat(8));
 
         let json = serde_json::to_string(&b).expect("serialize");
         assert!(!json.contains("preimage"), "preimage leaked: {json}");
@@ -213,6 +234,14 @@ mod tests {
         assert!(
             !json.contains("lnbc1pSECRET"),
             "payout_invoice value leaked: {json}"
+        );
+        assert!(
+            !json.contains("payout_payment_hash"),
+            "payout_payment_hash leaked: {json}"
+        );
+        assert!(
+            !json.contains("ba5eba11"),
+            "payout_payment_hash value leaked: {json}"
         );
         // Non-secret fields still serialize as usual.
         assert!(json.contains("hash"));

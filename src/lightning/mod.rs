@@ -268,6 +268,70 @@ impl LndConnector {
         Ok(())
     }
 
+    /// Look up a payment by hash, distinguishing "LND has no record" from
+    /// transport errors.
+    ///
+    /// Used by the bond payout flow to reconcile after a successful
+    /// `send_payment` whose follow-up DB write failed: on the next
+    /// scheduler tick `pay_counterparty` queries LND for the persisted
+    /// `payout_payment_hash` and only re-invokes `send_payment` if LND
+    /// confirms it never saw the hash.
+    ///
+    /// Returns:
+    /// - `Ok(Some(status))` — LND tracks this hash and reports `status`.
+    /// - `Ok(None)` — LND has no record of this hash (`NotFound`). The
+    ///   hash may never have been attempted, or LND pruned the record.
+    /// - `Err(_)` — transport / gRPC error; status is unknown.
+    pub async fn lookup_payment_status(
+        &mut self,
+        payment_hash: &[u8],
+    ) -> Result<Option<fedimint_tonic_lnd::lnrpc::payment::PaymentStatus>, MostroError> {
+        let track_req = TrackPaymentRequest {
+            payment_hash: payment_hash.to_vec(),
+            no_inflight_updates: false,
+        };
+
+        let stream = match self.client.router().track_payment_v2(track_req).await {
+            Ok(s) => s,
+            Err(status) => {
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
+                    return Ok(None);
+                }
+                return Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))));
+            }
+        };
+
+        let mut stream = stream.into_inner();
+        match stream.message().await {
+            Ok(Some(payment)) => {
+                let status =
+                    fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
+                        .map_err(|_| {
+                            MostroInternalErr(ServiceError::LnPaymentError(
+                                "Unknown payment status".to_string(),
+                            ))
+                        })?;
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(status) => {
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
+                    Ok(None)
+                } else {
+                    Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                        "code={:?} message={}",
+                        status.code(),
+                        status.message()
+                    ))))
+                }
+            }
+        }
+    }
+
     /// Query the current status of a payment by its hash.
     ///
     /// Returns the LND `PaymentStatus` if the payment is found, or an error

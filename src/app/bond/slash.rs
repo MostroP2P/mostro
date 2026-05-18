@@ -3,16 +3,20 @@
 //! Translates a [`BondResolution`] payload carried by `Action::AdminSettle`
 //! / `Action::AdminCancel` into concrete bond transitions:
 //!
-//! - **Slashed sides** move from `Locked` → `PendingPayout`, with
-//!   `slashed_reason`, `slashed_at`, and `node_share_sats` snapshotted in
-//!   the same `UPDATE` so a later config change or daemon restart cannot
-//!   rebalance the split.
+//! - **Slashed sides** have their hold invoice **immediately settled**
+//!   (`settle_hold_invoice(preimage)`) and the row moves
+//!   `Locked` → `PendingPayout`, with `slashed_reason`, `slashed_at`, and
+//!   `node_share_sats` snapshotted in the same `UPDATE` so a later config
+//!   change or daemon restart cannot rebalance the split. The HTLC is
+//!   claimed by Mostro **here**, not asynchronously by Phase 3.
 //! - **Non-slashed sides** are released exactly as Phase 1 did
 //!   (`cancel_hold_invoice` + state = `Released`).
 //!
-//! The actual Lightning payout to the counterparty is the job of Phase 3
-//! (`job_process_bond_payouts`). This module never touches the
-//! `payout_invoice` / `send_payment` machinery.
+//! The recipient payout (asking the winning counterparty for a bolt11,
+//! `send_payment` retries, forfeiture on the long-stop window) is still
+//! the job of Phase 3 (`job_process_bond_payouts`). Phase 3 no longer
+//! settles HTLCs — by the time it picks up a `PendingPayout` row, the
+//! sats are already in Mostro's wallet.
 //!
 //! ## Flow contract
 //!
@@ -33,6 +37,8 @@
 //! yields exactly the legacy behaviour.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
 use chrono::Utc;
 use mostro_core::error::{
@@ -51,6 +57,41 @@ use super::math::compute_node_share;
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 use crate::config::settings::Settings;
+use crate::lightning::LndConnector;
+
+/// Minimal LND-side capability the slash path needs: settle a hold
+/// invoice by preimage. Mirrors the [`crate::app::cancel::CancelLightning`]
+/// pattern so tests can pass a stub instead of a live `LndConnector`.
+pub trait SettleLightning {
+    fn settle_hold_invoice<'a>(
+        &'a mut self,
+        preimage: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>>;
+}
+
+impl SettleLightning for LndConnector {
+    fn settle_hold_invoice<'a>(
+        &'a mut self,
+        preimage: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move {
+            LndConnector::settle_hold_invoice(self, preimage)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+/// Classify a `settle_hold_invoice` failure: an "already settled"
+/// response is treated as success so admin retries (where the row is
+/// still `Locked` but the HTLC is already claimed) drive the bond into
+/// `PendingPayout` instead of looping forever on a benign error.
+pub(super) fn is_already_settled_error(err: &MostroError) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("already settled")
+        || s.contains("invoice already settled")
+        || s.contains("code=alreadyexists")
+}
 
 /// Which trade-flow side a slash flag is targeting. Internal helper —
 /// callers think in `BondResolution::slash_seller` / `slash_buyer`
@@ -119,24 +160,35 @@ pub async fn validate_bond_resolution(
 /// Apply a validated [`BondResolution`] to every active bond on the order.
 ///
 /// For each currently active bond:
-/// - if the bond's owner is on the slashed side(s), perform a CAS
+/// - if the bond's owner is on the slashed side(s), **settle the hold
+///   invoice immediately** (`settle_hold_invoice(preimage)`, claiming
+///   the sats into Mostro's wallet) and then CAS
 ///   `state='locked' → state='pending-payout'` that also writes
 ///   `slashed_reason`, `slashed_at`, and `node_share_sats` in the same
 ///   statement. The split snapshot is intentionally frozen at this
 ///   moment — Phase 3's payout job never reads `slash_node_share_pct`
 ///   from config; it reads `node_share_sats` from the row.
 /// - otherwise, release the bond exactly as Phase 1 did
-///   (`cancel_hold_invoice` if applicable, then state = `Released`).
+///   (`cancel_hold_invoice` + state = `Released`).
+///
+/// **Ordering invariant**: settle MUST succeed before the CAS runs. If
+/// settle fails (and is not the benign "already settled" idempotent
+/// case), the row stays `Locked` and a future admin retry will re-run
+/// the slash. Doing settle before CAS means a partial failure leaves a
+/// retry-able state instead of a `PendingPayout` row whose HTLC is
+/// still encumbered.
 ///
 /// Idempotent: a bond that already moved out of `Locked` (e.g. a
 /// duplicate admin call or a concurrent path) is left untouched by the
-/// CAS, and the loop continues to the next bond. The `release_bond`
-/// call is itself idempotent for terminal states.
+/// CAS, and the loop continues to the next bond. Settling an
+/// already-settled HTLC is also benign (LND returns AlreadyExists,
+/// which [`is_already_settled_error`] classifies as success).
 ///
 /// `reason` is `LostDispute` in Phase 2 (called from admin handlers);
 /// Phase 4 (timeout slash) will reuse this helper with `Timeout`.
-pub async fn apply_bond_resolution(
+pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
+    ln_client: &mut L,
     order: &Order,
     resolution: &BondResolution,
     reason: BondSlashReason,
@@ -170,7 +222,7 @@ pub async fn apply_bond_resolution(
 
     for bond in bonds.iter() {
         if slashed_ids.contains(&bond.id) {
-            slash_one(pool, bond, reason, node_share_pct).await;
+            slash_one(pool, ln_client, bond, reason, node_share_pct).await;
         } else {
             // Non-slashed bonds on the same order: release with the
             // Phase 1 contract. `release_bond` is best-effort and
@@ -188,15 +240,55 @@ pub async fn apply_bond_resolution(
     Ok(())
 }
 
-/// Single-bond `Locked → PendingPayout` transition with snapshot fields.
+/// Single-bond slash: settle the hold invoice into Mostro's wallet,
+/// then CAS the row `Locked → PendingPayout` with snapshot fields.
 ///
-/// Uses a CAS `WHERE id = ? AND state = 'locked'` so a duplicate admin
-/// call or a concurrent transition cannot overwrite a row that already
-/// moved on. The CAS write is the only place `slashed_reason`,
-/// `slashed_at`, and `node_share_sats` are populated for a `LostDispute`
-/// row, which is what makes the split snapshot deterministic across
-/// restarts and config changes.
-async fn slash_one(pool: &Pool<Sqlite>, bond: &Bond, reason: BondSlashReason, node_share_pct: f64) {
+/// Settling first means a transient LND failure leaves the bond
+/// retryably `Locked` rather than stranding a `PendingPayout` row
+/// whose HTLC is still encumbered. The CAS itself uses
+/// `WHERE id = ? AND state = 'locked'` so a duplicate admin call or a
+/// concurrent transition cannot overwrite a row that already moved on.
+///
+/// The CAS write is the only place `slashed_reason`, `slashed_at`, and
+/// `node_share_sats` are populated for a `LostDispute` row, which is
+/// what makes the split snapshot deterministic across restarts and
+/// config changes.
+async fn slash_one<L: SettleLightning + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+    bond: &Bond,
+    reason: BondSlashReason,
+    node_share_pct: f64,
+) {
+    let preimage = match bond.preimage.as_deref() {
+        Some(p) => p,
+        None => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "slash: bond has no preimage — cannot settle HTLC; leaving Locked for operator review"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
+        if is_already_settled_error(&e) {
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "slash: HTLC already settled (idempotent retry); proceeding to CAS"
+            );
+        } else {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "slash: settle_hold_invoice failed: {e} — leaving bond Locked for admin retry"
+            );
+            return;
+        }
+    }
+
     let node_share_sats = compute_node_share(bond.amount_sats, node_share_pct);
     let now = Utc::now().timestamp();
     let result = sqlx::query(
@@ -220,26 +312,27 @@ async fn slash_one(pool: &Pool<Sqlite>, bond: &Bond, reason: BondSlashReason, no
                 reason = %reason,
                 node_share_sats,
                 counterparty_share_sats = bond.amount_sats - node_share_sats,
-                "Bond transitioned to PendingPayout"
+                "Bond HTLC settled and row transitioned to PendingPayout"
             );
         }
         Ok(_) => {
             // The bond moved out of `Locked` between our enumerate and
-            // our CAS. Phase 3 will not pick it up (only `PendingPayout`
-            // qualifies for payout); any prior transition (e.g. a
-            // concurrent release) owns the row now.
+            // our CAS. HTLC is settled either way; whatever path owned
+            // the prior transition is responsible for any further
+            // movement. Phase 3 will not pick up anything but a
+            // `PendingPayout` row.
             warn!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
                 current_state = %bond.state,
-                "slash CAS no-op (bond state changed concurrently)"
+                "slash CAS no-op (bond state changed concurrently); HTLC was settled"
             );
         }
         Err(e) => {
             warn!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
-                "slash CAS DB error: {}", e
+                "slash CAS DB error: {} (HTLC was settled)", e
             );
         }
     }
@@ -267,6 +360,9 @@ fn resolve_locked_bond<'a>(order: &Order, bonds: &'a [Bond], side: Side) -> Opti
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use mostro_core::error::{MostroError, ServiceError};
     use mostro_core::message::{Action, Message, Payload};
     use mostro_core::order::{Kind, Order, Status};
     use sqlx::sqlite::SqlitePoolOptions;
@@ -275,6 +371,48 @@ mod tests {
     use super::*;
     use crate::app::bond::model::Bond;
     use crate::app::bond::types::{BondRole, BondSlashReason, BondState};
+
+    /// Recording stub for `SettleLightning`. Captures each preimage the
+    /// caller asked LND to settle, and can be primed to return either
+    /// success, an "already settled" error, or a transient transport
+    /// failure. Used end-to-end to verify the slash path settles at
+    /// slash time (one HTLC per slashed bond) and that it skips
+    /// non-slashed bonds entirely.
+    #[derive(Default)]
+    struct StubSettle {
+        calls: Mutex<Vec<String>>,
+        // When set, force every settle to return this canned error.
+        fail_with: Mutex<Option<String>>,
+    }
+
+    impl StubSettle {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn fail_next_with(&self, msg: &str) {
+            *self.fail_with.lock().unwrap() = Some(msg.to_string());
+        }
+    }
+
+    impl SettleLightning for Arc<StubSettle> {
+        fn settle_hold_invoice<'a>(
+            &'a mut self,
+            preimage: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(preimage.to_string());
+                if let Some(msg) = self.fail_with.lock().unwrap().take() {
+                    return Err(MostroError::MostroInternalErr(ServiceError::LnNodeError(
+                        msg,
+                    )));
+                }
+                Ok(())
+            })
+        }
+    }
 
     async fn setup_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -304,6 +442,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bonds migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260518120000_bond_payout_payment_hash.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_payment_hash migration");
         pool
     }
 
@@ -349,6 +493,14 @@ mod tests {
         }
     }
 
+    /// 32-byte zero preimage as a 64-char hex string. Real bonds carry
+    /// a random preimage populated by `request_taker_bond`; tests just
+    /// need *something* well-formed for the stub `SettleLightning` to
+    /// observe.
+    fn stub_preimage() -> String {
+        "00".repeat(32)
+    }
+
     async fn insert_bond(
         pool: &Pool<Sqlite>,
         order_id: Uuid,
@@ -357,6 +509,7 @@ mod tests {
     ) -> Bond {
         let mut b = Bond::new_requested(order_id, pubkey.to_string(), BondRole::Taker, 10_000);
         b.state = state.to_string();
+        b.preimage = Some(stub_preimage());
         // No hash → release_bond skips the LND cancel branch entirely
         // (see `release_bond` in flow.rs).
         b.hash = None;
@@ -498,9 +651,15 @@ mod tests {
             slash_seller: false,
             slash_buyer: false,
         };
-        apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
-            .await
-            .unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
 
         let row: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(bond.id)
@@ -527,9 +686,15 @@ mod tests {
             slash_seller: false,
             slash_buyer: true,
         };
-        apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
-            .await
-            .unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
 
         let row: (String, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
             "SELECT state, slashed_reason, slashed_at, node_share_sats \
@@ -563,9 +728,15 @@ mod tests {
             slash_buyer: true,
         };
 
-        apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
-            .await
-            .unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
         let first: (String, Option<i64>, Option<i64>) =
             sqlx::query_as("SELECT state, slashed_at, node_share_sats FROM bonds WHERE id = ?")
                 .bind(bond.id)
@@ -574,11 +745,17 @@ mod tests {
                 .unwrap();
         assert_eq!(first.0, BondState::PendingPayout.to_string());
 
-        // Pretend a duplicate admin DM arrived a second later.
+        // Pretend a duplicate admin message arrived a second later.
         std::thread::sleep(std::time::Duration::from_secs(1));
-        apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
-            .await
-            .unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
         let second: (String, Option<i64>, Option<i64>) =
             sqlx::query_as("SELECT state, slashed_at, node_share_sats FROM bonds WHERE id = ?")
                 .bind(bond.id)
@@ -611,13 +788,192 @@ mod tests {
             slash_seller: false,
             slash_buyer: false,
         };
-        apply_bond_resolution(&pool, &order, &res, BondSlashReason::LostDispute)
-            .await
-            .unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bonds")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(count.0, 0);
+    }
+
+    // ── Immediate-settle (the Phase 2 change shipped here) ──────────────────
+
+    #[tokio::test]
+    async fn slash_one_settles_exactly_one_htlc() {
+        // Single slashed taker bond → `settle_hold_invoice` runs once
+        // with that bond's preimage as part of the slash step. The row
+        // ends up in `PendingPayout` for Phase 3 to handle the
+        // counterparty payout asynchronously.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "slash path must settle exactly the slashed bond's HTLC"
+        );
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state.0, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn slash_both_settles_both_htlcs() {
+        // Both flags set + both buyer and seller carry a `Locked` bond:
+        // `settle_hold_invoice` must run **twice** (once per slashed
+        // bond) and both rows end up in `PendingPayout`. This is the
+        // Phase 5+ "both behaved badly" path; Phase 2 cannot reach it
+        // in production (taker-only world), but the slash machinery
+        // must handle the case correctly when Phase 5 wires it.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let buyer_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let seller_bond = insert_bond(&pool, order.id, maker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: true,
+        };
+
+        apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+            .await
+            .unwrap();
+
+        // Both preimages observed (order-independent: the apply loop
+        // walks `find_active_bonds_for_order` results which are not
+        // ordered by side).
+        assert_eq!(
+            ln.calls().len(),
+            2,
+            "both slashed bonds must have their HTLCs settled immediately"
+        );
+        for b in [&buyer_bond, &seller_bond] {
+            let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+                .bind(b.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state.0, BondState::PendingPayout.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn non_slashed_bond_is_released_not_settled() {
+        // When the resolution releases (no flags set), the slash path
+        // must NOT touch `settle_hold_invoice` — release is the
+        // Phase 1 `cancel_hold_invoice` flow.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: false,
+        };
+
+        apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+            .await
+            .unwrap();
+
+        assert!(
+            ln.calls().is_empty(),
+            "non-slashed (released) bonds must not invoke settle_hold_invoice"
+        );
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state.0, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn slash_treats_already_settled_as_success() {
+        // Admin retry: the HTLC was claimed on a previous attempt but
+        // the CAS failed. LND returns "already settled"; the slash
+        // path must classify that as success via
+        // `is_already_settled_error` and complete the CAS to
+        // `PendingPayout`.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=AlreadyExists: invoice already settled");
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+            .await
+            .unwrap();
+
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.0,
+            BondState::PendingPayout.to_string(),
+            "already-settled error must not block the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_settle_transport_failure_leaves_bond_locked() {
+        // Real LND transport failure: the bond stays `Locked` so a
+        // future admin retry can re-attempt the slash. The CAS must
+        // NOT have flipped the row to `PendingPayout`.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+            .await
+            .unwrap();
+
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.0,
+            BondState::Locked.to_string(),
+            "transient settle failure must leave the bond Locked for admin retry"
+        );
     }
 }

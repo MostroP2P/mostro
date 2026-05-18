@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub enum BondApplyTo {
     #[default]
     Take,
-    Create,
+    Make,
     Both,
 }
 
@@ -27,7 +27,7 @@ impl BondApplyTo {
 
     /// True when the maker side of a trade must lock a bond.
     pub fn applies_to_maker(self) -> bool {
-        matches!(self, BondApplyTo::Create | BondApplyTo::Both)
+        matches!(self, BondApplyTo::Make | BondApplyTo::Both)
     }
 }
 
@@ -437,8 +437,8 @@ mod anti_abuse_bond_tests {
     fn apply_to_predicates() {
         assert!(BondApplyTo::Take.applies_to_taker());
         assert!(!BondApplyTo::Take.applies_to_maker());
-        assert!(!BondApplyTo::Create.applies_to_taker());
-        assert!(BondApplyTo::Create.applies_to_maker());
+        assert!(!BondApplyTo::Make.applies_to_taker());
+        assert!(BondApplyTo::Make.applies_to_maker());
         assert!(BondApplyTo::Both.applies_to_taker());
         assert!(BondApplyTo::Both.applies_to_maker());
     }

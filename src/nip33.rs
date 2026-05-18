@@ -1,5 +1,6 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
+use crate::config::types::BondApplyTo;
 use crate::lightning::LnStatus;
 use crate::util::{get_expiration_timestamp_for_kind, get_keys};
 use crate::LN_STATUS;
@@ -487,8 +488,9 @@ pub fn order_to_tags(
 pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
+    let bond_settings = Settings::get_bond();
 
-    let tags: Tags = Tags::from_list(vec![
+    let mut tags_vec: Vec<Tag> = vec![
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("mostro_version")),
             vec![env!("CARGO_PKG_VERSION").to_string()],
@@ -577,8 +579,68 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
             TagKind::Custom(Cow::Borrowed("z")),
             vec!["info".to_string()],
         ),
-    ]);
+    ];
 
+    tags_vec.extend(bond_policy_tags(bond_settings));
+
+    Tags::from_list(tags_vec)
+}
+
+/// Build the bond policy tag block for the info event.
+///
+/// `bond_enabled` is always emitted so clients can disambiguate "bond
+/// feature off on this node" from "older daemon that doesn't speak bond
+/// at all". The remaining tags are present only when the feature is
+/// enabled — together they let a client warn the user about bond cost,
+/// scope, and slash policy *before* the take/create flow starts, and
+/// render any deadline (slashed_at + payout_claim_window_days) in the
+/// user's own locale without Mostro shipping any hardcoded text.
+///
+/// Split out from [`info_to_tags`] so unit tests can exercise both the
+/// disabled and enabled branches without mutating the `MOSTRO_CONFIG`
+/// OnceLock that the parent function reads from.
+fn bond_policy_tags(
+    bond_settings: Option<&crate::config::types::AntiAbuseBondSettings>,
+) -> Vec<Tag> {
+    let mut tags = Vec::with_capacity(7);
+    let bond_enabled = bond_settings.is_some_and(|b| b.enabled);
+    tags.push(Tag::custom(
+        TagKind::Custom(Cow::Borrowed("bond_enabled")),
+        vec![bond_enabled.to_string()],
+    ));
+    if let Some(bond) = bond_settings {
+        if bond.enabled {
+            let apply_to_str = match bond.apply_to {
+                BondApplyTo::Take => "take",
+                BondApplyTo::Make => "make",
+                BondApplyTo::Both => "both",
+            };
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_amount_pct")),
+                vec![bond.amount_pct.to_string()],
+            ));
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_base_amount_sats")),
+                vec![bond.base_amount_sats.to_string()],
+            ));
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_apply_to")),
+                vec![apply_to_str.to_string()],
+            ));
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_slash_on_waiting_timeout")),
+                vec![bond.slash_on_waiting_timeout.to_string()],
+            ));
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_slash_node_share_pct")),
+                vec![bond.slash_node_share_pct.to_string()],
+            ));
+            tags.push(Tag::custom(
+                TagKind::Custom(Cow::Borrowed("bond_payout_claim_window_days")),
+                vec![bond.payout_claim_window_days.to_string()],
+            ));
+        }
+    }
     tags
 }
 
@@ -779,6 +841,114 @@ mod tests {
         assert_eq!(
             y_values, expected,
             "info_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    /// Look up a single-value tag in a Tags collection, returning its
+    /// first value. Helper for the bond-policy assertions below.
+    fn get_tag_value(tags: &Tags, name: &str) -> Option<String> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            if vec.first().map(String::as_str) == Some(name) {
+                vec.get(1).cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn info_to_tags_emits_bond_disabled_marker_when_bond_off() {
+        // test_settings() builds Settings with `anti_abuse_bond = None`,
+        // i.e. the feature is off. `bond_enabled` must still be emitted
+        // (as "false") so clients can disambiguate "feature off" from
+        // "older daemon that doesn't speak bond at all". The rest of the
+        // policy tags must be absent.
+        init_test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = info_to_tags(&ln_status);
+
+        assert_eq!(
+            get_tag_value(&tags, "bond_enabled").as_deref(),
+            Some("false"),
+            "bond_enabled must be emitted as 'false' when the feature is off"
+        );
+
+        for absent in [
+            "bond_amount_pct",
+            "bond_base_amount_sats",
+            "bond_apply_to",
+            "bond_slash_on_waiting_timeout",
+            "bond_slash_node_share_pct",
+            "bond_payout_claim_window_days",
+        ] {
+            assert!(
+                get_tag_value(&tags, absent).is_none(),
+                "{absent} must be absent when the bond feature is disabled"
+            );
+        }
+    }
+
+    /// Build a `Tags` collection from a bond settings snapshot via the
+    /// pure `bond_policy_tags` helper. Exists because
+    /// `info_to_tags` itself reads bond settings from the
+    /// `MOSTRO_CONFIG` OnceLock — which is shared across the test
+    /// binary and cannot be mutated mid-run — so we exercise the
+    /// enabled branch through the helper directly.
+    fn bond_tags(bond: Option<&crate::config::types::AntiAbuseBondSettings>) -> Tags {
+        Tags::from_list(super::bond_policy_tags(bond))
+    }
+
+    #[test]
+    fn info_to_tags_emits_bond_enabled_marker_when_bond_on() {
+        // Companion of `info_to_tags_emits_bond_disabled_marker_when_bond_off`.
+        // Verifies every advertised policy tag is present and that the
+        // emitted value mirrors the source settings byte-for-byte —
+        // clients parse these as text, so any reformat by `to_string`
+        // would silently break them.
+        let bond = crate::config::types::AntiAbuseBondSettings {
+            enabled: true,
+            amount_pct: 0.02,
+            base_amount_sats: 2_500,
+            apply_to: crate::config::types::BondApplyTo::Both,
+            slash_on_waiting_timeout: true,
+            slash_node_share_pct: 0.4,
+            payout_invoice_window_seconds: 300,
+            payout_max_retries: 5,
+            payout_claim_window_days: 30,
+        };
+
+        let tags = bond_tags(Some(&bond));
+
+        assert_eq!(
+            get_tag_value(&tags, "bond_enabled").as_deref(),
+            Some("true"),
+            "bond_enabled must be emitted as 'true' when the feature is on"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_amount_pct").as_deref(),
+            Some("0.02")
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_base_amount_sats").as_deref(),
+            Some("2500")
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_apply_to").as_deref(),
+            Some("both")
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_slash_on_waiting_timeout").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_slash_node_share_pct").as_deref(),
+            Some("0.4")
+        );
+        assert_eq!(
+            get_tag_value(&tags, "bond_payout_claim_window_days").as_deref(),
+            Some("30")
         );
     }
 

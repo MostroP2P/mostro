@@ -31,6 +31,7 @@ use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
+use crate::app::bond::add_bond_invoice_action;
 use crate::app::cancel::cancel_action;
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
@@ -222,6 +223,9 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::AddInvoice => add_invoice_action(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
+        Action::AddBondInvoice => add_bond_invoice_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),

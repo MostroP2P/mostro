@@ -34,6 +34,27 @@ pub struct PaymentMessage {
     pub payment: Payment,
 }
 
+/// Routing-fee cap (in sats) handed to LND as `fee_limit_sat` for a
+/// payment of `amount` sats.
+///
+/// This is the single source of truth for the cap. Both the actual
+/// payment (`LndConnector::send_payment`) and the value persisted for
+/// operator debugging (`bonds.payout_routing_fee_sats`) derive from it,
+/// so the recorded number always matches what LND enforced.
+pub fn routing_fee_cap_sats(amount: i64) -> i64 {
+    let max_routing_fee = Settings::get_mostro().max_routing_fee;
+    // If the amount is small we use a different max routing fee.
+    let max_fee = match amount.cmp(&1000) {
+        Ordering::Less | Ordering::Equal => {
+            // For small amounts, use 1% but ensure minimum of 10 sats
+            // to allow routing (otherwise tiny amounts like 30 sats would have 0 fee limit)
+            (amount as f64 * 0.01).max(10.0)
+        }
+        Ordering::Greater => amount as f64 * max_routing_fee,
+    };
+    max_fee as i64
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -177,19 +198,11 @@ impl LndConnector {
         let invoice = decode_invoice(payment_request)?;
         let payment_hash = invoice.signable_hash();
         let hash = bytes_to_string(&payment_hash);
-        let mostro_settings = Settings::get_mostro();
 
-        // We need to set a max fee amount
-        // If the amount is small we use a different max routing fee
-        let max_fee = match amount.cmp(&1000) {
-            Ordering::Less | Ordering::Equal => {
-                // For small amounts, use 1% but ensure minimum of 10 sats
-                // to allow routing (otherwise tiny amounts like 30 sats would have 0 fee limit)
-                let calculated_fee = amount as f64 * 0.01;
-                calculated_fee.max(10.0)
-            }
-            Ordering::Greater => amount as f64 * mostro_settings.max_routing_fee,
-        };
+        // We need to set a max fee amount. `routing_fee_cap_sats` is the
+        // single source of truth so the value persisted for operator
+        // debugging always matches what LND actually enforces.
+        let max_fee = routing_fee_cap_sats(amount);
 
         let track_payment_req = TrackPaymentRequest {
             payment_hash: payment_hash.to_vec(),
@@ -214,7 +227,7 @@ impl LndConnector {
         let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
             timeout_seconds: 60,
-            fee_limit_sat: max_fee as i64,
+            fee_limit_sat: max_fee,
             ..Default::default()
         };
         let invoice_amount_milli = invoice.amount_milli_satoshis();
@@ -405,5 +418,45 @@ impl LnStatus {
             networks: info.chains.iter().map(|c| c.network.to_string()).collect(),
             uris: info.uris.iter().map(|u| u.to_string()).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::routing_fee_cap_sats;
+    use crate::config::settings::Settings;
+    use crate::config::MOSTRO_CONFIG;
+
+    fn init_test_settings() {
+        // Defaults set `max_routing_fee = 0.002`.
+        let _ = MOSTRO_CONFIG.set(Settings {
+            database: Default::default(),
+            nostr: Default::default(),
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+            anti_abuse_bond: None,
+        });
+    }
+
+    #[test]
+    fn small_amounts_use_one_percent_with_ten_sat_floor() {
+        init_test_settings();
+        // At and below 1000 sats the floor of 10 dominates the 1% rate,
+        // independent of `max_routing_fee`.
+        assert_eq!(routing_fee_cap_sats(30), 10);
+        assert_eq!(routing_fee_cap_sats(500), 10);
+        assert_eq!(routing_fee_cap_sats(1000), 10);
+    }
+
+    #[test]
+    fn large_amounts_use_max_routing_fee_truncated() {
+        init_test_settings();
+        // Above 1000 sats the cap is `amount * max_routing_fee`, truncated
+        // (not rounded up) to match LND's `fee_limit_sat`.
+        assert_eq!(routing_fee_cap_sats(1001), 2); // 2.002 -> 2
+        assert_eq!(routing_fee_cap_sats(2001), 4); // 4.002 -> 4
+        assert_eq!(routing_fee_cap_sats(100_000), 200);
     }
 }

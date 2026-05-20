@@ -72,7 +72,7 @@ use uuid::Uuid;
 use crate::app::context::AppContext;
 use crate::config::settings::Settings;
 use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
-use crate::lightning::LndConnector;
+use crate::lightning::{routing_fee_cap_sats, LndConnector};
 use crate::util::{bytes_to_string, enqueue_order_msg};
 
 use super::db::find_bonds_by_state;
@@ -573,8 +573,11 @@ async fn pay_counterparty(
     // point on, every re-entry into this function for this bond will
     // take the reconciliation branch above instead of issuing a
     // duplicate send.
-    let max_routing_fee = Settings::get_mostro().max_routing_fee;
-    let routing_fee_cap = ((counterparty_share as f64) * max_routing_fee).ceil() as i64;
+    // Mirror exactly what `send_payment` will pass to LND as
+    // `fee_limit_sat`, so this informational column never misleads an
+    // operator debugging a payout (notably small ones, where LND uses a
+    // 1% rate with a 10-sat floor rather than `max_routing_fee`).
+    let routing_fee_cap = routing_fee_cap_sats(counterparty_share);
     let persisted = sqlx::query(
         "UPDATE bonds \
            SET payout_routing_fee_sats = ?, payout_payment_hash = ? \
@@ -602,8 +605,8 @@ async fn pay_counterparty(
         return Ok(());
     }
 
-    // send_payment. The helper internally caps the fee at
-    // `counterparty_share * max_routing_fee`.
+    // send_payment. The helper caps the fee via `routing_fee_cap_sats`,
+    // the same value persisted above as `payout_routing_fee_sats`.
     let (tx, mut rx) = channel(100);
     let send_outcome = ln_client
         .send_payment(invoice, counterparty_share, tx)

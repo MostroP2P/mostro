@@ -341,7 +341,6 @@ async fn request_payout_invoice(
     };
 
     let counterparty_share = counterparty_share_sats(bond)?;
-    let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
 
     // `process_one_bond` already errored out on a missing `slashed_at`
     // before dispatching here, but re-check rather than `.unwrap()` so
@@ -354,23 +353,7 @@ async fn request_payout_invoice(
         )))
     })?;
 
-    let small = SmallOrder::new(
-        Some(order.id),
-        Some(order_kind),
-        None,
-        counterparty_share,
-        order.fiat_code.clone(),
-        order.min_amount,
-        order.max_amount,
-        order.fiat_amount,
-        order.payment_method.clone(),
-        order.premium,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    let small = build_payout_small_order(&order, counterparty_share)?;
 
     // Persist the cadence bump *before* enqueuing the outbound
     // message. Order matters: `enqueue_order_msg` mutates an
@@ -701,6 +684,10 @@ async fn slash_after_success(
                         counterparty_share_sats = counterparty_share,
                         "bond payout: send_payment succeeded; bond transitioned to Slashed"
                     );
+                    // Phase 3.5: confirm the payout to the winner so
+                    // their client can close the claim (best-effort —
+                    // never blocks or rolls back the slash).
+                    notify_payout_completed(pool, bond, counterparty_share).await;
                 } else {
                     // The row moved off `PendingPayout` between the
                     // send_payment and this CAS — only legitimate path
@@ -804,6 +791,170 @@ fn resolve_recipient(
         .transpose()
         .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
     Ok(pk)
+}
+
+/// Build the `SmallOrder` carried by bond-payout messages
+/// (`AddBondInvoice`, `BondInvoiceAccepted`, `BondPayoutCompleted`).
+/// `order.amount` carries the **counterparty share** — the figure the
+/// winner's client renders — not the trade amount.
+fn build_payout_small_order(
+    order: &Order,
+    counterparty_share: i64,
+) -> Result<SmallOrder, MostroError> {
+    let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    Ok(SmallOrder::new(
+        Some(order.id),
+        Some(order_kind),
+        None,
+        counterparty_share,
+        order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
+        order.fiat_amount,
+        order.payment_method.clone(),
+        order.premium,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ))
+}
+
+/// Phase 3.5 — best-effort outbound acknowledgement to the winning
+/// counterparty. Enqueues `action` (`BondInvoiceAccepted` or
+/// `BondPayoutCompleted`) carrying the order as a `SmallOrder`
+/// (amount = counterparty share) to `recipient`.
+///
+/// Deliberately infallible: a failure to *notify* must never roll back
+/// the bond state transition that triggered it. The winner still
+/// receives the sats over Lightning; the worst case of a dropped ack is
+/// a missing confirmation message, which a later user action or the
+/// generic `CantDo` backstop surfaces anyway. Failures are logged, not
+/// propagated.
+async fn enqueue_payout_ack(
+    order: &Order,
+    action: Action,
+    recipient: PublicKey,
+    counterparty_share: i64,
+) {
+    let small = match build_payout_small_order(order, counterparty_share) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                order_id = %order.id,
+                "bond payout: cannot build SmallOrder for {action} ack ({e:?}); skipping notification"
+            );
+            return;
+        }
+    };
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        action,
+        Some(Payload::Order(small)),
+        recipient,
+        None,
+    )
+    .await;
+}
+
+/// Phase 3.5 — tell the winner their payout bolt11 was received and the
+/// payment is now pending (`Action::BondInvoiceAccepted`). Sent to the
+/// submitter (`recipient`) right after the invoice is persisted, so the
+/// client stops prompting the user for another invoice. Best-effort.
+async fn notify_invoice_received(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    recipient: PublicKey,
+    counterparty_share: i64,
+) {
+    match Order::by_id(pool, bond.order_id).await {
+        Ok(Some(order)) => {
+            enqueue_payout_ack(
+                &order,
+                Action::BondInvoiceAccepted,
+                recipient,
+                counterparty_share,
+            )
+            .await;
+        }
+        Ok(None) => warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: order row missing; skipping BondInvoiceAccepted ack"
+        ),
+        Err(e) => warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: order load failed ({e}); skipping BondInvoiceAccepted ack"
+        ),
+    }
+}
+
+/// Phase 3.5 — tell the winner the payout succeeded and the claim is
+/// closed (`Action::BondPayoutCompleted`). Sent after the
+/// `PendingPayout → Slashed` CAS lands. Resolves the recipient the same
+/// way the invoice request does (the non-slashed counterparty).
+/// Best-effort. **Not** sent on the node-only
+/// (`slash_node_share_pct = 1.0`) path — there is no counterparty leg
+/// and the winner was never asked for an invoice.
+async fn notify_payout_completed(pool: &Pool<Sqlite>, bond: &Bond, counterparty_share: i64) {
+    let order = match Order::by_id(pool, bond.order_id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "bond payout: order row missing; skipping BondPayoutCompleted notification"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "bond payout: order load failed ({e}); skipping BondPayoutCompleted notification"
+            );
+            return;
+        }
+    };
+    let reason = match bond
+        .slashed_reason
+        .as_deref()
+        .and_then(|s| BondSlashReason::from_str(s).ok())
+    {
+        Some(r) => r,
+        None => {
+            warn!(
+                bond_id = %bond.id,
+                "bond payout: unparseable slashed_reason {:?}; skipping BondPayoutCompleted notification",
+                bond.slashed_reason
+            );
+            return;
+        }
+    };
+    match resolve_recipient(&order, bond, reason) {
+        Ok(Some(recipient)) => {
+            enqueue_payout_ack(
+                &order,
+                Action::BondPayoutCompleted,
+                recipient,
+                counterparty_share,
+            )
+            .await;
+        }
+        Ok(None) => warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: cannot resolve recipient; skipping BondPayoutCompleted notification"
+        ),
+        Err(e) => warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: recipient resolution failed ({e:?}); skipping BondPayoutCompleted notification"
+        ),
+    }
 }
 
 // ── Inbound action handler ──────────────────────────────────────────────
@@ -920,7 +1071,6 @@ pub async fn add_bond_invoice_action(
                 sender = %sender,
                 "bond payout: invoice accepted; awaiting scheduler tick for payout"
             );
-            Ok(())
         }
         InvoiceApplyOutcome::Resurrected => {
             info!(
@@ -929,10 +1079,18 @@ pub async fn add_bond_invoice_action(
                 sender = %sender,
                 "bond payout: Failed -> PendingPayout (user submitted fresh invoice within claim window); payout_attempts reset, awaiting scheduler tick for payout"
             );
-            Ok(())
         }
-        InvoiceApplyOutcome::Rejected => Err(MostroCantDo(CantDoReason::NotAllowedByStatus)),
+        InvoiceApplyOutcome::Rejected => {
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
     }
+
+    // Phase 3.5: acknowledge receipt to the winner (best-effort) so the
+    // client marks the invoice as received and stops prompting the user
+    // for another one. The bolt11 is already persisted at this point;
+    // a failed ack never affects the payout.
+    notify_invoice_received(pool, &bond, sender, counterparty_share).await;
+    Ok(())
 }
 
 /// Persist `invoice` onto `bond` via one of two state-specific CAS
@@ -2032,5 +2190,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.0, BondState::Slashed.to_string());
+    }
+
+    /// Recipient pubkeys (hex) of queued messages matching `order_id` +
+    /// `action`. Lets a test assert both the count and the destination
+    /// of Phase 3.5 acks against the global `MESSAGE_QUEUES`.
+    async fn ack_recipients(order_id: Uuid, action: Action) -> Vec<String> {
+        use crate::config::MESSAGE_QUEUES;
+        MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| {
+                let k = m.get_inner_message_kind();
+                k.id == Some(order_id) && k.action == action
+            })
+            .map(|(_, pk)| pk.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn notify_invoice_received_acks_submitter() {
+        // Phase 3.5: when the winner's payout bolt11 is accepted, an
+        // `Action::BondInvoiceAccepted` is enqueued back to the
+        // submitter so their client stops prompting for an invoice.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let recipient = PublicKey::from_str(maker_pk()).unwrap();
+        let before = ack_recipients(order_id, Action::BondInvoiceAccepted)
+            .await
+            .len();
+        notify_invoice_received(&pool, &bond, recipient, 5_000).await;
+        let after = ack_recipients(order_id, Action::BondInvoiceAccepted).await;
+
+        assert_eq!(after.len() - before, 1);
+        assert!(after.contains(&maker_pk().to_string()));
+    }
+
+    #[tokio::test]
+    async fn notify_payout_completed_acks_counterparty() {
+        // Phase 3.5: after the payout settles, the non-slashed
+        // counterparty (here the seller/maker, since the bond is on the
+        // buyer/taker of a sell order) receives BondPayoutCompleted.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = ack_recipients(order_id, Action::BondPayoutCompleted)
+            .await
+            .len();
+        notify_payout_completed(&pool, &bond, 5_000).await;
+        let after = ack_recipients(order_id, Action::BondPayoutCompleted).await;
+
+        assert_eq!(after.len() - before, 1);
+        assert!(after.contains(&maker_pk().to_string()));
+    }
+
+    #[tokio::test]
+    async fn slash_after_success_notifies_winner() {
+        // The success CAS that flips PendingPayout -> Slashed also
+        // enqueues exactly one BondPayoutCompleted to the counterparty.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            Some("lnbc1pPAID"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = ack_recipients(order_id, Action::BondPayoutCompleted)
+            .await
+            .len();
+        slash_after_success(&pool, &bond, 5_000).await.unwrap();
+        let after = ack_recipients(order_id, Action::BondPayoutCompleted).await;
+
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state.0, BondState::Slashed.to_string());
+        assert_eq!(after.len() - before, 1);
+        assert!(after.contains(&maker_pk().to_string()));
+    }
+
+    #[tokio::test]
+    async fn finalize_node_only_does_not_notify_winner() {
+        // slash_node_share_pct = 1.0: the whole bond is the node share,
+        // there is no counterparty leg, and the winner was never asked
+        // for an invoice — so no BondPayoutCompleted must be sent.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        // node_share == amount → counterparty share is 0.
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 10_000, now, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = ack_recipients(order_id, Action::BondPayoutCompleted)
+            .await
+            .len();
+        finalize_node_only(&pool, &bond).await.unwrap();
+        let after = ack_recipients(order_id, Action::BondPayoutCompleted).await;
+
+        let state: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state.0, BondState::Slashed.to_string());
+        assert_eq!(after.len(), before); // no new notification
     }
 }

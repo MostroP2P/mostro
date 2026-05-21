@@ -1374,8 +1374,8 @@ explicit refusal message.
 
 ### 8.5.1 Scope
 
-- **Two additive `Action` variants in `mostro-core`** (target a future
-  release, e.g. 0.11.4 — not yet shipped). Both are Mostro → winner and
+- **Two additive `Action` variants in `mostro-core`** (released in
+  0.11.4). Both are Mostro → winner and
   carry `Payload::Order` (the same `SmallOrder` shape the client already
   renders for other order-bearing actions), so older clients that ignore
   unknown actions degrade gracefully:
@@ -1833,8 +1833,8 @@ these requires a compatibility statement:
   must land together. `MessageKind::verify` accepts this variant only
   on `Action::AddBondInvoice`.
 - `Action::BondInvoiceAccepted` + `Action::BondPayoutCompleted` in
-  mostro-core (Phase 3.5). **Not yet released** — target a future minor
-  (e.g. 0.11.4). Mostro → winner acknowledgements (payout-invoice
+  mostro-core (Phase 3.5). **Released in `mostro-core` 0.11.4.** Mostro →
+  winner acknowledgements (payout-invoice
   receipt and terminal payout success); duals of the existing
   `Action::BuyerInvoiceAccepted` / `Action::PurchaseCompleted`. Both are
   serde-additive and carry `Payload::Order`, so a client that doesn't

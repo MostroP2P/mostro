@@ -57,7 +57,7 @@ pub async fn take_buy_action(
     //      committed; reject with `PendingOrderExists`.
     //   2. The sender's own pubkey already has a `Requested` bond on
     //      this order → idempotent retry: re-send the same
-    //      `PayInvoice` DM and return.
+    //      `PayInvoice` message and return.
     //   3. Otherwise fall through and create a fresh bond row.
     // We do *not* mutate the order's taker fields under the bond
     // path; that context lives on the bond row's `taker_*` columns

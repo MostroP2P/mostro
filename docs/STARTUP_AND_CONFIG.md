@@ -165,7 +165,7 @@ pub static MESSAGE_QUEUES: LazyLock<MessageQueues> =
     LazyLock::new(MessageQueues::default);
 ```
 
-(`MessageQueues` holds `Arc<RwLock<…>>` queues for order DMs, cant-do messages, rating events, and restore-session messages.)
+(`MessageQueues` holds `Arc<RwLock<…>>` queues for order messages, cant-do messages, rating events, and restore-session messages.)
 
 There is **no** database password or separate global for SQLite; the daemon opens the file URL from `[database]` in `settings.toml` only.
 

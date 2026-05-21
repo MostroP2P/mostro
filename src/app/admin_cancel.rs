@@ -216,10 +216,17 @@ pub async fn admin_cancel_action(
     // (release-by-default when absent). The buyer/seller pubkeys on
     // the order row are immutable through the dispute cycle, so the
     // original `order` snapshot is the right context for resolving
-    // sides to bonds. The Lightning payout side is Phase 3.
-    if let Err(e) =
-        bond::apply_bond_resolution(pool, &order, &bond_resolution, BondSlashReason::LostDispute)
-            .await
+    // sides to bonds. Slashed bonds have their hold invoices settled
+    // immediately; the recipient payout to the winning counterparty
+    // is still Phase 3's job.
+    if let Err(e) = bond::apply_bond_resolution(
+        pool,
+        ln_client,
+        &order,
+        &bond_resolution,
+        BondSlashReason::LostDispute,
+    )
+    .await
     {
         tracing::warn!(
             order_id = %order.id,

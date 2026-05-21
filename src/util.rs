@@ -526,7 +526,7 @@ pub async fn send_dm(
     .await?;
 
     info!(
-        "Sending DM, Event ID: {} to {} with payload: {:#?}",
+        "Sending message, Event ID: {} to {} with payload: {:#?}",
         event.id,
         receiver_pubkey.to_hex(),
         payload

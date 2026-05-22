@@ -9,12 +9,17 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct YadioResponse {
+    // Yadio reports `null` for currencies it currently has no rate for
+    // (observed: `"BGN": null`). A strict `HashMap<String, f64>` makes serde
+    // reject the *entire* response on the first null, taking every currency
+    // down with it. Parse leniently as `Option<f64>` and drop the bad
+    // entries in `update_prices`.
     #[serde(rename = "BTC")]
-    btc: HashMap<String, f64>,
+    btc: HashMap<String, Option<f64>>,
 }
 
 static BITCOIN_PRICES: Lazy<RwLock<HashMap<String, f64>>> =
@@ -35,13 +40,31 @@ impl BitcoinPriceManager {
             .json()
             .await
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+        // Keep only currencies with a usable rate: drop `null` (currencies
+        // Yadio has no price for) and any non-finite / non-positive value.
+        let rates_clone: HashMap<String, f64> = yadio_response
+            .btc
+            .into_iter()
+            .filter_map(|(code, value)| match value {
+                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
+                _ => None,
+            })
+            .collect();
+
+        // A response with zero usable rates (everything null/invalid, or an
+        // empty BTC object) must NOT overwrite the cache — that would turn a
+        // transient provider hiccup into total price unavailability for every
+        // currency. Keep the last known prices and try again next tick.
+        if rates_clone.is_empty() {
+            warn!("Yadio returned no usable BTC rates; keeping previously cached prices");
+            return Ok(());
+        }
+
         info!(
             "Bitcoin prices updated. Got BTC price in {} fiat currencies",
-            yadio_response.btc.keys().collect::<Vec<&String>>().len()
+            rates_clone.len()
         );
-
-        // Clone rates before acquiring lock to avoid holding it across await
-        let rates_clone = yadio_response.btc.clone();
 
         {
             let mut prices_write = BITCOIN_PRICES
@@ -201,10 +224,64 @@ mod tests {
         assert!(result.is_ok());
 
         let response = result.unwrap();
-        assert_eq!(response.btc.get("USD"), Some(&50000.0));
-        assert_eq!(response.btc.get("EUR"), Some(&45000.0));
-        assert_eq!(response.btc.get("GBP"), Some(&40000.0));
+        assert_eq!(response.btc.get("USD"), Some(&Some(50000.0)));
+        assert_eq!(response.btc.get("EUR"), Some(&Some(45000.0)));
+        assert_eq!(response.btc.get("GBP"), Some(&Some(40000.0)));
         assert_eq!(response.btc.len(), 3);
+    }
+
+    #[test]
+    fn test_yadio_response_with_null_rate_is_parsed_and_filtered() {
+        // Regression: Yadio now returns `null` for currencies it has no rate
+        // for (e.g. "BGN": null). The lenient `Option<f64>` parse must accept
+        // the whole payload, and the same filter `update_prices` applies must
+        // drop the null while keeping the good currencies.
+        let json_response = r#"
+        {
+            "BTC": { "USD": 75899.55, "EUR": 65393.99, "BGN": null },
+            "base": "BTC",
+            "timestamp": 1779480604069
+        }
+        "#;
+
+        let response: YadioResponse = serde_json::from_str(json_response).expect("must parse");
+        assert_eq!(response.btc.get("BGN"), Some(&None));
+
+        let rates: HashMap<String, f64> = response
+            .btc
+            .into_iter()
+            .filter_map(|(code, value)| match value {
+                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rates.len(), 2, "null BGN must be dropped");
+        assert_eq!(rates.get("USD"), Some(&75899.55));
+        assert_eq!(rates.get("EUR"), Some(&65393.99));
+        assert!(!rates.contains_key("BGN"));
+    }
+
+    #[test]
+    fn test_yadio_response_all_null_filters_to_empty() {
+        // When every rate is null/invalid the payload still parses, but the
+        // filter yields an empty map — the condition under which
+        // `update_prices` preserves the previously cached prices instead of
+        // overwriting them with nothing.
+        let json_response = r#"{ "BTC": { "BGN": null, "ZZZ": null }, "base": "BTC" }"#;
+        let response: YadioResponse = serde_json::from_str(json_response).expect("must parse");
+        let rates: HashMap<String, f64> = response
+            .btc
+            .into_iter()
+            .filter_map(|(code, value)| match value {
+                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rates.is_empty(),
+            "all-null response must filter to an empty rate set"
+        );
     }
 
     #[test]

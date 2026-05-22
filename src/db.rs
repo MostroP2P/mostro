@@ -1002,6 +1002,31 @@ pub async fn solver_has_write_permission(
     Ok(result)
 }
 
+/// Ensures the caller may finalize a dispute (`admin-settle` / `admin-cancel`).
+///
+/// Requires the caller to be the assigned solver (`is_assigned_solver`). The
+/// Mostro daemon identity (`caller_pubkey == admin_pubkey`) then bypasses solver
+/// category checks, matching `admin_take_dispute`. Human solvers must also have
+/// read-write permission on the assigned dispute.
+pub async fn ensure_dispute_finalize_permission(
+    pool: &SqlitePool,
+    caller_pubkey: &str,
+    admin_pubkey: &str,
+    order_id: Uuid,
+) -> Result<(), MostroError> {
+    if !is_assigned_solver(pool, caller_pubkey, order_id).await? {
+        return Err(MostroCantDo(CantDoReason::IsNotYourDispute));
+    }
+    if caller_pubkey == admin_pubkey {
+        return Ok(());
+    }
+    if solver_has_write_permission(pool, caller_pubkey, order_id).await? {
+        Ok(())
+    } else {
+        Err(MostroCantDo(CantDoReason::NotAuthorized))
+    }
+}
+
 /// Returns true when `pubkey` corresponds to a solver user with read-write
 /// permission (`users.is_solver = true` and `users.category = 2`), independent
 /// of any dispute assignment. Use this when the caller is a prospective taker
@@ -1248,6 +1273,8 @@ impl RestoreSessionManager {
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
+    use mostro_core::error::CantDoReason;
+    use mostro_core::prelude::MostroError;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use sqlx::Error;
     use std::collections::HashSet;
@@ -1904,7 +1931,92 @@ mod tests {
             .unwrap();
     }
 
+    async fn setup_finalize_permission_db() -> Result<SqlitePool, Error> {
+        let pool = setup_users_db().await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS disputes (
+                id char(36) primary key not null,
+                order_id char(36) unique not null,
+                status varchar(10) not null,
+                order_previous_status varchar(10) not null,
+                solver_pubkey char(64),
+                created_at integer not null,
+                taken_at integer default 0
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+        Ok(pool)
+    }
+
+    async fn insert_assigned_dispute(pool: &SqlitePool, order_id: uuid::Uuid, solver_pubkey: &str) {
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at)
+             VALUES (?1, ?2, 'in-progress', 'dispute', ?3, 1700000000)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(order_id)
+        .bind(solver_pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_read_only_solver(pool: &SqlitePool, pubkey: &str) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, is_solver, category, created_at) VALUES (?1, 1, 1, 1700000000)",
+        )
+        .bind(pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     const VALID_PUBKEY: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const DAEMON_PUBKEY: &str = "b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const HUMAN_SOLVER_PUBKEY: &str =
+        "c1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    #[tokio::test]
+    async fn ensure_dispute_finalize_permission_daemon_without_user_row() {
+        let pool = setup_finalize_permission_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_assigned_dispute(&pool, order_id, DAEMON_PUBKEY).await;
+
+        let result = super::ensure_dispute_finalize_permission(
+            &pool,
+            DAEMON_PUBKEY,
+            DAEMON_PUBKEY,
+            order_id,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "assigned daemon must finalize without a users row"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_dispute_finalize_permission_human_solver_denied() {
+        let pool = setup_finalize_permission_db().await.unwrap();
+        let order_id = uuid::Uuid::new_v4();
+        insert_read_only_solver(&pool, HUMAN_SOLVER_PUBKEY).await;
+        insert_assigned_dispute(&pool, order_id, HUMAN_SOLVER_PUBKEY).await;
+
+        let result = super::ensure_dispute_finalize_permission(
+            &pool,
+            HUMAN_SOLVER_PUBKEY,
+            DAEMON_PUBKEY,
+            order_id,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroError::MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+    }
 
     #[tokio::test]
     async fn test_update_user_trade_index_valid() {

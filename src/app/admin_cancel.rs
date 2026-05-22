@@ -4,8 +4,8 @@ use std::str::FromStr;
 use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
 use crate::db::{
-    find_dispute_by_order_id, is_assigned_solver, is_dispute_taken_by_admin,
-    solver_has_write_permission,
+    ensure_dispute_finalize_permission, find_dispute_by_order_id, is_assigned_solver,
+    is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
@@ -75,9 +75,13 @@ pub async fn admin_cancel_action(
         _ => {}
     }
 
-    if !solver_has_write_permission(pool, &event.identity.to_string(), order.id).await? {
-        return Err(MostroCantDo(CantDoReason::NotAuthorized));
-    }
+    ensure_dispute_finalize_permission(
+        pool,
+        &event.identity.to_string(),
+        &my_keys.public_key().to_string(),
+        order.id,
+    )
+    .await?;
 
     // Was order cooperatively cancelled?
     if order.check_status(Status::CooperativelyCanceled).is_ok() {

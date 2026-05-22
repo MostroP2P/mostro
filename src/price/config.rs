@@ -109,6 +109,15 @@ impl PriceSettings {
                 self.update_interval_seconds
             ));
         }
+        // A non-positive TTL would make `now - as_of <= ttl` never hold, so
+        // every stored price reads as `TooStale` — silently disabling all
+        // price lookups once this is wired into reads (Phase 4).
+        if self.max_price_staleness_seconds <= 0 {
+            return Err(format!(
+                "price: max_price_staleness_seconds must be > 0, got {}",
+                self.max_price_staleness_seconds
+            ));
+        }
         if !(self.outlier_threshold_pct.is_finite()
             && self.outlier_threshold_pct > 0.0
             && self.outlier_threshold_pct <= 100.0)
@@ -262,6 +271,19 @@ only = ["CUP", "MLC"]
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn non_positive_staleness_is_rejected() {
+        let with_ttl = |ttl: i64| PriceSettings {
+            max_price_staleness_seconds: ttl,
+            ..Default::default()
+        };
+        // Negative TTL → every price would read as TooStale.
+        assert!(with_ttl(-1).validate().is_err());
+        // Zero TTL is equally broken (stale the instant after it is written).
+        assert!(with_ttl(0).validate().is_err());
+        with_ttl(1800).validate().unwrap();
     }
 
     #[test]

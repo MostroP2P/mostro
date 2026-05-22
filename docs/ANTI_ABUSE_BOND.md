@@ -190,7 +190,7 @@ slash path.
 | 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | pending |
 | 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | pending |
 | 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | proposed |
-| 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) | 3 | pending |
+| 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (mostro-core 0.11.5) |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |
 | 7 | Timeout slash for maker bond | 5 | pending |
@@ -1516,6 +1516,17 @@ adding maker bond rows to the lookup.
 
 ### 9.3 Scope
 
+**Implemented (as shipped):** the timeout-slash dispatch lives in
+`bond::slash_or_release_on_timeout` (`src/app/bond/slash.rs`), called
+from `scheduler::job_cancel_orders` in the persist-success branch that
+previously did an unconditional Phase 1 release. It reuses the Phase 2
+`apply_bond_resolution` primitive, deriving a `BondResolution` from the
+§9.2 responsibility table; the §3.1 buyer/seller → bond mapping baked
+into that primitive resolves the responsible party's bond row. The bond
+config is passed in (the scheduler hands it `Settings::get_bond()`)
+rather than read from the global, so the gate is unit-testable. The
+slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
+
 - Modify `scheduler::job_cancel_orders`: when the waiting-state timeout
   elapses on an order in `WaitingBuyerInvoice` / `WaitingPayment`, run
   the §9.2 lookup. If a bond exists for the responsible party, reuse
@@ -1528,7 +1539,17 @@ adding maker bond rows to the lookup.
   §8.1: `slashed_reason = Timeout` plus the §9.2 responsibility entry
   uniquely names the non-slashed counterparty (`WaitingBuyerInvoice`
   → seller; `WaitingPayment` → buyer).
-- Localised message to the slashed user explaining forfeiture.
+- Localised forfeiture notice to the slashed user via the dedicated
+  `Action::BondSlashed` (mostro-core 0.11.5; Mostro → slashed user,
+  `Payload::Order` with `amount` = the slashed bond amount). It carries
+  no human-readable text — the client renders the forfeiture message in
+  the user's locale. The notice is **best-effort and complements** the
+  `Action::Canceled` the slashed user already receives for the order; a
+  dropped notice never rolls back the slash. It is sent **only after the
+  slash is confirmed to have landed** (the bond row re-reads as
+  `PendingPayout`), so a transient `settle_hold_invoice` failure — which
+  leaves the bond `Locked` for retry — can never produce a false "your
+  bond was slashed" message.
 - Tests:
   - "Cancel at minute 5 of a 15-minute timeout" → bond released, no
     slash.
@@ -1842,6 +1863,19 @@ these requires a compatibility statement:
   confirmation — no funds at risk. No new `CantDoReason` is needed: the
   "already paid / in progress" refusals reuse
   `CantDoReason::NotAllowedByStatus`.
+- `Action::BondSlashed` in mostro-core (Phase 4). **Released in
+  `mostro-core` 0.11.5.** Mostro → slashed-user forfeiture notice for a
+  waiting-state timeout slash; carries `Payload::Order` (`amount` = the
+  slashed bond amount). Earlier drafts of this spec assumed Phase 4 was
+  daemon-only with no protocol change and reused the existing
+  `Action::Canceled`; the dedicated action was added so the slashed
+  user's client can render an explicit, localised forfeiture message
+  rather than inferring it. Serde-additive: a client that doesn't know
+  the variant ignores the message and falls back to the
+  `Action::Canceled` it already receives for the order — no funds at
+  risk. `MessageKind::verify` accepts it like the other Mostro → user
+  notifications (id required; `BondResolution` / `BondPayoutRequest`
+  payloads rejected). No new `CantDoReason` is needed.
 - `Status::WaitingMakerBond` (Phase 5). Not yet shipped upstream;
   needs a follow-up `mostro-core` minor release before Phase 5 can
   land here.

@@ -425,16 +425,39 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // net.
                             match order_updated.update(pool).await {
                                 Ok(_) => {
-                                    // Phase 1: scheduler-driven cancels
-                                    // (waiting-state timeouts) always
-                                    // release the bond. Slashing on
-                                    // timeout lands in Phase 4.
-                                    bond::release_bonds_for_order_or_warn(
+                                    // Phase 4: a waiting-state timeout may
+                                    // slash the responsible party's bond
+                                    // (gated by `slash_on_waiting_timeout`
+                                    // + `apply_to`). The dispatch reuses
+                                    // the Phase 2 slash primitive (settle
+                                    // the bond HTLC + CAS to
+                                    // PendingPayout(Timeout)) and releases
+                                    // every other bond; when no slash
+                                    // applies it falls back to releasing
+                                    // all bonds, exactly as Phase 1 did.
+                                    // `order` is the pre-cancel snapshot —
+                                    // its waiting status and trade pubkeys
+                                    // are intact, which the §3.1
+                                    // buyer/seller → bond mapping needs.
+                                    match bond::slash_or_release_on_timeout(
                                         pool,
-                                        order_id,
-                                        "scheduler_timeout",
+                                        &mut ln_client,
+                                        &order,
+                                        Settings::get_bond(),
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        Ok(Some(slashed)) => {
+                                            bond::notify_bond_slashed(&order, &slashed).await;
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "scheduler_timeout: bond slash/release failed for {} ({})",
+                                                order_id, e
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(

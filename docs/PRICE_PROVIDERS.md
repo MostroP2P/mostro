@@ -99,7 +99,7 @@ Confirmed with the maintainer before writing this spec:
 
 ### 5.1 Module layout
 
-```
+```text
 src/price/
   mod.rs            -- PriceManager: public API + scheduler entry point
   provider.rs       -- PriceProvider trait, Quote, ProviderId, health/circuit-breaker
@@ -160,7 +160,7 @@ pub trait PriceProvider: Send + Sync {
 
 ### 5.3 The aggregation pipeline (one scheduler tick)
 
-```
+```text
                  ┌─ yadio.fetch()    ─┐  (PerBtc)
 poll all healthy ├─ coingecko.fetch()─┤  (PerBtc)   each with per-provider
 providers, in    └─ eltoque.fetch()  ─┘  (PerBase)  timeout + circuit breaker

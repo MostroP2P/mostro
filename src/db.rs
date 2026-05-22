@@ -1002,6 +1002,29 @@ pub async fn solver_has_write_permission(
     Ok(result)
 }
 
+/// Ensures the caller may finalize a dispute (`admin-settle` / `admin-cancel`).
+///
+/// The Mostro daemon identity (`caller_pubkey == admin_pubkey`) bypasses solver
+/// category checks, matching `admin_take_dispute`. Human solvers must have
+/// read-write permission on the assigned dispute.
+///
+/// Callers must already have passed `is_assigned_solver`.
+pub async fn ensure_dispute_finalize_permission(
+    pool: &SqlitePool,
+    caller_pubkey: &str,
+    admin_pubkey: &str,
+    order_id: Uuid,
+) -> Result<(), MostroError> {
+    if caller_pubkey == admin_pubkey {
+        return Ok(());
+    }
+    if solver_has_write_permission(pool, caller_pubkey, order_id).await? {
+        Ok(())
+    } else {
+        Err(MostroCantDo(CantDoReason::NotAuthorized))
+    }
+}
+
 /// Returns true when `pubkey` corresponds to a solver user with read-write
 /// permission (`users.is_solver = true` and `users.category = 2`), independent
 /// of any dispute assignment. Use this when the caller is a prospective taker

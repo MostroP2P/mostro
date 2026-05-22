@@ -63,12 +63,10 @@ impl AdminServiceImpl {
 
         // Admin RPC flows synthesize the inbound event with the node's own
         // pubkey in both `identity` and `sender` slots. Authorization is then
-        // enforced downstream by the handlers, which check `event.identity`
-        // against `is_assigned_solver` / `solver_has_write_permission` (and
-        // for cancel/settle, fall back to `is_dispute_taken_by_admin`). For
-        // these flows to succeed, the operator must register the daemon's own
-        // pubkey as an admin/solver with write permission. Authentication of
-        // the gRPC caller itself happens at the transport layer, not here.
+        // enforced downstream: the caller must be the assigned solver
+        // (`is_assigned_solver`), with `ensure_dispute_finalize_permission`
+        // bypassing solver category checks for the daemon key (same as
+        // `admin_take_dispute`). gRPC transport authenticates the operator.
         let event = UnwrappedMessage {
             message: msg.clone(),
             signature: None,

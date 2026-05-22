@@ -3,6 +3,7 @@ use crate::config::types::{
     AntiAbuseBondSettings, DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings,
     NostrSettings, RpcSettings,
 };
+use crate::price::PriceSettings;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -24,6 +25,11 @@ pub struct Settings {
     /// Anti-abuse bond configuration (issue #711). Absent section ≡ disabled.
     #[serde(default)]
     pub anti_abuse_bond: Option<AntiAbuseBondSettings>,
+    /// Multi-source price configuration (see `docs/PRICE_PROVIDERS.md`).
+    /// Absent section ≡ legacy single-source behaviour (synthesised in
+    /// Phase 1's migration).
+    #[serde(default)]
+    pub price: Option<PriceSettings>,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -91,6 +97,16 @@ impl Settings {
     /// configuration.
     pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
+    }
+
+    /// Retrieve the multi-source price configuration from the global
+    /// `MOSTRO_CONFIG`. Returns `None` when the `[price]` block is absent
+    /// (Phase 1 synthesises a legacy default in that case) and also when the
+    /// global settings haven't been initialized yet, so it never panics on
+    /// the price hot path or in unit tests that don't bring up the full
+    /// configuration — mirroring [`Settings::get_bond`].
+    pub fn get_price() -> Option<&'static PriceSettings> {
+        MOSTRO_CONFIG.get()?.price.as_ref()
     }
 
     /// True when the feature is configured AND explicitly enabled. This is

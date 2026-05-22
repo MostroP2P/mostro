@@ -199,6 +199,7 @@ mod tests {
             rpc: RpcSettings::default(),
             expiration: None,
             anti_abuse_bond: None,
+            price: None,
         }
     }
 

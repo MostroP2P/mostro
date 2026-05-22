@@ -277,12 +277,15 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
 /// so it is **not** gated on the current feature flag.
 ///
 /// Returns `Ok(Some(bond))` with the slashed bond row when a timeout
-/// slash actually landed (HTLC settled + row in `PendingPayout`), so the
-/// caller can notify the slashed user; `Ok(None)` otherwise. The slash is
-/// confirmed by re-reading the row: [`apply_bond_resolution`] is
-/// best-effort and leaves the bond `Locked` on a transient settle
-/// failure, so a `Some` return guarantees the bond was really forfeited
-/// and the notice is truthful.
+/// slash actually landed, so the caller can notify the slashed user;
+/// `Ok(None)` otherwise. The slash is confirmed by re-reading the row's
+/// durable `slashed_reason = Timeout` metadata (see
+/// [`timeout_slash_confirmed`]) rather than a transient
+/// `state = PendingPayout` check — the concurrent payout scheduler can
+/// move a just-slashed row onward within the confirmation window.
+/// [`apply_bond_resolution`] is best-effort and leaves the bond `Locked`
+/// (no slash metadata) on a transient settle failure, so a `Some` return
+/// guarantees the bond was really forfeited and the notice is truthful.
 ///
 /// `order` MUST carry the pre-cancel waiting status and the trade
 /// pubkeys; call this from the persist-success branch that replaces the
@@ -356,7 +359,7 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
     // settle failure leaves the bond `Locked` (apply_bond_resolution is
     // best-effort), and we must never tell a user their bond was forfeited
     // while the HTLC is still theirs.
-    if bond_is_pending_payout(pool, responsible.id).await? {
+    if timeout_slash_confirmed(pool, responsible.id).await? {
         info!(
             bond_id = %responsible.id,
             order_id = %order.id,
@@ -368,24 +371,45 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
         warn!(
             bond_id = %responsible.id,
             order_id = %order.id,
-            "timeout slash did not land (bond not in PendingPayout); no forfeiture notice sent"
+            "timeout slash did not land (bond still Locked); no forfeiture notice sent"
         );
         Ok(None)
     }
 }
 
-/// Re-read a bond row's state and report whether it reached
-/// `PendingPayout`. Used to confirm a timeout slash truly landed before
-/// notifying the slashed user.
-async fn bond_is_pending_payout(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
-        .bind(bond_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(row
-        .map(|(s,)| s == BondState::PendingPayout.to_string())
-        .unwrap_or(false))
+/// Confirm a timeout slash actually landed on `bond_id`, regardless of
+/// where the concurrent payout scheduler has since moved the row.
+///
+/// The slash CAS in [`slash_one`] writes `slashed_reason = Timeout`
+/// atomically with the `Locked → PendingPayout` transition, and **no**
+/// later transition clears it: the payout job's state changes
+/// (`PendingPayout → Slashed | Forfeited | Failed`, and the
+/// `Failed → PendingPayout` resurrection) only ever rewrite `state`, never
+/// `slashed_reason` / `slashed_at`. So `slashed_reason = Timeout` is a
+/// stable witness that *this* slash succeeded.
+///
+/// A point-in-time `state = PendingPayout` check would be racy: the payout
+/// scheduler runs every 60s and can move a just-slashed row off
+/// `PendingPayout` within the confirmation window (e.g. `finalize_node_only`
+/// flips a node-only slash, `slash_node_share_pct = 1.0`, straight to
+/// `Slashed`). Keying on the durable slash metadata instead means the
+/// forfeiture notice is never lost to that race.
+///
+/// A transient settle failure leaves the bond `Locked` with
+/// `slashed_reason` NULL, so this still returns `false` and no false
+/// forfeiture notice is sent. Dispute slashes write
+/// `slashed_reason = LostDispute`, so a (vanishingly unlikely) concurrent
+/// dispute slash that won the CAS first does not trigger a *timeout*
+/// notice here — the dispute path owns its own messaging.
+async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT slashed_reason FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let timeout = BondSlashReason::Timeout.to_string();
+    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(timeout.as_str()))
 }
 
 /// Phase 4 — best-effort forfeiture notice to the slashed user
@@ -1471,6 +1495,69 @@ mod tests {
             read_bond_state(&pool, bond.id).await,
             BondState::Locked.to_string(),
             "transient settle failure must leave the bond Locked for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_confirmed_survives_concurrent_payout_progression() {
+        // Regression: the payout scheduler runs concurrently (every 60s)
+        // and can move a just-slashed `PendingPayout` row onward — e.g. a
+        // node-only slash flips straight to `Slashed` via
+        // `finalize_node_only` — before the dispatch re-reads it. The
+        // confirmation must key off the durable `slashed_reason = Timeout`
+        // metadata, not the transient `PendingPayout` state, so the
+        // forfeiture notice is never lost to that race. Every post-slash
+        // state must confirm.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+
+        for state in [
+            BondState::PendingPayout,
+            BondState::Slashed,
+            BondState::Forfeited,
+            BondState::Failed,
+        ] {
+            let bond = insert_bond(&pool, order.id, taker_pk(), state).await;
+            // Stamp the timeout slash metadata that `slash_one` writes
+            // atomically with the Locked → PendingPayout CAS.
+            sqlx::query("UPDATE bonds SET slashed_reason = ? WHERE id = ?")
+                .bind(BondSlashReason::Timeout.to_string())
+                .bind(bond.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                timeout_slash_confirmed(&pool, bond.id).await.unwrap(),
+                "post-slash state {state:?} with slashed_reason=Timeout must confirm the slash"
+            );
+        }
+
+        // A still-Locked bond (transient settle failure) carries no slash
+        // metadata and must NOT confirm — no false forfeiture notice.
+        let locked = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        assert!(
+            !timeout_slash_confirmed(&pool, locked.id).await.unwrap(),
+            "a Locked bond with no slash metadata must not confirm"
+        );
+
+        // A dispute slash (LostDispute) must not be mistaken for a timeout
+        // slash, so the timeout notice is not sent for it.
+        let dispute = insert_bond(&pool, order.id, taker_pk(), BondState::PendingPayout).await;
+        sqlx::query("UPDATE bonds SET slashed_reason = ? WHERE id = ?")
+            .bind(BondSlashReason::LostDispute.to_string())
+            .bind(dispute.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !timeout_slash_confirmed(&pool, dispute.id).await.unwrap(),
+            "a LostDispute slash must not confirm as a timeout slash"
         );
     }
 

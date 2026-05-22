@@ -1546,10 +1546,14 @@ slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
   the user's locale. The notice is **best-effort and complements** the
   `Action::Canceled` the slashed user already receives for the order; a
   dropped notice never rolls back the slash. It is sent **only after the
-  slash is confirmed to have landed** (the bond row re-reads as
-  `PendingPayout`), so a transient `settle_hold_invoice` failure — which
-  leaves the bond `Locked` for retry — can never produce a false "your
-  bond was slashed" message.
+  slash is confirmed to have landed** — confirmed via the bond row's
+  durable `slashed_reason = Timeout` metadata (which the concurrent
+  Phase 3 payout scheduler never clears as it moves the row
+  `PendingPayout → Slashed | Forfeited | Failed`), not a transient
+  `state = PendingPayout` check that the scheduler could invalidate
+  within the race window. A transient `settle_hold_invoice` failure
+  leaves the bond `Locked` with no slash metadata, so it can never
+  produce a false "your bond was slashed" message.
 - Tests:
   - "Cancel at minute 5 of a 15-minute timeout" → bond released, no
     slash.

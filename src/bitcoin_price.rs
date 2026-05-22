@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct YadioResponse {
@@ -51,6 +51,15 @@ impl BitcoinPriceManager {
                 _ => None,
             })
             .collect();
+
+        // A response with zero usable rates (everything null/invalid, or an
+        // empty BTC object) must NOT overwrite the cache — that would turn a
+        // transient provider hiccup into total price unavailability for every
+        // currency. Keep the last known prices and try again next tick.
+        if rates_clone.is_empty() {
+            warn!("Yadio returned no usable BTC rates; keeping previously cached prices");
+            return Ok(());
+        }
 
         info!(
             "Bitcoin prices updated. Got BTC price in {} fiat currencies",
@@ -251,6 +260,28 @@ mod tests {
         assert_eq!(rates.get("USD"), Some(&75899.55));
         assert_eq!(rates.get("EUR"), Some(&65393.99));
         assert!(!rates.contains_key("BGN"));
+    }
+
+    #[test]
+    fn test_yadio_response_all_null_filters_to_empty() {
+        // When every rate is null/invalid the payload still parses, but the
+        // filter yields an empty map — the condition under which
+        // `update_prices` preserves the previously cached prices instead of
+        // overwriting them with nothing.
+        let json_response = r#"{ "BTC": { "BGN": null, "ZZZ": null }, "base": "BTC" }"#;
+        let response: YadioResponse = serde_json::from_str(json_response).expect("must parse");
+        let rates: HashMap<String, f64> = response
+            .btc
+            .into_iter()
+            .filter_map(|(code, value)| match value {
+                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rates.is_empty(),
+            "all-null response must filter to an empty rate set"
+        );
     }
 
     #[test]

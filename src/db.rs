@@ -1991,7 +1991,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "assigned daemon must finalize without a users row");
+        assert!(
+            result.is_ok(),
+            "assigned daemon must finalize without a users row"
+        );
     }
 
     #[tokio::test]

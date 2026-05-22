@@ -77,6 +77,11 @@ impl ProviderConfig {
                 "price provider '{id}': `only` and `except` are mutually exclusive"
             ));
         }
+        if self.enabled && self.url.trim().is_empty() {
+            return Err(format!(
+                "price provider '{id}': enabled provider must have a non-empty `url`"
+            ));
+        }
         Ok(())
     }
 
@@ -98,6 +103,12 @@ impl PriceSettings {
     /// Validate the whole `[price]` block: the outlier threshold must be a
     /// sane positive percentage, and every provider must validate.
     pub fn validate(&self) -> Result<(), String> {
+        if self.update_interval_seconds == 0 {
+            return Err(format!(
+                "price: update_interval_seconds must be > 0, got {}",
+                self.update_interval_seconds
+            ));
+        }
         if !(self.outlier_threshold_pct.is_finite()
             && self.outlier_threshold_pct > 0.0
             && self.outlier_threshold_pct <= 100.0)
@@ -242,6 +253,35 @@ only = ["CUP", "MLC"]
         assert!(with_pct(0.0).validate().is_err());
         assert!(with_pct(150.0).validate().is_err());
         with_pct(5.0).validate().unwrap();
+    }
+
+    #[test]
+    fn zero_update_interval_is_rejected() {
+        let cfg = PriceSettings {
+            update_interval_seconds: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_provider_with_blank_url_is_rejected() {
+        let blank = ProviderConfig {
+            enabled: true,
+            url: "  ".into(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+        };
+        assert!(blank.validate("yadio").is_err());
+        // A disabled provider with a blank url is allowed (inert).
+        let disabled = ProviderConfig {
+            enabled: false,
+            ..blank.clone()
+        };
+        disabled.validate("yadio").unwrap();
     }
 
     #[test]

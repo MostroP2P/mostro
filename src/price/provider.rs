@@ -163,7 +163,10 @@ impl ProviderHealth {
         let cooldown = base_cooldown_secs
             .saturating_mul(factor)
             .min(cooldown_cap_secs);
-        self.open_until = Some(now.saturating_add(cooldown as i64));
+        // Clamp the u64 cooldown into i64 so an absurd config cap can't wrap
+        // to a negative offset and push `open_until` into the past.
+        let cooldown = i64::try_from(cooldown).unwrap_or(i64::MAX);
+        self.open_until = Some(now.saturating_add(cooldown));
     }
 }
 

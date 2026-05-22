@@ -24,8 +24,9 @@ pub struct AggregateResult {
 /// - `n == 1` → that value,
 /// - `n == 2` → their mean,
 /// - `n >= 3` → the median, then the mean of the values within
-///   `outlier_pct` percent of that median (the median is always kept, so
-///   the set is non-empty).
+///   `outlier_pct` percent of that median; if nothing falls within the band
+///   (a widely-spread even-length input, where the median is a synthetic
+///   midpoint that matches no value), fall back to the median itself.
 ///
 /// The median anchors the truth; values too far from it are dropped before
 /// the mean, so one corrupt/stale source cannot move the result while
@@ -52,8 +53,16 @@ pub fn combine(xs: &[f64], outlier_pct: f64) -> Option<f64> {
                 .copied()
                 .filter(|x| (x - m).abs() <= tol)
                 .collect();
-            // `kept` always contains the median, so it is non-empty.
-            Some(mean(&kept))
+            // Odd `n`: the median is a member of `clean`, so it is always
+            // kept. Even `n`: the median is the synthetic midpoint of the two
+            // central values and may match nothing (widely-spread / bimodal
+            // input) → `kept` is empty. Fall back to the median rather than
+            // averaging an empty set, which would be NaN.
+            if kept.is_empty() {
+                Some(m)
+            } else {
+                Some(mean(&kept))
+            }
         }
     }
 }
@@ -204,6 +213,15 @@ mod tests {
         approx(combine(&[100.0, 100.0, 105.0], PCT).unwrap(), 305.0 / 3.0);
         // 106 is just past the bound → dropped, mean(100,100) = 100.
         approx(combine(&[100.0, 100.0, 106.0], PCT).unwrap(), 100.0);
+    }
+
+    #[test]
+    fn combine_even_length_no_value_near_median_falls_back_to_median() {
+        // Even n, bimodal: median = (2+100)/2 = 51; tol = 2.55 → nothing in
+        // the band. Must fall back to the median (finite), never NaN.
+        let out = combine(&[1.0, 2.0, 100.0, 101.0], PCT).unwrap();
+        assert!(out.is_finite(), "must not be NaN");
+        approx(out, 51.0);
     }
 
     #[test]

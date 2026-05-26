@@ -1170,14 +1170,14 @@ pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, Most
     let order_msg = msg.get_inner_message_kind();
     let order_id = order_msg
         .id
-        .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
+        .ok_or(MostroCantDo(CantDoReason::NotFound))?;
     let order = Order::by_id(pool, order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     if let Some(order) = order {
         Ok(order)
     } else {
-        Err(MostroInternalErr(ServiceError::InvalidOrderId))
+        Err(MostroCantDo(CantDoReason::NotFound))
     }
 }
 
@@ -1583,6 +1583,65 @@ mod tests {
             .unwrap();
 
         assert!(orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_id_missing() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let message = Message::Order(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_order_absent() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let missing_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(missing_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_order_when_found() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let user_pubkey = "a".repeat(64);
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, Some(&user_pubkey), None, &user_pubkey).await;
+
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let order = get_order(&message, &pool).await.unwrap();
+        assert_eq!(order.id, order_id);
     }
 
     #[test]

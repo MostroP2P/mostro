@@ -1168,9 +1168,7 @@ pub async fn get_dispute(msg: &Message, pool: &Pool<Sqlite>) -> Result<Dispute, 
 
 pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, MostroError> {
     let order_msg = msg.get_inner_message_kind();
-    let order_id = order_msg
-        .id
-        .ok_or(MostroCantDo(CantDoReason::NotFound))?;
+    let order_id = order_msg.id.ok_or(MostroCantDo(CantDoReason::NotFound))?;
     let order = Order::by_id(pool, order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

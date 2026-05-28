@@ -386,10 +386,26 @@ async fn job_cancel_orders(ctx: AppContext) {
                             }
                             Ok(None) => {}
                             Err(e) => {
+                                // `Err` from `slash_or_release_on_timeout` is a DB-read
+                                // failure (e.g. `find_active_bonds_for_order` /
+                                // `timeout_slash_confirmed` couldn't read the bond
+                                // rows), so we don't yet know whether the slash
+                                // applies. Falling through to cancel/republish
+                                // would persist the order out of
+                                // `find_order_by_seconds`'s waiting-state
+                                // eligibility window, and the next tick would
+                                // never re-evaluate it — losing the slash whose
+                                // applicability we couldn't even determine.
+                                // `continue` keeps the order eligible so the
+                                // next tick re-runs the full path (the slash
+                                // primitive is idempotent on a settled HTLC and
+                                // a `PendingPayout` bond, so a retry that
+                                // finds the work already done is a no-op).
                                 tracing::warn!(
-                                    "scheduler_timeout: bond slash/release failed for {} ({}); proceeding with cancel/republish — next tick re-attempts the slash",
+                                    "scheduler_timeout: bond slash/release errored for {} ({}); skipping cancel/republish so next tick retries",
                                     order.id, e
                                 );
+                                continue;
                             }
                         }
 

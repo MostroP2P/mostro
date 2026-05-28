@@ -346,6 +346,53 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 }
                             };
 
+                        // Phase 4: run the bond slash/release **before** any
+                        // DB mutation that takes the order out of
+                        // `find_order_by_seconds`'s
+                        // `status ∈ {WaitingBuyerInvoice, WaitingPayment}`
+                        // eligibility window — both `update_order_to_initial_state`
+                        // (republish path) and `order_updated.update`
+                        // (cancel path) below are such mutations. A
+                        // transient `settle_hold_invoice` failure inside
+                        // `slash_one` leaves the bond `Locked`; with the
+                        // slash gated on persist success (the original
+                        // Phase 4 layout) that means the slash is dropped
+                        // entirely, because the order has already moved
+                        // out of the eligible set and the next tick never
+                        // re-picks it up. Running it here means a
+                        // transient LND hiccup just defers the cancel to
+                        // the next tick, at which point the slash is
+                        // idempotent (HTLC's "already settled" path
+                        // proceeds to a CAS no-op and returns `Ok(None)`,
+                        // so neither the bond nor the user are touched
+                        // twice). The notification fires immediately on
+                        // first success so a later persist failure
+                        // doesn't lose it — by next tick `slash_or_release_on_timeout`
+                        // sees no `Locked` bond and returns `Ok(None)`,
+                        // so the notice never duplicates either.
+                        // `order` is the pre-mutation snapshot — its
+                        // waiting status and trade pubkeys are intact,
+                        // which the §3.1 buyer/seller → bond mapping needs.
+                        match bond::slash_or_release_on_timeout(
+                            pool,
+                            &mut ln_client,
+                            &order,
+                            Settings::get_bond(),
+                        )
+                        .await
+                        {
+                            Ok(Some(slashed)) => {
+                                bond::notify_bond_slashed(&order, &slashed).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    "scheduler_timeout: bond slash/release failed for {} ({}); proceeding with cancel/republish — next tick re-attempts the slash",
+                                    order.id, e
+                                );
+                            }
+                        }
+
                         let (maker_action, new_status, edited_order) =
                             match (order_status, order_kind) {
                                 (Status::WaitingBuyerInvoice, Kind::Sell)
@@ -413,58 +460,18 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 new_status
                             );
                             let order_id = order_updated.id;
-                            // Persist the new status before releasing
-                            // bonds: a release on top of a failed
-                            // persist would leave the order in its
-                            // pre-cancel status while the bond is
-                            // gone, so the next scheduler tick keeps
-                            // re-publishing cancels with no funds to
-                            // refund. Skip release on persist failure
-                            // — the next tick retries persist, and
-                            // the bond's CLTV expiry is the safety
-                            // net.
-                            match order_updated.update(pool).await {
-                                Ok(_) => {
-                                    // Phase 4: a waiting-state timeout may
-                                    // slash the responsible party's bond
-                                    // (gated by `slash_on_waiting_timeout`
-                                    // + `apply_to`). The dispatch reuses
-                                    // the Phase 2 slash primitive (settle
-                                    // the bond HTLC + CAS to
-                                    // PendingPayout(Timeout)) and releases
-                                    // every other bond; when no slash
-                                    // applies it falls back to releasing
-                                    // all bonds, exactly as Phase 1 did.
-                                    // `order` is the pre-cancel snapshot —
-                                    // its waiting status and trade pubkeys
-                                    // are intact, which the §3.1
-                                    // buyer/seller → bond mapping needs.
-                                    match bond::slash_or_release_on_timeout(
-                                        pool,
-                                        &mut ln_client,
-                                        &order,
-                                        Settings::get_bond(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(slashed)) => {
-                                            bond::notify_bond_slashed(&order, &slashed).await;
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "scheduler_timeout: bond slash/release failed for {} ({})",
-                                                order_id, e
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "scheduler_timeout: persist failed for order {} ({}); skipping bond release — will retry next tick",
-                                        order_id, e
-                                    );
-                                }
+                            // Persist the new status. The bond slash/release
+                            // has already run above (before any DB mutation
+                            // that strips eligibility) — on persist failure
+                            // the next tick retries this branch only; the
+                            // slash is durable in `bonds.slashed_reason` and
+                            // a re-entry sees no `Locked` bond, so it is a
+                            // no-op (no duplicate notify).
+                            if let Err(e) = order_updated.update(pool).await {
+                                tracing::warn!(
+                                    "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
+                                    order_id, e
+                                );
                             }
                         }
                     }

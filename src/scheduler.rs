@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
@@ -562,7 +562,33 @@ async fn job_update_bitcoin_prices() {
 
         loop {
             info!("Updating Bitcoin prices");
-            let _report = manager.update_all().await;
+            let report = manager.update_all().await;
+            // PriceManager already logs each provider's outcome per tick.
+            // The scheduler only surfaces the **outage** condition — every
+            // provider failed — because that's the moment ops cares about:
+            // the store is now reading last-known-good across the board.
+            if report.successes.is_empty() && !report.failures.is_empty() {
+                let failed: Vec<String> = report
+                    .failures
+                    .iter()
+                    .map(|(id, msg)| format!("{id}={msg}"))
+                    .collect();
+                error!(
+                    "price: all {} providers failed this tick — serving last-known-good [{}]",
+                    report.failures.len(),
+                    failed.join(", ")
+                );
+            } else if !report.failures.is_empty() {
+                // Partial outage: at least one provider failed but others
+                // covered. A summary at warn is enough; per-provider info
+                // is already in the manager's per-provider logs.
+                warn!(
+                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    report.failures.len(),
+                    report.failures.len() + report.successes.len(),
+                    report.fresh_currencies
+                );
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
         }
     });

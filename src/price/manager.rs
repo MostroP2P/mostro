@@ -18,7 +18,7 @@
 //!   this tick and the store's last-known-good value is preserved (spec
 //!   §6.4). The full circuit breaker integration lands in Phase 2.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -56,16 +56,12 @@ pub struct PriceManager {
     store: Arc<PriceStore>,
     settings: PriceSettings,
     http: reqwest::Client,
-    /// Currencies that have already emitted a "down to one source" / staleness
-    /// warning since process start. Prevents the scheduler tick from spamming
-    /// the log every poll while the condition persists.
-    warned_currencies: RwLock<HashMap<String, WarnReason>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarnReason {
-    Stale,
-    SingleSource,
+    /// One-shot guards for the two transient log conditions (spec §10.4
+    /// asks for transitions, not per-poll spam). Kept as two independent
+    /// sets so a `Stale` flag never clobbers a `SingleSource` flag (and
+    /// vice versa) for the same currency — both can hold simultaneously.
+    warned_stale: RwLock<HashSet<String>>,
+    warned_single_source: RwLock<HashSet<String>>,
 }
 
 impl PriceManager {
@@ -109,7 +105,8 @@ impl PriceManager {
             store: Arc::new(PriceStore::new()),
             settings,
             http,
-            warned_currencies: RwLock::new(HashMap::new()),
+            warned_stale: RwLock::new(HashSet::new()),
+            warned_single_source: RwLock::new(HashSet::new()),
         })
     }
 
@@ -192,10 +189,29 @@ impl PriceManager {
         // [price.providers.<id>]; the Phase 2 §6.6 pipeline glue (fiat
         // allowlist, etc.) layers on top of this. Doing the filter here
         // keeps `aggregate_tick` purely numeric.
-        let filtered: Vec<ProviderQuotes> = quotes_by_provider
+        let filtered_with_ids: Vec<(ProviderId, ProviderQuotes)> = quotes_by_provider
             .into_iter()
-            .map(|(id, quotes)| self.scope_quotes(id, quotes))
+            .map(|(id, quotes)| (id, self.scope_quotes(id, quotes)))
             .collect();
+
+        // Contributors are providers whose **post-scope** quotes still
+        // carry at least one currency — those are the only ids that can
+        // actually move an aggregate this tick (spec §9 Phase 1 calls for
+        // a "contributing-source list" in the Nostr `source` tag, not the
+        // "polled successfully" list, which would include a provider
+        // entirely filtered out by `only`/`except`). Outlier-rejected
+        // individual quotes at the `combine` level are not subtracted
+        // here: it would require pairing every Quote with a ProviderId
+        // through `aggregate_tick`, which is an invasive change to a
+        // Phase 0 pure-function module — Phase 2 may revisit if the
+        // contributor list grows enough that mid-aggregate rejection is
+        // common.
+        let contributors: Vec<ProviderId> = filtered_with_ids
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        let filtered: Vec<ProviderQuotes> = filtered_with_ids.into_iter().map(|(_, q)| q).collect();
 
         let aggregates = aggregate_tick(&filtered, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
@@ -207,9 +223,10 @@ impl PriceManager {
         self.observe_warnings(&aggregates);
         self.store.update(aggregates.clone(), now);
         report.fresh_currencies = aggregates.len();
+        report.contributors = contributors;
 
         if self.settings.publish_to_nostr {
-            self.publish_rates_to_nostr(&aggregates, &report.successes)
+            self.publish_rates_to_nostr(&aggregates, &report.contributors)
                 .await;
         }
 
@@ -232,23 +249,18 @@ impl PriceManager {
             .collect()
     }
 
-    /// Emit one-shot warnings on transitions: a currency dropping to a
-    /// single source, or aging out of fresh data. Spec §10.4 calls for
-    /// per-tick observability without log-spam.
+    /// Emit one-shot warnings on the single-source transition: a currency
+    /// with one contributor warns once; gaining a second contributor
+    /// clears the flag so a later regression warns again (spec §10.4).
     fn observe_warnings(&self, aggregates: &HashMap<String, AggregateResult>) {
-        let mut w = self
-            .warned_currencies
-            .write()
-            .expect("warned_currencies poisoned");
         for (currency, agg) in aggregates {
+            let key = currency.to_uppercase();
             if agg.sources <= 1 {
-                if w.insert(currency.clone(), WarnReason::SingleSource)
-                    != Some(WarnReason::SingleSource)
-                {
+                if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }
             } else {
-                w.remove(currency);
+                self.clear_warned(&self.warned_single_source, &key);
             }
         }
     }
@@ -256,18 +268,20 @@ impl PriceManager {
     /// Read a currency's per-BTC price.
     ///
     /// Phase 1 behaviour (spec §9 Phase 1): the staleness window is checked
-    /// and a `warn!` is logged when a value is older than one update
-    /// interval, but the price is still returned. Phase 4 turns this into
-    /// `Err(PriceTooStale)`; doing it now would refuse orders that today's
-    /// code happily prices, which is explicitly out of scope.
+    /// and a `warn!` is logged on the **transition** into a stale state,
+    /// but the price is still returned. The next call after a fresh tick
+    /// clears the flag so future regressions warn again. Phase 4 turns
+    /// this into `Err(PriceTooStale)`; doing it now would refuse orders
+    /// that today's code happily prices, which is explicitly out of scope.
     pub fn get_price(&self, currency: &str) -> Result<f64, MostroError> {
         let now = Utc::now().timestamp();
+        let key = currency.to_uppercase();
         match self
             .store
             .get(currency, self.settings.max_price_staleness_seconds, now)
         {
             Ok(value) => {
-                self.maybe_warn_stale(currency, now);
+                self.observe_freshness(currency, &key, now);
                 Ok(value)
             }
             Err(PriceError::TooStale) => {
@@ -276,11 +290,13 @@ impl PriceManager {
                 // into a hard error.
                 let snap = self.store.snapshot(currency);
                 if let Some(entry) = snap {
-                    warn!(
-                        "price: {} is past staleness window ({}s old) — Phase 1 still serves it",
-                        currency,
-                        now.saturating_sub(entry.as_of)
-                    );
+                    let age = now.saturating_sub(entry.as_of);
+                    if self.mark_warned(&self.warned_stale, &key) {
+                        warn!(
+                            "price: {} is past staleness window ({}s old) — Phase 1 still serves it",
+                            currency, age
+                        );
+                    }
                     Ok(entry.value)
                 } else {
                     // Should not happen: TooStale means an entry exists,
@@ -302,24 +318,44 @@ impl PriceManager {
         &self.store
     }
 
-    fn maybe_warn_stale(&self, currency: &str, now: i64) {
+    /// Inspect the entry served by the `Ok` branch of [`Self::get_price`]
+    /// to emit the "stale but within TTL" warning at most once, and to
+    /// clear the past-TTL flag once a fresh enough value lands so the
+    /// next slide past the TTL warns again.
+    fn observe_freshness(&self, currency: &str, key: &str, now: i64) {
         let Some(entry) = self.store.snapshot(currency) else {
             return;
         };
         let age = now.saturating_sub(entry.as_of);
         let one_interval = self.settings.update_interval_seconds as i64;
         if age <= one_interval {
+            // Fully fresh — also wipe any past-TTL flag so a future slide
+            // past `max_price_staleness_seconds` warns once more.
+            self.clear_warned(&self.warned_stale, key);
             return;
         }
-        let mut w = match self.warned_currencies.write() {
-            Ok(w) => w,
-            Err(_) => return,
-        };
-        if w.insert(currency.to_uppercase(), WarnReason::Stale) != Some(WarnReason::Stale) {
+        if self.mark_warned(&self.warned_stale, key) {
             warn!(
                 "price: {} is stale ({}s old, > {}s interval)",
                 currency, age, one_interval
             );
+        }
+    }
+
+    /// Insert `key` into `set`; return `true` if this is the first time
+    /// (the caller should warn) and `false` if the flag was already there.
+    /// A poisoned lock is treated as "already warned" so callers stay
+    /// quiet on lock failure rather than spamming after a panic.
+    fn mark_warned(&self, set: &RwLock<HashSet<String>>, key: &str) -> bool {
+        match set.write() {
+            Ok(mut w) => w.insert(key.to_string()),
+            Err(_) => false,
+        }
+    }
+
+    fn clear_warned(&self, set: &RwLock<HashSet<String>>, key: &str) {
+        if let Ok(mut w) = set.write() {
+            w.remove(key);
         }
     }
 
@@ -447,11 +483,20 @@ impl std::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// Per-tick outcome used by tests and the Phase 2 circuit breaker.
+/// Per-tick outcome used by the scheduler (for outage logging) and the
+/// Phase 2 circuit breaker.
 #[derive(Debug, Default)]
 pub struct TickReport {
+    /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick.
     pub successes: Vec<ProviderId>,
+    /// Providers that failed or timed out, with the stringified error.
     pub failures: Vec<(ProviderId, String)>,
+    /// Providers whose post-scope quote map was non-empty — i.e. those
+    /// that actually contributed at least one currency to the aggregate.
+    /// Distinct from `successes`: a scoped-out provider lands in
+    /// `successes` (it did poll OK) but **not** in `contributors`.
+    pub contributors: Vec<ProviderId>,
+    /// Number of currencies the tick produced a fresh aggregate for.
     pub fresh_currencies: usize,
 }
 
@@ -554,7 +599,8 @@ mod tests {
             store: Arc::new(PriceStore::new()),
             settings,
             http: reqwest::Client::new(),
-            warned_currencies: RwLock::new(HashMap::new()),
+            warned_stale: RwLock::new(HashSet::new()),
+            warned_single_source: RwLock::new(HashSet::new()),
         }
     }
 
@@ -573,6 +619,11 @@ mod tests {
 
         let report = manager.update_all().await;
         assert_eq!(report.successes, vec![ProviderId::Yadio]);
+        assert_eq!(
+            report.contributors,
+            vec![ProviderId::Yadio],
+            "yadio's quotes all survived scoping, so it contributes"
+        );
         assert!(report.failures.is_empty());
         assert_eq!(report.fresh_currencies, 3);
 
@@ -617,7 +668,8 @@ mod tests {
             store: Arc::new(PriceStore::new()),
             settings,
             http: reqwest::Client::new(),
-            warned_currencies: RwLock::new(HashMap::new()),
+            warned_stale: RwLock::new(HashSet::new()),
+            warned_single_source: RwLock::new(HashSet::new()),
         };
         let r = manager.update_all().await;
         assert_eq!(r.fresh_currencies, 0);
@@ -726,5 +778,93 @@ mod tests {
     fn sources_to_tag_is_deterministic() {
         let tag = sources_to_tag(&[ProviderId::CoinGecko, ProviderId::Yadio]);
         assert_eq!(tag, "coingecko,yadio");
+    }
+
+    #[tokio::test]
+    async fn scoped_out_provider_is_success_but_not_contributor() {
+        // A successful poll whose every currency is filtered by `only`
+        // contributes nothing to the aggregate — it must land in
+        // `report.successes` (it did poll OK and circuit breaker stays
+        // happy in Phase 2) but **not** in `report.contributors`, so the
+        // Nostr `source` tag never names a provider that didn't move the
+        // aggregate (spec §9 Phase 1: "contributing-source list").
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+        // Yadio is restricted to MLC — none of its quotes match.
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::Yadio.to_string())
+            .unwrap()
+            .only = Some(vec!["MLC".into()]);
+
+        let report = manager.update_all().await;
+        assert_eq!(report.successes, vec![ProviderId::Yadio]);
+        assert!(
+            report.contributors.is_empty(),
+            "scoped-out provider must not appear in the Nostr source tag"
+        );
+        assert_eq!(report.fresh_currencies, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_warning_is_one_shot_then_re_arms_on_fresh_read() {
+        // Build a manager whose only stored value is intentionally past
+        // the TTL, then call get_price() many times: the warned_stale set
+        // must grow by at most one entry. A fresh tick clears the flag
+        // so a future regression past TTL warns again.
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes.clone())]);
+        let mut manager = manager_with(scripted);
+        // Force the TTL low so the manually-written `as_of` is past it.
+        manager.settings.max_price_staleness_seconds = 1;
+        manager.settings.update_interval_seconds = 1;
+
+        // Seed an explicitly-stale entry.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+            },
+        );
+        // 1_000_000s ago: well past any plausible TTL.
+        let now = Utc::now().timestamp();
+        manager.store.update(agg, now - 1_000_000);
+
+        // 10 reads against a stale value: warned_stale must end with
+        // exactly one entry, regardless of how many times the legacy
+        // code would have logged.
+        for _ in 0..10 {
+            let _ = manager.get_price("USD");
+        }
+        assert_eq!(
+            manager.warned_stale.read().unwrap().len(),
+            1,
+            "TooStale must warn at most once between fresh reads"
+        );
+
+        // Inject a fresh tick: the `Ok` branch fires and clears the flag,
+        // so a subsequent regression past TTL warns once more.
+        let mut fresh = HashMap::new();
+        fresh.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+            },
+        );
+        let fresh_now = Utc::now().timestamp();
+        manager.store.update(fresh, fresh_now);
+        // Read once at fresh time so observe_freshness clears the flag.
+        let _ = manager.get_price("USD");
+        assert!(
+            manager.warned_stale.read().unwrap().is_empty(),
+            "fresh read must re-arm the stale guard"
+        );
     }
 }

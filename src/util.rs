@@ -1,4 +1,3 @@
-use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
@@ -69,7 +68,7 @@ pub async fn retries_yadio_request(
 }
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
-    BitcoinPriceManager::get_price(fiat_code)
+    crate::price::get_bitcoin_price(fiat_code)
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price

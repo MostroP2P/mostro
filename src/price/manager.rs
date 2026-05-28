@@ -194,30 +194,24 @@ impl PriceManager {
             .map(|(id, quotes)| (id, self.scope_quotes(id, quotes)))
             .collect();
 
-        // Contributors are providers whose **post-scope** quotes still
-        // carry at least one currency — those are the only ids that can
-        // actually move an aggregate this tick (spec §9 Phase 1 calls for
-        // a "contributing-source list" in the Nostr `source` tag, not the
-        // "polled successfully" list, which would include a provider
-        // entirely filtered out by `only`/`except`). Outlier-rejected
-        // individual quotes at the `combine` level are not subtracted
-        // here: it would require pairing every Quote with a ProviderId
-        // through `aggregate_tick`, which is an invasive change to a
-        // Phase 0 pure-function module — Phase 2 may revisit if the
-        // contributor list grows enough that mid-aggregate rejection is
-        // common.
-        let contributors: Vec<ProviderId> = filtered_with_ids
-            .iter()
-            .filter(|(_, q)| !q.is_empty())
-            .map(|(id, _)| *id)
-            .collect();
-        let filtered: Vec<ProviderQuotes> = filtered_with_ids.into_iter().map(|(_, q)| q).collect();
-
-        let aggregates = aggregate_tick(&filtered, self.settings.outlier_threshold_pct);
+        let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
             warn!("price: tick produced no fresh aggregates — keeping last-known-good");
             return report;
         }
+
+        // Tick-wide Nostr contributors = union of every per-currency
+        // contributor list (spec §9 Phase 1 "contributing-source list").
+        // Built from `aggregate_tick`'s provenance output so the tag
+        // reflects the providers whose quotes actually **survived**
+        // `combine`'s outlier filter, not merely those whose post-scope
+        // map was non-empty.
+        let mut contributor_set: std::collections::BTreeSet<ProviderId> =
+            std::collections::BTreeSet::new();
+        for agg in aggregates.values() {
+            contributor_set.extend(agg.contributors.iter().copied());
+        }
+        let contributors: Vec<ProviderId> = contributor_set.into_iter().collect();
 
         let now = Utc::now().timestamp();
         self.observe_warnings(&aggregates);
@@ -830,6 +824,7 @@ mod tests {
             AggregateResult {
                 value: 50_000.0,
                 sources: 1,
+                contributors: vec![ProviderId::Yadio],
             },
         );
         // 1_000_000s ago: well past any plausible TTL.
@@ -856,6 +851,7 @@ mod tests {
             AggregateResult {
                 value: 50_000.0,
                 sources: 1,
+                contributors: vec![ProviderId::Yadio],
             },
         );
         let fresh_now = Utc::now().timestamp();

@@ -1732,6 +1732,7 @@ dependencies = [
 name = "mostro"
 version = "0.17.4"
 dependencies = [
+ "async-trait",
  "axum",
  "bech32",
  "bitcoin",

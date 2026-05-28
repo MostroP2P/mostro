@@ -489,7 +489,21 @@ mod tests {
         );
         approx(out["USD"].value, 51.0); // (2+100)/2
                                         // All four clean providers survive the bimodal fallback.
-        assert_eq!(out["USD"].contributors.len(), 4);
+                                        // `kept_contributors` -> `dedup_sort` sorts by the derived `Ord`
+                                        // on `ProviderId`, which follows enum-variant declaration order
+                                        // (Yadio, CoinGecko, CurrencyApi, Blockchain, ElToque). Pin the
+                                        // exact list so a future refactor that perturbs ordering — or
+                                        // accidentally drops a contributor — is caught by this test
+                                        // rather than slipping past a loose `.len()` check.
+        assert_eq!(
+            out["USD"].contributors,
+            vec![
+                ProviderId::Yadio,
+                ProviderId::CoinGecko,
+                ProviderId::CurrencyApi,
+                ProviderId::Blockchain,
+            ]
+        );
     }
 
     #[test]

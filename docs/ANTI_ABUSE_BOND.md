@@ -1667,15 +1667,35 @@ and **while the claim window is still open**, Mostro should:
 All changes are in `src/app/bond/payout.rs` and the scheduler cadence;
 no `mostro-core` variant, no migration.
 
-- **Stale invoice on retry exhaustion is discarded, not terminal.**
-  Change `on_send_payment_failure` so that when
-  `payout_attempts >= payout_max_retries`:
+- **Only a *terminal* failure abandons the invoice (double-payout
+  guard).** Abandoning the current invoice — whether by re-arming for a
+  fresh one or by flipping to `Failed` — clears `payout_payment_hash`,
+  which disables the §8.1 reconciliation branch in `pay_counterparty`
+  (the branch that looks the payment up in LND before re-sending). If the
+  in-flight `send_payment` for the current invoice could still settle,
+  abandoning it would let a freshly-prompted invoice be paid while the
+  original later succeeds — a **double payout**. So
+  `on_send_payment_failure` distinguishes two failure kinds:
+  - **Terminal** — LND reported the payment `Failed` (via the status
+    stream or reconciliation), or the invoice is structurally unusable.
+    No payment is or will be in flight, so the invoice may be abandoned.
+  - **Indeterminate** — status-stream timeout, stream EOF, or a
+    `send_payment` RPC error. The payment may still be in flight. The
+    invoice and its `payout_payment_hash` are **kept**; the row stays in
+    `PendingPayout` and the next tick's reconciliation branch polls LND
+    to a definitive `Succeeded` / `Failed` before anything new is paid.
+    `payout_attempts` saturates at `payout_max_retries` so a long LND
+    outage cannot grow it without bound.
+- **Stale invoice on *terminal* retry exhaustion is discarded, not
+  terminal-`Failed`.** When `payout_attempts >= payout_max_retries`
+  after a **terminal** failure:
   - **If `now - slashed_at < payout_claim_window_days * 86_400`** (claim
     window still open): instead of transitioning to `Failed`, CAS the row
     *back into the invoice-request phase* — clear `payout_invoice`,
     `payout_routing_fee_sats`, and `payout_payment_hash` to `NULL`, reset
-    `payout_attempts = 0`, and **leave `state = PendingPayout`** and
-    `slashed_at` untouched. The guard is `WHERE id = ? AND state =
+    `payout_attempts = 0`, clear `last_invoice_request_at` (so the
+    re-prompt fires immediately), and **leave `state = PendingPayout`**
+    and `slashed_at` untouched. The guard is `WHERE id = ? AND state =
     'pending-payout'` so a row that raced to another state in the
     meantime is left alone.
   - **Else** (claim window already elapsed): transition to `Failed` as
@@ -1731,14 +1751,22 @@ ever observed after the claim window has elapsed.
 
 ### 9.5.5 Tests
 
-- **Re-request after exhaustion, in window.** Bond in `PendingPayout`
-  with a submitted-but-unroutable `payout_invoice`, day 2 of a 15-day
-  window. Drive `send_payment` failures up to `payout_max_retries`. The
-  row stays `PendingPayout`, `payout_invoice` / `payout_routing_fee_sats`
-  / `payout_payment_hash` are cleared, `payout_attempts` resets to 0, and
-  `slashed_at` is unchanged. On the next scheduler tick (cadence window
-  elapsed) a fresh `Action::AddBondInvoice` is enqueued to the winner and
+- **Re-request after *terminal* exhaustion, in window.** Bond in
+  `PendingPayout` with a submitted-but-unroutable `payout_invoice`, day 2
+  of a 15-day window. Drive **terminal** `send_payment` failures up to
+  `payout_max_retries`. The row stays `PendingPayout`, `payout_invoice` /
+  `payout_routing_fee_sats` / `payout_payment_hash` /
+  `last_invoice_request_at` are cleared, `payout_attempts` resets to 0,
+  and `slashed_at` is unchanged. On the next scheduler tick a fresh
+  `Action::AddBondInvoice` is enqueued to the winner and
   `invoice_request_attempts` increments.
+- **Indeterminate exhaustion keeps the invoice (double-payout guard).**
+  Same setup, but the failures are **indeterminate** (timeout / EOF /
+  send RPC error). After `payout_max_retries` the row stays
+  `PendingPayout` with `payout_invoice` **and** `payout_payment_hash`
+  intact (so reconciliation can poll LND), is **not** re-armed and
+  **not** `Failed`, and `payout_attempts` saturates at
+  `payout_max_retries`. Further indeterminate failures keep it pinned.
 - **Deadline does not move.** Across one or more re-request cycles, the
   `slashed_at` field and the `slashed_at` shipped in
   `Payload::BondPayoutRequest` are identical to the original slash

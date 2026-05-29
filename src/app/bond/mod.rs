@@ -24,5 +24,8 @@ pub use flow::{
 pub use math::{compute_bond_amount, compute_node_share};
 pub use model::Bond;
 pub use payout::{add_bond_invoice_action, run_bond_payout_cycle};
-pub use slash::{apply_bond_resolution, extract_bond_resolution, validate_bond_resolution};
+pub use slash::{
+    apply_bond_resolution, extract_bond_resolution, notify_bond_slashed,
+    slash_or_release_on_timeout, validate_bond_resolution,
+};
 pub use types::{BondRole, BondSlashReason, BondState};

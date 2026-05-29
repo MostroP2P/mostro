@@ -39,25 +39,30 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use chrono::Utc;
 use mostro_core::error::{
     CantDoReason,
-    MostroError::{self, MostroCantDo},
+    MostroError::{self, MostroCantDo, MostroInternalErr},
+    ServiceError,
 };
-use mostro_core::message::{BondResolution, Message, Payload};
-use mostro_core::order::Order;
+use mostro_core::message::{Action, BondResolution, Message, Payload};
+use mostro_core::order::{Order, SmallOrder, Status};
+use nostr_sdk::prelude::PublicKey;
 use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::db::find_active_bonds_for_order;
-use super::flow::release_bond;
+use super::flow::{release_bond, release_bonds_for_order_or_warn};
 use super::math::compute_node_share;
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 use crate::config::settings::Settings;
+use crate::config::types::AntiAbuseBondSettings;
 use crate::lightning::LndConnector;
+use crate::util::enqueue_order_msg;
 
 /// Minimal LND-side capability the slash path needs: settle a hold
 /// invoice by preimage. Mirrors the [`crate::app::cancel::CancelLightning`]
@@ -238,6 +243,231 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     }
 
     Ok(())
+}
+
+/// Phase 4 — timeout-slash dispatch for the scheduler's
+/// `job_cancel_orders`.
+///
+/// Given the **pre-cancel** snapshot of an order whose waiting-state
+/// deadline elapsed, decide — from the waiting state alone (the §9.2
+/// responsibility table) and the node's bond policy — whether the
+/// responsible party's bond is slashed with `BondSlashReason::Timeout`,
+/// or every bond on the order is simply released (the Phase 1 "always
+/// release" behaviour).
+///
+/// Responsibility maps directly from the waiting state:
+/// `WaitingBuyerInvoice → buyer`, `WaitingPayment → seller`. The
+/// buyer/seller → bond-row resolution then reuses the §3.1 order-kind
+/// mapping baked into [`apply_bond_resolution`] (a slash flag is matched
+/// against `order.buyer_pubkey` / `order.seller_pubkey`, which equal the
+/// bonded taker's trade pubkey). So under `apply_to = "take"` only the
+/// taker side ever carries a bond, and the maker-responsible rows of the
+/// §9.2 table fall through to release.
+///
+/// A slash happens **only** when all of the following hold:
+/// - the feature is enabled, `slash_on_waiting_timeout = true`, and
+///   `apply_to` covers the taker;
+/// - the order is in a waiting state;
+/// - the responsible party holds a `Locked` bond.
+///
+/// Otherwise every active bond is released. This preserves today's
+/// behaviour when the feature is off, when the bond belongs to the
+/// non-responsible party, or when no bond exists — and it is the path
+/// that drains stray bonds left over from a previously-enabled period,
+/// so it is **not** gated on the current feature flag.
+///
+/// Returns `Ok(Some(bond))` with the slashed bond row when a timeout
+/// slash actually landed, so the caller can notify the slashed user;
+/// `Ok(None)` otherwise. The slash is confirmed by re-reading the row's
+/// durable `slashed_reason = Timeout` metadata (see
+/// [`timeout_slash_confirmed`]) rather than a transient
+/// `state = PendingPayout` check — the concurrent payout scheduler can
+/// move a just-slashed row onward within the confirmation window.
+/// [`apply_bond_resolution`] is best-effort and leaves the bond `Locked`
+/// (no slash metadata) on a transient settle failure, so a `Some` return
+/// guarantees the bond was really forfeited and the notice is truthful.
+///
+/// `order` MUST carry the pre-cancel waiting status and the trade
+/// pubkeys; call this from the persist-success branch that replaces the
+/// Phase 1 release call. `bond_cfg` is the node's `[anti_abuse_bond]`
+/// config (the scheduler passes `Settings::get_bond()`); it is taken as a
+/// parameter rather than read from the global so the gate is unit-testable
+/// without mutating process-wide state.
+pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+    order: &Order,
+    bond_cfg: Option<&AntiAbuseBondSettings>,
+) -> Result<Option<Bond>, MostroError> {
+    // Responsible side from the waiting state. Anything else is not a
+    // Phase 4 trigger — release defensively and bail. (The scheduler only
+    // calls this for waiting-state orders, but we never assume it.)
+    let side = match order.get_order_status() {
+        Ok(Status::WaitingBuyerInvoice) => Side::Buyer,
+        Ok(Status::WaitingPayment) => Side::Seller,
+        _ => {
+            release_bonds_for_order_or_warn(pool, order.id, "scheduler_timeout").await;
+            return Ok(None);
+        }
+    };
+
+    // Gate the slash. `apply_to` is a posting-timing switch; Phase 4 is
+    // taker-only, so we check `applies_to_taker` (Phase 7 widens this to
+    // the maker). When the gate is closed we still release — bonds left
+    // over from a prior enabled period must drain regardless.
+    let slash_armed = bond_cfg
+        .is_some_and(|c| c.enabled && c.slash_on_waiting_timeout && c.apply_to.applies_to_taker());
+    if !slash_armed {
+        release_bonds_for_order_or_warn(pool, order.id, "scheduler_timeout").await;
+        return Ok(None);
+    }
+
+    // Does the responsible party hold a `Locked` bond?
+    let bonds = find_active_bonds_for_order(pool, order.id).await?;
+    let Some(responsible) = resolve_locked_bond(order, &bonds, side).cloned() else {
+        // Responsible party has no bond (e.g. the maker under
+        // `apply_to = take`), or the bond already moved out of `Locked`.
+        // No slash; release whatever is still active on the order.
+        release_bonds_for_order_or_warn(pool, order.id, "scheduler_timeout").await;
+        return Ok(None);
+    };
+
+    // Reuse the Phase 2 primitive. The `BondResolution` names the
+    // responsible side; `apply_bond_resolution` settles that bond's HTLC
+    // + CAS → PendingPayout(Timeout) and releases every other active bond
+    // on the order (the Phase 1 cancel path).
+    let resolution = match side {
+        Side::Buyer => BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        },
+        Side::Seller => BondResolution {
+            slash_seller: true,
+            slash_buyer: false,
+        },
+    };
+    apply_bond_resolution(
+        pool,
+        ln_client,
+        order,
+        &resolution,
+        BondSlashReason::Timeout,
+    )
+    .await?;
+
+    // Confirm the slash actually landed before claiming it: a transient
+    // settle failure leaves the bond `Locked` (apply_bond_resolution is
+    // best-effort), and we must never tell a user their bond was forfeited
+    // while the HTLC is still theirs.
+    if timeout_slash_confirmed(pool, responsible.id).await? {
+        info!(
+            bond_id = %responsible.id,
+            order_id = %order.id,
+            role = %responsible.role,
+            "Bond slashed on waiting-state timeout"
+        );
+        Ok(Some(responsible))
+    } else {
+        warn!(
+            bond_id = %responsible.id,
+            order_id = %order.id,
+            "timeout slash did not land (bond still Locked); no forfeiture notice sent"
+        );
+        Ok(None)
+    }
+}
+
+/// Confirm a timeout slash actually landed on `bond_id`, regardless of
+/// where the concurrent payout scheduler has since moved the row.
+///
+/// The slash CAS in [`slash_one`] writes `slashed_reason = Timeout`
+/// atomically with the `Locked → PendingPayout` transition, and **no**
+/// later transition clears it: the payout job's state changes
+/// (`PendingPayout → Slashed | Forfeited | Failed`, and the
+/// `Failed → PendingPayout` resurrection) only ever rewrite `state`, never
+/// `slashed_reason` / `slashed_at`. So `slashed_reason = Timeout` is a
+/// stable witness that *this* slash succeeded.
+///
+/// A point-in-time `state = PendingPayout` check would be racy: the payout
+/// scheduler runs every 60s and can move a just-slashed row off
+/// `PendingPayout` within the confirmation window (e.g. `finalize_node_only`
+/// flips a node-only slash, `slash_node_share_pct = 1.0`, straight to
+/// `Slashed`). Keying on the durable slash metadata instead means the
+/// forfeiture notice is never lost to that race.
+///
+/// A transient settle failure leaves the bond `Locked` with
+/// `slashed_reason` NULL, so this still returns `false` and no false
+/// forfeiture notice is sent. Dispute slashes write
+/// `slashed_reason = LostDispute`, so a (vanishingly unlikely) concurrent
+/// dispute slash that won the CAS first does not trigger a *timeout*
+/// notice here — the dispute path owns its own messaging.
+async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT slashed_reason FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let timeout = BondSlashReason::Timeout.to_string();
+    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(timeout.as_str()))
+}
+
+/// Phase 4 — best-effort forfeiture notice to the slashed user
+/// (`Action::BondSlashed`). Mirrors the Phase 3.5 payout acks: a dropped
+/// message must never roll back the slash, so failures are logged, not
+/// propagated. The slashed user also receives the order's
+/// `Action::Canceled` from the scheduler's normal cancel notification;
+/// this message is the bond-specific complement explaining the
+/// forfeiture. The `SmallOrder` carries the slashed bond amount in
+/// `amount` so the client can render the figure in the user's locale.
+pub async fn notify_bond_slashed(order: &Order, slashed: &Bond) {
+    let recipient = match PublicKey::from_str(&slashed.pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            warn!(
+                bond_id = %slashed.id,
+                order_id = %order.id,
+                "bond slash: unparseable bonded pubkey ({e}); skipping BondSlashed notice"
+            );
+            return;
+        }
+    };
+    let order_kind = match order.get_order_kind() {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(
+                order_id = %order.id,
+                "bond slash: cannot resolve order kind ({e:?}); skipping BondSlashed notice"
+            );
+            return;
+        }
+    };
+    let small = SmallOrder::new(
+        Some(order.id),
+        Some(order_kind),
+        None,
+        slashed.amount_sats,
+        order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
+        order.fiat_amount,
+        order.payment_method.clone(),
+        order.premium,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::BondSlashed,
+        Some(Payload::Order(small)),
+        recipient,
+        None,
+    )
+    .await;
 }
 
 /// Single-bond slash: settle the hold invoice into Mostro's wallet,
@@ -974,6 +1204,395 @@ mod tests {
             state.0,
             BondState::Locked.to_string(),
             "transient settle failure must leave the bond Locked for admin retry"
+        );
+    }
+
+    // ── Phase 4 — timeout-slash dispatch ────────────────────────────────────
+
+    use crate::config::types::{AntiAbuseBondSettings, BondApplyTo};
+
+    /// Bond config for the Phase 4 gate. `Default` is `enabled = false`;
+    /// override only the three flags `slash_or_release_on_timeout`
+    /// inspects.
+    fn timeout_cfg(
+        enabled: bool,
+        slash_on_waiting_timeout: bool,
+        apply_to: BondApplyTo,
+    ) -> AntiAbuseBondSettings {
+        AntiAbuseBondSettings {
+            enabled,
+            slash_on_waiting_timeout,
+            apply_to,
+            ..AntiAbuseBondSettings::default()
+        }
+    }
+
+    /// `fixture_order` parks the order in `Dispute`; the Phase 4 dispatch
+    /// keys off the waiting state, so override it.
+    fn waiting_order(kind: Kind, seller_pk: &str, buyer_pk: &str, status: Status) -> Order {
+        let mut o = fixture_order(kind, seller_pk, buyer_pk);
+        o.status = status.to_string();
+        o
+    }
+
+    async fn read_bond_state(pool: &Pool<Sqlite>, id: Uuid) -> String {
+        let row: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_disabled_releases_without_slashing() {
+        // slash_on_waiting_timeout = false: even with the responsible
+        // taker holding a Locked bond on a timed-out waiting state, the
+        // bond is released (Phase 1 behaviour), never slashed, and the
+        // HTLC is never settled.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, false, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "disabled timeout slash must not report a slash"
+        );
+        assert!(
+            ln.calls().is_empty(),
+            "release path must not settle the HTLC"
+        );
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_sell_buyer_silent_slashes_taker_bond() {
+        // sell order, WaitingBuyerInvoice: the buyer is responsible and on
+        // a sell order the buyer is the taker. Gate armed → the taker bond
+        // is slashed with reason=Timeout and the HTLC is settled exactly
+        // once. The dispatch reports the slashed bond.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.map(|b| b.id),
+            Some(bond.id),
+            "must report the slashed bond for notification"
+        );
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "slash settles exactly the responsible bond's HTLC"
+        );
+        let row: (String, Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT state, slashed_reason, slashed_at FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, BondState::PendingPayout.to_string());
+        assert_eq!(row.1.as_deref(), Some("timeout"));
+        assert!(row.2.unwrap() > 0, "slashed_at must be set");
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_buy_seller_silent_slashes_taker_bond() {
+        // buy order, WaitingPayment: the seller is responsible and on a
+        // buy order the seller is the taker. (For a buy order the maker is
+        // the buyer, so the taker's trade pubkey lives in `seller_pubkey`.)
+        // Gate armed → taker bond slashed with reason=Timeout.
+        let pool = setup_pool().await;
+        let order = waiting_order(Kind::Buy, taker_pk(), maker_pk(), Status::WaitingPayment);
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert_eq!(result.map(|b| b.id), Some(bond.id));
+        assert_eq!(ln.calls(), vec![stub_preimage()]);
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::PendingPayout.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_no_slash_when_responsible_party_is_maker_sell_order() {
+        // sell order, WaitingPayment: the seller is responsible, and on a
+        // sell order the seller is the *maker*, who holds no bond under
+        // apply_to=take. The taker (buyer) bond exists but belongs to the
+        // non-responsible party — it must be released, never slashed.
+        // This is the load-bearing money-safety case: a counterparty
+        // going silent must not cost the *other* party their bond.
+        let pool = setup_pool().await;
+        let order = waiting_order(Kind::Sell, maker_pk(), taker_pk(), Status::WaitingPayment);
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "maker-responsible row must not slash the taker's bond"
+        );
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_no_slash_when_responsible_party_is_maker_buy_order() {
+        // buy order, WaitingBuyerInvoice: the buyer is responsible, and on
+        // a buy order the buyer is the maker (no bond under apply_to=take).
+        // The taker (seller) bond is released, not slashed.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Buy,
+            taker_pk(),
+            maker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_skipped_when_apply_to_make_only() {
+        // apply_to=make: the taker side posts no bond, so the timeout path
+        // must not slash a taker bond even with an otherwise-armed config.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Make);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_no_config_releases_bond() {
+        // No [anti_abuse_bond] block (cfg = None): the dispatch still
+        // drains any active bond (release), and never slashes. This is the
+        // path that cleans up bonds left over from a previously-enabled
+        // period.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, None)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_transient_settle_failure_leaves_bond_locked_and_no_notice() {
+        // A transient settle failure leaves the bond Locked (the apply
+        // primitive is best-effort). The dispatch must re-read the row and
+        // report None, so the caller never sends a forfeiture notice for a
+        // bond whose HTLC is still the user's.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "an unconfirmed slash must not be reported to the caller"
+        );
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Locked.to_string(),
+            "transient settle failure must leave the bond Locked for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_confirmed_survives_concurrent_payout_progression() {
+        // Regression: the payout scheduler runs concurrently (every 60s)
+        // and can move a just-slashed `PendingPayout` row onward — e.g. a
+        // node-only slash flips straight to `Slashed` via
+        // `finalize_node_only` — before the dispatch re-reads it. The
+        // confirmation must key off the durable `slashed_reason = Timeout`
+        // metadata, not the transient `PendingPayout` state, so the
+        // forfeiture notice is never lost to that race. Every post-slash
+        // state must confirm.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+
+        for state in [
+            BondState::PendingPayout,
+            BondState::Slashed,
+            BondState::Forfeited,
+            BondState::Failed,
+        ] {
+            let bond = insert_bond(&pool, order.id, taker_pk(), state).await;
+            // Stamp the timeout slash metadata that `slash_one` writes
+            // atomically with the Locked → PendingPayout CAS.
+            sqlx::query("UPDATE bonds SET slashed_reason = ? WHERE id = ?")
+                .bind(BondSlashReason::Timeout.to_string())
+                .bind(bond.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                timeout_slash_confirmed(&pool, bond.id).await.unwrap(),
+                "post-slash state {state:?} with slashed_reason=Timeout must confirm the slash"
+            );
+        }
+
+        // A still-Locked bond (transient settle failure) carries no slash
+        // metadata and must NOT confirm — no false forfeiture notice.
+        let locked = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        assert!(
+            !timeout_slash_confirmed(&pool, locked.id).await.unwrap(),
+            "a Locked bond with no slash metadata must not confirm"
+        );
+
+        // A dispute slash (LostDispute) must not be mistaken for a timeout
+        // slash, so the timeout notice is not sent for it.
+        let dispute = insert_bond(&pool, order.id, taker_pk(), BondState::PendingPayout).await;
+        sqlx::query("UPDATE bonds SET slashed_reason = ? WHERE id = ?")
+            .bind(BondSlashReason::LostDispute.to_string())
+            .bind(dispute.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !timeout_slash_confirmed(&pool, dispute.id).await.unwrap(),
+            "a LostDispute slash must not confirm as a timeout slash"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_bond_slashed_targets_the_slashed_user() {
+        // The forfeiture notice goes to the bonded (slashed) taker,
+        // carrying Action::BondSlashed scoped to the order.
+        use crate::config::MESSAGE_QUEUES;
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::PendingPayout).await;
+
+        notify_bond_slashed(&order, &bond).await;
+
+        let recipients: Vec<String> = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| {
+                let k = m.get_inner_message_kind();
+                k.id == Some(order.id) && k.action == Action::BondSlashed
+            })
+            .map(|(_, pk)| pk.to_string())
+            .collect();
+        assert_eq!(
+            recipients,
+            vec![taker_pk().to_string()],
+            "BondSlashed must be enqueued to the slashed taker only"
         );
     }
 }

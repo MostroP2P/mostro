@@ -137,11 +137,21 @@ pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConne
 ///                          │                                                      │
 ///                          └──── send_payment success ─► Slashed                  │
 ///                                                                                 │
-///                                    send_payment failure ─► retry (or Failed) ◄──┘
+///                  retries left ─► retry next tick ◄── send_payment failure ◄─────┤
+///                                                                                 │
+///   re-arm (clear invoice, re-prompt) ◄── retries exhausted, in claim window ◄────┤
+///                                                                                 │
+///                              Failed ◄── retries exhausted, past claim window ◄───┘
 /// ```
 ///
 /// Each call advances by at most one of these arms; the scheduler
 /// reruns the row on the next tick until a terminal state is reached.
+/// The re-arm arm (Phase 4.5, [issue #750]) discards an unroutable
+/// invoice and loops the row back to the invoice-request sub-phase so
+/// the winner is re-prompted; it is bounded by the same forfeit window
+/// as the never-claimed case.
+///
+/// [issue #750]: https://github.com/MostroP2P/mostro/issues/750
 async fn process_one_bond(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
@@ -190,7 +200,17 @@ async fn process_one_bond(
 
     match bond.payout_invoice.as_deref() {
         None => request_payout_invoice(pool, bond, invoice_window_seconds).await,
-        Some(invoice) => pay_counterparty(pool, ln_client, bond, invoice, max_retries).await,
+        Some(invoice) => {
+            pay_counterparty(
+                pool,
+                ln_client,
+                bond,
+                invoice,
+                max_retries,
+                claim_window_seconds,
+            )
+            .await
+        }
     }
 }
 
@@ -476,6 +496,7 @@ async fn pay_counterparty(
     bond: &Bond,
     invoice: &str,
     max_retries: i64,
+    claim_window_seconds: i64,
 ) -> Result<(), MostroError> {
     let counterparty_share = counterparty_share_sats(bond)?;
 
@@ -490,6 +511,7 @@ async fn pay_counterparty(
                 pool,
                 bond,
                 max_retries,
+                claim_window_seconds,
                 &format!("payout invoice decode failed: {e}"),
             )
             .await;
@@ -522,6 +544,7 @@ async fn pay_counterparty(
                         pool,
                         bond,
                         max_retries,
+                        claim_window_seconds,
                         "tracked payment reported Failed on reconciliation",
                     )
                     .await;
@@ -595,7 +618,14 @@ async fn pay_counterparty(
         .send_payment(invoice, counterparty_share, tx)
         .await;
     if let Err(e) = send_outcome {
-        return on_send_payment_failure(pool, bond, max_retries, &format!("{e}")).await;
+        return on_send_payment_failure(
+            pool,
+            bond,
+            max_retries,
+            claim_window_seconds,
+            &format!("{e}"),
+        )
+        .await;
     }
 
     // Collect the first terminal status from the stream. Mirrors
@@ -643,7 +673,7 @@ async fn pay_counterparty(
     }
 
     let msg = failure.unwrap_or_else(|| "payment stream ended without terminal status".to_string());
-    on_send_payment_failure(pool, bond, max_retries, &msg).await
+    on_send_payment_failure(pool, bond, max_retries, claim_window_seconds, &msg).await
 }
 
 /// Flip a `PendingPayout` row to `Slashed` after a confirmed payment.
@@ -717,13 +747,41 @@ async fn slash_after_success(
     Err(MostroInternalErr(ServiceError::DbAccessError(cause)))
 }
 
-/// Bump `payout_attempts`; on `payout_max_retries` reached, transition
-/// the bond to `Failed`. This counter only increments on real
-/// `send_payment` failures, not on invoice-request messages.
+/// Bump `payout_attempts` after a failed `send_payment`. This counter
+/// only increments on real `send_payment` failures, not on
+/// invoice-request messages.
+///
+/// On reaching `payout_max_retries` against a single submitted invoice,
+/// the *current* bolt11 is unroutable. What happens next depends on the
+/// forfeit window (Phase 4.5, [issue #750]):
+///
+/// - **Inside the claim window** (`now - slashed_at < claim_window`):
+///   the stale invoice is discarded and the row is re-armed back into
+///   the invoice-request sub-phase (`payout_invoice`,
+///   `payout_routing_fee_sats`, `payout_payment_hash`, and
+///   `last_invoice_request_at` cleared; `payout_attempts` reset to 0;
+///   `state` stays `PendingPayout`). The next scheduler tick sees
+///   `payout_invoice IS NULL` and re-prompts the winner via
+///   `request_payout_invoice` for a fresh bolt11. The `slashed_at`
+///   anchor is **never touched**, so re-prompting cannot extend the
+///   winner's exposure — the forfeit deadline stays fixed and the
+///   re-prompt/retry cycle is bounded by `payout_claim_window_days`
+///   (after which `process_one_bond` forfeits the row). This makes the
+///   previously-unreachable §8.2 recovery Mostro-driven instead of
+///   relying on the winner spontaneously resubmitting.
+/// - **Outside the claim window**: there is no point re-prompting past
+///   the deadline, so the row transitions to `Failed` — the terminal
+///   "we held a valid invoice but could not route it and the window is
+///   closed" state, distinct from `Forfeited` (the winner never
+///   submitted an invoice at all). `Failed` requires operator
+///   attention.
+///
+/// [issue #750]: https://github.com/MostroP2P/mostro/issues/750
 async fn on_send_payment_failure(
     pool: &Pool<Sqlite>,
     bond: &Bond,
     max_retries: i64,
+    claim_window_seconds: i64,
     cause: &str,
 ) -> Result<(), MostroError> {
     let new_attempts = bond.payout_attempts + 1;
@@ -735,21 +793,7 @@ async fn on_send_payment_failure(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    if new_attempts >= max_retries {
-        sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Failed.to_string())
-            .bind(bond.id)
-            .bind(BondState::PendingPayout.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        error!(
-            bond_id = %bond.id,
-            order_id = %bond.order_id,
-            attempts = new_attempts,
-            "bond payout: send_payment exhausted retries — transitioning to Failed; node share retained, counterparty share stranded (operator review required). last error: {cause}"
-        );
-    } else {
+    if new_attempts < max_retries {
         warn!(
             bond_id = %bond.id,
             order_id = %bond.order_id,
@@ -757,7 +801,85 @@ async fn on_send_payment_failure(
             max_retries,
             "bond payout: send_payment failure ({cause}); will retry on next tick"
         );
+        return Ok(());
     }
+
+    // Retry budget for the *current* invoice is exhausted. Decide
+    // between re-prompting the winner (in-window) and giving up
+    // (out-of-window) based on the forfeit deadline anchored on
+    // `slashed_at`. A missing `slashed_at` is an invariant violation
+    // (Phase 2's slash CAS writes it atomically with the transition to
+    // `PendingPayout`); treat it conservatively as out-of-window so a
+    // corrupted row terminates in `Failed` for operator review rather
+    // than looping forever.
+    let now = Utc::now().timestamp();
+    let within_window = bond
+        .slashed_at
+        .is_some_and(|slashed_at| now - slashed_at < claim_window_seconds);
+
+    if within_window {
+        // Phase 4.5: discard the unroutable invoice and re-arm the
+        // invoice-request sub-phase. `request_payout_invoice` gates on
+        // `payout_invoice IS NULL`, so clearing it is what re-prompts
+        // the winner on the next tick. `last_invoice_request_at` is
+        // cleared so the re-prompt fires immediately (the winner has
+        // already waited through a full retry budget). `payout_attempts`
+        // resets to 0 so the next invoice gets a fresh budget;
+        // `payout_routing_fee_sats` / `payout_payment_hash` are cleared
+        // because they describe the discarded attempt. `slashed_at` and
+        // `invoice_request_attempts` are intentionally left untouched —
+        // the deadline must not move, and the nudge counter is bounded
+        // by the forfeit window (not the retry budget) so it keeps
+        // accumulating across re-prompts for operator visibility.
+        let result = sqlx::query(
+            "UPDATE bonds \
+               SET payout_invoice = NULL, \
+                   payout_routing_fee_sats = NULL, \
+                   payout_payment_hash = NULL, \
+                   payout_attempts = 0, \
+                   last_invoice_request_at = NULL \
+             WHERE id = ? AND state = ?",
+        )
+        .bind(bond.id)
+        .bind(BondState::PendingPayout.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        if result.rows_affected() == 1 {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                attempts = new_attempts,
+                "bond payout: send_payment exhausted retries for this invoice ({cause}); re-requesting a fresh invoice from the winner (still inside claim window, deadline unchanged)"
+            );
+        } else {
+            // The row moved off `PendingPayout` between the attempts
+            // bump and this re-arm CAS (e.g. a concurrent forfeit at
+            // the window edge). Nothing to do — the winning transition
+            // already decided this row's fate.
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "bond payout: re-arm CAS missed (concurrent transition); leaving row as-is"
+            );
+        }
+        return Ok(());
+    }
+
+    sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
+        .bind(BondState::Failed.to_string())
+        .bind(bond.id)
+        .bind(BondState::PendingPayout.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    error!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        attempts = new_attempts,
+        "bond payout: send_payment exhausted retries past the claim window — transitioning to Failed; node share retained, counterparty share stranded (operator review required). last error: {cause}"
+    );
     Ok(())
 }
 
@@ -1599,26 +1721,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_payment_failure_increments_attempts_and_flips_to_failed() {
-        // After `max_retries` consecutive `send_payment` failures the
-        // row must transition `PendingPayout -> Failed`. Exercises
-        // `on_send_payment_failure` with a tight retry budget.
+    async fn send_payment_failure_past_window_flips_to_failed() {
+        // After `max_retries` consecutive `send_payment` failures, a bond
+        // whose claim window has already elapsed must transition
+        // `PendingPayout -> Failed` (Phase 4.5: re-prompting is pointless
+        // past the deadline). Exercises `on_send_payment_failure` with a
+        // tight retry budget and an out-of-window `slashed_at`.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        // slashed_at older than the claim window → out of window.
+        let slashed_at = Utc::now().timestamp() - (CLAIM_WINDOW_SECONDS + 86_400);
         let bond = pending_payout_bond(
             order_id,
             taker_pk(),
             10_000,
             5_000,
-            Utc::now().timestamp(),
+            slashed_at,
             Some("lnbc1pSOMETHING"),
             None,
         );
         let bond = create_bond(&pool, bond).await.unwrap();
 
         // First failure: attempts 0 -> 1, still PendingPayout.
-        on_send_payment_failure(&pool, &bond, 3, "transient")
+        on_send_payment_failure(&pool, &bond, 3, CLAIM_WINDOW_SECONDS, "transient")
             .await
             .unwrap();
         let bond_after_1: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
@@ -1631,7 +1757,7 @@ mod tests {
 
         // Second + third failures use the *fresh* row each time so the
         // counter math is exercised end-to-end. Third must flip Failed.
-        on_send_payment_failure(&pool, &bond_after_1, 3, "transient")
+        on_send_payment_failure(&pool, &bond_after_1, 3, CLAIM_WINDOW_SECONDS, "transient")
             .await
             .unwrap();
         let bond_after_2: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
@@ -1641,7 +1767,7 @@ mod tests {
             .unwrap();
         assert_eq!(bond_after_2.payout_attempts, 2);
 
-        on_send_payment_failure(&pool, &bond_after_2, 3, "transient")
+        on_send_payment_failure(&pool, &bond_after_2, 3, CLAIM_WINDOW_SECONDS, "transient")
             .await
             .unwrap();
         let bond_after_3: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
@@ -1651,6 +1777,84 @@ mod tests {
             .unwrap();
         assert_eq!(bond_after_3.payout_attempts, 3);
         assert_eq!(bond_after_3.state, BondState::Failed.to_string());
+    }
+
+    #[tokio::test]
+    async fn send_payment_failure_within_window_reprompts_winner() {
+        // Phase 4.5 / issue #750: after `max_retries` send_payment
+        // failures against a submitted invoice, a bond still inside its
+        // claim window must NOT terminate in `Failed`. Instead it
+        // re-arms the invoice-request sub-phase: `payout_invoice` and
+        // the per-attempt columns are cleared, `payout_attempts` resets
+        // to 0, the row stays `PendingPayout`, and `slashed_at` (the
+        // forfeit anchor) is left untouched so the deadline never moves.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let slashed_at = Utc::now().timestamp();
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            slashed_at,
+            Some("lnbc1pSTALE"),
+            Some(slashed_at), // last_invoice_request_at set
+        );
+        // Simulate the per-attempt state accumulated during the failed
+        // send: a routing-fee cap and a payment hash from the stale
+        // invoice, plus one prior nudge to the winner.
+        bond.payout_routing_fee_sats = Some(50);
+        bond.payout_payment_hash = Some("deadbeef".to_string());
+        bond.invoice_request_attempts = 1;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        // First two failures: budget not exhausted, row stays put with
+        // its invoice and counters intact.
+        on_send_payment_failure(&pool, &bond, 3, CLAIM_WINDOW_SECONDS, "transient")
+            .await
+            .unwrap();
+        let after_1: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_1.payout_attempts, 1);
+        assert_eq!(after_1.state, BondState::PendingPayout.to_string());
+        assert_eq!(after_1.payout_invoice.as_deref(), Some("lnbc1pSTALE"));
+
+        on_send_payment_failure(&pool, &after_1, 3, CLAIM_WINDOW_SECONDS, "transient")
+            .await
+            .unwrap();
+        let after_2: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_2.payout_attempts, 2);
+
+        // Third failure hits `max_retries` (3) inside the window → re-arm.
+        on_send_payment_failure(&pool, &after_2, 3, CLAIM_WINDOW_SECONDS, "transient")
+            .await
+            .unwrap();
+        let after_3: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Re-armed back into the invoice-request sub-phase, NOT Failed.
+        assert_eq!(after_3.state, BondState::PendingPayout.to_string());
+        assert!(after_3.payout_invoice.is_none());
+        assert!(after_3.payout_routing_fee_sats.is_none());
+        assert!(after_3.payout_payment_hash.is_none());
+        assert!(after_3.last_invoice_request_at.is_none());
+        assert_eq!(after_3.payout_attempts, 0);
+        // Forfeit anchor untouched: the deadline must not move.
+        assert_eq!(after_3.slashed_at, Some(slashed_at));
+        // Nudge counter is bounded by the forfeit window, not the retry
+        // budget, so it is preserved across the re-prompt.
+        assert_eq!(after_3.invoice_request_attempts, 1);
     }
 
     #[tokio::test]
@@ -1981,9 +2185,13 @@ mod tests {
         // Drive back to Failed via three consecutive send_payment
         // failures with retry budget = 3. Each call re-reads the row
         // so the counter math is exercised against fresh state.
+        // `claim_window_seconds = 0` forces the out-of-window branch so
+        // exhaustion terminates in `Failed` (Phase 4.5: an in-window
+        // exhaustion would re-arm instead) — here we want a `Failed` row
+        // to feed the second resurrection.
         let mut current = bond_after_b;
         for _ in 0..3 {
-            on_send_payment_failure(&pool, &current, 3, "transient")
+            on_send_payment_failure(&pool, &current, 3, 0, "transient")
                 .await
                 .unwrap();
             current = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")

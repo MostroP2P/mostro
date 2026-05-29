@@ -115,20 +115,29 @@ async fn send_restore_session_response(
     match find_failed_payment_for_master_key(&pool, master_key).await {
         Ok(failed_orders) => {
             for order in failed_orders {
-                if let Ok(buyer_pubkey) = order.get_buyer_pubkey() {
-                    enqueue_order_msg(
-                        None,
-                        Some(order.id),
-                        Action::AddInvoice,
-                        Some(Payload::Order(SmallOrder::from(order.clone()))),
-                        buyer_pubkey,
-                        None,
-                    )
-                    .await;
-                    tracing::info!(
-                        "Re-sent AddInvoice for order {} on restore-session (failed payment)",
-                        order.id
-                    );
+                match order.get_buyer_pubkey() {
+                    Ok(buyer_pubkey) => {
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            Action::AddInvoice,
+                            Some(Payload::Order(SmallOrder::from(order.clone()))),
+                            buyer_pubkey,
+                            None,
+                        )
+                        .await;
+                        tracing::info!(
+                            "Re-sent AddInvoice for order {} on restore-session (failed payment)",
+                            order.id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipped re-sending AddInvoice for order {} (buyer_pubkey unavailable): {}",
+                            order.id,
+                            e
+                        );
+                    }
                 }
             }
         }

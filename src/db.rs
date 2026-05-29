@@ -575,6 +575,10 @@ pub async fn find_failed_payment_for_master_key(
     pool: &SqlitePool,
     master_key: &str,
 ) -> Result<Vec<Order>, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
     let orders = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -1795,6 +1799,33 @@ mod tests {
         assert!(
             result.is_empty(),
             "Should not return orders where failed_payment is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_failed_payment_for_master_key_ignores_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    master_buyer_pubkey)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    1, 3, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&master_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result = super::find_failed_payment_for_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not return orders with wrong status"
         );
     }
 

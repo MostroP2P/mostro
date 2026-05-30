@@ -138,20 +138,22 @@ async fn job_info_event_send(ctx: AppContext) {
     let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
-    let ln_status = LN_STATUS.get().unwrap();
     tokio::spawn(async move {
         loop {
-            info!("Sending info about mostro");
+            // LN_STATUS is absent in Cashu mode; skip the info event.
+            if let Some(ln_status) = LN_STATUS.get() {
+                info!("Sending info about mostro");
 
-            let tags = crate::nip33::info_to_tags(ln_status);
-            let id = mostro_keys.public_key().to_string();
+                let tags = crate::nip33::info_to_tags(ln_status);
+                let id = mostro_keys.public_key().to_string();
 
-            let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
-                Ok(info) => info,
-                Err(e) => return error!("{e}"),
-            };
+                let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
+                    Ok(info) => info,
+                    Err(e) => return error!("{e}"),
+                };
 
-            let _ = client.send_event(&info_ev).await;
+                let _ = client.send_event(&info_ev).await;
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }

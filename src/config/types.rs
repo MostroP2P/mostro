@@ -179,6 +179,7 @@ pub struct CashuSettings {
     #[serde(default)]
     pub enabled: bool,
     /// URL of the Cashu mint all trades on this node will use.
+    #[serde(default)]
     pub mint_url: String,
 }
 

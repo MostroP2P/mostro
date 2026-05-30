@@ -15,7 +15,7 @@ pub mod scheduler;
 pub mod util;
 
 use crate::app::context::AppContext;
-use crate::app::run;
+use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
@@ -123,6 +123,30 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Build AppContext and start the scheduler before mode-specific init so
+    // both Lightning and Cashu paths share the same context.
+    let settings = Arc::new(
+        MOSTRO_CONFIG
+            .get()
+            .expect("MOSTRO_CONFIG not initialized")
+            .clone(),
+    );
+    let ctx = AppContext::new(
+        get_db_pool(),
+        client.clone(),
+        settings,
+        MESSAGE_QUEUES.queue_order_msg.clone(),
+        mostro_keys.clone(),
+    );
+
+    start_scheduler(ctx.clone()).await;
+
+    if Settings::is_cashu_enabled() {
+        tracing::info!("Starting in Cashu escrow mode (LND not required)");
+        return run_cashu(ctx).await;
+    }
+
+    // Lightning mode: initialize LND connector and run the Lightning event loop.
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;
     let ln_status = LnStatus::from_get_info_response(ln_status);
@@ -164,25 +188,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Build AppContext explicitly with all dependencies
-    let settings = Arc::new(
-        MOSTRO_CONFIG
-            .get()
-            .expect("MOSTRO_CONFIG not initialized")
-            .clone(),
-    );
-    let ctx = AppContext::new(
-        get_db_pool(),
-        client.clone(),
-        settings,
-        MESSAGE_QUEUES.queue_order_msg.clone(),
-        mostro_keys.clone(),
-    );
-
-    // Start scheduler for tasks
-    start_scheduler(ctx.clone()).await;
-
-    // Run the Mostro and be happy!!
     run(ctx, &mut ln_client).await
 }
 

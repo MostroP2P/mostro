@@ -1,7 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    AntiAbuseBondSettings, DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings,
-    NostrSettings, RpcSettings,
+    AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
+    LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,11 @@ pub struct Settings {
     /// Phase 1's migration).
     #[serde(default)]
     pub price: Option<PriceSettings>,
+    /// Cashu 2-of-3 multisig escrow (see `docs/CASHU_ESCROW_ARCHITECTURE.md`).
+    /// Absent section ≡ Lightning mode. Mutually exclusive with
+    /// `anti_abuse_bond`.
+    #[serde(default)]
+    pub cashu: Option<CashuSettings>,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -115,5 +120,31 @@ impl Settings {
     /// `false` when settings haven't been initialized.
     pub fn is_bond_enabled() -> bool {
         Self::get_bond().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// Retrieve the Cashu escrow configuration from the global
+    /// `MOSTRO_CONFIG`. Returns `None` when the `[cashu]` block is absent
+    /// (treated as Lightning mode) and also when the global settings haven't
+    /// been initialized yet — never panics.
+    pub fn get_cashu() -> Option<&'static CashuSettings> {
+        MOSTRO_CONFIG.get()?.cashu.as_ref()
+    }
+
+    /// True when the `[cashu]` block is present AND `enabled = true`. This
+    /// is the single gate for Cashu-mode code paths. Returns `false` when
+    /// settings haven't been initialized.
+    pub fn is_cashu_enabled() -> bool {
+        Self::get_cashu().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// Resolves the active escrow mode from configuration. Returns
+    /// `EscrowMode::Cashu` only when Cashu is explicitly enabled; defaults
+    /// to `EscrowMode::Lightning` in every other case.
+    pub fn escrow_mode() -> EscrowMode {
+        if Self::is_cashu_enabled() {
+            EscrowMode::Cashu
+        } else {
+            EscrowMode::Lightning
+        }
     }
 }

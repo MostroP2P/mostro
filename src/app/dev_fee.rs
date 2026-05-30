@@ -1051,6 +1051,7 @@ mod tests {
             expiration: Some(Default::default()),
             anti_abuse_bond: None,
             price: None,
+            cashu: None,
         });
     }
 

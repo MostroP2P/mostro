@@ -395,6 +395,116 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     }
 }
 
+/// Cashu-mode event loop. Mirrors `run()` but without an LND client — all
+/// actions are routed through `handle_message_action_no_ln`. Actions that
+/// require LND (Release, Cancel, AdminCancel, AdminSettle) fall through to
+/// its `_` arm and are logged/ignored until the EscrowBackend abstraction
+/// lands in F3 and wires up proper Cashu dispatch.
+pub async fn run_cashu(ctx: AppContext) -> Result<()> {
+    let my_keys = ctx.keys();
+    let client = ctx.nostr_client();
+    let pow = ctx.settings().mostro.pow;
+
+    loop {
+        let mut notifications = client.notifications();
+
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                if !event.check_pow(pow) {
+                    tracing::info!("Not POW verified event!");
+                    continue;
+                }
+                if let Kind::GiftWrap = event.kind {
+                    if event.verify().is_err() {
+                        tracing::warn!("Error in event verification")
+                    };
+
+                    let unwrapped = match unwrap_message(&event, my_keys).await {
+                        Ok(Some(u)) => u,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::warn!("Error unwrapping NIP-59 message: {}", e);
+                            continue;
+                        }
+                    };
+                    let since_time = chrono::Utc::now()
+                        .checked_sub_signed(chrono::Duration::seconds(10))
+                        .unwrap()
+                        .timestamp() as u64;
+                    if unwrapped.created_at.as_secs() < since_time {
+                        continue;
+                    }
+                    let message = unwrapped.message.clone();
+
+                    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+                        tracing::warn!(
+                            "Missing inner signature: identity {} differs from trade key {}",
+                            unwrapped.identity,
+                            unwrapped.sender
+                        );
+                        continue;
+                    }
+
+                    let inner_message = message.get_inner_message_kind();
+                    if let Err(e) = check_trade_index(&ctx, &unwrapped, &message).await {
+                        tracing::warn!("Error checking trade index: {}", e);
+                        continue;
+                    }
+
+                    if inner_message.verify() {
+                        if let Some(action) = message.inner_action() {
+                            // Escrow-dependent actions are not yet wired for
+                            // Cashu mode (F4). Return CantDo so the peer gets
+                            // a clear error instead of a cryptic LND failure.
+                            let result = match action {
+                                // No escrow backend wired in F2: reject all
+                                // trade actions so peers get a clear error
+                                // rather than orders that can never be filled
+                                // or cancelled.
+                                Action::NewOrder
+                                | Action::TakeSell
+                                | Action::TakeBuy
+                                | Action::AddInvoice
+                                | Action::Release
+                                | Action::Cancel
+                                | Action::AdminCancel
+                                | Action::AdminSettle => {
+                                    Err(MostroError::MostroCantDo(CantDoReason::InvalidAction)
+                                        .into())
+                                }
+                                _ => {
+                                    handle_message_action_no_ln(
+                                        &action,
+                                        message.clone(),
+                                        &unwrapped,
+                                        my_keys,
+                                        &ctx,
+                                    )
+                                    .await
+                                }
+                            };
+                            if let Err(e) = result {
+                                match e.downcast::<MostroError>() {
+                                    Ok(err) => {
+                                        manage_errors(*err, message, unwrapped, &action).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Unexpected error type: {}", e);
+                                        warning_msg(
+                                            &action,
+                                            ServiceError::UnexpectedError(e.to_string()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

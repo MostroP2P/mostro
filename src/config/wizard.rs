@@ -9,7 +9,7 @@ use nostr_sdk::prelude::*;
 use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
 use super::settings::Settings;
 use super::types::{
-    DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    CashuSettings, DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 
 const TEMPLATE_BYTES: &[u8] = include_bytes!("../../settings.tpl.toml");
@@ -53,9 +53,27 @@ pub fn run_setup_menu(
 }
 
 fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Settings, MostroError> {
-    println!("\n--- Lightning (LND) Configuration ---\n");
+    println!("\n--- Escrow Mode ---\n");
 
-    let lightning = prompt_lightning_settings()?;
+    let mode_choices = &[
+        "Lightning (LND hold invoices — default)",
+        "Cashu (ecash 2-of-3, no LND required)",
+    ];
+    let mode_selection = Select::new()
+        .with_prompt("Escrow mode")
+        .items(mode_choices)
+        .default(0)
+        .interact()
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    let (lightning, cashu) = if mode_selection == 0 {
+        println!("\n--- Lightning (LND) Configuration ---\n");
+        (prompt_lightning_settings()?, None)
+    } else {
+        println!("\n--- Cashu Mint Configuration ---\n");
+        let cashu = prompt_cashu_settings()?;
+        (LightningSettings::default(), Some(cashu))
+    };
 
     println!("\n--- Nostr Configuration ---\n");
 
@@ -74,6 +92,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         expiration: None,
         anti_abuse_bond: None,
         price: None,
+        cashu,
     };
 
     let toml_content = toml::to_string_pretty(&settings)
@@ -314,6 +333,19 @@ fn prompt_mostro_settings() -> Result<MostroSettings, MostroError> {
     })
 }
 
+fn prompt_cashu_settings() -> Result<CashuSettings, MostroError> {
+    let mint_url: String = Input::new()
+        .with_prompt("Cashu mint URL (http or https)")
+        .validate_with(|input: &String| validate_mint_url(input))
+        .interact_text()
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    Ok(CashuSettings {
+        enabled: true,
+        mint_url,
+    })
+}
+
 // --- Validation helpers ---
 
 pub fn validate_file_exists(path: &str) -> Result<(), String> {
@@ -341,6 +373,18 @@ pub fn validate_nsec(input: &str) -> Result<(), String> {
     Keys::parse(input.trim())
         .map(|_| ())
         .map_err(|e| format!("Invalid nsec key: {}", e))
+}
+
+pub fn validate_mint_url(input: &str) -> Result<(), String> {
+    let parsed =
+        nostr_sdk::Url::parse(input.trim()).map_err(|_| format!("Invalid URL: {}", input))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!(
+            "Mint URL must use http or https, got: {}",
+            parsed.scheme()
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_relays(input: &str) -> Result<(), String> {

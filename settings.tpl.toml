@@ -111,3 +111,12 @@ port = 50051
 # # Days the winner has to claim their share by submitting a bolt11; after
 # # this the bond closes as `forfeited` and the node retains everything.
 # payout_claim_window_days = 15
+
+# Cashu 2-of-3 multisig escrow (alternative to Lightning hold invoices).
+# Opt-in, disabled by default. Mutually exclusive with [anti_abuse_bond].
+# When enabled, the node operates in Cashu mode and does not require LND.
+# See docs/CASHU_ESCROW_ARCHITECTURE.md for the full phased rollout.
+#
+# [cashu]
+# enabled = false
+# mint_url = "https://mint.example.com"

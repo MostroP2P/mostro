@@ -68,6 +68,35 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
         ))));
     }
 
+    // Cashu + anti_abuse_bond are mutually exclusive (design decision #5).
+    let cashu_on = settings.cashu.as_ref().is_some_and(|c| c.enabled);
+    let bond_on = settings.anti_abuse_bond.as_ref().is_some_and(|b| b.enabled);
+    if cashu_on && bond_on {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "cashu and anti_abuse_bond cannot both be enabled".to_string(),
+        )));
+    }
+
+    if let Some(cashu) = settings.cashu.as_ref().filter(|c| c.enabled) {
+        if cashu.mint_url.is_empty() {
+            return Err(MostroInternalErr(ServiceError::IOError(
+                "cashu.mint_url must not be empty when cashu is enabled".to_string(),
+            )));
+        }
+        let parsed = nostr_sdk::Url::parse(&cashu.mint_url).map_err(|_| {
+            MostroInternalErr(ServiceError::IOError(format!(
+                "cashu.mint_url is not a valid URL: {}",
+                cashu.mint_url
+            )))
+        })?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(MostroInternalErr(ServiceError::IOError(format!(
+                "cashu.mint_url must use http or https, got: {}",
+                parsed.scheme()
+            ))));
+        }
+    }
+
     Ok(())
 }
 
@@ -200,6 +229,7 @@ mod tests {
             expiration: None,
             anti_abuse_bond: None,
             price: None,
+            cashu: None,
         }
     }
 
@@ -271,5 +301,88 @@ mod tests {
             toml::from_str(toml_without_nsec).expect("nsec_privkey should be optional in TOML");
         assert_eq!(nostr.nsec_privkey, "");
         assert_eq!(nostr.relays, vec!["wss://relay.test"]);
+    }
+}
+
+#[cfg(test)]
+mod cashu_validation_tests {
+    use super::*;
+    use crate::config::types::{
+        AntiAbuseBondSettings, CashuSettings, DatabaseSettings, LightningSettings, MostroSettings,
+        NostrSettings, RpcSettings,
+    };
+
+    fn base_settings() -> Settings {
+        Settings {
+            database: DatabaseSettings::default(),
+            lightning: LightningSettings::default(),
+            nostr: NostrSettings {
+                nsec_privkey: String::new(),
+                relays: vec!["wss://relay.test".to_string()],
+            },
+            mostro: MostroSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: None,
+            anti_abuse_bond: None,
+            price: None,
+            cashu: None,
+        }
+    }
+
+    #[test]
+    fn cashu_valid_config_passes() {
+        let mut s = base_settings();
+        s.cashu = Some(CashuSettings {
+            enabled: true,
+            mint_url: "https://mint.example.com".to_string(),
+        });
+        assert!(validate_mostro_settings(&s).is_ok());
+    }
+
+    #[test]
+    fn cashu_and_bond_both_enabled_rejected() {
+        let mut s = base_settings();
+        s.cashu = Some(CashuSettings {
+            enabled: true,
+            mint_url: "https://mint.example.com".to_string(),
+        });
+        s.anti_abuse_bond = Some(AntiAbuseBondSettings {
+            enabled: true,
+            ..AntiAbuseBondSettings::default()
+        });
+        let err = validate_mostro_settings(&s).expect_err("must be rejected");
+        assert!(err.to_string().contains("cashu and anti_abuse_bond"));
+    }
+
+    #[test]
+    fn cashu_empty_mint_url_rejected() {
+        let mut s = base_settings();
+        s.cashu = Some(CashuSettings {
+            enabled: true,
+            mint_url: String::new(),
+        });
+        let err = validate_mostro_settings(&s).expect_err("empty URL must be rejected");
+        assert!(err.to_string().contains("mint_url must not be empty"));
+    }
+
+    #[test]
+    fn cashu_invalid_url_scheme_rejected() {
+        let mut s = base_settings();
+        s.cashu = Some(CashuSettings {
+            enabled: true,
+            mint_url: "ftp://mint.example.com".to_string(),
+        });
+        let err = validate_mostro_settings(&s).expect_err("non-http URL must be rejected");
+        assert!(err.to_string().contains("http or https"));
+    }
+
+    #[test]
+    fn cashu_disabled_skips_url_validation() {
+        let mut s = base_settings();
+        s.cashu = Some(CashuSettings {
+            enabled: false,
+            mint_url: String::new(),
+        });
+        assert!(validate_mostro_settings(&s).is_ok());
     }
 }

@@ -158,6 +158,31 @@ impl Default for AntiAbuseBondSettings {
     }
 }
 
+/// Selects the escrow backend for this node. Resolved from `[cashu].enabled`
+/// at startup; defaults to `Lightning` when the `[cashu]` block is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EscrowMode {
+    #[default]
+    Lightning,
+    Cashu,
+}
+
+/// Cashu 2-of-3 multisig escrow configuration.
+///
+/// Opt-in. When `enabled = false` (the default) every code path added by this
+/// feature remains inert — existing orders behave exactly as before. Mutually
+/// exclusive with `[anti_abuse_bond]`; the daemon refuses to start if both are
+/// enabled. See `docs/CASHU_ESCROW_ARCHITECTURE.md` for the full spec.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct CashuSettings {
+    /// Master switch. When false, Lightning escrow is used.
+    #[serde(default)]
+    pub enabled: bool,
+    /// URL of the Cashu mint all trades on this node will use.
+    #[serde(default)]
+    pub mint_url: String,
+}
+
 /// Event expiration configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExpirationSettings {
@@ -572,5 +597,40 @@ payout_claim_window_days = 30"#,
         // Other fields on the same block must still deserialize correctly.
         assert_eq!(parsed.anti_abuse_bond.slash_node_share_pct, 0.25);
         assert_eq!(parsed.anti_abuse_bond.payout_claim_window_days, 30);
+    }
+}
+
+#[cfg(test)]
+mod cashu_settings_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Stub {
+        cashu: Option<CashuSettings>,
+    }
+
+    #[test]
+    fn toml_cashu_absent_defaults_to_none() {
+        let parsed: Stub = toml::from_str("").expect("empty toml is valid");
+        assert!(parsed.cashu.is_none());
+    }
+
+    #[test]
+    fn toml_cashu_disabled_by_default() {
+        let parsed: Stub = toml::from_str("[cashu]\nmint_url = \"https://mint.example.com\"")
+            .expect("minimal block parses");
+        let cashu = parsed.cashu.expect("cashu block present");
+        assert!(!cashu.enabled);
+        assert_eq!(cashu.mint_url, "https://mint.example.com");
+    }
+
+    #[test]
+    fn toml_cashu_minimal_block_enabled() {
+        let parsed: Stub =
+            toml::from_str("[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"")
+                .expect("minimal enabled block parses");
+        let cashu = parsed.cashu.expect("cashu block present");
+        assert!(cashu.enabled);
+        assert_eq!(cashu.mint_url, "https://mint.example.com");
     }
 }

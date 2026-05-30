@@ -457,7 +457,12 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                             // Cashu mode (F4). Return CantDo so the peer gets
                             // a clear error instead of a cryptic LND failure.
                             let result = match action {
-                                Action::TakeSell
+                                // No escrow backend wired in F2: reject all
+                                // trade actions so peers get a clear error
+                                // rather than orders that can never be filled
+                                // or cancelled.
+                                Action::NewOrder
+                                | Action::TakeSell
                                 | Action::TakeBuy
                                 | Action::AddInvoice
                                 | Action::Release

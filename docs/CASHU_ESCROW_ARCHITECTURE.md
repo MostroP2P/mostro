@@ -55,10 +55,11 @@ sequenceDiagram
     M->>S: Notify: Check your bank
 
     Note over S,B: 4. RELEASE (Happy Path)
-    S->>M: Sign inputs (Sig 1)
-    M->>B: Forward Seller's Signature
+    S->>B: Direct Nostr DM: Seller's Signature (Sig 1)
+    S->>M: Notify: "I have released the funds" (State Update)
     B->>Mint: Submit SwapRequest (Sig 1 + Sig 2)
     Mint-->>B: Unencumbered ecash issued to Buyer
+    B->>M: Notify: "Trade complete" (State Update)
 ```
 
 ## Action Changes & Handlers
@@ -68,8 +69,8 @@ The introduction of Cashu Escrow modifies the responsibility of core action hand
 | Action | Proposed Handler Mod | Responsibility |
 | --- | --- | --- |
 | `add-invoice` | `src/app/add_invoice.rs` | Instead of creating a hold invoice, validates the submitted Cashu token using `cdk`, verifies the 2-of-3 spending condition, and calls the Mint API to ensure funds exist. |
-| `release` | `src/app/release.rs` | Instead of resolving an HTLC, Mostro simply accepts the Seller's cryptographic signature, appends it to the trade state, and relays the signature to the Buyer. |
-| `cancel` | `src/app/cancel.rs` | If a trade is canceled cooperatively, the Buyer provides their signature to the Seller so the Seller can reclaim the locked ecash. |
+| `release` | `src/app/release.rs` | Instead of acting as the middleman for signatures, Mostro simply receives the state update notification from the Seller. The cryptographic signature is sent directly to the Buyer via a P2P Nostr Direct Message (NIP-59) using the trade's ephemeral keys. |
+| `cancel` | `src/app/cancel.rs` | If a trade is canceled cooperatively, the Buyer provides their signature directly to the Seller (via NIP-59 DM) so the Seller can reclaim the locked ecash, bypassing Mostro's servers. |
 | `admin-settle` | `src/app/admin_settle.rs` | (Dispute Resolution) Mostro generates its signature ($P_M$) and hands it to the Buyer, allowing the Buyer to construct a valid 2-of-3 SwapRequest. |
 | `admin-cancel` | `src/app/admin_cancel.rs` | (Dispute Resolution) Mostro generates its signature ($P_M$) and hands it to the Seller, allowing the Seller to reclaim their funds. |
 

@@ -453,15 +453,26 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 
                     if inner_message.verify() {
                         if let Some(action) = message.inner_action() {
-                            if let Err(e) = handle_message_action_no_ln(
-                                &action,
-                                message.clone(),
-                                &unwrapped,
-                                my_keys,
-                                &ctx,
-                            )
-                            .await
-                            {
+                            // Escrow-dependent actions are not yet wired for
+                            // Cashu mode (F4). Return CantDo so the peer gets
+                            // a clear error instead of a cryptic LND failure.
+                            let result = match action {
+                                Action::TakeSell | Action::TakeBuy | Action::AddInvoice => {
+                                    Err(MostroError::MostroCantDo(CantDoReason::InvalidAction)
+                                        .into())
+                                }
+                                _ => {
+                                    handle_message_action_no_ln(
+                                        &action,
+                                        message.clone(),
+                                        &unwrapped,
+                                        my_keys,
+                                        &ctx,
+                                    )
+                                    .await
+                                }
+                            };
+                            if let Err(e) = result {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {
                                         manage_errors(*err, message, unwrapped, &action).await;

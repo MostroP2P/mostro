@@ -614,6 +614,9 @@ async fn job_update_bitcoin_prices() {
 /// All state-machine logic lives in [`crate::app::dev_fee`].
 #[mutants::skip]
 async fn job_process_dev_fee_payment(ctx: AppContext) {
+    if Settings::is_cashu_enabled() {
+        return;
+    }
     let interval = 60u64;
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
@@ -647,6 +650,9 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
 /// negligible.
 #[mutants::skip]
 async fn job_process_bond_payouts(ctx: AppContext) {
+    if Settings::is_cashu_enabled() {
+        return;
+    }
     let interval = 60u64;
 
     tokio::spawn(async move {

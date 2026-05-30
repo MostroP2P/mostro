@@ -229,6 +229,36 @@ pub async fn release_action(
         )
         .await;
 
+        // Generate and send PM signatures to the buyer "just in case" the seller forgot
+        // to send their own signature to the buyer via NIP-59 DM.
+        let mut pm_signatures = Vec::new();
+        let token_str = order.cashu_escrow_token.as_ref().unwrap();
+        if let Ok(token) = cdk::nuts::Token::from_str(token_str) {
+            let secrets = token.token_secrets();
+            if let Ok(p_m_secret) = cdk::nuts::nut01::SecretKey::from_str(&my_keys.secret_key().to_secret_hex()) {
+                for secret in secrets {
+                    let msg = secret.to_bytes();
+                    if let Ok(sig) = p_m_secret.sign(&msg) {
+                        pm_signatures.push(mostro_core::message::CashuProofSignature::new(
+                            secret.to_string(),
+                            sig.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        
+        if !pm_signatures.is_empty() {
+            enqueue_order_msg(
+                request_id,
+                Some(order.id),
+                Action::CashuPmSignature,
+                Some(Payload::CashuSignatures(pm_signatures)),
+                buyer_pubkey,
+                None,
+            ).await;
+        }
+
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
             request_id,

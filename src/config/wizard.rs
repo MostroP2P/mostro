@@ -376,8 +376,8 @@ pub fn validate_nsec(input: &str) -> Result<(), String> {
 }
 
 pub fn validate_mint_url(input: &str) -> Result<(), String> {
-    let parsed = nostr_sdk::Url::parse(input.trim())
-        .map_err(|_| format!("Invalid URL: {}", input))?;
+    let parsed =
+        nostr_sdk::Url::parse(input.trim()).map_err(|_| format!("Invalid URL: {}", input))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!(
             "Mint URL must use http or https, got: {}",

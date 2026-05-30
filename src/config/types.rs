@@ -173,22 +173,13 @@ pub enum EscrowMode {
 /// feature remains inert — existing orders behave exactly as before. Mutually
 /// exclusive with `[anti_abuse_bond]`; the daemon refuses to start if both are
 /// enabled. See `docs/CASHU_ESCROW_ARCHITECTURE.md` for the full spec.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct CashuSettings {
     /// Master switch. When false, Lightning escrow is used.
     #[serde(default)]
     pub enabled: bool,
     /// URL of the Cashu mint all trades on this node will use.
     pub mint_url: String,
-}
-
-impl Default for CashuSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mint_url: String::new(),
-        }
-    }
 }
 
 /// Event expiration configuration settings
@@ -634,10 +625,9 @@ mod cashu_settings_tests {
 
     #[test]
     fn toml_cashu_minimal_block_enabled() {
-        let parsed: Stub = toml::from_str(
-            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"",
-        )
-        .expect("minimal enabled block parses");
+        let parsed: Stub =
+            toml::from_str("[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"")
+                .expect("minimal enabled block parses");
         let cashu = parsed.cashu.expect("cashu block present");
         assert!(cashu.enabled);
         assert_eq!(cashu.mint_url, "https://mint.example.com");

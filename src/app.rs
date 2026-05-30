@@ -453,9 +453,14 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 
                     if inner_message.verify() {
                         if let Some(action) = message.inner_action() {
-                            if let Err(e) =
-                                handle_message_action_no_ln(&action, message.clone(), &unwrapped, my_keys, &ctx)
-                                    .await
+                            if let Err(e) = handle_message_action_no_ln(
+                                &action,
+                                message.clone(),
+                                &unwrapped,
+                                my_keys,
+                                &ctx,
+                            )
+                            .await
                             {
                                 match e.downcast::<MostroError>() {
                                     Ok(err) => {

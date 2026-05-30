@@ -70,10 +70,7 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
 
     // Cashu + anti_abuse_bond are mutually exclusive (design decision #5).
     let cashu_on = settings.cashu.as_ref().is_some_and(|c| c.enabled);
-    let bond_on = settings
-        .anti_abuse_bond
-        .as_ref()
-        .is_some_and(|b| b.enabled);
+    let bond_on = settings.anti_abuse_bond.as_ref().is_some_and(|b| b.enabled);
     if cashu_on && bond_on {
         return Err(MostroInternalErr(ServiceError::IOError(
             "cashu and anti_abuse_bond cannot both be enabled".to_string(),

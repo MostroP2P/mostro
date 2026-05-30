@@ -246,6 +246,7 @@ Runs alongside the tracks and closes the milestone:
 
 - End-to-end happy-path and dispute trades on the F6 mint; cross-track wiring once A+B (and then C, D) land.
 - Mint-unavailable handling and retries; idempotency on resubmitted tokens; `restore_session` for in-flight Cashu orders; expiry/timeout for un-locked escrows.
+- **Daemon-driven timeout cancel through the escrow seam.** `scheduler.rs`'s `job_cancel_orders` currently returns locked trade funds to the seller by calling `LndConnector::cancel_hold_invoice` directly. That bypasses `EscrowBackend` and is Lightning-only, so a Cashu order hitting the same timeout would not be handled correctly. Route this path through `EscrowBackend::cooperative_cancel` so daemon-initiated timeout refunds work for either backend. Deliberately left out of F3 (which is behavior-preserving and scoped to the user-facing `take_*`/`add_invoice`/`release`/`cancel`/`admin_*` call sites) and distinct from Track C, which only owns `cancel.rs`'s user-initiated branch.
 - Enforce and test the bonds-vs-Cashu mutual exclusion end to end.
 - Operator docs: enabling Cashu mode, choosing a mint, the trust model, and migration/runbook notes.
 

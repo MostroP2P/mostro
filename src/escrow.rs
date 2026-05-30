@@ -22,8 +22,24 @@
 
 use crate::lightning::LndConnector;
 use async_trait::async_trait;
-use fedimint_tonic_lnd::invoicesrpc::AddHoldInvoiceResp;
 use mostro_core::prelude::*;
+
+/// Backend-agnostic result of opening an escrow "lock".
+///
+/// For Lightning this carries the hold invoice: `payment_request` is the BOLT11
+/// string the counterparty pays, and `(preimage, hash)` identify and later
+/// settle it. Keeping this struct (rather than LND's `AddHoldInvoiceResp`) out
+/// of the trait keeps `fedimint-tonic-lnd` out of the escrow contract, so a
+/// non-Lightning backend can implement `EscrowBackend` without depending on it.
+#[derive(Debug, Clone)]
+pub struct HoldInvoice {
+    /// BOLT11 invoice the counterparty pays (Lightning).
+    pub payment_request: String,
+    /// Preimage that releases the locked funds.
+    pub preimage: Vec<u8>,
+    /// Payment hash identifying the escrow.
+    pub hash: Vec<u8>,
+}
 
 /// The escrow operations the order-action handlers depend on.
 ///
@@ -40,7 +56,7 @@ pub trait EscrowBackend: Send {
         &mut self,
         description: &str,
         amount: i64,
-    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError>;
+    ) -> Result<HoldInvoice, MostroError>;
 
     /// Release escrowed funds to the buyer.
     ///
@@ -62,8 +78,14 @@ impl EscrowBackend for LndConnector {
         &mut self,
         description: &str,
         amount: i64,
-    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
-        LndConnector::create_hold_invoice(self, description, amount).await
+    ) -> Result<HoldInvoice, MostroError> {
+        let (resp, preimage, hash) =
+            LndConnector::create_hold_invoice(self, description, amount).await?;
+        Ok(HoldInvoice {
+            payment_request: resp.payment_request,
+            preimage,
+            hash,
+        })
     }
 
     async fn settle_hold_invoice(&mut self, preimage: &str) -> Result<(), MostroError> {
@@ -93,7 +115,7 @@ impl EscrowBackend for CashuBackend {
         &mut self,
         _description: &str,
         _amount: i64,
-    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
+    ) -> Result<HoldInvoice, MostroError> {
         unimplemented!("Cashu escrow lock is implemented in the Cashu lock track")
     }
 

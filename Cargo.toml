@@ -41,7 +41,6 @@ pre-release-hook = [
 
 
 [dependencies]
-cdk = { version = "0.16", default-features = false }
 mutants = "0.0.3" # For #[mutants::skip] annotations
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
@@ -86,6 +85,8 @@ clearscreen = "4.0.1"
 tonic = "0.14.2"
 prost = "0.14.1"
 tonic-prost = "0.14.1"
+cdk = { version = "0.16.0", features = ["mint", "nostr", "wallet"] }
+cdk-http-client = "0.16.0"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }

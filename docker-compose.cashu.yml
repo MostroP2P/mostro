@@ -1,0 +1,27 @@
+# Local Cashu test mint for integration tests (F6 harness).
+#
+# Runs nutshell with the FakeWallet backend, so no real Lightning node is
+# needed. Mirrors the `cashu-mint` CI job in .github/workflows/ci.yml.
+#
+# Usage:
+#   docker compose -f docker-compose.cashu.yml up -d
+#   CASHU_TEST_MINT_URL=http://localhost:3338 cargo test --test cashu_mint
+#   docker compose -f docker-compose.cashu.yml down
+services:
+  cashu-mint:
+    image: cashubtc/nutshell:0.20.0
+    command: poetry run mint
+    ports:
+      - "3338:3338"
+    environment:
+      MINT_BACKEND_BOLT11_SAT: FakeWallet
+      MINT_LISTEN_HOST: 0.0.0.0
+      MINT_LISTEN_PORT: "3338"
+      MINT_PRIVATE_KEY: TEST_PRIVATE_KEY
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c 'import urllib.request; urllib.request.urlopen("http://localhost:3338/v1/info")'
+      interval: 5s
+      timeout: 3s
+      retries: 12

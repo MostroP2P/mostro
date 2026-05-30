@@ -4,10 +4,10 @@ use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
+use crate::escrow::EscrowBackend;
 use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::lightning::LndConnector;
 use crate::lnurl::HTTP_CLIENT;
 use crate::messages;
 use crate::models::Yadio;
@@ -1036,7 +1036,7 @@ pub async fn rate_counterpart(
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
     event: &UnwrappedMessage,
-    ln_client: &mut LndConnector,
+    ln_client: &mut dyn EscrowBackend,
     action: Action,
     is_admin: bool,
     order: &Order,

@@ -2,10 +2,10 @@ use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::do_payment;
-use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::price::PriceManager;
 use crate::util;
 use crate::LN_STATUS;
 use crate::{Keys, PublicKey};
@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
@@ -576,14 +576,24 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
 
 async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
-        let mostro_settings = Settings::get_mostro();
-        let configured_interval = mostro_settings.exchange_rates_update_interval_seconds;
+        let Some(manager) = PriceManager::global() else {
+            // Defensive: `main` installs the manager before the scheduler
+            // is started. If that ever changes (or an embedding binary
+            // skips installation) this job must not panic — every other
+            // job keeps running.
+            error!("price: PriceManager not installed; skipping bitcoin price job");
+            return;
+        };
+        let configured_interval = manager.settings().update_interval_seconds;
 
-        // Validate interval: minimum 60 seconds to avoid API rate limits
+        // Validate interval: minimum 60 seconds to avoid API rate limits.
+        // Keeps the legacy guard's behaviour now that the interval moves
+        // from `[mostro].exchange_rates_update_interval_seconds` to
+        // `[price].update_interval_seconds` (spec §10.1).
         const MIN_INTERVAL: u64 = 60;
         let update_interval = if configured_interval < MIN_INTERVAL {
             error!(
-                "exchange_rates_update_interval_seconds too low: {}s (minimum: {}s). Using minimum.",
+                "price: update_interval_seconds too low: {}s (minimum: {}s). Using minimum.",
                 configured_interval, MIN_INTERVAL
             );
             MIN_INTERVAL
@@ -598,8 +608,32 @@ async fn job_update_bitcoin_prices() {
 
         loop {
             info!("Updating Bitcoin prices");
-            if let Err(e) = BitcoinPriceManager::update_prices().await {
-                error!("Failed to update Bitcoin prices: {}", e);
+            let report = manager.update_all().await;
+            // PriceManager already logs each provider's outcome per tick.
+            // The scheduler only surfaces the **outage** condition — every
+            // provider failed — because that's the moment ops cares about:
+            // the store is now reading last-known-good across the board.
+            if report.successes.is_empty() && !report.failures.is_empty() {
+                let failed: Vec<String> = report
+                    .failures
+                    .iter()
+                    .map(|(id, msg)| format!("{id}={msg}"))
+                    .collect();
+                error!(
+                    "price: all {} providers failed this tick — serving last-known-good [{}]",
+                    report.failures.len(),
+                    failed.join(", ")
+                );
+            } else if !report.failures.is_empty() {
+                // Partial outage: at least one provider failed but others
+                // covered. A summary at warn is enough; per-provider info
+                // is already in the manager's per-provider logs.
+                warn!(
+                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    report.failures.len(),
+                    report.failures.len() + report.successes.len(),
+                    report.fresh_currencies
+                );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
         }

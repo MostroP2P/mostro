@@ -1382,6 +1382,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(include_str!(
+            "../migrations/20260530120000_cashu_escrow_fields.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
 
         pool
     }

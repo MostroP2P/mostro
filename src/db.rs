@@ -1356,7 +1356,10 @@ mod tests {
                 next_trade_index integer default 0,
                 dev_fee integer default 0,
                 dev_fee_paid integer not null default 0,
-                dev_fee_payment_hash char(64)
+                dev_fee_payment_hash char(64),
+                cashu_mint_url text,
+                cashu_escrow_token text,
+                cashu_escrow_locked_at integer
             )
             "#,
         )

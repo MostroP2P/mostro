@@ -50,14 +50,14 @@
     },
     "query": "\n            UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2\n        "
   },
-  "c7aff45523b2133b9c78052a7ec84bc8b48f9ce847c2141b8ab720f6425ca8ec": {
+  "bf23fa0ce3f5267b35df93984179201bb89911e63eb9cfd2f1db1c4e4e3eece8": {
     "describe": {
       "columns": [],
       "nullable": [],
       "parameters": {
-        "Right": 4
+        "Right": 5
       }
     },
-    "query": "\n            UPDATE orders\n            SET\n            cashu_mint_url = ?1,\n            cashu_escrow_token = ?2,\n            cashu_escrow_locked_at = ?3\n            WHERE id = ?4 AND cashu_escrow_locked_at IS NULL\n        "
+    "query": "\n            UPDATE orders\n            SET\n            cashu_mint_url = ?1,\n            cashu_escrow_token = ?2,\n            cashu_escrow_locked_at = ?3\n            WHERE id = ?4 AND status = ?5 AND cashu_escrow_locked_at IS NULL\n        "
   }
 }

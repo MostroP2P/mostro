@@ -743,17 +743,26 @@ pub async fn update_order_invoice_held_at_time(
 /// has been verified and accepted. Called by Track A (`AddCashuEscrow` handler)
 /// immediately before advancing the order status.
 ///
-/// The `WHERE cashu_escrow_locked_at IS NULL` guard makes this a compare-and-set:
-/// it only locks an escrow that is not yet locked. A replayed `AddCashuEscrow`
-/// message (or a race between two takers) therefore cannot silently overwrite an
-/// already-locked token — the second write matches zero rows and returns
-/// `Ok(false)`, so the caller can reject it instead of advancing the order again.
+/// The `WHERE` clause makes this an atomic compare-and-set on two conditions:
+/// - `status = ?5` — the order must still be in the lifecycle status the caller
+///   expects (e.g. `waiting-payment`). If a concurrent cancel/expire moved the
+///   order to a terminal status first, the write matches zero rows instead of
+///   stamping escrow data onto a dead order. The caller passes the expected
+///   status rather than F5 hard-coding it, so this primitive stays decoupled
+///   from Track A's lifecycle transitions.
+/// - `cashu_escrow_locked_at IS NULL` — the escrow is not yet locked, so a
+///   replayed `AddCashuEscrow` (or a race between two takers) cannot overwrite
+///   an already-locked token.
+///
+/// On either miss the function returns `Ok(false)` and the caller rejects the
+/// request instead of advancing the order.
 pub async fn update_order_cashu_escrow(
     pool: &SqlitePool,
     order_id: Uuid,
     mint_url: &str,
     token: &str,
     locked_at: i64,
+    expected_status: &str,
 ) -> Result<bool, MostroError> {
     let result = sqlx::query!(
         r#"
@@ -762,12 +771,13 @@ pub async fn update_order_cashu_escrow(
             cashu_mint_url = ?1,
             cashu_escrow_token = ?2,
             cashu_escrow_locked_at = ?3
-            WHERE id = ?4 AND cashu_escrow_locked_at IS NULL
+            WHERE id = ?4 AND status = ?5 AND cashu_escrow_locked_at IS NULL
         "#,
         mint_url,
         token,
         locked_at,
         order_id,
+        expected_status,
     )
     .execute(pool)
     .await
@@ -1359,9 +1369,9 @@ mod tests {
         Ok(pool)
     }
 
-    /// Create the orders table matching the production schema (base + dev_fee
-    /// + cashu escrow columns). Keep this DDL in sync with the migration files
-    /// whenever a new `orders` column is added.
+    /// Create the orders table matching the production schema (base plus the
+    /// dev_fee and cashu escrow columns). Keep this DDL in sync with the
+    /// migration files whenever a new `orders` column is added.
     async fn setup_orders_db() -> Result<SqlitePool, Error> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1690,27 +1700,29 @@ mod tests {
 
     // -- Tests for update_order_cashu_escrow / find_locked_cashu_orders --
 
-    /// Insert an `active` order with no Cashu escrow locked yet.
-    async fn insert_active_order(pool: &SqlitePool, id: uuid::Uuid) {
+    /// Insert an order in the given status with no Cashu escrow locked yet.
+    async fn insert_order_with_status(pool: &SqlitePool, id: uuid::Uuid, status: &str) {
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                     amount, fiat_code, fiat_amount, created_at, expires_at,
                     failed_payment, payment_attempts, dev_fee, dev_fee_paid)
-            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+            VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
                     100000, 'USD', 100, 1700000000, 1700086400,
                     0, 0, 0, 0)"#,
         )
         .bind(id)
+        .bind(status)
         .execute(pool)
         .await
         .unwrap();
     }
 
     #[tokio::test]
-    async fn update_order_cashu_escrow_locks_an_unlocked_order() {
+    async fn update_order_cashu_escrow_locks_when_status_matches() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
-        insert_active_order(&pool, id).await;
+        // Lock happens while the order awaits payment (spec: WaitingPayment → Active).
+        insert_order_with_status(&pool, id, "waiting-payment").await;
 
         let locked = super::update_order_cashu_escrow(
             &pool,
@@ -1718,22 +1730,63 @@ mod tests {
             "https://mint.example",
             "cashuABC",
             1700001000,
+            "waiting-payment",
         )
         .await
         .unwrap();
         assert!(locked, "First lock should affect the row");
 
-        // The order is now visible to the escrow monitor.
-        let monitored = super::find_locked_cashu_orders(&pool).await.unwrap();
-        assert_eq!(monitored.len(), 1, "Locked active order should be returned");
-        assert_eq!(monitored[0].cashu_escrow_token.as_deref(), Some("cashuABC"));
+        // Re-locking is now refused even with the same expected status.
+        let again = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example",
+            "cashuABC",
+            1700001000,
+            "waiting-payment",
+        )
+        .await
+        .unwrap();
+        assert!(!again, "An already-locked escrow must not be re-locked");
+    }
+
+    #[tokio::test]
+    async fn update_order_cashu_escrow_rejects_status_mismatch() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_order_with_status(&pool, id, "active").await;
+
+        // A concurrent cancel/expire moved the order off the expected status:
+        // the CAS must reject and leave no escrow data stamped on the order.
+        let locked = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example",
+            "cashuABC",
+            1700001000,
+            "waiting-payment",
+        )
+        .await
+        .unwrap();
+        assert!(!locked, "Status mismatch must match zero rows");
+
+        let token: Option<String> =
+            sqlx::query_scalar("SELECT cashu_escrow_token FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            token.is_none(),
+            "No escrow should be stamped on a mismatched order"
+        );
     }
 
     #[tokio::test]
     async fn update_order_cashu_escrow_is_compare_and_set() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
-        insert_active_order(&pool, id).await;
+        insert_order_with_status(&pool, id, "active").await;
 
         // First lock wins.
         assert!(super::update_order_cashu_escrow(
@@ -1741,7 +1794,8 @@ mod tests {
             id,
             "https://mint.a",
             "tokenA",
-            1700001000
+            1700001000,
+            "active",
         )
         .await
         .unwrap());
@@ -1753,6 +1807,7 @@ mod tests {
             "https://mint.evil",
             "tokenEVIL",
             1700009999,
+            "active",
         )
         .await
         .unwrap();
@@ -1773,7 +1828,7 @@ mod tests {
         let pool = setup_orders_db().await.unwrap();
 
         // Active but no escrow locked → excluded (cashu_escrow_locked_at IS NULL).
-        insert_active_order(&pool, uuid::Uuid::new_v4()).await;
+        insert_order_with_status(&pool, uuid::Uuid::new_v4(), "active").await;
 
         // Locked escrow but non-active status → excluded.
         let cancelled = uuid::Uuid::new_v4();

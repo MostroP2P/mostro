@@ -678,6 +678,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        // cashu escrow columns (mostro-core 0.12.0) — `Order::by_id` SELECTs
+        // them. Apply each ALTER separately for the same reason as dev_fee.
+        for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("cashu escrow migration");
+        }
         pool
     }
 

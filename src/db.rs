@@ -739,6 +739,62 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Write the three Cashu escrow columns for an order once the submitted token
+/// has been verified and accepted. Called by Track A (`AddCashuEscrow` handler)
+/// immediately before advancing the order status.
+///
+/// The `WHERE cashu_escrow_locked_at IS NULL` guard makes this a compare-and-set:
+/// it only locks an escrow that is not yet locked. A replayed `AddCashuEscrow`
+/// message (or a race between two takers) therefore cannot silently overwrite an
+/// already-locked token — the second write matches zero rows and returns
+/// `Ok(false)`, so the caller can reject it instead of advancing the order again.
+pub async fn update_order_cashu_escrow(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    mint_url: &str,
+    token: &str,
+    locked_at: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query!(
+        r#"
+            UPDATE orders
+            SET
+            cashu_mint_url = ?1,
+            cashu_escrow_token = ?2,
+            cashu_escrow_locked_at = ?3
+            WHERE id = ?4 AND cashu_escrow_locked_at IS NULL
+        "#,
+        mint_url,
+        token,
+        locked_at,
+        order_id,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Return all orders that have a locked Cashu escrow token and are still
+/// active. Used by background monitors and `restore_session` to re-check
+/// in-flight Cashu escrows after a daemon restart.
+pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE cashu_escrow_locked_at IS NOT NULL
+            AND status = 'active'
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -1303,7 +1359,9 @@ mod tests {
         Ok(pool)
     }
 
-    /// Create the orders table matching the production schema (base + dev_fee migration)
+    /// Create the orders table matching the production schema (base + dev_fee
+    /// + cashu escrow columns). Keep this DDL in sync with the migration files
+    /// whenever a new `orders` column is added.
     async fn setup_orders_db() -> Result<SqlitePool, Error> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1628,6 +1686,116 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "Should not find orders with held_at = 0");
+    }
+
+    // -- Tests for update_order_cashu_escrow / find_locked_cashu_orders --
+
+    /// Insert an `active` order with no Cashu escrow locked yet.
+    async fn insert_active_order(pool: &SqlitePool, id: uuid::Uuid) {
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0)"#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_order_cashu_escrow_locks_an_unlocked_order() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_active_order(&pool, id).await;
+
+        let locked = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example",
+            "cashuABC",
+            1700001000,
+        )
+        .await
+        .unwrap();
+        assert!(locked, "First lock should affect the row");
+
+        // The order is now visible to the escrow monitor.
+        let monitored = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert_eq!(monitored.len(), 1, "Locked active order should be returned");
+        assert_eq!(monitored[0].cashu_escrow_token.as_deref(), Some("cashuABC"));
+    }
+
+    #[tokio::test]
+    async fn update_order_cashu_escrow_is_compare_and_set() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_active_order(&pool, id).await;
+
+        // First lock wins.
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.a",
+            "tokenA",
+            1700001000
+        )
+        .await
+        .unwrap());
+
+        // A replayed/racing AddCashuEscrow must NOT overwrite the locked token.
+        let second = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.evil",
+            "tokenEVIL",
+            1700009999,
+        )
+        .await
+        .unwrap();
+        assert!(!second, "Second lock must match zero rows");
+
+        // The original token is intact.
+        let monitored = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert_eq!(monitored.len(), 1);
+        assert_eq!(monitored[0].cashu_escrow_token.as_deref(), Some("tokenA"));
+        assert_eq!(
+            monitored[0].cashu_mint_url.as_deref(),
+            Some("https://mint.a")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_locked_cashu_orders_ignores_unlocked_and_non_active() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Active but no escrow locked → excluded (cashu_escrow_locked_at IS NULL).
+        insert_active_order(&pool, uuid::Uuid::new_v4()).await;
+
+        // Locked escrow but non-active status → excluded.
+        let cancelled = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    cashu_mint_url, cashu_escrow_token, cashu_escrow_locked_at)
+            VALUES (?1, 'buy', 'ev1', 'canceled', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 'https://mint.x', 'tokenX', 1700001000)"#,
+        )
+        .bind(cancelled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Neither unlocked nor non-active escrows should be returned"
+        );
     }
 
     // -- Tests for find_failed_payment --

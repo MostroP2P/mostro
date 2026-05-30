@@ -739,17 +739,23 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
-/// Write the three Cashu escrow columns for an order once the submitted token
-/// has been verified and accepted. Called by Track A (`AddCashuEscrow` handler)
-/// immediately before advancing the order status.
+/// Atomically lock the Cashu escrow and advance the order's lifecycle status in
+/// a single write. Called by Track A (`AddCashuEscrow` handler) once the
+/// submitted token has been verified and accepted.
 ///
-/// The `WHERE` clause makes this an atomic compare-and-set on two conditions:
-/// - `status = ?5` — the order must still be in the lifecycle status the caller
-///   expects (e.g. `waiting-payment`). If a concurrent cancel/expire moved the
-///   order to a terminal status first, the write matches zero rows instead of
-///   stamping escrow data onto a dead order. The caller passes the expected
-///   status rather than F5 hard-coding it, so this primitive stays decoupled
-///   from Track A's lifecycle transitions.
+/// Locking the escrow and the status transition (`new_status`, e.g.
+/// `waiting-payment` → `active`) happen in **one** `UPDATE`, so there is no
+/// window in which the token is persisted but the order has not yet advanced. A
+/// crash right after this write leaves the order already `active` with the token
+/// recorded, so `find_locked_cashu_orders` (and thus the monitor / restore path)
+/// always sees a locked escrow — funds can never be locked-but-invisible.
+///
+/// The `WHERE` clause is a compare-and-set on two conditions:
+/// - `status = ?6` — the order must still be in the lifecycle status the caller
+///   expects. If a concurrent cancel/expire moved it to a terminal status first,
+///   the write matches zero rows instead of stamping escrow onto a dead order.
+///   The caller passes both the expected and the target status, so this
+///   primitive stays decoupled from Track A's lifecycle definitions.
 /// - `cashu_escrow_locked_at IS NULL` — the escrow is not yet locked, so a
 ///   replayed `AddCashuEscrow` (or a race between two takers) cannot overwrite
 ///   an already-locked token.
@@ -763,6 +769,7 @@ pub async fn update_order_cashu_escrow(
     token: &str,
     locked_at: i64,
     expected_status: &str,
+    new_status: &str,
 ) -> Result<bool, MostroError> {
     let result = sqlx::query!(
         r#"
@@ -770,12 +777,14 @@ pub async fn update_order_cashu_escrow(
             SET
             cashu_mint_url = ?1,
             cashu_escrow_token = ?2,
-            cashu_escrow_locked_at = ?3
-            WHERE id = ?4 AND status = ?5 AND cashu_escrow_locked_at IS NULL
+            cashu_escrow_locked_at = ?3,
+            status = ?4
+            WHERE id = ?5 AND status = ?6 AND cashu_escrow_locked_at IS NULL
         "#,
         mint_url,
         token,
         locked_at,
+        new_status,
         order_id,
         expected_status,
     )
@@ -1718,10 +1727,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_order_cashu_escrow_locks_when_status_matches() {
+    async fn update_order_cashu_escrow_locks_and_advances_atomically() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
-        // Lock happens while the order awaits payment (spec: WaitingPayment → Active).
+        // Lock happens while the order awaits payment (spec: WaitingPayment -> Active).
         insert_order_with_status(&pool, id, "waiting-payment").await;
 
         let locked = super::update_order_cashu_escrow(
@@ -1731,12 +1740,26 @@ mod tests {
             "cashuABC",
             1700001000,
             "waiting-payment",
+            "active",
         )
         .await
         .unwrap();
         assert!(locked, "First lock should affect the row");
 
-        // Re-locking is now refused even with the same expected status.
+        // Crash-window regression: the single write left the order BOTH `active`
+        // and locked, so the monitor/restore path sees it. There is no state in
+        // which the token is persisted but the order is not yet active.
+        let monitored = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert_eq!(
+            monitored.len(),
+            1,
+            "Locked order must be visible to monitor"
+        );
+        assert_eq!(monitored[0].cashu_escrow_token.as_deref(), Some("cashuABC"));
+        assert_eq!(monitored[0].status, "active");
+
+        // Re-locking is refused: the status already advanced past the expected
+        // one and the escrow is already locked.
         let again = super::update_order_cashu_escrow(
             &pool,
             id,
@@ -1744,6 +1767,7 @@ mod tests {
             "cashuABC",
             1700001000,
             "waiting-payment",
+            "active",
         )
         .await
         .unwrap();
@@ -1765,6 +1789,7 @@ mod tests {
             "cashuABC",
             1700001000,
             "waiting-payment",
+            "active",
         )
         .await
         .unwrap();
@@ -1786,15 +1811,16 @@ mod tests {
     async fn update_order_cashu_escrow_is_compare_and_set() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
-        insert_order_with_status(&pool, id, "active").await;
+        insert_order_with_status(&pool, id, "waiting-payment").await;
 
-        // First lock wins.
+        // First lock wins and advances the order to `active`.
         assert!(super::update_order_cashu_escrow(
             &pool,
             id,
             "https://mint.a",
             "tokenA",
             1700001000,
+            "waiting-payment",
             "active",
         )
         .await
@@ -1807,6 +1833,7 @@ mod tests {
             "https://mint.evil",
             "tokenEVIL",
             1700009999,
+            "waiting-payment",
             "active",
         )
         .await

@@ -47,6 +47,12 @@ Instead of routing HTLCs through Mostro's node, the seller locks the funds in a 
 2. $P_S$ (Seller Pubkey)
 3. $P_M$ (Mostro/Arbitrator Pubkey)
 
+> **The buyer and seller pubkeys MUST be the per-order trade keys, never the parties' identity (master) keys.** Mostro already derives a fresh, ephemeral *trade key* for each side of every order (see the existing trade-key flow used by `add-invoice`/`take-*`). The Cashu escrow reuses exactly those keys: $P_B$ is the buyer's trade pubkey for this order and $P_S$ is the seller's trade pubkey for this order. This is not an arbitrary choice — it is required for both privacy and protocol consistency:
+> - **Privacy / unlinkability.** Using identity keys would publish a long-lived pubkey into the mint's spending condition, letting the mint (or anyone who later inspects the token) link every escrow a user ever participates in back to one identity and to each other. Per-order trade keys keep each escrow cryptographically independent.
+> - **Consistency with the rest of the protocol.** Every other signature a party produces in an order (order messages, `release`, `cancel`, NIP-59 DMs carrying the release signature) is already made with the trade key. The Cashu signature that satisfies the 2-of-3 condition is produced by the *same* key, so the party can sign the swap with the key they already hold for this order, and the daemon verifies against the trade pubkey it already has on file.
+>
+> $P_M$ is Mostro's arbitrator key. It MAY be a Mostro key dedicated to Cashu arbitration rather than a per-order key, since Mostro only ever signs during dispute resolution; the daemon's identity is not something the trade is trying to hide.
+
 ```mermaid
 sequenceDiagram
     participant S as Seller (Maker)
@@ -97,10 +103,11 @@ Sellers construct the 2-of-3 spending condition using `cdk::nuts::nut10`. We rec
 use cdk::nuts::nut10::{Conditions, SpendingConditions, SigFlag};
 use cdk::nuts::PublicKey;
 
-// 1. Gather pubkeys
-let p_s: PublicKey = /* Seller */;
-let p_b: PublicKey = /* Buyer */;
-let p_m: PublicKey = /* Mostro */;
+// 1. Gather pubkeys — P_B and P_S MUST be the per-order *trade* keys
+//    for this order, NOT the parties' identity/master keys.
+let p_s: PublicKey = /* Seller's trade pubkey for this order */;
+let p_b: PublicKey = /* Buyer's trade pubkey for this order  */;
+let p_m: PublicKey = /* Mostro's arbitrator pubkey           */;
 
 // 2. Define 2-of-3 constraints
 let conditions = Conditions::new(
@@ -215,10 +222,10 @@ flowchart TD
 
 Six PRs. **F1 and F3 are the critical contracts** and should land first; F2/F4/F5/F6 can themselves be built in parallel once the contract shapes are agreed (a short written interface spec on day one lets F4 proceed before F3 merges, etc.). Zero behavior change when the feature is off.
 
-- **F1 · `mostro-core` protocol.** `src/message.rs`: add `Action` variants (`AddCashuEscrow`, `CashuEscrowLocked`, …) and `Payload` variants (`CashuToken(String)`, `CashuMintUrl(String)`, `CashuLockProof(CashuLockProofData)` where the struct carries `{ token, mint_url, buyer_pubkey, seller_pubkey, mostro_pubkey, signatures }`); extend `MessageKind::verify()`; add round-trip tests. `src/error.rs`: add `CantDoReason` variants (`InvalidCashuToken`, `CashuMintUnavailable`, `InvalidMintUrl`, `CashuEscrowNotLocked`, `CashuSignatureMissing`). `src/order.rs`: add optional `Order` fields (`cashu_mint_url`, `cashu_escrow_token`, `cashu_escrow_locked_at`); keep `SmallOrder` lean. Bump crate version; daemon pins the local `path` during dev.
+- **F1 · `mostro-core` protocol.** `src/message.rs`: add `Action` variants (`AddCashuEscrow`, `CashuEscrowLocked`, …) and `Payload` variants (`CashuToken(String)`, `CashuMintUrl(String)`, `CashuLockProof(CashuLockProofData)` where the struct carries `{ token, mint_url, buyer_pubkey, seller_pubkey, mostro_pubkey, signatures }` — `buyer_pubkey` and `seller_pubkey` are the per-order **trade** pubkeys, never identity keys); extend `MessageKind::verify()`; add round-trip tests. `src/error.rs`: add `CantDoReason` variants (`InvalidCashuToken`, `CashuMintUnavailable`, `InvalidMintUrl`, `CashuEscrowNotLocked`, `CashuSignatureMissing`). `src/order.rs`: add optional `Order` fields (`cashu_mint_url`, `cashu_escrow_token`, `cashu_escrow_locked_at`); keep `SmallOrder` lean. Bump crate version; daemon pins the local `path` during dev.
 - **F2 · config + escrow-mode + boot.** `Cargo.toml`: add `cdk`. `config/types.rs` + `settings.rs`: `CashuSettings { enabled, mint_url, .. }` as `#[serde(default)] pub cashu: Option<CashuSettings>` mirroring `anti_abuse_bond`; `get_cashu()` / `is_cashu_enabled()`. Add `enum EscrowMode { Lightning, Cashu }` resolved from config; validation (parseable `mint_url`; Cashu + `anti_abuse_bond.enabled` is a hard error; Lightning default when `[cashu]` absent). `main.rs`: in Cashu mode **skip** `LndConnector::new()` and the LN_STATUS probe. `wizard.rs` + `settings.tpl.toml`: prompts and a commented `[cashu]` block.
 - **F3 · `EscrowBackend` trait + Lightning impl.** Define the trait (`lock`, `release`, `cooperative_cancel`, `dispute_settle`, `dispute_cancel`, plus whatever startup/status hooks are needed). Refactor today's LND calls in `take_*`/`add_invoice`/`release`/`cancel`/`admin_*` to go through a `LightningBackend` implementation — **behavior-preserving, fully covered by existing tests**. Add a `CashuBackend` whose methods are `unimplemented!()`. `AppContext` carries the active backend. This is the seam that lets Tracks A–D edit disjoint method bodies.
-- **F4 · `CashuClient` library.** `src/cashu/mod.rs`: a self-contained `cdk` wrapper — `connect(mint_url)`, `check_state(...)` (NUT-07 `/v1/checkstate`), `verify_2of3_condition(token, p_b, p_s, p_m)` (NUT-10/11), `sign_with_pm(proofs)` (NUT-11 P2PK). Startup mint-connectivity check storing a `CASHU_STATUS` `OnceLock`. Unit-tested against the F6 mint; no daemon wiring, so it's fully parallelizable.
+- **F4 · `CashuClient` library.** `src/cashu/mod.rs`: a self-contained `cdk` wrapper — `connect(mint_url)`, `check_state(...)` (NUT-07 `/v1/checkstate`), `verify_2of3_condition(token, p_b, p_s, p_m)` (NUT-10/11), where `p_b`/`p_s` are the caller-supplied per-order trade pubkeys the condition must embed, `sign_with_pm(proofs)` (NUT-11 P2PK). Startup mint-connectivity check storing a `CASHU_STATUS` `OnceLock`. Unit-tested against the F6 mint; no daemon wiring, so it's fully parallelizable.
 - **F5 · DB migration + helpers.** One migration adding all Cashu columns to `orders`; `find_order_by_*` and update helpers. Frozen after this PR so no feature track writes a migration.
 - **F6 · test harness.** Containerized test mint (e.g. `nutshell`) wired into CI alongside the existing LN regtest, plus fixtures/helpers the tracks reuse for integration tests.
 
@@ -228,7 +235,7 @@ Six PRs. **F1 and F3 are the critical contracts** and should land first; F2/F4/F
 
 After Foundation merges, these four tracks are mutually independent — each fills in stubbed handler/backend bodies in **its own files** and adds its own tests against the F4 client and F6 mint. They can be assigned to four developers and merged in any order.
 
-- **Track A · Lock / escrow setup** (box 2 of the sequence diagram). Implement `CashuBackend::lock`: on `AddCashuEscrow`, parse the seller's token, call `CashuClient::verify_2of3_condition` over `{P_B, P_S, P_M}`, `check_state` to confirm unspent, persist the F5 columns, advance the order (`WaitingPayment` → `Active`), notify the buyer to send fiat. Touches the lock branch of `take_*`/`add_invoice` only. *Depends on F1, F3, F4, F5.*
+- **Track A · Lock / escrow setup** (box 2 of the sequence diagram). Implement `CashuBackend::lock`: on `AddCashuEscrow`, parse the seller's token, call `CashuClient::verify_2of3_condition` over `{P_B, P_S, P_M}` — asserting that $P_B$ and $P_S$ match the **trade pubkeys Mostro already holds for this order** (reject the token otherwise) and that $P_M$ is Mostro's own arbitrator key — `check_state` to confirm unspent, persist the F5 columns, advance the order (`WaitingPayment` → `Active`), notify the buyer to send fiat. Touches the lock branch of `take_*`/`add_invoice` only. *Depends on F1, F3, F4, F5.*
 - **Track B · Release happy path** (box 4). Implement `CashuBackend::release`: the seller's release **signature** goes seller→buyer P2P over NIP-59 DM (reuse `mostro-core`'s `chat`/`SendDm`); the daemon only validates the `FiatSent → released` transition and advances to a terminal success state — it never touches funds. Document the exact client↔client payload as an interface contract. Touches `release.rs`'s Cashu branch only. *Depends on F1, F3.*
 - **Track C · Cooperative cancel.** Implement `CashuBackend::cooperative_cancel`: record the cancel and transition state with **no** hold-invoice cancellation; the buyer hands their signature to the seller P2P so the seller reconstructs a `P_S + P_B` 2-of-3 swap to reclaim. Touches `cancel.rs`'s Cashu branch only. *Depends on F1, F3.*
 - **Track D · Dispute resolution** — the only place the daemon signs with `P_M`. Implement `CashuBackend::dispute_settle`/`dispute_cancel` using `CashuClient::sign_with_pm`: `admin_settle` → deliver `P_M` signature to the buyer; `admin_cancel` → deliver `P_M` signature to the seller. Reuse existing solver/permission checks; only the settlement primitive changes. Touches `admin_settle.rs`/`admin_cancel.rs` Cashu branches only. *Depends on F1, F3, F4.*

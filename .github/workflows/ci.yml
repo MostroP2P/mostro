@@ -46,6 +46,45 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  cashu-mint:
+    name: Cashu mint integration
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Start Cashu test mint (nutshell, FakeWallet)
+        run: |
+          docker run -d --name cashu-mint -p 3338:3338 \
+            -e MINT_BACKEND_BOLT11_SAT=FakeWallet \
+            -e MINT_LISTEN_HOST=0.0.0.0 \
+            -e MINT_LISTEN_PORT=3338 \
+            -e MINT_PRIVATE_KEY=TEST_PRIVATE_KEY \
+            cashubtc/nutshell:0.20.0 poetry run mint
+      - name: Wait for mint to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3338/v1/info >/dev/null; then
+              echo "mint is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "mint did not become ready"; docker logs cashu-mint; exit 1
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+      - name: cargo test (cashu integration)
+        env:
+          CASHU_TEST_MINT_URL: http://localhost:3338
+        run: cargo test --test cashu_mint
+      - name: Mint logs
+        if: always()
+        run: docker logs cashu-mint || true
+
   build:
     runs-on: ubuntu-latest
     needs: test

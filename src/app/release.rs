@@ -1,6 +1,7 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::config::settings::Settings;
 use crate::escrow::EscrowBackend;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
@@ -189,35 +190,87 @@ pub async fn release_action(
         .get_next_trade_key()
         .map_err(MostroInternalErr)?;
 
-    // Settle seller hold invoice
-    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
-    // Update order event with status SettledHoldInvoice
-    order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let is_cashu = Settings::is_cashu_enabled() && order.cashu_escrow_token.is_some();
 
-    // Persist the status change to DB before calling do_payment.
-    // do_payment spawns async tasks that capture an Order copy; without this
-    // explicit write the settled-hold-invoice status only lived in memory and
-    // was persisted as a side-effect of the full-row writes in
-    // check_failure_retries / payment_success (now replaced by targeted updates).
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
-            .bind(&order.status)
-            .bind(&order.event_id)
-            .bind(order.id)
-            .bind(Status::FiatSent.to_string())
-            .bind(Status::Dispute.to_string())
-            .execute(pool)
+    if is_cashu {
+        // Cashu flow: skip lightning invoice settlement and go straight to Success.
+        // Update order event with status Success
+        order = update_order_event(my_keys, Status::Success, &order)
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order.id
-        );
-        return Ok(());
+        let result =
+            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
+                .bind(&order.status)
+                .bind(&order.event_id)
+                .bind(order.id)
+                .bind(Status::FiatSent.to_string())
+                .bind(Status::Dispute.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        if result.rows_affected() == 0 {
+            tracing::warn!(
+                "Order {} not transitioned to success: status changed concurrently",
+                order.id
+            );
+            return Ok(());
+        }
+
+        // Send PurchaseCompleted message to buyer
+        enqueue_order_msg(
+            None,
+            Some(order.id),
+            Action::PurchaseCompleted,
+            None,
+            buyer_pubkey,
+            None,
+        )
+        .await;
+
+        // Send dm to buyer to rate counterpart
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::Rate,
+            None,
+            buyer_pubkey,
+            None,
+        )
+        .await;
+    } else {
+        // Lightning flow
+        // Settle seller hold invoice
+        settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
+        // Update order event with status SettledHoldInvoice
+        order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        // Persist the status change to DB before calling do_payment.
+        // do_payment spawns async tasks that capture an Order copy; without this
+        // explicit write the settled-hold-invoice status only lived in memory and
+        // was persisted as a side-effect of the full-row writes in
+        // check_failure_retries / payment_success (now replaced by targeted updates).
+        let result =
+            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
+                .bind(&order.status)
+                .bind(&order.event_id)
+                .bind(order.id)
+                .bind(Status::FiatSent.to_string())
+                .bind(Status::Dispute.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        if result.rows_affected() == 0 {
+            tracing::warn!(
+                "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
+                order.id
+            );
+            return Ok(());
+        }
     }
 
     // If there was an active dispute on this order, close it since the seller
@@ -276,8 +329,10 @@ pub async fn release_action(
     // does not block trade finalization.
     bond::release_bonds_for_order_or_warn(pool, order.id, "release_action").await;
 
-    // Finally we try to pay buyer's invoice
-    let _ = do_payment(ctx, order, request_id).await;
+    if !is_cashu {
+        // Finally we try to pay buyer's invoice
+        let _ = do_payment(ctx, order, request_id).await;
+    }
 
     Ok(())
 }

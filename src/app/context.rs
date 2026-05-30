@@ -269,6 +269,7 @@ pub mod test_utils {
             expiration: Some(ExpirationSettings::default()),
             anti_abuse_bond: None,
             price: None,
+            cashu: None,
         }
     }
 }

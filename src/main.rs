@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cashu;
 mod bitcoin_price;
 pub mod cli;
 pub mod config;

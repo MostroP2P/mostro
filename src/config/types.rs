@@ -158,6 +158,20 @@ impl Default for AntiAbuseBondSettings {
     }
 }
 
+/// Cashu escrow configuration.
+///
+/// Opt-in. When `enabled = false` (the default) the daemon boots in
+/// Lightning mode and no Cashu path is active. See
+/// `docs/CASHU_ESCROW_ARCHITECTURE.md` for the full rollout plan.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct CashuSettings {
+    /// Master switch. When false, the node operates in Lightning mode.
+    #[serde(default)]
+    pub enabled: bool,
+    /// URL of the Cashu mint all trades on this node will use.
+    pub mint_url: String,
+}
+
 /// Event expiration configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExpirationSettings {

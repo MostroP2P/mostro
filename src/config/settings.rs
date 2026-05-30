@@ -1,7 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    AntiAbuseBondSettings, DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings,
-    NostrSettings, RpcSettings,
+    AntiAbuseBondSettings, CashuSettings, DatabaseSettings, ExpirationSettings, LightningSettings,
+    MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,9 @@ pub struct Settings {
     /// Phase 1's migration).
     #[serde(default)]
     pub price: Option<PriceSettings>,
+    /// Cashu escrow configuration. Absent section ≡ Lightning mode.
+    #[serde(default)]
+    pub cashu: Option<CashuSettings>,
 }
 
 /// Initialize the global MOSTRO_CONFIG struct
@@ -115,5 +118,11 @@ impl Settings {
     /// `false` when settings haven't been initialized.
     pub fn is_bond_enabled() -> bool {
         Self::get_bond().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// True when the node is configured to run in Cashu escrow mode.
+    /// Returns `false` when `[cashu]` is absent or `enabled = false`.
+    pub fn is_cashu_mode(&self) -> bool {
+        self.cashu.as_ref().is_some_and(|c| c.enabled)
     }
 }

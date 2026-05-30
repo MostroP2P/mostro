@@ -16,6 +16,133 @@ use tracing::error;
 
 use super::release::do_payment;
 
+async fn cashu_admin_settle(
+    ctx: &AppContext,
+    order: Order,
+    msg: &Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+
+    let token_str = order
+        .cashu_escrow_token
+        .as_deref()
+        .ok_or(MostroInternalErr(ServiceError::InvalidPayload))?;
+
+    let sigs = crate::cashu::sign_with_pm(token_str, ctx.keys().secret_key())
+        .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+
+    let order_updated = update_order_event(my_keys, Status::SettledByAdmin, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+            .bind(&order_updated.status)
+            .bind(&order_updated.event_id)
+            .bind(order_updated.id)
+            .bind(Status::Dispute.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "Order {} not transitioned to settled-by-admin: status changed concurrently",
+            order_updated.id
+        );
+        return Ok(());
+    }
+
+    let dispute = find_dispute_by_order_id(pool, order.id).await;
+
+    if let Ok(mut d) = dispute {
+        let dispute_id = d.id;
+        d.status = DisputeStatus::Settled.to_string();
+        d.update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+            (true, false) => "seller",
+            (false, true) => "buyer",
+            (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+        };
+
+        let tags: Tags = Tags::from_list(vec![
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+                vec![DisputeStatus::Settled.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
+                vec![dispute_initiator],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+                create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+                vec!["dispute".to_string()],
+            ),
+        ]);
+
+        let dispute_event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        let client = ctx.nostr_client();
+        if let Err(e) = client.send_event(&dispute_event).await {
+            error!("Failed to send dispute settlement event: {}", e);
+        }
+    }
+
+    // Deliver P_M signatures to the buyer so they can redeem with buyer_sig + pm_sig
+    if let Some(ref buyer_pubkey) = order_updated.buyer_pubkey {
+        enqueue_order_msg(
+            None,
+            Some(order_updated.id),
+            Action::CashuPmSignature,
+            Some(Payload::CashuSignatures(sigs)),
+            PublicKey::from_str(buyer_pubkey)
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            msg.get_inner_message_kind().trade_index,
+        )
+        .await;
+    }
+
+    // Notify the solver and the seller that the dispute is settled
+    enqueue_order_msg(
+        request_id,
+        Some(order_updated.id),
+        Action::AdminSettled,
+        None,
+        event.sender,
+        msg.get_inner_message_kind().trade_index,
+    )
+    .await;
+
+    if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
+        enqueue_order_msg(
+            None,
+            Some(order_updated.id),
+            Action::AdminSettled,
+            None,
+            PublicKey::from_str(seller_pubkey)
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            msg.get_inner_message_kind().trade_index,
+        )
+        .await;
+    }
+
+    // do_payment() and bond::apply_bond_resolution() are intentionally skipped:
+    // the buyer redeems ecash directly at the mint using pm_sig + buyer_sig,
+    // and bonds are mutually exclusive with Cashu mode (architecture §5).
+    Ok(())
+}
+
 pub async fn admin_settle_action(
     ctx: &AppContext,
     msg: Message,
@@ -90,6 +217,10 @@ pub async fn admin_settle_action(
     // active bonds, slash none). See `docs/ANTI_ABUSE_BOND.md` §7.3.
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
+
+    if order.cashu_escrow_token.is_some() {
+        return cashu_admin_settle(ctx, order, &msg, event, my_keys, request_id).await;
+    }
 
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)

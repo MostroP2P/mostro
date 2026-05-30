@@ -200,6 +200,7 @@ mod tests {
             expiration: None,
             anti_abuse_bond: None,
             price: None,
+            cashu: None,
         }
     }
 

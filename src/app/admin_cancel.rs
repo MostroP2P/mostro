@@ -15,6 +15,129 @@ use nostr_sdk::prelude::*;
 use sqlx_crud::Crud;
 use tracing::{error, info};
 
+async fn cashu_admin_cancel(
+    ctx: &AppContext,
+    order: Order,
+    msg: &Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+
+    let token_str = order
+        .cashu_escrow_token
+        .as_deref()
+        .ok_or(MostroInternalErr(ServiceError::InvalidPayload))?;
+
+    let sigs = crate::cashu::sign_with_pm(token_str, ctx.keys().secret_key())
+        .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+
+    let dispute = find_dispute_by_order_id(pool, order.id).await;
+
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+    };
+
+    if let Ok(mut d) = dispute {
+        let dispute_id = d.id;
+        d.status = DisputeStatus::SellerRefunded.to_string();
+        d.update(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+        let tags: Tags = Tags::from_list(vec![
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("s")),
+                vec![DisputeStatus::SellerRefunded.to_string()],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
+                vec![dispute_initiator],
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+                create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
+            ),
+            Tag::custom(
+                TagKind::Custom(std::borrow::Cow::Borrowed("z")),
+                vec!["dispute".to_string()],
+            ),
+        ]);
+
+        let dispute_event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+        info!("Dispute event to be published: {dispute_event:#?}");
+
+        let client = ctx.nostr_client();
+        if let Err(e) = client.send_event(&dispute_event).await {
+            error!("Failed to send dispute status event: {}", e);
+        }
+    }
+
+    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let order_updated_id = order_updated.id;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            PublicKey::from_str(buyer.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        ),
+        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+    };
+
+    // Deliver P_M signatures to the seller so they can reclaim with seller_sig + pm_sig
+    enqueue_order_msg(
+        None,
+        Some(order_updated_id),
+        Action::CashuPmSignature,
+        Some(Payload::CashuSignatures(sigs)),
+        seller_pubkey,
+        msg.get_inner_message_kind().trade_index,
+    )
+    .await;
+
+    // Notify solver, seller, and buyer that the admin has canceled
+    let cancel_msg = Message::new_order(
+        Some(order.id),
+        request_id,
+        msg.get_inner_message_kind().trade_index,
+        Action::AdminCanceled,
+        None,
+    );
+    let cancel_json = cancel_msg
+        .as_json()
+        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+    send_dm(event.sender, my_keys, &cancel_json, None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    send_dm(seller_pubkey, my_keys, &cancel_json, None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    send_dm(buyer_pubkey, my_keys, &cancel_json, None)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // ln_client.cancel_hold_invoice() and bond::apply_bond_resolution() are
+    // intentionally skipped: the seller redeems ecash directly at the mint
+    // using pm_sig + seller_sig, and bonds are mutually exclusive with Cashu
+    // mode (architecture §5).
+    Ok(())
+}
+
 /// Admin-initiated order cancellation.
 ///
 /// Allows authorized dispute solvers or admins to cancel an order and refund
@@ -114,6 +237,10 @@ pub async fn admin_cancel_action(
     // resends a corrected directive. See `docs/ANTI_ABUSE_BOND.md` §7.3.
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
+
+    if order.cashu_escrow_token.is_some() {
+        return cashu_admin_cancel(ctx, order, &msg, event, my_keys, request_id).await;
+    }
 
     if order.hash.is_some() {
         // We return funds to seller

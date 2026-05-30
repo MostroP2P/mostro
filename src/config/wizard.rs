@@ -74,6 +74,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         expiration: None,
         anti_abuse_bond: None,
         price: None,
+        cashu: None,
     };
 
     let toml_content = toml::to_string_pretty(&settings)

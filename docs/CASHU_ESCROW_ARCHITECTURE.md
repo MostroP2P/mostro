@@ -125,3 +125,123 @@ let secret = SpendingConditions::new_p2pk(p_s, Some(conditions));
 2. **Offline Resilience:** If Mostro's daemon crashes or vanishes permanently, the Buyer and Seller can still cooperate out-of-band to settle the trade (Seller + Buyer = 2 keys).
 3. **No Routing Failures:** Bypasses Lightning Network topology, channel liquidity constraints, and unpredictable routing fees.
 4. **Zero Capital Lockup:** Mostro does not require inbound/outbound channel liquidity to facilitate trades.
+
+---
+
+# Implementation Plan (Phased Rollout)
+
+This section turns the architecture above into a concrete, incremental engineering plan. It follows the same phased-PR convention as [`ANTI_ABUSE_BOND.md`](./ANTI_ABUSE_BOND.md): each phase is a self-contained, reviewable pull request that leaves `main` shippable. The feature is **opt-in and defaults to off** — until an operator enables it, the daemon behaves exactly as it does today.
+
+## Design Decisions (locked)
+
+These decisions scope the plan and should not be re-litigated per phase:
+
+1. **Global mode switch, not per-order.** A node runs in **one** escrow mode at a time: `lightning` (today's default) **or** `cashu`. The mode is fixed in `settings.toml`. When a node runs in `cashu` mode, the `fedimint-tonic-lnd` connector is **not initialized** at startup — the node needs no LND. There is no mixed mode where a single node offers both escrow types simultaneously.
+2. **Node-configured, fixed mint.** The operator sets a single `mint_url` in `settings.toml`. All Cashu trades on that node use that mint. Per-order mint negotiation is explicitly out of scope for this rollout (possible future work).
+3. **The daemon is a coordinator, not a wallet.** All wallet-side ecash operations — the seller swapping unencumbered ecash into a 2-of-3 locked token, and the buyer redeeming the locked token with two signatures — happen in the **client**. The daemon's responsibilities are narrow: validate a submitted locked token against the mint (`/v1/checkstate`), verify the 2-of-3 spending condition embeds the right three pubkeys, hold its own key `P_M`, and produce a `P_M` signature **only** during dispute resolution. Client work is documented here as an interface contract but implemented in the client repos, not here.
+4. **`mostro-core` changes ship first.** New `Action`/`Payload`/`CantDoReason` variants and any new `Status` live in the shared `mostro-core` crate. They are additive and must be released (and the daemon's dependency bumped) before the daemon can use them. During development the daemon points at the local `mostro-core` via a `path` dependency.
+5. **Bonds and Cashu mode are mutually exclusive (for now).** The anti-abuse bond is built on LN hold invoices and cannot function without LND. In `cashu` mode the bond feature is rejected at config-validation time. A Cashu-native bond is future work.
+
+## Module Map (Target)
+
+```mermaid
+flowchart LR
+  subgraph mostro-core
+    MSG[message.rs<br/>Actions + Payloads]
+    ORD[order.rs<br/>Status + fields]
+  end
+  subgraph mostro/src
+    MAIN[main.rs<br/>escrow-mode boot]
+    CFG[config/*<br/>CashuSettings]
+    CASHU[cashu/mod.rs<br/>CashuClient]
+    ESCROW[escrow backend<br/>trait/enum]
+    APP[app/*<br/>handlers branch on mode]
+    DB[db.rs<br/>cashu columns]
+  end
+  MSG --> APP
+  ORD --> APP
+  CFG --> MAIN
+  MAIN --> CASHU
+  APP --> ESCROW
+  ESCROW --> CASHU
+  APP --> DB
+```
+
+## Phases
+
+### Phase 0 — Protocol & config foundations (no runtime escrow yet)
+
+**Goal:** land all the additive plumbing so later phases only touch handler logic. Zero behavior change when the feature is off.
+
+**`mostro-core`:**
+- `src/message.rs`: add `Action` variants — `AddCashuEscrow` (seller submits locked token), and any acknowledgement actions needed (`CashuEscrowLocked`). Add `Payload` variants — `CashuToken(String)`, `CashuMintUrl(String)`, and a `CashuLockProof(CashuLockProofData)` struct carrying `{ token, mint_url, buyer_pubkey, seller_pubkey, mostro_pubkey }`. Update `MessageKind::verify()` with the action↔payload shape rules and add round-trip tests.
+- `src/error.rs`: add `CantDoReason` variants — `InvalidCashuToken`, `CashuMintUnavailable`, `InvalidMintUrl`, `CashuEscrowNotLocked`.
+- `src/order.rs`: add optional `Order` fields for Cashu state (`cashu_mint_url`, `cashu_escrow_token`, `cashu_escrow_locked_at`). Keep `SmallOrder` lean — carry Cashu data in the new `Payload` variants, not the wire order.
+- Bump crate version.
+
+**`mostro`:**
+- `Cargo.toml`: point `mostro-core` at the local `path` during dev; add the `cdk` dependency.
+- `src/config/types.rs` + `settings.rs`: add `CashuSettings { enabled: bool, mint_url: String, .. }` as `#[serde(default)] pub cashu: Option<CashuSettings>`, mirroring `anti_abuse_bond` exactly. Add `Settings::get_cashu()` and `is_cashu_enabled()`.
+- Introduce an **escrow-mode** resolver (e.g. `enum EscrowMode { Lightning, Cashu }`) derived from config, with validation: Cashu requires a parseable `mint_url`; Cashu + `anti_abuse_bond.enabled` is a hard config error; Lightning is the default when `[cashu]` is absent.
+- `src/config/util.rs`: extend `validate_mostro_settings()` with the rules above. `src/config/wizard.rs`: add an escrow-mode prompt and a mint-URL prompt. `settings.tpl.toml`: add a commented-out `[cashu]` block.
+- `src/cashu/mod.rs` (new): a `CashuClient` scaffold built from `cdk` that connects to the configured mint and exposes a `check_state(...)` wrapper (used in later phases). Add a startup connectivity check analogous to the LND node-info check, storing a `CASHU_STATUS` `OnceLock`.
+- `src/main.rs`: branch on escrow mode — in Cashu mode, **skip** `LndConnector::new()` and the LN_STATUS probe, run the mint connectivity check instead. The `AppContext` carries the active escrow backend.
+
+**Deliverable:** node boots in either mode; in Cashu mode it connects to the mint and starts, but order handlers still assume LN (so Cashu orders cannot yet complete — documented as experimental and gated off by default).
+
+### Phase 1 — Escrow setup & lock validation
+
+**Goal:** replace hold-invoice *creation* with locked-token *validation*. This is box 2 ("ESCROW SETUP") of the sequence diagram.
+
+- In Cashu mode, the take/`add-invoice` path no longer calls `show_hold_invoice()`. Instead the seller's client submits the 2-of-3 locked token via `AddCashuEscrow`; the handler:
+  1. parses the token with `cdk`,
+  2. verifies the spending condition is P2PK 2-of-3 over exactly `{P_B, P_S, P_M}` with the order's trade pubkeys and this node's `P_M`,
+  3. calls the mint `/v1/checkstate` to confirm the proofs are unspent,
+  4. persists `cashu_mint_url` / `cashu_escrow_token` / `cashu_escrow_locked_at` and advances the order to `Active` (reusing existing statuses — `WaitingPayment` → `Active`), then notifies the buyer to send fiat.
+- Introduce a small **escrow backend** abstraction (trait or enum) so `take_sell` / `take_buy` / `add_invoice` call `backend.lock(...)` rather than LND directly; the Lightning impl wraps today's code unchanged.
+- DB migration for the new columns; `find_order_by_*` helpers as needed.
+
+**Deliverable:** a Cashu order can be matched and locked; the daemon confirms custody-free escrow exists. Release still TODO.
+
+### Phase 2 — Release (happy path)
+
+**Goal:** box 4 of the diagram. No custody, no LN payment.
+
+- `release_action` in Cashu mode does **not** settle a hold invoice or pay the buyer. The seller's release **signature** goes seller→buyer **directly P2P** over Nostr DM (reuse the existing `chat` / `SendDm` machinery in `mostro-core`), bypassing the daemon. The daemon only receives the seller's *state update* ("I released"), validates the `FiatSent → released` transition, advances the order to a terminal success state, and releases the taker bond hooks (no-op in Cashu mode).
+- Define precisely, as an interface contract, what the seller client sends to the buyer and what the buyer does with the mint — the daemon does not touch funds here.
+- `fiat_sent` is unchanged (pure messaging).
+
+**Deliverable:** full happy-path Cashu trade completes end to end on regtest against a test mint.
+
+### Phase 3 — Cooperative cancel
+
+**Goal:** the seller reclaims the locked ecash when both sides agree to cancel.
+
+- `cancel_action` in Cashu mode records the cooperative cancel and transitions state, but performs **no** `cancel_hold_invoice`. The buyer hands their signature to the seller P2P (NIP-59 DM) so the seller can reconstruct a 2-of-3 swap (`P_S + P_B`) and reclaim funds at the mint. Daemon stays out of the value path.
+
+**Deliverable:** cooperative cancel works without LND.
+
+### Phase 4 — Dispute resolution (the only place `P_M` signs)
+
+**Goal:** boxes for `admin-settle` / `admin-cancel`. This is where the daemon actually uses its key.
+
+- The daemon must hold/derive the signing key behind `P_M` and produce a `cdk` P2PK signature over the disputed proofs.
+- `admin_settle_action` (Cashu mode): solver rules in favor of the **buyer** → Mostro generates its `P_M` signature and delivers it to the buyer, who combines it with the seller's (or their own pre-agreed) signature to form a valid 2-of-3 swap.
+- `admin_cancel_action` (Cashu mode): solver rules in favor of the **seller** → Mostro delivers its `P_M` signature to the seller to reclaim.
+- Reuse the existing solver/dispute permission checks; only the settlement primitive changes.
+
+**Deliverable:** disputes are resolvable in Cashu mode; the 2-of-3 guarantee is fully exercised.
+
+### Phase 5 — Hardening, edge cases & docs
+
+- Mint-unavailable handling and retries; idempotency on resubmitted tokens; `restore_session` for in-flight Cashu orders; expiry/timeout behavior for un-locked escrows.
+- Enforce and test the bonds-vs-Cashu mutual exclusion end to end.
+- Integration tests against a containerized test mint (e.g. `nutshell`) wired into CI, mirroring the regtest LN setup.
+- Operator docs: enabling Cashu mode, choosing a mint, the trust model, and the migration/runbook notes.
+
+## Open Questions / Future Work
+
+- **`SIG_INPUTS` vs `SIG_ALL`** is currently decided as `SIG_INPUTS` (see above). Revisit if malicious-mint resistance becomes a requirement.
+- **Per-order mint negotiation** and **multi-mint allow-lists** are deferred.
+- **Cashu-native anti-abuse bond** to replace the LN bond in Cashu mode.
+- **Fee collection** in Cashu mode (today the Mostro fee is taken from the LN amounts) needs its own design — how/whether the operator collects a fee on a non-custodial ecash trade.

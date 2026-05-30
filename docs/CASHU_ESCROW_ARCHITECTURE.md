@@ -14,6 +14,8 @@ The Lightning hold-invoice escrow works well for users who run their own node an
 
 3. **Reduced legal/custody surface for the operator.** This is the key structural improvement over Lightning. With a hold invoice, Mostro takes actual custody of the funds for the few seconds between accepting the inbound HTLC and settling the outbound payment — brief, but real custody. In the Cashu 2-of-3 model the operator **never takes possession of user funds at any point**: Mostro only ever holds 1 of the 3 keys and can never unilaterally move the ecash. This removes Mostro from the custody path entirely, which materially shrinks the legal and regulatory burden of operating a coordinator.
 
+4. **Long-lived escrow for marketplace-style trades.** A Lightning hold invoice cannot stay pending indefinitely — it is bounded by its CLTV delta (measured in blocks), so the funds must be released or refunded within hours. This makes Lightning escrow unsuitable for any trade that does not settle almost immediately. Cashu ecash, by contrast, **does not expire**: a 2-of-3 locked token can sit in escrow for days or weeks without any on-chain timeout forcing resolution. This unlocks Mostro as a **marketplace** for physical goods and other slow-to-deliver items — a buyer can lock funds, wait for the seller to ship and the package to arrive, and only then release, with the same non-custodial safety throughout the entire delivery window.
+
 ## Module Map (Proposed)
 
 ```mermaid

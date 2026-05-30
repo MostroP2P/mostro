@@ -32,7 +32,7 @@ use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::bond::add_bond_invoice_action;
-use crate::app::cancel::cancel_action;
+use crate::app::cancel::{cancel_action, cancel_action_cashu};
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
@@ -457,16 +457,23 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                             // Cashu mode (F4). Return CantDo so the peer gets
                             // a clear error instead of a cryptic LND failure.
                             let result = match action {
-                                // No escrow backend wired in F2: reject all
-                                // trade actions so peers get a clear error
-                                // rather than orders that can never be filled
-                                // or cancelled.
+                                // Track C: cooperative cancel works in Cashu mode
+                                // without an LND client — Mostro never held custody,
+                                // so it only records the cancel and transitions state
+                                // while the parties reclaim the 2-of-3 token P2P.
+                                Action::Cancel => {
+                                    cancel_action_cashu(&ctx, message.clone(), &unwrapped, my_keys)
+                                        .await
+                                        .map_err(|e| e.into())
+                                }
+                                // Other trade actions have no escrow backend wired
+                                // yet: reject them so peers get a clear error rather
+                                // than orders that can never be filled or settled.
                                 Action::NewOrder
                                 | Action::TakeSell
                                 | Action::TakeBuy
                                 | Action::AddInvoice
                                 | Action::Release
-                                | Action::Cancel
                                 | Action::AdminCancel
                                 | Action::AdminSettle => {
                                     Err(MostroError::MostroCantDo(CantDoReason::InvalidAction)

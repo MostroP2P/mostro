@@ -161,6 +161,9 @@ async fn job_info_event_send(ctx: AppContext) {
 }
 
 async fn job_retry_failed_payments(ctx: AppContext) {
+    if Settings::is_cashu_enabled() {
+        return;
+    }
     let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
     let interval = ln_settings.payment_retries_interval as u64;
@@ -293,6 +296,9 @@ async fn notify_users_canceled_order(
 }
 
 async fn job_cancel_orders(ctx: AppContext) {
+    if Settings::is_cashu_enabled() {
+        return;
+    }
     info!("Create a pool to connect to db");
 
     let keys = ctx.keys().clone();

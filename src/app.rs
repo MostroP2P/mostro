@@ -457,7 +457,13 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                             // Cashu mode (F4). Return CantDo so the peer gets
                             // a clear error instead of a cryptic LND failure.
                             let result = match action {
-                                Action::TakeSell | Action::TakeBuy | Action::AddInvoice => {
+                                Action::TakeSell
+                                | Action::TakeBuy
+                                | Action::AddInvoice
+                                | Action::Release
+                                | Action::Cancel
+                                | Action::AdminCancel
+                                | Action::AdminSettle => {
                                     Err(MostroError::MostroCantDo(CantDoReason::InvalidAction)
                                         .into())
                                 }

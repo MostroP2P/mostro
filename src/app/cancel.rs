@@ -1,7 +1,10 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::config::settings::Settings;
+use crate::config::types::EscrowMode;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
+use crate::escrow::CashuBackend;
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::prelude::*;
@@ -30,6 +33,58 @@ impl CancelLightning for LndConnector {
                 .map(|_| ())
         })
     }
+}
+
+/// Cashu escrow mode has no Lightning client. The cooperative-cancel fund
+/// return is gated on [`Settings::escrow_mode`] and never reaches this method
+/// in Cashu mode; it is a defensive no-op so an unexpected call can't try (and
+/// fail) to cancel a hold invoice that, by construction, does not exist.
+impl CancelLightning for CashuBackend {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            warn!("cancel_hold_invoice called on Cashu backend — no-op (Mostro holds no custody)");
+            Ok(())
+        })
+    }
+}
+
+/// Return the escrowed funds to the seller when a cancel voids the trade.
+///
+/// The mechanism depends on the active escrow backend, so all cancel paths route
+/// the fund return through here to keep one consistent rule:
+/// - **Lightning:** cancel the seller's hold invoice — Mostro held custody, so it
+///   must actively void the invoice for the funds to return.
+/// - **Cashu:** a no-op. Mostro never took custody, so there is nothing to cancel:
+///   the counterparty hands their signature to the seller over NIP-59 and the
+///   seller reconstructs a 2-of-3 swap to reclaim the locked ecash, entirely P2P
+///   (see `docs/CASHU_ESCROW_ARCHITECTURE.md`).
+///
+/// `context` labels the log line (e.g. `"Cooperative cancel"`).
+async fn return_escrow_to_seller<L: CancelLightning + Send>(
+    order: &Order,
+    ln_client: &mut L,
+    context: &str,
+) -> Result<(), MostroError> {
+    match Settings::escrow_mode() {
+        EscrowMode::Lightning => {
+            if let Some(hash) = &order.hash {
+                ln_client.cancel_hold_invoice(hash).await?;
+                info!("{context}: Order Id {}: Funds returned to seller", order.id);
+            }
+        }
+        EscrowMode::Cashu => {
+            info!(
+                "{context}: Order Id {}: Cashu escrow — no hold invoice to cancel; \
+                 seller reclaims the 2-of-3 token P2P",
+                order.id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reset API-provided quote-derived amounts when republishing an order.
@@ -92,15 +147,9 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
         }
     }
 
-    // Cancel hold invoice if present; if funds were locked, this returns them to the seller.
-    if let Some(hash) = &order.hash {
-        // We return funds to seller
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!(
-            "Cooperative cancel: Order Id {}: Funds returned to seller",
-            &order.id
-        );
-    }
+    // Cooperative cancel voids the trade: return the escrowed funds to the seller
+    // (Lightning cancels the hold invoice; Cashu is a P2P no-op for Mostro).
+    return_escrow_to_seller(&order, ln_client, "Cooperative cancel").await?;
     order.status = Status::CooperativelyCanceled.to_string();
     // update db
     let order = order
@@ -273,11 +322,8 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
     ln_client: &mut L,
     taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
-    // Cancel hold invoice if present
-    if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
-    }
+    // Void the escrow and return funds to the seller (backend-dependent).
+    return_escrow_to_seller(&order, ln_client, "Cancel").await?;
 
     //We notify the taker that the order is cancelled
     enqueue_order_msg(
@@ -340,11 +386,8 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
-    // Cancel hold invoice if present
-    if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
-    }
+    // Void the escrow and return funds to the seller (backend-dependent).
+    return_escrow_to_seller(&order, ln_client, "Cancel").await?;
 
     enqueue_order_msg(
         request_id,
@@ -465,6 +508,34 @@ pub async fn cancel_action(
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
     cancel_action_generic(ctx, msg, event, my_keys, ln_client).await
+}
+
+/// Cancel entry point for **Cashu escrow mode**, where the daemon runs without
+/// an LND client (see `run_cashu`). Mostro never takes custody of Cashu funds,
+/// so a cooperative cancel only records the cancel and transitions state — the
+/// buyer hands their signature to the seller P2P (NIP-59 DM) so the seller
+/// reconstructs a `P_S + P_B` 2-of-3 swap to reclaim the locked ecash. The same
+/// cancel state machine drives both modes; here a no-op [`CashuBackend`] stands
+/// in for the Lightning client and the cooperative-cancel path skips the
+/// (non-existent) hold invoice via [`Settings::escrow_mode`].
+pub async fn cancel_action_cashu(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    // Fail fast outside Cashu mode. This entry injects a no-op `CashuBackend`,
+    // so running it while a Lightning escrow is configured would silently skip
+    // the real hold-invoice cancellation (`return_escrow_to_seller` would take
+    // the Lightning arm and no-op) while still marking the order canceled.
+    // Only reachable from `run_cashu` today, but the invariant is enforced here
+    // because this function is `pub`.
+    if Settings::escrow_mode() != EscrowMode::Cashu {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(
+            "cancel_action_cashu invoked while not in Cashu escrow mode".to_string(),
+        )));
+    }
+    cancel_action_generic(ctx, msg, event, my_keys, &mut CashuBackend).await
 }
 
 async fn cancel_action_generic<L: CancelLightning + Send>(
@@ -758,6 +829,52 @@ mod tests {
         {
             Box::pin(async move { Ok(()) })
         }
+    }
+
+    /// Track C: the Cashu cancel path drives the cancel state machine with a
+    /// no-op escrow client. Mostro holds no custody of Cashu funds, so even if
+    /// the hold-invoice primitive is reached it must not error — the seller
+    /// reclaims the 2-of-3 token P2P, off Mostro. This locks that contract.
+    #[tokio::test]
+    async fn cashu_backend_cancel_hold_invoice_is_noop() {
+        let mut backend = CashuBackend;
+        let result = backend.cancel_hold_invoice("deadbeef").await;
+        assert!(result.is_ok());
+    }
+
+    /// The Cashu cancel entry must refuse to run when the node is not in Cashu
+    /// escrow mode — otherwise it would inject the no-op CashuBackend and mark
+    /// an order canceled without cancelling the real Lightning hold invoice. The
+    /// unit-test binary's global escrow mode is Lightning, so this must error
+    /// before touching the order.
+    #[tokio::test]
+    async fn cancel_action_cashu_refuses_outside_cashu_mode() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build();
+
+        let caller = Keys::generate().public_key();
+        let event = create_unwrapped_message_with_pubkey(caller);
+        let msg = Message::new_order(
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            None,
+            Action::Cancel,
+            None,
+        );
+        let my_keys = Keys::generate();
+
+        let result = cancel_action_cashu(&ctx, msg, &event, &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+        ));
     }
 
     #[tokio::test]

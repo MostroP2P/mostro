@@ -32,7 +32,7 @@ use crate::app::admin_cancel::admin_cancel_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::bond::add_bond_invoice_action;
-use crate::app::cancel::cancel_action;
+use crate::app::cancel::{cancel_action, cancel_action_cashu};
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
@@ -395,11 +395,13 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     }
 }
 
-/// Cashu-mode event loop. Mirrors `run()` but without an LND client — all
-/// actions are routed through `handle_message_action_no_ln`. Actions that
-/// require LND (Release, Cancel, AdminCancel, AdminSettle) fall through to
-/// its `_` arm and are logged/ignored until the EscrowBackend abstraction
-/// lands in F3 and wires up proper Cashu dispatch.
+/// Cashu-mode event loop. Mirrors `run()` but without an LND client. Most
+/// actions route through `handle_message_action_no_ln`; `Action::Cancel` is
+/// handled by `cancel_action_cashu` (cooperative cancel needs no LND, since
+/// Mostro holds no custody of Cashu funds). The remaining escrow-dependent
+/// actions (`NewOrder`, `TakeSell`, `TakeBuy`, `AddInvoice`, `Release`,
+/// `AdminCancel`, `AdminSettle`) are rejected with `CantDo` until their Cashu
+/// tracks wire up the corresponding backend dispatch.
 pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
@@ -453,20 +455,28 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 
                     if inner_message.verify() {
                         if let Some(action) = message.inner_action() {
-                            // Escrow-dependent actions are not yet wired for
-                            // Cashu mode (F4). Return CantDo so the peer gets
-                            // a clear error instead of a cryptic LND failure.
+                            // Cancel is wired for Cashu (cooperative cancel); the
+                            // other escrow-dependent actions are rejected with
+                            // CantDo so the peer gets a clear error instead of a
+                            // cryptic LND failure, until their tracks land.
                             let result = match action {
-                                // No escrow backend wired in F2: reject all
-                                // trade actions so peers get a clear error
-                                // rather than orders that can never be filled
-                                // or cancelled.
+                                // Track C: cooperative cancel works in Cashu mode
+                                // without an LND client — Mostro never held custody,
+                                // so it only records the cancel and transitions state
+                                // while the parties reclaim the 2-of-3 token P2P.
+                                Action::Cancel => {
+                                    cancel_action_cashu(&ctx, message.clone(), &unwrapped, my_keys)
+                                        .await
+                                        .map_err(|e| e.into())
+                                }
+                                // Other trade actions have no escrow backend wired
+                                // yet: reject them so peers get a clear error rather
+                                // than orders that can never be filled or settled.
                                 Action::NewOrder
                                 | Action::TakeSell
                                 | Action::TakeBuy
                                 | Action::AddInvoice
                                 | Action::Release
-                                | Action::Cancel
                                 | Action::AdminCancel
                                 | Action::AdminSettle => {
                                     Err(MostroError::MostroCantDo(CantDoReason::InvalidAction)

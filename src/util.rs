@@ -1,3 +1,4 @@
+use crate::app::context::AppContext;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
@@ -26,6 +27,7 @@ use sqlx_crud::Crud;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
 use tracing::info;
@@ -789,6 +791,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
 }
 
 pub async fn show_hold_invoice(
+    escrow: &Arc<dyn EscrowBackend>,
     my_keys: &Keys,
     payment_request: Option<String>,
     buyer_pubkey: &PublicKey,
@@ -796,24 +799,30 @@ pub async fn show_hold_invoice(
     mut order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    let mut ln_client = lightning::LndConnector::new().await?;
     // Seller pays only the order amount and their Mostro fee
     // Dev fee is NOT charged to seller - it's paid by mostrod from its earnings
     let new_amount = order.amount + order.fee;
 
-    // Now we generate the hold invoice that seller should pay
-    let (invoice_response, preimage, hash) = ln_client
-        .create_hold_invoice(
-            &messages::hold_invoice_description(
-                &order.id.to_string(),
-                &order.fiat_code,
-                &order.fiat_amount.to_string(),
-            )
-            .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?,
-            new_amount,
-        )
+    // Open the escrow lock through the active backend. For Lightning this
+    // creates the hold invoice the seller pays.
+    let description = messages::hold_invoice_description(
+        &order.id.to_string(),
+        &order.fiat_code,
+        &order.fiat_amount.to_string(),
+    )
+    .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
+    let invoice_response = escrow
+        .lock(&order, &description, new_amount)
         .await
-        .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
+        .map_err(|e| match e {
+            MostroError::MostroInternalErr(ServiceError::HoldInvoiceError(_)) => e,
+            MostroError::MostroInternalErr(inner) => {
+                MostroInternalErr(ServiceError::HoldInvoiceError(inner.to_string()))
+            }
+            other => other,
+        })?;
+    let preimage = invoice_response.preimage.clone();
+    let hash = invoice_response.hash.clone();
     if let Some(invoice) = payment_request {
         order.buyer_invoice = Some(invoice);
     };
@@ -870,6 +879,90 @@ pub async fn show_hold_invoice(
     .await;
 
     let _ = invoice_subscribe(hash, request_id).await;
+
+    Ok(())
+}
+
+/// Cashu-mode counterpart of [`show_hold_invoice`].
+///
+/// In Cashu escrow mode there is no hold invoice: instead of locking funds on
+/// Mostro's node, the seller will swap unencumbered ecash into a 2-of-3 P2PK
+/// token (locked to the buyer/seller trade keys and Mostro's key) and submit it
+/// via `Action::AddCashuEscrow`. This helper performs the take-time transition:
+/// it records both trade pubkeys, moves the order to `WaitingPayment`, publishes
+/// the updated order event, and prompts the seller to fund the escrow — handing
+/// them the buyer trade pubkey (`P_B`) they need to build the token (`P_M` is
+/// Mostro's own node pubkey, already known to the client). No funds move through
+/// Mostro; the order only advances to `Active` once the submitted token is
+/// validated by `add_cashu_escrow_action`.
+///
+/// Mirrors `show_hold_invoice`'s status/DB/event handling so the rest of the
+/// trade lifecycle is identical to the Lightning flow from `WaitingPayment` on.
+#[allow(clippy::too_many_arguments)]
+pub async fn show_cashu_escrow_request(
+    my_keys: &Keys,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
+    mut order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // The seller locks exactly `order.amount` in the 2-of-3 token — this is the
+    // value `add_cashu_escrow_action` validates the submitted token against. We
+    // deliberately do NOT add the Mostro fee here: unlike a Lightning hold
+    // invoice (where Mostro settles the inbound HTLC and keeps the fee), Mostro
+    // never takes custody of the ecash and holds only 1 of 3 keys, so it cannot
+    // split a fee out of the redeemed token. Fee collection in Cashu mode is an
+    // open design question (see docs/CASHU_ESCROW_ARCHITECTURE.md, "Open
+    // Questions / Future Work"); until it is resolved the escrow locks the bare
+    // order amount.
+    let locked_amount = order.amount;
+
+    order.status = Status::WaitingPayment.to_string();
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.seller_pubkey = Some(seller_pubkey.to_string());
+
+    // Publish the new status and persist.
+    let pool = db::connect()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    order_updated
+        .update(&pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Prompt the seller to fund the escrow. The SmallOrder carries the buyer
+    // trade pubkey (P_B) the seller needs to construct the 2-of-3 token; P_M is
+    // Mostro's node pubkey, already known to the client.
+    let mut new_order = order.as_new_order();
+    new_order.status = Some(Status::WaitingPayment);
+    new_order.amount = locked_amount;
+    new_order.buyer_trade_pubkey = Some(buyer_pubkey.to_string());
+    new_order.seller_trade_pubkey = Some(seller_pubkey.to_string());
+    new_order.buyer_invoice = None;
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        Some(Payload::Order(new_order)),
+        *seller_pubkey,
+        order.trade_index_seller,
+    )
+    .await;
+
+    // Notify the buyer (maker) to wait for the seller to lock the escrow.
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        None,
+        *buyer_pubkey,
+        order.trade_index_buyer,
+    )
+    .await;
 
     Ok(())
 }
@@ -1032,11 +1125,15 @@ pub async fn rate_counterpart(
     Ok(())
 }
 
-/// Settle a seller hold invoice
-#[allow(clippy::too_many_arguments)]
+/// Settle a seller hold invoice via the active escrow backend.
+///
+/// Keeps the authorization check (sender must be the seller, unless `is_admin`)
+/// and routes the settlement through `ctx.escrow()`: the normal path uses
+/// `release`, the admin (dispute) path uses `dispute_settle`. For Lightning both
+/// settle the hold invoice by preimage; a missing preimage is `InvalidInvoice`.
 pub async fn settle_seller_hold_invoice(
     event: &UnwrappedMessage,
-    ln_client: &mut dyn EscrowBackend,
+    ctx: &AppContext,
     action: Action,
     is_admin: bool,
     order: &Order,
@@ -1053,13 +1150,13 @@ pub async fn settle_seller_hold_invoice(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    // Settling the hold invoice
-    if let Some(preimage) = order.preimage.as_ref() {
-        ln_client.settle_hold_invoice(preimage).await?;
-        info!("{action}: Order Id {}: hold invoice settled", order.id);
+    // Settle the escrow lock through the active backend.
+    if is_admin {
+        ctx.escrow().dispute_settle(order).await?;
     } else {
-        return Err(MostroCantDo(CantDoReason::InvalidInvoice));
+        ctx.escrow().release(order).await?;
     }
+    info!("{action}: Order Id {}: hold invoice settled", order.id);
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 use crate::app::bond;
 use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
+    get_order, set_waiting_invoice_status, show_cashu_escrow_request, show_hold_invoice,
+    update_order_event, validate_invoice,
 };
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -209,6 +211,16 @@ pub async fn take_sell_action(
     order.trade_index_buyer = Some(trade_index);
     order.set_timestamp_now();
 
+    // Cashu escrow mode: there is no hold invoice. Move the order to
+    // `WaitingPayment` and prompt the seller to fund the 2-of-3 escrow token;
+    // the order advances to `Active` only once the seller submits a valid token
+    // via `Action::AddCashuEscrow` (see `add_cashu_escrow_action`).
+    if Settings::is_cashu_enabled() {
+        show_cashu_escrow_request(my_keys, &event.sender, &seller_pubkey, order, request_id)
+            .await?;
+        return Ok(());
+    }
+
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {
         update_order_status(&mut order, my_keys, pool, request_id).await?;
@@ -216,6 +228,7 @@ pub async fn take_sell_action(
     // If payment request is present, show hold invoice
     else {
         show_hold_invoice(
+            ctx.escrow(),
             my_keys,
             payment_request,
             &event.sender,

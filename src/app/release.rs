@@ -1,7 +1,6 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
-use crate::escrow::EscrowBackend;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -113,7 +112,6 @@ pub async fn check_failure_retries(
 /// * `msg` - The message containing the release request and associated metadata
 /// * `event` - The unwrapped gift event containing the seller's signature and verification data
 /// * `my_keys` - The Mostro node's keys used for signing events and messages
-/// * `ln_client` - Lightning network client for invoice settlement
 ///
 /// # Returns
 ///
@@ -160,7 +158,6 @@ pub async fn release_action(
     msg: Message,
     event: &UnwrappedMessage,
     my_keys: &Keys,
-    ln_client: &mut dyn EscrowBackend,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get request id
@@ -190,7 +187,7 @@ pub async fn release_action(
         .map_err(MostroInternalErr)?;
 
     // Settle seller hold invoice
-    settle_seller_hold_invoice(event, ln_client, Action::Released, false, &order).await?;
+    settle_seller_hold_invoice(event, ctx, Action::Released, false, &order).await?;
     // Update order event with status SettledHoldInvoice
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await

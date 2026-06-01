@@ -133,18 +133,18 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
-    let ctx = AppContext::new(
-        get_db_pool(),
-        client.clone(),
-        settings,
-        MESSAGE_QUEUES.queue_order_msg.clone(),
-        mostro_keys.clone(),
-    );
-
-    start_scheduler(ctx.clone()).await;
-
     if Settings::is_cashu_enabled() {
         tracing::info!("Starting in Cashu escrow mode (LND not required)");
+        let escrow: Arc<dyn escrow::EscrowBackend> = Arc::new(cashu::CashuBackend::new());
+        let ctx = AppContext::new(
+            get_db_pool(),
+            client.clone(),
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            mostro_keys.clone(),
+            escrow,
+        );
+        start_scheduler(ctx.clone()).await;
         return run_cashu(ctx).await;
     }
 
@@ -155,6 +155,21 @@ async fn main() -> Result<()> {
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
     };
+
+    // Lightning escrow backend wraps the connector; handlers reach it via
+    // `ctx.escrow()`.
+    let escrow: Arc<dyn escrow::EscrowBackend> =
+        Arc::new(escrow::LightningBackend::new(ln_client.clone()));
+    let ctx = AppContext::new(
+        get_db_pool(),
+        client.clone(),
+        settings,
+        MESSAGE_QUEUES.queue_order_msg.clone(),
+        mostro_keys.clone(),
+        escrow,
+    );
+
+    start_scheduler(ctx.clone()).await;
 
     if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {

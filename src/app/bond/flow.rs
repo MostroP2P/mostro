@@ -968,11 +968,20 @@ async fn resume_take_after_bond(
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
 
+    // The bond feature is mutually exclusive with Cashu mode, so this resume
+    // path is always Lightning: wrap a fresh connector as the escrow backend
+    // for `show_hold_invoice` (which `escrow().lock()`s to create the hold
+    // invoice the seller pays).
+    let escrow: Arc<dyn crate::escrow::EscrowBackend> = Arc::new(
+        crate::escrow::LightningBackend::new(LndConnector::new().await?),
+    );
+
     match kind {
         // Buy order → taker = seller, no buyer-invoice required up front:
         // mirror the post-take path in take_buy_action.
         mostro_core::order::Kind::Buy => {
             show_hold_invoice(
+                &escrow,
                 my_keys,
                 None,
                 &buyer_pubkey,
@@ -989,6 +998,7 @@ async fn resume_take_after_bond(
             if order.buyer_invoice.is_some() {
                 let payment_request = order.buyer_invoice.clone();
                 show_hold_invoice(
+                    &escrow,
                     my_keys,
                     payment_request,
                     &buyer_pubkey,

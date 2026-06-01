@@ -112,6 +112,7 @@ pub async fn add_invoice_action(
         )
         .await;
     } else if let Err(cause) = show_hold_invoice(
+        ctx.escrow(),
         my_keys,
         None,
         &buyer_pubkey,

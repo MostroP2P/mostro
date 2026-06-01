@@ -135,6 +135,23 @@ async fn main() -> Result<()> {
     );
     if Settings::is_cashu_enabled() {
         tracing::info!("Starting in Cashu escrow mode (LND not required)");
+
+        // Connect to the operator-configured mint and verify it is reachable
+        // (and supports NUT-11 P2PK). The Track A lock handler needs a live
+        // client to validate seller-submitted escrow tokens — without it every
+        // `AddCashuEscrow` fails and no order can advance to `Active`. Refuse to
+        // boot if the mint is unavailable, mirroring how Lightning mode refuses
+        // to boot without LND.
+        let mint_url = Settings::get_cashu()
+            .map(|c| c.mint_url.clone())
+            .expect("cashu enabled but [cashu] config missing");
+        let cashu_client = match cashu::CashuClient::connect(&mint_url).await {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                panic!("No connection to Cashu mint {mint_url} - shutting down Mostro! ({e})")
+            }
+        };
+
         let escrow: Arc<dyn escrow::EscrowBackend> = Arc::new(cashu::CashuBackend::new());
         let ctx = AppContext::new(
             get_db_pool(),
@@ -143,7 +160,8 @@ async fn main() -> Result<()> {
             MESSAGE_QUEUES.queue_order_msg.clone(),
             mostro_keys.clone(),
             escrow,
-        );
+        )
+        .with_cashu_client(cashu_client);
         start_scheduler(ctx.clone()).await;
         return run_cashu(ctx).await;
     }

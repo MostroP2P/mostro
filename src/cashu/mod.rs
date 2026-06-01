@@ -149,12 +149,14 @@ impl CashuClient {
     ///    configured mint (`self.mint_url`); Mostro only escrows on its own mint.
     /// 3. **Amount.** The token's total value must equal `expected_amount`
     ///    (sats); `check_state` only proves unspent-ness, not quantity.
-    /// 4. **Unspent.** Every proof must be `Unspent` at the mint (NUT-07
+    /// 4. **Mint-issued (DLEQ).** Every proof must carry a valid NUT-12 DLEQ
+    ///    proof verifying against the mint's keyset ([`Self::verify_token_dleq`]).
+    ///    This authenticates the ecash as genuinely mint-signed — without it a
+    ///    seller could fabricate unspent-but-worthless proofs (see step 4 in the
+    ///    body), since `check_state` reports any unknown secret as `Unspent`.
+    /// 5. **Unspent.** Every proof must be `Unspent` at the mint (NUT-07
     ///    `/v1/checkstate`). The checkstate `Y` points are derived directly from
     ///    each proof secret via `hash_to_curve`, so this needs no keyset fetch.
-    ///
-    /// Mint authenticity of the proofs (DLEQ) is intentionally out of scope here
-    /// (see [`Self::verify_token_dleq`]); the parties already agreed on the mint.
     pub async fn verify_escrow_token(
         &self,
         token_str: &str,
@@ -188,7 +190,16 @@ impl CashuClient {
             )));
         }
 
-        // 4: every proof must be unspent at the mint. Derive the checkstate Y
+        // 4: the proofs must be genuine, mint-issued ecash. `check_state`
+        // (step 5) only proves a secret is unspent — an honest mint reports any
+        // *unknown* secret as `Unspent`, so a seller could fabricate proofs with
+        // the right 2-of-3 condition and amount but no mint signature and still
+        // pass every other check, tricking the buyer into sending fiat against
+        // worthless ecash. DLEQ (NUT-12) authenticates each proof's blind
+        // signature against the mint's keyset offline, closing that hole.
+        self.verify_token_dleq(&token).await?;
+
+        // 5: every proof must be unspent at the mint. Derive the checkstate Y
         // points from the proof secrets (Y = hash_to_curve(secret)).
         let secrets = token.token_secrets();
         if secrets.is_empty() {

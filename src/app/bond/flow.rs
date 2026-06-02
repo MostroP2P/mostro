@@ -1100,15 +1100,15 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
     Ok(())
 }
 
-/// If `order_id` is currently in `Status::WaitingTakerBond` and has no
-/// remaining active bond rows, transition it back to `Status::Pending`
-/// and republish the NIP-33 event. No-op otherwise.
+/// Atomically transition `order_id` from `WaitingTakerBond` back to
+/// `Pending` **iff** no active taker bond remains on it. Returns `true`
+/// when the transition was applied, `false` when it was a no-op.
 ///
-/// Used by `on_bond_invoice_canceled` (when LND cancels the only
-/// outstanding bond's hold invoice) and by the taker self-cancel path
-/// in `cancel.rs` (when the sender was the last bonded taker). Both
-/// call sites need the same "drop back to Pending if empty" logic;
-/// extracting it keeps them consistent.
+/// This is the load-bearing, side-effect-free core of
+/// [`maybe_drop_waiting_taker_bond`] (the latter adds the NIP-33
+/// republish, which needs process-wide keys). Splitting it out lets the
+/// CAS semantics be unit-tested directly instead of via an inlined SQL
+/// copy that could drift from production.
 ///
 /// Race-free: the status check, active-bond check, and status update
 /// run in a single conditional `UPDATE … WHERE … AND NOT EXISTS (…)`
@@ -1119,20 +1119,17 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
 /// `WaitingTakerBond` (winner promotes to `WaitingPayment`, maker
 /// cancels, etc.) is caught by the `status = 'waiting-taker-bond'`
 /// predicate.
-pub(crate) async fn maybe_drop_waiting_taker_bond(
+///
+/// Phase 5: the active-bond check is scoped to `role = 'taker'`. Under
+/// `apply_to = both` the order carries a `Locked` *maker* bond for the
+/// whole trade; counting it here would make `NOT EXISTS` permanently
+/// false, so a `WaitingTakerBond` order whose last taker bond was just
+/// cancelled would never drop back to `Pending`. The drop-to-Pending
+/// decision depends solely on whether any *taker* is still racing.
+pub(crate) async fn drop_waiting_taker_bond_to_pending(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
-) -> Result<(), MostroError> {
-    // Atomic compare-and-swap on (status, no active taker bonds). A single
-    // statement so SQLite snapshots both predicates at the same point
-    // in time.
-    //
-    // Phase 5: the active-bond check is scoped to `role = 'taker'`. Under
-    // `apply_to = both` the order carries a `Locked` *maker* bond for the
-    // whole trade; counting it here would make `NOT EXISTS` permanently
-    // false, so a `WaitingTakerBond` order whose last taker bond was just
-    // cancelled would never drop back to `Pending`. The drop-to-Pending
-    // decision depends solely on whether any *taker* is still racing.
+) -> Result<bool, MostroError> {
     let cas = sqlx::query(
         "UPDATE orders SET status = ? \
          WHERE id = ? AND status = ? \
@@ -1152,10 +1149,28 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    if cas.rows_affected() == 0 {
+    Ok(cas.rows_affected() == 1)
+}
+
+/// If `order_id` is currently in `Status::WaitingTakerBond` and has no
+/// remaining active taker bond, transition it back to `Status::Pending`
+/// and republish the NIP-33 event. No-op otherwise.
+///
+/// Used by `on_bond_invoice_canceled` (when LND cancels the only
+/// outstanding bond's hold invoice) and by the taker self-cancel path
+/// in `cancel.rs` (when the sender was the last bonded taker). Both
+/// call sites need the same "drop back to Pending if empty" logic;
+/// extracting it keeps them consistent. The CAS itself lives in
+/// [`drop_waiting_taker_bond_to_pending`]; this wrapper adds the
+/// NIP-33 republish.
+pub(crate) async fn maybe_drop_waiting_taker_bond(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+) -> Result<(), MostroError> {
+    if !drop_waiting_taker_bond_to_pending(pool, order_id).await? {
         // Either the order is no longer in `WaitingTakerBond`
         // (winner / maker-cancel / admin already moved it on), or a
-        // concurrent bond is still racing. Either way we have no
+        // concurrent taker bond is still racing. Either way we have no
         // status transition to publish.
         return Ok(());
     }
@@ -1660,10 +1675,9 @@ mod tests {
         // `Pending` even though the maker's `Locked` bond is still on the
         // order. The CAS's active-bond check is scoped to `role = 'taker'`,
         // so the lingering maker bond does not pin the order in
-        // `WaitingTakerBond`. (No Nostr globals needed: with the order at
-        // `Pending` after the CAS, the republish path is exercised by the
-        // dedicated Phase 1.5 tests; here we assert the DB transition via a
-        // direct status read after forcing the helper's CAS.)
+        // `WaitingTakerBond`. Exercises the real CAS helper
+        // (`drop_waiting_taker_bond_to_pending`) — not an inlined SQL copy
+        // — so the test tracks production semantics.
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id).await;
@@ -1681,29 +1695,11 @@ mod tests {
         maker.hash = Some("d".repeat(64));
         create_bond(&pool, maker).await.unwrap();
 
-        // Run the same CAS the helper uses (isolated from the Nostr
-        // republish that follows it, which needs process-wide keys).
-        let cas = sqlx::query(
-            "UPDATE orders SET status = ? \
-             WHERE id = ? AND status = ? \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM bonds \
-                 WHERE order_id = ? AND state IN (?, ?) AND role = ? \
-               )",
-        )
-        .bind(Status::Pending.to_string())
-        .bind(order_id)
-        .bind(Status::WaitingTakerBond.to_string())
-        .bind(order_id)
-        .bind(BondState::Requested.to_string())
-        .bind(BondState::Locked.to_string())
-        .bind(BondRole::Taker.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            cas.rows_affected(),
-            1,
+        let dropped = drop_waiting_taker_bond_to_pending(&pool, order_id)
+            .await
+            .unwrap();
+        assert!(
+            dropped,
             "order must drop to Pending: the Locked maker bond must not count as an active taker bond"
         );
 
@@ -1713,6 +1709,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, Status::Pending.to_string());
+    }
+
+    #[tokio::test]
+    async fn drop_waiting_taker_bond_held_by_active_taker_bond() {
+        // Counterpart to the maker-bond test: a still-active *taker* bond
+        // (Requested) MUST pin the order in `WaitingTakerBond` — the CAS
+        // returns false and the status is unchanged. Confirms the role
+        // filter does not over-drop while another taker is still racing.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut taker = make_bond(order_id, BondState::Requested);
+        taker.pubkey = "t".repeat(64);
+        taker.hash = Some("e".repeat(64));
+        create_bond(&pool, taker).await.unwrap();
+
+        let dropped = drop_waiting_taker_bond_to_pending(&pool, order_id)
+            .await
+            .unwrap();
+        assert!(!dropped, "an active taker bond must keep the order parked");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, Status::WaitingTakerBond.to_string());
     }
 
     #[tokio::test]

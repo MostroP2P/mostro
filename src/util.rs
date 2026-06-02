@@ -385,7 +385,21 @@ pub async fn publish_order(
     // the bond subscriber calls on `Accepted`. Range makers are deferred
     // to Phase 6 (parent/child proportional slashes), so they keep
     // publishing immediately for now.
-    if crate::app::bond::maker_bond_required() && !new_order_db.is_range_order() {
+    let maker_bond_required = crate::app::bond::maker_bond_required();
+    if maker_bond_required && new_order_db.is_range_order() {
+        // Visibility for operators: with `apply_to ∈ { make, both }` a
+        // range order is published WITHOUT a maker bond because
+        // proportional range-bond sizing/slashing is Phase 6. Without
+        // this log the operator could wrongly assume every order on a
+        // bond-enabled node is bonded.
+        tracing::warn!(
+            order_kind = %new_order_db.kind,
+            "publish_order: maker bond is enabled but order {} is a range order — \
+             publishing WITHOUT a maker bond (range maker bonds land in Phase 6)",
+            new_order_db.id
+        );
+    }
+    if maker_bond_required && !new_order_db.is_range_order() {
         let notional = maker_bond_notional_sats(&new_order_db)?;
         new_order_db.status = Status::WaitingMakerBond.to_string();
         let order = new_order_db

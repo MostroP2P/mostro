@@ -186,11 +186,12 @@ slash path.
 |------:|----------|------------|--------|
 | 0 | Foundation: config schema, `bonds` table, pure helpers, types | — | ✅ shipped (PR #712) |
 | 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped (PR #719) |
-| 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | pending |
-| 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | pending |
-| 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | pending |
-| 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | proposed |
-| 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (mostro-core 0.11.5) |
+| 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | ✅ shipped (PR #736) |
+| 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | ✅ shipped (PR #737) |
+| 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | ✅ shipped (PR #738) |
+| 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | ✅ shipped (PR #743) |
+| 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (PR #744) |
+| 4.5 | Re-prompt the winner for a fresh payout invoice after `send_payment` retries exhaust, instead of stranding the bond in `Failed` ([issue #750](https://github.com/MostroP2P/mostro/issues/750)) | 3 | pending |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |
 | 7 | Timeout slash for maker bond | 5 | pending |
@@ -199,7 +200,21 @@ slash path.
 Phases 4, 5, 6, 7 can partially overlap in time but must land in this
 order on `main` to keep review scope honest. Phase 3.5 depends only on
 Phase 3 and is orthogonal to the slash-path phases (4–7); it can land
-any time after Phase 3.
+any time after Phase 3. Phase 4.5 likewise depends only on Phase 3's
+payout flow (it hardens the `send_payment`-exhaustion path) and is
+orthogonal to the slash-direction phases — it can land any time after
+Phase 3, and is numbered 4.5 only because it was reported from field
+testing after Phase 4 shipped.
+
+**Status as of this revision.** Phases 0 through 4 are merged on
+`main` (PRs #712, #719, #736, #737, #738, #743, #744). The
+`mostro-core` pin in `Cargo.toml` is **0.11.5**, which carries every
+protocol variant those phases need (`Status::WaitingTakerBond`,
+`Action::PayBondInvoice`, `Payload::BondResolution`,
+`Action::AddBondInvoice`, `Payload::BondPayoutRequest`,
+`Action::BondInvoiceAccepted`, `Action::BondPayoutCompleted`,
+`Action::BondSlashed`). Phase 4.5 and Phases 5–8 are not yet
+implemented.
 
 ---
 
@@ -519,7 +534,7 @@ instead of memo parsing.
 
 ---
 
-## 6.5. Phase 1.5 — Dedicated `PayBondInvoice` + `WaitingTakerBond`
+## 6.5. Phase 1.5 — Dedicated `PayBondInvoice` + `WaitingTakerBond` ✅ Completed
 
 Small, protocol-only phase. Lands the dedicated `Action` and `Status`
 variants that Phase 1 deferred (§6 implementation note) so clients can
@@ -804,7 +819,7 @@ never has to lean on memo parsing in the wild.
 
 ---
 
-## 7. Phase 2 — Solver-directed dispute slash
+## 7. Phase 2 — Solver-directed dispute slash ✅ Completed
 
 Behaviour gate: `enabled && apply_to ∈ { take, both }` (Phase 5 extends to
 maker).
@@ -977,7 +992,7 @@ sats are already in Mostro's wallet.
 
 ---
 
-## 8. Phase 3 — Payout flow
+## 8. Phase 3 — Payout flow ✅ Completed
 
 Shared infrastructure used by every slash path afterwards. Non-blocking:
 trade finalization must never wait on the **counterparty** payout
@@ -1139,6 +1154,13 @@ must land hand-in-hand with the client adoption. See §14.3.
        to `PendingPayout`, overwrites `payout_invoice`, and resets
        `payout_attempts` to 0 (see `add_bond_invoice_action` below).
        Past the claim window, `Failed` requires operator attention.
+       **Superseded by Phase 4.5 (§9.5):** as shipped in Phase 3 this
+       recovery only fires if the winner *spontaneously* resubmits —
+       Mostro never re-prompts — which makes the in-window recovery
+       unreachable in practice ([issue #750](https://github.com/MostroP2P/mostro/issues/750)).
+       Phase 4.5 changes the in-window exhaustion transition to discard
+       the stale invoice and re-prompt the winner via the scheduler
+       instead of going straight to `Failed`.
 
   When `slash_node_share_pct = 1.0` the counterparty leg is skipped
   entirely (no `AddBondInvoice` message, no `send_payment`, no forfeit
@@ -1230,7 +1252,13 @@ must land hand-in-hand with the client adoption. See §14.3.
 - **User-side recovery from `Failed`.** `Failed` is *not* a hard
   terminal state from the recipient's perspective. A fresh
   `AddBondInvoice` from the same recipient resurrects the bond via a
-  guarded CAS:
+  guarded CAS. **(Phase 4.5 §9.5 makes this Mostro-driven.** In Phase 3
+  this resurrection depends on the winner spontaneously resubmitting;
+  Phase 4.5 has the daemon re-prompt the winner on in-window
+  retry-exhaustion so the recovery no longer hinges on a client guess —
+  see [issue #750](https://github.com/MostroP2P/mostro/issues/750). The
+  CAS below is retained as belt-and-braces for rows that still reach
+  `Failed`.)
   `UPDATE bonds SET state='pending-payout', payout_invoice=?,
    payout_attempts=0, invoice_request_attempts=0
    WHERE id=? AND state='failed'`, gated in Rust by `now -
@@ -1355,7 +1383,7 @@ must land hand-in-hand with the client adoption. See §14.3.
 
 ---
 
-## 8.5. Phase 3.5 — Payout confirmation to the winning counterparty
+## 8.5. Phase 3.5 — Payout confirmation to the winning counterparty ✅ Completed
 
 Small, protocol-only follow-up to Phase 3. Phase 3 drives the payout but
 tells the winner **nothing** once they have submitted their bolt11: the
@@ -1472,7 +1500,7 @@ the client to stop prompting.
 
 ---
 
-## 9. Phase 4 — Timeout slash (taker bond)
+## 9. Phase 4 — Timeout slash (taker bond) ✅ Completed
 
 Gate: `enabled && slash_on_waiting_timeout && apply_to ∈ { take, both }`.
 
@@ -1571,6 +1599,207 @@ slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
 - Attack-invariant test passes: counterparty cancelling before timeout
   never causes a slash.
 - Timeout slashes feed Phase 3 payout flow.
+
+---
+
+## 9.5. Phase 4.5 — Re-prompt the winner after payout-payment failure
+
+Small, daemon-only follow-up to Phase 3. No `mostro-core` change, no
+schema change, no new slashing — it closes a hole in the Phase 3 payout
+state machine that makes a slashed bond's counterparty share
+unrecoverable in practice. Reported as
+[issue #750](https://github.com/MostroP2P/mostro/issues/750) from field
+testing of the bond rollout.
+
+Depends only on Phase 3 (it reuses `Action::AddBondInvoice` from Phase 3
+and `Action::BondInvoiceAccepted` from Phase 3.5); orthogonal to the
+slash-direction phases (4–7).
+
+### 9.5.1 The problem
+
+Once a bond is slashed and the winning counterparty has submitted a
+payout bolt11, Phase 3's scheduler (`run_bond_payout_cycle` →
+`process_one_bond` → `pay_counterparty`) tries `send_payment` against
+that invoice and, on failure, bumps `payout_attempts`
+(`on_send_payment_failure` in `src/app/bond/payout.rs`). When
+`payout_attempts >= payout_max_retries` (default 5) the bond transitions
+to `Failed` and **only an ERROR is logged — no message is sent to the
+winner**.
+
+From that point the counterparty share is stranded:
+
+1. The scheduler enumerates **only `PendingPayout` bonds**. A `Failed`
+   bond is invisible to it, so `Action::AddBondInvoice` is never
+   re-sent.
+2. Throughout the retry phase the row keeps its original
+   `payout_invoice` set, so `process_one_bond` always routes to
+   `pay_counterparty`. All `payout_max_retries` attempts hit the **same**
+   bolt11 — Mostro never asks the winner for a fresh one (e.g. routed via
+   a different path or a node with inbound liquidity).
+
+Phase 3 documented a recovery path (the "`Failed` resurrection" branch in
+`apply_payout_invoice`, §8.2): a fresh `AddBondInvoice` from the winner,
+inside the claim window, flips `Failed → PendingPayout`, overwrites
+`payout_invoice`, and resets `payout_attempts`. But that branch only
+fires if the **client spontaneously resubmits**. Mostro never prompts the
+winner and never tells them the payment failed, so the winner has no
+signal to act on — the resurrection path is, in practice, unreachable.
+Net effect: a payout that can't be routed on the first invoice silently
+stalls forever and requires manual operator intervention, contradicting
+the §8 "non-blocking, self-healing payout" intent.
+
+### 9.5.2 Expected behaviour (from the issue)
+
+After the final `send_payment` attempt against a given invoice fails,
+and **while the claim window is still open**, Mostro should:
+
+- **Re-request an invoice from the winner** — re-send
+  `Action::AddBondInvoice` — instead of going silent.
+- **Not reset the claim-window deadline.** The forfeit deadline stays
+  anchored on `slashed_at` (§8.1 / §15.4); re-prompting must never push
+  it forward, or a winner whose node is briefly unroutable could be kept
+  on the hook indefinitely.
+- **Stop prompting once a valid invoice is submitted** and routed
+  successfully (the bond reaches `Slashed`).
+
+### 9.5.3 Scope
+
+All changes are in `src/app/bond/payout.rs` and the scheduler cadence;
+no `mostro-core` variant, no migration.
+
+- **Only a *terminal* failure abandons the invoice (double-payout
+  guard).** Abandoning the current invoice — whether by re-arming for a
+  fresh one or by flipping to `Failed` — clears `payout_payment_hash`,
+  which disables the §8.1 reconciliation branch in `pay_counterparty`
+  (the branch that looks the payment up in LND before re-sending). If the
+  in-flight `send_payment` for the current invoice could still settle,
+  abandoning it would let a freshly-prompted invoice be paid while the
+  original later succeeds — a **double payout**. So
+  `on_send_payment_failure` distinguishes two failure kinds:
+  - **Terminal** — LND reported the payment `Failed` (via the status
+    stream or reconciliation), or the invoice is structurally unusable.
+    No payment is or will be in flight, so the invoice may be abandoned.
+  - **Indeterminate** — status-stream timeout, stream EOF, or a
+    `send_payment` RPC error. The payment may still be in flight. The
+    invoice and its `payout_payment_hash` are **kept**; the row stays in
+    `PendingPayout` and the next tick's reconciliation branch polls LND
+    to a definitive `Succeeded` / `Failed` before anything new is paid.
+    `payout_attempts` saturates at `payout_max_retries` so a long LND
+    outage cannot grow it without bound.
+- **Stale invoice on *terminal* retry exhaustion is discarded, not
+  terminal-`Failed`.** When `payout_attempts >= payout_max_retries`
+  after a **terminal** failure:
+  - **If `now - slashed_at < payout_claim_window_days * 86_400`** (claim
+    window still open): instead of transitioning to `Failed`, CAS the row
+    *back into the invoice-request phase* — clear `payout_invoice`,
+    `payout_routing_fee_sats`, and `payout_payment_hash` to `NULL`, reset
+    `payout_attempts = 0`, clear `last_invoice_request_at` (so the
+    re-prompt fires immediately), and **leave `state = PendingPayout`**
+    and `slashed_at` untouched. The guard is `WHERE id = ? AND state =
+    'pending-payout'` so a row that raced to another state in the
+    meantime is left alone.
+  - **Else** (claim window already elapsed): transition to `Failed` as
+    today. Past the deadline there is no point re-prompting; `Failed`
+    remains the terminal "we held a valid invoice but could not route it,
+    and the window is closed — operator review required" state. It stays
+    distinct from `Forfeited` ("the winner never submitted an invoice at
+    all").
+- **The scheduler re-prompts on the next tick automatically.** With
+  `payout_invoice` now `NULL`, §8.1 step 1 fires on the next
+  `run_bond_payout_cycle` pass: subject to the existing
+  `payout_invoice_window_seconds` cadence guard, it enqueues a fresh
+  `Action::AddBondInvoice` (carrying the **unchanged** `slashed_at` in
+  `Payload::BondPayoutRequest`, so the client renders the *same* forfeit
+  deadline as before — §8.1), bumps `invoice_request_attempts`, and sets
+  `last_invoice_request_at = now`. No new code path is needed for the
+  re-prompt itself — clearing the invoice is what re-arms step 1. The
+  persist-first ordering invariant from §8.1 step 1 still holds.
+- **Bounding the loop.** Re-prompting is bounded by the **forfeit
+  window**, not by `payout_max_retries`: the top-of-cycle forfeit check
+  (§8.1) keeps running, and once `now - slashed_at >= claim window` with
+  `payout_invoice IS NULL` the row CAS-transitions to `Forfeited` and the
+  node retains the full `amount_sats`. So the re-prompt/retry cycle
+  cannot run forever; it has exactly the same long-stop as the
+  never-claimed case. `invoice_request_attempts` continues to count
+  across re-prompts (it is bounded by the forfeit window, per §8.1, not
+  by the retry budget).
+- **`payout_max_retries` keeps its meaning *per invoice*.** It still
+  caps `send_payment` attempts against a single submitted bolt11. The
+  change is only what happens *after* the cap is hit inside the window:
+  discard that bolt11 and ask for another, rather than giving up
+  silently.
+- **Winner-facing signalling reuses Phase 3.5.** When the winner
+  responds to a re-prompt with a fresh bolt11, the existing
+  `add_bond_invoice_action` path persists it and enqueues
+  `Action::BondInvoiceAccepted` (Phase 3.5 §8.5) exactly as for the first
+  invoice — so the client sees "invoice received, payout in progress"
+  again and stops prompting locally until the next failure-driven
+  re-request, if any. On eventual success the winner still receives
+  `Action::BondPayoutCompleted`. No new action variant is required.
+
+### 9.5.4 Interaction with the §8.2 `Failed` resurrection path
+
+Phase 4.5 makes the in-window resurrection path the **common** path
+(now Mostro-driven) rather than relying on a spontaneous client resend.
+The §8.2 resurrection CAS (`Failed → PendingPayout` on a fresh
+`AddBondInvoice` within the window) is **retained** as a belt-and-braces
+recovery for any row that still reaches `Failed` — e.g. a row that was
+already `Failed` before this phase shipped, or one that exhausted retries
+exactly as the window closed. After Phase 4.5, the expected steady-state
+is that an in-window payout never silently terminates; `Failed` is only
+ever observed after the claim window has elapsed.
+
+### 9.5.5 Tests
+
+- **Re-request after *terminal* exhaustion, in window.** Bond in
+  `PendingPayout` with a submitted-but-unroutable `payout_invoice`, day 2
+  of a 15-day window. Drive **terminal** `send_payment` failures up to
+  `payout_max_retries`. The row stays `PendingPayout`, `payout_invoice` /
+  `payout_routing_fee_sats` / `payout_payment_hash` /
+  `last_invoice_request_at` are cleared, `payout_attempts` resets to 0,
+  and `slashed_at` is unchanged. On the next scheduler tick a fresh
+  `Action::AddBondInvoice` is enqueued to the winner and
+  `invoice_request_attempts` increments.
+- **Indeterminate exhaustion keeps the invoice (double-payout guard).**
+  Same setup, but the failures are **indeterminate** (timeout / EOF /
+  send RPC error). After `payout_max_retries` the row stays
+  `PendingPayout` with `payout_invoice` **and** `payout_payment_hash`
+  intact (so reconciliation can poll LND), is **not** re-armed and
+  **not** `Failed`, and `payout_attempts` saturates at
+  `payout_max_retries`. Further indeterminate failures keep it pinned.
+- **Deadline does not move.** Across one or more re-request cycles, the
+  `slashed_at` field and the `slashed_at` shipped in
+  `Payload::BondPayoutRequest` are identical to the original slash
+  anchor; the forfeit deadline the client would compute is unchanged.
+- **Successful re-payment closes the claim.** After a re-prompt the
+  winner submits a routable bolt11 → `BondInvoiceAccepted` is enqueued,
+  the next tick's `send_payment` succeeds, the row reaches `Slashed`, and
+  `BondPayoutCompleted` is enqueued. No further `AddBondInvoice` is sent.
+- **Re-request loop is forfeit-bounded.** A winner whose every submitted
+  invoice keeps failing is re-prompted across the window; once
+  `now - slashed_at >= claim window` with `payout_invoice IS NULL`, the
+  row CAS-transitions to `Forfeited` (not an infinite loop), node retains
+  `amount_sats` in full.
+- **Past-window exhaustion still yields `Failed`.** A late invoice that
+  arrives near the deadline and exhausts `payout_max_retries` *after*
+  `now - slashed_at >= claim window` transitions to `Failed`, not back to
+  the invoice-request phase — preserving the operator-review terminal.
+- **`slash_node_share_pct = 1.0`.** No counterparty leg exists, so no
+  invoice is ever requested and this path is never reached (regression
+  guard).
+- **`enabled = false`.** No bond payouts run; no behaviour change.
+
+### 9.5.6 Acceptance
+
+- The issue #750 failure mode is gone: a payout whose first invoice
+  cannot be routed no longer strands silently in `Failed`. Mostro
+  re-prompts the winner for a fresh invoice within the claim window.
+- The forfeit deadline stays anchored on `slashed_at` across every
+  re-request; re-prompting cannot extend a winner's exposure.
+- `Failed` becomes an out-of-window-only terminal; the in-window payout
+  is self-healing without operator intervention.
+- Phase 3's split math and accounting are untouched — this phase only
+  changes the retry-exhaustion transition and reuses existing messages.
 
 ---
 
@@ -1820,12 +2049,16 @@ Tests mirror Phase 4 from the maker side; the "no slash" rows in the
   is.
 - New `Status` / `Action` / `Payload` variants in `mostro-core` must
   ship in that crate first and be pinned to a version in this repo's
-  `Cargo.toml`. As of `mostro-core` **0.11.0**, the variants for
-  Phases 1.5 and 2 (`Status::WaitingTakerBond`,
-  `Action::PayBondInvoice`, `Payload::BondResolution`) are released
-  and ready to pin. Phase 5's `Status::WaitingMakerBond` is still
-  pending in `mostro-core`. Clients must handle unknown statuses
-  gracefully — this is already the case.
+  `Cargo.toml`. As of `mostro-core` **0.11.5** (the current pin on
+  `main`), every variant for Phases 1.5 through 4 is released and
+  pinned: `Status::WaitingTakerBond`, `Action::PayBondInvoice`,
+  `Payload::BondResolution` (0.11.0), `Action::AddBondInvoice`
+  (0.11.2), `Payload::BondPayoutRequest` (0.11.3),
+  `Action::BondInvoiceAccepted` / `Action::BondPayoutCompleted`
+  (0.11.4), and `Action::BondSlashed` (0.11.5). Phase 4.5 needs no new
+  variant. Phase 5's `Status::WaitingMakerBond` is still pending in
+  `mostro-core`. Clients must handle unknown statuses gracefully — this
+  is already the case.
 - An admin/solver client that does not yet know about `BondResolution`
   sends `payload: null`, which the daemon interprets as
   "release-by-default". No silent slashes.
@@ -1846,7 +2079,8 @@ these requires a compatibility statement:
   the buyer-invoice `Action::AddInvoice` so the daemon can route on
   action type alone.
 - `Payload::BondPayoutRequest` variant in mostro-core (Phase 3).
-  **Targets `mostro-core` 0.11.3** (not yet released). Carries
+  **Released in `mostro-core` 0.11.3** (pinned via the 0.11.5 bump on
+  `main`). Carries
   `{ order: SmallOrder, slashed_at: i64 }` on `Action::AddBondInvoice`
   so the client can compute the forfeit deadline from the slash
   anchor instead of from message receipt time. Without this anchor a
@@ -1880,6 +2114,11 @@ these requires a compatibility statement:
   risk. `MessageKind::verify` accepts it like the other Mostro → user
   notifications (id required; `BondResolution` / `BondPayoutRequest`
   payloads rejected). No new `CantDoReason` is needed.
+- Phase 4.5 (§9.5). **No upstream dependency — daemon-side only.**
+  Reuses `Action::AddBondInvoice` (Phase 3) and
+  `Action::BondInvoiceAccepted` (Phase 3.5); it only changes the
+  `send_payment`-exhaustion transition in `src/app/bond/payout.rs`. No
+  new variant, no `mostro-core` bump, no migration.
 - `Status::WaitingMakerBond` (Phase 5). Not yet shipped upstream;
   needs a follow-up `mostro-core` minor release before Phase 5 can
   land here.

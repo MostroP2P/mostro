@@ -754,13 +754,22 @@ async fn on_bond_invoice_accepted(
     // Atomic Requested → Locked with concurrent-bonds guard. Exactly
     // one bond can win per order — if two `Accepted` events arrive in
     // the same window, the loser's UPDATE returns `rows_affected = 0`.
+    //
+    // Phase 5: the guard counts only OTHER `Locked` *taker* bonds. The
+    // first-to-lock-wins race is purely a taker concern; under
+    // `apply_to = both` the maker's own bond is already `Locked` on every
+    // published order (that is the steady state, not a competitor). Without
+    // the `role = 'taker'` filter the `NOT EXISTS` subquery would see the
+    // maker bond, this UPDATE would affect zero rows, and the first taker
+    // to pay would be wrongly treated as a race loser — rejecting every
+    // taker on a maker-bonded order.
     let now = Utc::now().timestamp();
     let result = sqlx::query(
         "UPDATE bonds SET state = ?, locked_at = ? \
          WHERE id = ? AND state = ? \
            AND NOT EXISTS ( \
              SELECT 1 FROM bonds b2 \
-             WHERE b2.order_id = ? AND b2.state = ? AND b2.id != ? \
+             WHERE b2.order_id = ? AND b2.state = ? AND b2.role = ? AND b2.id != ? \
            )",
     )
     .bind(BondState::Locked.to_string())
@@ -769,6 +778,7 @@ async fn on_bond_invoice_accepted(
     .bind(BondState::Requested.to_string())
     .bind(bond.order_id)
     .bind(BondState::Locked.to_string())
+    .bind(BondRole::Taker.to_string())
     .bind(bond.id)
     .execute(pool)
     .await
@@ -1113,15 +1123,22 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<(), MostroError> {
-    // Atomic compare-and-swap on (status, no active bonds). A single
+    // Atomic compare-and-swap on (status, no active taker bonds). A single
     // statement so SQLite snapshots both predicates at the same point
     // in time.
+    //
+    // Phase 5: the active-bond check is scoped to `role = 'taker'`. Under
+    // `apply_to = both` the order carries a `Locked` *maker* bond for the
+    // whole trade; counting it here would make `NOT EXISTS` permanently
+    // false, so a `WaitingTakerBond` order whose last taker bond was just
+    // cancelled would never drop back to `Pending`. The drop-to-Pending
+    // decision depends solely on whether any *taker* is still racing.
     let cas = sqlx::query(
         "UPDATE orders SET status = ? \
          WHERE id = ? AND status = ? \
            AND NOT EXISTS ( \
              SELECT 1 FROM bonds \
-             WHERE order_id = ? AND state IN (?, ?) \
+             WHERE order_id = ? AND state IN (?, ?) AND role = ? \
            )",
     )
     .bind(Status::Pending.to_string())
@@ -1130,6 +1147,7 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     .bind(order_id)
     .bind(BondState::Requested.to_string())
     .bind(BondState::Locked.to_string())
+    .bind(BondRole::Taker.to_string())
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1327,6 +1345,33 @@ mod tests {
         b.state = state.to_string();
         b.hash = Some("c".repeat(64));
         b
+    }
+
+    /// Mirror of the production taker first-to-lock-wins CAS in
+    /// `on_bond_invoice_accepted` (including the `role = 'taker'` filter on
+    /// the `NOT EXISTS` guard). Returns `rows_affected`. Kept in lockstep
+    /// with the real query so the race tests verify the actual semantics.
+    async fn try_lock(pool: &Pool<Sqlite>, bond: &Bond) -> u64 {
+        sqlx::query(
+            "UPDATE bonds SET state = ?, locked_at = ? \
+             WHERE id = ? AND state = ? \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM bonds b2 \
+                 WHERE b2.order_id = ? AND b2.state = ? AND b2.role = ? AND b2.id != ? \
+               )",
+        )
+        .bind(BondState::Locked.to_string())
+        .bind(Utc::now().timestamp())
+        .bind(bond.id)
+        .bind(BondState::Requested.to_string())
+        .bind(bond.order_id)
+        .bind(BondState::Locked.to_string())
+        .bind(BondRole::Taker.to_string())
+        .bind(bond.id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected()
     }
 
     #[tokio::test]
@@ -1547,29 +1592,6 @@ mod tests {
         b.pubkey = "b".repeat(64);
         let bond_b = create_bond(&pool, b).await.unwrap();
 
-        // Helper that runs the same SQL as `on_bond_invoice_accepted`.
-        async fn try_lock(pool: &Pool<Sqlite>, bond: &Bond) -> u64 {
-            sqlx::query(
-                "UPDATE bonds SET state = ?, locked_at = ? \
-                 WHERE id = ? AND state = ? \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM bonds b2 \
-                     WHERE b2.order_id = ? AND b2.state = ? AND b2.id != ? \
-                   )",
-            )
-            .bind(BondState::Locked.to_string())
-            .bind(Utc::now().timestamp())
-            .bind(bond.id)
-            .bind(BondState::Requested.to_string())
-            .bind(bond.order_id)
-            .bind(BondState::Locked.to_string())
-            .bind(bond.id)
-            .execute(pool)
-            .await
-            .unwrap()
-            .rows_affected()
-        }
-
         // A goes first and wins.
         assert_eq!(try_lock(&pool, &bond_a).await, 1);
         // B's UPDATE sees A already Locked → guarded out.
@@ -1583,6 +1605,114 @@ mod tests {
         assert!(states
             .iter()
             .any(|(id, s)| *id == bond_b.id && s == &BondState::Requested.to_string()));
+    }
+
+    #[tokio::test]
+    async fn locked_maker_bond_does_not_block_taker_lock_race() {
+        // Phase 5 regression (apply_to = both): a `Locked` maker bond is
+        // present on every published order. The taker first-to-lock-wins
+        // CAS must IGNORE it (its `NOT EXISTS` guard is scoped to
+        // `role = 'taker'`), so the first taker to pay still wins. Without
+        // the role filter the maker bond would satisfy the guard, the
+        // taker's UPDATE would affect zero rows, and every taker would be
+        // wrongly rejected as a race loser.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        // Maker bond already Locked (the steady state after publication).
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = BondState::Locked.to_string();
+        maker.hash = Some("d".repeat(64));
+        let maker = create_bond(&pool, maker).await.unwrap();
+
+        // A taker now pays their bond.
+        let mut taker = make_bond(order_id, BondState::Requested);
+        taker.pubkey = "t".repeat(64);
+        taker.hash = Some("e".repeat(64));
+        let taker = create_bond(&pool, taker).await.unwrap();
+
+        assert_eq!(
+            try_lock(&pool, &taker).await,
+            1,
+            "taker must win the lock race despite the Locked maker bond"
+        );
+
+        // Maker bond untouched; taker bond now Locked.
+        let maker_after = find_bond_by_hash(&pool, &"d".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(maker_after.id, maker.id);
+        assert_eq!(maker_after.state, BondState::Locked.to_string());
+        let taker_after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taker_after.id, taker.id);
+        assert_eq!(taker_after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_ignores_locked_maker_bond() {
+        // Phase 5 regression (apply_to = both): when the last taker bond is
+        // cancelled, the order must drop from `WaitingTakerBond` back to
+        // `Pending` even though the maker's `Locked` bond is still on the
+        // order. The CAS's active-bond check is scoped to `role = 'taker'`,
+        // so the lingering maker bond does not pin the order in
+        // `WaitingTakerBond`. (No Nostr globals needed: with the order at
+        // `Pending` after the CAS, the republish path is exercised by the
+        // dedicated Phase 1.5 tests; here we assert the DB transition via a
+        // direct status read after forcing the helper's CAS.)
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Only a Locked maker bond remains (the taker bond was already
+        // released by the caller before maybe_drop runs).
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = BondState::Locked.to_string();
+        maker.hash = Some("d".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        // Run the same CAS the helper uses (isolated from the Nostr
+        // republish that follows it, which needs process-wide keys).
+        let cas = sqlx::query(
+            "UPDATE orders SET status = ? \
+             WHERE id = ? AND status = ? \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM bonds \
+                 WHERE order_id = ? AND state IN (?, ?) AND role = ? \
+               )",
+        )
+        .bind(Status::Pending.to_string())
+        .bind(order_id)
+        .bind(Status::WaitingTakerBond.to_string())
+        .bind(order_id)
+        .bind(BondState::Requested.to_string())
+        .bind(BondState::Locked.to_string())
+        .bind(BondRole::Taker.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cas.rows_affected(),
+            1,
+            "order must drop to Pending: the Locked maker bond must not count as an active taker bond"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, Status::Pending.to_string());
     }
 
     #[tokio::test]

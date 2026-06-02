@@ -363,7 +363,7 @@ pub async fn publish_order(
     trade_index: Option<i64>,
 ) -> Result<(), MostroError> {
     // Prepare a new default order
-    let new_order_db = match prepare_new_order(
+    let mut new_order_db = match prepare_new_order(
         new_order,
         initiator_pubkey,
         trade_index,
@@ -378,19 +378,98 @@ pub async fn publish_order(
         }
     };
 
+    // Phase 5: when the maker side is bonded, the order must NOT hit the
+    // order book until the maker locks an anti-abuse bond. Park it at
+    // `WaitingMakerBond` (no NIP-33 event emitted), request the bond, and
+    // defer the publication to `resume_publish_after_maker_bond`, which
+    // the bond subscriber calls on `Accepted`. Range makers are deferred
+    // to Phase 6 (parent/child proportional slashes), so they keep
+    // publishing immediately for now.
+    if crate::app::bond::maker_bond_required() && !new_order_db.is_range_order() {
+        let notional = maker_bond_notional_sats(&new_order_db)?;
+        new_order_db.status = Status::WaitingMakerBond.to_string();
+        let order = new_order_db
+            .create(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        info!("New order saved (awaiting maker bond) Id: {}", order.id);
+        crate::app::bond::request_maker_bond(
+            pool,
+            &order,
+            trade_pubkey,
+            notional,
+            request_id,
+            trade_index,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // CRUD order creation
-    let mut order = new_order_db
-        .clone()
+    let order = new_order_db
         .create(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    info!("New order saved Id: {}", order.id);
+
+    finalize_order_publication(
+        pool,
+        keys,
+        order,
+        identity_pubkey,
+        trade_pubkey,
+        request_id,
+        trade_index,
+    )
+    .await
+}
+
+/// Sats notional a maker bond is sized against (Phase 5, non-range only).
+///
+/// Fixed-price orders carry their sats `amount` directly. Market-priced
+/// single orders have `amount == 0` at creation, so we convert the fiat
+/// amount at the current cached price — the same quote
+/// `calculate_and_check_quote` validates against at order time. The bond
+/// is a one-time snapshot and is not repriced if the market moves before
+/// the order is taken (spec §10.3). Range orders never reach this path in
+/// Phase 5; their `max_amount`-based sizing lands in Phase 6.
+fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
+    if order.amount > 0 {
+        return Ok(order.amount);
+    }
+    let price = get_bitcoin_price(&order.fiat_code)?;
+    if price <= 0.0 {
+        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
+    }
+    let sats = (order.fiat_amount as f64 / price) * 1E8;
+    Ok(sats as i64)
+}
+
+/// Publish the NIP-33 event for a freshly-persisted order, persist its
+/// `event_id`, ack the maker with [`Action::NewOrder`], and broadcast.
+///
+/// Shared by the inline `publish_order` path (no maker bond) and the
+/// deferred [`resume_publish_after_maker_bond`] path (maker bond locked).
+/// The order row must already exist in the DB; on success it is in
+/// `Status::Pending` with its `event_id` set.
+async fn finalize_order_publication(
+    pool: &SqlitePool,
+    keys: &Keys,
+    mut order: Order,
+    identity_pubkey: PublicKey,
+    trade_pubkey: PublicKey,
+    request_id: Option<u64>,
+    trade_index: Option<i64>,
+) -> Result<(), MostroError> {
     let order_id = order.id;
-    info!("New order saved Id: {}", order_id);
+    // The maker-bond path parked the order at `WaitingMakerBond`; the
+    // no-bond path created it at `Pending`. Either way it goes live now.
+    order.status = Status::Pending.to_string();
 
     // Get tags for new order in case of full privacy or normal order
     // nip33 kind with order fields as tags and order id as identifier (kind 38383 for orders)
     let event = if let Some(tags) =
-        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey, keys).await?
+        get_tags_for_new_order(&order, pool, &identity_pubkey, &trade_pubkey, keys).await?
     {
         new_order_event(keys, "", order_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
@@ -401,21 +480,22 @@ pub async fn publish_order(
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
-    // We update the order with the new event_id
+    // We update the order with the new event_id (and Pending status)
     order.event_id = event_id;
+    // Build the ack payload before `update` consumes the order row.
+    let mut small = order.as_new_order();
+    small.id = Some(order_id);
     order
         .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let mut order = new_order_db.as_new_order();
-    order.id = Some(order_id);
 
     // Send message as ack with small order
     enqueue_order_msg(
         request_id,
         Some(order_id),
         Action::NewOrder,
-        Some(Payload::Order(order)),
+        Some(Payload::Order(small)),
         trade_pubkey,
         trade_index,
     )
@@ -428,6 +508,47 @@ pub async fn publish_order(
         .await
         .map(|_s| ())
         .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
+}
+
+/// Finish publishing an order whose maker bond has just locked.
+///
+/// Called from the bond subscriber (`bond::flow::on_maker_bond_accepted`).
+/// Derives the maker's identity and trade pubkeys from the order row —
+/// the maker is the seller on a sell order, the buyer on a buy order
+/// (§3.1) — and hands off to [`finalize_order_publication`]. Idempotency
+/// across redeliveries is enforced by the caller, which only invokes this
+/// while the order is still in `WaitingMakerBond`.
+pub async fn resume_publish_after_maker_bond(
+    pool: &SqlitePool,
+    keys: &Keys,
+    order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let (trade_pubkey, identity_pubkey, trade_index) = match kind {
+        OrderKind::Sell => (
+            order.get_seller_pubkey().map_err(MostroInternalErr)?,
+            order
+                .get_master_seller_pubkey()
+                .map_err(MostroInternalErr)?,
+            order.trade_index_seller,
+        ),
+        OrderKind::Buy => (
+            order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+            order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
+            order.trade_index_buyer,
+        ),
+    };
+    finalize_order_publication(
+        pool,
+        keys,
+        order,
+        identity_pubkey,
+        trade_pubkey,
+        request_id,
+        trade_index,
+    )
+    .await
 }
 
 async fn prepare_new_order(
@@ -1382,6 +1503,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(include_str!(
+            "../migrations/20260530120000_cashu_escrow_fields.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
 
         pool
     }
@@ -1610,5 +1737,19 @@ mod tests {
         // With 30%, 1 * 0.30 = 0.3 -> 0
         let fee = calculate_dev_fee(1, 0.30);
         assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn maker_bond_notional_uses_fixed_amount_directly() {
+        // Phase 5: a fixed-price order carries its sats `amount`, so the
+        // maker-bond notional is exactly that — no price lookup, no API
+        // dependency in this path.
+        let order = Order {
+            amount: 50_000,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 25,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 50_000);
     }
 }

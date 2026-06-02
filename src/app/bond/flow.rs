@@ -75,6 +75,36 @@ pub fn taker_bond_required() -> bool {
         .is_some_and(|cfg| cfg.apply_to.applies_to_taker())
 }
 
+/// True when the configuration requires the **maker** to post a bond.
+///
+/// Phase 5 gate, symmetric to [`taker_bond_required`]. `publish_order`
+/// asks this question before publishing a new order to Nostr: when it is
+/// true (and the order is non-range — Phase 6 handles range makers), the
+/// order is parked at [`Status::WaitingMakerBond`] and no NIP-33 event is
+/// emitted until the maker locks the bond.
+pub fn maker_bond_required() -> bool {
+    Settings::get_bond()
+        .filter(|cfg| cfg.enabled)
+        .is_some_and(|cfg| cfg.apply_to.applies_to_maker())
+}
+
+/// True when a `Locked` **taker** bond already exists among `bonds` — the
+/// signal that the order's trade is committed and no further take may
+/// begin (it must be rejected with `PendingOrderExists`).
+///
+/// The role scoping is load-bearing for Phase 5. Under `apply_to = both`
+/// the maker's own bond is `Locked` on *every* published order — that is
+/// the steady state, not a committed trade. Counting it here would reject
+/// every taker. Only a `Locked` *taker* bond marks the
+/// first-to-lock-wins race as decided (§6.5), so the take handlers
+/// (`take_buy_action` / `take_sell_action`) gate on this predicate
+/// instead of "any Locked bond".
+pub fn trade_committed_by_locked_taker_bond(bonds: &[Bond]) -> bool {
+    let locked = BondState::Locked.to_string();
+    let taker = BondRole::Taker.to_string();
+    bonds.iter().any(|b| b.state == locked && b.role == taker)
+}
+
 /// Per-take context that the take handler computed locally and now
 /// stashes on the bond row instead of mutating the order.
 ///
@@ -276,6 +306,119 @@ pub async fn request_taker_bond(
             }
         }
     }
+
+    Ok(bond)
+}
+
+/// Create a hold invoice for the **maker's** bond, persist a `Bond` row
+/// in `Requested`, ship the bolt11 to the maker, and arm the LND
+/// subscriber that flips the row to `Locked` once the maker pays.
+///
+/// Phase 5 counterpart of [`request_taker_bond`]. Unlike the taker side
+/// there is exactly one maker bond per order (no concurrent-bonds race),
+/// and the order has already been persisted at
+/// [`Status::WaitingMakerBond`] by `publish_order` with **no** NIP-33
+/// event emitted — the order stays invisible in the book until the bond
+/// locks. On `Accepted`, [`on_bond_invoice_accepted`] resumes the
+/// deferred publication (see `crate::util::resume_publish_after_maker_bond`).
+///
+/// `notional_sats` is the sats notional the bond is sized against: the
+/// fixed order amount for a fixed-price order, or the price-converted
+/// fiat amount for a market-priced single order. Range orders never
+/// reach this function in Phase 5 (deferred to Phase 6).
+///
+/// On any failure the bond row may exist in `Requested` with no LND
+/// counterpart; the order will be reaped (and the bond released) by the
+/// `WaitingMakerBond` expiry path, mirroring the taker "always release"
+/// contract.
+pub async fn request_maker_bond(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    maker_pubkey: PublicKey,
+    notional_sats: i64,
+    request_id: Option<u64>,
+    trade_index: Option<i64>,
+) -> Result<Bond, MostroError> {
+    let cfg = Settings::get_bond().ok_or_else(|| {
+        MostroInternalErr(ServiceError::UnexpectedError(
+            "anti_abuse_bond block is missing while maker bond was deemed required".into(),
+        ))
+    })?;
+
+    let amount = compute_bond_amount(notional_sats, cfg);
+    let memo = format!("mostro bond order_id={}", order.id);
+
+    let mut ln_client = LndConnector::new().await?;
+    let (invoice_resp, preimage, hash) = ln_client
+        .create_hold_invoice(&memo, amount)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
+
+    let mut bond = Bond::new_requested(order.id, maker_pubkey.to_string(), BondRole::Maker, amount);
+    bond.hash = Some(bytes_to_string(&hash));
+    bond.preimage = Some(bytes_to_string(&preimage));
+    bond.payment_request = Some(invoice_resp.payment_request.clone());
+    // No `taker_*` context on a maker bond: those columns describe the
+    // deferred take snapshot of a concurrent taker bond and stay NULL here.
+
+    let bond = create_bond(pool, bond).await?;
+
+    info!(
+        "Maker bond requested: bond_id={} order_id={} amount_sats={}",
+        bond.id, order.id, bond.amount_sats
+    );
+
+    // The bond bolt11 ships as a dedicated `Action::PayBondInvoice`, same
+    // as the taker side. The order is not on the wire yet (no NIP-33
+    // event), so the `SmallOrder` carries `Status::Pending` purely as a
+    // neutral placeholder for the client.
+    let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let bond_small = SmallOrder::new(
+        Some(order.id),
+        Some(order_kind),
+        Some(Status::Pending),
+        amount,
+        order.fiat_code.clone(),
+        order.min_amount,
+        order.max_amount,
+        order.fiat_amount,
+        order.payment_method.clone(),
+        order.premium,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Arm the subscriber BEFORE shipping the bolt11 (same ordering
+    // rationale as the taker side: a fast payer must not race ahead of
+    // the listener). On subscribe failure, release the row so we don't
+    // strand a `Requested` bond with no listener.
+    if let Err(e) = bond_invoice_subscribe(hash, request_id).await {
+        warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "request_maker_bond: subscribe failed ({}); rolling back bond row",
+            e
+        );
+        let _ = release_bond(pool, &bond).await;
+        return Err(e);
+    }
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::PayBondInvoice,
+        Some(Payload::PaymentRequest(
+            Some(bond_small),
+            invoice_resp.payment_request,
+            None,
+        )),
+        maker_pubkey,
+        trade_index,
+    )
+    .await;
 
     Ok(bond)
 }
@@ -600,6 +743,14 @@ async fn on_bond_invoice_accepted(
         }
     };
 
+    // Phase 5: a maker bond is a singleton (one per order, posted at
+    // order-creation time), so it never participates in the taker
+    // first-to-lock-wins race below. Route it to its own lock + resume
+    // path, which finishes the deferred order publication.
+    if bond.role == BondRole::Maker.to_string() {
+        return on_maker_bond_accepted(&bond, hash, pool, request_id).await;
+    }
+
     // Atomic Requested → Locked with concurrent-bonds guard. Exactly
     // one bond can win per order — if two `Accepted` events arrive in
     // the same window, the loser's UPDATE returns `rows_affected = 0`.
@@ -734,6 +885,90 @@ async fn on_bond_invoice_accepted(
 
     let my_keys = get_keys()?;
     resume_take_after_bond(pool, order, &my_keys, request_id).await
+}
+
+/// Subscriber callback path for a **maker** bond reaching `Accepted`.
+///
+/// The maker bond is a singleton, so there is no first-to-lock-wins race
+/// and no loser to cancel. We atomically flip `Requested → Locked`, then
+/// — if the order is still parked at `WaitingMakerBond` — resume the
+/// deferred order publication that `publish_order` skipped.
+///
+/// Idempotent across redeliveries and the restart resubscriber: a
+/// duplicate firing for an already-`Locked` bond re-reads `Locked` and
+/// falls through to the resume, which itself no-ops once the order has
+/// moved on to `Pending` (already published).
+async fn on_maker_bond_accepted(
+    bond: &Bond,
+    hash: &str,
+    pool: &Pool<Sqlite>,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    let now = Utc::now().timestamp();
+    let result =
+        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::Locked.to_string())
+            .bind(now)
+            .bind(bond.id)
+            .bind(BondState::Requested.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Re-read so a concurrent release (e.g. the order expired and its
+    // bond was cancelled) is visible before we try to publish.
+    let current = match find_bond_by_hash(pool, hash).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let current_state = match BondState::from_str(&current.state) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Maker bond {} has unparseable state {:?}: {} — skipping publish",
+                current.id, current.state, e
+            );
+            return Ok(());
+        }
+    };
+    if current_state != BondState::Locked {
+        info!(
+            "Maker bond {} no longer Locked (state={}) — skipping publish",
+            current.id, current.state
+        );
+        return Ok(());
+    }
+    if result.rows_affected() == 1 {
+        info!(
+            "Maker bond {} locked for order {}",
+            current.id, current.order_id
+        );
+    }
+
+    let order = Order::by_id(pool, current.order_id)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        .ok_or_else(|| {
+            MostroInternalErr(ServiceError::UnexpectedError(format!(
+                "Maker bond {} references missing order {}",
+                current.id, current.order_id
+            )))
+        })?;
+
+    // Only resume the deferred publication while the order is still
+    // parked at `WaitingMakerBond`. A previous firing (or the restart
+    // resubscriber) may already have published it (status `Pending`),
+    // in which case we must not re-publish or re-ack the maker.
+    if order.status != Status::WaitingMakerBond.to_string() {
+        info!(
+            "Maker bond {} accepted but order {} is in status {} — skipping publish",
+            current.id, order.id, order.status
+        );
+        return Ok(());
+    }
+
+    let my_keys = get_keys()?;
+    crate::util::resume_publish_after_maker_bond(pool, &my_keys, order, request_id).await
 }
 
 /// Message the taker of a losing concurrent bond that their take was
@@ -1058,6 +1293,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        // cashu escrow columns (mostro-core 0.12.0) — `Order::by_id` SELECTs
+        // them. Apply each ALTER separately for the same reason as dev_fee.
+        for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("cashu escrow migration");
+        }
         pool
     }
 
@@ -1151,6 +1398,131 @@ mod tests {
         // Guarantees that all bond touchpoints are inert in the absence
         // of an `[anti_abuse_bond]` block.
         assert!(!taker_bond_required());
+    }
+
+    #[test]
+    fn maker_bond_required_is_false_without_config() {
+        // Phase 5: same inertness guarantee for the maker gate. With no
+        // `[anti_abuse_bond]` block, `publish_order` must never park an
+        // order at `WaitingMakerBond` or request a maker bond.
+        assert!(!maker_bond_required());
+    }
+
+    #[test]
+    fn locked_maker_bond_does_not_commit_the_trade() {
+        // Phase 5 (load-bearing): under `apply_to = both` every published
+        // order already carries a `Locked` maker bond. The take handlers'
+        // committed-trade gate must NOT count it — otherwise the first
+        // taker is wrongly rejected with `PendingOrderExists` on every
+        // bond-enabled order. Only a `Locked` *taker* bond commits the
+        // trade (first-to-lock-wins, §6.5).
+        let order_id = Uuid::new_v4();
+        let mut maker = Bond::new_requested(order_id, "a".repeat(64), BondRole::Maker, 1_000);
+        maker.state = BondState::Locked.to_string();
+        // A still-racing taker bond (Requested) must also not commit.
+        let taker_requested = Bond::new_requested(order_id, "b".repeat(64), BondRole::Taker, 1_000);
+
+        assert!(
+            !trade_committed_by_locked_taker_bond(&[maker.clone(), taker_requested.clone()]),
+            "a Locked maker bond + a Requested taker bond must not commit the trade"
+        );
+
+        // Once a taker bond reaches Locked, the trade IS committed.
+        let mut taker_locked = taker_requested;
+        taker_locked.state = BondState::Locked.to_string();
+        assert!(
+            trade_committed_by_locked_taker_bond(&[maker, taker_locked]),
+            "a Locked taker bond commits the trade"
+        );
+    }
+
+    #[test]
+    fn empty_bond_set_does_not_commit_the_trade() {
+        // Defensive: the no-bonds case (feature just enabled, or all
+        // bonds released) must read as "not committed" so takes proceed.
+        assert!(!trade_committed_by_locked_taker_bond(&[]));
+    }
+
+    #[tokio::test]
+    async fn maker_bond_lock_is_singleton_and_idempotent() {
+        // Phase 5: the maker bond is a singleton, so `on_maker_bond_accepted`
+        // uses a plain `Requested → Locked` CAS (no concurrent-bonds
+        // `NOT EXISTS` guard). The first firing locks it; a duplicate
+        // firing (LND redelivery / restart resubscriber) affects zero
+        // rows because the row is no longer `Requested`, and the bond
+        // stays `Locked` exactly once.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut bond = Bond::new_requested(order_id, "d".repeat(64), BondRole::Maker, 1_000);
+        bond.hash = Some("e".repeat(64));
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        async fn try_lock(pool: &Pool<Sqlite>, bond: &Bond) -> u64 {
+            sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
+                .bind(BondState::Locked.to_string())
+                .bind(Utc::now().timestamp())
+                .bind(bond.id)
+                .bind(BondState::Requested.to_string())
+                .execute(pool)
+                .await
+                .unwrap()
+                .rows_affected()
+        }
+
+        assert_eq!(try_lock(&pool, &bond).await, 1, "first lock wins");
+        assert_eq!(
+            try_lock(&pool, &bond).await,
+            0,
+            "duplicate firing is a no-op"
+        );
+
+        let after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
+        assert_eq!(after.role, BondRole::Maker.to_string());
+    }
+
+    #[tokio::test]
+    async fn maker_bond_lock_does_not_touch_other_bonds() {
+        // The maker lock CAS is keyed by `id`, so it must flip only the
+        // maker row even when an unrelated bond row exists on the same
+        // order. Guards against a future refactor accidentally widening
+        // the predicate.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = Bond::new_requested(order_id, "d".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("e".repeat(64));
+        let maker = create_bond(&pool, maker).await.unwrap();
+
+        let mut other = Bond::new_requested(order_id, "f".repeat(64), BondRole::Taker, 1_000);
+        other.hash = Some("0".repeat(64));
+        let other = create_bond(&pool, other).await.unwrap();
+
+        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::Locked.to_string())
+            .bind(Utc::now().timestamp())
+            .bind(maker.id)
+            .bind(BondState::Requested.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let other_after = find_bond_by_hash(&pool, &"0".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other_after.state,
+            BondState::Requested.to_string(),
+            "unrelated bond must stay Requested"
+        );
+        assert_eq!(other_after.id, other.id);
     }
 
     #[tokio::test]

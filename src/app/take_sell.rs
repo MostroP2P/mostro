@@ -77,8 +77,8 @@ pub async fn take_sell_action(
     // multiple `Requested` taker bonds coexist on the order and the
     // first to reach `Locked` wins. Three guards before this take
     // proceeds:
-    //   1. A `Locked` bond already on the order means the trade is
-    //      committed; reject with `PendingOrderExists`.
+    //   1. A `Locked` *taker* bond already on the order means the
+    //      trade is committed; reject with `PendingOrderExists`.
     //   2. The sender's own pubkey already has a `Requested` bond on
     //      this order → idempotent retry: re-send the same
     //      `PayInvoice` message and return.
@@ -87,13 +87,16 @@ pub async fn take_sell_action(
     // The order's taker fields are not mutated under the bond path —
     // they're stashed on the bond row's `taker_*` columns until the
     // winning bond locks.
+    //
+    // Phase 5: with `apply_to = both` the maker's own bond is already
+    // `Locked` on every published order — that is the normal state, not
+    // a committed trade. The committed-trade gate must therefore only
+    // count `Locked` *taker* bonds; otherwise a locked maker bond would
+    // wrongly block every taker with `PendingOrderExists`.
     let bond_required = bond::taker_bond_required();
     if bond_required {
         let active = crate::app::bond::db::find_active_bonds_for_order(pool, order.id).await?;
-        if active
-            .iter()
-            .any(|b| b.state == crate::app::bond::BondState::Locked.to_string())
-        {
+        if bond::trade_committed_by_locked_taker_bond(&active) {
             return Err(MostroCantDo(CantDoReason::PendingOrderExists));
         }
         let sender_str = event.sender.to_string();

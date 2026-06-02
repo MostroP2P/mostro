@@ -737,7 +737,21 @@ mod tests {
         pubkey: &str,
         state: BondState,
     ) -> Bond {
-        let mut b = Bond::new_requested(order_id, pubkey.to_string(), BondRole::Taker, 10_000);
+        insert_bond_with_role(pool, order_id, pubkey, BondRole::Taker, state).await
+    }
+
+    /// Phase 5: same fixture as [`insert_bond`] but parameterised on the
+    /// posting role, so maker-bond dispute-slash tests can assert the
+    /// buyer/seller → bond-row resolution resolves to the maker row when
+    /// the maker is on the named side (§3.1).
+    async fn insert_bond_with_role(
+        pool: &Pool<Sqlite>,
+        order_id: Uuid,
+        pubkey: &str,
+        role: BondRole,
+        state: BondState,
+    ) -> Bond {
+        let mut b = Bond::new_requested(order_id, pubkey.to_string(), role, 10_000);
         b.state = state.to_string();
         b.preimage = Some(stub_preimage());
         // No hash → release_bond skips the LND cancel branch entirely
@@ -943,6 +957,120 @@ mod tests {
         // snapshot is *persisted* on the row; the specific value is a
         // function of config and is exercised by math.rs tests.
         assert_eq!(row.3, Some(0));
+    }
+
+    #[tokio::test]
+    async fn apply_slash_seller_on_sell_order_transitions_maker_bond() {
+        // Phase 5 (§10.2 / §10.4 acceptance bullet 3): on a sell-order
+        // the maker IS the seller, so `slash_seller=true` must resolve to
+        // the maker's bond row via the §3.1 pubkey mapping — even though
+        // the resolver is role-agnostic and matches on
+        // `order.seller_pubkey`. With both a maker bond (seller) and a
+        // taker bond (buyer) posted, slashing only the seller transitions
+        // the maker bond to PendingPayout and releases the taker bond,
+        // proving the two sides resolve orthogonally.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: false,
+        };
+
+        // Pre-flight validation must accept the directive: the seller
+        // (maker) holds a Locked bond.
+        validate_bond_resolution(&pool, &order, &res).await.unwrap();
+
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        let maker_row: (String, Option<String>) =
+            sqlx::query_as("SELECT state, slashed_reason FROM bonds WHERE id = ?")
+                .bind(maker_bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            maker_row.0,
+            BondState::PendingPayout.to_string(),
+            "maker bond must be slashed on slash_seller for a sell order"
+        );
+        assert_eq!(maker_row.1.as_deref(), Some("lost-dispute"));
+
+        let taker_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(taker_bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            taker_state,
+            BondState::Released.to_string(),
+            "the non-slashed taker bond must be released, not settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_slash_buyer_on_buy_order_transitions_maker_bond() {
+        // Phase 5 (§3.1 mirror): on a buy-order the maker IS the buyer,
+        // so `slash_buyer=true` resolves to the maker's bond row. This is
+        // the buy-order counterpart of the sell-order test above and
+        // completes the §10.4 acceptance bullet 3 matrix.
+        let pool = setup_pool().await;
+        // Buy order: maker is the buyer, taker is the seller.
+        let order = fixture_order(Kind::Buy, taker_pk(), maker_pk());
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        validate_bond_resolution(&pool, &order, &res).await.unwrap();
+        apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT state, slashed_reason FROM bonds WHERE id = ?")
+                .bind(maker_bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0,
+            BondState::PendingPayout.to_string(),
+            "maker bond must be slashed on slash_buyer for a buy order"
+        );
+        assert_eq!(row.1.as_deref(), Some("lost-dispute"));
     }
 
     #[tokio::test]

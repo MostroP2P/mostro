@@ -521,6 +521,38 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         order.id,
                         order.created_at
                     );
+
+                    // Phase 5: a `WaitingMakerBond` order was never
+                    // published to Nostr (the maker abandoned the bond
+                    // invoice), so there is no NIP-33 event to replace.
+                    // Going through `update_order_event` would publish a
+                    // brand-new Expired/Canceled event for an order that
+                    // never appeared in the book — a ghost entry the
+                    // §10.4 acceptance forbids. Mark it Expired directly
+                    // in the DB and release any bond row instead.
+                    if order.status == Status::WaitingMakerBond.to_string() {
+                        let order_id = order.id;
+                        let mut expired = order.clone();
+                        expired.status = Status::Expired.to_string();
+                        match expired.update(pool).await {
+                            Ok(_) => {
+                                bond::release_bonds_for_order_or_warn(
+                                    pool,
+                                    order_id,
+                                    "maker_bond_expiry",
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "maker_bond_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
+                                    order_id, e
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     // We update the order id with the new event_id
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await

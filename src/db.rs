@@ -593,12 +593,19 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     // `waiting-taker-bond` here, an order parked at that status past its
     // `expires_at` would never expire and the bond HTLCs would tie up
     // taker funds in LND until CLTV expiry.
+    //
+    // Phase 5: `waiting-maker-bond` is the maker-side analogue — an order
+    // whose maker never paid the bond, so it was never published to
+    // Nostr at all. It must also expire here, otherwise the abandoned
+    // order row and its bond HTLC linger until CLTV. Unlike the other two
+    // buckets this status has no NIP-33 event, so the expiry job skips the
+    // Nostr republish for it (see `job_expire_pending_older_orders`).
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
           WHERE expires_at < ?1
-            AND status IN ('pending', 'waiting-taker-bond')
+            AND status IN ('pending', 'waiting-taker-bond', 'waiting-maker-bond')
         "#,
     )
     .bind(expire_time.as_secs() as i64)
@@ -1356,7 +1363,10 @@ mod tests {
                 next_trade_index integer default 0,
                 dev_fee integer default 0,
                 dev_fee_paid integer not null default 0,
-                dev_fee_payment_hash char(64)
+                dev_fee_payment_hash char(64),
+                cashu_mint_url text,
+                cashu_escrow_token text,
+                cashu_escrow_locked_at integer
             )
             "#,
         )
@@ -1764,8 +1774,10 @@ mod tests {
 
         let pending_expired = uuid::Uuid::new_v4();
         let waiting_taker_bond_expired = uuid::Uuid::new_v4();
+        let waiting_maker_bond_expired = uuid::Uuid::new_v4();
         let pending_fresh = uuid::Uuid::new_v4();
         let waiting_taker_bond_fresh = uuid::Uuid::new_v4();
+        let waiting_maker_bond_fresh = uuid::Uuid::new_v4();
         let active_expired = uuid::Uuid::new_v4(); // out-of-bucket; must not match
 
         insert(&pool, pending_expired, "pending", past).await;
@@ -1776,11 +1788,25 @@ mod tests {
             past,
         )
         .await;
+        insert(
+            &pool,
+            waiting_maker_bond_expired,
+            "waiting-maker-bond",
+            past,
+        )
+        .await;
         insert(&pool, pending_fresh, "pending", future).await;
         insert(
             &pool,
             waiting_taker_bond_fresh,
             "waiting-taker-bond",
+            future,
+        )
+        .await;
+        insert(
+            &pool,
+            waiting_maker_bond_fresh,
+            "waiting-maker-bond",
             future,
         )
         .await;
@@ -1798,12 +1824,20 @@ mod tests {
             "expired WaitingTakerBond must be returned (Phase 1.5)"
         );
         assert!(
+            ids.contains(&waiting_maker_bond_expired),
+            "expired WaitingMakerBond must be returned (Phase 5)"
+        );
+        assert!(
             !ids.contains(&pending_fresh),
             "non-expired Pending must NOT be returned"
         );
         assert!(
             !ids.contains(&waiting_taker_bond_fresh),
             "non-expired WaitingTakerBond must NOT be returned"
+        );
+        assert!(
+            !ids.contains(&waiting_maker_bond_fresh),
+            "non-expired WaitingMakerBond must NOT be returned"
         );
         assert!(
             !ids.contains(&active_expired),

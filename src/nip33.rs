@@ -1074,6 +1074,26 @@ mod tests {
         );
     }
 
+    /// Phase 5 (`docs/ANTI_ABUSE_BOND.md` §10.1 / §10.4): an order whose
+    /// daemon-internal status is `WaitingMakerBond` has **not** been
+    /// published to Nostr yet — the maker's bond is still outstanding.
+    /// `create_status_tags` must therefore signal "do not emit an event"
+    /// (`create_event == false`), so the order never appears in the book
+    /// until the bond locks and the order transitions to `Pending`. This
+    /// is the opposite of `WaitingTakerBond`, which is already advertised
+    /// and must keep emitting.
+    #[test]
+    fn waiting_maker_bond_is_not_published_on_wire() {
+        let mut order = make_pending_order();
+        order.status = Status::WaitingMakerBond.to_string();
+
+        let (emit, _mapped) = create_status_tags(&order).expect("status tags");
+        assert!(
+            !emit,
+            "WaitingMakerBond must NOT emit an order event — the order is invisible until the bond locks"
+        );
+    }
+
     /// Sanity: the existing `Pending` mapping behaves identically. If
     /// somebody refactors `create_status_tags` the bucket-equivalence
     /// between `Pending` and `WaitingTakerBond` must not drift.

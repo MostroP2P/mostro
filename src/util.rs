@@ -407,7 +407,7 @@ pub async fn publish_order(
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         info!("New order saved (awaiting maker bond) Id: {}", order.id);
-        crate::app::bond::request_maker_bond(
+        if let Err(e) = crate::app::bond::request_maker_bond(
             pool,
             &order,
             trade_pubkey,
@@ -415,7 +415,33 @@ pub async fn publish_order(
             request_id,
             trade_index,
         )
-        .await?;
+        .await
+        {
+            // The order was parked at `WaitingMakerBond` but never emitted
+            // a NIP-33 event, and `request_maker_bond` already released any
+            // bond row it managed to create. Without cleanup the row would
+            // sit hidden in `WaitingMakerBond` until the order-expiry job
+            // reaps it hours later. Delete the stranded row now (scoped to
+            // the parked status so we never touch one that has since
+            // advanced) and surface the error to the maker.
+            tracing::warn!(
+                order_id = %order.id,
+                "publish_order: request_maker_bond failed ({}); deleting stranded WaitingMakerBond order",
+                e
+            );
+            if let Err(del) = sqlx::query("DELETE FROM orders WHERE id = ? AND status = ?")
+                .bind(order.id)
+                .bind(Status::WaitingMakerBond.to_string())
+                .execute(pool)
+                .await
+            {
+                tracing::warn!(
+                    order_id = %order.id,
+                    "publish_order: failed to delete stranded order: {}", del
+                );
+            }
+            return Err(e);
+        }
         return Ok(());
     }
 
@@ -538,6 +564,29 @@ pub async fn resume_publish_after_maker_bond(
     order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    // Atomically claim the deferred `WaitingMakerBond → Pending`
+    // transition. The bond subscriber already re-read the row and saw
+    // `WaitingMakerBond`, but that check is not atomic with the publish
+    // below: the order-expiry job (`job_expire_pending_older_orders`) can
+    // flip the row `WaitingMakerBond → Expired` (and cancel the just-locked
+    // bond) in between. Without a CAS the full-row write inside
+    // `finalize_order_publication` would blindly resurrect the dead order
+    // back to `Pending` and emit a NIP-33 event for it. If the CAS affects
+    // 0 rows another path already owns the status, so we skip cleanly.
+    let cas = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
+        .bind(Status::Pending.to_string())
+        .bind(order.id)
+        .bind(Status::WaitingMakerBond.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if cas.rows_affected() != 1 {
+        info!(
+            "resume_publish_after_maker_bond: order {} no longer WaitingMakerBond — skipping deferred publish",
+            order.id
+        );
+        return Ok(());
+    }
     let kind = order.get_order_kind().map_err(MostroInternalErr)?;
     let (trade_pubkey, identity_pubkey, trade_index) = match kind {
         OrderKind::Sell => (

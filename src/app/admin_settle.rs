@@ -261,28 +261,8 @@ mod tests {
         "d1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
     async fn setup_permission_db() -> sqlx::SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .unwrap();
-        sqlx::query(include_str!("../../migrations/20221222153301_orders.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(include_str!("../../migrations/20251126120000_dev_fee.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(include_str!("../../migrations/20231005195154_users.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(include_str!("../../migrations/20230928145530_disputes.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
         pool
     }
 

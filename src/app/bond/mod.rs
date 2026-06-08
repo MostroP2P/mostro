@@ -19,8 +19,9 @@ pub mod types;
 
 pub use flow::{
     maker_bond_required, release_bond, release_bonds_for_order, release_bonds_for_order_or_warn,
-    request_maker_bond, request_taker_bond, resubscribe_active_bonds, taker_bond_required,
-    trade_committed_by_locked_taker_bond, TakerContext,
+    release_taker_bonds_for_order_or_warn, request_maker_bond, request_taker_bond,
+    resubscribe_active_bonds, taker_bond_required, trade_committed_by_locked_taker_bond,
+    TakerContext,
 };
 pub use math::{compute_bond_amount, compute_node_share};
 pub use model::Bond;

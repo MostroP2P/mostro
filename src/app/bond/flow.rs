@@ -593,8 +593,29 @@ pub async fn release_bonds_for_order(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<(), MostroError> {
+    release_active_bonds(pool, order_id, false).await
+}
+
+/// Release every active bond on `order_id`, optionally **retaining** the
+/// maker's bond.
+///
+/// `retain_makers = true` is the waiting-timeout **republish** path: the
+/// order returns to the book, the maker is still committed to it, so its
+/// `Locked` bond must stay put and be resolved only when the order itself
+/// terminates (completed, cancelled, or expired `Pending`). Only the
+/// abandoning taker side is released. Every other path releases all bonds
+/// (`retain_makers = false`).
+async fn release_active_bonds(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    retain_makers: bool,
+) -> Result<(), MostroError> {
     let bonds = find_active_bonds_for_order(pool, order_id).await?;
+    let maker = BondRole::Maker.to_string();
     for bond in bonds.iter() {
+        if retain_makers && bond.role == maker {
+            continue;
+        }
         if let Err(e) = release_bond(pool, bond).await {
             warn!("Failed to release bond {}: {}", bond.id, e);
         }
@@ -615,6 +636,21 @@ pub async fn release_bonds_for_order_or_warn(
     context: &'static str,
 ) {
     if let Err(e) = release_bonds_for_order(pool, order_id).await {
+        warn!("{context}: bond release failed for {}: {}", order_id, e);
+    }
+}
+
+/// Like [`release_bonds_for_order_or_warn`] but **retains the maker's
+/// bond** — the waiting-timeout republish path (see [`release_active_bonds`]).
+/// The maker's `Locked` bond stays put because the order returns to the
+/// book with the maker still committed; only the abandoning taker side is
+/// released.
+pub async fn release_taker_bonds_for_order_or_warn(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    context: &'static str,
+) {
+    if let Err(e) = release_active_bonds(pool, order_id, true).await {
         warn!("{context}: bond release failed for {}: {}", order_id, e);
     }
 }

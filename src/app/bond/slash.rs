@@ -48,17 +48,19 @@ use mostro_core::error::{
     ServiceError,
 };
 use mostro_core::message::{Action, BondResolution, Message, Payload};
-use mostro_core::order::{Order, SmallOrder, Status};
+use mostro_core::order::{Kind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::PublicKey;
 use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::db::find_active_bonds_for_order;
-use super::flow::{release_bond, release_bonds_for_order_or_warn};
+use super::flow::{
+    release_bond, release_bonds_for_order_or_warn, release_taker_bonds_for_order_or_warn,
+};
 use super::math::compute_node_share;
 use super::model::Bond;
-use super::types::{BondSlashReason, BondState};
+use super::types::{BondRole, BondSlashReason, BondState};
 use crate::config::settings::Settings;
 use crate::config::types::AntiAbuseBondSettings;
 use crate::lightning::LndConnector;
@@ -293,6 +295,36 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
 /// config (the scheduler passes `Settings::get_bond()`); it is taken as a
 /// parameter rather than read from the global so the gate is unit-testable
 /// without mutating process-wide state.
+/// Does a waiting-state timeout on this order **republish** it (return it
+/// to the book in `Pending`) rather than cancel it outright?
+///
+/// Mirrors the republish branch of `scheduler::job_cancel_orders`:
+/// `(WaitingBuyerInvoice, Sell)` and `(WaitingPayment, Buy)` republish —
+/// in both the responsible party is the *taker*, so the maker stays
+/// committed and the order goes back to the book. The complementary
+/// `(WaitingBuyerInvoice, Buy)` / `(WaitingPayment, Sell)` cases cancel the
+/// order (the responsible party is the *maker*). Keep this in sync with the
+/// scheduler's match.
+fn order_republishes_on_timeout(order: &Order) -> bool {
+    matches!(
+        (order.get_order_status(), order.get_order_kind()),
+        (Ok(Status::WaitingBuyerInvoice), Ok(Kind::Sell))
+            | (Ok(Status::WaitingPayment), Ok(Kind::Buy))
+    )
+}
+
+/// Release the still-active bonds on a timed-out order, honouring the
+/// republish-vs-cancel distinction: on a republish the maker's `Locked`
+/// bond is retained (it follows the order's lifecycle), otherwise every
+/// bond is released.
+async fn release_on_timeout(pool: &Pool<Sqlite>, order_id: Uuid, republishes: bool) {
+    if republishes {
+        release_taker_bonds_for_order_or_warn(pool, order_id, "scheduler_timeout").await;
+    } else {
+        release_bonds_for_order_or_warn(pool, order_id, "scheduler_timeout").await;
+    }
+}
+
 pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
@@ -311,14 +343,26 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
         }
     };
 
+    // Will this timeout **republish** the order (return it to the book) or
+    // **terminate** it? When the taker is the responsible party the order
+    // goes back to `Pending` and is republished, so the maker's commitment
+    // survives — its bond stays `Locked` and is resolved only when the
+    // order itself terminates (completed / cancelled / `Pending` expiry).
+    // Only the abandoning taker side is settled here. When the maker is
+    // responsible the order is cancelled outright, so every bond is
+    // released. This mirrors `scheduler::job_cancel_orders`' own
+    // republish-vs-cancel split (keep the two in sync).
+    let republishes = order_republishes_on_timeout(order);
+
     // Gate the slash. `apply_to` is a posting-timing switch; Phase 4 is
     // taker-only, so we check `applies_to_taker` (Phase 7 widens this to
     // the maker). When the gate is closed we still release — bonds left
-    // over from a prior enabled period must drain regardless.
+    // over from a prior enabled period must drain regardless (but a
+    // republish still retains the maker bond).
     let slash_armed = bond_cfg
         .is_some_and(|c| c.enabled && c.slash_on_waiting_timeout && c.apply_to.applies_to_taker());
     if !slash_armed {
-        release_bonds_for_order_or_warn(pool, order.id, "scheduler_timeout").await;
+        release_on_timeout(pool, order.id, republishes).await;
         return Ok(None);
     }
 
@@ -327,38 +371,50 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
     let Some(responsible) = resolve_locked_bond(order, &bonds, side).cloned() else {
         // Responsible party has no bond (e.g. the maker under
         // `apply_to = take`), or the bond already moved out of `Locked`.
-        // No slash; release whatever is still active on the order.
-        release_bonds_for_order_or_warn(pool, order.id, "scheduler_timeout").await;
+        // No slash; release whatever is still active on the order
+        // (retaining the maker bond on a republish).
+        release_on_timeout(pool, order.id, republishes).await;
         return Ok(None);
     };
 
-    // Reuse the Phase 2 primitive. The `BondResolution` names the
-    // responsible side; `apply_bond_resolution` settles that bond's HTLC
-    // + CAS → PendingPayout(Timeout) and releases every other active bond
-    // on the order (the Phase 1 cancel path).
-    let resolution = match side {
-        Side::Buyer => BondResolution {
-            slash_seller: false,
-            slash_buyer: true,
-        },
-        Side::Seller => BondResolution {
-            slash_seller: true,
-            slash_buyer: false,
-        },
-    };
-    apply_bond_resolution(
+    // Settle the responsible bond's HTLC + CAS → PendingPayout(Timeout)
+    // (the Phase 2 `slash_one` primitive), then resolve the remaining
+    // active bonds: release them — but on a republish retain the maker's
+    // still-`Locked` bond, which the abandoning taker's timeout must not
+    // disturb. (We intentionally do **not** route this through
+    // `apply_bond_resolution`, which always releases every non-slashed
+    // bond — that is correct for a terminal dispute resolution but would
+    // wrongly release the maker on a republish.)
+    let node_share_pct = Settings::get_bond().map_or(0.0, |c| c.slash_node_share_pct);
+    slash_one(
         pool,
         ln_client,
-        order,
-        &resolution,
+        &responsible,
         BondSlashReason::Timeout,
+        node_share_pct,
     )
-    .await?;
+    .await;
+    let maker = BondRole::Maker.to_string();
+    for bond in bonds.iter() {
+        if bond.id == responsible.id {
+            continue;
+        }
+        if republishes && bond.role == maker {
+            continue;
+        }
+        if let Err(e) = release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %order.id,
+                "scheduler_timeout: release_bond failed: {}", e
+            );
+        }
+    }
 
     // Confirm the slash actually landed before claiming it: a transient
-    // settle failure leaves the bond `Locked` (apply_bond_resolution is
-    // best-effort), and we must never tell a user their bond was forfeited
-    // while the HTLC is still theirs.
+    // settle failure leaves the bond `Locked` (`slash_one` is best-effort),
+    // and we must never tell a user their bond was forfeited while the HTLC
+    // is still theirs.
     if timeout_slash_confirmed(pool, responsible.id).await? {
         info!(
             bond_id = %responsible.id,
@@ -1449,6 +1505,148 @@ mod tests {
         assert_eq!(row.0, BondState::PendingPayout.to_string());
         assert_eq!(row.1.as_deref(), Some("timeout"));
         assert!(row.2.unwrap() > 0, "slashed_at must be set");
+    }
+
+    #[tokio::test]
+    async fn timeout_republish_retains_maker_bond_sell_order() {
+        // Regression (PR #767 review): sell order, WaitingBuyerInvoice. The
+        // buyer (taker) times out, so the order is **republished** to the
+        // book — the maker (seller) is still committed to it. The taker
+        // bond must be slashed, but the maker bond must stay `Locked`:
+        // releasing it would put a takeable order back in the book with no
+        // maker bond backing it. It is only released when the order itself
+        // terminates.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        // apply_to=both so a maker bond is in play alongside the taker bond.
+        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.map(|b| b.id),
+            Some(taker_bond.id),
+            "the abandoning taker's bond is the one slashed"
+        );
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::PendingPayout.to_string(),
+            "taker bond is slashed on the republish path"
+        );
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::Locked.to_string(),
+            "maker bond must stay Locked when the order is republished"
+        );
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "only the slashed taker HTLC is settled; the maker HTLC is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_republish_with_no_slash_still_retains_maker_bond() {
+        // Same republish scenario but with the slash gate closed
+        // (slash_on_waiting_timeout = false). The taker bond drains via the
+        // Phase 1 release, but the maker bond must still be retained — the
+        // order goes back to the book with the maker committed.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, false, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "gate closed → no slash reported");
+        assert!(ln.calls().is_empty(), "release path never settles an HTLC");
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::Released.to_string(),
+            "taker bond is released when the slash gate is closed"
+        );
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::Locked.to_string(),
+            "maker bond is retained on republish even when no slash happens"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_cancel_releases_maker_bond_sell_order() {
+        // Counterpart to the republish case: sell order, WaitingPayment.
+        // The seller (maker) is responsible, so the order is **cancelled**
+        // outright (not republished). Because the order terminates, the
+        // maker bond must be released — the retain-on-republish carve-out
+        // must NOT leak into the terminal cancel path. Gate closed
+        // (slash_on_waiting_timeout = false) keeps this purely about the
+        // release routing, mirroring the republish/no-slash test above.
+        let pool = setup_pool().await;
+        let order = waiting_order(Kind::Sell, maker_pk(), taker_pk(), Status::WaitingPayment);
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, false, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::Released.to_string(),
+            "maker bond is released when the order is cancelled (terminal)"
+        );
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::Released.to_string(),
+            "taker bond is released too on a terminal cancel"
+        );
     }
 
     #[tokio::test]

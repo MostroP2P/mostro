@@ -235,8 +235,16 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     // Look at what's left on the order. If other concurrent takers
     // still have active bonds, do NOT reset the order — they are
     // still racing. Just message the sender that their take is cancelled.
+    //
+    // Phase 5: scope this to *taker* bonds. Under `apply_to = both` the
+    // order also carries a `Locked` maker bond (pubkey != the cancelling
+    // taker), which must not count as "another taker still racing" — that
+    // would wrongly keep the order in `WaitingTakerBond` and prevent it
+    // from dropping back to `Pending` when the last taker backs out.
     let remaining = crate::app::bond::db::find_active_bonds_for_order(pool, order_id).await?;
-    let others_remain = remaining.iter().any(|b| b.pubkey != sender_str);
+    let others_remain = remaining
+        .iter()
+        .any(|b| b.pubkey != sender_str && b.role == crate::app::bond::BondRole::Taker.to_string());
     if others_remain {
         enqueue_order_msg(
             request_id,

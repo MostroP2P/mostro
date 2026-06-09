@@ -1830,6 +1830,14 @@ buyer/seller resolution operates over:
 - Order completed (release path) → maker bond released.
 - Order cancelled before take, or expires `Pending` → maker bond
   released.
+- **Take attempt times out and the order is republished** (the taker is
+  the responsible party — `(WaitingBuyerInvoice, sell)` /
+  `(WaitingPayment, buy)`) → the maker bond **stays `Locked`**. The order
+  returns to the book with the maker still committed; only the abandoning
+  taker bond is resolved (slashed under §9.2, else released). The maker
+  bond is released only when the order itself terminates. Handled in
+  `slash_or_release_on_timeout` via the republish-aware release routing
+  (`release_taker_bonds_for_order_or_warn`).
 - Solver dispute resolution: `BondResolution { slash_seller, slash_buyer }`
   resolves to the maker bond when the maker is on the named side per
   §3.1 (sell-order → `slash_seller` targets maker; buy-order →

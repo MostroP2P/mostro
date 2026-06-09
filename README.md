@@ -66,6 +66,26 @@ While @lnp2pBot works excellently, it relies on Telegram—a platform potentiall
 - **Nostr Protocol** - NIP-59 (GiftWrap), NIP-33 (replaceable events) compliance
 - **Observability** - Structured logging with `tracing`, configurable log levels
 
+### Nostr Event Kinds Used by the Daemon
+
+Mostro uses a small set of Nostr event kinds. Some are part of the public protocol, and some are transport-only details that live inside NIP-59 GiftWrap envelopes.
+
+| Kind | Name / Constant | Used for | Notes |
+| --- | --- | --- | --- |
+| `0` | `Metadata` | Mostro profile metadata | Standard Nostr profile event published at startup when metadata is configured. |
+| `1` | `TextNote` | Inner rumor in NIP-59 | Transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
+| `13` | `Seal` | Inner sealed envelope in NIP-59 | Transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
+| `1059` | `GiftWrap` | NIP-59 outer envelope | This is the relay-visible event kind that Mostro subscribes to and publishes for wrapped messages. |
+| `10002` | `RelayList` | Relay metadata | Standard Nostr relay list event published periodically by the scheduler. |
+| `8383` | `DEV_FEE_AUDIT_EVENT_KIND` | Dev fee audit event | Public audit event used for transparent fee accounting. |
+| `30078` | `NOSTR_EXCHANGE_RATES_EVENT_KIND` | Exchange rates | NIP-33 replaceable event for BTC/fiat rate publishing. |
+| `38383` | `NOSTR_ORDER_EVENT_KIND` | Orders | NIP-33 replaceable event for order publications. |
+| `38384` | `NOSTR_RATING_EVENT_KIND` | Ratings | NIP-33 replaceable event for reputation snapshots. |
+| `38385` | `NOSTR_INFO_EVENT_KIND` | Mostro info | NIP-33 replaceable event for operator / node metadata. |
+| `38386` | `NOSTR_DISPUTE_EVENT_KIND` | Disputes | NIP-33 replaceable event for dispute publications. |
+
+> Note: `kind 1` and `kind 13` are *inside* the `kind 1059` GiftWrap transport. They are created and verified by the wrapping/unwrapping code, but they are not emitted or consumed as standalone public relay events by the daemon.
+
 ---
 
 ## How It Works
@@ -670,8 +690,8 @@ sqlite3 ~/.mostro/mostro.db "SELECT id, dev_fee, dev_fee_paid, dev_fee_payment_h
 **Query Nostr for Mostro info event**:
 ```bash
 # Install nostr tools: cargo install nostreq nostcat
-# Fetch Mostro settings (kind 38383)
-nostreq --kinds 38383 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
+# Fetch Mostro settings (kind 38385)
+nostreq --kinds 38385 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
 ```
 
 ---
@@ -1057,21 +1077,21 @@ Mostro implements a reputation system where users rate their experience with eac
 
 1. **Setup Infrastructure**: Follow [INSTALL.md](INSTALL.md) for production deployment
 2. **Configure Settings**: Set fee structure, currencies, limits in `settings.toml`
-3. **Announce Your Mostro**: Publish info event (kind 38383) - done automatically on startup
+3. **Announce Your Mostro**: Publish info event (kind 38385) - done automatically on startup
 4. **Add to Directories**: Submit your Mostro to community listings and websites
 5. **Assign Arbiters**: Add trusted npubs as dispute solvers via RPC or admin actions
 
 ### Finding Other Mostros
 
 Users can discover Mostro operators by:
-- Querying Nostr for kind 38383 events (Mostro info)
+- Querying Nostr for kind 38385 events (Mostro info)
 - Checking community-maintained directories (e.g., mostro.network)
 - Word-of-mouth and local Bitcoin communities
 
 **Example Query**:
 ```bash
 # Find all Mostro instances on Nostr
-nostreq --kinds 38383 | nostcat --stream wss://relay.damus.io | jq
+nostreq --kinds 38385 | nostcat --stream wss://relay.damus.io | jq
 ```
 
 ### Operator Support

@@ -193,7 +193,7 @@ slash path.
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (PR #744) |
 | 4.5 | Re-prompt the winner for a fresh payout invoice after `send_payment` retries exhaust, instead of stranding the bond in `Failed` ([issue #750](https://github.com/MostroP2P/mostro/issues/750)) | 3 | pending |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | ✅ shipped (PR #767) |
-| 6 | Maker bond for **range orders** with proportional slashes | 5 | ✅ shipped |
+| 6 | Maker bond for **range orders** with proportional slashes | 5 | ✅ shipped (PR #770) |
 | 7 | Timeout slash for maker bond | 5 | pending |
 | 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | pending |
 

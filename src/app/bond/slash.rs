@@ -54,7 +54,10 @@ use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::db::find_active_bonds_for_order;
+use super::db::{
+    create_bond, find_active_bonds_for_order, find_child_slashes_for_parent,
+    find_maker_bond_for_order, find_range_root_order,
+};
 use super::flow::{
     release_bond, release_bonds_for_order_or_warn, release_taker_bonds_for_order_or_warn,
 };
@@ -155,13 +158,66 @@ pub async fn validate_bond_resolution(
         return Ok(());
     }
     let bonds = find_active_bonds_for_order(pool, order.id).await?;
-    if resolution.slash_seller && resolve_locked_bond(order, &bonds, Side::Seller).is_none() {
+    let is_range = order_has_range_maker_bond(pool, order).await?;
+    if resolution.slash_seller
+        && resolve_slash_target(pool, order, &bonds, Side::Seller, is_range)
+            .await?
+            .is_none()
+    {
         return Err(MostroCantDo(CantDoReason::InvalidPayload));
     }
-    if resolution.slash_buyer && resolve_locked_bond(order, &bonds, Side::Buyer).is_none() {
+    if resolution.slash_buyer
+        && resolve_slash_target(pool, order, &bonds, Side::Buyer, is_range)
+            .await?
+            .is_none()
+    {
         return Err(MostroCantDo(CantDoReason::InvalidPayload));
     }
     Ok(())
+}
+
+/// Is the bonded party on `side` the **maker** (vs the taker) for this
+/// order? §3.1: a `sell` order's maker is the seller; a `buy` order's
+/// maker is the buyer.
+fn side_is_maker(order: &Order, side: Side) -> Result<bool, MostroError> {
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    Ok(matches!(
+        (kind, side),
+        (Kind::Sell, Side::Seller) | (Kind::Buy, Side::Buyer)
+    ))
+}
+
+/// Resolve the `Locked` bond a slash flag targets, owned so callers don't
+/// juggle borrow lifetimes across the range-root fallback.
+///
+/// Resolution order:
+/// 1. **Pubkey match on this order's active bonds** ([`resolve_locked_bond`]
+///    via the §3.1 buyer/seller → trade-pubkey lookup). This covers taker
+///    bonds and a non-range / first-slice maker bond (which lives on the
+///    order itself).
+/// 2. **Range-root fallback** — only for the *maker* side of a range order
+///    whose slash landed on a descendant slice (the maker bond lives on the
+///    range root, not the slice). Walks `range_parent_id` via
+///    [`find_maker_bond_for_order`].
+async fn resolve_slash_target(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    bonds: &[Bond],
+    side: Side,
+    is_range: bool,
+) -> Result<Option<Bond>, MostroError> {
+    if let Some(b) = resolve_locked_bond(order, bonds, side) {
+        return Ok(Some(b.clone()));
+    }
+    if is_range && side_is_maker(order, side)? {
+        let locked = BondState::Locked.to_string();
+        if let Some(b) = find_maker_bond_for_order(pool, order).await? {
+            if b.state == locked {
+                return Ok(Some(b));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Apply a validated [`BondResolution`] to every active bond on the order.
@@ -200,51 +256,94 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     resolution: &BondResolution,
     reason: BondSlashReason,
 ) -> Result<(), MostroError> {
-    let bonds = find_active_bonds_for_order(pool, order.id).await?;
-    if bonds.is_empty() {
-        return Ok(());
-    }
-
-    let mut slashed_ids: HashSet<Uuid> = HashSet::new();
-    if resolution.slash_seller {
-        if let Some(bond) = resolve_locked_bond(order, &bonds, Side::Seller) {
-            slashed_ids.insert(bond.id);
-        }
-        // No-op if a Locked bond is missing: validation should have run
-        // before any trade-side mutation. Reaching here with a missing
-        // bond means a concurrent path (release, slash, expiry) raced
-        // between validate and apply — letting the loop fall through to
-        // the release branch on whatever remains is the safe outcome.
-    }
-    if resolution.slash_buyer {
-        if let Some(bond) = resolve_locked_bond(order, &bonds, Side::Buyer) {
-            slashed_ids.insert(bond.id);
-        }
-    }
+    // Active bonds attached to *this* order — i.e. the taker bond(s) on
+    // this slice. The maker bond may live on a range root elsewhere and is
+    // resolved separately via `find_maker_bond_for_order`.
+    let active = find_active_bonds_for_order(pool, order.id).await?;
 
     // Snapshot the split percentage *once* per call. Phase 3 will read
     // `node_share_sats` off each row; we never recompute it after the
     // transition.
     let node_share_pct = Settings::get_bond().map_or(0.0, |c| c.slash_node_share_pct);
 
-    for bond in bonds.iter() {
-        if slashed_ids.contains(&bond.id) {
-            slash_one(pool, ln_client, bond, reason, node_share_pct).await;
+    // Is the maker bond governing this order a *range* bond (one HTLC sized
+    // against `max_amount`, slashed proportionally per slice and settled
+    // only at range close)? If so, the maker bond must never be settled or
+    // released inline here — `resolve_range_maker_bond_at_close` owns its
+    // HTLC. We still record a proportional child slash row below.
+    let is_range = order_has_range_maker_bond(pool, order).await?;
+
+    // Track the bonds we slashed inline (via `slash_one`) so the release
+    // sweep at the end skips them. Range maker slashes don't go here — the
+    // parent HTLC stays `Locked` and is excluded from the sweep by the
+    // `is_range` guard instead.
+    let mut slashed_ids: HashSet<Uuid> = HashSet::new();
+
+    for (flag, side) in [
+        (resolution.slash_seller, Side::Seller),
+        (resolution.slash_buyer, Side::Buyer),
+    ] {
+        if !flag {
+            continue;
+        }
+        // No-op if no Locked bond resolves: validation should have run
+        // before any trade-side mutation. Reaching here with a missing bond
+        // means a concurrent path raced between validate and apply — the
+        // release sweep below handles whatever remains safely.
+        let Some(target) = resolve_slash_target(pool, order, &active, side, is_range).await? else {
+            continue;
+        };
+        if is_range && side_is_maker(order, side)? {
+            // Phase 6: the maker bond on a range order is slashed
+            // proportionally per slice — record a child row and leave the
+            // parent HTLC `Locked`. The single settle happens at range close
+            // (`resolve_range_maker_bond_at_close`, called by the admin
+            // handler right after this returns).
+            let root = find_range_root_order(pool, order.clone()).await?;
+            record_maker_slice_slash(pool, order, &root, &target, reason, node_share_pct).await?;
         } else {
-            // Non-slashed bonds on the same order: release with the
-            // Phase 1 contract. `release_bond` is best-effort and
-            // tolerant of transient LND failures.
-            if let Err(e) = release_bond(pool, bond).await {
-                warn!(
-                    bond_id = %bond.id,
-                    order_id = %order.id,
-                    "apply_bond_resolution: release_bond failed: {}", e
-                );
-            }
+            // Taker bond, or a non-range maker bond (Phase 2/5): settle the
+            // HTLC inline.
+            slash_one(pool, ln_client, &target, reason, node_share_pct).await;
+            slashed_ids.insert(target.id);
+        }
+    }
+
+    // Release the non-slashed bonds attached to this order. For a range
+    // order the maker bond is deliberately retained: its HTLC spans the
+    // whole range and is resolved (settled-at-close or released) by
+    // `resolve_range_maker_bond_at_close` once the range terminates — the
+    // admin handler calls that right after this function returns.
+    let maker_role = BondRole::Maker.to_string();
+    for bond in active.iter() {
+        if slashed_ids.contains(&bond.id) {
+            continue;
+        }
+        if is_range && bond.role == maker_role {
+            continue;
+        }
+        if let Err(e) = release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %order.id,
+                "apply_bond_resolution: release_bond failed: {}", e
+            );
         }
     }
 
     Ok(())
+}
+
+/// True when the maker bond governing `order` is a **range** bond — i.e.
+/// the order's range root carries a `max_amount`. Range maker bonds use
+/// the Phase 6 accumulate-and-settle-at-close path; everything else uses
+/// the Phase 2/5 inline settle.
+async fn order_has_range_maker_bond(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+) -> Result<bool, MostroError> {
+    let root = find_range_root_order(pool, order.clone()).await?;
+    Ok(root.max_amount.is_some())
 }
 
 /// Phase 4 — timeout-slash dispatch for the scheduler's
@@ -624,6 +723,281 @@ async fn slash_one<L: SettleLightning + Send>(
     }
 }
 
+/// Phase 6 — record a proportional slash of a range maker bond against the
+/// taken slice `slice`, **without settling the parent HTLC**.
+///
+/// A range maker posts a single hold invoice (the `parent_bond`) sized
+/// against `max_amount`. A BOLT11 hold invoice is all-or-nothing, so we
+/// cannot claim only one slice's share mid-range. Instead we insert a child
+/// row recording the share and leave the parent `Locked`; the actual settle
+/// happens once, at range close
+/// ([`resolve_range_maker_bond_at_close`], Option A / "accumulate and
+/// settle-at-close").
+///
+/// The share is **price-invariant**: `slice.fiat_amount / root.max_amount`
+/// (both fiat — the ratio is independent of any BTC price drift between
+/// publication and take), times the locked bond amount. The child row's
+/// `order_id` and maker-side `pubkey` are the slice's, so the Phase 3
+/// recipient resolver pays the slice's *other* side (the winner).
+async fn record_maker_slice_slash(
+    pool: &Pool<Sqlite>,
+    slice: &Order,
+    root: &Order,
+    parent_bond: &Bond,
+    reason: BondSlashReason,
+    node_share_pct: f64,
+) -> Result<(), MostroError> {
+    let kind = slice.get_order_kind().map_err(MostroInternalErr)?;
+    let maker_slice_pubkey = match kind {
+        Kind::Sell => slice.seller_pubkey.as_deref(),
+        Kind::Buy => slice.buyer_pubkey.as_deref(),
+    };
+    let Some(maker_slice_pubkey) = maker_slice_pubkey else {
+        warn!(
+            bond_id = %parent_bond.id,
+            slice_order_id = %slice.id,
+            "record_maker_slice_slash: slice has no maker-side pubkey; skipping"
+        );
+        return Ok(());
+    };
+    let Some(max_fiat) = root.max_amount.filter(|m| *m > 0) else {
+        warn!(
+            bond_id = %parent_bond.id,
+            root_order_id = %root.id,
+            "record_maker_slice_slash: range root missing positive max_amount; skipping"
+        );
+        return Ok(());
+    };
+
+    // Price-invariant proportional share, clamped so the cumulative slashed
+    // share can never exceed the locked bond (rounding guard).
+    let raw = (parent_bond.amount_sats as f64 * slice.fiat_amount as f64 / max_fiat as f64).round()
+        as i64;
+    let remaining = (parent_bond.amount_sats - parent_bond.slashed_share_sats).max(0);
+    let slash_amount = raw.clamp(0, remaining);
+    if slash_amount <= 0 {
+        warn!(
+            bond_id = %parent_bond.id,
+            slice_order_id = %slice.id,
+            raw, remaining,
+            "record_maker_slice_slash: computed non-positive / over-allocated share; skipping"
+        );
+        return Ok(());
+    }
+
+    let now = Utc::now().timestamp();
+    let mut child = Bond::new_requested(
+        slice.id,
+        maker_slice_pubkey.to_string(),
+        BondRole::Maker,
+        slash_amount,
+    );
+    child.parent_bond_id = Some(parent_bond.id);
+    child.child_order_id = Some(slice.id);
+    child.state = BondState::PendingPayout.to_string();
+    child.slashed_reason = Some(reason.to_string());
+    child.slashed_at = Some(now);
+    child.node_share_sats = Some(compute_node_share(slash_amount, node_share_pct));
+    // No `preimage` / `hash` / `payment_request`: the child shares the
+    // parent HTLC and has no hold invoice of its own.
+    create_bond(pool, child).await?;
+
+    // Recompute the parent's running total from the authoritative slice
+    // child rows (self-healing: a crash between the insert above and this
+    // update is repaired by the next slash or by the close recompute). Only
+    // touch a still-`Locked` parent. The refund row (`child_order_id NULL`)
+    // is excluded so it never inflates the slashed total.
+    sqlx::query(
+        "UPDATE bonds SET slashed_share_sats = \
+            (SELECT COALESCE(SUM(amount_sats), 0) FROM bonds \
+               WHERE parent_bond_id = ? AND child_order_id IS NOT NULL) \
+         WHERE id = ? AND state = ?",
+    )
+    .bind(parent_bond.id)
+    .bind(parent_bond.id)
+    .bind(BondState::Locked.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    info!(
+        bond_id = %parent_bond.id,
+        slice_order_id = %slice.id,
+        reason = %reason,
+        slash_amount,
+        "Phase 6: recorded proportional maker slice slash (parent HTLC stays Locked)"
+    );
+    Ok(())
+}
+
+/// Phase 6 — resolve a maker bond when its order (range chain) terminates
+/// (settle-at-close, "Option A").
+///
+/// Called from every terminal hook for an order *except* a successful
+/// release that spawns a range remainder (the range continues then, so the
+/// maker stays committed). Idempotent and best-effort:
+///
+/// - **Non-range maker bond** → released inline (`cancel_hold_invoice`).
+///   Unifies the Phase 5 completion/cancel behaviour so hooks call one
+///   function for both fixed and range makers.
+/// - **Range, no slice ever slashed** → released: the maker gets the whole
+///   bond back (the HTLC is cancelled, never charged).
+/// - **Range, ≥1 slice slashed** → the single parent HTLC is settled
+///   **once** (claiming the full bond into Mostro's wallet), the parent row
+///   moves `Locked → Slashed`, and an unslashed-remainder **refund row**
+///   (`child_order_id = NULL`, recipient = the maker) is created. The
+///   per-slice child rows and the refund row — all `PendingPayout` — are
+///   then driven by the Phase 3 payout scheduler, which skipped them while
+///   the parent was `Locked`.
+pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+    order: &Order,
+) -> Result<(), MostroError> {
+    let Some(parent) = find_maker_bond_for_order(pool, order).await? else {
+        return Ok(());
+    };
+    // Idempotent: act only on a still-`Locked` parent. A prior close (or a
+    // Phase 5 inline release/slash) already moved it on.
+    if parent.state != BondState::Locked.to_string() {
+        return Ok(());
+    }
+
+    let root = find_range_root_order(pool, order.clone()).await?;
+    let slice_children: Vec<Bond> = if root.max_amount.is_some() {
+        find_child_slashes_for_parent(pool, parent.id)
+            .await?
+            .into_iter()
+            .filter(|c| c.child_order_id.is_some())
+            .collect()
+    } else {
+        // Non-range maker bond: no child rows exist; fall through to release.
+        Vec::new()
+    };
+
+    let total_slashed: i64 = slice_children.iter().map(|c| c.amount_sats).sum();
+    if total_slashed == 0 {
+        // Nothing was ever slashed across the whole range (or non-range
+        // happy path): release the bond back to the maker.
+        return release_bond(pool, &parent).await;
+    }
+
+    // ≥1 slice slashed: settle the whole HTLC once. Settle BEFORE the CAS so
+    // a transient failure leaves the parent retryably `Locked`.
+    let Some(preimage) = parent.preimage.as_deref() else {
+        warn!(
+            bond_id = %parent.id,
+            "range close: parent bond has no preimage; cannot settle — left Locked"
+        );
+        return Ok(());
+    };
+    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
+        if is_already_settled_error(&e) {
+            info!(
+                bond_id = %parent.id,
+                "range close: parent HTLC already settled (idempotent); proceeding"
+            );
+        } else {
+            warn!(
+                bond_id = %parent.id,
+                "range close: settle_hold_invoice failed: {e} — leaving Locked for retry"
+            );
+            return Ok(());
+        }
+    }
+
+    // Move the parent `Locked → Slashed` (settled & distributed via the
+    // child rows + the refund row). The CAS ensures exactly one close wins
+    // if two terminal hooks race; the loser must not create a second refund
+    // row.
+    let cas = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
+        .bind(BondState::Slashed.to_string())
+        .bind(parent.id)
+        .bind(BondState::Locked.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if cas.rows_affected() != 1 {
+        info!(
+            bond_id = %parent.id,
+            "range close: parent already closed concurrently; skipping refund row"
+        );
+        return Ok(());
+    }
+
+    let refund_amount = (parent.amount_sats - total_slashed).max(0);
+    info!(
+        bond_id = %parent.id,
+        order_id = %root.id,
+        amount_sats = parent.amount_sats,
+        total_slashed,
+        refund_amount,
+        children = slice_children.len(),
+        "Phase 6: range maker bond settled at close; distributing child shares + maker refund"
+    );
+
+    if refund_amount > 0 {
+        let now = Utc::now().timestamp();
+        // Inherit a parseable reason from a slice child so the Phase 3
+        // `slashed_reason` invariant holds; the refund recipient is resolved
+        // directly from the row (the maker), not via the reason.
+        let reason = slice_children
+            .first()
+            .and_then(|c| c.slashed_reason.clone())
+            .unwrap_or_else(|| BondSlashReason::LostDispute.to_string());
+        let mut refund = Bond::new_requested(
+            root.id,
+            parent.pubkey.clone(),
+            BondRole::Maker,
+            refund_amount,
+        );
+        refund.parent_bond_id = Some(parent.id);
+        refund.child_order_id = None; // marks the maker-refund row
+        refund.state = BondState::PendingPayout.to_string();
+        refund.slashed_reason = Some(reason);
+        refund.slashed_at = Some(now);
+        refund.node_share_sats = Some(0); // full refund to the maker
+        create_bond(pool, refund).await?;
+    }
+
+    Ok(())
+}
+
+/// Open an `LndConnector` and run [`resolve_range_maker_bond_at_close`],
+/// logging on failure. For the non-admin terminal hooks (completion,
+/// cancel, scheduler expiry) that don't already hold an LND client. A cheap
+/// pre-check skips opening LND entirely when there is no `Locked` maker bond
+/// to resolve — the common case. The admin handlers pass their own
+/// `ln_client` to the generic function directly.
+pub async fn resolve_range_maker_bond_at_close_or_warn(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    context: &'static str,
+) {
+    let locked = BondState::Locked.to_string();
+    match find_maker_bond_for_order(pool, order).await {
+        Ok(Some(b)) if b.state == locked => {}
+        Ok(_) => return,
+        Err(e) => {
+            warn!("{context}: maker bond lookup failed for {}: {e}", order.id);
+            return;
+        }
+    }
+    let mut ln = match LndConnector::new().await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("{context}: cannot connect to LND to resolve maker bond at close: {e}");
+            return;
+        }
+    };
+    if let Err(e) = resolve_range_maker_bond_at_close(pool, &mut ln, order).await {
+        warn!(
+            order_id = %order.id,
+            "{context}: resolve_range_maker_bond_at_close failed: {e}"
+        );
+    }
+}
+
 /// Resolve a buyer/seller slash flag to the matching `Locked` bond row,
 /// if any. The mapping uses the §3.1 buyer-side → trade-pubkey lookup
 /// on the order, then filters bonds by `pubkey` and `state = Locked`.
@@ -734,6 +1108,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        // Phase 6 chain-walk tests load full `Order` rows via `Order::by_id`,
+        // which selects every column the model declares — so the orders
+        // table must carry the later Cashu columns too.
+        for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("cashu_escrow_fields migration");
+        }
         pool
     }
 
@@ -1920,5 +2307,301 @@ mod tests {
             vec![taker_pk().to_string()],
             "BondSlashed must be enqueued to the slashed taker only"
         );
+    }
+
+    // ── Phase 6: range-order maker bond ────────────────────────────────
+
+    use crate::app::bond::db::{
+        find_bond_by_id, find_child_slashes_for_parent, find_maker_bond_for_order,
+        find_range_root_order,
+    };
+
+    /// Insert an order row including the range columns (`min_amount`,
+    /// `max_amount`, `range_parent_id`) that `insert_order_row` omits.
+    async fn insert_range_order_row(pool: &Pool<Sqlite>, order: &Order) {
+        sqlx::query(
+            r#"INSERT INTO orders (
+                id, kind, event_id, status, premium, payment_method,
+                amount, fiat_code, fiat_amount, min_amount, max_amount,
+                range_parent_id, created_at, expires_at, seller_pubkey, buyer_pubkey
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(order.id)
+        .bind(&order.kind)
+        .bind(order.id.simple().to_string())
+        .bind(&order.status)
+        .bind(&order.payment_method)
+        .bind(order.amount)
+        .bind(&order.fiat_code)
+        .bind(order.fiat_amount)
+        .bind(order.min_amount)
+        .bind(order.max_amount)
+        .bind(order.range_parent_id)
+        .bind(order.created_at)
+        .bind(order.expires_at)
+        .bind(order.seller_pubkey.as_deref())
+        .bind(order.buyer_pubkey.as_deref())
+        .execute(pool)
+        .await
+        .expect("insert range order");
+    }
+
+    /// A range-order slice: `amount = 0`, `min`/`max` set (so
+    /// `is_range_order()` and the root-`max_amount` check hold).
+    fn range_slice(
+        kind: Kind,
+        seller_pk: &str,
+        buyer_pk: &str,
+        fiat_amount: i64,
+        min: i64,
+        max: i64,
+    ) -> Order {
+        let mut o = fixture_order(kind, seller_pk, buyer_pk);
+        o.amount = 0;
+        o.fiat_amount = fiat_amount;
+        o.min_amount = Some(min);
+        o.max_amount = Some(max);
+        o
+    }
+
+    /// A `Locked` parent maker bond with a settleable preimage and **no**
+    /// `hash` (so the release path skips the live LND `cancel_hold_invoice`
+    /// and the settle path is exercised only via the `StubSettle`).
+    async fn insert_parent_maker_bond(
+        pool: &Pool<Sqlite>,
+        order_id: Uuid,
+        pubkey: &str,
+        amount_sats: i64,
+    ) -> Bond {
+        let mut b = Bond::new_requested(order_id, pubkey.to_string(), BondRole::Maker, amount_sats);
+        b.state = BondState::Locked.to_string();
+        b.preimage = Some(stub_preimage());
+        b.hash = None;
+        sqlx_crud::Crud::create(b.clone(), pool).await.unwrap();
+        b
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_is_proportional() {
+        // sell range order: maker = seller. max fiat = 100, slice fiat = 40,
+        // bond = 1000 → slash = round(1000 * 40/100) = 400; node 50% = 200.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        let c = &children[0];
+        assert_eq!(c.amount_sats, 400, "proportional slice share");
+        assert_eq!(c.node_share_sats, Some(200));
+        assert_eq!(c.state, BondState::PendingPayout.to_string());
+        assert_eq!(c.parent_bond_id, Some(parent.id));
+        assert_eq!(c.child_order_id, Some(root.id));
+        assert_eq!(c.order_id, root.id);
+        // Maker's slice-side (seller) key, so Phase 3 pays the buyer winner.
+        assert_eq!(c.pubkey, maker_pk());
+        assert!(c.slashed_at.is_some());
+        assert!(c.preimage.is_none(), "child shares the parent HTLC");
+
+        // Parent accumulates the running total but stays Locked (no settle).
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.slashed_share_sats, 400);
+        assert_eq!(p.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_clamps_cumulative_to_bond() {
+        // Two slices that together exceed the bond must clamp so the
+        // cumulative slashed share never exceeds `amount_sats`.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 80, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        // First slice 80/100 → 800.
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.0,
+        )
+        .await
+        .unwrap();
+        // Reload parent (slashed_share_sats now 800) and slash another 80/100
+        // → raw 800, but only 200 remaining → clamp to 200. (Same order row
+        // reused as the slice to satisfy the bonds→orders foreign key.)
+        let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        let total: i64 = children.iter().map(|c| c.amount_sats).sum();
+        assert_eq!(total, 1000, "cumulative slash clamped to the bond amount");
+    }
+
+    #[tokio::test]
+    async fn range_close_no_slashes_releases_maker_bond() {
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let stub = StubSettle::new();
+        resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root)
+            .await
+            .unwrap();
+
+        assert!(
+            stub.calls().is_empty(),
+            "no slice was ever slashed → the HTLC must be cancelled, not settled"
+        );
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Released.to_string());
+        assert!(find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_close_with_one_slash_settles_once_and_refunds_remainder() {
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let stub = StubSettle::new();
+        resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root)
+            .await
+            .unwrap();
+
+        // Settled exactly once, with the parent preimage.
+        assert_eq!(stub.calls(), vec![stub_preimage()]);
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Slashed.to_string());
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 2, "slice slash + maker refund row");
+        let refund = children
+            .iter()
+            .find(|c| c.child_order_id.is_none())
+            .expect("a maker-refund row");
+        assert_eq!(refund.amount_sats, 600, "1000 bond - 400 slashed");
+        assert_eq!(refund.node_share_sats, Some(0), "full refund to the maker");
+        assert_eq!(refund.pubkey, maker_pk());
+        assert_eq!(refund.order_id, root.id);
+        assert_eq!(refund.state, BondState::PendingPayout.to_string());
+
+        // Idempotent: a second close (parent now Slashed) is a no-op.
+        resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root)
+            .await
+            .unwrap();
+        assert_eq!(stub.calls().len(), 1, "no second settle");
+        assert_eq!(
+            find_child_slashes_for_parent(&pool, parent.id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "no duplicate refund row"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_range_maker_slash_records_child_without_settling() {
+        let pool = setup_pool().await;
+        // sell range order: `slash_seller` targets the maker (seller).
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: false,
+        };
+        let stub = StubSettle::new();
+        apply_bond_resolution(
+            &pool,
+            &mut stub.clone(),
+            &root,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            stub.calls().is_empty(),
+            "a range maker slash records a child row but must NOT settle inline"
+        );
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Locked.to_string());
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].amount_sats, 400);
+        assert_eq!(children[0].child_order_id, Some(root.id));
+    }
+
+    #[tokio::test]
+    async fn maker_bond_resolves_from_descendant_slice() {
+        // The maker bond lives on the range root; a slash on a descendant
+        // slice must still find it by walking `range_parent_id`.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 30, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let mut c1 = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 70);
+        c1.range_parent_id = Some(root.id);
+        insert_range_order_row(&pool, &c1).await;
+
+        let found = find_maker_bond_for_order(&pool, &c1)
+            .await
+            .unwrap()
+            .expect("maker bond resolved via the range root");
+        assert_eq!(found.id, parent.id);
+
+        let resolved_root = find_range_root_order(&pool, c1.clone()).await.unwrap();
+        assert_eq!(resolved_root.id, root.id);
     }
 }

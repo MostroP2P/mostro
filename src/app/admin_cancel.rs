@@ -238,5 +238,17 @@ pub async fn admin_cancel_action(
         );
     }
 
+    // Phase 6: a dispute resolution ends the range (no remainder is
+    // republished), so resolve the maker bond at close — settle the parent
+    // HTLC once and refund the unslashed remainder if any slice was slashed,
+    // otherwise release. A no-op for non-range maker bonds and for orders
+    // with no maker bond.
+    if let Err(e) = bond::resolve_range_maker_bond_at_close(pool, ln_client, &order).await {
+        tracing::warn!(
+            order_id = %order.id,
+            "admin_cancel: maker bond close failed: {}", e
+        );
+    }
+
     Ok(())
 }

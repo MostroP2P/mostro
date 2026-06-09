@@ -3,13 +3,20 @@
 //! Phase 0 exposes the CRUD surface later phases will need. Nothing in
 //! this module hits LND or the Nostr client — it's purely storage.
 
-use mostro_core::error::{MostroError::MostroInternalErr, ServiceError};
+use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
+use mostro_core::order::Order;
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use uuid::Uuid;
 
 use super::model::Bond;
 use super::types::{BondRole, BondState};
+
+/// Defensive upper bound on a `range_parent_id` walk. The real chain
+/// length is bounded by how many slices a range can be split into
+/// (`max_amount / min_amount`), always small; this cap exists only so a
+/// corrupt cycle in the DB can never hang the daemon.
+const MAX_RANGE_CHAIN_DEPTH: usize = 1024;
 
 /// Insert a new bond row. Returns the persisted `Bond`.
 pub async fn create_bond(
@@ -57,6 +64,20 @@ pub async fn find_bonds_by_state(
     sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE state = ? ORDER BY created_at ASC")
         .bind(state_str)
         .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Look up a bond row by its primary key. Used by the Phase 3 payout
+/// scheduler to check a child slash row's parent state (skip while the
+/// parent HTLC is still `Locked`, i.e. before range close).
+pub async fn find_bond_by_id(
+    pool: &Pool<Sqlite>,
+    id: Uuid,
+) -> Result<Option<Bond>, mostro_core::error::MostroError> {
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ? LIMIT 1")
+        .bind(id)
+        .fetch_optional(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
@@ -144,6 +165,69 @@ pub async fn find_active_bond_by_taker(
     .bind(requested)
     .bind(locked)
     .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Walk the `range_parent_id` chain from `order` up to the range root —
+/// the order that owns the maker bond (Phase 6).
+///
+/// `range_parent_id` is a linked list to the *immediate* parent slice, not
+/// a star to the root (see `create_base_order` in `app::release`), so the
+/// maker bond lives on whichever order has `range_parent_id IS NULL`. A
+/// non-range order or an already-root order returns itself. The walk is
+/// bounded by [`MAX_RANGE_CHAIN_DEPTH`]; a missing parent row (should never
+/// happen) terminates the walk at the deepest order we could load.
+pub async fn find_range_root_order(
+    pool: &Pool<Sqlite>,
+    order: Order,
+) -> Result<Order, MostroError> {
+    let mut current = order;
+    for _ in 0..MAX_RANGE_CHAIN_DEPTH {
+        let Some(parent_id) = current.range_parent_id else {
+            return Ok(current);
+        };
+        match Order::by_id(pool, parent_id)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        {
+            Some(parent) => current = parent,
+            None => return Ok(current),
+        }
+    }
+    Err(MostroInternalErr(ServiceError::UnexpectedError(
+        "range_parent_id chain exceeded max depth (possible cycle)".to_string(),
+    )))
+}
+
+/// Find the parent **maker** bond governing `order`, walking the range
+/// chain to its root first.
+///
+/// A maker slash (or release) can land on any slice in a range chain, but
+/// there is only ever one maker bond and it lives on the root order. This
+/// resolves that single bond from any slice. Returns `None` when no maker
+/// bond exists (feature off, `apply_to` excludes the maker, or the bond
+/// was already released).
+pub async fn find_maker_bond_for_order(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+) -> Result<Option<Bond>, MostroError> {
+    let root = find_range_root_order(pool, order.clone()).await?;
+    find_bond_by_order_and_role(pool, root.id, BondRole::Maker).await
+}
+
+/// Every child slash row that belongs to `parent_bond_id` (Phase 6
+/// range-order accounting). Ordered oldest-first for deterministic
+/// iteration at parent-close.
+pub async fn find_child_slashes_for_parent(
+    pool: &Pool<Sqlite>,
+    parent_bond_id: Uuid,
+) -> Result<Vec<Bond>, MostroError> {
+    sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds WHERE parent_bond_id = ? ORDER BY created_at ASC",
+    )
+    .bind(parent_bond_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }

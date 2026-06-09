@@ -558,6 +558,9 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
                         let order_id = order_updated.id;
+                        // Snapshot before `update` consumes the row — the
+                        // Phase 6 close hook below needs an `&Order`.
+                        let order_snapshot = order_updated.clone();
                         // Same gate as the timeout job: only release
                         // bonds when the Expired status was actually
                         // persisted. On persist failure the next tick
@@ -575,9 +578,21 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                                 // expiry — Phase 1 promises "always
                                 // release" on every exit path,
                                 // expiry included.
-                                bond::release_bonds_for_order_or_warn(
+                                bond::release_taker_bonds_for_order_or_warn(
                                     pool,
                                     order_id,
+                                    "pending_expiry",
+                                )
+                                .await;
+                                // Phase 6: an expiring Pending order may be a
+                                // range remainder (or the range root) — resolve
+                                // the maker bond at range close (release when no
+                                // slice was slashed; settle-at-close otherwise).
+                                // Also covers the non-range maker bond via the
+                                // close helper's non-range release branch.
+                                bond::resolve_range_maker_bond_at_close_or_warn(
+                                    pool,
+                                    &order_snapshot,
                                     "pending_expiry",
                                 )
                                 .await;

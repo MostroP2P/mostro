@@ -77,11 +77,12 @@ pub fn taker_bond_required() -> bool {
 
 /// True when the configuration requires the **maker** to post a bond.
 ///
-/// Phase 5 gate, symmetric to [`taker_bond_required`]. `publish_order`
+/// Phase 5/6 gate, symmetric to [`taker_bond_required`]. `publish_order`
 /// asks this question before publishing a new order to Nostr: when it is
-/// true (and the order is non-range — Phase 6 handles range makers), the
-/// order is parked at [`Status::WaitingMakerBond`] and no NIP-33 event is
-/// emitted until the maker locks the bond.
+/// true the order is parked at [`Status::WaitingMakerBond`] and no NIP-33
+/// event is emitted until the maker locks the bond. Both fixed-amount
+/// (Phase 5) and range (Phase 6) makers take this path; range makers size
+/// the bond against `max_amount` and slash proportionally per slice.
 pub fn maker_bond_required() -> bool {
     Settings::get_bond()
         .filter(|cfg| cfg.enabled)

@@ -40,6 +40,14 @@ impl AdminServiceImpl {
         }
     }
 
+    /// Build the Lightning escrow backend the admin handlers reach through
+    /// `AppContext::escrow()`. The RPC service is Lightning-only (it owns an
+    /// `LndConnector`), so this always wraps a clone of that connector.
+    async fn escrow_backend(&self) -> Arc<dyn crate::escrow::EscrowBackend> {
+        let conn = self.ln_client.lock().await.clone();
+        Arc::new(crate::escrow::LightningBackend::new(conn))
+    }
+
     /// Convert admin actions to use existing handlers
     /// This creates the necessary structures to call existing admin handlers
     async fn call_admin_cancel(
@@ -89,12 +97,14 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
+        let escrow = self.escrow_backend().await;
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            escrow,
         );
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
@@ -144,15 +154,16 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
+        let escrow = self.escrow_backend().await;
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            escrow,
         );
-        let mut ln_client = self.ln_client.lock().await;
-        admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
+        admin_settle_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin settle failed: {}", e))?;
 
@@ -198,12 +209,14 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
+        let escrow = self.escrow_backend().await;
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            escrow,
         );
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
@@ -252,12 +265,14 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
+        let escrow = self.escrow_backend().await;
         let ctx = AppContext::new(
             self.pool.clone(),
             nostr_client,
             settings,
             MESSAGE_QUEUES.queue_order_msg.clone(),
             self.keys.clone(),
+            escrow,
         );
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await

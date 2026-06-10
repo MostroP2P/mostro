@@ -38,6 +38,11 @@ pub struct AppContext {
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
     keys: Keys,
+    escrow: Arc<dyn crate::escrow::EscrowBackend>,
+    /// Connected Cashu mint client, present only when the node boots in Cashu
+    /// escrow mode. The Track A lock handler reaches it via [`Self::cashu_client`]
+    /// to validate seller-submitted escrow tokens. `None` in Lightning mode.
+    cashu_client: Option<Arc<crate::cashu::CashuClient>>,
 }
 
 impl AppContext {
@@ -48,6 +53,7 @@ impl AppContext {
         settings: Arc<Settings>,
         order_msg_queue: OrderMsgQueue,
         keys: Keys,
+        escrow: Arc<dyn crate::escrow::EscrowBackend>,
     ) -> Self {
         Self {
             pool,
@@ -55,7 +61,19 @@ impl AppContext {
             settings,
             order_msg_queue,
             keys,
+            escrow,
+            cashu_client: None,
         }
+    }
+
+    /// Attach a connected Cashu mint client (Cashu mode only).
+    ///
+    /// Builder-style so it composes with [`Self::new`] without widening the
+    /// constructor: Lightning-mode callers (and every existing test) keep the
+    /// `None` default, while the Cashu boot path in `main` sets the live client.
+    pub fn with_cashu_client(mut self, client: Arc<crate::cashu::CashuClient>) -> Self {
+        self.cashu_client = Some(client);
+        self
     }
 
     /// Database connection pool.
@@ -89,6 +107,22 @@ impl AppContext {
     /// Use this instead of `get_keys()` to avoid re-parsing on every call.
     pub fn keys(&self) -> &Keys {
         &self.keys
+    }
+
+    /// Active escrow backend (Lightning today; Cashu opt-in later).
+    ///
+    /// Order-action handlers call `lock` / `release` / `cooperative_cancel` /
+    /// `dispute_*` through this instead of touching the LND connector directly.
+    pub fn escrow(&self) -> &Arc<dyn crate::escrow::EscrowBackend> {
+        &self.escrow
+    }
+
+    /// Connected Cashu mint client, if the node is in Cashu escrow mode.
+    ///
+    /// Returns `None` in Lightning mode. The Track A lock handler uses it to
+    /// validate seller-submitted 2-of-3 escrow tokens against the mint.
+    pub fn cashu_client(&self) -> Option<&Arc<crate::cashu::CashuClient>> {
+        self.cashu_client.as_ref()
     }
 }
 
@@ -153,6 +187,7 @@ pub mod test_utils {
         order_msg_queue: Option<OrderMsgQueue>,
         mock_order_msg_queue: Option<MockOrderMsgQueue>,
         keys: Option<Keys>,
+        escrow: Option<Arc<dyn crate::escrow::EscrowBackend>>,
     }
 
     impl TestContextBuilder {
@@ -164,6 +199,7 @@ pub mod test_utils {
                 order_msg_queue: None,
                 mock_order_msg_queue: None,
                 keys: None,
+                escrow: None,
             }
         }
 
@@ -205,6 +241,13 @@ pub mod test_utils {
             self
         }
 
+        /// Inject a specific escrow backend (e.g. a `MockEscrowBackend` whose
+        /// call counters the test later inspects).
+        pub fn with_escrow(mut self, escrow: Arc<dyn crate::escrow::EscrowBackend>) -> Self {
+            self.escrow = Some(escrow);
+            self
+        }
+
         /// Build the test context.
         ///
         /// This is synchronous: callers must provide dependencies explicitly.
@@ -234,7 +277,13 @@ pub mod test_utils {
                     .expect("TestContextBuilder: invalid nsec_privkey in settings")
             });
 
-            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
+            // Default to a recording mock backend so handler tests that don't
+            // care about escrow still get a working, asserting backend.
+            let escrow = self
+                .escrow
+                .unwrap_or_else(|| Arc::new(crate::escrow::test_utils::MockEscrowBackend::new()));
+
+            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys, escrow)
         }
 
         /// Build context plus mock handles used for assertions.

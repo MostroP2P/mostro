@@ -5,6 +5,7 @@
 pub mod context;
 
 // Submodules for different trading actions
+pub mod add_cashu_escrow; // Handles Cashu 2-of-3 escrow lock (Track A)
 pub mod add_invoice; // Handles invoice creation
 pub mod admin_add_solver; // Admin functionality to add dispute solvers
 pub mod admin_cancel; // Admin order cancellation
@@ -26,6 +27,7 @@ pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
 
 // Import action handlers from submodules
+use crate::app::add_cashu_escrow::add_cashu_escrow_action;
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
@@ -229,6 +231,12 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
+        // Cashu escrow lock only exists in Cashu mode (`run_cashu` routes it
+        // there). In Lightning mode it is invalid — reject explicitly rather
+        // than silently `Ok(())` via the wildcard, mirroring `PayInvoice`.
+        Action::AddCashuEscrow => {
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into())
+        }
         Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
@@ -273,7 +281,7 @@ async fn handle_message_action(
     ctx: &AppContext,
 ) -> Result<()> {
     match action {
-        Action::Release => release_action(ctx, msg, event, my_keys, ln_client)
+        Action::Release => release_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
         Action::Cancel => cancel_action(ctx, msg, event, my_keys, ln_client)
@@ -282,7 +290,7 @@ async fn handle_message_action(
         Action::AdminCancel => admin_cancel_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
-        Action::AdminSettle => admin_settle_action(ctx, msg, event, my_keys, ln_client)
+        Action::AdminSettle => admin_settle_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
         _ => handle_message_action_no_ln(action, msg, event, my_keys, ctx).await,
@@ -457,14 +465,32 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                             // Cashu mode (F4). Return CantDo so the peer gets
                             // a clear error instead of a cryptic LND failure.
                             let result = match action {
-                                // No escrow backend wired in F2: reject all
-                                // trade actions so peers get a clear error
-                                // rather than orders that can never be filled
-                                // or cancelled.
-                                Action::NewOrder
-                                | Action::TakeSell
-                                | Action::TakeBuy
-                                | Action::AddInvoice
+                                // Track A: the seller submits a 2-of-3 Cashu
+                                // escrow token; Mostro validates it and advances
+                                // the order to Active (the Cashu analogue of
+                                // paying the hold invoice).
+                                Action::AddCashuEscrow => add_cashu_escrow_action(
+                                    &ctx,
+                                    message.clone(),
+                                    &unwrapped,
+                                    my_keys,
+                                )
+                                .await
+                                .map_err(|e| e.into()),
+                                // Order creation and the take flow are Cashu-aware:
+                                // `take_*` branch on `is_cashu_enabled()` and route
+                                // the lock through `show_cashu_escrow_request`
+                                // (no hold invoice) instead of `escrow().lock()`,
+                                // moving the order to `WaitingPayment` so the seller
+                                // can submit the 2-of-3 token via `AddCashuEscrow`.
+                                // They fall through to the no-LN dispatcher below.
+                                //
+                                // The remaining trade actions have no Cashu path yet
+                                // and reject with a clear error: `AddInvoice` would
+                                // call `escrow().lock()` on the Cashu backend (which
+                                // is `unimplemented!()` and would panic), and
+                                // release/cancel/dispute belong to Tracks B/C/D.
+                                Action::AddInvoice
                                 | Action::Release
                                 | Action::Cancel
                                 | Action::AdminCancel

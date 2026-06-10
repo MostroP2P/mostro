@@ -1,9 +1,10 @@
 use crate::app::bond;
 use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, show_hold_invoice,
+    get_order, show_cashu_escrow_request, show_hold_invoice,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -180,8 +181,19 @@ pub async fn take_buy_action(
     order.trade_index_seller = Some(trade_index);
     order.set_timestamp_now();
 
+    // Cashu escrow mode: no hold invoice. Move to `WaitingPayment` and prompt
+    // the seller (the taker, here) to fund the 2-of-3 escrow token; the order
+    // advances to `Active` only once they submit a valid token via
+    // `Action::AddCashuEscrow` (see `add_cashu_escrow_action`).
+    if Settings::is_cashu_enabled() {
+        show_cashu_escrow_request(my_keys, &buyer_pubkey, &seller_pubkey, order, request_id)
+            .await?;
+        return Ok(());
+    }
+
     // Show hold invoice and return success or error
     if let Err(cause) = show_hold_invoice(
+        ctx.escrow(),
         my_keys,
         None,
         &buyer_pubkey,

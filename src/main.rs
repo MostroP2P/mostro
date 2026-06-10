@@ -133,18 +133,36 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
-    let ctx = AppContext::new(
-        get_db_pool(),
-        client.clone(),
-        settings,
-        MESSAGE_QUEUES.queue_order_msg.clone(),
-        mostro_keys.clone(),
-    );
-
-    start_scheduler(ctx.clone()).await;
-
     if Settings::is_cashu_enabled() {
         tracing::info!("Starting in Cashu escrow mode (LND not required)");
+
+        // Connect to the operator-configured mint and verify it is reachable
+        // (and supports NUT-11 P2PK). The Track A lock handler needs a live
+        // client to validate seller-submitted escrow tokens — without it every
+        // `AddCashuEscrow` fails and no order can advance to `Active`. Refuse to
+        // boot if the mint is unavailable, mirroring how Lightning mode refuses
+        // to boot without LND.
+        let mint_url = Settings::get_cashu()
+            .map(|c| c.mint_url.clone())
+            .expect("cashu enabled but [cashu] config missing");
+        let cashu_client = match cashu::CashuClient::connect(&mint_url).await {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                panic!("No connection to Cashu mint {mint_url} - shutting down Mostro! ({e})")
+            }
+        };
+
+        let escrow: Arc<dyn escrow::EscrowBackend> = Arc::new(cashu::CashuBackend::new());
+        let ctx = AppContext::new(
+            get_db_pool(),
+            client.clone(),
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            mostro_keys.clone(),
+            escrow,
+        )
+        .with_cashu_client(cashu_client);
+        start_scheduler(ctx.clone()).await;
         return run_cashu(ctx).await;
     }
 
@@ -155,6 +173,21 @@ async fn main() -> Result<()> {
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
     };
+
+    // Lightning escrow backend wraps the connector; handlers reach it via
+    // `ctx.escrow()`.
+    let escrow: Arc<dyn escrow::EscrowBackend> =
+        Arc::new(escrow::LightningBackend::new(ln_client.clone()));
+    let ctx = AppContext::new(
+        get_db_pool(),
+        client.clone(),
+        settings,
+        MESSAGE_QUEUES.queue_order_msg.clone(),
+        mostro_keys.clone(),
+        escrow,
+    );
+
+    start_scheduler(ctx.clone()).await;
 
     if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {

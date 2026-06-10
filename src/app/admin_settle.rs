@@ -21,7 +21,6 @@ pub async fn admin_settle_action(
     msg: Message,
     event: &UnwrappedMessage,
     my_keys: &Keys,
-    ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get request id
@@ -92,7 +91,7 @@ pub async fn admin_settle_action(
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
     // Settle seller hold invoice
-    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)
+    settle_seller_hold_invoice(event, ctx, Action::AdminSettled, true, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
     // Update order event
@@ -214,9 +213,16 @@ pub async fn admin_settle_action(
     // payout (asking the winning counterparty for a bolt11,
     // `send_payment`, retries, forfeiture on the long-stop window) is
     // still Phase 3's job.
+    // The anti-abuse bond is Lightning-only (mutually exclusive with Cashu
+    // mode), so settling slashed bonds always goes through an LND connector.
+    // The escrow seam is not involved here — bond hold invoices are distinct
+    // from the trade escrow.
+    let mut ln_client = LndConnector::new()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
     if let Err(e) = bond::apply_bond_resolution(
         pool,
-        ln_client,
+        &mut ln_client,
         &order_updated,
         &bond_resolution,
         BondSlashReason::LostDispute,

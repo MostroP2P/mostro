@@ -747,30 +747,6 @@ async fn record_maker_slice_slash(
     reason: BondSlashReason,
     node_share_pct: f64,
 ) -> Result<(), MostroError> {
-    // Idempotency guard: record at most one slash row per slice under a
-    // given parent. A slice's share is fixed; inserting a second row would
-    // make the close path double-count it and over-slash/over-pay. The admin
-    // handlers already block a retry via their order-status guard (the status
-    // moves off `Dispute` before `apply_bond_resolution` runs), so this is
-    // defensive — it keeps the invariant true for any future caller (e.g.
-    // the Phase 7 maker timeout slash) regardless of caller-side guards.
-    let (already_slashed,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?",
-    )
-    .bind(parent_bond.id)
-    .bind(slice.id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    if already_slashed > 0 {
-        info!(
-            bond_id = %parent_bond.id,
-            slice_order_id = %slice.id,
-            "record_maker_slice_slash: slice already slashed under this parent; skipping duplicate"
-        );
-        return Ok(());
-    }
-
     let kind = slice.get_order_kind().map_err(MostroInternalErr)?;
     let maker_slice_pubkey = match kind {
         Kind::Sell => slice.seller_pubkey.as_deref(),
@@ -810,21 +786,54 @@ async fn record_maker_slice_slash(
     }
 
     let now = Utc::now().timestamp();
-    let mut child = Bond::new_requested(
-        slice.id,
-        maker_slice_pubkey.to_string(),
-        BondRole::Maker,
-        slash_amount,
-    );
-    child.parent_bond_id = Some(parent_bond.id);
-    child.child_order_id = Some(slice.id);
-    child.state = BondState::PendingPayout.to_string();
-    child.slashed_reason = Some(reason.to_string());
-    child.slashed_at = Some(now);
-    child.node_share_sats = Some(compute_node_share(slash_amount, node_share_pct));
-    // No `preimage` / `hash` / `payment_request`: the child shares the
-    // parent HTLC and has no hold invoice of its own.
-    create_bond(pool, child).await?;
+    let node_share = compute_node_share(slash_amount, node_share_pct);
+
+    // Insert the child slash row **atomically** with an existence check, so a
+    // slice is slashed at most once under a given parent. This must be a
+    // single statement, not a read-then-`create_bond`: admin settle/cancel
+    // has two independent entry points (the serial Nostr loop and the RPC
+    // service, each with its own LND client), and `admin_cancel` has no
+    // order-status CAS, so two concurrent duplicate cancels could otherwise
+    // both pass a separate existence check and both allocate against the same
+    // (single) HTLC. `INSERT ... WHERE NOT EXISTS` is atomic under SQLite's
+    // write lock; the loser sees `rows_affected = 0`. `order_id` is the
+    // slice's and there is no `preimage`/`hash`/`payment_request` — the child
+    // shares the parent HTLC. Unset columns take their schema defaults
+    // (`slashed_share_sats`/`payout_attempts`/`invoice_request_attempts` = 0,
+    // the rest NULL), matching `Bond::new_requested`.
+    let inserted = sqlx::query(
+        "INSERT INTO bonds \
+            (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
+             amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(slice.id)
+    .bind(parent_bond.id)
+    .bind(slice.id)
+    .bind(maker_slice_pubkey)
+    .bind(BondRole::Maker.to_string())
+    .bind(slash_amount)
+    .bind(BondState::PendingPayout.to_string())
+    .bind(reason.to_string())
+    .bind(node_share)
+    .bind(now)
+    .bind(now)
+    .bind(parent_bond.id)
+    .bind(slice.id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if inserted.rows_affected() == 0 {
+        info!(
+            bond_id = %parent_bond.id,
+            slice_order_id = %slice.id,
+            "record_maker_slice_slash: slice already slashed under this parent; skipping duplicate"
+        );
+        return Ok(());
+    }
 
     // Recompute the parent's running total from the authoritative slice
     // child rows (self-healing: a crash between the insert above and this

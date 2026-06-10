@@ -747,6 +747,30 @@ async fn record_maker_slice_slash(
     reason: BondSlashReason,
     node_share_pct: f64,
 ) -> Result<(), MostroError> {
+    // Idempotency guard: record at most one slash row per slice under a
+    // given parent. A slice's share is fixed; inserting a second row would
+    // make the close path double-count it and over-slash/over-pay. The admin
+    // handlers already block a retry via their order-status guard (the status
+    // moves off `Dispute` before `apply_bond_resolution` runs), so this is
+    // defensive — it keeps the invariant true for any future caller (e.g.
+    // the Phase 7 maker timeout slash) regardless of caller-side guards.
+    let (already_slashed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?",
+    )
+    .bind(parent_bond.id)
+    .bind(slice.id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if already_slashed > 0 {
+        info!(
+            bond_id = %parent_bond.id,
+            slice_order_id = %slice.id,
+            "record_maker_slice_slash: slice already slashed under this parent; skipping duplicate"
+        );
+        return Ok(());
+    }
+
     let kind = slice.get_order_kind().map_err(MostroInternalErr)?;
     let maker_slice_pubkey = match kind {
         Kind::Sell => slice.seller_pubkey.as_deref(),
@@ -2465,13 +2489,15 @@ mod tests {
         )
         .await
         .unwrap();
-        // Reload parent (slashed_share_sats now 800) and slash another 80/100
-        // → raw 800, but only 200 remaining → clamp to 200. (Same order row
-        // reused as the slice to satisfy the bonds→orders foreign key.)
+        // Reload parent (slashed_share_sats now 800) and slash a *second*,
+        // distinct slice (its own order row) of another 80/100 → raw 800, but
+        // only 200 remaining → clamp to 200.
         let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        let slice2 = range_slice(Kind::Sell, maker_pk(), taker_pk(), 80, 10, 100);
+        insert_range_order_row(&pool, &slice2).await;
         record_maker_slice_slash(
             &pool,
-            &root,
+            &slice2,
             &root,
             &parent,
             BondSlashReason::LostDispute,
@@ -2675,5 +2701,47 @@ mod tests {
             "slice child claim window must re-anchor at close time, got {:?}",
             slice.slashed_at
         );
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_is_idempotent_per_slice() {
+        // Recording the same slice twice (e.g. a retry while the parent HTLC
+        // is still Locked) must NOT insert a second child row or double the
+        // accumulated share.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+        // Reload parent (slashed_share_sats now 400) and replay the slash.
+        let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "the slice must be slashed exactly once");
+        assert_eq!(children[0].amount_sats, 400);
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.slashed_share_sats, 400, "share must not double on replay");
     }
 }

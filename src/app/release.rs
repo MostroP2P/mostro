@@ -261,8 +261,9 @@ pub async fn release_action(
             // creation anywhere; the lost remainder is a pre-existing
             // limitation, logged here.)
             tracing::warn!(
-                "get_child_order failed for order {}: {e}; resolving maker bond at close (no remainder was created)",
-                order.id
+                order_id = %order.id,
+                error = %e,
+                "get_child_order failed; resolving maker bond at close (no remainder was created)"
             );
             bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
         }

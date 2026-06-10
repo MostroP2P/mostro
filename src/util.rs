@@ -469,9 +469,14 @@ pub async fn publish_order(
 fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
     // Range orders: size against the fiat ceiling (`max_amount`).
     if order.is_range_order() {
-        let max_fiat = order.max_amount.ok_or_else(|| {
+        // `is_range_order()` only checks that `min`/`max` are `Some`, not
+        // that they are positive, so guard against a zero/negative ceiling
+        // here — a non-positive `max_amount` would otherwise size the bond
+        // at the floor and later divide-by-zero in the proportional slash
+        // (`record_maker_slice_slash`, which carries the matching guard).
+        let max_fiat = order.max_amount.filter(|m| *m > 0).ok_or_else(|| {
             MostroInternalErr(ServiceError::UnexpectedError(
-                "range order missing max_amount".to_string(),
+                "range order missing positive max_amount".to_string(),
             ))
         })?;
         let price = get_bitcoin_price(&order.fiat_code)?;
@@ -1821,5 +1826,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(maker_bond_notional_sats(&order).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_sizes_against_max_at_price() {
+        // Phase 6: a range order sizes the notional against `max_amount`
+        // converted at the cached price: 100 fiat / 60_000 * 1e8 ≈ 166_666
+        // sats. Unique fiat_code avoids clobbering the shared price cache.
+        BitcoinPriceManager::set_price_for_test("T6RANGE", 60_000.0);
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(100),
+            fiat_code: "T6RANGE".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 166_666);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_rejects_non_positive_max() {
+        // `is_range_order()` only checks `Some`-ness, so a `max_amount` of 0
+        // still enters the range branch and must be rejected before bond
+        // sizing (it would divide-by-zero in the proportional slash). A
+        // `None` max can't reach here — `is_range_order()` would be false.
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(0),
+            fiat_code: "T6ZERO".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        let err = maker_bond_notional_sats(&order).unwrap_err();
+        assert!(
+            matches!(err, MostroInternalErr(ServiceError::UnexpectedError(_))),
+            "expected UnexpectedError for non-positive max_amount, got {err:?}"
+        );
     }
 }

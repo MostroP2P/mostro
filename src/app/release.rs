@@ -253,10 +253,18 @@ pub async fn release_action(
             bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
         }
         Err(e) => {
+            // `get_child_order` only *computes* the remainder (it neither
+            // persists nor publishes a child), so on error no remainder
+            // exists on the book — the range has effectively ended. Resolve
+            // the maker bond at close rather than leaving it Locked until
+            // the LND CLTV safety net. (mostro does not retry child-order
+            // creation anywhere; the lost remainder is a pre-existing
+            // limitation, logged here.)
             tracing::warn!(
-                "get_child_order failed for order {}: {e}; maker bond left Locked for a later terminal event",
+                "get_child_order failed for order {}: {e}; resolving maker bond at close (no remainder was created)",
                 order.id
             );
+            bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
         }
     }
 

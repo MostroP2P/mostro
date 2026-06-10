@@ -925,6 +925,29 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         return Ok(());
     }
 
+    let now = Utc::now().timestamp();
+
+    // Phase 6: anchor each slice child's claim window at *close* time, not at
+    // slice-slash time. A child can only be paid out once the parent HTLC is
+    // settled (now); leaving its `slashed_at` at slice-slash time would let
+    // the `payout_claim_window_days` countdown run while the bond was still
+    // unpayable, so a range that stayed open past the window could forfeit a
+    // child the instant it became processable, before the counterparty was
+    // ever asked for an invoice. (In the dispute path close follows the slash
+    // almost immediately, but the timeout-slash path in Phase 7 may not.)
+    if !slice_children.is_empty() {
+        sqlx::query(
+            "UPDATE bonds SET slashed_at = ? \
+             WHERE parent_bond_id = ? AND child_order_id IS NOT NULL AND state = ?",
+        )
+        .bind(now)
+        .bind(parent.id)
+        .bind(BondState::PendingPayout.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+
     let refund_amount = (parent.amount_sats - total_slashed).max(0);
     info!(
         bond_id = %parent.id,
@@ -937,7 +960,6 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
     );
 
     if refund_amount > 0 {
-        let now = Utc::now().timestamp();
         // Inherit a parseable reason from a slice child so the Phase 3
         // `slashed_reason` invariant holds; the refund recipient is resolved
         // directly from the row (the maker), not via the reason.
@@ -2603,5 +2625,55 @@ mod tests {
 
         let resolved_root = find_range_root_order(&pool, c1.clone()).await.unwrap();
         assert_eq!(resolved_root.id, root.id);
+    }
+
+    #[tokio::test]
+    async fn range_close_reanchors_slice_child_claim_window() {
+        // A child's payout claim window must start at *close* time, not at
+        // slice-slash time — otherwise a long-open range could forfeit the
+        // child the instant it becomes payable.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        // Backdate the slice child's slashed_at to simulate a range that
+        // stayed open well past the claim window before closing.
+        sqlx::query(
+            "UPDATE bonds SET slashed_at = ? WHERE parent_bond_id = ? AND child_order_id IS NOT NULL",
+        )
+        .bind(1_000_000i64)
+        .bind(parent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before_close = Utc::now().timestamp();
+        resolve_range_maker_bond_at_close(&pool, &mut StubSettle::new(), &root)
+            .await
+            .unwrap();
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        let slice = children
+            .iter()
+            .find(|c| c.child_order_id.is_some())
+            .expect("slice child");
+        assert!(
+            slice.slashed_at.unwrap() >= before_close,
+            "slice child claim window must re-anchor at close time, got {:?}",
+            slice.slashed_at
+        );
     }
 }

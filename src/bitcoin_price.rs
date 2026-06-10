@@ -162,6 +162,19 @@ impl BitcoinPriceManager {
             .cloned()
             .ok_or(MostroInternalErr(ServiceError::NoAPIResponse))
     }
+
+    /// Test-only: seed the in-memory price cache so unit tests in other
+    /// modules can exercise price-dependent paths (e.g. range-order bond
+    /// sizing) deterministically without hitting the network. Use a unique
+    /// `currency` per test to avoid cross-test interference on the shared
+    /// static.
+    #[cfg(test)]
+    pub(crate) fn set_price_for_test(currency: &str, price: f64) {
+        BITCOIN_PRICES
+            .write()
+            .expect("price cache write lock")
+            .insert(currency.to_string(), price);
+    }
 }
 
 #[cfg(test)]

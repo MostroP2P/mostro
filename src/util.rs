@@ -906,17 +906,6 @@ pub async fn show_cashu_escrow_request(
     mut order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    // The seller locks exactly `order.amount` in the 2-of-3 token — this is the
-    // value `add_cashu_escrow_action` validates the submitted token against. We
-    // deliberately do NOT add the Mostro fee here: unlike a Lightning hold
-    // invoice (where Mostro settles the inbound HTLC and keeps the fee), Mostro
-    // never takes custody of the ecash and holds only 1 of 3 keys, so it cannot
-    // split a fee out of the redeemed token. Fee collection in Cashu mode is an
-    // open design question (see docs/CASHU_ESCROW_ARCHITECTURE.md, "Open
-    // Questions / Future Work"); until it is resolved the escrow locks the bare
-    // order amount.
-    let locked_amount = order.amount;
-
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
@@ -938,7 +927,16 @@ pub async fn show_cashu_escrow_request(
     // Mostro's node pubkey, already known to the client.
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
-    new_order.amount = locked_amount;
+    // The seller locks exactly `order.amount` in the 2-of-3 token — this is the
+    // value `add_cashu_escrow_action` validates the submitted token against. We
+    // deliberately do NOT add the Mostro fee here: unlike a Lightning hold
+    // invoice (where Mostro settles the inbound HTLC and keeps the fee), Mostro
+    // never takes custody of the ecash and holds only 1 of 3 keys, so it cannot
+    // split a fee out of the redeemed token. Fee collection in Cashu mode is an
+    // open design question (see docs/CASHU_ESCROW_ARCHITECTURE.md, "Open
+    // Questions / Future Work"); until it is resolved the escrow locks the bare
+    // order amount.
+    new_order.amount = order.amount;
     new_order.buyer_trade_pubkey = Some(buyer_pubkey.to_string());
     new_order.seller_trade_pubkey = Some(seller_pubkey.to_string());
     new_order.buyer_invoice = None;

@@ -163,9 +163,19 @@ pub async fn take_sell_action(
         order.dev_fee = get_dev_fee(total_mostro_fee);
     }
 
-    // Validate invoice and get payment request if present
-    // NOW dev_fee is set correctly for proper validation
-    let payment_request = validate_invoice(&msg, &order).await?;
+    // Resolve the buyer payout invoice. In Cashu mode the buyer is paid in
+    // ecash (Track B), not over Lightning, so a buyer invoice is meaningless:
+    // reject one if provided rather than silently dropping it, and never run
+    // Lightning invoice validation (which could fail on an irrelevant invoice).
+    // On the Lightning path, validate as before (dev_fee is now set correctly).
+    let payment_request = if Settings::is_cashu_enabled() {
+        if msg.get_inner_message_kind().get_payment_request().is_some() {
+            return Err(MostroCantDo(CantDoReason::InvalidParameters));
+        }
+        None
+    } else {
+        validate_invoice(&msg, &order).await?
+    };
 
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,

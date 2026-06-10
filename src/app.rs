@@ -231,6 +231,12 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
+        // Cashu escrow lock only exists in Cashu mode (`run_cashu` routes it
+        // there). In Lightning mode it is invalid — reject explicitly rather
+        // than silently `Ok(())` via the wildcard, mirroring `PayInvoice`.
+        Action::AddCashuEscrow => {
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into())
+        }
         Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),

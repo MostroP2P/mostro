@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use cdk::error::Error as CdkClientError;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{nut00::Proofs, nut01::SecretKey as NutSecretKey, nut10::SpendingConditions};
-use cdk::nuts::{nut02::ShortKeysetId, CheckStateRequest, CheckStateResponse, PublicKey, Token};
+use cdk::nuts::{
+    nut02::ShortKeysetId, CheckStateRequest, CheckStateResponse, CurrencyUnit, PublicKey, Token,
+};
 use cdk::wallet::MintConnector;
 use mostro_core::prelude::*;
 
@@ -59,10 +61,27 @@ impl CashuClient {
 
         match cashu_client.client.get_mint_info().await {
             Ok(info) => {
+                // The Track A lock path needs NUT-11 (P2PK 2-of-3), NUT-07
+                // (`/v1/checkstate` unspent check) and NUT-12 (DLEQ
+                // mint-authentication). A mint missing any of these would boot
+                // fine and then fail every `AddCashuEscrow`, stranding orders in
+                // `WaitingPayment` — so refuse to connect up front.
                 if !info.nuts.nut11.supported {
                     CASHU_STATUS.get_or_init(|| false);
                     return Err(Error::MintConnection(
                         "Mint does not support NUT-11 P2PK".into(),
+                    ));
+                }
+                if !info.nuts.nut07.supported {
+                    CASHU_STATUS.get_or_init(|| false);
+                    return Err(Error::MintConnection(
+                        "Mint does not support NUT-07 token state check".into(),
+                    ));
+                }
+                if !info.nuts.nut12.supported {
+                    CASHU_STATUS.get_or_init(|| false);
+                    return Err(Error::MintConnection(
+                        "Mint does not support NUT-12 DLEQ proofs".into(),
                     ));
                 }
                 CASHU_STATUS.get_or_init(|| true);
@@ -179,7 +198,16 @@ impl CashuClient {
             )));
         }
 
-        // 3: the locked amount must equal the order amount exactly.
+        // 3: the locked amount must equal the order amount exactly, and be
+        // denominated in sats. `value()` is a bare integer, so without the
+        // unit guard a mint exposing multiple units would let a 100_000-msat
+        // token satisfy a 100_000-sat order (a 1000x-underfunded escrow).
+        match token.unit() {
+            Some(CurrencyUnit::Sat) => {}
+            other => {
+                return Err(Error::Token(format!("token unit {other:?} is not sat")));
+            }
+        }
         let value = token
             .value()
             .map_err(|e| Error::Token(format!("token value: {e}")))?
@@ -210,7 +238,16 @@ impl CashuClient {
             .map(|s| cdk::dhke::hash_to_curve(s.as_bytes()))
             .collect::<Result<Vec<PublicKey>, _>>()
             .map_err(|e| Error::Token(format!("proof Y: {e}")))?;
+        let expected_states = ys.len();
         let states = self.check_state(ys).await?;
+        // Fail closed if the mint returns fewer states than proofs queried: a
+        // missing entry must never be treated as implicitly `Unspent`.
+        if states.states.len() != expected_states {
+            return Err(Error::Token(format!(
+                "checkstate returned {} states for {expected_states} proofs",
+                states.states.len()
+            )));
+        }
         if states
             .states
             .iter()
@@ -238,6 +275,12 @@ impl CashuClient {
     /// Verifies the DLEQ proofs for all proofs in a token.
     /// This authenticates that the token was actually issued by the mint.
     pub async fn verify_token_dleq(&self, token: &Token) -> Result<(), Error> {
+        // TODO(track-b): `get_mint_keys` returns only ACTIVE keysets (NUT-01),
+        // so a proof minted under a since-rotated keyset is rejected here as
+        // "Unknown keyset" even though the mint still honours it. Track A only
+        // ever sees freshly-minted tokens so this is safe, but before Track B
+        // verifies older tokens this must fall back to fetching the specific
+        // keyset via `/v1/keys/{keyset_id}` for inactive keyset ids.
         let keysets = self.client.get_mint_keys().await.map_err(Error::Client)?;
 
         match token {
@@ -398,5 +441,99 @@ mod tests {
         // Right length, but not valid hex / not a curve point.
         let not_hex = "z".repeat(64);
         assert!(cashu_pubkey_from_xonly_hex(&not_hex).is_err());
+    }
+
+    /// The derivation always prepends `02`, but a Nostr trade key's point may
+    /// have ODD-Y parity (`03`). NUT-11 P2PK uses BIP340 Schnorr, which verifies
+    /// against the x-only coordinate (the even-Y lift), so a signature by such a
+    /// key must still validate against the `02`-derived pubkey. If this failed,
+    /// the parity handling would be wrong and Track B (where Mostro signs with
+    /// its own key) would break. This is the sign/verify roundtrip proving it.
+    #[test]
+    fn odd_y_nostr_key_signs_for_derived_cashu_pubkey() {
+        use cdk::nuts::nut00::{Proof, Witness};
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::nut11::P2PKWitness;
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use nostr_sdk::Keys;
+
+        // Find a Nostr key whose secp256k1 point has odd-Y parity (`0x03`).
+        let (keys, nut_sk) = loop {
+            let keys = Keys::generate();
+            let nut_sk = NutSecretKey::from_hex(keys.secret_key().to_secret_hex())
+                .expect("nostr secret converts to a cdk secret key");
+            if nut_sk.public_key().to_bytes()[0] == 0x03 {
+                break (keys, nut_sk);
+            }
+        };
+
+        let xonly_hex = keys.public_key().to_hex();
+        let cashu_pk = cashu_pubkey_from_xonly_hex(&xonly_hex).expect("derive cashu pubkey");
+        // Derivation forced even-Y even though the source key is odd-Y.
+        assert_eq!(cashu_pk.to_bytes()[0], 0x02);
+
+        // Lock a proof to a 1-of-1 P2PK over the derived pubkey, sign with the
+        // odd-Y Nostr key, and verify.
+        let secret: Secret = SpendingConditions::new_p2pk(cashu_pk, None)
+            .try_into()
+            .expect("p2pk secret");
+        let mut proof = Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::ZERO,
+            secret,
+            c: PublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: Some(Witness::P2PKWitness(P2PKWitness { signatures: vec![] })),
+            dleq: None,
+            p2pk_e: None,
+        };
+        proof.sign_p2pk(nut_sk).expect("sign with the odd-Y key");
+        assert!(
+            proof.verify_p2pk().is_ok(),
+            "an odd-Y Nostr key must sign validly for the 02-derived cashu pubkey"
+        );
+    }
+
+    /// Mint-authentication (step 4 of `verify_escrow_token` →
+    /// `verify_token_dleq` → `Proof::verify_dleq`) closes the fabricated-token
+    /// hole only because cdk rejects a proof carrying NO DLEQ. Pin that pinned-
+    /// dependency behavior so a future cdk bump can't silently reopen it: an
+    /// absent DLEQ must error with `MissingDleqProof`. (The full
+    /// `verify_escrow_token` path needs a live mint and is covered by the
+    /// env-gated integration suite; this is the offline regression guard for
+    /// the exact attack primitive.)
+    #[test]
+    fn proof_without_dleq_is_rejected() {
+        use cdk::nuts::nut00::Proof;
+        use cdk::nuts::nut02::Id;
+        use cdk::secret::Secret;
+        use cdk::Amount;
+
+        let proof = Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::ZERO,
+            secret: Secret::generate(),
+            c: PublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let mint_pubkey = PublicKey::from_str(
+            "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                proof.verify_dleq(mint_pubkey),
+                Err(cdk::nuts::nut12::Error::MissingDleqProof)
+            ),
+            "a proof with no DLEQ must be rejected (fabricated-token defense)"
+        );
     }
 }

@@ -129,34 +129,61 @@ pub async fn add_cashu_escrow_action(
         return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
-    // Re-fetch the now-active, locked order and publish the replaceable event so
-    // clients observe the new status.
-    let order = get_order(&msg, pool).await?;
-    let order_updated = update_order_event(my_keys, Status::Active, &order).await?;
-    order_updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // From here on the escrow is durably locked and the order is `Active` in
+    // the DB. Everything below — re-publishing the replaceable event and
+    // notifying the parties — is best-effort: a failure must NOT be returned to
+    // the seller, because a retry would then hit the CAS guard above and get a
+    // confusing `InvalidOrderStatus` for an order that is already escrowed.
+    // Log loudly and still confirm the lock so the seller receives
+    // `CashuEscrowLocked` whenever the lock persisted. Notification context is
+    // taken from the pre-CAS `order` (id and trade indices are immutable
+    // through the lock), so the notices fire even if the re-fetch fails.
+    let order_id = order.id;
+    let trade_index_seller = order.trade_index_seller;
+    let trade_index_buyer = order.trade_index_buyer;
+
+    match get_order(&msg, pool).await {
+        Ok(active_order) => {
+            match update_order_event(my_keys, Status::Active, &active_order).await {
+                Ok(order_updated) => {
+                    if let Err(e) = order_updated.update(pool).await {
+                        tracing::error!(
+                            order_id = %order_id,
+                            "AddCashuEscrow: escrow locked but persisting the updated order event failed: {e}"
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    order_id = %order_id,
+                    "AddCashuEscrow: escrow locked but publishing the order event failed: {e}"
+                ),
+            }
+        }
+        Err(e) => tracing::error!(
+            order_id = %order_id,
+            "AddCashuEscrow: escrow locked but re-fetching the order failed: {e}"
+        ),
+    }
 
     // Confirm the lock to the seller.
     enqueue_order_msg(
         request_id,
-        Some(order.id),
+        Some(order_id),
         Action::CashuEscrowLocked,
         None,
         seller_pubkey,
-        order.trade_index_seller,
+        trade_index_seller,
     )
     .await;
 
     // Notify the buyer that escrow is locked — they can now send fiat.
     enqueue_order_msg(
         None,
-        Some(order.id),
+        Some(order_id),
         Action::CashuEscrowLocked,
         None,
         buyer_pubkey,
-        order.trade_index_buyer,
+        trade_index_buyer,
     )
     .await;
 

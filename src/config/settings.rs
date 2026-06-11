@@ -1,10 +1,12 @@
-use super::{DB_POOL, MOSTRO_CONFIG};
+use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
+use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
     LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::transport::Transport;
+use nostr_sdk::Keys;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -38,11 +40,20 @@ pub struct Settings {
     pub price: Option<PriceSettings>,
 }
 
-/// Initialize the global MOSTRO_CONFIG struct
-pub fn init_mostro_settings(s: Settings) {
+/// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
+pub fn init_mostro_settings(mut s: Settings) {
+    let keys = take_nsec_for_init(&mut s.nostr).expect("Failed to parse nostr private key");
+    NOSTR_KEYS
+        .set(keys)
+        .expect("Failed to set Mostro nostr keys");
     MOSTRO_CONFIG
         .set(s)
         .expect("Failed to set Mostro global settings");
+}
+
+/// Parsed Mostro Nostr signing keys, initialized once at startup.
+pub fn get_mostro_keys() -> Option<&'static Keys> {
+    NOSTR_KEYS.get()
 }
 
 /// Get database pool for Mostro db operations to share across the thread

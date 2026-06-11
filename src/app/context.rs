@@ -99,6 +99,7 @@ pub mod test_utils {
         DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
         RpcSettings,
     };
+    use secrecy::{ExposeSecret, SecretString};
 
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
@@ -230,7 +231,7 @@ pub mod test_utils {
 
             // Use provided keys or parse from settings
             let keys = self.keys.unwrap_or_else(|| {
-                Keys::parse(&settings.nostr.nsec_privkey)
+                Keys::parse(settings.nostr.nsec_privkey.expose_secret())
                     .expect("TestContextBuilder: invalid nsec_privkey in settings")
             });
 
@@ -259,8 +260,9 @@ pub mod test_utils {
             },
             nostr: NostrSettings {
                 // Valid test nsec from src/config/mod.rs tests
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec!["wss://relay.test".to_string()],
             },
             mostro: MostroSettings::default(),

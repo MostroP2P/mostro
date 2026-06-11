@@ -804,26 +804,41 @@ async fn record_maker_slice_slash(
     let now = Utc::now().timestamp();
     let node_share = compute_node_share(slash_amount, node_share_pct);
 
-    // Insert the child slash row **atomically** with an existence check, so a
-    // slice is slashed at most once under a given parent. This must be a
-    // single statement, not a read-then-`create_bond`: admin settle/cancel
-    // has two independent entry points (the serial Nostr loop and the RPC
-    // service, each with its own LND client), and `admin_cancel` has no
-    // order-status CAS, so two concurrent duplicate cancels could otherwise
-    // both pass a separate existence check and both allocate against the same
-    // (single) HTLC. `INSERT ... WHERE NOT EXISTS` is atomic under SQLite's
-    // write lock; the loser sees `rows_affected = 0`. `order_id` is the
-    // slice's and there is no `preimage`/`hash`/`payment_request` — the child
-    // shares the parent HTLC. Unset columns take their schema defaults
-    // (`slashed_share_sats`/`payout_attempts`/`invoice_request_attempts` = 0,
-    // the rest NULL), matching `Bond::new_requested`.
+    // Insert the child slash row **atomically** with two guards, so a slice is
+    // slashed at most once under a given parent *and* only while that parent is
+    // still open. This must be a single statement, not a read-then-`create_bond`:
+    // admin settle/cancel has two independent entry points (the serial Nostr
+    // loop and the RPC service, each with its own LND client), and `admin_cancel`
+    // has no order-status CAS, so two concurrent duplicate cancels could
+    // otherwise both pass a separate existence check and both allocate against
+    // the same (single) HTLC.
+    //
+    // The guards:
+    //   * `NOT EXISTS (child for this slice)` — at-most-once per slice.
+    //   * `EXISTS (parent still Locked)` — lock the child out once the parent
+    //     close wins its `Locked → Slashed` CAS (see
+    //     `resolve_range_maker_bond_at_close`). Without this a slash that lands
+    //     after the close already settled + refunded the HTLC would insert a
+    //     `PendingPayout` child that the scheduler pays out, pushing the total
+    //     distributed past the single settled HTLC. A slice that misses this
+    //     window is dropped (logged below): the safe direction, since the HTLC
+    //     amount is already fixed.
+    //
+    // Both run under SQLite's single write lock, so they observe the same
+    // committed parent state as the close CAS; the loser sees `rows_affected = 0`.
+    // `order_id` is the slice's and there is no `preimage`/`hash`/`payment_request`
+    // — the child shares the parent HTLC. Unset columns take their schema
+    // defaults (`slashed_share_sats`/`payout_attempts`/`invoice_request_attempts`
+    // = 0, the rest NULL), matching `Bond::new_requested`.
     let insert = sqlx::query(
         "INSERT INTO bonds \
             (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
              amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
          WHERE NOT EXISTS ( \
-             SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?)",
+             SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?) \
+           AND EXISTS ( \
+             SELECT 1 FROM bonds WHERE id = ? AND state = ?)",
     )
     .bind(Uuid::new_v4())
     .bind(slice.id)
@@ -839,6 +854,8 @@ async fn record_maker_slice_slash(
     .bind(now)
     .bind(parent_bond.id)
     .bind(slice.id)
+    .bind(parent_bond.id)
+    .bind(BondState::Locked.to_string())
     .execute(pool)
     .await;
     // The `WHERE NOT EXISTS` guard makes the loser of a race insert 0 rows.
@@ -863,10 +880,13 @@ async fn record_maker_slice_slash(
         }
     };
     if inserted.rows_affected() == 0 {
+        // Either the slice was already slashed (duplicate) or the parent bond
+        // is no longer `Locked` — its close already settled the HTLC, so this
+        // slice missed the slash window and is intentionally dropped.
         info!(
             bond_id = %parent_bond.id,
             slice_order_id = %slice.id,
-            "record_maker_slice_slash: slice already slashed under this parent; skipping duplicate"
+            "record_maker_slice_slash: slice already slashed or parent no longer Locked; skipping"
         );
         return Ok(());
     }
@@ -944,8 +964,12 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         Vec::new()
     };
 
-    let total_slashed: i64 = slice_children.iter().map(|c| c.amount_sats).sum();
-    if total_slashed == 0 {
+    // Snapshot total, used only as a fast-path hint to choose release vs.
+    // settle. The refund below is recomputed authoritatively *inside* the
+    // close transaction — this read can be stale (a concurrent slice slash may
+    // commit between here and the CAS).
+    let snapshot_slashed: i64 = slice_children.iter().map(|c| c.amount_sats).sum();
+    if snapshot_slashed == 0 {
         // Nothing was ever slashed across the whole range (or non-range
         // happy path): release the bond back to the maker.
         return release_bond(pool, &parent).await;
@@ -985,7 +1009,6 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
     // thus the sole in-flight state and there is no partially-closed `Slashed`
     // window to repair.
     let now = Utc::now().timestamp();
-    let refund_amount = (parent.amount_sats - total_slashed).max(0);
 
     let mut tx = pool
         .begin()
@@ -1011,6 +1034,24 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         );
         return Ok(());
     }
+
+    // Recompute the slashed total authoritatively from the child rows *inside*
+    // the transaction. The CAS above now holds the write lock and the parent is
+    // `Slashed`, so the gated slice-slash INSERT (see `record_maker_slice_slash`)
+    // can no longer add a child: this SUM is the final, consistent set. Deriving
+    // the refund from the pre-transaction `snapshot_slashed` instead would
+    // over-refund the maker whenever a slice slash committed between the snapshot
+    // read and the CAS — the late child would still be paid out, pushing the
+    // total distributed (children + refund) past the single settled HTLC.
+    let total_slashed: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM bonds \
+         WHERE parent_bond_id = ? AND child_order_id IS NOT NULL",
+    )
+    .bind(parent.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let refund_amount = (parent.amount_sats - total_slashed).max(0);
 
     // Phase 6: anchor each slice child's claim window at *close* time, not at
     // slice-slash time. A child can only be paid out once the parent HTLC is
@@ -3096,6 +3137,48 @@ mod tests {
         assert_eq!(children[0].amount_sats, 400);
         let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
         assert_eq!(p.slashed_share_sats, 400, "share must not double on replay");
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_skipped_once_parent_left_locked() {
+        // Race guard: once the parent close wins its `Locked → Slashed` CAS and
+        // settles + refunds the single HTLC, a slice slash that lands afterwards
+        // must NOT insert a child row — otherwise the scheduler would pay that
+        // orphan out on top of the already-distributed HTLC. The INSERT's
+        // `EXISTS (parent still Locked)` guard makes it a no-op (rows_affected =
+        // 0), independent of the per-slice uniqueness guard.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        // Simulate the close having already moved the parent off `Locked`.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Slashed.to_string())
+            .bind(parent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A slice slash arriving after the close is dropped silently.
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert!(
+            children.is_empty(),
+            "no child row may be inserted once the parent has left Locked"
+        );
     }
 
     #[tokio::test]

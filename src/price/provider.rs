@@ -32,7 +32,7 @@ pub type ProviderQuotes = HashMap<String, Quote>;
 /// tracking, and the Nostr `source` metadata. The string form (via
 /// [`fmt::Display`] / [`FromStr`]) matches the `[price.providers.<id>]`
 /// config sub-table key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProviderId {
     Yadio,
     CoinGecko,

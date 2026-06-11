@@ -233,4 +233,72 @@ mod tests {
         );
         assert_eq!(mostro_settings.mostro.max_orders_per_response, 10);
     }
+
+    // Same as MOSTRO_SETTINGS but with `bitcoin_price_api_url` omitted — the
+    // shape an operator who has migrated to a `[price]` block and deleted the
+    // deprecated key would have (spec §10.1).
+    const MOSTRO_SETTINGS_NO_PRICE_URL: &str = r#"[mostro]
+                                            fee = 0
+                                            max_routing_fee = 0.002
+                                            max_order_amount = 1000000
+                                            min_payment_amount = 100
+                                            expiration_hours = 24
+                                            max_expiration_days = 15
+                                            expiration_seconds = 900
+                                            user_rates_sent_interval_seconds = 3600
+                                            publish_relays_interval = 60
+                                            pow = 0
+                                            publish_mostro_info_interval = 300
+                                            fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
+                                            max_orders_per_response = 10
+                                            dev_fee_percentage = 0.30"#;
+
+    #[test]
+    fn test_mostro_settings_without_bitcoin_price_api_url_defaults() {
+        // A settings.toml that omits the deprecated key must still
+        // deserialize (it is `#[serde(default)]`), falling back to the same
+        // URL the `Default` impl uses.
+        let parsed: StubSettingsMostro =
+            toml::from_str(MOSTRO_SETTINGS_NO_PRICE_URL).expect("must deserialize without the key");
+        assert_eq!(
+            parsed.mostro.bitcoin_price_api_url, "https://api.yadio.io",
+            "omitted legacy key must fall back to the default URL"
+        );
+    }
+
+    #[test]
+    fn test_legacy_synthesis_same_whether_key_present_or_defaulted() {
+        // Legacy synthesis (`[price]` absent) must produce the same
+        // single-yadio config whether the deprecated key was present at its
+        // default value or omitted entirely (spec §10.1 byte-for-byte
+        // compatibility).
+        let omitted: StubSettingsMostro =
+            toml::from_str(MOSTRO_SETTINGS_NO_PRICE_URL).expect("deserialize (omitted)");
+        let present: StubSettingsMostro =
+            toml::from_str(MOSTRO_SETTINGS).expect("deserialize (present)");
+
+        let synth = |m: &MostroSettings| {
+            crate::price::synthesise_legacy_price_settings(
+                &m.bitcoin_price_api_url,
+                m.exchange_rates_update_interval_seconds,
+                m.publish_exchange_rates_to_nostr,
+            )
+        };
+        let from_omitted = synth(&omitted.mostro);
+        let from_present = synth(&present.mostro);
+
+        // Exactly one provider (yadio) in both, with the default URL.
+        for cfg in [&from_omitted, &from_present] {
+            assert_eq!(cfg.providers.len(), 1);
+            let yadio = cfg.providers.get("yadio").expect("yadio provider present");
+            assert!(yadio.enabled);
+            assert_eq!(yadio.url, "https://api.yadio.io");
+        }
+        // And the synthesised cadence / publish flag match across the two.
+        assert_eq!(
+            from_omitted.update_interval_seconds,
+            from_present.update_interval_seconds
+        );
+        assert_eq!(from_omitted.publish_to_nostr, from_present.publish_to_nostr);
+    }
 }

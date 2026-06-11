@@ -1,4 +1,3 @@
-use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
@@ -37,13 +36,63 @@ const MAX_RETRY: u16 = 4;
 // Redefined for convenience
 type OrderKind = mostro_core::order::Kind;
 
+/// Resolve the Yadio base URL for the live market-quote path (`/convert`,
+/// `/currencies`).
+///
+/// Phase 1 transition (spec §10.1): the cached aggregate path reads
+/// `[price.providers.yadio].url`, but this live path historically read the
+/// legacy `[mostro].bitcoin_price_api_url`. If an operator customises only
+/// the new key, the two paths would silently hit different Yadio bases.
+/// Prefer the configured Yadio provider URL when it is *usable* — the provider
+/// is enabled and has a non-empty URL — otherwise fall back to the legacy key.
+/// A disabled or blank provider entry must not suppress that fallback. The
+/// chosen URL is normalized exactly as [`YadioProvider::new`] does
+/// (`trim_end_matches('/')`) so appending `/convert` / `/currencies` can never
+/// produce a `//`, keeping the live and aggregate paths on an identical base.
+/// Phase 4 removes this live HTTP path entirely, at which point the legacy key
+/// only feeds legacy synthesis.
+fn yadio_base_url() -> String {
+    let provider = Settings::get_price().and_then(|price| {
+        price
+            .providers
+            .get(&crate::price::ProviderId::Yadio.to_string())
+            .map(|yadio| (yadio.url.as_str(), yadio.enabled))
+    });
+    let legacy = Settings::get_mostro().bitcoin_price_api_url.clone();
+    select_yadio_base_url(provider, &legacy)
+}
+
+/// Drop surrounding whitespace and any trailing slash, matching
+/// [`crate::price::providers::yadio::YadioProvider::new`]. A URL that is only
+/// slashes/whitespace normalizes to empty and is treated as "not configured".
+fn normalize_base_url(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// Pure selection logic behind [`yadio_base_url`], split out so it is unit
+/// testable without the write-once global `Settings`. `provider` is
+/// `(url, enabled)` for the `[price.providers.yadio]` entry when present.
+/// Prefer that URL only when it is *usable* — the provider is enabled and the
+/// URL is non-empty after normalization — otherwise fall back to the
+/// (normalized) legacy `bitcoin_price_api_url`.
+fn select_yadio_base_url(provider: Option<(&str, bool)>, legacy: &str) -> String {
+    if let Some((url, enabled)) = provider {
+        if enabled {
+            let url = normalize_base_url(url);
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+    normalize_base_url(legacy)
+}
+
 pub async fn retries_yadio_request(
     req_string: &str,
     fiat_code: &str,
 ) -> Result<(Option<reqwest::Response>, bool), MostroError> {
     // Get Fiat list and check if currency exchange is available
-    let mostro_settings = Settings::get_mostro();
-    let api_req_string = format!("{}/currencies", mostro_settings.bitcoin_price_api_url);
+    let api_req_string = format!("{}/currencies", yadio_base_url());
     let fiat_list_check = HTTP_CLIENT
         .get(api_req_string)
         .send()
@@ -69,7 +118,7 @@ pub async fn retries_yadio_request(
 }
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
-    BitcoinPriceManager::get_price(fiat_code)
+    crate::price::get_bitcoin_price(fiat_code)
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price
@@ -79,10 +128,11 @@ pub async fn get_market_quote(
     premium: i64,
 ) -> Result<i64, MostroError> {
     // Add here check for market price
-    let mostro_settings = Settings::get_mostro();
     let req_string = format!(
         "{}/convert/{}/{}/BTC",
-        mostro_settings.bitcoin_price_api_url, fiat_amount, fiat_code
+        yadio_base_url(),
+        fiat_amount,
+        fiat_code
     );
     info!("Requesting API price: {}", req_string);
 
@@ -1549,6 +1599,56 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    #[test]
+    fn select_yadio_base_url_prefers_enabled_provider() {
+        // Enabled provider with a usable URL wins over the legacy key.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://provider.example", true)),
+                "https://legacy.example"
+            ),
+            "https://provider.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_strips_trailing_slash_like_provider_new() {
+        // A configured trailing slash must not survive — otherwise appending
+        // `/convert` yields `//convert`. Matches `YadioProvider::new`.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://api.yadio.io/", true)),
+                "https://legacy.example"
+            ),
+            "https://api.yadio.io"
+        );
+        // Whitespace + multiple trailing slashes both normalized away.
+        assert_eq!(
+            select_yadio_base_url(Some(("  https://api.yadio.io//  ", true)), "ignored"),
+            "https://api.yadio.io"
+        );
+        // The legacy fallback is normalized the same way.
+        assert_eq!(
+            select_yadio_base_url(None, "https://legacy.example/"),
+            "https://legacy.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_falls_back_when_provider_unusable() {
+        let legacy = "https://legacy.example";
+        // Disabled provider → fall back to legacy even with a URL set.
+        assert_eq!(
+            select_yadio_base_url(Some(("https://provider.example", false)), legacy),
+            legacy
+        );
+        // Enabled but blank / slash-only URL → fall back to legacy.
+        assert_eq!(select_yadio_base_url(Some(("   ", true)), legacy), legacy);
+        assert_eq!(select_yadio_base_url(Some(("/", true)), legacy), legacy);
+        // No provider entry at all → legacy.
+        assert_eq!(select_yadio_base_url(None, legacy), legacy);
     }
 
     async fn setup_orders_pool() -> SqlitePool {

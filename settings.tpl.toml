@@ -54,7 +54,17 @@ publish_relays_interval = 60
 pow = 0
 # Publish mostro info interval
 publish_mostro_info_interval = 300
-# Bitcoin price API base URL
+# Bitcoin price API base URL.
+# DEPRECATED: prefer `[price.providers.yadio].url` in the new multi-source
+# `[price]` block below (see docs/PRICE_PROVIDERS.md §10.1). Lifecycle:
+#  (a) Now OPTIONAL — once you configure a `[price]` block you may delete this
+#      key. When it is absent AND `[price]` is also absent, the default
+#      "https://api.yadio.io" is used for the legacy single-source synthesis.
+#  (b) Still read by the live market-quote path (/convert) until Phase 4. To
+#      avoid the live and cached paths hitting different Yadio URLs, the live
+#      path prefers `[price.providers.yadio].url` when a `[price]` block is
+#      present and only falls back to this key otherwise.
+#  (c) Fully removed in Phase 5.
 bitcoin_price_api_url = "https://api.yadio.io"
 # Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
@@ -87,6 +97,34 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+
+# Multi-source price providers (see docs/PRICE_PROVIDERS.md).
+# Absent section ≡ legacy single-source behaviour synthesised from
+# `[mostro].bitcoin_price_api_url` + `exchange_rates_update_interval_seconds`
+# + `publish_exchange_rates_to_nostr`. Uncomment the block to take control.
+#
+# [price]
+# # Poll cadence and freshness budget.
+# update_interval_seconds = 300
+# max_price_staleness_seconds = 1800
+# # Discard a source whose value deviates more than this % from the median
+# # (only applies with >= 3 sources for a currency).
+# outlier_threshold_pct = 5.0
+# # Per-provider request timeout and circuit-breaker (cooldown caps at 30 min).
+# provider_timeout_seconds = 10
+# provider_failure_threshold = 3
+# provider_failure_cooldown_seconds = 120
+# # Publish the aggregated rates to Nostr (kind 30078). Replaces the legacy
+# # `publish_exchange_rates_to_nostr`.
+# publish_to_nostr = true
+#
+# [price.providers.yadio]
+# enabled = true
+# url = "https://api.yadio.io"
+#
+# # The keyless backups, El Toque, etc. are wired in Phases 2 and 3 — see
+# # docs/PRICE_PROVIDERS.md §7 for the full provider list and §6.6 for the
+# # `only` / `except` per-provider currency scoping rules.
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

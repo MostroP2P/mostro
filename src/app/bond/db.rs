@@ -4,7 +4,7 @@
 //! this module hits LND or the Nostr client — it's purely storage.
 
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
-use mostro_core::order::Order;
+use mostro_core::order::{Order, Status};
 use sqlx::{Pool, Sqlite};
 use sqlx_crud::Crud;
 use uuid::Uuid;
@@ -232,6 +232,80 @@ pub async fn find_child_slashes_for_parent(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Order statuses from which a range slice can never re-activate. Once
+/// every order in a range tree has reached one of these, the maker bond is
+/// safe to close — no descendant can still draw against it. Kept as the
+/// complement of the in-flight states (`Pending`, `Active`, the `Waiting*`
+/// states, `FiatSent`, `SettledHoldInvoice`, `Dispute`, `InProgress`) so a
+/// new in-flight status defaults to "not terminal" (conservative: the sweep
+/// won't prematurely close a bond it doesn't understand).
+const TERMINAL_ORDER_STATUSES: [Status; 7] = [
+    Status::Success,
+    Status::Canceled,
+    Status::CanceledByAdmin,
+    Status::SettledByAdmin,
+    Status::CompletedByAdmin,
+    Status::CooperativelyCanceled,
+    Status::Expired,
+];
+
+/// Every `Locked` **parent** maker bond (`role = 'maker'`,
+/// `parent_bond_id IS NULL`). The reconciliation sweep
+/// (`reconcile_stranded_range_maker_bonds`) starts from this set and then
+/// filters to the ones whose whole range tree has terminated. Child slash
+/// rows and refund rows (both `parent_bond_id IS NOT NULL`) are excluded.
+pub async fn find_locked_maker_parent_bonds(pool: &Pool<Sqlite>) -> Result<Vec<Bond>, MostroError> {
+    let locked = BondState::Locked.to_string();
+    let maker = BondRole::Maker.to_string();
+    sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds \
+         WHERE state = ? AND role = ? AND parent_bond_id IS NULL \
+         ORDER BY created_at ASC",
+    )
+    .bind(locked)
+    .bind(maker)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Is the whole range tree rooted at `root_id` fully terminal — i.e. does no
+/// order reachable from the root via `range_parent_id` sit in a non-terminal
+/// status?
+///
+/// Walks the `range_parent_id` linked list **downwards** with a recursive
+/// CTE (the inverse of [`find_range_root_order`], which walks up). Returns
+/// `true` only when every order in the tree — the root included — is in a
+/// [`TERMINAL_ORDER_STATUSES`] state, so the maker bond can be safely closed.
+/// A non-range or already-root order tree is just the single root row.
+pub async fn range_tree_fully_terminal(
+    pool: &Pool<Sqlite>,
+    root_id: Uuid,
+) -> Result<bool, MostroError> {
+    let placeholders = TERMINAL_ORDER_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE tree(id, status) AS ( \
+             SELECT id, status FROM orders WHERE id = ? \
+             UNION ALL \
+             SELECT o.id, o.status FROM orders o JOIN tree t ON o.range_parent_id = t.id \
+         ) \
+         SELECT COUNT(*) FROM tree WHERE status NOT IN ({placeholders})"
+    );
+    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(root_id);
+    for status in TERMINAL_ORDER_STATUSES {
+        query = query.bind(status.to_string());
+    }
+    let non_terminal = query
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(non_terminal == 0)
+}
+
 /// Update a bond row by primary key. Returns the persisted `Bond`.
 pub async fn update_bond(
     pool: &Pool<Sqlite>,
@@ -274,6 +348,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260611120000_bond_slice_slash_unique.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_slice_slash_unique migration");
         // SQLite doesn't enforce FKs unless asked. Turn them on so the FK to
         // `orders` is a real constraint in tests (mirrors production).
         sqlx::query("PRAGMA foreign_keys = ON")
@@ -297,8 +377,95 @@ mod tests {
         .expect("insert parent order");
     }
 
+    /// Insert an order with an explicit status and optional `range_parent_id`,
+    /// so the range-tree-terminal walk can be exercised over a real chain.
+    async fn insert_order_with(
+        pool: &Pool<Sqlite>,
+        id: Uuid,
+        status: Status,
+        range_parent_id: Option<Uuid>,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO orders (
+                id, kind, event_id, status, premium, payment_method,
+                amount, fiat_code, fiat_amount, range_parent_id, created_at, expires_at
+            ) VALUES (?, 'sell', ?, ?, 0, 'ln', 1000, 'USD', 10, ?, 0, 0)"#,
+        )
+        .bind(id)
+        .bind(id.simple().to_string())
+        .bind(status.to_string())
+        .bind(range_parent_id)
+        .execute(pool)
+        .await
+        .expect("insert order with status");
+    }
+
     fn dummy_bond(order_id: Uuid, role: BondRole) -> Bond {
         Bond::new_requested(order_id, "a".repeat(64), role, 1_500)
+    }
+
+    #[tokio::test]
+    async fn range_tree_terminal_walks_descendants() {
+        // root <- child (range_parent_id chain). The tree is "fully terminal"
+        // only when BOTH the root and every descendant are terminal.
+        let pool = setup_pool().await;
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_order_with(&pool, root, Status::CooperativelyCanceled, None).await;
+        insert_order_with(&pool, child, Status::Active, Some(root)).await;
+
+        // A still-Active descendant keeps the tree non-terminal.
+        assert!(
+            !range_tree_fully_terminal(&pool, root).await.unwrap(),
+            "an Active descendant must make the tree non-terminal"
+        );
+
+        // Terminate the descendant → the whole tree is terminal.
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::Expired.to_string())
+            .bind(child)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            range_tree_fully_terminal(&pool, root).await.unwrap(),
+            "root + descendant both terminal → tree terminal"
+        );
+
+        // A non-terminal root alone also blocks (single-row tree).
+        let lone = Uuid::new_v4();
+        insert_order_with(&pool, lone, Status::Pending, None).await;
+        assert!(!range_tree_fully_terminal(&pool, lone).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn locked_maker_parent_bonds_excludes_children() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        let child_order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+        insert_parent_order(&pool, child_order_id).await;
+
+        // A Locked maker parent.
+        let mut parent = dummy_bond(order_id, BondRole::Maker);
+        parent.state = BondState::Locked.to_string();
+        let parent = create_bond(&pool, parent).await.unwrap();
+
+        // A child slash row (PendingPayout) — must be excluded.
+        let mut child = dummy_bond(order_id, BondRole::Maker);
+        child.parent_bond_id = Some(parent.id);
+        child.child_order_id = Some(child_order_id);
+        child.state = BondState::PendingPayout.to_string();
+        create_bond(&pool, child).await.unwrap();
+
+        // A Locked taker bond — wrong role, excluded.
+        let mut taker = dummy_bond(child_order_id, BondRole::Taker);
+        taker.state = BondState::Locked.to_string();
+        create_bond(&pool, taker).await.unwrap();
+
+        let locked = find_locked_maker_parent_bonds(&pool).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        assert_eq!(locked[0].id, parent.id);
     }
 
     #[tokio::test]

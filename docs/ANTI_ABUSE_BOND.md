@@ -1911,6 +1911,28 @@ carries `parent_bond_id` / `child_order_id` / `slashed_share_sats`).
   (a CAS `Locked → Slashed`) and a no-op for non-range / already-resolved
   bonds. Maker-responsible **timeout** slashes for range bonds land in
   Phase 7; until then a maker-timeout cancel releases (no slash).
+- **"One slash row per slice" is enforced at the schema level.** Besides the
+  atomic `INSERT ... WHERE NOT EXISTS` in `record_maker_slice_slash` (which
+  already wins/loses the TOCTOU race correctly), a partial UNIQUE index on
+  `bonds(parent_bond_id, child_order_id) WHERE parent_bond_id IS NOT NULL AND
+  child_order_id IS NOT NULL` (migration `20260611120000`) makes the invariant
+  hold for any future caller (e.g. the Phase 7 maker-timeout slash) and
+  survive a code regression that drops the guard. SQLite treats NULLs as
+  distinct, so parent rows, taker bonds, and the maker-refund row
+  (`child_order_id NULL`) are unconstrained. The insert path treats a
+  constraint violation as the same idempotent no-op as `rows_affected = 0`.
+- **A reconciliation sweep retries a stranded close.** Because the order's
+  terminal-state commit is never gated on close success (best-effort, §8.2),
+  a transient LND/DB failure in `resolve_range_maker_bond_at_close` leaves the
+  parent `Locked` with no further retry from the terminal hooks — blocking
+  every slashed slice's payout until the CLTV safety net. The scheduler job
+  `job_reconcile_stranded_maker_bonds` (every 5 min) scans for `Locked` maker
+  parent bonds whose entire range tree (root + every `range_parent_id`
+  descendant) is in a terminal status and re-invokes the (idempotent) close
+  for each. A legitimately-open range — whose maker bond is `Locked` by
+  design — is never touched, since at least one descendant is non-terminal.
+  So a close failure **no longer relies solely on the CLTV safety net**; the
+  sweep is the primary recovery and CLTV is the last-resort backstop.
 
 ### 11.1 Data model
 

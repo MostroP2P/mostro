@@ -51,6 +51,7 @@ use mostro_core::message::{Action, BondResolution, Message, Payload};
 use mostro_core::order::{Kind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::PublicKey;
 use sqlx::{Pool, Sqlite};
+use sqlx_crud::Crud;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -101,6 +102,21 @@ pub(super) fn is_already_settled_error(err: &MostroError) -> bool {
     s.contains("already settled")
         || s.contains("invoice already settled")
         || s.contains("code=alreadyexists")
+}
+
+/// Classify a SQLite error as a UNIQUE-constraint violation. sqlx 0.6's
+/// `DatabaseError` exposes the extended result code (2067 =
+/// `SQLITE_CONSTRAINT_UNIQUE`) and the driver message; either is sufficient.
+/// Used so the partial UNIQUE index on `(parent_bond_id, child_order_id)`
+/// (migration `20260611120000`) collapses a forced duplicate slice slash into
+/// the same idempotent no-op as the `INSERT ... WHERE NOT EXISTS` guard.
+pub(super) fn is_unique_violation(err: &sqlx::Error) -> bool {
+    err.as_database_error().is_some_and(|d| {
+        d.code().as_deref() == Some("2067")
+            || d.message()
+                .to_lowercase()
+                .contains("unique constraint failed")
+    })
 }
 
 /// Which trade-flow side a slash flag is targeting. Internal helper —
@@ -801,7 +817,7 @@ async fn record_maker_slice_slash(
     // shares the parent HTLC. Unset columns take their schema defaults
     // (`slashed_share_sats`/`payout_attempts`/`invoice_request_attempts` = 0,
     // the rest NULL), matching `Bond::new_requested`.
-    let inserted = sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO bonds \
             (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
              amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
@@ -824,8 +840,28 @@ async fn record_maker_slice_slash(
     .bind(parent_bond.id)
     .bind(slice.id)
     .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    .await;
+    // The `WHERE NOT EXISTS` guard makes the loser of a race insert 0 rows.
+    // The partial UNIQUE index on `(parent_bond_id, child_order_id)`
+    // (migration `20260611120000`) is defence-in-depth for any future caller
+    // that forgets the guard: treat a constraint violation as the same
+    // idempotent no-op, never an error.
+    let inserted = match insert {
+        Ok(r) => r,
+        Err(e) if is_unique_violation(&e) => {
+            info!(
+                bond_id = %parent_bond.id,
+                slice_order_id = %slice.id,
+                "record_maker_slice_slash: slice already slashed (unique index); skipping duplicate"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )))
+        }
+    };
     if inserted.rows_affected() == 0 {
         info!(
             bond_id = %parent_bond.id,
@@ -1053,6 +1089,102 @@ pub async fn resolve_range_maker_bond_at_close_or_warn(
     }
 }
 
+/// Collect the range-root orders whose maker bond is still `Locked` even
+/// though the whole range tree has terminated — the stranded set the
+/// reconciliation sweep retries.
+///
+/// `resolve_range_maker_bond_at_close[_or_warn]` is best-effort (§8.2): on a
+/// transient LND/DB failure it logs and leaves the parent `Locked`, and once
+/// the order is terminal nothing re-invokes it, so the HTLC would sit
+/// `Locked` until the LND CLTV safety net (and any slashed slice's payout
+/// stays blocked the whole time). This is the scan side of the periodic
+/// retry: a parent maker bond is "stranded" when it is still `Locked` and
+/// every order in its range tree (root + every `range_parent_id` descendant)
+/// is in a terminal status, so a legitimately-open range — whose maker bond
+/// is `Locked` by design — is never touched.
+async fn collect_stranded_range_maker_roots(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<Order>, MostroError> {
+    let mut stranded = Vec::new();
+    for bond in super::db::find_locked_maker_parent_bonds(pool).await? {
+        // The parent maker bond lives on the range root, so `bond.order_id`
+        // is the root id. A missing order row (should never happen) is
+        // skipped rather than fabricating a close.
+        let Some(root) = Order::by_id(pool, bond.order_id)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        else {
+            continue;
+        };
+        if super::db::range_tree_fully_terminal(pool, bond.order_id).await? {
+            stranded.push(root);
+        }
+    }
+    Ok(stranded)
+}
+
+/// Reconciliation sweep (testable core): retry the settle-at-close for every
+/// stranded range maker bond, returning how many resolved without error.
+///
+/// `resolve_range_maker_bond_at_close` is idempotent (a CAS `Locked →
+/// Slashed`), so re-invoking it is safe whether the prior close half-finished
+/// or never ran. A per-bond failure is logged and the sweep moves on — the
+/// next tick (and ultimately the CLTV safety net) retries.
+pub(crate) async fn reconcile_stranded_range_maker_bonds_with<L: SettleLightning + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+) -> usize {
+    let roots = match collect_stranded_range_maker_roots(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("reconcile_sweep: scan for stranded maker bonds failed: {e}");
+            return 0;
+        }
+    };
+    let mut resolved = 0;
+    for order in &roots {
+        match resolve_range_maker_bond_at_close(pool, ln_client, order).await {
+            Ok(()) => resolved += 1,
+            Err(e) => warn!(
+                order_id = %order.id,
+                "reconcile_sweep: resolve_range_maker_bond_at_close failed: {e}"
+            ),
+        }
+    }
+    resolved
+}
+
+/// Reconciliation sweep (scheduler entry point): scan for range maker bonds
+/// stranded `Locked` after a failed close and retry each one. Opens a single
+/// `LndConnector` for the batch, and only when there is at least one stranded
+/// bond — the common case (no stranded bond) costs one indexed query and
+/// never touches LND.
+pub async fn reconcile_stranded_range_maker_bonds(pool: &Pool<Sqlite>) {
+    // Cheap pre-check so an idle node never opens LND just to find nothing.
+    match collect_stranded_range_maker_roots(pool).await {
+        Ok(roots) if roots.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("reconcile_sweep: scan for stranded maker bonds failed: {e}");
+            return;
+        }
+    }
+    let mut ln = match LndConnector::new().await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("reconcile_sweep: cannot connect to LND to retry stranded maker bonds: {e}");
+            return;
+        }
+    };
+    let resolved = reconcile_stranded_range_maker_bonds_with(pool, &mut ln).await;
+    if resolved > 0 {
+        info!(
+            resolved,
+            "reconcile_sweep: retried stranded range maker bond(s) at close"
+        );
+    }
+}
+
 /// Resolve a buyer/seller slash flag to the matching `Locked` bond row,
 /// if any. The mapping uses the §3.1 buyer-side → trade-pubkey lookup
 /// on the order, then filters bonds by `pubkey` and `state = Locked`.
@@ -1176,6 +1308,12 @@ mod tests {
                 .await
                 .expect("cashu_escrow_fields migration");
         }
+        sqlx::query(include_str!(
+            "../../../migrations/20260611120000_bond_slice_slash_unique.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_slice_slash_unique migration");
         pool
     }
 
@@ -2752,5 +2890,250 @@ mod tests {
         assert_eq!(children[0].amount_sats, 400);
         let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
         assert_eq!(p.slashed_share_sats, 400, "share must not double on replay");
+    }
+
+    #[tokio::test]
+    async fn slice_slash_unique_index_rejects_forced_duplicate() {
+        // Item 1: the partial UNIQUE index on (parent_bond_id, child_order_id)
+        // enforces "one slash row per slice" at the schema level, even for a
+        // caller that bypasses the `INSERT ... WHERE NOT EXISTS` guard. A
+        // forced raw duplicate insert must fail with a unique violation.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        // First child row via the normal path.
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        // A raw insert of a second child row for the same (parent, child) —
+        // no `WHERE NOT EXISTS` guard — must be rejected by the index.
+        let now = Utc::now().timestamp();
+        let forced = sqlx::query(
+            "INSERT INTO bonds \
+                (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
+                 amount_sats, state, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(root.id)
+        .bind(parent.id)
+        .bind(root.id)
+        .bind(maker_pk())
+        .bind(BondRole::Maker.to_string())
+        .bind(123)
+        .bind(BondState::PendingPayout.to_string())
+        .bind(now)
+        .execute(&pool)
+        .await;
+        let err = forced.expect_err("duplicate child slash must violate the unique index");
+        assert!(
+            is_unique_violation(&err),
+            "expected a unique-constraint violation, got {err:?}"
+        );
+
+        // The maker-refund shape (child_order_id NULL) and parent rows are
+        // unconstrained: SQLite treats NULLs as distinct, so this succeeds.
+        let refund = sqlx::query(
+            "INSERT INTO bonds \
+                (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
+                 amount_sats, state, created_at) \
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(root.id)
+        .bind(parent.id)
+        .bind(maker_pk())
+        .bind(BondRole::Maker.to_string())
+        .bind(456)
+        .bind(BondState::PendingPayout.to_string())
+        .bind(now)
+        .execute(&pool)
+        .await;
+        assert!(
+            refund.is_ok(),
+            "a maker-refund row (child_order_id NULL) must be unconstrained: {refund:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_sweep_retries_stranded_locked_parent_after_failed_close() {
+        // Item 2: a transient settle failure on the first close leaves the
+        // parent `Locked` even though the range is terminal. The
+        // reconciliation sweep must retry and drive it to `Slashed`, unblocking
+        // the slice child rows.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        // Whole range terminated (cooperatively canceled).
+        root.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        // First close: settle fails transiently → parent stays Locked.
+        let failing = StubSettle::new();
+        failing.fail_next_with("transient lnd transport error");
+        resolve_range_maker_bond_at_close(&pool, &mut failing.clone(), &root)
+            .await
+            .unwrap();
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.state,
+            BondState::Locked.to_string(),
+            "a failed settle must leave the parent retryably Locked"
+        );
+
+        // The sweep finds the stranded parent (range tree fully terminal) and
+        // retries the close with a healthy LND stub.
+        let healthy = StubSettle::new();
+        let resolved = reconcile_stranded_range_maker_bonds_with(&pool, &mut healthy.clone()).await;
+        assert_eq!(resolved, 1, "exactly one stranded parent resolved");
+        assert_eq!(healthy.calls(), vec![stub_preimage()], "HTLC settled once");
+
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.state,
+            BondState::Slashed.to_string(),
+            "the sweep drives the parent to Slashed"
+        );
+        // The slice child is now unblocked (parent no longer Locked) and a
+        // maker-refund row exists.
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 2, "slice slash + maker refund row");
+        assert!(children
+            .iter()
+            .all(|c| c.state == BondState::PendingPayout.to_string()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_sweep_skips_open_range() {
+        // The sweep must never disturb a legitimately-open range whose maker
+        // bond is `Locked` by design (a slice can still be taken).
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::Active.to_string(); // still on the book
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let stub = StubSettle::new();
+        let resolved = reconcile_stranded_range_maker_bonds_with(&pool, &mut stub.clone()).await;
+        assert_eq!(resolved, 0, "an open range must not be swept");
+        assert!(stub.calls().is_empty(), "no HTLC touched");
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn range_close_conserves_sats_across_two_slices() {
+        // Item 3: wallet-accounting invariant. With 2 distinct slices slashed
+        // (exercising accumulation + rounding), the sum of every child row's
+        // amount_sats (slice slashes + maker refund) equals the parent bond
+        // exactly, and node retention (Σ node_share_sats) + counterparty
+        // payouts (Σ amount - node_share) == the parent bond. The maker refund
+        // absorbs any rounding remainder by construction (refund = bond -
+        // Σ slice_slashes), so no sat is created or lost.
+        let pool = setup_pool().await;
+        // max fiat 7, bond 1000: slice fiat 2 → round(1000*2/7)=286,
+        // slice fiat 3 → round(1000*3/7)=429. Both round (285.71 / 428.57),
+        // so the refund (1000-715=285) must absorb the remainder.
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 2, 1, 7);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let node_pct = 0.3;
+
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            node_pct,
+        )
+        .await
+        .unwrap();
+        // Second, distinct slice (own order row); reload parent for the
+        // updated running total.
+        let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        let slice2 = range_slice(Kind::Sell, maker_pk(), taker_pk(), 3, 1, 7);
+        insert_range_order_row(&pool, &slice2).await;
+        record_maker_slice_slash(
+            &pool,
+            &slice2,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            node_pct,
+        )
+        .await
+        .unwrap();
+
+        resolve_range_maker_bond_at_close(&pool, &mut StubSettle::new(), &root)
+            .await
+            .unwrap();
+
+        let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        // 2 slice slashes + 1 maker refund.
+        assert_eq!(children.len(), 3, "two slices + maker refund");
+
+        let total_child_sats: i64 = children.iter().map(|c| c.amount_sats).sum();
+        assert_eq!(
+            total_child_sats, parent.amount_sats,
+            "Σ child amount_sats (slices + refund) must equal the parent bond exactly"
+        );
+
+        let node_retention: i64 = children
+            .iter()
+            .map(|c| c.node_share_sats.unwrap_or(0))
+            .sum();
+        let counterparty_total: i64 = children
+            .iter()
+            .map(|c| c.amount_sats - c.node_share_sats.unwrap_or(0))
+            .sum();
+        assert_eq!(
+            node_retention + counterparty_total,
+            parent.amount_sats,
+            "no sat created or lost: node retention + counterparty payouts == bond"
+        );
+        // The refund row carries the unslashed remainder (bond minus the two
+        // slice slashes), full value to the maker — this is where the rounding
+        // remainder lands.
+        let refund = children
+            .iter()
+            .find(|c| c.child_order_id.is_none())
+            .expect("maker refund row");
+        assert_eq!(refund.node_share_sats, Some(0));
+        let slice_slash_total: i64 = children
+            .iter()
+            .filter(|c| c.child_order_id.is_some())
+            .map(|c| c.amount_sats)
+            .sum();
+        assert_eq!(
+            refund.amount_sats,
+            parent.amount_sats - slice_slash_total,
+            "refund = bond - Σ slice slashes (absorbs the rounding remainder)"
+        );
     }
 }

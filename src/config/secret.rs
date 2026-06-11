@@ -8,6 +8,7 @@ use mostro_core::error::ServiceError;
 use nostr_sdk::Keys;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serializer;
+use zeroize::Zeroize;
 
 /// Serialize a [`SecretString`] for config files (wizard / TOML export only).
 pub fn serialize_nsec<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
@@ -20,12 +21,15 @@ where
 /// Read `MOSTRO_NSEC_PRIVKEY` from the process environment, trim whitespace,
 /// and wrap in a [`SecretString`]. Returns `None` when unset or blank.
 pub fn read_nsec_env_var() -> Option<SecretString> {
-    let nsec_from_env = std::env::var(NSEC_ENV_VAR).ok()?;
+    let mut nsec_from_env = std::env::var(NSEC_ENV_VAR).ok()?;
     let trimmed = nsec_from_env.trim();
     if trimmed.is_empty() {
+        nsec_from_env.zeroize();
         return None;
     }
-    Some(SecretString::from(trimmed.to_owned()))
+    let secret = SecretString::from(trimmed.to_owned());
+    nsec_from_env.zeroize();
+    Some(secret)
 }
 
 /// Parse a bech32 nsec into [`Keys`], exposing the secret only in this scope.

@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
@@ -157,10 +157,10 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
 
     let nsec = if has_nsec {
         let input = Zeroizing::new(
-            Input::new()
+            Password::new()
                 .with_prompt("Enter your nsec private key")
                 .validate_with(|input: &String| validate_nsec(input))
-                .interact_text()
+                .interact()
                 .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?,
         );
         SecretString::from(input.to_string())
@@ -176,8 +176,8 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
         println!("\nGenerated new Nostr keypair:");
-        println!("  nsec: {}", nsec);
-        println!("  npub: {}", npub);
+        println!("  npub: {npub}");
+        println!("  You will be prompted to store the private key securely next.");
 
         SecretString::from(nsec)
     };

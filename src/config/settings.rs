@@ -5,6 +5,8 @@ use crate::config::types::{
     LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use mostro_core::transport::Transport;
 use nostr_sdk::Keys;
 use serde::{Deserialize, Serialize};
@@ -41,14 +43,19 @@ pub struct Settings {
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
-pub fn init_mostro_settings(mut s: Settings) {
-    let keys = take_nsec_for_init(&mut s.nostr).expect("Failed to parse nostr private key");
-    NOSTR_KEYS
-        .set(keys)
-        .expect("Failed to set Mostro nostr keys");
-    MOSTRO_CONFIG
-        .set(s)
-        .expect("Failed to set Mostro global settings");
+pub fn init_mostro_settings(mut s: Settings) -> Result<(), MostroError> {
+    let keys = take_nsec_for_init(&mut s.nostr)?;
+    NOSTR_KEYS.set(keys).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(
+            "Mostro nostr keys already initialized".to_string(),
+        ))
+    })?;
+    MOSTRO_CONFIG.set(s).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(
+            "Mostro settings already initialized".to_string(),
+        ))
+    })?;
+    Ok(())
 }
 
 /// Parsed Mostro Nostr signing keys, initialized once at startup.

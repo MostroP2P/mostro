@@ -174,7 +174,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
         apply_nsec_env_override(&mut settings);
         validate_mostro_settings(&settings)?;
-        init_mostro_settings(settings);
+        init_mostro_settings(settings)?;
         tracing::info!("Settings correctly loaded!");
         return Ok(());
     }
@@ -201,7 +201,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());
 
     // Initialize the global settings variable
-    init_mostro_settings(settings);
+    init_mostro_settings(settings)?;
 
     tracing::info!("Settings correctly loaded!");
 

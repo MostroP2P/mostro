@@ -1932,7 +1932,11 @@ carries `parent_bond_id` / `child_order_id` / `slashed_share_sats`).
   for each. A legitimately-open range — whose maker bond is `Locked` by
   design — is never touched, since at least one descendant is non-terminal.
   So a close failure **no longer relies solely on the CLTV safety net**; the
-  sweep is the primary recovery and CLTV is the last-resort backstop.
+  sweep is the primary recovery and CLTV is the last-resort backstop. The
+  range-tree terminality check walks `range_parent_id` downward with a
+  recursive CTE that uses `UNION` (dedup) so a corrupt cycle can't hang the
+  tick, and the scan isolates per-root failures (log + `continue`) so one
+  bad chain never blocks reconciliation of the other stranded bonds.
 
 ### 11.1 Data model
 

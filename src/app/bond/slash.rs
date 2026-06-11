@@ -1107,17 +1107,37 @@ async fn collect_stranded_range_maker_roots(
 ) -> Result<Vec<Order>, MostroError> {
     let mut stranded = Vec::new();
     for bond in super::db::find_locked_maker_parent_bonds(pool).await? {
+        // Best-effort, per-root isolation (§8.2): a transient failure on one
+        // root (DB busy, a missing/corrupt order row) must only skip that
+        // root, never abort the whole tick and starve retries for every other
+        // stranded bond. So per-root errors log and `continue` rather than
+        // propagate via `?`.
+        //
         // The parent maker bond lives on the range root, so `bond.order_id`
-        // is the root id. A missing order row (should never happen) is
-        // skipped rather than fabricating a close.
-        let Some(root) = Order::by_id(pool, bond.order_id)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        else {
-            continue;
+        // is the root id.
+        let root = match Order::by_id(pool, bond.order_id).await {
+            Ok(Some(root)) => root,
+            Ok(None) => continue, // missing order row (should never happen)
+            Err(e) => {
+                warn!(
+                    order_id = %bond.order_id,
+                    error = %e,
+                    "reconcile_sweep: range-root order lookup failed; skipping this root"
+                );
+                continue;
+            }
         };
-        if super::db::range_tree_fully_terminal(pool, bond.order_id).await? {
-            stranded.push(root);
+        match super::db::range_tree_fully_terminal(pool, bond.order_id).await {
+            Ok(true) => stranded.push(root),
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    order_id = %bond.order_id,
+                    error = %e,
+                    "reconcile_sweep: range-tree terminal check failed; skipping this root"
+                );
+                continue;
+            }
         }
     }
     Ok(stranded)
@@ -3041,6 +3061,61 @@ mod tests {
         assert!(stub.calls().is_empty(), "no HTLC touched");
         let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
         assert_eq!(p.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn reconcile_sweep_isolates_a_bad_root_and_processes_the_rest() {
+        // Per-root isolation (§8.2): a `Locked` maker parent whose range-root
+        // order can't be resolved (here: a missing order row → `Order::by_id`
+        // returns None) must only skip that root, never abort the tick and
+        // starve every other stranded bond. The tree-check error path shares
+        // the same `continue`.
+        let pool = setup_pool().await;
+
+        // Bad root: a Locked maker parent bond whose order_id has no order row
+        // (a corrupt/partially-deleted state). FK enforcement is on by
+        // default, so drop it just for this orphan insert to simulate that.
+        let orphan_order_id = Uuid::new_v4();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bad = insert_parent_maker_bond(&pool, orphan_order_id, maker_pk(), 1000).await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Good root: a fully-terminal range with one slashed slice — stranded
+        // and genuinely resolvable.
+        let mut good = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        good.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &good).await;
+        let good_parent = insert_parent_maker_bond(&pool, good.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &good,
+            &good,
+            &good_parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let stub = StubSettle::new();
+        let resolved = reconcile_stranded_range_maker_bonds_with(&pool, &mut stub.clone()).await;
+
+        // The good root was still processed despite the bad root.
+        assert_eq!(resolved, 1, "the valid stranded root must still resolve");
+        let gp = find_bond_by_id(&pool, good_parent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gp.state, BondState::Slashed.to_string());
+        // The bad root's bond is untouched (still Locked, never settled).
+        let bp = find_bond_by_id(&pool, bad.id).await.unwrap().unwrap();
+        assert_eq!(bp.state, BondState::Locked.to_string());
     }
 
     #[tokio::test]

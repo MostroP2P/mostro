@@ -287,10 +287,16 @@ pub async fn range_tree_fully_terminal(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
+    // `UNION` (not `UNION ALL`) is deliberate: it deduplicates, so a corrupt
+    // `range_parent_id` cycle (e.g. A↔B) terminates the recursion instead of
+    // looping unbounded and hanging the scheduler tick. This mirrors the
+    // `MAX_RANGE_CHAIN_DEPTH` guard on the upward walk in
+    // `find_range_root_order`. Dedup is safe here because the result is only
+    // reduced to `COUNT(*) … == 0` below — the exact count is never used.
     let sql = format!(
         "WITH RECURSIVE tree(id, status) AS ( \
              SELECT id, status FROM orders WHERE id = ? \
-             UNION ALL \
+             UNION \
              SELECT o.id, o.status FROM orders o JOIN tree t ON o.range_parent_id = t.id \
          ) \
          SELECT COUNT(*) FROM tree WHERE status NOT IN ({placeholders})"
@@ -436,6 +442,42 @@ mod tests {
         let lone = Uuid::new_v4();
         insert_order_with(&pool, lone, Status::Pending, None).await;
         assert!(!range_tree_fully_terminal(&pool, lone).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn range_tree_terminal_is_cycle_safe() {
+        // A corrupt `range_parent_id` cycle (A↔B) must NOT hang the query:
+        // the CTE uses `UNION` (dedup), so the walk terminates. This test
+        // completing at all proves there is no unbounded loop.
+        let pool = setup_pool().await;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Insert both first (no parent), then point them at each other.
+        insert_order_with(&pool, a, Status::Active, None).await;
+        insert_order_with(&pool, b, Status::Active, None).await;
+        sqlx::query("UPDATE orders SET range_parent_id = ? WHERE id = ?")
+            .bind(b)
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET range_parent_id = ? WHERE id = ?")
+            .bind(a)
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Returns promptly without error; both nodes Active → non-terminal.
+        assert!(!range_tree_fully_terminal(&pool, a).await.unwrap());
+
+        // Terminate both → the cyclic tree reads as terminal (still no hang).
+        sqlx::query("UPDATE orders SET status = ?")
+            .bind(Status::Expired.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(range_tree_fully_terminal(&pool, a).await.unwrap());
     }
 
     #[tokio::test]

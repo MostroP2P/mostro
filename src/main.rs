@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
     }
 
     if has_metadata {
-        if let Ok(metadata_ev) = EventBuilder::metadata(&metadata).sign_with_keys(&mostro_keys) {
+        if let Ok(metadata_ev) = EventBuilder::metadata(&metadata).sign_with_keys(mostro_keys) {
             let _ = client.send_event(&metadata_ev).await;
             tracing::info!("Published NIP-01 kind 0 metadata event");
         }

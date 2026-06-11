@@ -5,7 +5,6 @@ use nostr_sdk::prelude::*;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
-use std::fs::{set_permissions, Permissions};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -388,6 +387,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         // Restrict file permissions — only owner can read and write
         #[cfg(unix)]
         {
+            use std::fs::{set_permissions, Permissions};
             set_permissions(db_path, Permissions::from_mode(0o600))
                 .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         }

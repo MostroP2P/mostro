@@ -2,9 +2,8 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use crate::config::constants::{
-    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, NSEC_ENV_VAR,
-};
+use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
@@ -12,6 +11,7 @@ use mostro_core::error::ServiceError;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 const DB_FILENAME: &str = "mostro.db";
 
@@ -41,11 +41,8 @@ fn load_env_file(settings_dir: &std::path::Path) {
 /// value, override the nsec loaded from `settings.toml`. Whitespace is
 /// trimmed; blank values are ignored so the TOML stays the fallback.
 fn apply_nsec_env_override(settings: &mut Settings) {
-    if let Ok(nsec_from_env) = std::env::var(NSEC_ENV_VAR) {
-        let trimmed = nsec_from_env.trim();
-        if !trimmed.is_empty() {
-            settings.nostr.nsec_privkey = trimmed.to_string();
-        }
+    if let Some(nsec) = read_nsec_env_var() {
+        settings.nostr.nsec_privkey = nsec;
     }
 }
 
@@ -121,9 +118,12 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         return Ok(());
     }
 
-    // Read the file content
-    let contents = fs::read_to_string(&config_file_path)
-        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    // Read the file content into a zeroizing buffer so TOML plaintext is wiped
+    // after parsing.
+    let contents = Zeroizing::new(
+        fs::read_to_string(&config_file_path)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?,
+    );
 
     // Parse TOML content
     let mut settings: Settings = toml::from_str(&contents)
@@ -150,9 +150,11 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::constants::NSEC_ENV_VAR;
     use crate::config::types::{
         DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
     };
+    use secrecy::{ExposeSecret, SecretString};
     use std::sync::Mutex;
 
     // Tests that read/write MOSTRO_NSEC_PRIVKEY must run serially because the
@@ -192,7 +194,7 @@ mod tests {
             database: DatabaseSettings::default(),
             lightning: LightningSettings::default(),
             nostr: NostrSettings {
-                nsec_privkey: nsec.to_string(),
+                nsec_privkey: SecretString::from(nsec.to_owned()),
                 relays: vec!["wss://relay.test".to_string()],
             },
             mostro: MostroSettings::default(),
@@ -212,7 +214,7 @@ mod tests {
         let mut settings = make_settings("nsec_from_toml");
         apply_nsec_env_override(&mut settings);
 
-        assert_eq!(settings.nostr.nsec_privkey, "nsec_from_env");
+        assert_eq!(settings.nostr.nsec_privkey.expose_secret(), "nsec_from_env");
     }
 
     #[test]
@@ -224,7 +226,10 @@ mod tests {
         let mut settings = make_settings("nsec_from_toml");
         apply_nsec_env_override(&mut settings);
 
-        assert_eq!(settings.nostr.nsec_privkey, "nsec_from_toml");
+        assert_eq!(
+            settings.nostr.nsec_privkey.expose_secret(),
+            "nsec_from_toml"
+        );
     }
 
     #[test]
@@ -235,7 +240,10 @@ mod tests {
         let mut settings = make_settings("nsec_from_toml");
         apply_nsec_env_override(&mut settings);
 
-        assert_eq!(settings.nostr.nsec_privkey, "nsec_from_toml");
+        assert_eq!(
+            settings.nostr.nsec_privkey.expose_secret(),
+            "nsec_from_toml"
+        );
     }
 
     #[test]
@@ -247,7 +255,10 @@ mod tests {
         let mut settings = make_settings("nsec_from_toml");
         apply_nsec_env_override(&mut settings);
 
-        assert_eq!(settings.nostr.nsec_privkey, "nsec_from_toml");
+        assert_eq!(
+            settings.nostr.nsec_privkey.expose_secret(),
+            "nsec_from_toml"
+        );
     }
 
     #[test]
@@ -259,7 +270,7 @@ mod tests {
         let mut settings = make_settings("nsec_from_toml");
         apply_nsec_env_override(&mut settings);
 
-        assert_eq!(settings.nostr.nsec_privkey, "nsec_from_env");
+        assert_eq!(settings.nostr.nsec_privkey.expose_secret(), "nsec_from_env");
     }
 
     #[test]
@@ -269,7 +280,7 @@ mod tests {
         let toml_without_nsec = r#"relays = ["wss://relay.test"]"#;
         let nostr: NostrSettings =
             toml::from_str(toml_without_nsec).expect("nsec_privkey should be optional in TOML");
-        assert_eq!(nostr.nsec_privkey, "");
+        assert!(nostr.nsec_privkey.expose_secret().is_empty());
         assert_eq!(nostr.relays, vec!["wss://relay.test"]);
     }
 }

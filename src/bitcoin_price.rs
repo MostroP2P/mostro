@@ -120,7 +120,7 @@ impl BitcoinPriceManager {
             Tag::expiration(Timestamp::from(expiration as u64)),
         ]);
 
-        let event = new_exchange_rates_event(&keys, &content, tags).map_err(|e| {
+        let event = new_exchange_rates_event(keys, &content, tags).map_err(|e| {
             error!("Failed to create exchange rates event: {}", e);
             MostroInternalErr(ServiceError::MessageSerializationError)
         })?;

@@ -189,19 +189,28 @@ impl PriceManager {
 
         // Poll concurrently (spec §5.3 "poll all healthy providers, in
         // parallel"): the tick's wall-clock is the slowest single provider,
-        // never the sum, and each fetch carries its own
-        // [`tokio::time::timeout`] so one hanging API can't stretch even
-        // that bound.
-        let timeout = Duration::from_secs(self.settings.provider_timeout_seconds);
+        // never the sum. Each fetch carries its own [`tokio::time::timeout`]
+        // sized by [`Self::poll_budget`] — the *per-attempt* bound is the
+        // shared `reqwest` client's request timeout (`from_settings`), while
+        // this outer budget covers the provider's whole mirror sequence, so
+        // a hanging primary cannot starve its `fallback_urls` (they'd be
+        // dead code in exactly the hung case otherwise).
         let outcomes: Vec<(ProviderId, TimeoutResult)> =
             futures::future::join_all(pollable.iter().map(|p| async move {
-                let res = tokio::time::timeout(timeout, p.provider.fetch(&self.http)).await;
+                let res =
+                    tokio::time::timeout(self.poll_budget(p.id), p.provider.fetch(&self.http))
+                        .await;
                 (p.id, res)
             }))
             .await;
 
         let mut quotes_by_provider: Vec<(ProviderId, ProviderQuotes)> =
             Vec::with_capacity(pollable.len());
+        // Re-stamp the clock: the polls above may have consumed up to a full
+        // poll budget, and a breaker cooldown anchored at the *pre-poll*
+        // `now` would be born already partially expired — weakening the
+        // skip exactly when a slow-failing provider needs it most.
+        let failed_at = Utc::now().timestamp();
         // `join_all` preserves input order, so `pollable[i]` is the provider
         // behind `outcomes[i]` — zip them to feed the breaker.
         for (p, (id, outcome)) in pollable.iter().zip(outcomes) {
@@ -219,8 +228,9 @@ impl PriceManager {
                 }
                 Err(_) => {
                     warn!(
-                        "price: {} timed out after {}s",
-                        id, self.settings.provider_timeout_seconds
+                        "price: {} timed out after {}s (full mirror budget)",
+                        id,
+                        self.poll_budget(id).as_secs()
                     );
                     report.failures.push((id, "timeout".to_string()));
                     false
@@ -231,7 +241,7 @@ impl PriceManager {
                     health.record_success();
                 } else {
                     health.record_failure(
-                        now,
+                        failed_at,
                         self.settings.provider_failure_threshold,
                         self.settings.provider_failure_cooldown_seconds,
                         PROVIDER_COOLDOWN_CAP_SECONDS,
@@ -297,6 +307,35 @@ impl PriceManager {
         }
 
         report
+    }
+
+    /// Wall-clock budget for one provider's poll: `provider_timeout_seconds`
+    /// times the number of URLs the provider may try (primary +
+    /// `fallback_urls`), plus one second of slack for inter-attempt
+    /// overhead.
+    ///
+    /// Layering: the **per-attempt** bound is enforced by the shared
+    /// `reqwest` client (`from_settings` sets
+    /// `.timeout(provider_timeout_seconds)`), so a hung mirror burns one
+    /// slot of this budget, not all of it. Sizing the outer
+    /// [`tokio::time::timeout`] to the whole sequence keeps the §7
+    /// "mirrors tried in sequence" promise alive in the hung-primary case —
+    /// with a flat budget the fallbacks were dead code precisely when the
+    /// primary hung rather than refused (Codex review on PR #773).
+    fn poll_budget(&self, id: ProviderId) -> Duration {
+        let attempts = self
+            .settings
+            .providers
+            .get(&id.to_string())
+            .map(|c| 1 + c.fallback_urls.len() as u64)
+            .unwrap_or(1)
+            .max(1);
+        Duration::from_secs(
+            self.settings
+                .provider_timeout_seconds
+                .saturating_mul(attempts)
+                .saturating_add(1),
+        )
     }
 
     /// Apply this provider's `only`/`except` filter (spec §6.6). Done at the
@@ -1108,6 +1147,39 @@ mod tests {
             "the scripted Ok was never consumed"
         );
         assert!(second.failures.is_empty(), "skipped ≠ failed");
+    }
+
+    #[test]
+    fn poll_budget_scales_with_fallback_urls() {
+        // The outer per-provider timeout must cover the whole mirror
+        // sequence (primary + fallbacks), or a hung primary starves the
+        // mirrors (Codex review on PR #773). Per-attempt bounding is the
+        // shared reqwest client's job.
+        let scripted = ScriptedProvider::new(ProviderId::CurrencyApi, vec![]);
+        let mut manager = manager_with(scripted);
+        manager.settings.provider_timeout_seconds = 10;
+
+        // No fallbacks: one attempt + 1s slack.
+        assert_eq!(
+            manager.poll_budget(ProviderId::CurrencyApi),
+            Duration::from_secs(11)
+        );
+        // Two mirrors: three attempts + slack.
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::CurrencyApi.to_string())
+            .unwrap()
+            .fallback_urls = vec!["http://m1".into(), "http://m2".into()];
+        assert_eq!(
+            manager.poll_budget(ProviderId::CurrencyApi),
+            Duration::from_secs(31)
+        );
+        // Unknown id (defensive): single-attempt budget.
+        assert_eq!(
+            manager.poll_budget(ProviderId::Blockchain),
+            Duration::from_secs(11)
+        );
     }
 
     #[tokio::test]

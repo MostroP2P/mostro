@@ -236,6 +236,63 @@ mod tests {
         assert!(quotes.contains_key("USD"));
     }
 
+    /// A *hanging* primary (vs the fast connection-refused above) must not
+    /// starve the mirror: the per-attempt bound is the HTTP client's
+    /// request timeout, so the hung attempt is cut at ~1s and the mirror
+    /// still answers within the manager's mirror-sequence budget
+    /// (`poll_budget`). Guards the Codex finding on PR #773.
+    #[tokio::test]
+    async fn hanging_primary_does_not_starve_the_mirror() {
+        use axum::{routing::get, Router};
+
+        // Primary: accepts the connection, then stalls far past the client
+        // request timeout.
+        let hang = Router::new().route(
+            "/v1/currencies/btc.min.json",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                SAMPLE_PAYLOAD
+            }),
+        );
+        let hang_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hang_addr = hang_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(hang_listener, hang).await.unwrap();
+        });
+
+        // Mirror: instant fixture.
+        let ok = Router::new().route(
+            "/v1/currencies/btc.min.json",
+            get(|| async { SAMPLE_PAYLOAD }),
+        );
+        let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(ok_listener, ok).await.unwrap();
+        });
+
+        let p = CurrencyApiProvider::new(&cfg(
+            &format!("http://{hang_addr}/v1"),
+            vec![format!("http://{ok_addr}/v1")],
+        ));
+        // Mirrors `from_settings`: the client's request timeout IS the
+        // per-attempt bound.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let quotes = p
+            .fetch(&http)
+            .await
+            .expect("mirror must carry the fetch despite the hung primary");
+        assert!(quotes.contains_key("USD"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "hung primary must be cut by the per-attempt timeout, not ride forever"
+        );
+    }
+
     #[tokio::test]
     async fn all_urls_failing_is_one_provider_error() {
         let p = CurrencyApiProvider::new(&cfg(

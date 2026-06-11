@@ -6,4 +6,7 @@
 //! [`super::PriceManager::from_settings`] + one config sub-table (see spec
 //! §5.4). The aggregation core, store and scheduler are never touched.
 
+pub mod blockchain;
+pub mod coingecko;
+pub mod currency_api;
 pub mod yadio;

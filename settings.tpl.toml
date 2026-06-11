@@ -122,9 +122,31 @@ port = 50051
 # enabled = true
 # url = "https://api.yadio.io"
 #
-# # The keyless backups, El Toque, etc. are wired in Phases 2 and 3 — see
-# # docs/PRICE_PROVIDERS.md §7 for the full provider list and §6.6 for the
-# # `only` / `except` per-provider currency scoping rules.
+# [price.providers.coingecko]
+# enabled = true
+# url = "https://api.coingecko.com/api/v3"
+# # api_key = "CG-xxxx"   # optional demo/pro key; raises rate limits. Pro
+# # plans use url = "https://pro-api.coingecko.com/api/v3" (the adapter picks
+# # the matching auth header from the host).
+#
+# # Keyless, CDN-hosted, 300+ currencies incl. CUP at the OFFICIAL rate — so
+# # CUP/MLC are excluded to avoid mixing official with the informal-market
+# # sources (docs/PRICE_PROVIDERS.md §6.6).
+# [price.providers.currency_api]
+# enabled = true
+# url = "https://currency-api.pages.dev/v1"
+# # Ordered mirrors tried in sequence when `url` fails this tick.
+# fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
+# except = ["CUP", "MLC"]
+#
+# # Keyless, ~28 major fiats, no CUP/MLC. Mid-market (`last`) only.
+# [price.providers.blockchain]
+# enabled = true
+# url = "https://blockchain.info"
+#
+# # El Toque (fiat-cross CUP/MLC, requires a token) is wired in Phase 3 —
+# # see docs/PRICE_PROVIDERS.md §7 for the full provider list and §6.6 for
+# # the `only` / `except` per-provider currency scoping rules.
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

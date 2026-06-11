@@ -56,8 +56,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::db::{
-    create_bond, find_active_bonds_for_order, find_child_slashes_for_parent,
-    find_maker_bond_for_order, find_range_root_order,
+    find_active_bonds_for_order, find_child_slashes_for_parent, find_maker_bond_for_order,
+    find_range_root_order,
 };
 use super::flow::{
     release_bond, release_bonds_for_order_or_warn, release_taker_bonds_for_order_or_warn,
@@ -975,26 +975,42 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         }
     }
 
-    // Move the parent `Locked → Slashed` (settled & distributed via the
-    // child rows + the refund row). The CAS ensures exactly one close wins
-    // if two terminal hooks race; the loser must not create a second refund
-    // row.
+    // The HTLC is now settled while the parent is still `Locked`. Perform ALL
+    // the DB-side close work — the CAS, the child claim-window re-anchor, and
+    // the maker-refund row — in ONE transaction, so `Slashed` only ever
+    // becomes visible once the dependent rows are durably written together.
+    // A crash anywhere in here leaves a `Locked` parent that the
+    // reconciliation sweep retries; the retry re-settles harmlessly (LND
+    // returns "already settled", classified as success above). `Locked` is
+    // thus the sole in-flight state and there is no partially-closed `Slashed`
+    // window to repair.
+    let now = Utc::now().timestamp();
+    let refund_amount = (parent.amount_sats - total_slashed).max(0);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Move the parent `Locked → Slashed`. The CAS — kept inside the tx —
+    // ensures exactly one close wins if two terminal hooks race; the loser
+    // sees `rows_affected = 0`, rolls back, and returns with no side effects
+    // (so it never writes a second refund row).
     let cas = sqlx::query("UPDATE bonds SET state = ? WHERE id = ? AND state = ?")
         .bind(BondState::Slashed.to_string())
         .bind(parent.id)
         .bind(BondState::Locked.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     if cas.rows_affected() != 1 {
+        let _ = tx.rollback().await;
         info!(
             bond_id = %parent.id,
             "range close: parent already closed concurrently; skipping refund row"
         );
         return Ok(());
     }
-
-    let now = Utc::now().timestamp();
 
     // Phase 6: anchor each slice child's claim window at *close* time, not at
     // slice-slash time. A child can only be paid out once the parent HTLC is
@@ -1012,12 +1028,48 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         .bind(now)
         .bind(parent.id)
         .bind(BondState::PendingPayout.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     }
 
-    let refund_amount = (parent.amount_sats - total_slashed).max(0);
+    if refund_amount > 0 {
+        // Inherit a parseable reason from a slice child so the Phase 3
+        // `slashed_reason` invariant holds; the refund recipient is resolved
+        // directly from the row (the maker), not via the reason. Raw INSERT
+        // (mirroring the slice-slash insert, `child_order_id = NULL` marks the
+        // maker-refund row) so it runs on the same transaction as the CAS.
+        // Unset columns take their schema defaults, matching `Bond::new_requested`.
+        let reason = slice_children
+            .first()
+            .and_then(|c| c.slashed_reason.clone())
+            .unwrap_or_else(|| BondSlashReason::LostDispute.to_string());
+        sqlx::query(
+            "INSERT INTO bonds \
+                (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
+                 amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(root.id)
+        .bind(parent.id)
+        .bind(parent.pubkey.clone())
+        .bind(BondRole::Maker.to_string())
+        .bind(refund_amount)
+        .bind(BondState::PendingPayout.to_string())
+        .bind(reason)
+        .bind(0_i64) // node_share_sats = 0: full refund to the maker
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     info!(
         bond_id = %parent.id,
         order_id = %root.id,
@@ -1027,29 +1079,6 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
         children = slice_children.len(),
         "Phase 6: range maker bond settled at close; distributing child shares + maker refund"
     );
-
-    if refund_amount > 0 {
-        // Inherit a parseable reason from a slice child so the Phase 3
-        // `slashed_reason` invariant holds; the refund recipient is resolved
-        // directly from the row (the maker), not via the reason.
-        let reason = slice_children
-            .first()
-            .and_then(|c| c.slashed_reason.clone())
-            .unwrap_or_else(|| BondSlashReason::LostDispute.to_string());
-        let mut refund = Bond::new_requested(
-            root.id,
-            parent.pubkey.clone(),
-            BondRole::Maker,
-            refund_amount,
-        );
-        refund.parent_bond_id = Some(parent.id);
-        refund.child_order_id = None; // marks the maker-refund row
-        refund.state = BondState::PendingPayout.to_string();
-        refund.slashed_reason = Some(reason);
-        refund.slashed_at = Some(now);
-        refund.node_share_sats = Some(0); // full refund to the maker
-        create_bond(pool, refund).await?;
-    }
 
     Ok(())
 }
@@ -2758,6 +2787,163 @@ mod tests {
             2,
             "no duplicate refund row"
         );
+    }
+
+    #[tokio::test]
+    async fn range_close_crash_after_settle_is_resumed() {
+        // The settle precedes one atomic state+rows transaction. If the HTLC
+        // settles but the transaction fails (crash / DB error before commit),
+        // the parent must stay `Locked` with NO refund row and NO re-anchor —
+        // so the Locked-keyed reconciliation sweep covers the window — and a
+        // later retry (mock reports "already settled") completes the close.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+        // Snapshot the slice child's pre-close slashed_at to prove it is only
+        // re-anchored on a committed close.
+        let slice_before = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.child_order_id.is_some())
+            .expect("slice child");
+        let original_slashed_at = slice_before.slashed_at;
+
+        // Inject a DB failure mid-transaction: a trigger that aborts the
+        // maker-refund INSERT (the row with parent_bond_id set, child_order_id
+        // NULL). The slice-slash insert and the CAS/UPDATE are unaffected.
+        sqlx::query(
+            "CREATE TRIGGER bond_refund_fail BEFORE INSERT ON bonds \
+             WHEN NEW.parent_bond_id IS NOT NULL AND NEW.child_order_id IS NULL \
+             BEGIN SELECT RAISE(ABORT, 'injected refund insert failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Settle succeeds, then the transaction aborts → the whole close errors.
+        let stub = StubSettle::new();
+        let err = resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root).await;
+        assert!(
+            err.is_err(),
+            "a failed close transaction must surface as Err"
+        );
+        assert_eq!(stub.calls(), vec![stub_preimage()], "settle attempted once");
+
+        // Parent rolled back to Locked; no refund row; slice child NOT re-anchored.
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.state,
+            BondState::Locked.to_string(),
+            "parent must remain Locked so the sweep retries it"
+        );
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "no refund row was written");
+        assert!(children.iter().all(|c| c.child_order_id.is_some()));
+        let slice_mid = children
+            .iter()
+            .find(|c| c.child_order_id.is_some())
+            .unwrap();
+        assert_eq!(
+            slice_mid.slashed_at, original_slashed_at,
+            "the slice claim window must not re-anchor until the close commits"
+        );
+
+        // Remove the injected failure and re-run the close (the sweep's retry).
+        // The HTLC is already settled, so LND reports "already settled".
+        sqlx::query("DROP TRIGGER bond_refund_fail")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Backdate the slice child so the close-time re-anchor is observable
+        // despite 1-second timestamp granularity.
+        sqlx::query(
+            "UPDATE bonds SET slashed_at = 1000000 \
+             WHERE parent_bond_id = ? AND child_order_id IS NOT NULL",
+        )
+        .bind(parent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before_close = Utc::now().timestamp();
+        stub.fail_next_with("invoice already settled");
+        resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root)
+            .await
+            .unwrap();
+
+        // Now fully closed: settle attempted twice, but rows written once.
+        assert_eq!(stub.calls().len(), 2, "settle re-attempted on retry");
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Slashed.to_string());
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 2, "exactly one refund row after the retry");
+        let refund = children
+            .iter()
+            .find(|c| c.child_order_id.is_none())
+            .expect("maker refund row");
+        assert_eq!(refund.amount_sats, 600);
+        assert_eq!(refund.node_share_sats, Some(0));
+        let slice_after = children
+            .iter()
+            .find(|c| c.child_order_id.is_some())
+            .unwrap();
+        assert!(
+            slice_after.slashed_at.unwrap() >= before_close,
+            "slice claim window re-anchored at close time once committed (got {:?})",
+            slice_after.slashed_at
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_already_settled_is_treated_as_success() {
+        // A double-settle (LND returns "already settled") is classified as
+        // success, so a close after a crashed settle still completes normally.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let stub = StubSettle::new();
+        stub.fail_next_with("invoice already settled");
+        resolve_range_maker_bond_at_close(&pool, &mut stub.clone(), &root)
+            .await
+            .unwrap();
+
+        assert_eq!(stub.calls(), vec![stub_preimage()], "settle attempted once");
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Slashed.to_string());
+        let refund = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.child_order_id.is_none())
+            .expect("maker refund row");
+        assert_eq!(refund.amount_sats, 600);
     }
 
     #[tokio::test]

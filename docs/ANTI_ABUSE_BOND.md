@@ -1886,7 +1886,12 @@ carries `parent_bond_id` / `child_order_id` / `slashed_share_sats`).
   shares are paid, and the unslashed remainder is refunded to the maker.
   Mostro never fronts liquidity. (The alternative — eager per-child payout —
   was rejected to keep the "`PendingPayout` ⇒ sats already claimable"
-  invariant.)
+  invariant.) At close, the parent HTLC is settled **first** (while the bond
+  is still `Locked`), and only then are the `Locked → Slashed` CAS, the
+  maker-refund row insert, and the child claim-window re-anchor written in one
+  atomic SQLite transaction — so `Locked` is the sole in-flight state and the
+  `Locked`-keyed reconciliation sweep covers every crash window (a retry
+  re-settles harmlessly, since LND reports "already settled").
 - **Slash share is computed in fiat, not sats.** The literal §11.2 formula
   divides sats by sats, but the slice sats and the bond-notional sats are
   quoted at *different* prices (take time vs publication time), so that

@@ -453,7 +453,9 @@ fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceP
         | ProviderId::CurrencyApi
         | ProviderId::Blockchain
         | ProviderId::ElToque => Err(format!(
-            "price: provider `{id}` is configured but not yet implemented in this release"
+            "price: provider `{id}` is configured (enabled) but not yet implemented in \
+             this release — disable it or remove it from `[price.providers]` \
+             (see docs/PRICE_PROVIDERS.md §7)"
         )),
     }
 }

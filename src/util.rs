@@ -36,13 +36,37 @@ const MAX_RETRY: u16 = 4;
 // Redefined for convenience
 type OrderKind = mostro_core::order::Kind;
 
+/// Resolve the Yadio base URL for the live market-quote path (`/convert`,
+/// `/currencies`).
+///
+/// Phase 1 transition (spec §10.1): the cached aggregate path reads
+/// `[price.providers.yadio].url`, but this live path historically read the
+/// legacy `[mostro].bitcoin_price_api_url`. If an operator customises only
+/// the new key, the two paths would silently hit different Yadio bases.
+/// Prefer the configured Yadio provider URL when a `[price]` block is present
+/// (falling back to the legacy key otherwise). Phase 4 removes this live HTTP
+/// path entirely, at which point the legacy key only feeds legacy synthesis.
+fn yadio_base_url() -> String {
+    if let Some(price) = Settings::get_price() {
+        if let Some(yadio) = price
+            .providers
+            .get(&crate::price::ProviderId::Yadio.to_string())
+        {
+            let url = yadio.url.trim();
+            if !url.is_empty() {
+                return url.to_string();
+            }
+        }
+    }
+    Settings::get_mostro().bitcoin_price_api_url.clone()
+}
+
 pub async fn retries_yadio_request(
     req_string: &str,
     fiat_code: &str,
 ) -> Result<(Option<reqwest::Response>, bool), MostroError> {
     // Get Fiat list and check if currency exchange is available
-    let mostro_settings = Settings::get_mostro();
-    let api_req_string = format!("{}/currencies", mostro_settings.bitcoin_price_api_url);
+    let api_req_string = format!("{}/currencies", yadio_base_url());
     let fiat_list_check = HTTP_CLIENT
         .get(api_req_string)
         .send()
@@ -78,10 +102,11 @@ pub async fn get_market_quote(
     premium: i64,
 ) -> Result<i64, MostroError> {
     // Add here check for market price
-    let mostro_settings = Settings::get_mostro();
     let req_string = format!(
         "{}/convert/{}/{}/BTC",
-        mostro_settings.bitcoin_price_api_url, fiat_amount, fiat_code
+        yadio_base_url(),
+        fiat_amount,
+        fiat_code
     );
     info!("Requesting API price: {}", req_string);
 

@@ -56,8 +56,15 @@ pow = 0
 publish_mostro_info_interval = 300
 # Bitcoin price API base URL.
 # DEPRECATED: prefer `[price.providers.yadio].url` in the new multi-source
-# `[price]` block below. Still honoured for backward compatibility when
-# `[price]` is absent (see docs/PRICE_PROVIDERS.md §10.1).
+# `[price]` block below (see docs/PRICE_PROVIDERS.md §10.1). Lifecycle:
+#  (a) Now OPTIONAL — once you configure a `[price]` block you may delete this
+#      key. When it is absent AND `[price]` is also absent, the default
+#      "https://api.yadio.io" is used for the legacy single-source synthesis.
+#  (b) Still read by the live market-quote path (/convert) until Phase 4. To
+#      avoid the live and cached paths hitting different Yadio URLs, the live
+#      path prefers `[price.providers.yadio].url` when a `[price]` block is
+#      present and only falls back to this key otherwise.
+#  (c) Fully removed in Phase 5.
 bitcoin_price_api_url = "https://api.yadio.io"
 # Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']

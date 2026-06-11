@@ -817,6 +817,17 @@ pub async fn publish_dev_fee_audit_event(
     Ok(())
 }
 
+/// Return Mostro's parsed Nostr signing keys.
+///
+/// Keys are initialized once at startup by [`crate::config::init_mostro_settings`],
+/// which parses the nsec and stores the result in the global `NOSTR_KEYS`
+/// slot. Callers must ensure that initialization has completed before invoking
+/// this function (normally guaranteed by `settings_init()` in `main`).
+///
+/// Returns a borrowed `Keys` on success. Returns
+/// [`MostroInternalErr`](mostro_core::error::MostroError::MostroInternalErr) with
+/// [`ServiceError::NostrError`] when `NOSTR_KEYS` has not been set — for example
+/// in unit tests that skip the full configuration bootstrap.
 pub fn get_keys() -> Result<&'static Keys, MostroError> {
     crate::config::get_mostro_keys().ok_or_else(|| {
         MostroInternalErr(ServiceError::NostrError(

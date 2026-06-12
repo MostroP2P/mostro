@@ -760,7 +760,9 @@ pub async fn send_dm(
     let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
-    let transport = Settings::get_mostro().transport;
+    // Non-panicking accessor: send_dm sits on every reply path and is
+    // exercised by unit tests that don't initialize the global config.
+    let transport = Settings::get_transport();
 
     // Kind-14 events are visible to relays, so they always carry a NIP-40
     // expiration tag (default 30 days via `dm_days`) instead of lingering

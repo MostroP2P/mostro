@@ -92,7 +92,7 @@ identity travels **inside the ciphertext** — never visible at the event
 level, exactly as private as before — proven by a signature over the
 domain-tagged payload:
 
-```
+```text
 mostro-transport-v2-identity:<trade_pubkey_hex>:<message_json>
 ```
 

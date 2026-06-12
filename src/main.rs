@@ -54,6 +54,11 @@ async fn main() -> Result<()> {
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
     settings_init()?;
 
+    // Build and install the multi-source price manager (spec §9 Phase 1).
+    // Done immediately after settings load so every later subsystem
+    // (scheduler, util::get_bitcoin_price, RPC) can read prices through it.
+    install_price_manager()?;
+
     // Connect to database
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
@@ -184,6 +189,34 @@ async fn main() -> Result<()> {
 
     // Run the Mostro and be happy!!
     run(ctx, &mut ln_client).await
+}
+
+/// Build the multi-source [`crate::price::PriceManager`] from settings and
+/// install it as the process-wide global. When `[price]` is absent in the
+/// settings file we synthesise it from the legacy `[mostro]` keys
+/// (`bitcoin_price_api_url`, `exchange_rates_update_interval_seconds`,
+/// `publish_exchange_rates_to_nostr`) so existing `settings.toml` files keep
+/// working byte-for-byte (spec §10.1).
+fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use crate::price::{synthesise_legacy_price_settings, PriceManager};
+
+    let mostro_settings = Settings::get_mostro();
+    let price_settings = match Settings::get_price() {
+        Some(p) => p.clone(),
+        None => synthesise_legacy_price_settings(
+            &mostro_settings.bitcoin_price_api_url,
+            mostro_settings.exchange_rates_update_interval_seconds,
+            mostro_settings.publish_exchange_rates_to_nostr,
+        ),
+    };
+
+    let manager = PriceManager::from_settings(price_settings)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;
+    manager
+        .install_global()
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;
+    tracing::info!("PriceManager installed");
+    Ok(())
 }
 
 #[cfg(test)]

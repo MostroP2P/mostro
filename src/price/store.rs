@@ -127,6 +127,10 @@ mod tests {
                     AggregateResult {
                         value: *v,
                         sources: *s,
+                        // Store tests are agnostic to contributors — they
+                        // exercise TTL/last-known-good semantics. Empty
+                        // is fine since the store never reads this field.
+                        contributors: Vec::new(),
                     },
                 )
             })

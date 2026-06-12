@@ -340,7 +340,15 @@ pub struct MostroSettings {
     pub pow: u8,
     /// Publish mostro info interval
     pub publish_mostro_info_interval: u32,
-    /// Bitcoin price API base URL
+    /// Bitcoin price API base URL.
+    ///
+    /// DEPRECATED (spec §10.1): superseded by `[price.providers.yadio].url`.
+    /// `#[serde(default)]` so a `settings.toml` that has migrated to a
+    /// `[price]` block may omit this key entirely without failing
+    /// deserialization. Still read by the live `/convert` path
+    /// (`src/util.rs`) and by `install_price_manager()` legacy synthesis when
+    /// `[price]` is absent, so the field itself stays until Phase 4/5.
+    #[serde(default = "default_bitcoin_price_api_url")]
     pub bitcoin_price_api_url: String,
     /// Fiat currencies accepted for orders (empty list accepts all)
     pub fiat_currencies_accepted: Vec<String>,
@@ -363,6 +371,12 @@ pub struct MostroSettings {
     /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
+}
+
+fn default_bitcoin_price_api_url() -> String {
+    // Matches the `Default` impl below so an omitted legacy key and an
+    // explicit one behave identically for legacy synthesis (spec §10.1).
+    "https://api.yadio.io".to_string()
 }
 
 fn default_publish_exchange_rates() -> bool {

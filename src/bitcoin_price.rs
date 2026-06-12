@@ -21,16 +21,17 @@ impl BitcoinPriceManager {
         crate::price::get_bitcoin_price(currency)
     }
 
-    /// Test-only: seed the in-memory price cache so unit tests in other
-    /// modules can exercise price-dependent paths (e.g. range-order bond
-    /// sizing) deterministically without hitting the network. Use a unique
-    /// `currency` per test to avoid cross-test interference on the shared
-    /// static.
+    /// Test-only: seed the price-override map consulted by
+    /// [`crate::price::get_bitcoin_price`] so unit tests in other modules
+    /// can exercise price-dependent paths (e.g. range-order bond sizing)
+    /// deterministically without hitting the network or installing the
+    /// global `PriceManager`. Use a unique `currency` per test to avoid
+    /// cross-test interference on the shared map.
     #[cfg(test)]
     pub(crate) fn set_price_for_test(currency: &str, price: f64) {
-        BITCOIN_PRICES
+        crate::price::test_price_overrides()
             .write()
-            .expect("price cache write lock")
+            .expect("price override write lock")
             .insert(currency.to_string(), price);
     }
 }

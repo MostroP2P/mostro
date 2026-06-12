@@ -27,6 +27,22 @@ pub use store::{AggregatedPrice, PriceError, PriceStore};
 
 use mostro_core::error::{MostroError, ServiceError};
 
+/// Test-only per-currency price overrides consulted by
+/// [`get_bitcoin_price`] before the global manager. Unit tests in other
+/// modules (e.g. range-order bond sizing in `util.rs`) seed this via
+/// `BitcoinPriceManager::set_price_for_test` instead of installing the
+/// global [`PriceManager`] — its `OnceLock` would leak one test's
+/// configuration into every other test in the binary. Tests use a unique
+/// currency code each to avoid cross-test interference on the shared map.
+#[cfg(test)]
+pub(crate) fn test_price_overrides(
+) -> &'static std::sync::RwLock<std::collections::HashMap<String, f64>> {
+    static OVERRIDES: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    > = std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
 /// Read a currency's per-BTC price from the global [`PriceManager`].
 ///
 /// This is the Phase 1 entry point for consumers (`util::get_bitcoin_price`
@@ -36,6 +52,14 @@ use mostro_core::error::{MostroError, ServiceError};
 /// legacy code returned when `BITCOIN_PRICES` was empty, so callers behave
 /// identically.
 pub fn get_bitcoin_price(currency: &str) -> Result<f64, MostroError> {
+    #[cfg(test)]
+    if let Some(price) = test_price_overrides()
+        .read()
+        .expect("price override read lock")
+        .get(currency)
+    {
+        return Ok(*price);
+    }
     match PriceManager::global() {
         Some(m) => m.get_price(currency),
         None => Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse)),

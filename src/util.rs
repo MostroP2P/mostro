@@ -1598,6 +1598,7 @@ pub async fn notify_taker_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitcoin_price::BitcoinPriceManager;
     use mostro_core::message::{Message, MessageKind};
     use mostro_core::order::Order;
     use sqlx::sqlite::SqlitePoolOptions;

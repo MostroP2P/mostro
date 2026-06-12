@@ -234,16 +234,39 @@ pub async fn release_action(
     )
     .await;
 
-    // Handle child order for range orders
-    if let Ok((Some(child_order), Some(event))) = get_child_order(ctx, order.clone(), my_keys).await
-    {
-        let client = ctx.nostr_client();
-        if client.send_event(&event).await.is_err() {
-            tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
+    // Handle child order for range orders. A spawned remainder means the
+    // range continues, so the maker stays committed and its bond stays
+    // `Locked`. No remainder means the range is fully consumed (or this was
+    // a fixed-amount order) — resolve the maker bond at close (Phase 6
+    // settle-at-close, or the Phase 5 release for a non-range maker bond).
+    match get_child_order(ctx, order.clone(), my_keys).await {
+        Ok((Some(child_order), Some(event))) => {
+            let client = ctx.nostr_client();
+            if client.send_event(&event).await.is_err() {
+                tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
+            }
+            handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         }
-        handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        Ok(_) => {
+            bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
+        }
+        Err(e) => {
+            // `get_child_order` only *computes* the remainder (it neither
+            // persists nor publishes a child), so on error no remainder
+            // exists on the book — the range has effectively ended. Resolve
+            // the maker bond at close rather than leaving it Locked until
+            // the LND CLTV safety net. (mostro does not retry child-order
+            // creation anywhere; the lost remainder is a pre-existing
+            // limitation, logged here.)
+            tracing::warn!(
+                order_id = %order.id,
+                error = %e,
+                "get_child_order failed; resolving maker bond at close (no remainder was created)"
+            );
+            bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
+        }
     }
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
@@ -269,11 +292,12 @@ pub async fn release_action(
     )
     .await;
 
-    // Phase 1: release any taker bond attached to this order before we
-    // hand off to the buyer payment task. Slashing is intentionally not
-    // wired in yet — that's Phase 2+. A failed bond release is logged but
-    // does not block trade finalization.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "release_action").await;
+    // Phase 1/6: release the taker bond(s) on this slice. The maker bond is
+    // handled by `resolve_range_maker_bond_at_close_or_warn` above — its
+    // single HTLC may span a whole range, so releasing it here would
+    // wrongly cancel a bond still committed to a continuing range. A failed
+    // bond release is logged but does not block trade finalization.
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "release_action").await;
 
     // Finally we try to pay buyer's invoice
     let _ = do_payment(ctx, order, request_id).await;

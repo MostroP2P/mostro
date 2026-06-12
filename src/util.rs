@@ -428,28 +428,16 @@ pub async fn publish_order(
         }
     };
 
-    // Phase 5: when the maker side is bonded, the order must NOT hit the
+    // Phase 5/6: when the maker side is bonded, the order must NOT hit the
     // order book until the maker locks an anti-abuse bond. Park it at
     // `WaitingMakerBond` (no NIP-33 event emitted), request the bond, and
     // defer the publication to `resume_publish_after_maker_bond`, which
-    // the bond subscriber calls on `Accepted`. Range makers are deferred
-    // to Phase 6 (parent/child proportional slashes), so they keep
-    // publishing immediately for now.
+    // the bond subscriber calls on `Accepted`. Both fixed-amount (Phase 5)
+    // and range (Phase 6) orders take this path; range orders size the
+    // bond against `max_amount` (worst-case exposure) and resolve slashes
+    // proportionally per taken slice — see `maker_bond_notional_sats`.
     let maker_bond_required = crate::app::bond::maker_bond_required();
-    if maker_bond_required && new_order_db.is_range_order() {
-        // Visibility for operators: with `apply_to ∈ { make, both }` a
-        // range order is published WITHOUT a maker bond because
-        // proportional range-bond sizing/slashing is Phase 6. Without
-        // this log the operator could wrongly assume every order on a
-        // bond-enabled node is bonded.
-        tracing::warn!(
-            order_kind = %new_order_db.kind,
-            "publish_order: maker bond is enabled but order {} is a range order — \
-             publishing WITHOUT a maker bond (range maker bonds land in Phase 6)",
-            new_order_db.id
-        );
-    }
-    if maker_bond_required && !new_order_db.is_range_order() {
+    if maker_bond_required {
         let notional = maker_bond_notional_sats(&new_order_db)?;
         new_order_db.status = Status::WaitingMakerBond.to_string();
         let order = new_order_db
@@ -514,16 +502,40 @@ pub async fn publish_order(
     .await
 }
 
-/// Sats notional a maker bond is sized against (Phase 5, non-range only).
+/// Sats notional a maker bond is sized against.
 ///
-/// Fixed-price orders carry their sats `amount` directly. Market-priced
-/// single orders have `amount == 0` at creation, so we convert the fiat
-/// amount at the current cached price — the same quote
-/// `calculate_and_check_quote` validates against at order time. The bond
-/// is a one-time snapshot and is not repriced if the market moves before
-/// the order is taken (spec §10.3). Range orders never reach this path in
-/// Phase 5; their `max_amount`-based sizing lands in Phase 6.
+/// - **Range orders (Phase 6).** Sized against `max_amount` — the
+///   worst-case fiat exposure the maker is advertising — converted at the
+///   current cached price. Each taken slice later slashes a proportional
+///   share of the resulting bond (`slice.fiat_amount / max_amount`), so
+///   the notional must be the range ceiling, not any single slice.
+/// - **Fixed-price orders.** Carry their sats `amount` directly.
+/// - **Market-priced single orders.** `amount == 0` at creation, so we
+///   convert the fiat amount at the current cached price — the same quote
+///   `calculate_and_check_quote` validates against at order time.
+///
+/// The bond is a one-time snapshot and is not repriced if the market moves
+/// before the order is taken (spec §10.3).
 fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
+    // Range orders: size against the fiat ceiling (`max_amount`).
+    if order.is_range_order() {
+        // `is_range_order()` only checks that `min`/`max` are `Some`, not
+        // that they are positive, so guard against a zero/negative ceiling
+        // here — a non-positive `max_amount` would otherwise size the bond
+        // at the floor and later divide-by-zero in the proportional slash
+        // (`record_maker_slice_slash`, which carries the matching guard).
+        let max_fiat = order.max_amount.filter(|m| *m > 0).ok_or_else(|| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "range order missing positive max_amount".to_string(),
+            ))
+        })?;
+        let price = get_bitcoin_price(&order.fiat_code)?;
+        if price <= 0.0 {
+            return Err(MostroInternalErr(ServiceError::NoAPIResponse));
+        }
+        let sats = (max_fiat as f64 / price) * 1E8;
+        return Ok(sats as i64);
+    }
     if order.amount > 0 {
         return Ok(order.amount);
     }
@@ -1914,5 +1926,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(maker_bond_notional_sats(&order).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_sizes_against_max_at_price() {
+        // Phase 6: a range order sizes the notional against `max_amount`
+        // converted at the cached price: 100 fiat / 60_000 * 1e8 ≈ 166_666
+        // sats. Unique fiat_code avoids clobbering the shared price cache.
+        BitcoinPriceManager::set_price_for_test("T6RANGE", 60_000.0);
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(100),
+            fiat_code: "T6RANGE".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 166_666);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_rejects_non_positive_max() {
+        // `is_range_order()` only checks `Some`-ness, so a `max_amount` of 0
+        // still enters the range branch and must be rejected before bond
+        // sizing (it would divide-by-zero in the proportional slash). A
+        // `None` max can't reach here — `is_range_order()` would be false.
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(0),
+            fiat_code: "T6ZERO".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        let err = maker_bond_notional_sats(&order).unwrap_err();
+        assert!(
+            matches!(err, MostroInternalErr(ServiceError::UnexpectedError(_))),
+            "expected UnexpectedError for non-positive max_amount, got {err:?}"
+        );
     }
 }

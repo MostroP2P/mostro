@@ -31,6 +31,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_retry_failed_payments(ctx.clone()).await;
     job_process_dev_fee_payment(ctx.clone()).await;
     job_process_bond_payouts(ctx.clone()).await;
+    job_reconcile_stranded_maker_bonds(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
@@ -558,6 +559,9 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
                         let order_id = order_updated.id;
+                        // Snapshot before `update` consumes the row — the
+                        // Phase 6 close hook below needs an `&Order`.
+                        let order_snapshot = order_updated.clone();
                         // Same gate as the timeout job: only release
                         // bonds when the Expired status was actually
                         // persisted. On persist failure the next tick
@@ -575,9 +579,21 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                                 // expiry — Phase 1 promises "always
                                 // release" on every exit path,
                                 // expiry included.
-                                bond::release_bonds_for_order_or_warn(
+                                bond::release_taker_bonds_for_order_or_warn(
                                     pool,
                                     order_id,
+                                    "pending_expiry",
+                                )
+                                .await;
+                                // Phase 6: an expiring Pending order may be a
+                                // range remainder (or the range root) — resolve
+                                // the maker bond at range close (release when no
+                                // slice was slashed; settle-at-close otherwise).
+                                // Also covers the non-range maker bond via the
+                                // close helper's non-range release branch.
+                                bond::resolve_range_maker_bond_at_close_or_warn(
+                                    pool,
+                                    &order_snapshot,
                                     "pending_expiry",
                                 )
                                 .await;
@@ -602,6 +618,27 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Phase 6 hardening: periodically retry the settle-at-close for any range
+/// maker bond left `Locked` after a terminal hook's close failed (transient
+/// LND/DB error). The order's terminal-state commit is never gated on close
+/// success (best-effort bond design, §8.2), so without this sweep a stranded
+/// parent HTLC would sit `Locked` — blocking every slashed slice's payout —
+/// until the LND CLTV safety net. The close is idempotent (CAS), so the
+/// retry is safe; a parent is only touched once its whole range tree is
+/// terminal, so a legitimately-open range is never disturbed. Runs every
+/// 5 minutes — far below the CLTV horizon, far above any useful churn.
+async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            bond::reconcile_stranded_range_maker_bonds(pool).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
 }

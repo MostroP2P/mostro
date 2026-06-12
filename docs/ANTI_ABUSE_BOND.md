@@ -192,8 +192,8 @@ slash path.
 | 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | ✅ shipped (PR #743) |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (PR #744) |
 | 4.5 | Re-prompt the winner for a fresh payout invoice after `send_payment` retries exhaust, instead of stranding the bond in `Failed` ([issue #750](https://github.com/MostroP2P/mostro/issues/750)) | 3 | pending |
-| 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | pending |
-| 6 | Maker bond for **range orders** with proportional slashes | 5 | pending |
+| 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | ✅ shipped (PR #767) |
+| 6 | Maker bond for **range orders** with proportional slashes | 5 | ✅ shipped (PR #770) |
 | 7 | Timeout slash for maker bond | 5 | pending |
 | 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | pending |
 
@@ -206,15 +206,16 @@ orthogonal to the slash-direction phases — it can land any time after
 Phase 3, and is numbered 4.5 only because it was reported from field
 testing after Phase 4 shipped.
 
-**Status as of this revision.** Phases 0 through 4 are merged on
-`main` (PRs #712, #719, #736, #737, #738, #743, #744). The
-`mostro-core` pin in `Cargo.toml` is **0.11.5**, which carries every
-protocol variant those phases need (`Status::WaitingTakerBond`,
+**Status as of this revision.** Phases 0 through 5 (including 4.5) are
+merged on `main` (PRs #712, #719, #736, #737, #738, #743, #744, #755,
+#767), and Phase 6 is implemented. The `mostro-core` pin in `Cargo.toml`
+is **0.12.1**, which carries every protocol variant those phases need
+(`Status::WaitingTakerBond`, `Status::WaitingMakerBond`,
 `Action::PayBondInvoice`, `Payload::BondResolution`,
 `Action::AddBondInvoice`, `Payload::BondPayoutRequest`,
 `Action::BondInvoiceAccepted`, `Action::BondPayoutCompleted`,
-`Action::BondSlashed`). Phase 4.5 and Phases 5–8 are not yet
-implemented.
+`Action::BondSlashed`). Phase 6 is daemon-only (no protocol/schema
+change). Phases 7–8 are not yet implemented.
 
 ---
 
@@ -1870,6 +1871,77 @@ publication time and is not repriced.
 
 Dependent on Phase 5. This is the only genuinely subtle phase; keep the
 review bar high.
+
+**Implementation notes (as shipped).** Daemon-only — no `mostro-core`
+change (reuses the Phase 2 dispute, Phase 3 payout, and Phase 4/5
+mechanisms) and **no new migration** (the Phase 0 `bonds` schema already
+carries `parent_bond_id` / `child_order_id` / `slashed_share_sats`).
+
+- **Payout timing: settle-at-close ("Option A").** The parent hold invoice
+  stays `Locked` for the whole range life. Each maker slice slash inserts a
+  child row (`PendingPayout`) and accumulates `slashed_share_sats` **without
+  settling**. The Phase 3 payout scheduler skips any child row whose parent
+  is still `Locked` (`child_payout_blocked_by_locked_parent`). At range
+  close the parent HTLC is settled **once**, the per-child counterparty
+  shares are paid, and the unslashed remainder is refunded to the maker.
+  Mostro never fronts liquidity. (The alternative — eager per-child payout —
+  was rejected to keep the "`PendingPayout` ⇒ sats already claimable"
+  invariant.) At close, the parent HTLC is settled **first** (while the bond
+  is still `Locked`), and only then are the `Locked → Slashed` CAS, the
+  maker-refund row insert, and the child claim-window re-anchor written in one
+  atomic SQLite transaction — so `Locked` is the sole in-flight state and the
+  `Locked`-keyed reconciliation sweep covers every crash window (a retry
+  re-settles harmlessly, since LND reports "already settled").
+- **Slash share is computed in fiat, not sats.** The literal §11.2 formula
+  divides sats by sats, but the slice sats and the bond-notional sats are
+  quoted at *different* prices (take time vs publication time), so that
+  ratio drifts with the BTC price. The daemon instead uses
+  `share_fraction = slice.fiat_amount / root.max_amount` (both fiat — the
+  ratio is price-invariant and equals the sats formula when the price is
+  stable). This needs no `parent_max_sats` column. The cumulative slashed
+  share is clamped to the locked bond amount as a rounding guard.
+- **The maker bond lives on the range *root*.** A slash on any slice walks
+  `range_parent_id` to the root (`find_maker_bond_for_order`) to find the
+  single maker bond. The child slash row's `order_id` and maker-side
+  `pubkey` are the *slice's*, so the Phase 3 recipient resolver pays the
+  slice's winning counterparty unchanged. The maker-refund row is marked by
+  `parent_bond_id IS NOT NULL AND child_order_id IS NULL` and pays
+  `bond.pubkey` (the maker) directly (`resolve_payout_recipient`).
+- **Range close is detected at every terminal hook** *except* a successful
+  release that spawns a remainder (the range continues then — the maker
+  bond stays `Locked`). `resolve_range_maker_bond_at_close[_or_warn]` is
+  invoked from `release_action` (no child spawned), `admin_settle` /
+  `admin_cancel` (a dispute ends the range), the three `cancel.rs` order-
+  termination paths, and the scheduler's `pending_expiry`. It is idempotent
+  (a CAS `Locked → Slashed`) and a no-op for non-range / already-resolved
+  bonds. Maker-responsible **timeout** slashes for range bonds land in
+  Phase 7; until then a maker-timeout cancel releases (no slash).
+- **"One slash row per slice" is enforced at the schema level.** Besides the
+  atomic `INSERT ... WHERE NOT EXISTS` in `record_maker_slice_slash` (which
+  already wins/loses the TOCTOU race correctly), a partial UNIQUE index on
+  `bonds(parent_bond_id, child_order_id) WHERE parent_bond_id IS NOT NULL AND
+  child_order_id IS NOT NULL` (migration `20260611120000`) makes the invariant
+  hold for any future caller (e.g. the Phase 7 maker-timeout slash) and
+  survive a code regression that drops the guard. SQLite treats NULLs as
+  distinct, so parent rows, taker bonds, and the maker-refund row
+  (`child_order_id NULL`) are unconstrained. The insert path treats a
+  constraint violation as the same idempotent no-op as `rows_affected = 0`.
+- **A reconciliation sweep retries a stranded close.** Because the order's
+  terminal-state commit is never gated on close success (best-effort, §8.2),
+  a transient LND/DB failure in `resolve_range_maker_bond_at_close` leaves the
+  parent `Locked` with no further retry from the terminal hooks — blocking
+  every slashed slice's payout until the CLTV safety net. The scheduler job
+  `job_reconcile_stranded_maker_bonds` (every 5 min) scans for `Locked` maker
+  parent bonds whose entire range tree (root + every `range_parent_id`
+  descendant) is in a terminal status and re-invokes the (idempotent) close
+  for each. A legitimately-open range — whose maker bond is `Locked` by
+  design — is never touched, since at least one descendant is non-terminal.
+  So a close failure **no longer relies solely on the CLTV safety net**; the
+  sweep is the primary recovery and CLTV is the last-resort backstop. The
+  range-tree terminality check walks `range_parent_id` downward with a
+  recursive CTE that uses `UNION` (dedup) so a corrupt cycle can't hang the
+  tick, and the scan isolates per-root failures (log + `continue`) so one
+  bad chain never blocks reconciliation of the other stranded bonds.
 
 ### 11.1 Data model
 

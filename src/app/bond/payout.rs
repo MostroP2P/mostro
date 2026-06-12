@@ -75,7 +75,7 @@ use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
 use crate::lightning::{routing_fee_cap_sats, LndConnector};
 use crate::util::{bytes_to_string, enqueue_order_msg};
 
-use super::db::find_bonds_by_state;
+use super::db::{find_bond_by_id, find_bonds_by_state};
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 
@@ -156,11 +156,51 @@ pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConne
 /// [`PaymentFailureKind`].
 ///
 /// [issue #750]: https://github.com/MostroP2P/mostro/issues/750
+/// Phase 6 — should the payout scheduler **skip** `bond` this tick because
+/// it is a child payout row (slice slash or maker refund) whose parent
+/// range bond is still `Locked`?
+///
+/// The parent HTLC is settled only at range close
+/// (`resolve_range_maker_bond_at_close` → parent `Slashed`); until then the
+/// sats backing the child are not in Mostro's wallet, so the child must not
+/// request an invoice or attempt `send_payment`. A missing parent (should
+/// never happen) is treated as "skip" defensively. Non-child rows
+/// (`parent_bond_id IS NULL`) are never blocked.
+async fn child_payout_blocked_by_locked_parent(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+) -> Result<bool, MostroError> {
+    let Some(parent_id) = bond.parent_bond_id else {
+        return Ok(false);
+    };
+    match find_bond_by_id(pool, parent_id).await? {
+        Some(parent) => Ok(parent.state == BondState::Locked.to_string()),
+        None => {
+            warn!(
+                bond_id = %bond.id,
+                parent_bond_id = %parent_id,
+                "bond payout: child row's parent bond is missing; skipping this tick"
+            );
+            Ok(true)
+        }
+    }
+}
+
 async fn process_one_bond(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
     bond: &Bond,
 ) -> Result<(), MostroError> {
+    // Phase 6 — a child payout row (slice slash or maker refund) must not
+    // be driven while its parent range bond is still `Locked`: the parent
+    // HTLC has not been settled, so the sats are not yet in Mostro's wallet
+    // and there is nothing to pay out from. `resolve_range_maker_bond_at_close`
+    // settles the parent (→ `Slashed`) at range close, which unblocks every
+    // child row on the next scheduler tick. Skip silently until then.
+    if child_payout_blocked_by_locked_parent(pool, bond).await? {
+        return Ok(());
+    }
+
     let cfg = Settings::get_bond();
     let claim_window_seconds = cfg
         .map(|c| c.payout_claim_window_days as i64 * 86_400)
@@ -352,7 +392,7 @@ async fn request_payout_invoice(
             )))
         })?;
 
-    let recipient_pubkey = match resolve_recipient(&order, bond, reason)? {
+    let recipient_pubkey = match resolve_payout_recipient(&order, bond, reason)? {
         Some(pk) => pk,
         None => {
             warn!(
@@ -997,6 +1037,29 @@ fn resolve_recipient(
     Ok(pk)
 }
 
+/// Payout recipient for any `PendingPayout` row, Phase-6 aware.
+///
+/// - **Maker-refund row** (Phase 6: `parent_bond_id` set, `child_order_id`
+///   NULL) → the recipient is the **maker themselves** (`bond.pubkey`), not
+///   a trade counterparty. This is the unslashed remainder being returned
+///   after a partial range slash.
+/// - **Everything else** — a normal slash row, or a Phase 6 *slice-slash*
+///   child (whose `order_id` is the slice order and whose `pubkey` is the
+///   maker's slice-side key) — resolves via [`resolve_recipient`] to the
+///   non-`bond.pubkey` side of the order, i.e. the winning counterparty.
+fn resolve_payout_recipient(
+    order: &Order,
+    bond: &Bond,
+    reason: BondSlashReason,
+) -> Result<Option<PublicKey>, MostroError> {
+    if bond.parent_bond_id.is_some() && bond.child_order_id.is_none() {
+        let pk = PublicKey::from_str(&bond.pubkey)
+            .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+        return Ok(Some(pk));
+    }
+    resolve_recipient(order, bond, reason)
+}
+
 /// Build the `SmallOrder` carried by bond-payout messages
 /// (`AddBondInvoice`, `BondInvoiceAccepted`, `BondPayoutCompleted`).
 /// `order.amount` carries the **counterparty share** — the figure the
@@ -1138,7 +1201,7 @@ async fn notify_payout_completed(pool: &Pool<Sqlite>, bond: &Bond, counterparty_
             return;
         }
     };
-    match resolve_recipient(&order, bond, reason) {
+    match resolve_payout_recipient(&order, bond, reason) {
         Ok(Some(recipient)) => {
             enqueue_payout_ack(
                 &order,
@@ -1223,7 +1286,24 @@ pub async fn add_bond_invoice_action(
     };
 
     let sender = event.sender;
-    let bond = find_recoverable_bond_for_recipient(pool, order_id, &sender.to_string()).await?;
+    // Phase 6: a single order can carry more than one payout debt to the
+    // *same* recipient (e.g. under `apply_to = both`, a range root may owe
+    // the maker both a taker-slash counterparty share and an unslashed
+    // refund). Decode the submitted invoice's amount so the finder can
+    // disambiguate by `counterparty_share` when several candidates share a
+    // recipient. `None` (amountless invoice / decode failure) falls back to
+    // the legacy recipient-only match.
+    let invoice_share_sats = decode_invoice(&payment_request)
+        .ok()
+        .and_then(|inv| inv.amount_milli_satoshis())
+        .map(|msat| (msat / 1000) as i64);
+    let bond = find_recoverable_bond_for_recipient(
+        pool,
+        order_id,
+        &sender.to_string(),
+        invoice_share_sats,
+    )
+    .await?;
     let bond = match bond {
         Some(b) => b,
         None => {
@@ -1439,6 +1519,7 @@ async fn find_recoverable_bond_for_recipient(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     sender_pubkey: &str,
+    expected_share_sats: Option<i64>,
 ) -> Result<Option<Bond>, MostroError> {
     let bonds: Vec<Bond> = sqlx::query_as::<_, Bond>(
         "SELECT * FROM bonds \
@@ -1464,6 +1545,10 @@ async fn find_recoverable_bond_for_recipient(
         None => return Ok(None),
     };
 
+    // Collect every recoverable row whose recipient matches the sender.
+    // Usually there is exactly one; Phase 6 can produce two debts to the
+    // same recipient on one order (see caller).
+    let mut matches: Vec<Bond> = Vec::new();
     for bond in bonds {
         let reason = match bond
             .slashed_reason
@@ -1473,13 +1558,30 @@ async fn find_recoverable_bond_for_recipient(
             Some(r) => r,
             None => continue,
         };
-        if let Some(recipient) = resolve_recipient(&order, &bond, reason)? {
+        if let Some(recipient) = resolve_payout_recipient(&order, &bond, reason)? {
             if recipient.to_string() == sender_pubkey {
-                return Ok(Some(bond));
+                matches.push(bond);
             }
         }
     }
-    Ok(None)
+
+    // Disambiguate by the submitted invoice amount when more than one debt
+    // shares the recipient: prefer the row whose counterparty share equals
+    // the invoice's amount. Fall back to the first (most recently slashed)
+    // match for the single-candidate case or an amountless invoice — this
+    // preserves the pre-Phase-6 behaviour exactly.
+    if matches.len() > 1 {
+        if let Some(target) = expected_share_sats {
+            if let Some(exact) = matches.iter().find(|b| {
+                counterparty_share_sats(b)
+                    .map(|s| s == target)
+                    .unwrap_or(false)
+            }) {
+                return Ok(Some(exact.clone()));
+            }
+        }
+    }
+    Ok(matches.into_iter().next())
 }
 
 #[cfg(test)]
@@ -1622,6 +1724,89 @@ mod tests {
         let bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, 0, None, None);
         let r = resolve_recipient(&order, &bond, BondSlashReason::LostDispute).unwrap();
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn resolve_payout_recipient_refund_row_pays_the_maker() {
+        // Phase 6 maker-refund row: `parent_bond_id` set, `child_order_id`
+        // NULL, `pubkey` = the maker. The recipient is the maker themselves,
+        // not the trade counterparty.
+        let order = Order {
+            kind: Kind::Sell.to_string(),
+            seller_pubkey: Some(maker_pk().to_string()),
+            buyer_pubkey: Some(taker_pk().to_string()),
+            ..Order::default()
+        };
+        let mut refund = pending_payout_bond(Uuid::new_v4(), maker_pk(), 600, 0, 0, None, None);
+        refund.parent_bond_id = Some(Uuid::new_v4());
+        refund.child_order_id = None;
+        let r = resolve_payout_recipient(&order, &refund, BondSlashReason::LostDispute).unwrap();
+        assert_eq!(
+            r.unwrap().to_string(),
+            maker_pk(),
+            "the unslashed-remainder refund is paid back to the maker"
+        );
+    }
+
+    #[test]
+    fn resolve_payout_recipient_slice_slash_pays_the_winner() {
+        // Phase 6 slice-slash child: `child_order_id` set, `pubkey` = the
+        // maker's slice-side key → recipient = the slice's other side (the
+        // winner), exactly as a normal slash resolves.
+        let order = Order {
+            kind: Kind::Sell.to_string(),
+            seller_pubkey: Some(maker_pk().to_string()),
+            buyer_pubkey: Some(taker_pk().to_string()),
+            ..Order::default()
+        };
+        let mut child = pending_payout_bond(Uuid::new_v4(), maker_pk(), 400, 200, 0, None, None);
+        child.parent_bond_id = Some(Uuid::new_v4());
+        child.child_order_id = Some(Uuid::new_v4());
+        let r = resolve_payout_recipient(&order, &child, BondSlashReason::LostDispute).unwrap();
+        assert_eq!(
+            r.unwrap().to_string(),
+            taker_pk(),
+            "a slice slash pays the non-maker winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_payout_blocked_while_parent_locked() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+
+        let mut parent =
+            Bond::new_requested(order_id, maker_pk().to_string(), BondRole::Maker, 1_000);
+        parent.state = BondState::Locked.to_string();
+        let parent = create_bond(&pool, parent).await.unwrap();
+
+        let mut child = pending_payout_bond(order_id, maker_pk(), 400, 0, 0, None, None);
+        child.parent_bond_id = Some(parent.id);
+        child.child_order_id = Some(order_id);
+        let child = create_bond(&pool, child).await.unwrap();
+
+        // Parent Locked → child must be skipped.
+        assert!(child_payout_blocked_by_locked_parent(&pool, &child)
+            .await
+            .unwrap());
+
+        // Settle the parent (range close) → child is unblocked.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Slashed.to_string())
+            .bind(parent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!child_payout_blocked_by_locked_parent(&pool, &child)
+            .await
+            .unwrap());
+
+        // A normal (non-child) row is never blocked.
+        let normal = pending_payout_bond(order_id, taker_pk(), 1_000, 0, 0, None, None);
+        assert!(!child_payout_blocked_by_locked_parent(&pool, &normal)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

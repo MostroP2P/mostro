@@ -531,6 +531,14 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
             TagKind::Custom(Cow::Borrowed("pow")),
             vec![mostro_settings.pow.to_string()],
         ),
+        // Capability advertisement: which Mostro protocol version this node
+        // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
+        // `transport` setting so clients pick the right wire format before
+        // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("protocol_versions")),
+            vec![mostro_settings.transport.protocol_version().to_string()],
+        ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("hold_invoice_expiration_window")),
             vec![ln_settings.hold_invoice_expiration_window.to_string()],

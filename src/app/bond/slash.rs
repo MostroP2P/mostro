@@ -375,17 +375,25 @@ async fn order_has_range_maker_bond(
 /// Responsibility maps directly from the waiting state:
 /// `WaitingBuyerInvoice → buyer`, `WaitingPayment → seller`. The
 /// buyer/seller → bond-row resolution then reuses the §3.1 order-kind
-/// mapping baked into [`apply_bond_resolution`] (a slash flag is matched
-/// against `order.buyer_pubkey` / `order.seller_pubkey`, which equal the
-/// bonded taker's trade pubkey). So under `apply_to = "take"` only the
-/// taker side ever carries a bond, and the maker-responsible rows of the
-/// §9.2 table fall through to release.
+/// mapping (a slash side is matched against `order.buyer_pubkey` /
+/// `order.seller_pubkey`, with the Phase 6 range-root fallback for a
+/// maker bond living on the range root). Phase 4 armed the taker side of
+/// the §9.2 table; Phase 7 fills the maker-responsible rows — the gate
+/// checks `apply_to` against the *responsible* party's posting role.
 ///
 /// A slash happens **only** when all of the following hold:
 /// - the feature is enabled, `slash_on_waiting_timeout = true`, and
-///   `apply_to` covers the taker;
+///   `apply_to` covers the responsible party's posting role (taker since
+///   Phase 4, maker since Phase 7);
 /// - the order is in a waiting state;
 /// - the responsible party holds a `Locked` bond.
+///
+/// A maker-responsible slash on a **range** order goes through the Phase 6
+/// partial-slash path: a proportional child row is recorded and the parent
+/// HTLC stays `Locked` (the single settle happens at range close — the
+/// scheduler's cancel branch runs the close right after the order
+/// terminates, with the reconciliation sweep as backstop). The returned
+/// bond is then the *child* row, carrying the slice's slashed amount.
 ///
 /// Otherwise every active bond is released. This preserves today's
 /// behaviour when the feature is off, when the bond belongs to the
@@ -469,21 +477,35 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
     // republish-vs-cancel split (keep the two in sync).
     let republishes = order_republishes_on_timeout(order);
 
-    // Gate the slash. `apply_to` is a posting-timing switch; Phase 4 is
-    // taker-only, so we check `applies_to_taker` (Phase 7 widens this to
-    // the maker). When the gate is closed we still release — bonds left
+    // Gate the slash per responsible role. `apply_to` is a posting-timing
+    // switch: Phase 4 armed the taker side, Phase 7 widens to the maker —
+    // the slash only arms when `apply_to` covers the *responsible* party's
+    // posting role. When the gate is closed we still release — bonds left
     // over from a prior enabled period must drain regardless (but a
     // republish still retains the maker bond).
-    let slash_armed = bond_cfg
-        .is_some_and(|c| c.enabled && c.slash_on_waiting_timeout && c.apply_to.applies_to_taker());
+    let responsible_is_maker = side_is_maker(order, side)?;
+    let slash_armed = bond_cfg.is_some_and(|c| {
+        c.enabled
+            && c.slash_on_waiting_timeout
+            && if responsible_is_maker {
+                c.apply_to.applies_to_maker()
+            } else {
+                c.apply_to.applies_to_taker()
+            }
+    });
     if !slash_armed {
         release_on_timeout(pool, order.id, republishes).await;
         return Ok(None);
     }
 
-    // Does the responsible party hold a `Locked` bond?
+    // Does the responsible party hold a `Locked` bond? Phase 7: a range
+    // order's maker bond lives on the range *root*, so the resolver must be
+    // range-aware (`resolve_slash_target` falls back to the root walk for
+    // the maker side; the taker side resolves on this order's bonds alone,
+    // exactly as Phase 4 did).
     let bonds = find_active_bonds_for_order(pool, order.id).await?;
-    let Some(responsible) = resolve_locked_bond(order, &bonds, side).cloned() else {
+    let is_range = order_has_range_maker_bond(pool, order).await?;
+    let Some(responsible) = resolve_slash_target(pool, order, &bonds, side, is_range).await? else {
         // Responsible party has no bond (e.g. the maker under
         // `apply_to = take`), or the bond already moved out of `Locked`.
         // No slash; release whatever is still active on the order
@@ -492,29 +514,71 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
         return Ok(None);
     };
 
-    // Settle the responsible bond's HTLC + CAS → PendingPayout(Timeout)
-    // (the Phase 2 `slash_one` primitive), then resolve the remaining
-    // active bonds: release them — but on a republish retain the maker's
-    // still-`Locked` bond, which the abandoning taker's timeout must not
-    // disturb. (We intentionally do **not** route this through
-    // `apply_bond_resolution`, which always releases every non-slashed
-    // bond — that is correct for a terminal dispute resolution but would
-    // wrongly release the maker on a republish.)
+    // Slash the responsible bond, then resolve the remaining active bonds:
+    // release them — but on a republish retain the maker's still-`Locked`
+    // bond, which the abandoning taker's timeout must not disturb. (We
+    // intentionally do **not** route this through `apply_bond_resolution`,
+    // which always releases every non-slashed bond — that is correct for a
+    // terminal dispute resolution but would wrongly release the maker on a
+    // republish.)
+    //
+    // Two slash shapes (mirroring `apply_bond_resolution`):
+    // - **Range maker** (Phase 7 × Phase 6): record a proportional child
+    //   slash row and leave the parent HTLC `Locked` — the single settle
+    //   happens at range close (`resolve_range_maker_bond_at_close`, run
+    //   by the scheduler's cancel branch / reconciliation sweep once the
+    //   order terminates). The notice-worthy row is the *child* (it carries
+    //   the slice's slashed amount), and only when this call actually
+    //   inserted it — an idempotent re-run must not re-notify.
+    // - **Everything else** (taker, non-range maker): settle the HTLC
+    //   inline via the Phase 2 `slash_one` primitive and confirm through
+    //   the durable `slashed_reason = Timeout` witness.
     let node_share_pct = Settings::get_bond().map_or(0.0, |c| c.slash_node_share_pct);
-    slash_one(
-        pool,
-        ln_client,
-        &responsible,
-        BondSlashReason::Timeout,
-        node_share_pct,
-    )
-    .await;
+    let slashed_row: Option<Bond> = if responsible_is_maker && is_range {
+        let root = find_range_root_order(pool, order.clone()).await?;
+        let inserted = record_maker_slice_slash(
+            pool,
+            order,
+            &root,
+            &responsible,
+            BondSlashReason::Timeout,
+            node_share_pct,
+        )
+        .await?;
+        if inserted {
+            find_slice_slash_child(pool, responsible.id, order.id).await?
+        } else {
+            None
+        }
+    } else {
+        slash_one(
+            pool,
+            ln_client,
+            &responsible,
+            BondSlashReason::Timeout,
+            node_share_pct,
+        )
+        .await;
+        // Confirm the slash actually landed before claiming it: a transient
+        // settle failure leaves the bond `Locked` (`slash_one` is
+        // best-effort), and we must never tell a user their bond was
+        // forfeited while the HTLC is still theirs.
+        if timeout_slash_confirmed(pool, responsible.id).await? {
+            Some(responsible.clone())
+        } else {
+            None
+        }
+    };
+
     let maker = BondRole::Maker.to_string();
     for bond in bonds.iter() {
         if bond.id == responsible.id {
             continue;
         }
-        if republishes && bond.role == maker {
+        // Retain the maker bond when the order survives (republish) or when
+        // it is a range parent — the latter spans the whole range and is
+        // resolved only at range close, never inline here.
+        if bond.role == maker && (republishes || is_range) {
             continue;
         }
         if let Err(e) = release_bond(pool, bond).await {
@@ -526,26 +590,42 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
         }
     }
 
-    // Confirm the slash actually landed before claiming it: a transient
-    // settle failure leaves the bond `Locked` (`slash_one` is best-effort),
-    // and we must never tell a user their bond was forfeited while the HTLC
-    // is still theirs.
-    if timeout_slash_confirmed(pool, responsible.id).await? {
-        info!(
-            bond_id = %responsible.id,
-            order_id = %order.id,
-            role = %responsible.role,
-            "Bond slashed on waiting-state timeout"
-        );
-        Ok(Some(responsible))
-    } else {
-        warn!(
-            bond_id = %responsible.id,
-            order_id = %order.id,
-            "timeout slash did not land (bond still Locked); no forfeiture notice sent"
-        );
-        Ok(None)
+    match slashed_row {
+        Some(slashed) => {
+            info!(
+                bond_id = %slashed.id,
+                order_id = %order.id,
+                role = %slashed.role,
+                "Bond slashed on waiting-state timeout"
+            );
+            Ok(Some(slashed))
+        }
+        None => {
+            warn!(
+                bond_id = %responsible.id,
+                order_id = %order.id,
+                "timeout slash did not land (still Locked / already slashed); no forfeiture notice sent"
+            );
+            Ok(None)
+        }
     }
+}
+
+/// Fetch the Phase 6 child slash row recorded for `(parent_bond_id,
+/// slice_order_id)` — the row the Phase 7 range-maker timeout path returns
+/// to the caller for the `BondSlashed` notice (it carries the slice's
+/// proportional slashed amount, not the whole parent bond).
+async fn find_slice_slash_child(
+    pool: &Pool<Sqlite>,
+    parent_bond_id: Uuid,
+    slice_order_id: Uuid,
+) -> Result<Option<Bond>, MostroError> {
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?")
+        .bind(parent_bond_id)
+        .bind(slice_order_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// Confirm a timeout slash actually landed on `bond_id`, regardless of
@@ -755,6 +835,12 @@ async fn slash_one<L: SettleLightning + Send>(
 /// publication and take), times the locked bond amount. The child row's
 /// `order_id` and maker-side `pubkey` are the slice's, so the Phase 3
 /// recipient resolver pays the slice's *other* side (the winner).
+///
+/// Returns `Ok(true)` when a child row was actually inserted by this call,
+/// `Ok(false)` on every idempotent skip (slice already slashed, parent no
+/// longer `Locked`, degenerate share). The Phase 7 timeout path keys the
+/// one-shot `BondSlashed` notice on this so a scheduler retry never
+/// re-notifies the maker for a slash that already landed.
 async fn record_maker_slice_slash(
     pool: &Pool<Sqlite>,
     slice: &Order,
@@ -762,7 +848,7 @@ async fn record_maker_slice_slash(
     parent_bond: &Bond,
     reason: BondSlashReason,
     node_share_pct: f64,
-) -> Result<(), MostroError> {
+) -> Result<bool, MostroError> {
     let kind = slice.get_order_kind().map_err(MostroInternalErr)?;
     let maker_slice_pubkey = match kind {
         Kind::Sell => slice.seller_pubkey.as_deref(),
@@ -774,7 +860,7 @@ async fn record_maker_slice_slash(
             slice_order_id = %slice.id,
             "record_maker_slice_slash: slice has no maker-side pubkey; skipping"
         );
-        return Ok(());
+        return Ok(false);
     };
     let Some(max_fiat) = root.max_amount.filter(|m| *m > 0) else {
         warn!(
@@ -782,7 +868,7 @@ async fn record_maker_slice_slash(
             root_order_id = %root.id,
             "record_maker_slice_slash: range root missing positive max_amount; skipping"
         );
-        return Ok(());
+        return Ok(false);
     };
 
     // Price-invariant proportional share, clamped so the cumulative slashed
@@ -798,7 +884,7 @@ async fn record_maker_slice_slash(
             raw, remaining,
             "record_maker_slice_slash: computed non-positive / over-allocated share; skipping"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let now = Utc::now().timestamp();
@@ -871,7 +957,7 @@ async fn record_maker_slice_slash(
                 slice_order_id = %slice.id,
                 "record_maker_slice_slash: slice already slashed (unique index); skipping duplicate"
             );
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => {
             return Err(MostroInternalErr(ServiceError::DbAccessError(
@@ -888,7 +974,7 @@ async fn record_maker_slice_slash(
             slice_order_id = %slice.id,
             "record_maker_slice_slash: slice already slashed or parent no longer Locked; skipping"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // Recompute the parent's running total from the authoritative slice
@@ -916,7 +1002,7 @@ async fn record_maker_slice_slash(
         slash_amount,
         "Phase 6: recorded proportional maker slice slash (parent HTLC stays Locked)"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Phase 6 — resolve a maker bond when its order (range chain) terminates
@@ -2428,6 +2514,256 @@ mod tests {
         assert_eq!(
             read_bond_state(&pool, bond.id).await,
             BondState::Released.to_string()
+        );
+    }
+
+    // ── Phase 7 — maker timeout slash ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_maker_responsible_slashes_maker_bond_sell_order() {
+        // Phase 7: sell order, WaitingPayment — the seller is responsible
+        // and on a sell order the seller is the *maker*. With apply_to=make
+        // armed, the maker's bond is slashed with reason=Timeout (the §9.2
+        // "no slash" row filled in by Phase 7).
+        let pool = setup_pool().await;
+        let order = waiting_order(Kind::Sell, maker_pk(), taker_pk(), Status::WaitingPayment);
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Make);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.map(|b| b.id),
+            Some(maker_bond.id),
+            "must report the slashed maker bond for notification"
+        );
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "the non-range maker slash settles the HTLC inline"
+        );
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT state, slashed_reason FROM bonds WHERE id = ?")
+                .bind(maker_bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, BondState::PendingPayout.to_string());
+        assert_eq!(row.1.as_deref(), Some("timeout"));
+    }
+
+    #[tokio::test]
+    async fn timeout_maker_responsible_buy_order_slashes_maker_and_releases_taker() {
+        // Phase 7 buy-order mirror: WaitingBuyerInvoice → buyer responsible,
+        // and on a buy order the buyer is the maker. Under apply_to=both the
+        // taker (seller) also holds a bond — it belongs to the
+        // non-responsible party, so it must be released, never slashed, and
+        // never retained (the timeout cancels the order outright).
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Buy,
+            taker_pk(),
+            maker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert_eq!(result.map(|b| b.id), Some(maker_bond.id));
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::PendingPayout.to_string(),
+            "maker bond slashed on maker-responsible timeout"
+        );
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::Released.to_string(),
+            "the non-responsible taker's bond is released on the terminal cancel"
+        );
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "only the slashed maker HTLC is settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_maker_slash_skipped_when_apply_to_take_only() {
+        // Per-role gate: a maker-responsible timeout with a leftover Locked
+        // maker bond (posted during a prior apply_to=make period) must NOT
+        // slash under apply_to=take — the gate checks the responsible
+        // party's posting role, not "any side is covered". The bond drains
+        // via release instead.
+        let pool = setup_pool().await;
+        let order = waiting_order(Kind::Sell, maker_pk(), taker_pk(), Status::WaitingPayment);
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_range_maker_slash_records_child_and_keeps_parent_locked() {
+        // Phase 7 × Phase 6: a maker-responsible timeout on a *range* order
+        // goes through the partial-slash path — a proportional child row is
+        // recorded (slice fiat 40 / max 100 × bond 1000 = 400, reason
+        // timeout) and the parent HTLC stays Locked; the single settle
+        // happens at range close, never here. The reported bond is the
+        // child (it carries the slice's slashed amount for the notice).
+        // The taker's own bond is released on the terminal cancel.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::WaitingPayment.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let taker_bond = insert_bond(&pool, root.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &root, Some(&cfg))
+            .await
+            .unwrap();
+
+        let child = result.expect("range maker timeout must report the child slash row");
+        assert_eq!(child.parent_bond_id, Some(parent.id));
+        assert_eq!(child.child_order_id, Some(root.id));
+        assert_eq!(child.amount_sats, 400, "proportional slice share");
+        assert_eq!(child.state, BondState::PendingPayout.to_string());
+        assert_eq!(child.slashed_reason.as_deref(), Some("timeout"));
+        assert_eq!(child.pubkey, maker_pk(), "the maker is the slashed party");
+
+        assert!(
+            ln.calls().is_empty(),
+            "the parent HTLC must NOT be settled mid-range (settle-at-close)"
+        );
+        let parent_row = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(parent_row.state, BondState::Locked.to_string());
+        assert_eq!(parent_row.slashed_share_sats, 400);
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::Released.to_string(),
+            "taker bond released on the terminal cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_range_maker_slash_resolves_root_bond_from_descendant_slice() {
+        // The maker bond lives on the range *root*; a timeout on a
+        // descendant slice (range remainder spawned by an earlier release)
+        // must walk `range_parent_id` to find it and record the child slash
+        // against the slice's own order id.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 0, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let mut slice = range_slice(Kind::Sell, maker_pk(), taker_pk(), 25, 10, 100);
+        slice.status = Status::WaitingPayment.to_string();
+        slice.range_parent_id = Some(root.id);
+        insert_range_order_row(&pool, &slice).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Make);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &slice, Some(&cfg))
+            .await
+            .unwrap();
+
+        let child = result.expect("slice timeout must resolve the root's maker bond");
+        assert_eq!(child.parent_bond_id, Some(parent.id));
+        assert_eq!(child.child_order_id, Some(slice.id));
+        assert_eq!(child.amount_sats, 250, "25/100 of the 1000-sat bond");
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, parent.id).await,
+            BondState::Locked.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_range_maker_slash_is_idempotent_per_slice() {
+        // A slice whose share was already slashed (e.g. by a dispute, or by
+        // a prior tick whose order-persist failed) must not be slashed
+        // twice, and — crucially for the notice — the dispatch must report
+        // None so the maker is never re-notified for the same slash.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::WaitingPayment.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        // Pre-existing child slash for this same slice.
+        let inserted = record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.0,
+        )
+        .await
+        .unwrap();
+        assert!(inserted, "fixture insert must land");
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Make);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &root, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "an already-slashed slice must not re-notify"
+        );
+        assert!(ln.calls().is_empty());
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "no duplicate child row");
+        assert_eq!(
+            children[0].slashed_reason.as_deref(),
+            Some("lost-dispute"),
+            "the original slash row is untouched"
         );
     }
 

@@ -482,13 +482,39 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // that strips eligibility) — on persist failure
                             // the next tick retries this branch only; the
                             // slash is durable in `bonds.slashed_reason` and
-                            // a re-entry sees no `Locked` bond, so it is a
+                            // a re-entry sees no `Locked` bond (or an
+                            // already-recorded slice child), so it is a
                             // no-op (no duplicate notify).
-                            if let Err(e) = order_updated.update(pool).await {
-                                tracing::warn!(
-                                    "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
-                                    order_id, e
-                                );
+                            match order_updated.update(pool).await {
+                                Ok(_) => {
+                                    // Phase 7: a maker-responsible timeout
+                                    // cancels the order outright, terminating
+                                    // its range chain — resolve the range
+                                    // maker bond at close (settle + per-slice
+                                    // payouts + maker refund when a slice was
+                                    // slashed; plain release otherwise). The
+                                    // close helper is idempotent and a cheap
+                                    // no-op for non-range / already-resolved
+                                    // bonds; on transient failure the
+                                    // reconciliation sweep retries. The
+                                    // republish branch must NOT close: the
+                                    // order returns to the book with the
+                                    // maker still committed.
+                                    if matches!(new_status, Status::Canceled) {
+                                        bond::resolve_range_maker_bond_at_close_or_warn(
+                                            pool,
+                                            &order,
+                                            "scheduler_timeout",
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
+                                        order_id, e
+                                    );
+                                }
                             }
                         }
                     }

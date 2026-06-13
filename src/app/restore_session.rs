@@ -143,6 +143,7 @@ async fn send_restore_session_response(
                     Action::AddInvoice,
                     Some(Payload::Order(SmallOrder::from(order.clone()))),
                     buyer_trade_pubkey,
+                    order.trade_index_buyer,
                 )
                 .await;
                 tracing::info!(

@@ -1126,8 +1126,9 @@ pub async fn enqueue_order_msg_on_restore_queue(
     action: Action,
     payload: Option<Payload>,
     destination_key: PublicKey,
+    trade_index: Option<i64>,
 ) {
-    let message = Message::new_order(order_id, None, None, action, payload);
+    let message = Message::new_order(order_id, None, trade_index, action, payload);
     MESSAGE_QUEUES
         .queue_restore_session_msg
         .write()

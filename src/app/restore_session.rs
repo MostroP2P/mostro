@@ -1,7 +1,7 @@
 use crate::app::context::AppContext;
 use crate::config::settings::get_db_pool;
 use crate::db::{find_failed_payment_for_master_key, RestoreSessionManager};
-use crate::util::{enqueue_order_msg, enqueue_restore_session_msg};
+use crate::util::{enqueue_order_msg_on_restore_queue, enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -112,50 +112,43 @@ async fn send_restore_session_response(
     // Re-send AddInvoice for any orders stuck in settled-hold-invoice with a failed payment.
     // Uses get_db_pool() since pool is not available in this function's scope.
     //
-    // IMPORTANT: we send to the *restoring* identity (master_key), not to
-    // order.get_buyer_pubkey().  The stored buyer pubkey is the session/trade
-    // key from the original failed payment; the reconnecting user may have
-    // rotated keys, switched devices, or restored from seed — in all those
-    // cases the old pubkey is stale and the DM would never be seen.
-    // Anchoring on master_key (the identity that just performed restore-session)
-    // guarantees delivery to whoever is actually waiting for the prompt.
-    let restoring_pubkey = match PublicKey::from_hex(master_key) {
-        Ok(pk) => pk,
-        Err(e) => {
-            tracing::error!(
-                "restore-session: could not parse master_key as PublicKey, skipping AddInvoice re-send: {}",
-                e
-            );
-            return Ok(());
-        }
-    };
+    // `find_failed_payment_for_master_key` filters on `master_buyer_pubkey =
+    // master_key`, so every order returned belongs to this restoring user as
+    // the BUYER. The correct AddInvoice recipient is therefore the order's
+    // own buyer trade key (`order.buyer_pubkey` / get_buyer_pubkey()) — the
+    // key the client actually listens on for order DMs. Sending to the
+    // master/identity key instead would (a) never reach the client, since
+    // order messages are only delivered to trade keys, and (b) publish the
+    // identity key as a gift-wrap recipient on Nostr, linking it to this
+    // order and breaking trade-key unlinkability.
     let pool = get_db_pool();
     match find_failed_payment_for_master_key(&pool, master_key).await {
         Ok(failed_orders) => {
             for order in failed_orders {
-                // Log a warning when the stored buyer pubkey is missing so operators
-                // can detect data inconsistencies, but always deliver to the
-                // reconnecting identity regardless.
-                if order.get_buyer_pubkey().is_err() {
-                    tracing::warn!(
-                        "Order {} has no stored buyer_pubkey; delivering AddInvoice to restoring identity {}",
-                        order.id,
-                        master_key
-                    );
-                }
-                enqueue_order_msg(
-                    None,
+                let buyer_trade_pubkey = match order.get_buyer_pubkey() {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Order {} has no valid buyer_pubkey (trade key); skipping AddInvoice re-send",
+                            order.id
+                        );
+                        continue;
+                    }
+                };
+                // Route through the restore-session queue so this AddInvoice
+                // is sent AFTER the restore-session response (same queue =
+                // FIFO), not before it.
+                enqueue_order_msg_on_restore_queue(
                     Some(order.id),
                     Action::AddInvoice,
                     Some(Payload::Order(SmallOrder::from(order.clone()))),
-                    restoring_pubkey,
-                    None,
+                    buyer_trade_pubkey,
                 )
                 .await;
                 tracing::info!(
-                    "Re-sent AddInvoice for order {} to restoring identity {} (failed payment)",
+                    "Re-sent AddInvoice for order {} to buyer trade key {} (failed payment)",
                     order.id,
-                    master_key
+                    buyer_trade_pubkey
                 );
             }
         }

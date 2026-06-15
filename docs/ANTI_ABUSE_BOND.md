@@ -195,7 +195,7 @@ slash path.
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | ✅ shipped (PR #767) |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | ✅ shipped (PR #770) |
 | 7 | Timeout slash for maker bond | 5 | ✅ shipped (PR #775) |
-| 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | ✅ shipped (PR #PLACEHOLDER) |
+| 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | ✅ shipped (PR #777) |
 
 Phases 4, 5, 6, 7 can partially overlap in time but must land in this
 order on `main` to keep review scope honest. Phase 3.5 depends only on
@@ -208,7 +208,7 @@ testing after Phase 4 shipped.
 
 **Status as of this revision.** Phases 0 through 7 (including 4.5) are
 merged on `main` (PRs #712, #719, #736, #737, #738, #743, #744, #755,
-#767, #770, #775), and Phase 8 is implemented (PR #PLACEHOLDER). The
+#767, #770, #775), and Phase 8 is implemented (PR #777). The
 `mostro-core` pin in `Cargo.toml` is **0.12.1**, which carries every
 protocol variant those phases need (`Status::WaitingTakerBond`,
 `Status::WaitingMakerBond`, `Action::PayBondInvoice`,

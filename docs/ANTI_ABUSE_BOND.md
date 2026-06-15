@@ -191,10 +191,10 @@ slash path.
 | 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | ✅ shipped (PR #738) |
 | 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | ✅ shipped (PR #743) |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (PR #744) |
-| 4.5 | Re-prompt the winner for a fresh payout invoice after `send_payment` retries exhaust, instead of stranding the bond in `Failed` ([issue #750](https://github.com/MostroP2P/mostro/issues/750)) | 3 | pending |
+| 4.5 | Re-prompt the winner for a fresh payout invoice after `send_payment` retries exhaust, instead of stranding the bond in `Failed` ([issue #750](https://github.com/MostroP2P/mostro/issues/750)) | 3 | ✅ shipped (PR #755) |
 | 5 | Maker bond (non-range): lock + dispute slash reusing Phase 2/3 | 3 | ✅ shipped (PR #767) |
 | 6 | Maker bond for **range orders** with proportional slashes | 5 | ✅ shipped (PR #770) |
-| 7 | Timeout slash for maker bond | 5 | pending |
+| 7 | Timeout slash for maker bond | 5 | ✅ shipped (PR #775) |
 | 8 | Public config exposure (Mostro info event) + operator docs polish | 7 | pending |
 
 Phases 4, 5, 6, 7 can partially overlap in time but must land in this
@@ -206,16 +206,17 @@ orthogonal to the slash-direction phases — it can land any time after
 Phase 3, and is numbered 4.5 only because it was reported from field
 testing after Phase 4 shipped.
 
-**Status as of this revision.** Phases 0 through 5 (including 4.5) are
+**Status as of this revision.** Phases 0 through 6 (including 4.5) are
 merged on `main` (PRs #712, #719, #736, #737, #738, #743, #744, #755,
-#767), and Phase 6 is implemented. The `mostro-core` pin in `Cargo.toml`
-is **0.12.1**, which carries every protocol variant those phases need
-(`Status::WaitingTakerBond`, `Status::WaitingMakerBond`,
-`Action::PayBondInvoice`, `Payload::BondResolution`,
-`Action::AddBondInvoice`, `Payload::BondPayoutRequest`,
-`Action::BondInvoiceAccepted`, `Action::BondPayoutCompleted`,
-`Action::BondSlashed`). Phase 6 is daemon-only (no protocol/schema
-change). Phases 7–8 are not yet implemented.
+#767, #770), and Phase 7 is implemented (PR #775). The `mostro-core` pin
+in `Cargo.toml` is **0.12.1**, which carries every protocol variant
+those phases need (`Status::WaitingTakerBond`,
+`Status::WaitingMakerBond`, `Action::PayBondInvoice`,
+`Payload::BondResolution`, `Action::AddBondInvoice`,
+`Payload::BondPayoutRequest`, `Action::BondInvoiceAccepted`,
+`Action::BondPayoutCompleted`, `Action::BondSlashed`). Phases 6 and 7
+are daemon-only (no protocol/schema change). Phase 8 is not yet
+implemented.
 
 ---
 
@@ -1914,8 +1915,9 @@ carries `parent_bond_id` / `child_order_id` / `slashed_share_sats`).
   `admin_cancel` (a dispute ends the range), the three `cancel.rs` order-
   termination paths, and the scheduler's `pending_expiry`. It is idempotent
   (a CAS `Locked → Slashed`) and a no-op for non-range / already-resolved
-  bonds. Maker-responsible **timeout** slashes for range bonds land in
-  Phase 7; until then a maker-timeout cancel releases (no slash).
+  bonds. Maker-responsible **timeout** slashes for range bonds shipped in
+  Phase 7 (a per-slice child slash via this same path; the scheduler's
+  terminal cancel branch then runs the close).
 - **"One slash row per slice" is enforced at the schema level.** Besides the
   atomic `INSERT ... WHERE NOT EXISTS` in `record_maker_slice_slash` (which
   already wins/loses the TOCTOU race correctly), a partial UNIQUE index on
@@ -2035,7 +2037,7 @@ the maker.
 
 ---
 
-## 12. Phase 7 — Maker timeout slash
+## 12. Phase 7 — Maker timeout slash ✅ Completed
 
 Gate: `enabled && slash_on_waiting_timeout && apply_to ∈ { make, both }`.
 
@@ -2051,6 +2053,49 @@ Phase 6 partial-slash path.
 
 Tests mirror Phase 4 from the maker side; the "no slash" rows in the
 §9.2 table become "slash maker bond".
+
+**Implementation notes (as shipped, PR #775).** Daemon-only — no
+`mostro-core` change, no migration (reuses `Action::BondSlashed` from
+Phase 4 and the Phase 6 child-slash schema).
+
+- **The gate is per responsible role.** `slash_or_release_on_timeout`
+  maps the §9.2 responsible side to maker/taker via the §3.1 order-kind
+  mapping and checks `apply_to` against *that* posting role
+  (`applies_to_maker()` / `applies_to_taker()`). A leftover `Locked`
+  maker bond under `apply_to = take` therefore still releases — the
+  gate is about who the node's policy covers, not "any side has a
+  bond".
+- **Range-aware bond resolution.** The responsible bond resolves
+  through the Phase 2/6 `resolve_slash_target` primitive: pubkey match
+  on the order's own bonds first, then the range-root walk for the
+  maker side (the maker bond of a range order lives on the root, not
+  the slice).
+- **Non-range maker slash** settles the HTLC inline via the Phase 2
+  `slash_one` primitive and confirms through the durable
+  `slashed_reason = Timeout` witness, exactly like the taker path.
+- **Range maker slash** records a proportional child row
+  (`record_maker_slice_slash`, `reason = Timeout`) and leaves the
+  parent HTLC `Locked` — settle-at-close, per Phase 6. The dispatch
+  reports the *child* row, so the `Action::BondSlashed` notice carries
+  the slice's slashed amount. `record_maker_slice_slash` now returns
+  whether it actually inserted; the notice fires only on a fresh
+  insert, so a scheduler retry (order persist failed, next tick
+  re-runs) never re-notifies — the range parent stays `Locked` by
+  design, so the Phase 4 "no `Locked` bond on re-entry" guarantee
+  cannot provide this and the insert flag does instead.
+- **Range close on the terminal cancel.** A maker-responsible timeout
+  cancels the order outright (no remainder is spawned on a cancel), so
+  the range terminates. The scheduler's cancel branch runs
+  `resolve_range_maker_bond_at_close_or_warn` right after the
+  `Canceled` status persists: the parent settles once and the
+  per-slice counterparty shares + maker refund distribute promptly via
+  Phase 3, instead of waiting for the 5-minute reconciliation sweep
+  (which remains the backstop on transient failure). The republish
+  branch never closes — the order returns to the book with the maker
+  still committed and its bond `Locked`.
+- **The timeout release loop retains a range maker parent** alongside
+  the existing retain-on-republish carve-out: the parent spans the
+  whole range and is only ever resolved at range close.
 
 ---
 

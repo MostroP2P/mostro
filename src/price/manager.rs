@@ -7,31 +7,47 @@
 //! providers, aggregate, and write the store; consumers (`get_bitcoin_price`,
 //! `BitcoinPriceManager::get_price`) read through [`PriceManager::get_price`].
 //!
-//! ## Phase 1 invariants (spec §9 Phase 1)
-//! - The registry is built from `[price]`; only Yadio is wired here, the
-//!   keyless backups land in Phase 2.
+//! ## Phase 1 / 2 invariants (spec §9)
+//! - The registry is built from `[price]`; the direct quoters (Yadio,
+//!   CoinGecko, currency-api, Blockchain) are wired, El Toque lands in
+//!   Phase 3.
 //! - Staleness is **logged, not enforced**: a value older than one
 //!   `update_interval` emits a `warn!` but still returns to the caller, so
-//!   Phase 1 never refuses an order that would have priced today.
+//!   Phases 1–3 never refuse an order that would have priced today.
 //!   Enforcement turns on in Phase 4.
 //! - Per-provider failures are isolated: a failed poll contributes nothing
 //!   this tick and the store's last-known-good value is preserved (spec
-//!   §6.4). The full circuit breaker integration lands in Phase 2.
+//!   §6.4). Providers are polled **concurrently**, each bounded by
+//!   `provider_timeout_seconds`, and repeated failures open a per-provider
+//!   circuit breaker with exponential-backoff cooldown (spec §6.5).
+//! - The §6.6 pipeline glue (fiat allowlist + per-provider `only`/`except`
+//!   scoping) runs at the manager boundary, keeping `aggregate_tick`
+//!   purely numeric.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use mostro_core::error::{MostroError, ServiceError};
 use nostr_sdk::prelude::*;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::aggregate::{aggregate_tick, AggregateResult};
 use super::config::{PriceSettings, ProviderConfig};
-use super::provider::{PriceProvider, ProviderError, ProviderId, ProviderQuotes};
+use super::fiat::is_known_fiat;
+use super::provider::{PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes};
+use super::providers::blockchain::BlockchainProvider;
+use super::providers::coingecko::CoinGeckoProvider;
+use super::providers::currency_api::CurrencyApiProvider;
 use super::providers::yadio::YadioProvider;
 use super::store::{PriceError, PriceStore};
+
+/// Hard cap on the circuit breaker's exponential-backoff cooldown
+/// (spec §6.5: backs off from `provider_failure_cooldown_seconds` "up to a
+/// cap (default 1800)"). Not configurable — a provider that has been down
+/// for a while should still be re-probed at least every 30 minutes.
+const PROVIDER_COOLDOWN_CAP_SECONDS: u64 = 1800;
 
 /// Process-wide singleton. Initialized once in `main` after settings load,
 /// then read by the scheduler (`update_all`) and consumers (`get_price`).
@@ -39,11 +55,13 @@ use super::store::{PriceError, PriceStore};
 /// and tests that never call `init_global` see `None`.
 static PRICE_MANAGER: OnceLock<PriceManager> = OnceLock::new();
 
-/// One enabled provider plus its registry metadata. Health tracking goes
-/// here in Phase 2 — Phase 1 only needs the box.
+/// One enabled provider plus its registry metadata and circuit-breaker
+/// state (spec §6.5). `health` is a `Mutex` (not `RwLock`) because every
+/// access mutates; contention is nil — one scheduler tick at a time.
 struct EnabledProvider {
     id: ProviderId,
     provider: Box<dyn PriceProvider>,
+    health: Mutex<ProviderHealth>,
 }
 
 /// Outer `Result` is from [`tokio::time::timeout`] (Elapsed = timed out),
@@ -84,7 +102,11 @@ impl PriceManager {
             match id_str.parse::<ProviderId>() {
                 Ok(id) => {
                     let provider = build_provider(id, cfg)?;
-                    providers.push(EnabledProvider { id, provider });
+                    providers.push(EnabledProvider {
+                        id,
+                        provider,
+                        health: Mutex::new(ProviderHealth::new()),
+                    });
                 }
                 Err(_) => {
                     warn!(
@@ -132,14 +154,15 @@ impl PriceManager {
         &self.settings
     }
 
-    /// One scheduler tick: poll all enabled providers concurrently with a
-    /// per-provider timeout, aggregate, and write the store
-    /// (spec §5.3 steps 1–3). A failed/timed-out provider contributes
-    /// nothing — the store's prior values for its currencies survive as
-    /// last-known-good (spec §6.4).
+    /// One scheduler tick: poll all enabled, breaker-available providers
+    /// **concurrently** — each fetch bounded by `provider_timeout_seconds`
+    /// — then aggregate and write the store (spec §5.3 steps 1–3). A
+    /// failed/timed-out provider contributes nothing — the store's prior
+    /// values for its currencies survive as last-known-good (spec §6.4) —
+    /// and counts against its circuit breaker (spec §6.5).
     ///
-    /// Returns the per-provider outcome so the scheduler / Phase 2 circuit
-    /// breaker can act on it. Phase 1 only logs it.
+    /// Returns the per-provider outcome so the scheduler can log outage
+    /// transitions.
     pub async fn update_all(&self) -> TickReport {
         let mut report = TickReport::default();
         if self.providers.is_empty() {
@@ -147,51 +170,110 @@ impl PriceManager {
             return report;
         }
 
-        // Phase 1 only wires Yadio, so per-provider parallelism does not
-        // change wall-clock time yet; each fetch is awaited in sequence
-        // with its own [`tokio::time::timeout`] guard so one hanging API
-        // can't block the tick beyond `provider_timeout_seconds`. Phase 2
-        // (multiple direct quoters) replaces this with a concurrent driver
-        // alongside the circuit-breaker integration (spec §6.5).
-        let timeout = Duration::from_secs(self.settings.provider_timeout_seconds);
-        let mut outcomes: Vec<(ProviderId, TimeoutResult)> =
-            Vec::with_capacity(self.providers.len());
+        // Circuit breaker (spec §6.5): a provider in cooldown is skipped
+        // outright — no request, no log spam, no tick slow-down. A poisoned
+        // health lock degrades to "available": polling a sick provider too
+        // often is the safer failure mode (worst case: log noise), whereas
+        // never polling again would silently amputate a source.
+        let now = Utc::now().timestamp();
+        let mut pollable: Vec<&EnabledProvider> = Vec::with_capacity(self.providers.len());
         for p in &self.providers {
-            let res = tokio::time::timeout(timeout, p.provider.fetch(&self.http)).await;
-            outcomes.push((p.id, res));
+            let available = p.health.lock().map(|h| h.is_available(now)).unwrap_or(true);
+            if available {
+                pollable.push(p);
+            } else {
+                info!("price: {} skipped: cooldown (circuit breaker open)", p.id);
+                report.skipped.push(p.id);
+            }
         }
 
+        // Poll concurrently (spec §5.3 "poll all healthy providers, in
+        // parallel"): the tick's wall-clock is the slowest single provider,
+        // never the sum. Each fetch carries its own [`tokio::time::timeout`]
+        // sized by [`Self::poll_budget`] — the *per-attempt* bound is the
+        // shared `reqwest` client's request timeout (`from_settings`), while
+        // this outer budget covers the provider's whole mirror sequence, so
+        // a hanging primary cannot starve its `fallback_urls` (they'd be
+        // dead code in exactly the hung case otherwise).
+        let outcomes: Vec<(ProviderId, TimeoutResult)> =
+            futures::future::join_all(pollable.iter().map(|p| async move {
+                let res =
+                    tokio::time::timeout(self.poll_budget(p.id), p.provider.fetch(&self.http))
+                        .await;
+                (p.id, res)
+            }))
+            .await;
+
         let mut quotes_by_provider: Vec<(ProviderId, ProviderQuotes)> =
-            Vec::with_capacity(self.providers.len());
-        for (id, outcome) in outcomes {
-            match outcome {
+            Vec::with_capacity(pollable.len());
+        // Re-stamp the clock: the polls above may have consumed up to a full
+        // poll budget, and a breaker cooldown anchored at the *pre-poll*
+        // `now` would be born already partially expired — weakening the
+        // skip exactly when a slow-failing provider needs it most.
+        let failed_at = Utc::now().timestamp();
+        // `join_all` preserves input order, so `pollable[i]` is the provider
+        // behind `outcomes[i]` — zip them to feed the breaker.
+        for (p, (id, outcome)) in pollable.iter().zip(outcomes) {
+            let ok = match outcome {
                 Ok(Ok(quotes)) => {
                     info!("price: {} ok ({} currencies)", id, quotes.len());
                     quotes_by_provider.push((id, quotes));
                     report.successes.push(id);
+                    true
                 }
                 Ok(Err(e)) => {
                     warn!("price: {} error: {}", id, e);
                     report.failures.push((id, e.to_string()));
+                    false
                 }
                 Err(_) => {
                     warn!(
-                        "price: {} timed out after {}s",
-                        id, self.settings.provider_timeout_seconds
+                        "price: {} timed out after {}s (full mirror budget)",
+                        id,
+                        self.poll_budget(id).as_secs()
                     );
                     report.failures.push((id, "timeout".to_string()));
+                    false
+                }
+            };
+            if let Ok(mut health) = p.health.lock() {
+                if ok {
+                    health.record_success();
+                } else {
+                    health.record_failure(
+                        failed_at,
+                        self.settings.provider_failure_threshold,
+                        self.settings.provider_failure_cooldown_seconds,
+                        PROVIDER_COOLDOWN_CAP_SECONDS,
+                    );
                 }
             }
         }
 
-        // Apply per-provider currency scoping (spec §6.6) before
-        // aggregation. The scoping rules are configured per
-        // [price.providers.<id>]; the Phase 2 §6.6 pipeline glue (fiat
-        // allowlist, etc.) layers on top of this. Doing the filter here
-        // keeps `aggregate_tick` purely numeric.
+        // §6.6 pipeline glue, at the manager boundary so `aggregate_tick`
+        // stays purely numeric:
+        //  1. fiat allowlist — drop crypto/metals/non-ISO junk (e.g.
+        //     currency-api's `eth`, Yadio's `XAU`) before they can form
+        //     single-source aggregates or bloat the Nostr event;
+        //  2. per-provider `only`/`except` scoping — a mis-marketed source
+        //     (currency-api's official-rate CUP) never enters the median.
         let filtered_with_ids: Vec<(ProviderId, ProviderQuotes)> = quotes_by_provider
             .into_iter()
-            .map(|(id, quotes)| (id, self.scope_quotes(id, quotes)))
+            .map(|(id, quotes)| {
+                let before = quotes.len();
+                let fiat_only: ProviderQuotes = quotes
+                    .into_iter()
+                    .filter(|(code, _)| is_known_fiat(code))
+                    .collect();
+                let dropped = before - fiat_only.len();
+                if dropped > 0 {
+                    debug!(
+                        "price: {} dropped {} non-fiat codes (allowlist)",
+                        id, dropped
+                    );
+                }
+                (id, self.scope_quotes(id, fiat_only))
+            })
             .collect();
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
@@ -225,6 +307,35 @@ impl PriceManager {
         }
 
         report
+    }
+
+    /// Wall-clock budget for one provider's poll: `provider_timeout_seconds`
+    /// times the number of URLs the provider may try (primary +
+    /// `fallback_urls`), plus one second of slack for inter-attempt
+    /// overhead.
+    ///
+    /// Layering: the **per-attempt** bound is enforced by the shared
+    /// `reqwest` client (`from_settings` sets
+    /// `.timeout(provider_timeout_seconds)`), so a hung mirror burns one
+    /// slot of this budget, not all of it. Sizing the outer
+    /// [`tokio::time::timeout`] to the whole sequence keeps the §7
+    /// "mirrors tried in sequence" promise alive in the hung-primary case —
+    /// with a flat budget the fallbacks were dead code precisely when the
+    /// primary hung rather than refused (Codex review on PR #773).
+    fn poll_budget(&self, id: ProviderId) -> Duration {
+        let attempts = self
+            .settings
+            .providers
+            .get(&id.to_string())
+            .map(|c| 1 + c.fallback_urls.len() as u64)
+            .unwrap_or(1)
+            .max(1);
+        Duration::from_secs(
+            self.settings
+                .provider_timeout_seconds
+                .saturating_mul(attempts)
+                .saturating_add(1),
+        )
     }
 
     /// Apply this provider's `only`/`except` filter (spec §6.6). Done at the
@@ -446,13 +557,12 @@ fn sources_to_tag(ids: &[ProviderId]) -> String {
 fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceProvider>, String> {
     match id {
         ProviderId::Yadio => Ok(Box::new(YadioProvider::new(cfg))),
-        // Other adapters land in their own phases (CoinGecko/currency_api/
-        // Blockchain → Phase 2, El Toque → Phase 3). Reject explicitly so
-        // an over-eager config doesn't silently spawn nothing.
-        ProviderId::CoinGecko
-        | ProviderId::CurrencyApi
-        | ProviderId::Blockchain
-        | ProviderId::ElToque => Err(format!(
+        ProviderId::CoinGecko => Ok(Box::new(CoinGeckoProvider::new(cfg))),
+        ProviderId::CurrencyApi => Ok(Box::new(CurrencyApiProvider::new(cfg))),
+        ProviderId::Blockchain => Ok(Box::new(BlockchainProvider::new(cfg))),
+        // El Toque lands in Phase 3. Reject explicitly so an over-eager
+        // config doesn't silently spawn nothing.
+        ProviderId::ElToque => Err(format!(
             "price: provider `{id}` is configured (enabled) but not yet implemented in \
              this release — disable it or remove it from `[price.providers]` \
              (see docs/PRICE_PROVIDERS.md §7)"
@@ -479,14 +589,17 @@ impl std::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// Per-tick outcome used by the scheduler (for outage logging) and the
-/// Phase 2 circuit breaker.
+/// Per-tick outcome used by the scheduler (for outage logging) and tests.
 #[derive(Debug, Default)]
 pub struct TickReport {
     /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick.
     pub successes: Vec<ProviderId>,
     /// Providers that failed or timed out, with the stringified error.
     pub failures: Vec<(ProviderId, String)>,
+    /// Providers not polled because their circuit breaker is in cooldown
+    /// (spec §6.5). Neither a success nor a failure: the breaker state
+    /// carries over to the next tick.
+    pub skipped: Vec<ProviderId>,
     /// Providers whose post-scope quote map was non-empty — i.e. those
     /// that actually contributed at least one currency to the aggregate.
     /// Distinct from `successes`: a scoped-out provider lands in
@@ -566,7 +679,7 @@ mod tests {
         }
     }
 
-    fn manager_with(scripted: ScriptedProvider) -> PriceManager {
+    fn manager_with_many(scripted: Vec<ScriptedProvider>) -> PriceManager {
         // Disable Nostr publishing so tests don't reach the global Nostr
         // client (which isn't installed in unit tests); short timeout so a
         // hanging mock can't blow the test runner.
@@ -575,29 +688,38 @@ mod tests {
             provider_timeout_seconds: 5,
             ..PriceSettings::default()
         };
-        settings.providers.insert(
-            scripted.id.to_string(),
-            ProviderConfig {
-                enabled: true,
-                url: "http://test".into(),
-                fallback_urls: vec![],
-                api_key: None,
-                token: None,
-                only: None,
-                except: None,
-            },
-        );
+        let mut providers = Vec::new();
+        for s in scripted {
+            settings.providers.insert(
+                s.id.to_string(),
+                ProviderConfig {
+                    enabled: true,
+                    url: "http://test".into(),
+                    fallback_urls: vec![],
+                    api_key: None,
+                    token: None,
+                    only: None,
+                    except: None,
+                },
+            );
+            providers.push(EnabledProvider {
+                id: s.id,
+                provider: Box::new(s),
+                health: Mutex::new(ProviderHealth::new()),
+            });
+        }
         PriceManager {
-            providers: vec![EnabledProvider {
-                id: scripted.id,
-                provider: Box::new(scripted),
-            }],
+            providers,
             store: Arc::new(PriceStore::new()),
             settings,
             http: reqwest::Client::new(),
             warned_stale: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
         }
+    }
+
+    fn manager_with(scripted: ScriptedProvider) -> PriceManager {
+        manager_with_many(vec![scripted])
     }
 
     #[tokio::test]
@@ -710,23 +832,51 @@ mod tests {
     }
 
     #[test]
-    fn from_settings_rejects_invalid_provider_id() {
-        // An enabled provider whose adapter isn't yet wired must fail at
-        // startup, not silently produce nothing.
+    fn from_settings_rejects_unimplemented_provider_id() {
+        // An enabled provider whose adapter isn't yet wired (El Toque,
+        // Phase 3) must fail at startup, not silently produce nothing.
         let mut settings = PriceSettings::default();
         settings.providers.insert(
-            ProviderId::CoinGecko.to_string(),
+            ProviderId::ElToque.to_string(),
             ProviderConfig {
                 enabled: true,
-                url: "https://api.coingecko.com/api/v3".into(),
+                url: "https://tasas.eltoque.com".into(),
                 fallback_urls: vec![],
                 api_key: None,
-                token: None,
+                token: Some("x".into()),
                 only: None,
                 except: None,
             },
         );
         assert!(PriceManager::from_settings(settings).is_err());
+    }
+
+    #[test]
+    fn from_settings_builds_all_phase2_providers() {
+        // Spec §9 Phase 2: the three keyless backups join Yadio in the
+        // registry — the §7 example config must now build cleanly.
+        let mut settings = PriceSettings::default();
+        for (id, url) in [
+            (ProviderId::Yadio, "https://api.yadio.io"),
+            (ProviderId::CoinGecko, "https://api.coingecko.com/api/v3"),
+            (ProviderId::CurrencyApi, "https://currency-api.pages.dev/v1"),
+            (ProviderId::Blockchain, "https://blockchain.info"),
+        ] {
+            settings.providers.insert(
+                id.to_string(),
+                ProviderConfig {
+                    enabled: true,
+                    url: url.into(),
+                    fallback_urls: vec![],
+                    api_key: None,
+                    token: None,
+                    only: None,
+                    except: None,
+                },
+            );
+        }
+        let m = PriceManager::from_settings(settings).expect("phase 2 registry builds");
+        assert_eq!(m.providers.len(), 4);
     }
 
     #[test]
@@ -803,6 +953,257 @@ mod tests {
             "scoped-out provider must not appear in the Nostr source tag"
         );
         assert_eq!(report.fresh_currencies, 0);
+    }
+
+    fn quotes_of(pairs: &[(&str, f64)]) -> ProviderQuotes {
+        pairs
+            .iter()
+            .map(|(c, v)| (c.to_string(), Quote::PerBtc(*v)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn multi_source_aggregate_is_median_plus_outlier_mean() {
+        // Spec §9 Phase 2 acceptance: EUR/USD aggregate = median + outlier
+        // across all live direct quoters, and a wild outlier with ≥3
+        // sources is discarded. USD candidates {49_500, 50_000, 50_500,
+        // 80_000}: median 50_250, the 5% band keeps the first three, the
+        // 80_000 outlier is dropped → mean = 50_000.
+        let providers = vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![Ok(quotes_of(&[("USD", 50_000.0), ("EUR", 43_000.0)]))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CoinGecko,
+                vec![Ok(quotes_of(&[("USD", 50_500.0), ("EUR", 43_200.0)]))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::Blockchain,
+                vec![Ok(quotes_of(&[("USD", 49_500.0), ("EUR", 42_800.0)]))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CurrencyApi,
+                vec![Ok(quotes_of(&[("USD", 80_000.0)]))], // wild outlier
+            ),
+        ];
+        let manager = manager_with_many(providers);
+        let report = manager.update_all().await;
+        assert_eq!(report.successes.len(), 4);
+
+        let usd = manager.get_price("USD").unwrap();
+        assert!(
+            (usd - 50_000.0).abs() < 1e-6,
+            "outlier must be discarded before the mean, got {usd}"
+        );
+        let eur = manager.get_price("EUR").unwrap();
+        assert!(
+            (eur - 43_000.0).abs() < 1e-6,
+            "median-anchored mean, got {eur}"
+        );
+        // The outlier provider polled OK but its value did not survive —
+        // it must not appear in the contributing-source list.
+        assert!(report.contributors.contains(&ProviderId::Yadio));
+        assert!(!report.contributors.contains(&ProviderId::CurrencyApi));
+    }
+
+    #[tokio::test]
+    async fn lowercase_and_uppercase_codes_combine() {
+        // Spec §9 Phase 2 acceptance: lowercase currency-api codes combine
+        // with uppercase Yadio codes — the normalisation test that would
+        // silently fail without §6.6. (Adapters canonicalise; this guards
+        // the aggregator-side uppercase against a future adapter that
+        // forgets.)
+        let providers = vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes_of(&[("USD", 50_000.0)]))]),
+            ScriptedProvider::new(
+                ProviderId::CurrencyApi,
+                vec![Ok(quotes_of(&[("usd", 51_000.0)]))],
+            ),
+        ];
+        let manager = manager_with_many(providers);
+        manager.update_all().await;
+        let usd = manager.get_price("USD").unwrap();
+        assert!(
+            (usd - 50_500.0).abs() < 1e-6,
+            "two casings must form ONE two-source aggregate (mean), got {usd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_fiat_codes_are_dropped_by_allowlist() {
+        // Spec §9 Phase 2 acceptance: non-fiat codes (`eth`, `bnb`) from
+        // currency-api are dropped by the allowlist — as are Yadio's
+        // metals/BTC self-quote.
+        let providers = vec![ScriptedProvider::new(
+            ProviderId::CurrencyApi,
+            vec![Ok(quotes_of(&[
+                ("usd", 50_000.0),
+                ("eth", 37.8),
+                ("bnb", 150.0),
+                ("xau", 25.0),
+                ("btc", 1.0),
+            ]))],
+        )];
+        let manager = manager_with_many(providers);
+        let report = manager.update_all().await;
+        assert_eq!(
+            report.fresh_currencies, 1,
+            "only USD survives the allowlist"
+        );
+        assert!(manager.get_price("USD").is_ok());
+        assert!(manager.get_price("ETH").is_err());
+        assert!(manager.get_price("BTC").is_err());
+    }
+
+    #[tokio::test]
+    async fn official_cup_is_scoped_out_by_except() {
+        // Spec §9 Phase 2 acceptance: currency-api's official-rate CUP is
+        // scoped out by the shipped `except = ["CUP","MLC"]`, so it never
+        // enters the CUP aggregate — Yadio's informal rate stands alone.
+        let providers = vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![Ok(quotes_of(&[("USD", 50_000.0), ("CUP", 20_000_000.0)]))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CurrencyApi,
+                // Official rate: ~26 CUP/USD → 1.3M CUP/BTC — 15× off.
+                vec![Ok(quotes_of(&[("usd", 50_100.0), ("cup", 1_300_000.0)]))],
+            ),
+        ];
+        let mut manager = manager_with_many(providers);
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::CurrencyApi.to_string())
+            .unwrap()
+            .except = Some(vec!["CUP".into(), "MLC".into()]);
+
+        manager.update_all().await;
+        let cup = manager.get_price("CUP").unwrap();
+        assert!(
+            (cup - 20_000_000.0).abs() < 1e-6,
+            "official-rate CUP must never enter the aggregate (got {cup}); \
+             with only 2 sources the outlier guard cannot save us — scoping must"
+        );
+        // USD still combines from both.
+        let usd = manager.get_price("USD").unwrap();
+        assert!((usd - 50_050.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn provider_down_falls_back_to_remaining_sources() {
+        // Spec §9 Phase 2 acceptance: a provider down → currencies fall
+        // back to the remaining sources, same tick.
+        let providers = vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes_of(&[("USD", 50_000.0)]))]),
+            ScriptedProvider::new(
+                ProviderId::CoinGecko,
+                vec![Err(ProviderError::Http("down".into()))],
+            ),
+        ];
+        let manager = manager_with_many(providers);
+        let report = manager.update_all().await;
+        assert_eq!(report.successes, vec![ProviderId::Yadio]);
+        assert_eq!(report.failures.len(), 1);
+        assert!((manager.get_price("USD").unwrap() - 50_000.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_skips_after_threshold_failures() {
+        // Spec §9 Phase 2 acceptance: the breaker opens after N consecutive
+        // failures, and an open breaker means the provider is not even
+        // polled next tick (skipped, not failed). The cooldown/half-open
+        // timing math is covered by the pure ProviderHealth unit tests.
+        let scripted = ScriptedProvider::new(
+            ProviderId::CoinGecko,
+            vec![
+                Err(ProviderError::Http("down".into())),
+                // Would succeed if (wrongly) polled while the breaker is open:
+                Ok(quotes_of(&[("USD", 50_000.0)])),
+            ],
+        );
+        let mut manager = manager_with(scripted);
+        manager.settings.provider_failure_threshold = 1;
+        manager.settings.provider_failure_cooldown_seconds = 3_600; // ≫ test runtime
+
+        let first = manager.update_all().await;
+        assert_eq!(
+            first.failures.len(),
+            1,
+            "tick 1: the failure trips the breaker"
+        );
+        assert!(first.skipped.is_empty());
+
+        let second = manager.update_all().await;
+        assert_eq!(
+            second.skipped,
+            vec![ProviderId::CoinGecko],
+            "tick 2: open breaker → skipped without polling"
+        );
+        assert!(
+            second.successes.is_empty(),
+            "the scripted Ok was never consumed"
+        );
+        assert!(second.failures.is_empty(), "skipped ≠ failed");
+    }
+
+    #[test]
+    fn poll_budget_scales_with_fallback_urls() {
+        // The outer per-provider timeout must cover the whole mirror
+        // sequence (primary + fallbacks), or a hung primary starves the
+        // mirrors (Codex review on PR #773). Per-attempt bounding is the
+        // shared reqwest client's job.
+        let scripted = ScriptedProvider::new(ProviderId::CurrencyApi, vec![]);
+        let mut manager = manager_with(scripted);
+        manager.settings.provider_timeout_seconds = 10;
+
+        // No fallbacks: one attempt + 1s slack.
+        assert_eq!(
+            manager.poll_budget(ProviderId::CurrencyApi),
+            Duration::from_secs(11)
+        );
+        // Two mirrors: three attempts + slack.
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::CurrencyApi.to_string())
+            .unwrap()
+            .fallback_urls = vec!["http://m1".into(), "http://m2".into()];
+        assert_eq!(
+            manager.poll_budget(ProviderId::CurrencyApi),
+            Duration::from_secs(31)
+        );
+        // Unknown id (defensive): single-attempt budget.
+        assert_eq!(
+            manager.poll_budget(ProviderId::Blockchain),
+            Duration::from_secs(11)
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_success_after_cooldown_resets() {
+        // With a zero-second cooldown the breaker re-probes immediately;
+        // a success must reset it (no skip on the following tick).
+        let scripted = ScriptedProvider::new(
+            ProviderId::CoinGecko,
+            vec![
+                Err(ProviderError::Http("down".into())),
+                Ok(quotes_of(&[("USD", 50_000.0)])),
+                Ok(quotes_of(&[("USD", 50_100.0)])),
+            ],
+        );
+        let mut manager = manager_with(scripted);
+        manager.settings.provider_failure_threshold = 1;
+        manager.settings.provider_failure_cooldown_seconds = 0; // immediate re-probe
+
+        manager.update_all().await; // fails, opens (0s cooldown)
+        let second = manager.update_all().await; // re-probe succeeds → reset
+        assert_eq!(second.successes, vec![ProviderId::CoinGecko]);
+        let third = manager.update_all().await;
+        assert_eq!(third.successes, vec![ProviderId::CoinGecko]);
+        assert!(third.skipped.is_empty());
     }
 
     #[tokio::test]

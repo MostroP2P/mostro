@@ -1,17 +1,26 @@
 //! Multi-source BTC/fiat price module (see `docs/PRICE_PROVIDERS.md`).
 //!
 //! ## Phase 1
-//! The module is now wired into the daemon: [`PriceManager`] builds the
+//! The module is wired into the daemon: [`PriceManager`] builds the
 //! provider registry from `[price]` (or a legacy migration when the
 //! section is absent, spec §10.1), the scheduler drives
 //! [`PriceManager::update_all`] every `update_interval_seconds`, and
 //! [`get_bitcoin_price`] / `BitcoinPriceManager::get_price` read through
-//! the manager. The only adapter wired so far is [`providers::yadio`];
-//! the keyless backups (CoinGecko, currency-api, Blockchain) land in
-//! Phase 2, and El Toque in Phase 3.
+//! the manager.
+//!
+//! ## Phase 2
+//! The system is genuinely multi-source: the keyless direct backups
+//! ([`providers::coingecko`], [`providers::currency_api`],
+//! [`providers::blockchain`]) join [`providers::yadio`]; providers are
+//! polled **concurrently** with a per-provider timeout and circuit
+//! breaker (spec §6.5), and the §6.6 pipeline glue (code canonicalisation,
+//! the [`fiat`] allowlist, per-provider `only`/`except` scoping) sits
+//! between the adapters and the aggregation core. El Toque lands in
+//! Phase 3.
 
 pub mod aggregate;
 pub mod config;
+pub mod fiat;
 pub mod manager;
 pub mod provider;
 pub mod providers;

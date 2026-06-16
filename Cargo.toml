@@ -74,6 +74,7 @@ mostro-core = { version = "0.12.1", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"
+futures = "0.3.31"
 clap = { version = "4.5.45", features = ["derive"] }
 lnurl-rs = { version = "0.9.0", default-features = false, features = ["ureq"] }
 once_cell = "1.20.2"

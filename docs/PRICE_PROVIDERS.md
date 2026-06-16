@@ -471,9 +471,9 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 
 | Phase | PR scope | Depends on | Status |
 |------:|----------|------------|--------|
-| 0 | Foundation: `PriceProvider` trait, `Quote`, aggregation core (pure), store, `[price]` config types | — | pending |
-| 1 | Yadio provider + registry + scheduler wiring (single-source parity); `get_bitcoin_price` reads new store | 0 | pending |
-| 2 | Direct backup quoters (CoinGecko, currency-api, Blockchain.com) → real multi-source aggregation; per-provider health/circuit-breaker; currency normalisation + fiat allowlist + per-provider scoping | 1 | pending |
+| 0 | Foundation: `PriceProvider` trait, `Quote`, aggregation core (pure), store, `[price]` config types | — | done (PR #753) |
+| 1 | Yadio provider + registry + scheduler wiring (single-source parity); `get_bitcoin_price` reads new store | 0 | done (PR #753) |
+| 2 | Direct backup quoters (CoinGecko, currency-api, Blockchain.com) → real multi-source aggregation; per-provider health/circuit-breaker; currency normalisation + fiat allowlist + per-provider scoping | 1 | in review |
 | 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | pending |
 | 4 | Unify `get_market_quote` onto the cache; staleness TTL enforcement (`PriceTooStale`) at create/take | 2 | pending |
 | 5 | Nostr aggregated publishing + token/paid-provider support polish + info-event exposure + retire `bitcoin_price.rs` + ops docs | 3, 4 | pending |

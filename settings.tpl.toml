@@ -144,9 +144,17 @@ port = 50051
 # enabled = true
 # url = "https://blockchain.info"
 #
-# # El Toque (fiat-cross CUP/MLC, requires a token) is wired in Phase 3 —
-# # see docs/PRICE_PROVIDERS.md §7 for the full provider list and §6.6 for
-# # the `only` / `except` per-provider currency scoping rules.
+# # El Toque — informal-market CUP/MLC (fiat-cross, resolved against the
+# # aggregated USD/BTC anchor; §6.3, §11.3). Opt-in: requires a free Bearer
+# # token. Scoped to CUP/MLC only — that is all this source contributes.
+# # NOTE: the request wiring is PROVISIONAL pending a confirmed payload from
+# # the token-gated API — keep `enabled = false` in production until then
+# # (see docs/PRICE_PROVIDERS.md §11.3).
+# [price.providers.eltoque]
+# enabled = false
+# url = "https://tasas.eltoque.com"
+# # token = "xxxx"        # REQUIRED when enabled; provider refuses to start otherwise
+# only = ["CUP", "MLC"]
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

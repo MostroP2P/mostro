@@ -474,7 +474,7 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 | 0 | Foundation: `PriceProvider` trait, `Quote`, aggregation core (pure), store, `[price]` config types | — | done (PR #753) |
 | 1 | Yadio provider + registry + scheduler wiring (single-source parity); `get_bitcoin_price` reads new store | 0 | done (PR #753) |
 | 2 | Direct backup quoters (CoinGecko, currency-api, Blockchain.com) → real multi-source aggregation; per-provider health/circuit-breaker; currency normalisation + fiat allowlist + per-provider scoping | 1 | in review |
-| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | pending |
+| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | in review (provisional wiring — see §11.3) |
 | 4 | Unify `get_market_quote` onto the cache; staleness TTL enforcement (`PriceTooStale`) at create/take | 2 | pending |
 | 5 | Nostr aggregated publishing + token/paid-provider support polish + info-event exposure + retire `bitcoin_price.rs` + ops docs | 3, 4 | pending |
 
@@ -730,6 +730,25 @@ a BTC price source**. Therefore:
    Yadio's CUP is the informal rate (it has been historically); if Yadio
    ever switched to official, we would scope its CUP out too and lean on
    El Toque.
+
+> **Phase 3 shipped status (provisional wiring).** The El Toque adapter
+> (`src/price/providers/eltoque.rs`) is wired with answers settled so far:
+> **anchor = USD only** (Q2 above declined for this phase). The token-gated
+> tasas API could not be hit to capture a real payload, so:
+> - The **parse path is grounded** in the confirmed CUP-denominated `tasas`
+>   shape (`{"tasas":{"USD":…,"ECU":…,"MLC":…}}`, where El Toque uses `ECU`
+>   for the euro) and the §11.3 cross math, and is fully unit-tested.
+> - The **request line in `fetch` is provisional**: Bearer-token auth is
+>   confirmed, but the path (`/v1/trmi`), method (`GET`), and any
+>   `date_from`/`date_to` parameters are best-effort from third-party
+>   reverse-engineering, not the official docs.
+> - The shipped fixture (`tests/fixtures/price/eltoque_trmi.json`) is a
+>   **representative sample**, not a captured response.
+>
+> A follow-up must confirm the request against the official docs
+> (<https://tasas.eltoque.com/docs>), replace the fixture with a real
+> capture, and resolve Q1/Q3. Keep `enabled = false` in production until
+> then.
 
 ### 11.4 Blockchain.com (direct, 28 major fiats, NO CUP/MLC)
 - `GET https://blockchain.info/ticker` →

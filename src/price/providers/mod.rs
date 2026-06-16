@@ -9,4 +9,5 @@
 pub mod blockchain;
 pub mod coingecko;
 pub mod currency_api;
+pub mod eltoque;
 pub mod yadio;

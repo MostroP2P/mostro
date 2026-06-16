@@ -314,7 +314,7 @@ sequenceDiagram
     Bond-->>Taker: Action=BondSlashed (timeout path)
     Sched->>Bond: job_process_bond_payouts
     Bond-->>Counterparty: Action=AddBondInvoice (asks for payout bolt11)
-    Counterparty-->>Bond: Action=AddInvoice (payout bolt11)
+    Counterparty-->>Bond: Action=AddBondInvoice (payout bolt11)
     Bond->>LND: send_payment(counterparty share)
     Bond->>DB: state=Slashed (or Forfeited if claim window lapses)
   end

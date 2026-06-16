@@ -584,7 +584,7 @@ For better separation of secrets from config, Mostro can read the nsec from the
 Three common ways to provide it:
 
 1. **`~/.mostro/.env`** (auto-loaded at startup, `chmod 600` recommended):
-   ```
+   ```bash
    MOSTRO_NSEC_PRIVKEY=nsec1...
    ```
    The interactive setup wizard can create this file for you.

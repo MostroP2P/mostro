@@ -1,6 +1,6 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
-use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
+use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DM_EVENT_KIND};
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,8 @@ pub struct ExpirationSettings {
     pub dispute_days: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_audit_days: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dm_days: Option<u32>,
 }
 
 impl ExpirationSettings {
@@ -179,6 +181,7 @@ impl ExpirationSettings {
             NOSTR_RATING_EVENT_KIND => self.rating_days.or(Some(90)), // ratings
             NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
             DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
+            DM_EVENT_KIND => self.dm_days.or(Some(30)),             // protocol-v2 direct messages
             _ => None, // unknown kinds don't get expiration
         }
     }
@@ -216,6 +219,24 @@ mod tests {
             settings.get_expiration_for_kind(NOSTR_ORDER_EVENT_KIND),
             Some(30)
         );
+    }
+
+    #[test]
+    fn dm_kind_respects_configured_days_and_falls_back_to_30() {
+        let settings = ExpirationSettings {
+            dm_days: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(settings.get_expiration_for_kind(DM_EVENT_KIND), Some(7));
+        let settings = ExpirationSettings::default();
+        assert_eq!(settings.get_expiration_for_kind(DM_EVENT_KIND), Some(30));
+    }
+
+    #[test]
+    fn transport_defaults_to_gift_wrap() {
+        // v0.18.x default: wire-identical to pre-v2 daemons. The default
+        // flips to nip44 in v0.19.0 (docs/TRANSPORT_V2_SPEC.md §5).
+        assert_eq!(MostroSettings::default().transport, Transport::GiftWrap);
     }
 
     #[test]
@@ -371,6 +392,11 @@ pub struct MostroSettings {
     /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
+    /// Wire transport for protocol messages: `"gift-wrap"` (protocol v1,
+    /// NIP-59, DEPRECATED) or `"nip44"` (protocol v2, kind-14 direct).
+    /// A node speaks exactly one. See docs/TRANSPORT_V2_SPEC.md.
+    #[serde(default)]
+    pub transport: Transport,
 }
 
 fn default_bitcoin_price_api_url() -> String {
@@ -416,6 +442,7 @@ impl Default for MostroSettings {
             website: None,
             publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
             exchange_rates_update_interval_seconds: default_exchange_rates_update_interval(),
+            transport: Transport::default(),
         }
     }
 }

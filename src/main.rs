@@ -74,9 +74,11 @@ async fn main() -> Result<()> {
     // Get mostro keys
     let mostro_keys = util::get_keys()?;
 
+    // Subscribe only to the configured transport's kind: 1059 (protocol v1
+    // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())
-        .kind(Kind::GiftWrap)
+        .kind(Settings::get_mostro().transport.event_kind())
         .limit(0);
 
     let client = match get_nostr_client() {

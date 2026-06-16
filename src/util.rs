@@ -1,4 +1,6 @@
-use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
+use crate::config::constants::{
+    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS, DM_EVENT_KIND,
+};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
@@ -310,6 +312,9 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
             let mostro_settings = Settings::get_mostro();
             Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
         }
+        // Protocol-v2 direct messages: same 30-day default as
+        // `ExpirationSettings::get_expiration_for_kind`.
+        DM_EVENT_KIND => Some(now + Duration::days(30).num_seconds()),
         _ => None,
     }
 }
@@ -755,10 +760,24 @@ pub async fn send_dm(
     let message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
+    // Non-panicking accessor: send_dm sits on every reply path and is
+    // exercised by unit tests that don't initialize the global config.
+    let transport = Settings::get_transport();
+
+    // Kind-14 events are visible to relays, so they always carry a NIP-40
+    // expiration tag (default 30 days via `dm_days`) instead of lingering
+    // forever. Callers that pass an explicit expiration keep it.
+    let expiration = match (transport, expiration) {
+        (Transport::Nip44Direct, None) => get_expiration_timestamp_for_kind(DM_EVENT_KIND)
+            .map(|secs| Timestamp::from_secs(secs as u64)),
+        (_, exp) => exp,
+    };
+
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
     // trade_index for the node.
-    let event = wrap_message(
+    let event = wrap_message_with(
+        transport,
         &message,
         sender_keys,
         sender_keys,

@@ -52,6 +52,14 @@ user_rates_sent_interval_seconds = 3600
 publish_relays_interval = 60
 # Requested POW
 pow = 0
+# Wire transport for protocol messages. A node speaks exactly one:
+#   "gift-wrap" - protocol v1, NIP-59 gift wraps (kind 1059). DEPRECATED,
+#                 will be removed in v0.19.0.
+#   "nip44"     - protocol v2, signed kind-14 events with NIP-44 encrypted
+#                 content. Rate-limitable by relays; switch once the clients
+#                 your community uses support protocol v2.
+# See docs/TRANSPORT_V2_SPEC.md
+transport = "gift-wrap"
 # Publish mostro info interval
 publish_mostro_info_interval = 300
 # Bitcoin price API base URL.
@@ -87,6 +95,8 @@ rating_days = 90
 dispute_days = 90
 # Fee audit events (kind 8383) - annual transparency
 fee_audit_days = 365
+# Protocol-v2 direct messages (kind 14) - trade lifetime plus dispute window
+dm_days = 30
 
 [rpc]
 # Enable RPC server for direct admin communication

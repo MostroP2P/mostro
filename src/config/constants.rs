@@ -13,6 +13,11 @@ pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.co
 /// This ensures events are NOT replaceable, maintaining complete audit history
 pub const DEV_FEE_AUDIT_EVENT_KIND: u16 = 8383;
 
+/// Nostr event kind for protocol-v2 direct messages (NIP-44 direct transport)
+/// Kind 14 carries Mostro protocol messages as signed events with NIP-44
+/// encrypted content when `transport = "nip44"` (see docs/TRANSPORT_V2_SPEC.md)
+pub const DM_EVENT_KIND: u16 = 14;
+
 /// Nostr event kind for exchange rates (NIP-33 addressable event)
 /// Kind 30078 is in the replaceable events range (30000-39999) per NIP-33
 /// This allows the same Mostro instance to publish updated rates that replace previous events

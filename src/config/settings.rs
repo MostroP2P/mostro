@@ -4,6 +4,7 @@ use crate::config::types::{
     NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
+use mostro_core::transport::Transport;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -97,6 +98,18 @@ impl Settings {
     /// configuration.
     pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
+    }
+
+    /// Wire transport for protocol messages. Falls back to the default
+    /// (`gift-wrap`, protocol v1) when the global settings haven't been
+    /// initialized yet — `send_dm()` sits on every reply path and must
+    /// degrade to v1 behavior rather than panic in unit tests that don't
+    /// bring up the full configuration, mirroring [`Settings::get_bond`].
+    pub fn get_transport() -> Transport {
+        MOSTRO_CONFIG
+            .get()
+            .map(|s| s.mostro.transport)
+            .unwrap_or_default()
     }
 
     /// Retrieve the multi-source price configuration from the global

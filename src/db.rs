@@ -5,6 +5,7 @@ use nostr_sdk::prelude::*;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool};
+use std::collections::HashSet;
 use std::fs::{set_permissions, Permissions};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,8 +15,68 @@ use uuid::Uuid;
 const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
 const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 
+/// Terminal order statuses for the Phase 2 active-trade-pubkey cache: an
+/// order in any of these will never legitimately originate further trade-key
+/// messages, so its participants drop out of the "known keys" set.
+///
+/// This is deliberately [`EXCLUDED_ORDER_STATUSES`] **minus `'dispute'`** — a
+/// disputed order is still active (buyer, seller and the assigned solver keep
+/// messaging), so its trade keys must stay fast-pathed. See
+/// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
+const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Collect the "known keys" the Phase 2 anti-spam gate fast-paths: the trade
+/// pubkeys (buyer / seller / creator) of every **non-terminal** order, plus
+/// the solver pubkey of every **active** dispute (spec §6 Phase 2).
+///
+/// Status lists are compile-time constants ([`TERMINAL_ORDER_STATUSES`],
+/// [`ACTIVE_DISPUTE_STATUSES`]), never user input, so the inline
+/// interpolation carries no injection risk — same pattern the restore-session
+/// queries already use. The result is deduplicated.
+pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>, MostroError> {
+    let mut keys: HashSet<String> = HashSet::new();
+
+    // Order participants of every still-active order (disputed orders
+    // included — `TERMINAL_ORDER_STATUSES` excludes `'dispute'`).
+    let order_query = format!(
+        "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders WHERE status NOT IN ({TERMINAL_ORDER_STATUSES})"
+    );
+    let order_rows = sqlx::query(&order_query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    for row in order_rows {
+        for col in ["buyer_pubkey", "seller_pubkey", "creator_pubkey"] {
+            if let Ok(Some(pk)) = row.try_get::<Option<String>, _>(col) {
+                if !pk.is_empty() {
+                    keys.insert(pk);
+                }
+            }
+        }
+    }
+
+    // Assigned solvers of active disputes (so admin-settle/cancel/take from
+    // the solver's key fast-paths instead of hitting the first-contact lane).
+    let dispute_query = format!(
+        "SELECT solver_pubkey FROM disputes WHERE status IN ({ACTIVE_DISPUTE_STATUSES}) AND solver_pubkey IS NOT NULL"
+    );
+    let dispute_rows = sqlx::query(&dispute_query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    for row in dispute_rows {
+        if let Ok(Some(pk)) = row.try_get::<Option<String>, _>("solver_pubkey") {
+            if !pk.is_empty() {
+                keys.insert(pk);
+            }
+        }
+    }
+
+    Ok(keys.into_iter().collect())
+}
 
 /// Helper function to rebuild disputes table without token columns when DROP COLUMN is unsupported.
 async fn rebuild_disputes_table_without_tokens(pool: &SqlitePool) -> Result<(), MostroError> {
@@ -1405,6 +1466,156 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Insert an order carrying explicit trade pubkeys, for the Phase 2
+    /// active-trade-pubkey cache query.
+    async fn insert_order_with_pubkeys(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+        status: &str,
+        creator: Option<&str>,
+        buyer: Option<&str>,
+        seller: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                creator_pubkey, buyer_pubkey, seller_pubkey)
+            VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(creator)
+        .bind(buyer)
+        .bind(seller)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn setup_disputes_table(pool: &SqlitePool) {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS disputes (
+                id char(36) primary key not null,
+                order_id char(36) unique not null,
+                status varchar(10) not null,
+                order_previous_status varchar(10) not null,
+                solver_pubkey char(64),
+                created_at integer not null,
+                taken_at integer default 0
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Phase 2 (docs/TRANSPORT_V2_SPEC.md §6): the active-trade-pubkey cache
+    /// must include participants of every non-terminal order — **including
+    /// disputed ones** — and the solvers of active disputes, while excluding
+    /// terminal orders and resolved disputes.
+    #[tokio::test]
+    async fn find_active_trade_pubkeys_covers_active_and_disputed_excludes_terminal() {
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        // Active order — all three keys are "known".
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "waiting-payment",
+            Some("creator_active"),
+            Some("buyer_active"),
+            Some("seller_active"),
+        )
+        .await;
+        // Disputed order — still active (the load-bearing nuance: 'dispute' is
+        // NOT in TERMINAL_ORDER_STATUSES), so its keys must be included.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "dispute",
+            Some("creator_disp"),
+            Some("buyer_disp"),
+            Some("seller_disp"),
+        )
+        .await;
+        // Terminal orders — excluded.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "success",
+            Some("creator_succ"),
+            Some("buyer_succ"),
+            Some("seller_succ"),
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "canceled",
+            Some("creator_canc"),
+            None,
+            None,
+        )
+        .await;
+
+        // Active dispute with an assigned solver → solver key included.
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+             VALUES (?1, ?2, 'in-progress', 'fiat-sent', 'solver_active', 1700000000)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Resolved dispute → its solver is NOT included.
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+             VALUES (?1, ?2, 'settled', 'fiat-sent', 'solver_settled', 1700000000)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        for k in [
+            "creator_active",
+            "buyer_active",
+            "seller_active",
+            "creator_disp",
+            "buyer_disp",
+            "seller_disp",
+            "solver_active",
+        ] {
+            assert!(keys.contains(k), "{k} should be a known active key");
+        }
+        for k in [
+            "creator_succ",
+            "buyer_succ",
+            "seller_succ",
+            "creator_canc",
+            "solver_settled",
+        ] {
+            assert!(
+                !keys.contains(k),
+                "{k} must NOT be known (terminal/resolved)"
+            );
+        }
     }
 
     #[tokio::test]

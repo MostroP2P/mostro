@@ -240,6 +240,62 @@ mod tests {
     }
 
     #[test]
+    fn pow_first_contact_defaults_to_base_pow() {
+        // Unset ⇒ first-contact gate uses the base `pow`, so a config that
+        // predates Phase 2 behaves exactly as before (spec §6 Phase 2).
+        let s = MostroSettings {
+            pow: 8,
+            ..MostroSettings::default()
+        };
+        assert_eq!(s.pow_first_contact, None);
+        assert_eq!(s.effective_pow_first_contact(), 8);
+    }
+
+    #[test]
+    fn pow_first_contact_override_takes_precedence() {
+        let s = MostroSettings {
+            pow: 4,
+            pow_first_contact: Some(20),
+            ..MostroSettings::default()
+        };
+        assert_eq!(s.effective_pow_first_contact(), 20);
+    }
+
+    #[test]
+    fn active_pubkeys_refresh_interval_defaults_to_60() {
+        assert_eq!(
+            MostroSettings::default().active_pubkeys_refresh_interval,
+            60
+        );
+    }
+
+    #[test]
+    fn mostro_settings_omitting_phase2_keys_parses() {
+        // An existing settings.toml without the Phase 2 keys must still
+        // deserialize (both fields are `#[serde(default)]`).
+        let toml_str = r#"
+fee = 0
+max_routing_fee = 0.002
+max_order_amount = 1000000
+min_payment_amount = 100
+expiration_hours = 24
+expiration_seconds = 900
+user_rates_sent_interval_seconds = 3600
+max_expiration_days = 15
+publish_relays_interval = 60
+pow = 0
+publish_mostro_info_interval = 300
+fiat_currencies_accepted = ["USD"]
+max_orders_per_response = 10
+dev_fee_percentage = 0.30
+"#;
+        let s: MostroSettings = toml::from_str(toml_str).expect("legacy config parses");
+        assert_eq!(s.pow_first_contact, None);
+        assert_eq!(s.active_pubkeys_refresh_interval, 60);
+        assert_eq!(s.effective_pow_first_contact(), 0);
+    }
+
+    #[test]
     fn dispute_kind_falls_back_to_90_when_unconfigured() {
         let settings = ExpirationSettings::default();
         assert_eq!(
@@ -397,6 +453,33 @@ pub struct MostroSettings {
     /// A node speaks exactly one. See docs/TRANSPORT_V2_SPEC.md.
     #[serde(default)]
     pub transport: Transport,
+    /// Proof-of-work difficulty (leading-zero bits) demanded of a
+    /// *first-contact* event on the protocol-v2 (`nip44`) transport — one
+    /// whose visible sender (trade key) is **not** in the active-trade
+    /// cache — checked BEFORE the daemon pays the NIP-44 decrypt cost. This
+    /// is the Phase 2 anti-spam lane: ongoing trades (known keys) need only
+    /// `pow`, while brand-new orders/takes from unseen keys must grind this
+    /// harder toll (see docs/TRANSPORT_V2_SPEC.md §6 Phase 2).
+    ///
+    /// `None` ⇒ falls back to `pow`, so existing configs and the v1
+    /// transport are wire-identical to before. Has no effect on `gift-wrap`
+    /// (v1 senders are throwaway keys that can't be pre-validated).
+    #[serde(default)]
+    pub pow_first_contact: Option<u8>,
+    /// How often (seconds) to rebuild the active-trade-pubkey cache that the
+    /// Phase 2 anti-spam gate consults. Lower = fresher known-keys set (a
+    /// just-taken order's keys fast-path sooner); higher = less DB load.
+    #[serde(default = "default_active_pubkeys_refresh_interval")]
+    pub active_pubkeys_refresh_interval: u64,
+}
+
+impl MostroSettings {
+    /// Effective first-contact PoW difficulty: the explicit
+    /// `pow_first_contact` when set, otherwise the base `pow`. Centralised so
+    /// the event loop and tests agree on the fallback (spec §6 Phase 2).
+    pub fn effective_pow_first_contact(&self) -> u8 {
+        self.pow_first_contact.unwrap_or(self.pow)
+    }
 }
 
 fn default_bitcoin_price_api_url() -> String {
@@ -411,6 +494,10 @@ fn default_publish_exchange_rates() -> bool {
 
 fn default_exchange_rates_update_interval() -> u64 {
     300 // 5 minutes
+}
+
+fn default_active_pubkeys_refresh_interval() -> u64 {
+    60 // 1 minute — keeps a just-taken order's keys fast-pathing promptly
 }
 
 impl Default for MostroSettings {
@@ -443,6 +530,8 @@ impl Default for MostroSettings {
             publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
             exchange_rates_update_interval_seconds: default_exchange_rates_update_interval(),
             transport: Transport::default(),
+            pow_first_contact: None,
+            active_pubkeys_refresh_interval: default_active_pubkeys_refresh_interval(),
         }
     }
 }

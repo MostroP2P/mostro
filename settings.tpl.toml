@@ -60,6 +60,19 @@ pow = 0
 #                 your community uses support protocol v2.
 # See docs/TRANSPORT_V2_SPEC.md
 transport = "gift-wrap"
+# Anti-spam gate for the "nip44" transport (docs/TRANSPORT_V2_SPEC.md §6
+# Phase 2). Proof-of-work (leading-zero bits) demanded of a *first-contact*
+# event — one whose visible sender (trade key) is not part of an active
+# order/dispute — checked BEFORE decryption. Ongoing trades (known keys) need
+# only `pow`; brand-new orders/takes from unseen keys must clear this stiffer
+# toll. Omit (or leave commented) to fall back to `pow`. No effect on
+# "gift-wrap". Example: keep pow = 0 for cheap ongoing trades but require work
+# from first-contact senders.
+# pow_first_contact = 16
+# How often (seconds) to rebuild the active-trade-pubkey cache the gate
+# consults. Lower = a just-taken order's keys fast-path sooner; higher = less
+# DB load. Default 60.
+# active_pubkeys_refresh_interval = 60
 # Publish mostro info interval
 publish_mostro_info_interval = 300
 # Bitcoin price API base URL.

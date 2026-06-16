@@ -27,58 +27,40 @@ gpg: Good signature from "Catrya (github) <140891948+Catrya@users.noreply.github
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.17.4
+## What's Changed in 0.17.5
 
 ### 🚀 Features
 
 
-* feat(bond): Phase 3.5 — payout confirmation to the winner by [@grunch](https://github.com/grunch) in [#743](https://github.com/MostroP2P/mostro/pull/743)
-* feat(bond): Phase 3 — payout flow for slashed bonds by [@grunch](https://github.com/grunch) in [#738](https://github.com/MostroP2P/mostro/pull/738)
-* feat(bond): Phase 2 — solver-directed dispute slash by [@grunch](https://github.com/grunch) in [#737](https://github.com/MostroP2P/mostro/pull/737)
-* feat: support MOSTRO_NSEC_PRIVKEY env var for Nostr private key by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#713](https://github.com/MostroP2P/mostro/pull/713)
-* feat(bond): Phase 1.5 — dedicated PayBondInvoice action + WaitingTakerBond status by [@grunch](https://github.com/grunch) in [#736](https://github.com/MostroP2P/mostro/pull/736)
-* feat(bond): concurrent taker bonds, first-to-lock wins (Phase 0+1) by [@grunch](https://github.com/grunch) in [#733](https://github.com/MostroP2P/mostro/pull/733)
-* feat(bond): align AntiAbuseBondSettings with spec — slash split, claim window, drop unused dispute flag by [@grunch](https://github.com/grunch) in [#728](https://github.com/MostroP2P/mostro/pull/728)
-* feat(bond): add Forfeited terminal state for long-stop bond payout by [@grunch](https://github.com/grunch) in [#727](https://github.com/MostroP2P/mostro/pull/727)
-* feat(bond): add Phase 0 schema columns for split, forfeit window, and retry separation by [@grunch](https://github.com/grunch) in [#726](https://github.com/MostroP2P/mostro/pull/726)
-* feat: added catrya key for manifest signature by [@Catrya](https://github.com/Catrya) in [#724](https://github.com/MostroP2P/mostro/pull/724)
-* feat(bond): anti-abuse bond phase 1 — taker lifecycle (lock + always release) by [@grunch](https://github.com/grunch) in [#719](https://github.com/MostroP2P/mostro/pull/719)
-* feat(nip59): adopt mostro-core 0.10.0 dual-key gift wrap transport by [@grunch](https://github.com/grunch) in [#718](https://github.com/MostroP2P/mostro/pull/718)
-* feat(bond): anti-abuse bond phase 0 foundation by [@grunch](https://github.com/grunch) in [#712](https://github.com/MostroP2P/mostro/pull/712)
+* feat(price): Phase 2 — direct backup quoters + multi-source aggregation by [@grunch](https://github.com/grunch) in [#773](https://github.com/MostroP2P/mostro/pull/773)
+* feat(bond): Phase 7 — maker timeout slash by [@grunch](https://github.com/grunch) in [#775](https://github.com/MostroP2P/mostro/pull/775)
+* feat(bond): Phase 6 — range-order maker bond with proportional slashes by [@grunch](https://github.com/grunch) in [#770](https://github.com/MostroP2P/mostro/pull/770)
+* feat(price): Phase 1 — Yadio provider + PriceManager wiring by [@grunch](https://github.com/grunch) in [#753](https://github.com/MostroP2P/mostro/pull/753)
+* feat(bond): Phase 5 — maker bond (non-range) + dispute slash by [@grunch](https://github.com/grunch) in [#767](https://github.com/MostroP2P/mostro/pull/767)
+* feat(bond): Phase 4.5 — re-prompt winner for payout invoice on payment failure by [@grunch](https://github.com/grunch) in [#755](https://github.com/MostroP2P/mostro/pull/755)
+* feat(bond): Phase 4 — timeout slash for the taker bond by [@grunch](https://github.com/grunch) in [#744](https://github.com/MostroP2P/mostro/pull/744)
+* feat(price): Phase 0 — multi-source price module foundation by [@grunch](https://github.com/grunch) in [#747](https://github.com/MostroP2P/mostro/pull/747)
 
 ### 🐛 Bug Fixes
 
 
-* fix(price): tolerate null rates in Yadio /exrates/BTC response by [@grunch](https://github.com/grunch) in [#748](https://github.com/MostroP2P/mostro/pull/748)
-* fix: include created_at on AddInvoice SmallOrder by [@arkanoider](https://github.com/arkanoider) in [#739](https://github.com/MostroP2P/mostro/pull/739)
-* fix(bond): align bond invoice memo with spec §6.1 by [@grunch](https://github.com/grunch) in [#735](https://github.com/MostroP2P/mostro/pull/735)
-* fix(restore-session): re-send AddInvoice for failed payments on session restore by [@codaMW](https://github.com/codaMW) in [#721](https://github.com/MostroP2P/mostro/pull/721)
-
-### 💼 Other
-
-
-* Revert "fix(restore-session): re-send AddInvoice for failed payments on session restore" by [@grunch](https://github.com/grunch) in [#722](https://github.com/MostroP2P/mostro/pull/722)
-* Add read and read-write dispute solver permissions by [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) in [#708](https://github.com/MostroP2P/mostro/pull/708)
+* fix(price): repair test-only price seeding broken by #753/#770 merge skew by [@grunch](https://github.com/grunch) in [#774](https://github.com/MostroP2P/mostro/pull/774)
+* fix: let daemon finalize disputes without solver row by [@arkanoider](https://github.com/arkanoider) in [#746](https://github.com/MostroP2P/mostro/pull/746)
 
 ### 📚 Documentation
 
 
-* docs: spec for multi-source price providers (remove Yadio single point of failure) by [@grunch](https://github.com/grunch) in [#745](https://github.com/MostroP2P/mostro/pull/745)
-* docs(bond): add Phase 3.5 — payout confirmation to the winner by [@grunch](https://github.com/grunch) in [#742](https://github.com/MostroP2P/mostro/pull/742)
-* docs(bond): fold taker_* columns into Phase 0 schema by [@grunch](https://github.com/grunch) in [#734](https://github.com/MostroP2P/mostro/pull/734)
-* docs(bond): switch Phase 1.5 to concurrent taker bonds, first-to-lock wins by [@grunch](https://github.com/grunch) in [#732](https://github.com/MostroP2P/mostro/pull/732)
-* docs(bond): spec cancel_action handling for WaitingTakerBond status by [@grunch](https://github.com/grunch) in [#730](https://github.com/MostroP2P/mostro/pull/730)
-* docs(bond): note that mostro-core 0.11.0 ships Phase 1.5 + Phase 2 variants by [@grunch](https://github.com/grunch) in [#729](https://github.com/MostroP2P/mostro/pull/729)
-* docs(bond): decouple slash from trade outcome; clarify maker/taker vs… by [@grunch](https://github.com/grunch) in [#725](https://github.com/MostroP2P/mostro/pull/725)
+* docs(bond): Phase 8 — public config exposure + operator docs by [@grunch](https://github.com/grunch) in [#777](https://github.com/MostroP2P/mostro/pull/777)
+* docs: document daemon event kinds by [@ermeme[bot]](https://github.com/ermeme[bot]) in [#769](https://github.com/MostroP2P/mostro/pull/769)
+* docs: clarify Cashu escrow uses per-order trade keys by [@grunch](https://github.com/grunch) in [#757](https://github.com/MostroP2P/mostro/pull/757)
+* docs: add Cashu 2-of-3 multisig escrow architecture spec by [@a1denvalu3](https://github.com/a1denvalu3) in [#756](https://github.com/MostroP2P/mostro/pull/756)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#748](https://github.com/MostroP2P/mostro/pull/748)
-* [@arkanoider](https://github.com/arkanoider) made their contribution in [#739](https://github.com/MostroP2P/mostro/pull/739)
-* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#713](https://github.com/MostroP2P/mostro/pull/713)
-* [@Catrya](https://github.com/Catrya) made their contribution in [#724](https://github.com/MostroP2P/mostro/pull/724)
-* [@codaMW](https://github.com/codaMW) made their contribution in [#721](https://github.com/MostroP2P/mostro/pull/721)
-* [@mostronatorcoder[bot]](https://github.com/mostronatorcoder[bot]) made their contribution in [#708](https://github.com/MostroP2P/mostro/pull/708)
+* [@grunch](https://github.com/grunch) made their contribution in [#773](https://github.com/MostroP2P/mostro/pull/773)
+* [@ermeme[bot]](https://github.com/ermeme[bot]) made their contribution in [#769](https://github.com/MostroP2P/mostro/pull/769)
+* [@a1denvalu3](https://github.com/a1denvalu3) made their contribution in [#756](https://github.com/MostroP2P/mostro/pull/756)
+* [@arkanoider](https://github.com/arkanoider) made their contribution in [#746](https://github.com/MostroP2P/mostro/pull/746)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.17.3...0.17.4
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.17.4...0.17.5
 
 <!-- generated by git-cliff -->

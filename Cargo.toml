@@ -85,6 +85,8 @@ clearscreen = "4.0.1"
 tonic = "0.14.2"
 prost = "0.14.1"
 tonic-prost = "0.14.1"
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = "1.8"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }

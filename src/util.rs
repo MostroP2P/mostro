@@ -862,7 +862,7 @@ pub async fn publish_dev_fee_audit_event(
     // Create and sign event
     let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
         .tags(tags)
-        .sign_with_keys(&keys)
+        .sign_with_keys(keys)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Publish event to relays
@@ -879,16 +879,23 @@ pub async fn publish_dev_fee_audit_event(
     Ok(())
 }
 
-pub fn get_keys() -> Result<Keys, MostroError> {
-    let nostr_settings = Settings::get_nostr();
-    // nostr private key
-    match Keys::parse(&nostr_settings.nsec_privkey) {
-        Ok(my_keys) => Ok(my_keys),
-        Err(e) => {
-            tracing::error!("Failed to parse nostr private key: {}", e);
-            Err(MostroInternalErr(ServiceError::NostrError(e.to_string())))
-        }
-    }
+/// Return Mostro's parsed Nostr signing keys.
+///
+/// Keys are initialized once at startup by [`crate::config::init_mostro_settings`],
+/// which parses the nsec and stores the result in the global `NOSTR_KEYS`
+/// slot. Callers must ensure that initialization has completed before invoking
+/// this function (normally guaranteed by `settings_init()` in `main`).
+///
+/// Returns a borrowed `Keys` on success. Returns
+/// [`MostroInternalErr`](mostro_core::error::MostroError::MostroInternalErr) with
+/// [`ServiceError::NostrError`] when `NOSTR_KEYS` has not been set — for example
+/// in unit tests that skip the full configuration bootstrap.
+pub fn get_keys() -> Result<&'static Keys, MostroError> {
+    crate::config::get_mostro_keys().ok_or_else(|| {
+        MostroInternalErr(ServiceError::NostrError(
+            "Nostr keys not initialized".to_string(),
+        ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1152,7 +1159,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                             continue;
                         }
                     };
-                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool, &keys).await {
+                    if let Err(e) = flow::hold_invoice_paid(&hash, request_id, &pool, keys).await {
                         info!("Invoice flow error {e}");
                     } else {
                         info!("Invoice with hash {hash} accepted!");

@@ -1,10 +1,12 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use nostr_sdk::prelude::*;
+use secrecy::{ExposeSecret, SecretString};
+use zeroize::Zeroizing;
 
 use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
 use super::settings::Settings;
@@ -153,11 +155,14 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     let nsec = if has_nsec {
-        Input::new()
-            .with_prompt("Enter your nsec private key")
-            .validate_with(|input: &String| validate_nsec(input))
-            .interact_text()
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?
+        let input = Zeroizing::new(
+            Password::new()
+                .with_prompt("Enter your nsec private key")
+                .validate_with(|input: &String| validate_nsec(input))
+                .interact()
+                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?,
+        );
+        SecretString::from(input.to_string())
     } else {
         let keys = Keys::generate();
         let nsec = keys
@@ -170,10 +175,10 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
             .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
         println!("\nGenerated new Nostr keypair:");
-        println!("  nsec: {}", nsec);
-        println!("  npub: {}", npub);
+        println!("  npub: {npub}");
+        println!("  You will be prompted to store the private key securely next.");
 
-        nsec
+        SecretString::from(nsec)
     };
 
     let nsec_privkey = prompt_nsec_storage(settings_dir, &nsec)?;
@@ -199,7 +204,10 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
 
 /// Ask the user where to persist the nsec and return the value that should be
 /// written into `settings.toml` (empty string when the key is stored elsewhere).
-fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, MostroError> {
+fn prompt_nsec_storage(
+    settings_dir: &Path,
+    nsec: &SecretString,
+) -> Result<SecretString, MostroError> {
     println!("\nMostro supports two storage locations for your nsec. Both are fully supported;");
     println!("pick the one that fits your threat model and deployment setup. You can also");
     println!("provide MOSTRO_NSEC_PRIVKEY via the real process environment (systemd, Docker,");
@@ -220,21 +228,21 @@ fn prompt_nsec_storage(settings_dir: &Path, nsec: &str) -> Result<String, Mostro
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     let nsec_in_toml = if selection == 0 {
-        write_env_file(&env_file_path, nsec)?;
+        write_env_file(&env_file_path, nsec.expose_secret())?;
         // Export the key into the current process so the daemon can use it
         // immediately after the wizard finishes, without requiring a restart.
-        std::env::set_var(NSEC_ENV_VAR, nsec);
+        std::env::set_var(NSEC_ENV_VAR, nsec.expose_secret());
         println!(
             "\n  Private key saved to {} (permissions 600).",
             env_file_path.display()
         );
-        String::new()
+        SecretString::default()
     } else {
         println!(
             "\n  Private key will be written inside {}.",
             settings_dir.join("settings.toml").display()
         );
-        nsec.to_string()
+        nsec.clone()
     };
 
     println!(

@@ -402,7 +402,7 @@ impl PriceManager {
             Tag::expiration(Timestamp::from(expiration as u64)),
         ]);
 
-        let event = match crate::nip33::new_exchange_rates_event(&keys, &content, tags) {
+        let event = match crate::nip33::new_exchange_rates_event(keys, &content, tags) {
             Ok(e) => e,
             Err(e) => {
                 error!("price: failed to build exchange-rates event: {e}");

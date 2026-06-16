@@ -176,6 +176,111 @@ Retrieves LND node information including:
 
 **Usage**: Called during startup to populate `config::LN_STATUS` (src/main.rs:86)
 
+## Anti-Abuse Bond Operations
+
+The optional anti-abuse bond (`[anti_abuse_bond]`, off by default) puts a
+**second** hold invoice on a trade, owned by the maker and/or taker. It is
+released on normal completion and on cancels before a waiting-state
+timeout; it is slashed only on an explicit solver `BondResolution`
+directive or a waiting-state timeout (when `slash_on_waiting_timeout =
+true`). Full design: `docs/ANTI_ABUSE_BOND.md`. This section is the
+operator runbook.
+
+### Where the state lives
+
+Every bond is one row in the `bonds` table (`src/app/bond/db.rs`,
+`model.rs`). Inspect it directly:
+
+```sql
+SELECT id, order_id, role, state, amount_sats,
+       parent_bond_id, child_order_id, slashed_share_sats,
+       node_share_sats, slashed_reason,
+       payout_attempts, invoice_request_attempts, slashed_at
+  FROM bonds ORDER BY created_at;
+```
+
+`state` (string-backed, `src/app/bond/types.rs`) walks:
+
+```text
+requested → locked ─┬→ released                       (happy / cancel before timeout)
+                    └→ pending-payout ─┬→ slashed      (counterparty paid their share)
+                                       ├→ forfeited    (counterparty never claimed in window)
+                                       └→ failed       (send_payment exhausted)
+```
+
+- **`pending-payout`** — a slash already fired. The bond HTLC was
+  **settled** (claimed into Mostro's wallet) at slash time; the scheduler
+  is now driving the counterparty payout. The split is frozen here:
+  `node_share_sats` is the node's retained share, `amount_sats -
+  node_share_sats` is owed to the winning counterparty.
+- **`slashed`** — terminal success; the counterparty share was paid.
+- **`forfeited`** — designed-in long-stop: the counterparty never sent a
+  payout invoice within `payout_claim_window_days`. The node keeps
+  `amount_sats` in full. **No operator action needed.**
+- **`failed`** — `send_payment` exhausted `payout_max_retries` against a
+  delivered invoice. **User-recoverable** while inside the claim window: a
+  fresh `Action::AddBondInvoice` from the recipient flips the row back to
+  `pending-payout`. Only past the window does it need operator attention
+  (see below).
+- `slashed_reason` is `lost-dispute` (solver directive) or `timeout`
+  (waiting-state timeout). A cancel before the timeout is never a slash.
+
+For range-order maker bonds the parent row stays `locked` while child
+rows (`parent_bond_id` set, `child_order_id` = the taken slice) carry the
+proportional per-slice slashes; the single settle happens at range close.
+
+### Scheduler jobs
+
+Run from `src/scheduler.rs` (see `run_jobs`):
+
+- `job_process_bond_payouts` — drives every `pending-payout` row: requests
+  a payout bolt11 from the winner (`Action::AddBondInvoice`, cadenced by
+  `payout_invoice_window_seconds`), runs `send_payment`, retries up to
+  `payout_max_retries`, and reconciles against LND on entry so a daemon
+  restart never double-pays.
+- `job_reconcile_stranded_maker_bonds` — settles and distributes a range
+  maker bond at range close (per-slice counterparty shares + maker
+  refund); the 5-minute sweep is the backstop if the inline close failed.
+
+### Reading what happened in the logs
+
+Bond transitions log through `tracing` (`bond payout: …` lines in
+`src/app/bond/payout.rs`, plus slash/release lines in `flow.rs` /
+`slash.rs`). To follow a solver decision, look for the `BondResolution`
+on the inbound `admin-settle` / `admin-cancel` message — its wire shape is:
+
+```json
+{ "order": { "version": 1, "id": "<order-id>", "action": "admin-cancel",
+  "payload": { "bond_resolution": { "slash_seller": true, "slash_buyer": false } } } }
+```
+
+`slash_seller` / `slash_buyer` are resolved to a maker- or taker-bond row
+by the order kind (sell → maker is seller; buy → maker is buyer). A
+`payload: null` (or absent) means **release both bonds** — no slash. A
+slash directed at a side with no `locked` bond is rejected with
+`CantDo(InvalidPayload)` and the trade resolution does not run.
+
+### Resolving a `failed` bond manually
+
+A `failed` row means the bond was slashed (sats are already in Mostro's
+wallet), but Mostro could not route the counterparty's share and the
+claim window has since elapsed, so the auto-recovery path no longer
+re-arms it. There is no slash to undo and no funds at risk on the
+counterparty's side — the value is held by the node. To make the
+counterparty whole, pay them out-of-band (the amount owed is
+`amount_sats - node_share_sats`) and keep the row as the audit record.
+Before the window elapses, prefer the built-in path: have the
+counterparty resend their payout invoice, which flips the row back to
+`pending-payout` automatically.
+
+### Public exposure
+
+The node advertises its bond policy in the kind-38385 info event
+(`src/nip33.rs::info_to_tags`) so clients can warn users before they
+trade: `bond_enabled` (always emitted), and when enabled `bond_apply_to`,
+`bond_amount_pct`, `bond_base_amount_sats`, `bond_slash_on_waiting_timeout`,
+`bond_slash_node_share_pct`, and `bond_payout_claim_window_days`.
+
 ## Diagrams
 ```mermaid
 flowchart TD

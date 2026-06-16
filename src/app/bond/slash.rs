@@ -265,13 +265,20 @@ async fn resolve_slash_target(
 ///
 /// `reason` is `LostDispute` in Phase 2 (called from admin handlers);
 /// Phase 4 (timeout slash) will reuse this helper with `Timeout`.
+///
+/// Returns the bond rows whose slash is *confirmed*, so the caller can send
+/// each a best-effort `Action::BondSlashed` forfeiture notice (#768). A
+/// transient settle failure (bond left `Locked`) yields no row, so the
+/// notice is never untruthful; an idempotent admin retry yields none either,
+/// so a winner is never re-notified. Range rows carry the slice amount, all
+/// others the full bond amount.
 pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
     order: &Order,
     resolution: &BondResolution,
     reason: BondSlashReason,
-) -> Result<(), MostroError> {
+) -> Result<Vec<Bond>, MostroError> {
     // Active bonds attached to *this* order — i.e. the taker bond(s) on
     // this slice. The maker bond may live on a range root elsewhere and is
     // resolved separately via `find_maker_bond_for_order`.
@@ -295,6 +302,14 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     // `is_range` guard instead.
     let mut slashed_ids: HashSet<Uuid> = HashSet::new();
 
+    // Rows worth a `BondSlashed` forfeiture notice — only the slashes that
+    // are *confirmed* to have landed, so the caller never tells a user
+    // their bond was forfeited while the HTLC is still theirs (a transient
+    // settle failure leaves the bond `Locked`). Non-range rows carry the
+    // full bond amount; range rows carry the slice's proportional amount.
+    // Mirrors `slash_or_release_on_timeout`'s `slashed_row` (#768).
+    let mut notify_rows: Vec<Bond> = Vec::new();
+
     for (flag, side) in [
         (resolution.slash_seller, Side::Seller),
         (resolution.slash_buyer, Side::Buyer),
@@ -314,14 +329,29 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
             // proportionally per slice — record a child row and leave the
             // parent HTLC `Locked`. The single settle happens at range close
             // (`resolve_range_maker_bond_at_close`, called by the admin
-            // handler right after this returns).
+            // handler right after this returns). Only notify when this call
+            // actually inserted the child row — an idempotent re-run must
+            // not re-notify the maker for a slice already slashed.
             let root = find_range_root_order(pool, order.clone()).await?;
-            record_maker_slice_slash(pool, order, &root, &target, reason, node_share_pct).await?;
+            let inserted =
+                record_maker_slice_slash(pool, order, &root, &target, reason, node_share_pct)
+                    .await?;
+            if inserted {
+                if let Some(child) = find_slice_slash_child(pool, target.id, order.id).await? {
+                    notify_rows.push(child);
+                }
+            }
         } else {
             // Taker bond, or a non-range maker bond (Phase 2/5): settle the
-            // HTLC inline.
+            // HTLC inline. Skip the release sweep regardless of outcome —
+            // a transient settle failure leaves the bond `Locked` for an
+            // admin retry, never released. Confirm the slash via the durable
+            // `slashed_reason` witness before queueing a notice.
             slash_one(pool, ln_client, &target, reason, node_share_pct).await;
             slashed_ids.insert(target.id);
+            if slash_reason_recorded(pool, target.id, reason).await? {
+                notify_rows.push(target.clone());
+            }
         }
     }
 
@@ -347,7 +377,7 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
         }
     }
 
-    Ok(())
+    Ok(notify_rows)
 }
 
 /// True when the maker bond governing `order` is a **range** bond — i.e.

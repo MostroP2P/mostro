@@ -628,15 +628,16 @@ async fn find_slice_slash_child(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
-/// Confirm a timeout slash actually landed on `bond_id`, regardless of
-/// where the concurrent payout scheduler has since moved the row.
+/// Confirm a slash with the `expected` reason actually landed on `bond_id`
+/// by checking the durable `slashed_reason` witness, regardless of where the
+/// concurrent payout scheduler has since moved the row.
 ///
-/// The slash CAS in [`slash_one`] writes `slashed_reason = Timeout`
-/// atomically with the `Locked → PendingPayout` transition, and **no**
-/// later transition clears it: the payout job's state changes
+/// The slash CAS in [`slash_one`] writes `slashed_reason` atomically with
+/// the `Locked → PendingPayout` transition, and **no** later transition
+/// clears it: the payout job's state changes
 /// (`PendingPayout → Slashed | Forfeited | Failed`, and the
 /// `Failed → PendingPayout` resurrection) only ever rewrite `state`, never
-/// `slashed_reason` / `slashed_at`. So `slashed_reason = Timeout` is a
+/// `slashed_reason` / `slashed_at`. So the recorded `slashed_reason` is a
 /// stable witness that *this* slash succeeded.
 ///
 /// A point-in-time `state = PendingPayout` check would be racy: the payout
@@ -647,20 +648,31 @@ async fn find_slice_slash_child(
 /// forfeiture notice is never lost to that race.
 ///
 /// A transient settle failure leaves the bond `Locked` with
-/// `slashed_reason` NULL, so this still returns `false` and no false
-/// forfeiture notice is sent. Dispute slashes write
-/// `slashed_reason = LostDispute`, so a (vanishingly unlikely) concurrent
-/// dispute slash that won the CAS first does not trigger a *timeout*
-/// notice here — the dispute path owns its own messaging.
-async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+/// `slashed_reason` NULL, so this returns `false` and no false forfeiture
+/// notice is sent. The `expected` reason is matched exactly, so a timeout
+/// caller never confirms on a dispute slash's `LostDispute` witness and
+/// vice-versa — each slash path owns its own messaging.
+async fn slash_reason_recorded(
+    pool: &Pool<Sqlite>,
+    bond_id: Uuid,
+    expected: BondSlashReason,
+) -> Result<bool, MostroError> {
     let row: Option<(Option<String>,)> =
         sqlx::query_as("SELECT slashed_reason FROM bonds WHERE id = ?")
             .bind(bond_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let timeout = BondSlashReason::Timeout.to_string();
-    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(timeout.as_str()))
+    let expected = expected.to_string();
+    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(expected.as_str()))
+}
+
+/// Confirm a *timeout* slash landed on `bond_id`. Thin wrapper over
+/// [`slash_reason_recorded`] keyed on `BondSlashReason::Timeout`; see that
+/// function for why the durable `slashed_reason` witness is used instead of
+/// a transient `state = PendingPayout` check.
+async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    slash_reason_recorded(pool, bond_id, BondSlashReason::Timeout).await
 }
 
 /// Phase 4 — best-effort forfeiture notice to the slashed user

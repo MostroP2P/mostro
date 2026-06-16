@@ -265,13 +265,20 @@ async fn resolve_slash_target(
 ///
 /// `reason` is `LostDispute` in Phase 2 (called from admin handlers);
 /// Phase 4 (timeout slash) will reuse this helper with `Timeout`.
+///
+/// Returns the bond rows whose slash is *confirmed*, so the caller can send
+/// each a best-effort `Action::BondSlashed` forfeiture notice (#768). A
+/// transient settle failure (bond left `Locked`) yields no row, so the
+/// notice is never untruthful; an idempotent admin retry yields none either,
+/// so a winner is never re-notified. Range rows carry the slice amount, all
+/// others the full bond amount.
 pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
     order: &Order,
     resolution: &BondResolution,
     reason: BondSlashReason,
-) -> Result<(), MostroError> {
+) -> Result<Vec<Bond>, MostroError> {
     // Active bonds attached to *this* order — i.e. the taker bond(s) on
     // this slice. The maker bond may live on a range root elsewhere and is
     // resolved separately via `find_maker_bond_for_order`.
@@ -295,6 +302,14 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
     // `is_range` guard instead.
     let mut slashed_ids: HashSet<Uuid> = HashSet::new();
 
+    // Rows worth a `BondSlashed` forfeiture notice — only the slashes that
+    // are *confirmed* to have landed, so the caller never tells a user
+    // their bond was forfeited while the HTLC is still theirs (a transient
+    // settle failure leaves the bond `Locked`). Non-range rows carry the
+    // full bond amount; range rows carry the slice's proportional amount.
+    // Mirrors `slash_or_release_on_timeout`'s `slashed_row` (#768).
+    let mut notify_rows: Vec<Bond> = Vec::new();
+
     for (flag, side) in [
         (resolution.slash_seller, Side::Seller),
         (resolution.slash_buyer, Side::Buyer),
@@ -314,14 +329,29 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
             // proportionally per slice — record a child row and leave the
             // parent HTLC `Locked`. The single settle happens at range close
             // (`resolve_range_maker_bond_at_close`, called by the admin
-            // handler right after this returns).
+            // handler right after this returns). Only notify when this call
+            // actually inserted the child row — an idempotent re-run must
+            // not re-notify the maker for a slice already slashed.
             let root = find_range_root_order(pool, order.clone()).await?;
-            record_maker_slice_slash(pool, order, &root, &target, reason, node_share_pct).await?;
+            let inserted =
+                record_maker_slice_slash(pool, order, &root, &target, reason, node_share_pct)
+                    .await?;
+            if inserted {
+                if let Some(child) = find_slice_slash_child(pool, target.id, order.id).await? {
+                    notify_rows.push(child);
+                }
+            }
         } else {
             // Taker bond, or a non-range maker bond (Phase 2/5): settle the
-            // HTLC inline.
+            // HTLC inline. Skip the release sweep regardless of outcome —
+            // a transient settle failure leaves the bond `Locked` for an
+            // admin retry, never released. Confirm the slash via the durable
+            // `slashed_reason` witness before queueing a notice.
             slash_one(pool, ln_client, &target, reason, node_share_pct).await;
             slashed_ids.insert(target.id);
+            if slash_reason_recorded(pool, target.id, reason).await? {
+                notify_rows.push(target.clone());
+            }
         }
     }
 
@@ -347,7 +377,7 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
         }
     }
 
-    Ok(())
+    Ok(notify_rows)
 }
 
 /// True when the maker bond governing `order` is a **range** bond — i.e.
@@ -628,15 +658,16 @@ async fn find_slice_slash_child(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
-/// Confirm a timeout slash actually landed on `bond_id`, regardless of
-/// where the concurrent payout scheduler has since moved the row.
+/// Confirm a slash with the `expected` reason actually landed on `bond_id`
+/// by checking the durable `slashed_reason` witness, regardless of where the
+/// concurrent payout scheduler has since moved the row.
 ///
-/// The slash CAS in [`slash_one`] writes `slashed_reason = Timeout`
-/// atomically with the `Locked → PendingPayout` transition, and **no**
-/// later transition clears it: the payout job's state changes
+/// The slash CAS in [`slash_one`] writes `slashed_reason` atomically with
+/// the `Locked → PendingPayout` transition, and **no** later transition
+/// clears it: the payout job's state changes
 /// (`PendingPayout → Slashed | Forfeited | Failed`, and the
 /// `Failed → PendingPayout` resurrection) only ever rewrite `state`, never
-/// `slashed_reason` / `slashed_at`. So `slashed_reason = Timeout` is a
+/// `slashed_reason` / `slashed_at`. So the recorded `slashed_reason` is a
 /// stable witness that *this* slash succeeded.
 ///
 /// A point-in-time `state = PendingPayout` check would be racy: the payout
@@ -647,20 +678,31 @@ async fn find_slice_slash_child(
 /// forfeiture notice is never lost to that race.
 ///
 /// A transient settle failure leaves the bond `Locked` with
-/// `slashed_reason` NULL, so this still returns `false` and no false
-/// forfeiture notice is sent. Dispute slashes write
-/// `slashed_reason = LostDispute`, so a (vanishingly unlikely) concurrent
-/// dispute slash that won the CAS first does not trigger a *timeout*
-/// notice here — the dispute path owns its own messaging.
-async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+/// `slashed_reason` NULL, so this returns `false` and no false forfeiture
+/// notice is sent. The `expected` reason is matched exactly, so a timeout
+/// caller never confirms on a dispute slash's `LostDispute` witness and
+/// vice-versa — each slash path owns its own messaging.
+async fn slash_reason_recorded(
+    pool: &Pool<Sqlite>,
+    bond_id: Uuid,
+    expected: BondSlashReason,
+) -> Result<bool, MostroError> {
     let row: Option<(Option<String>,)> =
         sqlx::query_as("SELECT slashed_reason FROM bonds WHERE id = ?")
             .bind(bond_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let timeout = BondSlashReason::Timeout.to_string();
-    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(timeout.as_str()))
+    let expected = expected.to_string();
+    Ok(row.and_then(|(reason,)| reason).as_deref() == Some(expected.as_str()))
+}
+
+/// Confirm a *timeout* slash landed on `bond_id`. Thin wrapper over
+/// [`slash_reason_recorded`] keyed on `BondSlashReason::Timeout`; see that
+/// function for why the durable `slashed_reason` witness is used instead of
+/// a transient `state = PendingPayout` check.
+async fn timeout_slash_confirmed(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    slash_reason_recorded(pool, bond_id, BondSlashReason::Timeout).await
 }
 
 /// Phase 4 — best-effort forfeiture notice to the slashed user
@@ -3815,5 +3857,249 @@ mod tests {
             parent.amount_sats - slice_slash_total,
             "refund = bond - Σ slice slashes (absorbs the rounding remainder)"
         );
+    }
+
+    // ── #768 — dispute-slash forfeiture notice (apply return value) ──────────
+
+    #[tokio::test]
+    async fn apply_slash_buyer_returns_confirmed_taker_row() {
+        // A confirmed taker-bond slash is returned so the caller can send a
+        // BondSlashed notice carrying the full bond amount.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        let slashed = apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(slashed.len(), 1, "exactly the buyer's bond is returned");
+        assert_eq!(slashed[0].id, bond.id);
+        assert_eq!(
+            slashed[0].amount_sats, bond.amount_sats,
+            "full bond amount carried for the notice"
+        );
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::PendingPayout.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_slash_both_returns_two_confirmed_rows() {
+        // Both bonds slashed → both returned, so both parties are notified.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: true,
+        };
+
+        let mut slashed = apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        slashed.sort_by_key(|b| b.id);
+        let mut expected = vec![maker_bond.id, taker_bond.id];
+        expected.sort();
+        assert_eq!(
+            slashed.iter().map(|b| b.id).collect::<Vec<_>>(),
+            expected,
+            "both slashed bonds are returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_null_payload_returns_no_rows() {
+        // No slash directive → nothing to notify; the bond is released.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: false,
+        };
+
+        let slashed = apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+
+        assert!(slashed.is_empty(), "no slash → no notice");
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_transient_settle_failure_returns_no_row() {
+        // Load-bearing: a transient settle failure leaves the bond Locked,
+        // so the slash is unconfirmed and MUST NOT be returned — the caller
+        // never tells a user their bond was forfeited while the HTLC is
+        // still theirs.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        let slashed =
+            apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+                .await
+                .unwrap();
+
+        assert!(slashed.is_empty(), "unconfirmed slash yields no notice");
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Locked.to_string(),
+            "bond stays Locked for an admin retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_idempotent_retry_returns_no_row() {
+        // Non-range admin retry: the first apply slashes and reports the
+        // bond; a second apply finds it already PendingPayout (no longer
+        // active), so nothing is returned and the winner is never
+        // re-notified.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        let first = apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let second = apply_bond_resolution(
+            &pool,
+            &mut StubSettle::new(),
+            &order,
+            &res,
+            BondSlashReason::LostDispute,
+        )
+        .await
+        .unwrap();
+        assert!(
+            second.is_empty(),
+            "retry on a PendingPayout bond yields no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_range_maker_slash_returns_child_with_slice_amount() {
+        // Phase 6 × #768: a dispute slash of a range maker bond returns the
+        // child slice row (slice fiat 40 / max 100 × 1000 = 400), not the
+        // full parent bond, and leaves the parent HTLC Locked.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: false,
+        };
+        let mut ln = StubSettle::new();
+
+        let slashed =
+            apply_bond_resolution(&pool, &mut ln, &root, &res, BondSlashReason::LostDispute)
+                .await
+                .unwrap();
+
+        assert_eq!(slashed.len(), 1);
+        assert_eq!(slashed[0].parent_bond_id, Some(parent.id));
+        assert_eq!(slashed[0].child_order_id, Some(root.id));
+        assert_eq!(slashed[0].amount_sats, 400, "slice share, not full bond");
+        assert_eq!(
+            slashed[0].pubkey,
+            maker_pk(),
+            "the maker is the slashed party"
+        );
+        assert!(
+            ln.calls().is_empty(),
+            "parent HTLC is settled only at range close, never inline"
+        );
+        assert_eq!(
+            read_bond_state(&pool, parent.id).await,
+            BondState::Locked.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_range_maker_slash_idempotent_retry_returns_no_row() {
+        // A re-applied dispute resolution (admin retry) must not re-notify:
+        // the slice child already exists, so record_maker_slice_slash inserts
+        // nothing and no row is returned.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let res = BondResolution {
+            slash_seller: true,
+            slash_buyer: false,
+        };
+        let mut ln = StubSettle::new();
+
+        let first =
+            apply_bond_resolution(&pool, &mut ln, &root, &res, BondSlashReason::LostDispute)
+                .await
+                .unwrap();
+        assert_eq!(first.len(), 1, "first apply records and reports the slice");
+
+        let second =
+            apply_bond_resolution(&pool, &mut ln, &root, &res, BondSlashReason::LostDispute)
+                .await
+                .unwrap();
+        assert!(second.is_empty(), "retry must not re-notify the maker");
     }
 }

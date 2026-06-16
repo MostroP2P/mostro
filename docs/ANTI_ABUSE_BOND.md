@@ -188,6 +188,7 @@ slash path.
 | 1 | Taker bond lifecycle: **lock + always release** (no slashing yet) | 0 | ✅ shipped (PR #719) |
 | 1.5 | Protocol cleanup: dedicated `Action::PayBondInvoice` + `Status::WaitingTakerBond` (retire the Phase 1 `PayInvoice` reuse) | 1 | ✅ shipped (PR #736) |
 | 2 | Solver-directed dispute slash via `BondResolution` payload (taker bond) | 1.5 | ✅ shipped (PR #737) |
+| 2.5 | Forfeiture notice on dispute slash: send `Action::BondSlashed` to each slashed party, matching the timeout path ([issue #768](https://github.com/MostroP2P/mostro/issues/768)) | 2, 6 | 🚧 in progress |
 | 3 | Payout flow: `Action::AddBondInvoice` to winner, routing-fee estimation, retries | 2 | ✅ shipped (PR #738) |
 | 3.5 | Payout confirmation to the winner: `BondInvoiceAccepted` (receipt) + `BondPayoutCompleted` (paid) + explicit "already paid" refusal | 3 | ✅ shipped (PR #743) |
 | 4 | Timeout slash for taker bond (`slash_on_waiting_timeout`) + `Action::BondSlashed` forfeiture notice | 3 | ✅ shipped (PR #744) |
@@ -217,7 +218,10 @@ protocol variant those phases need (`Status::WaitingTakerBond`,
 `Action::BondPayoutCompleted`, `Action::BondSlashed`). Phases 6, 7 and 8
 are daemon-only (no protocol/schema change) — Phase 8 in particular adds
 no code beyond the info-event tags already shipped in Phase 3 (§13.1); it
-is documentation polish. The feature is now **complete**.
+is documentation polish. The feature is **complete**; the one open
+follow-up is Phase 2.5 (#768), a daemon-only hardening that sends the
+already-existing `Action::BondSlashed` notice on the dispute-slash path too,
+so it needs no protocol or schema change.
 
 ---
 
@@ -956,6 +960,20 @@ or a legacy admin client):
    When both bonds are slashed in a single dispute, this loop runs
    `settle_hold_invoice` **once per bond** — two HTLCs claimed before
    the slash step returns.
+5. **Notify each slashed party** with a best-effort `Action::BondSlashed`
+   forfeiture notice carrying the slashed amount ([issue #768](https://github.com/MostroP2P/mostro/issues/768)).
+   This mirrors the timeout-slash path (§9): a settle/cancel resolution
+   otherwise produces the **same** order message whether or not a bond was
+   slashed, leaving the loser with no protocol signal that they forfeited a
+   bond. `apply_bond_resolution` returns the bond rows whose slash is
+   **confirmed** (via the durable `slashed_reason = LostDispute` witness, or
+   a freshly-inserted range slice child row); the handler sends one notice
+   per returned row. A transient settle failure (bond left `Locked`) and an
+   idempotent admin retry both yield no row, so the notice is never
+   untruthful and a winner is never re-notified. The amount is the full bond
+   for a taker / non-range maker bond, or the slice's proportional amount for
+   a range maker bond. Like the timeout notice it is fire-and-forget — a
+   dropped message never rolls back the slash.
 
 The recipient payout (asking the winning counterparty for a bolt11,
 `send_payment`, retries, forfeiture on the long-stop window) is
@@ -985,6 +1003,14 @@ sats are already in Mostro's wallet.
 - Both flags true with both bonds present (Phase 5 onward) → both rows
   in `PendingPayout`.
 - Non-admin sending `BondResolution` → rejected before processing.
+- Confirmed slash → `apply_bond_resolution` returns the slashed row(s) and
+  the handler sends `Action::BondSlashed` to each slashed party (#768);
+  `null` payload / no slash → no row, no notice.
+- Transient settle failure (bond left `Locked`) → no row returned, no
+  notice (never untruthful); idempotent admin retry → no row, no
+  re-notification of the winner.
+- Range maker dispute slash → the returned row is the slice child carrying
+  the proportional amount, not the full parent bond.
 
 ### 7.6 Acceptance
 
@@ -992,6 +1018,9 @@ sats are already in Mostro's wallet.
   one, or both bonds — orthogonal decisions.
 - Phase 1 behaviour is preserved when the solver omits the payload.
 - The "Alice scenario" (§15.1) is expressible end-to-end.
+- A slashed party receives an explicit `Action::BondSlashed` notice, so a
+  dispute slash is as transparent as a timeout slash (#768) — no longer
+  indistinguishable from a no-slash resolution.
 
 ---
 

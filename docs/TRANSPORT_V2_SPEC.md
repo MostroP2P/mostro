@@ -138,7 +138,7 @@ dm_days = 30
 | `nip44` | 14 (v2) | v2-capable clients only — the only mode from v0.19.0 |
 
 **Capability discovery:** the node advertises its protocol in the kind
-`38385` instance-info event with a `protocol_versions` tag (`"1"` or
+`38385` instance-info event with a `protocol_version` tag (`"1"` or
 `"2"`, derived from `transport`). Old clients ignore the unknown tag;
 v2-capable clients check it and use the matching wire format — a client
 implementation should keep both wrap paths (mostro-core ships both) to
@@ -151,7 +151,7 @@ with the clients that community uses.
 
 - **v0.18.0** — protocol v2 ships. Default `transport = "gift-wrap"`
   (nothing changes for existing clients). **Protocol v1 is DEPRECATED**:
-  announced in release notes, protocol docs and the `protocol_versions`
+  announced in release notes, protocol docs and the `protocol_version`
   tag. Client developers have the 0.18.x cycle to ship v2.
 - **v0.19.0** — protocol v2 becomes the default and only protocol.
   Everything v1-related is removed from mostrod (gift-wrap path,
@@ -191,7 +191,7 @@ Minimal daemon integration; **zero handler changes** by design:
 - `src/util.rs send_dm()` — wraps via `wrap_message_with(transport, …)`;
   on the nip44 transport, fills a default NIP-40 expiration from `dm_days`
   when the caller didn't pass one.
-- `src/nip33.rs` — `protocol_versions` tag in the kind-38385 info event.
+- `src/nip33.rs` — `protocol_version` tag in the kind-38385 info event.
 
 ### Phase 2 — anti-spam gates (DONE — this change; daemon-only, the payoff)
 
@@ -237,7 +237,7 @@ the gate sits entirely in the event-loop preamble.
   `key_management.md` (v2 examples mirroring the existing unencrypted
   gift-wrap walkthroughs), migration guide for client developers.
 - mostro-cli / client support via the same mostro-core 0.13.0 APIs:
-  clients keep both wrap paths and pick per node from `protocol_versions`.
+  clients keep both wrap paths and pick per node from `protocol_version`.
 
 ### Phase 4 — the v0.19.0 cutover (PENDING)
 

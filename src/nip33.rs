@@ -536,7 +536,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         // `transport` setting so clients pick the right wire format before
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("protocol_versions")),
+            TagKind::Custom(Cow::Borrowed("protocol_version")),
             vec![mostro_settings.transport.protocol_version().to_string()],
         ),
         Tag::custom(

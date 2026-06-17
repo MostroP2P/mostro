@@ -1,6 +1,6 @@
 # Transport v2 — NIP-44 Direct Messaging (Protocol v2)
 
-**Status:** Phase 1 implemented (this spec ships with it) · Phases 2–4 pending
+**Status:** Phases 1–2 implemented · Phases 3–4 pending
 **Issue:** [#626 — Messaging Transport Abstraction Layer](https://github.com/MostroP2P/mostro/issues/626)
 **Full proposal:** [issue comment](https://github.com/MostroP2P/mostro/issues/626#issuecomment-4694164653)
 **Core implementation:** [mostro-core#152](https://github.com/MostroP2P/mostro-core/pull/152), released in mostro-core **0.13.0** (`transport` module)
@@ -193,19 +193,42 @@ Minimal daemon integration; **zero handler changes** by design:
   when the caller didn't pass one.
 - `src/nip33.rs` — `protocol_versions` tag in the kind-38385 info event.
 
-### Phase 2 — anti-spam gates (PENDING — daemon-only, the payoff)
+### Phase 2 — anti-spam gates (DONE — this change; daemon-only, the payoff)
 
-The reason v2 exists: reject junk *before* paying decrypt/parse costs.
+The reason v2 exists: reject junk *before* paying decrypt/parse costs. All of
+the following are **v2-only** — the gate is skipped on the `gift-wrap`
+transport, whose outer key is a throwaway with no pre-validatable signal.
 
-- Cache of active trade pubkeys (open orders/disputes), refreshed on state
-  changes.
-- Cheap pre-validation in the event loop for kind 14: check `event.pubkey`
-  against the cache **before** decrypting.
-- Two lanes — this is the necessary nuance to "only accept known keys":
-  brand-new orders and takes arrive from keys Mostro has never seen, so
-  there is a *known-keys lane* (pre-validated, cheap) and a *first-contact
-  lane* (where spam lives; PoW + relay rate-limiting apply there).
-- TTL / stale-event rejection and dedup as defense in depth.
+- **Active-trade-pubkey cache** (`src/spam_gate.rs`, `SpamGate`): the trade
+  keys that may legitimately message Mostro now — buyer/seller/creator of
+  every non-terminal order, plus the solver of every active dispute. Built by
+  `db::find_active_trade_pubkeys` (terminal set = the restore-session
+  `EXCLUDED_ORDER_STATUSES` **minus `'dispute'`**, so disputed orders stay
+  active). Warmed at startup in `main.rs` and rebuilt every
+  `active_pubkeys_refresh_interval` seconds (default 60) by
+  `scheduler::job_refresh_active_pubkeys` — a periodic full reload, chosen
+  because status mutations are scattered across handlers with no single
+  choke-point. Global-singleton (`OnceLock`), mirroring `PriceManager`.
+- **Cheap pre-validation in the event loop** (`src/app.rs`), for kind 14,
+  **before** `unwrap_incoming` decrypts: check `event.pubkey` against the
+  cache.
+- **Two lanes** — the necessary nuance to "only accept known keys": brand-new
+  orders and takes arrive from keys Mostro has never seen.
+  - *Known-keys lane:* sender in the cache → fast-path; only the base `pow`
+    (already checked at the top of the loop) applies.
+  - *First-contact lane:* sender unseen → must clear `pow_first_contact`
+    (`[mostro]`, defaults to `pow` so existing configs are unchanged) before
+    the daemon decrypts. This is where spam concentrates; PoW here plus
+    relay-side rate limiting are the toll.
+- **Dedup as defense in depth:** a `REPLAY_WINDOW_SECS` (60 s) guard drops a
+  re-sent identical event id before decryption. The existing 10-second
+  freshness window (post-decrypt, on the inner `created_at`) still applies as
+  the precise stale-event check.
+
+New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
+and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,
+so pre-Phase-2 `settings.toml` files are wire-identical. Zero handler changes;
+the gate sits entirely in the event-loop preamble.
 
 ### Phase 3 — protocol docs + client migration (PENDING)
 

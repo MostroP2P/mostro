@@ -36,8 +36,38 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
+    job_refresh_active_pubkeys(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
+/// cache from the DB (spec §6 Phase 2). Status mutations are scattered across
+/// many handlers with no single choke-point, so a periodic full reload is the
+/// robust, low-coupling refresh strategy: a just-taken order's keys begin
+/// fast-pathing within one `active_pubkeys_refresh_interval`. Inert on the v1
+/// transport (the event loop only consults the gate for kind-14 events).
+async fn job_refresh_active_pubkeys(ctx: AppContext) {
+    let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
+    tokio::spawn(async move {
+        loop {
+            match find_active_trade_pubkeys(ctx.pool()).await {
+                Ok(keys) => {
+                    if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                        let n = keys.len();
+                        gate.set_known(keys);
+                        tracing::debug!(
+                            "spam_gate: refreshed active-trade-pubkey cache ({n} keys)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("spam_gate: failed to refresh active-trade-pubkey cache: {e}")
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
 }
 
 async fn job_flush_messages_queue(ctx: AppContext) {

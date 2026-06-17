@@ -12,6 +12,7 @@ pub mod nip33;
 pub mod price;
 pub mod rpc;
 pub mod scheduler;
+pub mod spam_gate;
 pub mod util;
 
 use crate::app::context::AppContext;
@@ -169,6 +170,29 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::error!("RPC server failed to start: {}", e),
             }
         });
+    }
+
+    // Install the protocol-v2 anti-spam gate and warm its active-trade-pubkey
+    // cache before the event loop starts, so the very first kind-14 events are
+    // already pre-filtered against known keys (spec §6 Phase 2). The cache is
+    // kept fresh afterwards by `job_refresh_active_pubkeys`. Inert on the v1
+    // (gift-wrap) transport, which never consults the gate.
+    {
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+        match db::find_active_trade_pubkeys(get_db_pool().as_ref()).await {
+            Ok(keys) => {
+                tracing::info!(
+                    "SpamGate: warming active-trade-pubkey cache ({} keys)",
+                    keys.len()
+                );
+                gate.set_known(keys);
+            }
+            Err(e) => tracing::warn!("SpamGate: initial cache warm failed: {e}"),
+        }
+        if gate.install_global().is_err() {
+            tracing::warn!("SpamGate already installed");
+        }
     }
 
     // Build AppContext explicitly with all dependencies

@@ -77,9 +77,16 @@ async fn main() -> Result<()> {
 
     // Subscribe only to the configured transport's kind: 1059 (protocol v1
     // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
+    let transport = Settings::get_mostro().transport;
+    tracing::info!(
+        "Transport: {} (protocol v{}, event kind {})",
+        transport,
+        transport.protocol_version(),
+        transport.event_kind().as_u16()
+    );
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())
-        .kind(Settings::get_mostro().transport.event_kind())
+        .kind(transport.event_kind())
         .limit(0);
 
     let client = match get_nostr_client() {

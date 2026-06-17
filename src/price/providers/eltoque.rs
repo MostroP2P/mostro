@@ -24,37 +24,44 @@
 //! provider without a token is a startup error (spec §7); the token is
 //! redacted from `Debug`/logs (spec §10.3).
 //!
-//! ──────────────────────────────────────────────────────────────────────
-//! ⚠️ PROVISIONAL WIRING — finalise in a follow-up phase.
+//! ## Request
 //!
-//! The El Toque tasas API is token-gated (registration + Bearer key), so a
-//! **real captured payload** could not be obtained for this phase. What is
-//! **confirmed**: the API authenticates with a Bearer API key, and its
-//! response is a `tasas` object mapping currency codes to CUP-denominated
-//! values (e.g. `{"tasas":{"USD":442.0,"ECU":500.0,"MLC":210.0,…}}`, where
-//! El Toque uses `ECU` for the euro). The CUP-denomination and the `tasas`
-//! envelope are what [`ElToqueProvider::parse`] targets, and they are drawn
-//! from public El Toque outputs — so the **parse path is grounded**.
+//! `GET {url}/v1/trmi?date_from=…&date_to=…` with `Authorization: Bearer
+//! <token>`. The endpoint requires a `[date_from, date_to]` range (wire
+//! format `YYYY-MM-DD HH:MM:SS`, URL-encoded) and returns the most recent
+//! rate published within it, so [`PriceProvider::fetch`] queries a rolling
+//! window ending "now" (see [`LOOKBACK_HOURS`]). The response is a `tasas`
+//! object mapping currency codes to CUP-denominated values, plus the
+//! timestamp of the returned rate (`date`/`hour`/`minutes`/`seconds`, which
+//! the parser ignores). El Toque uses `ECU` for the euro. Example:
 //!
-//! What is **NOT yet confirmed** (and therefore best-effort in
-//! [`PriceProvider::fetch`]): the exact request line — the path
-//! (`/v1/trmi`), the HTTP method (modelled as `GET`), and whether the
-//! endpoint requires `date_from`/`date_to` query parameters. These come
-//! from third-party reverse-engineering, not the official (token-gated)
-//! docs at <https://tasas.eltoque.com/docs>. Before enabling El Toque in
-//! production, confirm the request against those docs, capture a real
-//! payload into `tests/fixtures/price/eltoque_trmi.json`, and tighten the
-//! request here if needed. The fixture shipped with this phase is a
-//! representative sample of the real shape, not a captured response.
-//! ──────────────────────────────────────────────────────────────────────
+//! ```json
+//! { "tasas": { "USD": 490.0, "MLC": 200.0, "ECU": 540.0, … },
+//!   "date": "2022-10-27", "hour": 7, "minutes": 59, "seconds": 30 }
+//! ```
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 
 use crate::price::config::ProviderConfig;
 use crate::price::provider::{PriceProvider, ProviderError, ProviderId, ProviderQuotes, Quote};
+
+/// How far back the `[date_from, date_to]` window reaches from "now".
+///
+/// `/v1/trmi` returns the most recent informal-market rate published inside
+/// the requested range, so the window only needs to be wide enough that a
+/// quiet day (no fresh publication) still falls within it — El Toque's TRMI
+/// updates roughly daily, and 48h comfortably absorbs that plus any
+/// UTC↔Cuba (UTC-4/-5) skew, so each poll resolves a recent rate rather than
+/// an empty `tasas`.
+const LOOKBACK_HOURS: i64 = 48;
+
+/// `date_from`/`date_to` wire format, e.g. `2022-10-27 00:00:01`
+/// (sent URL-encoded by reqwest, matching the El Toque API).
+const DATE_FMT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Response shape: `{ "tasas": { "USD": 442.0, "MLC": 210.0, … } }`.
 ///
@@ -162,15 +169,23 @@ impl PriceProvider for ElToqueProvider {
         ProviderId::ElToque
     }
 
-    /// ⚠️ PROVISIONAL request line — see the module-level note. Confirmed:
-    /// Bearer-token auth. Not yet confirmed: the path/method/params (this
-    /// models a `GET {url}/v1/trmi` with no date range). The parse path it
-    /// feeds is grounded; tighten this once the official docs are available.
+    /// `GET {url}/v1/trmi?date_from=…&date_to=…` with Bearer-token auth.
+    ///
+    /// The endpoint requires a `[date_from, date_to]` range and returns the
+    /// most recent rate published within it; we query a rolling window ending
+    /// "now" (see [`LOOKBACK_HOURS`]) so each poll resolves the latest TRMI.
+    /// reqwest URL-encodes the `YYYY-MM-DD HH:MM:SS` params.
     async fn fetch(&self, http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError> {
         let url = format!("{}/v1/trmi", self.url);
+        let now = Utc::now();
+        let from = now - Duration::hours(LOOKBACK_HOURS);
         let res = http
             .get(&url)
             .bearer_auth(&self.token)
+            .query(&[
+                ("date_from", from.format(DATE_FMT).to_string()),
+                ("date_to", now.format(DATE_FMT).to_string()),
+            ])
             .send()
             .await
             .map_err(|e| ProviderError::Http(format!("eltoque GET {url}: {e}")))?;
@@ -192,10 +207,7 @@ impl PriceProvider for ElToqueProvider {
 mod tests {
     use super::*;
 
-    // ⚠️ PROVISIONAL fixture: a representative sample of El Toque's real
-    // CUP-denominated `tasas` shape (see module note), NOT a captured live
-    // response — the API is token-gated. Replace with a real capture when
-    // finalising the provider.
+    // A captured El Toque `/v1/trmi` response (CUP-denominated `tasas`).
     const SAMPLE_PAYLOAD: &str = include_str!("../../../tests/fixtures/price/eltoque_trmi.json");
 
     fn cfg(url: &str, token: Option<&str>) -> ProviderConfig {
@@ -229,20 +241,20 @@ mod tests {
         // ECU=EUR, crypto) are not contributed by this fiat-cross adapter.
         assert_eq!(quotes.len(), 2, "exactly CUP and MLC are emitted");
 
-        // CUP per USD is taken straight from `tasas.USD` (442 in the sample).
-        assert!((per_usd(&quotes["CUP"]) - 442.0).abs() < 1e-9);
+        // CUP per USD is taken straight from `tasas.USD` (490 in the sample).
+        assert!((per_usd(&quotes["CUP"]) - 490.0).abs() < 1e-9);
 
-        // MLC per USD = cup_per_usd / cup_per_mlc = 442 / 210.
-        assert!((per_usd(&quotes["MLC"]) - 442.0 / 210.0).abs() < 1e-9);
+        // MLC per USD = cup_per_usd / cup_per_mlc = 490 / 200.
+        assert!((per_usd(&quotes["MLC"]) - 490.0 / 200.0).abs() < 1e-9);
 
         // Resolved against a USD/BTC anchor this gives sane per-BTC figures:
-        // CUP/BTC = 442 × USD/BTC, MLC/BTC = (442/210) × USD/BTC — i.e. 1 MLC
-        // is worth 210 CUP, matching the source. Cross-check the ratio.
+        // CUP/BTC = 490 × USD/BTC, MLC/BTC = (490/200) × USD/BTC — i.e. 1 MLC
+        // is worth 200 CUP, matching the source. Cross-check the ratio.
         let cup_per_btc = per_usd(&quotes["CUP"]) * 50_000.0; // pretend USD/BTC
         let mlc_per_btc = per_usd(&quotes["MLC"]) * 50_000.0;
         assert!(
-            (cup_per_btc / mlc_per_btc - 210.0).abs() < 1e-6,
-            "1 MLC must price at 210 CUP, matching tasas"
+            (cup_per_btc / mlc_per_btc - 200.0).abs() < 1e-6,
+            "1 MLC must price at 200 CUP, matching tasas"
         );
     }
 

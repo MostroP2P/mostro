@@ -7,10 +7,10 @@
 //! providers, aggregate, and write the store; consumers (`get_bitcoin_price`,
 //! `BitcoinPriceManager::get_price`) read through [`PriceManager::get_price`].
 //!
-//! ## Phase 1 / 2 invariants (spec §9)
+//! ## Phase 1 / 2 / 3 invariants (spec §9)
 //! - The registry is built from `[price]`; the direct quoters (Yadio,
-//!   CoinGecko, currency-api, Blockchain) are wired, El Toque lands in
-//!   Phase 3.
+//!   CoinGecko, currency-api, Blockchain) and the El Toque fiat-cross
+//!   quoter (Phase 3, CUP/MLC) are all wired.
 //! - Staleness is **logged, not enforced**: a value older than one
 //!   `update_interval` emits a `warn!` but still returns to the caller, so
 //!   Phases 1–3 never refuse an order that would have priced today.
@@ -40,6 +40,7 @@ use super::provider::{PriceProvider, ProviderError, ProviderHealth, ProviderId, 
 use super::providers::blockchain::BlockchainProvider;
 use super::providers::coingecko::CoinGeckoProvider;
 use super::providers::currency_api::CurrencyApiProvider;
+use super::providers::eltoque::ElToqueProvider;
 use super::providers::yadio::YadioProvider;
 use super::store::{PriceError, PriceStore};
 
@@ -560,13 +561,10 @@ fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceP
         ProviderId::CoinGecko => Ok(Box::new(CoinGeckoProvider::new(cfg))),
         ProviderId::CurrencyApi => Ok(Box::new(CurrencyApiProvider::new(cfg))),
         ProviderId::Blockchain => Ok(Box::new(BlockchainProvider::new(cfg))),
-        // El Toque lands in Phase 3. Reject explicitly so an over-eager
-        // config doesn't silently spawn nothing.
-        ProviderId::ElToque => Err(format!(
-            "price: provider `{id}` is configured (enabled) but not yet implemented in \
-             this release — disable it or remove it from `[price.providers]` \
-             (see docs/PRICE_PROVIDERS.md §7)"
-        )),
+        // El Toque (fiat-cross CUP/MLC). `new` returns `Err` when the
+        // required Bearer token is missing, so an enabled-but-unconfigured
+        // provider fails fast at startup (spec §7).
+        ProviderId::ElToque => Ok(Box::new(ElToqueProvider::new(cfg)?)),
     }
 }
 
@@ -831,23 +829,39 @@ mod tests {
         cfg.validate().expect("synthesised config must validate");
     }
 
+    fn eltoque_cfg(token: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            enabled: true,
+            url: "https://tasas.eltoque.com".into(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: token.map(String::from),
+            only: Some(vec!["CUP".into(), "MLC".into()]),
+            except: None,
+        }
+    }
+
     #[test]
-    fn from_settings_rejects_unimplemented_provider_id() {
-        // An enabled provider whose adapter isn't yet wired (El Toque,
-        // Phase 3) must fail at startup, not silently produce nothing.
+    fn from_settings_builds_eltoque_with_token() {
+        // Phase 3: El Toque is now wired. With its required Bearer token it
+        // builds into the registry like any other provider.
         let mut settings = PriceSettings::default();
-        settings.providers.insert(
-            ProviderId::ElToque.to_string(),
-            ProviderConfig {
-                enabled: true,
-                url: "https://tasas.eltoque.com".into(),
-                fallback_urls: vec![],
-                api_key: None,
-                token: Some("x".into()),
-                only: None,
-                except: None,
-            },
-        );
+        settings
+            .providers
+            .insert(ProviderId::ElToque.to_string(), eltoque_cfg(Some("tok")));
+        let m = PriceManager::from_settings(settings).expect("eltoque builds with a token");
+        assert_eq!(m.providers.len(), 1);
+        assert_eq!(m.providers[0].id, ProviderId::ElToque);
+    }
+
+    #[test]
+    fn from_settings_rejects_eltoque_without_token() {
+        // Spec §7: an enabled El Toque missing its required Bearer token must
+        // fail fast at startup, not silently produce nothing.
+        let mut settings = PriceSettings::default();
+        settings
+            .providers
+            .insert(ProviderId::ElToque.to_string(), eltoque_cfg(None));
         assert!(PriceManager::from_settings(settings).is_err());
     }
 

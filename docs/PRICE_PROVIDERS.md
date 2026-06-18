@@ -474,7 +474,7 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 | 0 | Foundation: `PriceProvider` trait, `Quote`, aggregation core (pure), store, `[price]` config types | — | done (PR #753) |
 | 1 | Yadio provider + registry + scheduler wiring (single-source parity); `get_bitcoin_price` reads new store | 0 | done (PR #753) |
 | 2 | Direct backup quoters (CoinGecko, currency-api, Blockchain.com) → real multi-source aggregation; per-provider health/circuit-breaker; currency normalisation + fiat allowlist + per-provider scoping | 1 | in review |
-| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | pending |
+| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | in review (see §11.3) |
 | 4 | Unify `get_market_quote` onto the cache; staleness TTL enforcement (`PriceTooStale`) at create/take | 2 | pending |
 | 5 | Nostr aggregated publishing + token/paid-provider support polish + info-event exposure + retire `bitcoin_price.rs` + ops docs | 3, 4 | pending |
 
@@ -730,6 +730,25 @@ a BTC price source**. Therefore:
    Yadio's CUP is the informal rate (it has been historically); if Yadio
    ever switched to official, we would scope its CUP out too and lean on
    El Toque.
+
+> **Phase 3 shipped status.** The El Toque adapter
+> (`src/price/providers/eltoque.rs`) is wired with **anchor = USD only**
+> (Q2 above declined for this phase). The request and response are confirmed
+> against the live API:
+> - **Request:** `GET {url}/v1/trmi?date_from=…&date_to=…` with
+>   `Authorization: Bearer <token>`. The endpoint requires a
+>   `[date_from, date_to]` range (`YYYY-MM-DD HH:MM:SS`, URL-encoded) and
+>   returns the most recent rate within it, so `fetch` queries a rolling
+>   48h window ending "now".
+> - **Response:** a CUP-denominated `tasas` object
+>   (`{"tasas":{"USD":490.0,"MLC":200.0,"ECU":540.0,…}}`, where El Toque uses
+>   `ECU` for the euro) plus the timestamp of the returned rate
+>   (`date`/`hour`/`minutes`/`seconds`, which the parser ignores). The parse
+>   path applies the §11.3 cross math and is fully unit-tested against a
+>   captured fixture (`tests/fixtures/price/eltoque_trmi.json`).
+>
+> Q1/Q3 remain open. Keep `enabled = false` in production until a token is
+> provisioned and the operator opts in.
 
 ### 11.4 Blockchain.com (direct, 28 major fiats, NO CUP/MLC)
 - `GET https://blockchain.info/ticker` →

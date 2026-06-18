@@ -235,7 +235,32 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
 
     let mostro_settings = Settings::get_mostro();
     let price_settings = match Settings::get_price() {
-        Some(p) => p.clone(),
+        Some(p) => {
+            // Multi-source mode: the `[price.providers.*]` tables drive
+            // aggregation, so the legacy `[mostro].bitcoin_price_api_url` is
+            // not consulted here. Surface that explicitly so an operator who
+            // still has the legacy key set isn't misled into thinking it
+            // takes effect — name the providers actually in play instead.
+            let mut enabled: Vec<&str> = p
+                .providers
+                .iter()
+                .filter(|(_, cfg)| cfg.enabled)
+                .map(|(id, _)| id.as_str())
+                .collect();
+            enabled.sort_unstable();
+            let enabled = if enabled.is_empty() {
+                "<none>".to_string()
+            } else {
+                enabled.join(", ")
+            };
+            tracing::warn!(
+                "price: legacy `bitcoin_price_api_url` = \"{}\" is ignored for price \
+                 aggregation because `[price]` is configured; using enabled providers: {}",
+                mostro_settings.bitcoin_price_api_url,
+                enabled,
+            );
+            p.clone()
+        }
         None => synthesise_legacy_price_settings(
             &mostro_settings.bitcoin_price_api_url,
             mostro_settings.exchange_rates_update_interval_seconds,

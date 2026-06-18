@@ -7,14 +7,15 @@
 //! providers, aggregate, and write the store; consumers (`get_bitcoin_price`,
 //! `BitcoinPriceManager::get_price`) read through [`PriceManager::get_price`].
 //!
-//! ## Phase 1 / 2 / 3 invariants (spec §9)
+//! ## Invariants (spec §9, Phases 1–4)
 //! - The registry is built from `[price]`; the direct quoters (Yadio,
 //!   CoinGecko, currency-api, Blockchain) and the El Toque fiat-cross
 //!   quoter (Phase 3, CUP/MLC) are all wired.
-//! - Staleness is **logged, not enforced**: a value older than one
-//!   `update_interval` emits a `warn!` but still returns to the caller, so
-//!   Phases 1–3 never refuse an order that would have priced today.
-//!   Enforcement turns on in Phase 4.
+//! - Staleness is **enforced** (Phase 4, spec §6.4): a value within
+//!   `max_price_staleness_seconds` is served (with a one-shot `warn!` once
+//!   it ages past one `update_interval`); a value older than the TTL is
+//!   refused with `ServiceError::PriceTooStale` so an order is never priced
+//!   on stale data.
 //! - Per-provider failures are isolated: a failed poll contributes nothing
 //!   this tick and the store's last-known-good value is preserved (spec
 //!   §6.4). Providers are polled **concurrently**, each bounded by
@@ -371,14 +372,15 @@ impl PriceManager {
         }
     }
 
-    /// Read a currency's per-BTC price.
+    /// Read a currency's per-BTC price, enforcing the staleness window.
     ///
-    /// Phase 1 behaviour (spec §9 Phase 1): the staleness window is checked
-    /// and a `warn!` is logged on the **transition** into a stale state,
-    /// but the price is still returned. The next call after a fresh tick
-    /// clears the flag so future regressions warn again. Phase 4 turns
-    /// this into `Err(PriceTooStale)`; doing it now would refuse orders
-    /// that today's code happily prices, which is explicitly out of scope.
+    /// Phase 4 behaviour (spec §6.4, §9 Phase 4): a value within
+    /// `max_price_staleness_seconds` is returned (with a one-shot `warn!`
+    /// once it ages past one update interval); a value older than the TTL is
+    /// **refused** with `ServiceError::PriceTooStale` so a market-priced
+    /// order is never priced on stale data. Consumers map that onto a
+    /// user-facing `CantDoReason::PriceTooStale` at the order boundary.
+    /// A currency that was never stored is `NoAPIResponse` (no data yet).
     pub fn get_price(&self, currency: &str) -> Result<f64, MostroError> {
         let now = Utc::now().timestamp();
         let key = currency.to_uppercase();
@@ -391,25 +393,28 @@ impl PriceManager {
                 Ok(value)
             }
             Err(PriceError::TooStale) => {
-                // Phase 1: log but still return the value — preserve the
-                // legacy "never refuse" behaviour. Phase 4 will turn this
-                // into a hard error.
-                let snap = self.store.snapshot(currency);
-                if let Some(entry) = snap {
-                    let age = now.saturating_sub(entry.as_of);
-                    if self.mark_warned(&self.warned_stale, &key) {
-                        warn!(
-                            "price: {} is past staleness window ({}s old) — Phase 1 still serves it",
+                // Phase 4: refuse past-TTL prices. Warn once on the
+                // transition so the log isn't spammed every read while the
+                // outage persists; a later fresh tick clears the flag (via
+                // `observe_freshness`) so the next slide past the TTL warns
+                // again.
+                if self.mark_warned(&self.warned_stale, &key) {
+                    let age = self
+                        .store
+                        .snapshot(currency)
+                        .map(|e| now.saturating_sub(e.as_of));
+                    match age {
+                        Some(age) => warn!(
+                            "price: {} is past the staleness window ({}s old) — refusing",
                             currency, age
-                        );
+                        ),
+                        None => warn!(
+                            "price: {} is past the staleness window — refusing",
+                            currency
+                        ),
                     }
-                    Ok(entry.value)
-                } else {
-                    // Should not happen: TooStale means an entry exists,
-                    // but tolerate the race in case the entry was wiped
-                    // between get and snapshot.
-                    Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
                 }
+                Err(MostroError::MostroInternalErr(ServiceError::PriceTooStale))
             }
             Err(PriceError::NoCurrency) => {
                 Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
@@ -1279,5 +1284,48 @@ mod tests {
             manager.warned_stale.read().unwrap().is_empty(),
             "fresh read must re-arm the stale guard"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_price_is_refused_but_fresh_is_served() {
+        // Spec §9 Phase 4: a value past the staleness window is refused with
+        // `PriceTooStale`; a value within the window is still served. (Phases
+        // 1–3 served the stale value too — this is the behaviour change.)
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+        manager.settings.max_price_staleness_seconds = 1_800;
+
+        let mk = |v: f64| {
+            let mut agg = HashMap::new();
+            agg.insert(
+                "USD".to_string(),
+                AggregateResult {
+                    value: v,
+                    sources: 1,
+                    contributors: vec![ProviderId::Yadio],
+                },
+            );
+            agg
+        };
+        let now = Utc::now().timestamp();
+
+        // Past the TTL → refused with PriceTooStale.
+        manager.store.update(mk(50_000.0), now - 10_000);
+        assert!(matches!(
+            manager.get_price("USD"),
+            Err(MostroError::MostroInternalErr(ServiceError::PriceTooStale))
+        ));
+
+        // A fresh tick brings it back within the window → served again.
+        manager.store.update(mk(51_000.0), now);
+        assert!((manager.get_price("USD").unwrap() - 51_000.0).abs() < 1e-6);
+
+        // A never-seen currency is "no data", not "stale".
+        assert!(matches!(
+            manager.get_price("EUR"),
+            Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
+        ));
     }
 }

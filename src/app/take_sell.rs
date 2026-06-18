@@ -149,12 +149,17 @@ pub async fn take_sell_action(
     // Invoice validation needs the correct dev_fee to verify buyer invoice amount
     if order.has_no_amount() {
         // Market price: calculate amount, fee, and dev_fee
-        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium) {
             Ok(amount_fees) => {
                 order.amount = amount_fees.0;
                 order.fee = amount_fees.1;
                 let total_mostro_fee = order.fee * 2;
                 order.dev_fee = get_dev_fee(total_mostro_fee);
+            }
+            // No fresh rate within the staleness window — refuse cleanly so
+            // the taker can retry rather than pricing on stale data.
+            Err(MostroInternalErr(ServiceError::PriceTooStale)) => {
+                return Err(MostroCantDo(CantDoReason::PriceTooStale))
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };

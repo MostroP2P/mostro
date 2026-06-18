@@ -54,10 +54,14 @@ use crate::price::provider::{PriceProvider, ProviderError, ProviderId, ProviderQ
 /// `/v1/trmi` returns the most recent informal-market rate published inside
 /// the requested range, so the window only needs to be wide enough that a
 /// quiet day (no fresh publication) still falls within it — El Toque's TRMI
-/// updates roughly daily, and 48h comfortably absorbs that plus any
-/// UTC↔Cuba (UTC-4/-5) skew, so each poll resolves a recent rate rather than
-/// an empty `tasas`.
-const LOOKBACK_HOURS: i64 = 48;
+/// updates roughly daily, so a ~day-wide window resolves a recent rate rather
+/// than an empty `tasas`.
+///
+/// **Hard cap:** the API rejects any range of 24h or more with `400 "El
+/// intervalo de tiempo debe ser menor a 24 horas"`, so the window must stay
+/// *strictly* under 24h. 23h leaves a 1h margin for request-construction skew
+/// while still spanning roughly a full daily cycle.
+const LOOKBACK_HOURS: i64 = 23;
 
 /// `date_from`/`date_to` wire format, e.g. `2022-10-27 00:00:01`
 /// (sent URL-encoded by reqwest, matching the El Toque API).

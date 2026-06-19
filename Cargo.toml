@@ -70,7 +70,9 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.13.0", features = ["sqlx"] }
+# 0.13.1 carries `ServiceError::PriceTooStale` / `CantDoReason::PriceTooStale`
+# (MostroP2P/mostro-core#153), consumed by the Phase 4 staleness enforcement.
+mostro-core = { version = "0.13.1", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

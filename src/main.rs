@@ -7,7 +7,6 @@ pub mod flow;
 pub mod lightning;
 pub mod lnurl;
 pub mod messages;
-pub mod models;
 pub mod nip33;
 pub mod price;
 pub mod rpc;

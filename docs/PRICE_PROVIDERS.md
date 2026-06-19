@@ -474,8 +474,8 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 | 0 | Foundation: `PriceProvider` trait, `Quote`, aggregation core (pure), store, `[price]` config types | — | done (PR #753) |
 | 1 | Yadio provider + registry + scheduler wiring (single-source parity); `get_bitcoin_price` reads new store | 0 | done (PR #753) |
 | 2 | Direct backup quoters (CoinGecko, currency-api, Blockchain.com) → real multi-source aggregation; per-provider health/circuit-breaker; currency normalisation + fiat allowlist + per-provider scoping | 1 | in review |
-| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | in review (see §11.3) |
-| 4 | Unify `get_market_quote` onto the cache; staleness TTL enforcement (`PriceTooStale`) at create/take | 2 | pending |
+| 3 | El Toque provider (fiat-cross CUP/MLC) via PerBase anchor resolution | 2 | done (PR #778) |
+| 4 | Unify `get_market_quote` onto the cache; staleness TTL enforcement (`PriceTooStale`) at create/take | 2 | done |
 | 5 | Nostr aggregated publishing + token/paid-provider support polish + info-event exposure + retire `bitcoin_price.rs` + ops docs | 3, 4 | pending |
 
 Phases 3 and 4 both depend on Phase 2 and can land in either order.
@@ -607,6 +607,23 @@ they can land in one PR or be split per provider.
   currencies unaffected.
 - No HTTP call happens during a take (cache read only).
 
+> **Phase 4 shipped status.** `get_market_quote` (`util.rs`) is now a
+> synchronous cache read — `sats = (fiat_amount / get_price(ccy)) × 1e8`
+> with the premium applied — and the live Yadio path
+> (`retries_yadio_request`, `yadio_base_url`, the `/convert` call, the
+> `Yadio` response model) is deleted. With the live path gone, the legacy
+> `[mostro].bitcoin_price_api_url` now feeds **only** legacy synthesis
+> (§10.1).
+>
+> Staleness is enforced in `PriceManager::get_price`: a value past
+> `max_price_staleness_seconds` returns
+> `ServiceError::PriceTooStale` (still warning once on the transition).
+> Order create (`app/order.rs`) and market-priced takes
+> (`app/take_buy.rs`, `app/take_sell.rs`) map that onto a user-facing
+> `CantDoReason::PriceTooStale`. The dedicated error variants landed in
+> **mostro-core 0.13.1** (MostroP2P/mostro-core#153), replacing the
+> interim `NoAPIResponse` reuse described in §10.2.
+
 ### Phase 5 — Nostr publishing, paid providers, exposure, cleanup
 
 **Scope**
@@ -643,17 +660,19 @@ they can land in one PR or be split per provider.
   CUP scoped out (§6.6).
 - **Consumer surface.** `get_bitcoin_price` keeps its signature;
   `BitcoinPriceManager::get_price` becomes a shim until Phase 5.
-- **Behaviour during rollout.** Staleness is logged-only until Phase 4,
-  so Phases 1–3 never refuse an order that would have priced today.
+- **Behaviour during rollout.** Staleness was logged-only through Phases
+  1–3 (never refusing an order that would have priced today); Phase 4
+  turns enforcement on (§6.4), so a market-priced create/take is refused
+  with `PriceTooStale` once the rate ages past the TTL.
 
 ### 10.2 mostro-core changes
 
-- A new error for refused stale prices is likely needed:
-  `ServiceError::PriceTooStale` (internal) and/or a
-  `CantDoReason::PriceTooStale` (user-facing) in `mostro-core`. This is a
-  cross-repo, serde-additive change pinned by version, on the same
-  cadence as other protocol additions. Until it lands, Phase 4 can reuse
-  `ServiceError::NoAPIResponse` and swap later. Confirm before Phase 4.
+- A new error for refused stale prices was needed:
+  `ServiceError::PriceTooStale` (internal) and `CantDoReason::PriceTooStale`
+  (user-facing) in `mostro-core`. **Shipped in mostro-core 0.13.1**
+  (MostroP2P/mostro-core#153) — a serde-additive change. Phase 4 consumes
+  these directly; the interim `NoAPIResponse` reuse mentioned here is no
+  longer used.
 
 ### 10.3 Security
 

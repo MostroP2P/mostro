@@ -1,8 +1,11 @@
 name: Mutation Testing
 
 on:
-  push:
-    branches: [main]
+  # NOTE: intentionally NOT run on push to main. Full mutation testing is
+  # slow (one test-suite run per mutant) and `continue-on-error` here, so it
+  # gates nothing — running it on every merge only burns CI minutes. It runs
+  # as a weekly audit (schedule) and on demand (workflow_dispatch), plus an
+  # opt-in per-PR job (the `run-mutation` label).
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
@@ -38,7 +41,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
 
       - name: Run mutation testing on changed files
         # Only test mutants in files changed in this PR
@@ -185,7 +190,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
 
       - name: Run full mutation testing
         run: cargo mutants

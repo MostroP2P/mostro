@@ -746,6 +746,25 @@ async fn prepare_new_order(
     Ok(new_order_db)
 }
 
+/// Overwrite the inner protocol version of `message` so it matches the wire
+/// `transport` (`gift-wrap` -> v1, `nip44` -> v2).
+///
+/// `MessageKind::new` always stamps the crate-wide `PROTOCOL_VER`, so without
+/// this every reply would advertise v2 even when it is served over the v1
+/// gift-wrap transport. Keeping the inner version aligned with the transport
+/// lets the protocol version follow the negotiated wire format.
+fn stamp_protocol_version(message: &mut Message, transport: Transport) {
+    let version = transport.protocol_version();
+    match message {
+        Message::Order(k)
+        | Message::Dispute(k)
+        | Message::CantDo(k)
+        | Message::Rate(k)
+        | Message::Dm(k)
+        | Message::Restore(k) => k.version = version,
+    }
+}
+
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
     sender_keys: &Keys,
@@ -757,12 +776,17 @@ pub async fn send_dm(
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(payload)
+    let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
     let transport = Settings::get_transport();
+
+    // Stamp the inner protocol version to match the active wire transport.
+    // Done before wrapping so the version is covered by the message/trade
+    // signatures.
+    stamp_protocol_version(&mut message, transport);
 
     // Kind-14 events are visible to relays, so they always carry a NIP-40
     // expiration tag (default 30 days via `dm_days`) instead of lingering
@@ -1629,6 +1653,45 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    #[test]
+    fn stamp_protocol_version_follows_transport() {
+        use mostro_core::message::Action;
+
+        // A v2-stamped message (the `MessageKind::new` default) must be
+        // downgraded to v1 when served over the gift-wrap transport...
+        let mut msg = Message::new_order(
+            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
+            Some(1),
+            None,
+            Action::NewOrder,
+            None,
+        );
+        stamp_protocol_version(&mut msg, Transport::GiftWrap);
+        assert_eq!(msg.get_inner_message_kind().version, 1);
+
+        // ...and stamped back to v2 over the nip44 direct transport.
+        stamp_protocol_version(&mut msg, Transport::Nip44Direct);
+        assert_eq!(msg.get_inner_message_kind().version, 2);
+    }
+
+    #[test]
+    fn stamp_protocol_version_covers_all_variants() {
+        use mostro_core::message::Action;
+
+        let kind = MessageKind::new(None, Some(1), None, Action::CantDo, None);
+        for mut msg in [
+            Message::Order(kind.clone()),
+            Message::Dispute(kind.clone()),
+            Message::CantDo(kind.clone()),
+            Message::Rate(kind.clone()),
+            Message::Dm(kind.clone()),
+            Message::Restore(kind.clone()),
+        ] {
+            stamp_protocol_version(&mut msg, Transport::GiftWrap);
+            assert_eq!(msg.get_inner_message_kind().version, 1);
+        }
     }
 
     #[test]

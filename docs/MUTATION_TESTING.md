@@ -110,11 +110,21 @@ test_tool_options = ["--", "--test-threads=1"]
 
 ## CI/CD Integration
 
-Mutation testing runs in CI on every PR and on main branch:
+Mutation testing is **not** run on every push to `main`: a full run is slow
+(one test-suite run per mutant) and the job is `continue-on-error`, so running
+it on every merge would only burn CI minutes without gating anything. Instead
+it runs as a periodic audit plus an opt-in per-PR job:
 
-1. **PR workflow**: Runs mutation testing on changed files only (faster feedback)
-2. **Main branch**: Runs full mutation testing weekly (baseline tracking)
-3. **Release gate**: Mutation score must not decrease from previous release
+1. **PR workflow (opt-in)**: Add the `run-mutation` label to a PR to test
+   mutants in the files it changed only (faster feedback).
+2. **Weekly baseline** (`schedule`): Full mutation testing every Sunday for
+   baseline tracking, with the HTML report published to GitHub Pages.
+3. **On demand** (`workflow_dispatch`): Trigger a full run manually from the
+   Actions tab whenever needed.
+
+For pre-push feedback, run it locally instead (see [Running Locally](#running-locally))
+— `cargo mutants --in-diff` against `main` is the closest equivalent to the
+opt-in PR job.
 
 ### Initial Setup (Non-blocking)
 
@@ -224,6 +234,9 @@ fn test_order_validation_rejects_invalid() {
 
 # Or run cargo-mutants directly:
 cargo mutants --file src/flow.rs --output mutants.out
+
+# Pre-push: only mutants in your diff vs main (mirrors the opt-in PR job)
+cargo mutants --in-diff <(git diff origin/main...HEAD)
 ```
 
 ## Performance Considerations

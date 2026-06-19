@@ -159,7 +159,7 @@ pub async fn dispute_action(
     let order_id = if let Some(order_id) = msg.get_inner_message_kind().id {
         order_id
     } else {
-        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
+        return Err(MostroCantDo(CantDoReason::NotFound));
     };
     // Check dispute for this order id is yet present.
     if find_dispute_by_order_id(pool, order_id).await.is_ok() {

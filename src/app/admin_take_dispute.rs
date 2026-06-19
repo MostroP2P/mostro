@@ -180,11 +180,11 @@ pub async fn admin_take_dispute_action(
     // Get order from db using the dispute order id
     let order = if let Some(order) = Order::by_id(pool, dispute.order_id)
         .await
-        .map_err(|_| MostroInternalErr(ServiceError::InvalidOrderId))?
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
     {
         order
     } else {
-        return Err(MostroInternalErr(ServiceError::InvalidOrderId));
+        return Err(MostroCantDo(CantDoReason::NotFound));
     };
 
     // Update dispute fields

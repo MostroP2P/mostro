@@ -1,0 +1,92 @@
+[package]
+name = "fedimint-tonic-lnd"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.65.0"
+description = "An async library implementing LND RPC via tonic and prost. Forked from https://github.com/Kixunil/tonic_lnd"
+homepage = "https://github.com/fedimint/tonic_lnd"
+repository = "https://github.com/fedimint/tonic_lnd"
+readme = "README.md"
+keywords = ["LND", "rpc", "grpc", "tonic", "async"]
+categories = [
+  "api-bindings",
+  "asynchronous",
+  "cryptography::cryptocurrencies",
+  "network-programming",
+]
+license = "MITNFA"
+
+[features]
+lightningrpc = []
+signrpc = []
+walletrpc = ["signrpc"]
+peersrpc = []
+versionrpc = []
+routerrpc = ["lightningrpc"]
+invoicesrpc = ["lightningrpc"]
+staterpc = ["lightningrpc"]
+all = [
+  "lightningrpc",
+  "walletrpc",
+  "peersrpc",
+  "versionrpc",
+  "routerrpc",
+  "invoicesrpc",
+  "staterpc",
+]
+default = ["all"]
+tls-ring = ["tonic/tls-ring"]
+tls-aws-lc = ["tonic/tls-aws-lc"]
+tracing = []
+
+[dependencies]
+hex = "0.4.3"
+hyper = { version = "1", features = ["client"], default-features = false }
+hyper-util = { version = "0.1.14" }
+prost = "0.13.0"
+rustls = { version = "0.23.0", features = ["std"], default-features = false }
+rustls-pemfile = "1.0.0"
+hyper-rustls = { version = "0.27.7", features = [
+  "http2",
+  "tls12",
+], default-features = false }
+tonic = { version = "0.13.1", features = ["transport"] }
+tokio = { version = "1.32.0", features = ["fs"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.13.1"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1.7.1", features = ["rt-multi-thread"] }
+
+[[example]]
+name = "get_info"
+path = "examples/get_info.rs"
+required-features = ["lightningrpc"]
+
+[[example]]
+name = "get_version"
+path = "examples/get_version.rs"
+required-features = ["versionrpc"]
+
+[[example]]
+name = "track_payment"
+path = "examples/track_payment.rs"
+required-features = ["routerrpc"]
+
+[[example]]
+name = "cancel_invoice"
+path = "examples/cancel_invoice.rs"
+required-features = ["invoicesrpc"]
+
+[[example]]
+name = "subscribe_invoices"
+path = "examples/subscribe_invoices.rs"
+required-features = ["invoicesrpc"]
+
+[[example]]
+name = "intercept_htlcs"
+path = "examples/intercept_htlcs.rs"
+required-features = ["routerrpc"]

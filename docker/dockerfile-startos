@@ -3,7 +3,7 @@ FROM rust:1.86-alpine AS builder
 
 # Install build dependencies
 RUN apk update && \
-    apk add --no-cache cmake build-base sqlite-dev pkgconfig protoc perl git
+    apk add --no-cache build-base sqlite-dev pkgconfig git
 
 # Set working directory
 WORKDIR /mostro

@@ -804,9 +804,10 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
           SELECT *
           FROM orders
           WHERE cashu_escrow_locked_at IS NOT NULL
-            AND status = 'active'
+            AND status = ?
         "#,
     )
+    .bind(Status::Active.to_string())
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;

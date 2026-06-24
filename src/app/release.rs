@@ -193,22 +193,78 @@ pub async fn release_action(
     let is_cashu = Settings::is_cashu_enabled() && order.cashu_escrow_token.is_some();
 
     if is_cashu {
-        // Cashu flow: skip lightning invoice settlement and go straight to Success.
-        // Update order event with status Success
+        // Cashu flow: there is no Lightning hold invoice to settle. Mostro only
+        // coordinates the 2-of-3 escrow, so "release" means handing the buyer
+        // the P_M (Mostro) signatures they need to redeem the escrowed ecash and
+        // advancing the order to Success.
+        //
+        // Compute the signatures *before* mutating any state. If anything here
+        // fails we return early and leave the order in FiatSent/Dispute so the
+        // seller can retry — rather than marking the order Success and notifying
+        // the buyer of a completed purchase they cannot actually claim.
+        let token_str = order.cashu_escrow_token.as_ref().ok_or_else(|| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "cashu_escrow_token missing on order in Cashu mode".to_string(),
+            ))
+        })?;
+
+        let token = cdk::nuts::Token::from_str(token_str).map_err(|e| {
+            MostroInternalErr(ServiceError::UnexpectedError(format!(
+                "Failed to parse Cashu escrow token: {e}"
+            )))
+        })?;
+
+        // The node's Nostr secret key doubles as the Cashu P_M signing key.
+        let p_m_secret = cdk::nuts::nut01::SecretKey::from_str(
+            &my_keys.secret_key().to_secret_hex(),
+        )
+        .map_err(|e| {
+            MostroInternalErr(ServiceError::UnexpectedError(format!(
+                "Failed to derive Cashu P_M signing key from node key: {e}"
+            )))
+        })?;
+
+        let mut pm_signatures = Vec::new();
+        for secret in token.token_secrets() {
+            let msg = secret.to_bytes();
+            let sig = p_m_secret.sign(&msg).map_err(|e| {
+                MostroInternalErr(ServiceError::UnexpectedError(format!(
+                    "Failed to sign Cashu proof secret for order {}: {e}",
+                    order.id
+                )))
+            })?;
+            pm_signatures.push(mostro_core::message::CashuProofSignature::new(
+                secret.to_string(),
+                sig.to_string(),
+            ));
+        }
+
+        // A token with no proofs to sign means the buyer would receive a
+        // PurchaseCompleted with no way to redeem the escrow — treat it as a
+        // hard error so the order stays retryable instead of silently stuck.
+        if pm_signatures.is_empty() {
+            return Err(MostroInternalErr(ServiceError::UnexpectedError(format!(
+                "Cashu escrow token for order {} contained no proof secrets to sign",
+                order.id
+            ))));
+        }
+
+        // Signatures are ready — now it is safe to commit the Success transition.
         order = update_order_event(my_keys, Status::Success, &order)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-        let result =
-            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
-                .bind(&order.status)
-                .bind(&order.event_id)
-                .bind(order.id)
-                .bind(Status::FiatSent.to_string())
-                .bind(Status::Dispute.to_string())
-                .execute(pool)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let result = sqlx::query(
+            "UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)",
+        )
+        .bind(&order.status)
+        .bind(&order.event_id)
+        .bind(order.id)
+        .bind(Status::FiatSent.to_string())
+        .bind(Status::Dispute.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         if result.rows_affected() == 0 {
             tracing::warn!(
@@ -218,7 +274,9 @@ pub async fn release_action(
             return Ok(());
         }
 
-        // Send PurchaseCompleted message to buyer
+        // Notify the buyer the purchase completed, then deliver the P_M
+        // signatures "just in case" the seller forgot to DM their own signature
+        // to the buyer via NIP-59.
         enqueue_order_msg(
             None,
             Some(order.id),
@@ -229,35 +287,15 @@ pub async fn release_action(
         )
         .await;
 
-        // Generate and send PM signatures to the buyer "just in case" the seller forgot
-        // to send their own signature to the buyer via NIP-59 DM.
-        let mut pm_signatures = Vec::new();
-        let token_str = order.cashu_escrow_token.as_ref().unwrap();
-        if let Ok(token) = cdk::nuts::Token::from_str(token_str) {
-            let secrets = token.token_secrets();
-            if let Ok(p_m_secret) = cdk::nuts::nut01::SecretKey::from_str(&my_keys.secret_key().to_secret_hex()) {
-                for secret in secrets {
-                    let msg = secret.to_bytes();
-                    if let Ok(sig) = p_m_secret.sign(&msg) {
-                        pm_signatures.push(mostro_core::message::CashuProofSignature::new(
-                            secret.to_string(),
-                            sig.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        
-        if !pm_signatures.is_empty() {
-            enqueue_order_msg(
-                request_id,
-                Some(order.id),
-                Action::CashuPmSignature,
-                Some(Payload::CashuSignatures(pm_signatures)),
-                buyer_pubkey,
-                None,
-            ).await;
-        }
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::CashuPmSignature,
+            Some(Payload::CashuSignatures(pm_signatures)),
+            buyer_pubkey,
+            None,
+        )
+        .await;
 
         // Send dm to buyer to rate counterpart
         enqueue_order_msg(
@@ -283,16 +321,17 @@ pub async fn release_action(
         // explicit write the settled-hold-invoice status only lived in memory and
         // was persisted as a side-effect of the full-row writes in
         // check_failure_retries / payment_success (now replaced by targeted updates).
-        let result =
-            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
-                .bind(&order.status)
-                .bind(&order.event_id)
-                .bind(order.id)
-                .bind(Status::FiatSent.to_string())
-                .bind(Status::Dispute.to_string())
-                .execute(pool)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let result = sqlx::query(
+            "UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)",
+        )
+        .bind(&order.status)
+        .bind(&order.event_id)
+        .bind(order.id)
+        .bind(Status::FiatSent.to_string())
+        .bind(Status::Dispute.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
         if result.rows_affected() == 0 {
             tracing::warn!(
@@ -308,15 +347,20 @@ pub async fn release_action(
     close_dispute_after_user_resolution(ctx, &order, DisputeStatus::Settled, my_keys, "release")
         .await;
 
-    enqueue_order_msg(
-        None,
-        Some(order.id),
-        Action::Released,
-        None,
-        buyer_pubkey,
-        None,
-    )
-    .await;
+    // In the Cashu flow the buyer was already told the purchase completed
+    // (PurchaseCompleted) and given the redeem signatures; the Lightning-only
+    // "Released" notification would be a redundant/conflicting message.
+    if !is_cashu {
+        enqueue_order_msg(
+            None,
+            Some(order.id),
+            Action::Released,
+            None,
+            buyer_pubkey,
+            None,
+        )
+        .await;
+    }
 
     // Handle child order for range orders
     if let Ok((Some(child_order), Some(event))) = get_child_order(ctx, order.clone(), my_keys).await
@@ -331,16 +375,19 @@ pub async fn release_action(
     }
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
-    // indicate *funds released* message to seller
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::HoldInvoicePaymentSettled,
-        None,
-        seller_pubkey,
-        None,
-    )
-    .await;
+    // indicate *funds released* message to seller. This is Lightning-specific
+    // (there is no hold invoice in the Cashu flow), so skip it for Cashu.
+    if !is_cashu {
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            Action::HoldInvoicePaymentSettled,
+            None,
+            seller_pubkey,
+            None,
+        )
+        .await;
+    }
 
     // We send a message to seller indicating seller released funds
     enqueue_order_msg(

@@ -104,10 +104,21 @@ impl EscrowBackend for LndConnector {
 /// A placeholder for the opt-in Cashu mode. In Cashu mode Mostro is only a
 /// coordinator and never takes custody, so these hold-invoice primitives do not
 /// map onto Cashu directly — the feature tracks replace the escrow paths that
-/// call them. Until then every method is `unimplemented!()` and the backend is
-/// never instantiated (the daemon defaults to Lightning).
+/// call them. Until then every method returns a typed error (never `panic!`)
+/// and the backend is never instantiated (the daemon defaults to Lightning).
+/// Returning `Err` rather than `unimplemented!()` keeps an accidental future
+/// instantiation from crashing the daemon in the middle of a trade.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CashuBackend;
+
+impl CashuBackend {
+    /// Error returned by every not-yet-implemented Cashu escrow primitive.
+    fn not_implemented(primitive: &str) -> MostroError {
+        MostroError::MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "Cashu escrow {primitive} is not implemented yet"
+        )))
+    }
+}
 
 #[async_trait]
 impl EscrowBackend for CashuBackend {
@@ -116,14 +127,14 @@ impl EscrowBackend for CashuBackend {
         _description: &str,
         _amount: i64,
     ) -> Result<HoldInvoice, MostroError> {
-        unimplemented!("Cashu escrow lock is implemented in the Cashu lock track")
+        Err(Self::not_implemented("lock"))
     }
 
     async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
-        unimplemented!("Cashu escrow release is implemented in the Cashu release track")
+        Err(Self::not_implemented("release"))
     }
 
     async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
-        unimplemented!("Cashu escrow cancel is implemented in the Cashu cancel track")
+        Err(Self::not_implemented("cancel"))
     }
 }

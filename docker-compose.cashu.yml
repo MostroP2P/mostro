@@ -17,6 +17,9 @@ services:
       MINT_BACKEND_BOLT11_SAT: FakeWallet
       MINT_LISTEN_HOST: 0.0.0.0
       MINT_LISTEN_PORT: "3338"
+      # Non-sensitive fixture: this is a throwaway FakeWallet test mint used
+      # only by the local/CI Cashu integration tests. It holds no real funds and
+      # must never be reused for a production mint.
       MINT_PRIVATE_KEY: TEST_PRIVATE_KEY
     healthcheck:
       test:

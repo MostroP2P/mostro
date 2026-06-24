@@ -1,6 +1,6 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
-use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
+use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DM_EVENT_KIND};
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,8 @@ pub struct ExpirationSettings {
     pub dispute_days: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_audit_days: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dm_days: Option<u32>,
 }
 
 impl ExpirationSettings {
@@ -204,6 +206,7 @@ impl ExpirationSettings {
             NOSTR_RATING_EVENT_KIND => self.rating_days.or(Some(90)), // ratings
             NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
             DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
+            DM_EVENT_KIND => self.dm_days.or(Some(30)),             // protocol-v2 direct messages
             _ => None, // unknown kinds don't get expiration
         }
     }
@@ -241,6 +244,80 @@ mod tests {
             settings.get_expiration_for_kind(NOSTR_ORDER_EVENT_KIND),
             Some(30)
         );
+    }
+
+    #[test]
+    fn dm_kind_respects_configured_days_and_falls_back_to_30() {
+        let settings = ExpirationSettings {
+            dm_days: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(settings.get_expiration_for_kind(DM_EVENT_KIND), Some(7));
+        let settings = ExpirationSettings::default();
+        assert_eq!(settings.get_expiration_for_kind(DM_EVENT_KIND), Some(30));
+    }
+
+    #[test]
+    fn transport_defaults_to_gift_wrap() {
+        // v0.18.x default: wire-identical to pre-v2 daemons. The default
+        // flips to nip44 in v0.19.0 (docs/TRANSPORT_V2_SPEC.md §5).
+        assert_eq!(MostroSettings::default().transport, Transport::GiftWrap);
+    }
+
+    #[test]
+    fn pow_first_contact_defaults_to_base_pow() {
+        // Unset ⇒ first-contact gate uses the base `pow`, so a config that
+        // predates Phase 2 behaves exactly as before (spec §6 Phase 2).
+        let s = MostroSettings {
+            pow: 8,
+            ..MostroSettings::default()
+        };
+        assert_eq!(s.pow_first_contact, None);
+        assert_eq!(s.effective_pow_first_contact(), 8);
+    }
+
+    #[test]
+    fn pow_first_contact_override_takes_precedence() {
+        let s = MostroSettings {
+            pow: 4,
+            pow_first_contact: Some(20),
+            ..MostroSettings::default()
+        };
+        assert_eq!(s.effective_pow_first_contact(), 20);
+    }
+
+    #[test]
+    fn active_pubkeys_refresh_interval_defaults_to_60() {
+        assert_eq!(
+            MostroSettings::default().active_pubkeys_refresh_interval,
+            60
+        );
+    }
+
+    #[test]
+    fn mostro_settings_omitting_phase2_keys_parses() {
+        // An existing settings.toml without the Phase 2 keys must still
+        // deserialize (both fields are `#[serde(default)]`).
+        let toml_str = r#"
+fee = 0
+max_routing_fee = 0.002
+max_order_amount = 1000000
+min_payment_amount = 100
+expiration_hours = 24
+expiration_seconds = 900
+user_rates_sent_interval_seconds = 3600
+max_expiration_days = 15
+publish_relays_interval = 60
+pow = 0
+publish_mostro_info_interval = 300
+fiat_currencies_accepted = ["USD"]
+max_orders_per_response = 10
+dev_fee_percentage = 0.30
+"#;
+        let s: MostroSettings = toml::from_str(toml_str).expect("legacy config parses");
+        assert_eq!(s.pow_first_contact, None);
+        assert_eq!(s.active_pubkeys_refresh_interval, 60);
+        assert_eq!(s.effective_pow_first_contact(), 0);
     }
 
     #[test]
@@ -365,7 +442,15 @@ pub struct MostroSettings {
     pub pow: u8,
     /// Publish mostro info interval
     pub publish_mostro_info_interval: u32,
-    /// Bitcoin price API base URL
+    /// Bitcoin price API base URL.
+    ///
+    /// DEPRECATED (spec §10.1): superseded by `[price.providers.yadio].url`.
+    /// `#[serde(default)]` so a `settings.toml` that has migrated to a
+    /// `[price]` block may omit this key entirely without failing
+    /// deserialization. Still read by the live `/convert` path
+    /// (`src/util.rs`) and by `install_price_manager()` legacy synthesis when
+    /// `[price]` is absent, so the field itself stays until Phase 4/5.
+    #[serde(default = "default_bitcoin_price_api_url")]
     pub bitcoin_price_api_url: String,
     /// Fiat currencies accepted for orders (empty list accepts all)
     pub fiat_currencies_accepted: Vec<String>,
@@ -388,6 +473,44 @@ pub struct MostroSettings {
     /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
+    /// Wire transport for protocol messages: `"gift-wrap"` (protocol v1,
+    /// NIP-59, DEPRECATED) or `"nip44"` (protocol v2, kind-14 direct).
+    /// A node speaks exactly one. See docs/TRANSPORT_V2_SPEC.md.
+    #[serde(default)]
+    pub transport: Transport,
+    /// Proof-of-work difficulty (leading-zero bits) demanded of a
+    /// *first-contact* event on the protocol-v2 (`nip44`) transport — one
+    /// whose visible sender (trade key) is **not** in the active-trade
+    /// cache — checked BEFORE the daemon pays the NIP-44 decrypt cost. This
+    /// is the Phase 2 anti-spam lane: ongoing trades (known keys) need only
+    /// `pow`, while brand-new orders/takes from unseen keys must grind this
+    /// harder toll (see docs/TRANSPORT_V2_SPEC.md §6 Phase 2).
+    ///
+    /// `None` ⇒ falls back to `pow`, so existing configs and the v1
+    /// transport are wire-identical to before. Has no effect on `gift-wrap`
+    /// (v1 senders are throwaway keys that can't be pre-validated).
+    #[serde(default)]
+    pub pow_first_contact: Option<u8>,
+    /// How often (seconds) to rebuild the active-trade-pubkey cache that the
+    /// Phase 2 anti-spam gate consults. Lower = fresher known-keys set (a
+    /// just-taken order's keys fast-path sooner); higher = less DB load.
+    #[serde(default = "default_active_pubkeys_refresh_interval")]
+    pub active_pubkeys_refresh_interval: u64,
+}
+
+impl MostroSettings {
+    /// Effective first-contact PoW difficulty: the explicit
+    /// `pow_first_contact` when set, otherwise the base `pow`. Centralised so
+    /// the event loop and tests agree on the fallback (spec §6 Phase 2).
+    pub fn effective_pow_first_contact(&self) -> u8 {
+        self.pow_first_contact.unwrap_or(self.pow)
+    }
+}
+
+fn default_bitcoin_price_api_url() -> String {
+    // Matches the `Default` impl below so an omitted legacy key and an
+    // explicit one behave identically for legacy synthesis (spec §10.1).
+    "https://api.yadio.io".to_string()
 }
 
 fn default_publish_exchange_rates() -> bool {
@@ -396,6 +519,10 @@ fn default_publish_exchange_rates() -> bool {
 
 fn default_exchange_rates_update_interval() -> u64 {
     300 // 5 minutes
+}
+
+fn default_active_pubkeys_refresh_interval() -> u64 {
+    60 // 1 minute — keeps a just-taken order's keys fast-pathing promptly
 }
 
 impl Default for MostroSettings {
@@ -427,6 +554,9 @@ impl Default for MostroSettings {
             website: None,
             publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
             exchange_rates_update_interval_seconds: default_exchange_rates_update_interval(),
+            transport: Transport::default(),
+            pow_first_contact: None,
+            active_pubkeys_refresh_interval: default_active_pubkeys_refresh_interval(),
         }
     }
 }

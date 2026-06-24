@@ -14,6 +14,7 @@ pub mod nip33;
 pub mod price;
 pub mod rpc;
 pub mod scheduler;
+pub mod spam_gate;
 pub mod util;
 
 use crate::app::context::AppContext;
@@ -56,6 +57,11 @@ async fn main() -> Result<()> {
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
     settings_init()?;
 
+    // Build and install the multi-source price manager (spec §9 Phase 1).
+    // Done immediately after settings load so every later subsystem
+    // (scheduler, util::get_bitcoin_price, RPC) can read prices through it.
+    install_price_manager()?;
+
     // Connect to database
     if DB_POOL.set(db::connect().await?).is_err() {
         tracing::error!("No connection to database - closing Mostro!");
@@ -71,9 +77,18 @@ async fn main() -> Result<()> {
     // Get mostro keys
     let mostro_keys = util::get_keys()?;
 
+    // Subscribe only to the configured transport's kind: 1059 (protocol v1
+    // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
+    let transport = Settings::get_mostro().transport;
+    tracing::info!(
+        "Transport: {} (protocol v{}, event kind {})",
+        transport,
+        transport.protocol_version(),
+        transport.event_kind().as_u16()
+    );
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())
-        .kind(Kind::GiftWrap)
+        .kind(transport.event_kind())
         .limit(0);
 
     let client = match get_nostr_client() {
@@ -190,7 +205,86 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Install the protocol-v2 anti-spam gate and warm its active-trade-pubkey
+    // cache before the event loop starts, so the very first kind-14 events are
+    // already pre-filtered against known keys (spec §6 Phase 2). The cache is
+    // kept fresh afterwards by `job_refresh_active_pubkeys`. Inert on the v1
+    // (gift-wrap) transport, which never consults the gate.
+    {
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+        match db::find_active_trade_pubkeys(get_db_pool().as_ref()).await {
+            Ok(keys) => {
+                tracing::info!(
+                    "SpamGate: warming active-trade-pubkey cache ({} keys)",
+                    keys.len()
+                );
+                gate.set_known(keys);
+            }
+            Err(e) => tracing::warn!("SpamGate: initial cache warm failed: {e}"),
+        }
+        if gate.install_global().is_err() {
+            tracing::warn!("SpamGate already installed");
+        }
+    }
+
+    // ctx was built and the scheduler started above (shared by the Lightning
+    // and Cashu paths); the Cashu path already returned via `run_cashu`, so
+    // here we run the Lightning event loop.
     run(ctx, &mut ln_client).await
+}
+
+/// Build the multi-source [`crate::price::PriceManager`] from settings and
+/// install it as the process-wide global. When `[price]` is absent in the
+/// settings file we synthesise it from the legacy `[mostro]` keys
+/// (`bitcoin_price_api_url`, `exchange_rates_update_interval_seconds`,
+/// `publish_exchange_rates_to_nostr`) so existing `settings.toml` files keep
+/// working byte-for-byte (spec §10.1).
+fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use crate::price::{synthesise_legacy_price_settings, PriceManager};
+
+    let mostro_settings = Settings::get_mostro();
+    let price_settings = match Settings::get_price() {
+        Some(p) => {
+            // Multi-source mode: the `[price.providers.*]` tables drive
+            // aggregation, so the legacy `[mostro].bitcoin_price_api_url` is
+            // not consulted here. Surface that explicitly so an operator who
+            // still has the legacy key set isn't misled into thinking it
+            // takes effect — name the providers actually in play instead.
+            let mut enabled: Vec<&str> = p
+                .providers
+                .iter()
+                .filter(|(_, cfg)| cfg.enabled)
+                .map(|(id, _)| id.as_str())
+                .collect();
+            enabled.sort_unstable();
+            let enabled = if enabled.is_empty() {
+                "<none>".to_string()
+            } else {
+                enabled.join(", ")
+            };
+            tracing::warn!(
+                "price: legacy `bitcoin_price_api_url` = \"{}\" is ignored for price \
+                 aggregation because `[price]` is configured; using enabled providers: {}",
+                mostro_settings.bitcoin_price_api_url,
+                enabled,
+            );
+            p.clone()
+        }
+        None => synthesise_legacy_price_settings(
+            &mostro_settings.bitcoin_price_api_url,
+            mostro_settings.exchange_rates_update_interval_seconds,
+            mostro_settings.publish_exchange_rates_to_nostr,
+        ),
+    };
+
+    let manager = PriceManager::from_settings(price_settings)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;
+    manager
+        .install_global()
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;
+    tracing::info!("PriceManager installed");
+    Ok(())
 }
 
 #[cfg(test)]

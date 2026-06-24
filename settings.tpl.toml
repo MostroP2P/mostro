@@ -52,9 +52,40 @@ user_rates_sent_interval_seconds = 3600
 publish_relays_interval = 60
 # Requested POW
 pow = 0
+# Wire transport for protocol messages. A node speaks exactly one:
+#   "gift-wrap" - protocol v1, NIP-59 gift wraps (kind 1059). DEPRECATED,
+#                 will be removed in v0.19.0.
+#   "nip44"     - protocol v2, signed kind-14 events with NIP-44 encrypted
+#                 content. Rate-limitable by relays; switch once the clients
+#                 your community uses support protocol v2.
+# See docs/TRANSPORT_V2_SPEC.md
+transport = "gift-wrap"
+# Anti-spam gate for the "nip44" transport (docs/TRANSPORT_V2_SPEC.md §6
+# Phase 2). Proof-of-work (leading-zero bits) demanded of a *first-contact*
+# event — one whose visible sender (trade key) is not part of an active
+# order/dispute — checked BEFORE decryption. Ongoing trades (known keys) need
+# only `pow`; brand-new orders/takes from unseen keys must clear this stiffer
+# toll. Omit (or leave commented) to fall back to `pow`. No effect on
+# "gift-wrap". Example: keep pow = 0 for cheap ongoing trades but require work
+# from first-contact senders.
+# pow_first_contact = 16
+# How often (seconds) to rebuild the active-trade-pubkey cache the gate
+# consults. Lower = a just-taken order's keys fast-path sooner; higher = less
+# DB load. Default 60.
+# active_pubkeys_refresh_interval = 60
 # Publish mostro info interval
 publish_mostro_info_interval = 300
-# Bitcoin price API base URL
+# Bitcoin price API base URL.
+# DEPRECATED: prefer `[price.providers.yadio].url` in the new multi-source
+# `[price]` block below (see docs/PRICE_PROVIDERS.md §10.1). Lifecycle:
+#  (a) Now OPTIONAL — once you configure a `[price]` block you may delete this
+#      key. When it is absent AND `[price]` is also absent, the default
+#      "https://api.yadio.io" is used for the legacy single-source synthesis.
+#  (b) Still read by the live market-quote path (/convert) until Phase 4. To
+#      avoid the live and cached paths hitting different Yadio URLs, the live
+#      path prefers `[price.providers.yadio].url` when a `[price]` block is
+#      present and only falls back to this key otherwise.
+#  (c) Fully removed in Phase 5.
 bitcoin_price_api_url = "https://api.yadio.io"
 # Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
@@ -77,6 +108,8 @@ rating_days = 90
 dispute_days = 90
 # Fee audit events (kind 8383) - annual transparency
 fee_audit_days = 365
+# Protocol-v2 direct messages (kind 14) - trade lifetime plus dispute window
+dm_days = 30
 
 [rpc]
 # Enable RPC server for direct admin communication
@@ -87,6 +120,64 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+
+# Multi-source price providers (see docs/PRICE_PROVIDERS.md).
+# Absent section ≡ legacy single-source behaviour synthesised from
+# `[mostro].bitcoin_price_api_url` + `exchange_rates_update_interval_seconds`
+# + `publish_exchange_rates_to_nostr`. Uncomment the block to take control.
+#
+# [price]
+# # Poll cadence and freshness budget.
+# update_interval_seconds = 300
+# max_price_staleness_seconds = 1800
+# # Discard a source whose value deviates more than this % from the median
+# # (only applies with >= 3 sources for a currency).
+# outlier_threshold_pct = 5.0
+# # Per-provider request timeout and circuit-breaker (cooldown caps at 30 min).
+# provider_timeout_seconds = 10
+# provider_failure_threshold = 3
+# provider_failure_cooldown_seconds = 120
+# # Publish the aggregated rates to Nostr (kind 30078). Replaces the legacy
+# # `publish_exchange_rates_to_nostr`.
+# publish_to_nostr = true
+#
+# [price.providers.yadio]
+# enabled = true
+# url = "https://api.yadio.io"
+#
+# [price.providers.coingecko]
+# enabled = true
+# url = "https://api.coingecko.com/api/v3"
+# # api_key = "CG-xxxx"   # optional demo/pro key; raises rate limits. Pro
+# # plans use url = "https://pro-api.coingecko.com/api/v3" (the adapter picks
+# # the matching auth header from the host).
+#
+# # Keyless, CDN-hosted, 300+ currencies incl. CUP at the OFFICIAL rate — so
+# # CUP/MLC are excluded to avoid mixing official with the informal-market
+# # sources (docs/PRICE_PROVIDERS.md §6.6).
+# [price.providers.currency_api]
+# enabled = true
+# url = "https://currency-api.pages.dev/v1"
+# # Ordered mirrors tried in sequence when `url` fails this tick.
+# fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
+# except = ["CUP", "MLC"]
+#
+# # Keyless, ~28 major fiats, no CUP/MLC. Mid-market (`last`) only.
+# [price.providers.blockchain]
+# enabled = true
+# url = "https://blockchain.info"
+#
+# # El Toque — informal-market CUP/MLC (fiat-cross, resolved against the
+# # aggregated USD/BTC anchor; §6.3, §11.3). Opt-in: requires a free Bearer
+# # token. Scoped to CUP/MLC only — that is all this source contributes.
+# # NOTE: the request wiring is PROVISIONAL pending a confirmed payload from
+# # the token-gated API — keep `enabled = false` in production until then
+# # (see docs/PRICE_PROVIDERS.md §11.3).
+# [price.providers.eltoque]
+# enabled = false
+# url = "https://tasas.eltoque.com"
+# # token = "xxxx"        # REQUIRED when enabled; provider refuses to start otherwise
+# only = ["CUP", "MLC"]
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

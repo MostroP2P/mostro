@@ -1,4 +1,4 @@
--- mostro-core 0.12.0 adds three Cashu escrow fields to the `Order` model.
+-- mostro-core 0.12.1 adds three Cashu escrow fields to the `Order` model.
 -- These columns back the Cashu 2-of-3 multisig escrow mode (see the escrow
 -- architecture spec). They are `NULL` for Lightning orders.
 --

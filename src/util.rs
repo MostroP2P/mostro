@@ -1,5 +1,6 @@
-use crate::bitcoin_price::BitcoinPriceManager;
-use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS};
+use crate::config::constants::{
+    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS, DM_EVENT_KIND,
+};
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
@@ -37,13 +38,63 @@ const MAX_RETRY: u16 = 4;
 // Redefined for convenience
 type OrderKind = mostro_core::order::Kind;
 
+/// Resolve the Yadio base URL for the live market-quote path (`/convert`,
+/// `/currencies`).
+///
+/// Phase 1 transition (spec §10.1): the cached aggregate path reads
+/// `[price.providers.yadio].url`, but this live path historically read the
+/// legacy `[mostro].bitcoin_price_api_url`. If an operator customises only
+/// the new key, the two paths would silently hit different Yadio bases.
+/// Prefer the configured Yadio provider URL when it is *usable* — the provider
+/// is enabled and has a non-empty URL — otherwise fall back to the legacy key.
+/// A disabled or blank provider entry must not suppress that fallback. The
+/// chosen URL is normalized exactly as [`YadioProvider::new`] does
+/// (`trim_end_matches('/')`) so appending `/convert` / `/currencies` can never
+/// produce a `//`, keeping the live and aggregate paths on an identical base.
+/// Phase 4 removes this live HTTP path entirely, at which point the legacy key
+/// only feeds legacy synthesis.
+fn yadio_base_url() -> String {
+    let provider = Settings::get_price().and_then(|price| {
+        price
+            .providers
+            .get(&crate::price::ProviderId::Yadio.to_string())
+            .map(|yadio| (yadio.url.as_str(), yadio.enabled))
+    });
+    let legacy = Settings::get_mostro().bitcoin_price_api_url.clone();
+    select_yadio_base_url(provider, &legacy)
+}
+
+/// Drop surrounding whitespace and any trailing slash, matching
+/// [`crate::price::providers::yadio::YadioProvider::new`]. A URL that is only
+/// slashes/whitespace normalizes to empty and is treated as "not configured".
+fn normalize_base_url(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// Pure selection logic behind [`yadio_base_url`], split out so it is unit
+/// testable without the write-once global `Settings`. `provider` is
+/// `(url, enabled)` for the `[price.providers.yadio]` entry when present.
+/// Prefer that URL only when it is *usable* — the provider is enabled and the
+/// URL is non-empty after normalization — otherwise fall back to the
+/// (normalized) legacy `bitcoin_price_api_url`.
+fn select_yadio_base_url(provider: Option<(&str, bool)>, legacy: &str) -> String {
+    if let Some((url, enabled)) = provider {
+        if enabled {
+            let url = normalize_base_url(url);
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+    normalize_base_url(legacy)
+}
+
 pub async fn retries_yadio_request(
     req_string: &str,
     fiat_code: &str,
 ) -> Result<(Option<reqwest::Response>, bool), MostroError> {
     // Get Fiat list and check if currency exchange is available
-    let mostro_settings = Settings::get_mostro();
-    let api_req_string = format!("{}/currencies", mostro_settings.bitcoin_price_api_url);
+    let api_req_string = format!("{}/currencies", yadio_base_url());
     let fiat_list_check = HTTP_CLIENT
         .get(api_req_string)
         .send()
@@ -69,7 +120,7 @@ pub async fn retries_yadio_request(
 }
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
-    BitcoinPriceManager::get_price(fiat_code)
+    crate::price::get_bitcoin_price(fiat_code)
 }
 
 /// Request market quote from Yadio to have sats amount at actual market price
@@ -79,10 +130,11 @@ pub async fn get_market_quote(
     premium: i64,
 ) -> Result<i64, MostroError> {
     // Add here check for market price
-    let mostro_settings = Settings::get_mostro();
     let req_string = format!(
         "{}/convert/{}/{}/BTC",
-        mostro_settings.bitcoin_price_api_url, fiat_amount, fiat_code
+        yadio_base_url(),
+        fiat_amount,
+        fiat_code
     );
     info!("Requesting API price: {}", req_string);
 
@@ -260,6 +312,9 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
             let mostro_settings = Settings::get_mostro();
             Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
         }
+        // Protocol-v2 direct messages: same 30-day default as
+        // `ExpirationSettings::get_expiration_for_kind`.
+        DM_EVENT_KIND => Some(now + Duration::days(30).num_seconds()),
         _ => None,
     }
 }
@@ -363,7 +418,7 @@ pub async fn publish_order(
     trade_index: Option<i64>,
 ) -> Result<(), MostroError> {
     // Prepare a new default order
-    let new_order_db = match prepare_new_order(
+    let mut new_order_db = match prepare_new_order(
         new_order,
         initiator_pubkey,
         trade_index,
@@ -378,19 +433,150 @@ pub async fn publish_order(
         }
     };
 
+    // Phase 5/6: when the maker side is bonded, the order must NOT hit the
+    // order book until the maker locks an anti-abuse bond. Park it at
+    // `WaitingMakerBond` (no NIP-33 event emitted), request the bond, and
+    // defer the publication to `resume_publish_after_maker_bond`, which
+    // the bond subscriber calls on `Accepted`. Both fixed-amount (Phase 5)
+    // and range (Phase 6) orders take this path; range orders size the
+    // bond against `max_amount` (worst-case exposure) and resolve slashes
+    // proportionally per taken slice — see `maker_bond_notional_sats`.
+    let maker_bond_required = crate::app::bond::maker_bond_required();
+    if maker_bond_required {
+        let notional = maker_bond_notional_sats(&new_order_db)?;
+        new_order_db.status = Status::WaitingMakerBond.to_string();
+        let order = new_order_db
+            .create(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        info!("New order saved (awaiting maker bond) Id: {}", order.id);
+        if let Err(e) = crate::app::bond::request_maker_bond(
+            pool,
+            &order,
+            trade_pubkey,
+            notional,
+            request_id,
+            trade_index,
+        )
+        .await
+        {
+            // The order was parked at `WaitingMakerBond` but never emitted
+            // a NIP-33 event, and `request_maker_bond` already released any
+            // bond row it managed to create. Without cleanup the row would
+            // sit hidden in `WaitingMakerBond` until the order-expiry job
+            // reaps it hours later. Delete the stranded row now (scoped to
+            // the parked status so we never touch one that has since
+            // advanced) and surface the error to the maker.
+            tracing::warn!(
+                order_id = %order.id,
+                "publish_order: request_maker_bond failed ({}); deleting stranded WaitingMakerBond order",
+                e
+            );
+            if let Err(del) = sqlx::query("DELETE FROM orders WHERE id = ? AND status = ?")
+                .bind(order.id)
+                .bind(Status::WaitingMakerBond.to_string())
+                .execute(pool)
+                .await
+            {
+                tracing::warn!(
+                    order_id = %order.id,
+                    "publish_order: failed to delete stranded order: {}", del
+                );
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+
     // CRUD order creation
-    let mut order = new_order_db
-        .clone()
+    let order = new_order_db
         .create(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    info!("New order saved Id: {}", order.id);
+
+    finalize_order_publication(
+        pool,
+        keys,
+        order,
+        identity_pubkey,
+        trade_pubkey,
+        request_id,
+        trade_index,
+    )
+    .await
+}
+
+/// Sats notional a maker bond is sized against.
+///
+/// - **Range orders (Phase 6).** Sized against `max_amount` — the
+///   worst-case fiat exposure the maker is advertising — converted at the
+///   current cached price. Each taken slice later slashes a proportional
+///   share of the resulting bond (`slice.fiat_amount / max_amount`), so
+///   the notional must be the range ceiling, not any single slice.
+/// - **Fixed-price orders.** Carry their sats `amount` directly.
+/// - **Market-priced single orders.** `amount == 0` at creation, so we
+///   convert the fiat amount at the current cached price — the same quote
+///   `calculate_and_check_quote` validates against at order time.
+///
+/// The bond is a one-time snapshot and is not repriced if the market moves
+/// before the order is taken (spec §10.3).
+fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
+    // Range orders: size against the fiat ceiling (`max_amount`).
+    if order.is_range_order() {
+        // `is_range_order()` only checks that `min`/`max` are `Some`, not
+        // that they are positive, so guard against a zero/negative ceiling
+        // here — a non-positive `max_amount` would otherwise size the bond
+        // at the floor and later divide-by-zero in the proportional slash
+        // (`record_maker_slice_slash`, which carries the matching guard).
+        let max_fiat = order.max_amount.filter(|m| *m > 0).ok_or_else(|| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "range order missing positive max_amount".to_string(),
+            ))
+        })?;
+        let price = get_bitcoin_price(&order.fiat_code)?;
+        if price <= 0.0 {
+            return Err(MostroInternalErr(ServiceError::NoAPIResponse));
+        }
+        let sats = (max_fiat as f64 / price) * 1E8;
+        return Ok(sats as i64);
+    }
+    if order.amount > 0 {
+        return Ok(order.amount);
+    }
+    let price = get_bitcoin_price(&order.fiat_code)?;
+    if price <= 0.0 {
+        return Err(MostroInternalErr(ServiceError::NoAPIResponse));
+    }
+    let sats = (order.fiat_amount as f64 / price) * 1E8;
+    Ok(sats as i64)
+}
+
+/// Publish the NIP-33 event for a freshly-persisted order, persist its
+/// `event_id`, ack the maker with [`Action::NewOrder`], and broadcast.
+///
+/// Shared by the inline `publish_order` path (no maker bond) and the
+/// deferred [`resume_publish_after_maker_bond`] path (maker bond locked).
+/// The order row must already exist in the DB; on success it is in
+/// `Status::Pending` with its `event_id` set.
+async fn finalize_order_publication(
+    pool: &SqlitePool,
+    keys: &Keys,
+    mut order: Order,
+    identity_pubkey: PublicKey,
+    trade_pubkey: PublicKey,
+    request_id: Option<u64>,
+    trade_index: Option<i64>,
+) -> Result<(), MostroError> {
     let order_id = order.id;
-    info!("New order saved Id: {}", order_id);
+    // The maker-bond path parked the order at `WaitingMakerBond`; the
+    // no-bond path created it at `Pending`. Either way it goes live now.
+    order.status = Status::Pending.to_string();
 
     // Get tags for new order in case of full privacy or normal order
     // nip33 kind with order fields as tags and order id as identifier (kind 38383 for orders)
     let event = if let Some(tags) =
-        get_tags_for_new_order(&new_order_db, pool, &identity_pubkey, &trade_pubkey, keys).await?
+        get_tags_for_new_order(&order, pool, &identity_pubkey, &trade_pubkey, keys).await?
     {
         new_order_event(keys, "", order_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
@@ -401,21 +587,22 @@ pub async fn publish_order(
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
-    // We update the order with the new event_id
+    // We update the order with the new event_id (and Pending status)
     order.event_id = event_id;
+    // Build the ack payload before `update` consumes the order row.
+    let mut small = order.as_new_order();
+    small.id = Some(order_id);
     order
         .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let mut order = new_order_db.as_new_order();
-    order.id = Some(order_id);
 
     // Send message as ack with small order
     enqueue_order_msg(
         request_id,
         Some(order_id),
         Action::NewOrder,
-        Some(Payload::Order(order)),
+        Some(Payload::Order(small)),
         trade_pubkey,
         trade_index,
     )
@@ -428,6 +615,70 @@ pub async fn publish_order(
         .await
         .map(|_s| ())
         .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
+}
+
+/// Finish publishing an order whose maker bond has just locked.
+///
+/// Called from the bond subscriber (`bond::flow::on_maker_bond_accepted`).
+/// Derives the maker's identity and trade pubkeys from the order row —
+/// the maker is the seller on a sell order, the buyer on a buy order
+/// (§3.1) — and hands off to [`finalize_order_publication`]. Idempotency
+/// across redeliveries is enforced by the caller, which only invokes this
+/// while the order is still in `WaitingMakerBond`.
+pub async fn resume_publish_after_maker_bond(
+    pool: &SqlitePool,
+    keys: &Keys,
+    order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Atomically claim the deferred `WaitingMakerBond → Pending`
+    // transition. The bond subscriber already re-read the row and saw
+    // `WaitingMakerBond`, but that check is not atomic with the publish
+    // below: the order-expiry job (`job_expire_pending_older_orders`) can
+    // flip the row `WaitingMakerBond → Expired` (and cancel the just-locked
+    // bond) in between. Without a CAS the full-row write inside
+    // `finalize_order_publication` would blindly resurrect the dead order
+    // back to `Pending` and emit a NIP-33 event for it. If the CAS affects
+    // 0 rows another path already owns the status, so we skip cleanly.
+    let cas = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
+        .bind(Status::Pending.to_string())
+        .bind(order.id)
+        .bind(Status::WaitingMakerBond.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if cas.rows_affected() != 1 {
+        info!(
+            "resume_publish_after_maker_bond: order {} no longer WaitingMakerBond — skipping deferred publish",
+            order.id
+        );
+        return Ok(());
+    }
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let (trade_pubkey, identity_pubkey, trade_index) = match kind {
+        OrderKind::Sell => (
+            order.get_seller_pubkey().map_err(MostroInternalErr)?,
+            order
+                .get_master_seller_pubkey()
+                .map_err(MostroInternalErr)?,
+            order.trade_index_seller,
+        ),
+        OrderKind::Buy => (
+            order.get_buyer_pubkey().map_err(MostroInternalErr)?,
+            order.get_master_buyer_pubkey().map_err(MostroInternalErr)?,
+            order.trade_index_buyer,
+        ),
+    };
+    finalize_order_publication(
+        pool,
+        keys,
+        order,
+        identity_pubkey,
+        trade_pubkey,
+        request_id,
+        trade_index,
+    )
+    .await
 }
 
 async fn prepare_new_order(
@@ -495,6 +746,25 @@ async fn prepare_new_order(
     Ok(new_order_db)
 }
 
+/// Overwrite the inner protocol version of `message` so it matches the wire
+/// `transport` (`gift-wrap` -> v1, `nip44` -> v2).
+///
+/// `MessageKind::new` always stamps the crate-wide `PROTOCOL_VER`, so without
+/// this every reply would advertise v2 even when it is served over the v1
+/// gift-wrap transport. Keeping the inner version aligned with the transport
+/// lets the protocol version follow the negotiated wire format.
+fn stamp_protocol_version(message: &mut Message, transport: Transport) {
+    let version = transport.protocol_version();
+    match message {
+        Message::Order(k)
+        | Message::Dispute(k)
+        | Message::CantDo(k)
+        | Message::Rate(k)
+        | Message::Dm(k)
+        | Message::Restore(k) => k.version = version,
+    }
+}
+
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
     sender_keys: &Keys,
@@ -506,13 +776,32 @@ pub async fn send_dm(
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(payload)
+    let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+    // Non-panicking accessor: send_dm sits on every reply path and is
+    // exercised by unit tests that don't initialize the global config.
+    let transport = Settings::get_transport();
+
+    // Stamp the inner protocol version to match the active wire transport.
+    // Done before wrapping so the version is covered by the message/trade
+    // signatures.
+    stamp_protocol_version(&mut message, transport);
+
+    // Kind-14 events are visible to relays, so they always carry a NIP-40
+    // expiration tag (default 30 days via `dm_days`) instead of lingering
+    // forever. Callers that pass an explicit expiration keep it.
+    let expiration = match (transport, expiration) {
+        (Transport::Nip44Direct, None) => get_expiration_timestamp_for_kind(DM_EVENT_KIND)
+            .map(|secs| Timestamp::from_secs(secs as u64)),
+        (_, exp) => exp,
+    };
 
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
     // trade_index for the node.
-    let event = wrap_message(
+    let event = wrap_message_with(
+        transport,
         &message,
         sender_keys,
         sender_keys,
@@ -1168,16 +1457,14 @@ pub async fn get_dispute(msg: &Message, pool: &Pool<Sqlite>) -> Result<Dispute, 
 
 pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, MostroError> {
     let order_msg = msg.get_inner_message_kind();
-    let order_id = order_msg
-        .id
-        .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
+    let order_id = order_msg.id.ok_or(MostroCantDo(CantDoReason::NotFound))?;
     let order = Order::by_id(pool, order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     if let Some(order) = order {
         Ok(order)
     } else {
-        Err(MostroInternalErr(ServiceError::InvalidOrderId))
+        Err(MostroCantDo(CantDoReason::NotFound))
     }
 }
 
@@ -1352,6 +1639,7 @@ pub async fn notify_taker_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitcoin_price::BitcoinPriceManager;
     use mostro_core::message::{Message, MessageKind};
     use mostro_core::order::Order;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -1365,6 +1653,95 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    #[test]
+    fn stamp_protocol_version_follows_transport() {
+        use mostro_core::message::Action;
+
+        // A v2-stamped message (the `MessageKind::new` default) must be
+        // downgraded to v1 when served over the gift-wrap transport...
+        let mut msg = Message::new_order(
+            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
+            Some(1),
+            None,
+            Action::NewOrder,
+            None,
+        );
+        stamp_protocol_version(&mut msg, Transport::GiftWrap);
+        assert_eq!(msg.get_inner_message_kind().version, 1);
+
+        // ...and stamped back to v2 over the nip44 direct transport.
+        stamp_protocol_version(&mut msg, Transport::Nip44Direct);
+        assert_eq!(msg.get_inner_message_kind().version, 2);
+    }
+
+    #[test]
+    fn stamp_protocol_version_covers_all_variants() {
+        use mostro_core::message::Action;
+
+        let kind = MessageKind::new(None, Some(1), None, Action::CantDo, None);
+        for mut msg in [
+            Message::Order(kind.clone()),
+            Message::Dispute(kind.clone()),
+            Message::CantDo(kind.clone()),
+            Message::Rate(kind.clone()),
+            Message::Dm(kind.clone()),
+            Message::Restore(kind.clone()),
+        ] {
+            stamp_protocol_version(&mut msg, Transport::GiftWrap);
+            assert_eq!(msg.get_inner_message_kind().version, 1);
+        }
+    }
+
+    #[test]
+    fn select_yadio_base_url_prefers_enabled_provider() {
+        // Enabled provider with a usable URL wins over the legacy key.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://provider.example", true)),
+                "https://legacy.example"
+            ),
+            "https://provider.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_strips_trailing_slash_like_provider_new() {
+        // A configured trailing slash must not survive — otherwise appending
+        // `/convert` yields `//convert`. Matches `YadioProvider::new`.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://api.yadio.io/", true)),
+                "https://legacy.example"
+            ),
+            "https://api.yadio.io"
+        );
+        // Whitespace + multiple trailing slashes both normalized away.
+        assert_eq!(
+            select_yadio_base_url(Some(("  https://api.yadio.io//  ", true)), "ignored"),
+            "https://api.yadio.io"
+        );
+        // The legacy fallback is normalized the same way.
+        assert_eq!(
+            select_yadio_base_url(None, "https://legacy.example/"),
+            "https://legacy.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_falls_back_when_provider_unusable() {
+        let legacy = "https://legacy.example";
+        // Disabled provider → fall back to legacy even with a URL set.
+        assert_eq!(
+            select_yadio_base_url(Some(("https://provider.example", false)), legacy),
+            legacy
+        );
+        // Enabled but blank / slash-only URL → fall back to legacy.
+        assert_eq!(select_yadio_base_url(Some(("   ", true)), legacy), legacy);
+        assert_eq!(select_yadio_base_url(Some(("/", true)), legacy), legacy);
+        // No provider entry at all → legacy.
+        assert_eq!(select_yadio_base_url(None, legacy), legacy);
     }
 
     async fn setup_orders_pool() -> SqlitePool {
@@ -1591,6 +1968,65 @@ mod tests {
         assert!(orders.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_id_missing() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let message = Message::Order(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_order_absent() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let missing_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(missing_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_order_when_found() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let user_pubkey = "a".repeat(64);
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, Some(&user_pubkey), None, &user_pubkey).await;
+
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let order = get_order(&message, &pool).await.unwrap();
+        assert_eq!(order.id, order_id);
+    }
+
     #[test]
     fn test_get_dev_fee_basic() {
         // 1000 sats Mostro fee at 30% -> 300 sats
@@ -1616,5 +2052,59 @@ mod tests {
         // With 30%, 1 * 0.30 = 0.3 -> 0
         let fee = calculate_dev_fee(1, 0.30);
         assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn maker_bond_notional_uses_fixed_amount_directly() {
+        // Phase 5: a fixed-price order carries its sats `amount`, so the
+        // maker-bond notional is exactly that — no price lookup, no API
+        // dependency in this path.
+        let order = Order {
+            amount: 50_000,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 25,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_sizes_against_max_at_price() {
+        // Phase 6: a range order sizes the notional against `max_amount`
+        // converted at the cached price: 100 fiat / 60_000 * 1e8 ≈ 166_666
+        // sats. Unique fiat_code avoids clobbering the shared price cache.
+        BitcoinPriceManager::set_price_for_test("T6RANGE", 60_000.0);
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(100),
+            fiat_code: "T6RANGE".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 166_666);
+    }
+
+    #[test]
+    fn maker_bond_notional_range_rejects_non_positive_max() {
+        // `is_range_order()` only checks `Some`-ness, so a `max_amount` of 0
+        // still enters the range branch and must be rejected before bond
+        // sizing (it would divide-by-zero in the proportional slash). A
+        // `None` max can't reach here — `is_range_order()` would be false.
+        let order = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(0),
+            fiat_code: "T6ZERO".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert!(order.is_range_order());
+        let err = maker_bond_notional_sats(&order).unwrap_err();
+        assert!(
+            matches!(err, MostroInternalErr(ServiceError::UnexpectedError(_))),
+            "expected UnexpectedError for non-positive max_amount, got {err:?}"
+        );
     }
 }

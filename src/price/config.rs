@@ -74,12 +74,14 @@ impl ProviderConfig {
     pub fn validate(&self, id: &str) -> Result<(), String> {
         if self.only.is_some() && self.except.is_some() {
             return Err(format!(
-                "price provider '{id}': `only` and `except` are mutually exclusive"
+                "price provider '{id}': `only` and `except` are mutually exclusive \
+                 (see docs/PRICE_PROVIDERS.md §7)"
             ));
         }
         if self.enabled && self.url.trim().is_empty() {
             return Err(format!(
-                "price provider '{id}': enabled provider must have a non-empty `url`"
+                "price provider '{id}': enabled provider must have a non-empty `url` \
+                 (see docs/PRICE_PROVIDERS.md §7)"
             ));
         }
         Ok(())

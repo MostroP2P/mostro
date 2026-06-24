@@ -56,7 +56,8 @@ use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
-use mostro_core::nip59::{unwrap_message, UnwrappedMessage};
+use mostro_core::nip59::UnwrappedMessage;
+use mostro_core::transport::unwrap_incoming;
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 
@@ -300,6 +301,17 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
+    // The node speaks exactly one transport (protocol v1 gift wrap or v2
+    // NIP-44 direct); events of any other kind are dropped before any
+    // decryption work. See docs/TRANSPORT_V2_SPEC.md.
+    let accepted_kind = ctx.settings().mostro.transport.event_kind();
+    // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): on the v2 (kind
+    // 14) transport the visible author is the trade key, so the daemon can
+    // pre-validate before decrypting. Unknown (first-contact) senders must
+    // clear `pow_first_contact`; known active-trade keys need only `pow`. The
+    // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
+    let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
+    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
 
     loop {
         let mut notifications = client.notifications();
@@ -312,22 +324,56 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                     tracing::info!("Not POW verified event!");
                     continue;
                 }
-                if let Kind::GiftWrap = event.kind {
+                if event.kind == accepted_kind {
+                    // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
+                    // cheap pre-validation BEFORE paying the NIP-44 decrypt
+                    // cost. v1 gift wraps skip this — their outer key is a
+                    // throwaway with no pre-validatable signal.
+                    if is_v2 {
+                        if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                            let now = chrono::Utc::now().timestamp();
+                            // Dedup: drop a re-sent identical event (defense in
+                            // depth against replay floods).
+                            if gate.is_replay(event.id, now) {
+                                tracing::debug!("Dropping replayed event {}", event.id);
+                                continue;
+                            }
+                            // Two lanes: a sender already in an active trade is
+                            // fast-pathed (only the base `pow` already checked
+                            // above applies); an unseen first-contact sender
+                            // must clear the stiffer `pow_first_contact` before
+                            // we decrypt. New orders/takes legitimately arrive
+                            // here — so does spam, hence the PoW toll.
+                            if !gate.is_known(&event.pubkey.to_string())
+                                && !event.check_pow(pow_first_contact)
+                            {
+                                tracing::info!(
+                                    "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
+                                    event.pubkey,
+                                    pow_first_contact
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     // Validate event signature
                     if event.verify().is_err() {
                         tracing::warn!("Error in event verification")
                     };
 
-                    // Mostro-core's NIP-59 transport handles the dual-key layout
-                    // (identity key signs seal, trade key authors rumor) plus inner
-                    // tuple (message, signature) decoding and signature verification
-                    // in one shot.
-                    let unwrapped = match unwrap_message(&event, my_keys).await {
+                    // Mostro-core dispatches on the event kind: the gift wrap
+                    // path handles the dual-key layout (identity key signs
+                    // seal, trade key authors rumor), the kind-14 path the
+                    // 3-element tuple with its in-ciphertext identity proof.
+                    // Both decode and verify signatures in one shot and yield
+                    // the same transport-agnostic `UnwrappedMessage`.
+                    let unwrapped = match unwrap_incoming(&event, my_keys).await {
                         Ok(Some(u)) => u,
-                        // Outer NIP-44 decrypt failed: not addressed to this node.
+                        // NIP-44 decrypt failed: not addressed to this node.
                         Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!("Error unwrapping NIP-59 message: {}", e);
+                            tracing::warn!("Error unwrapping incoming message: {}", e);
                             continue;
                         }
                     };
@@ -419,11 +465,11 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                         tracing::warn!("Error in event verification")
                     };
 
-                    let unwrapped = match unwrap_message(&event, my_keys).await {
+                    let unwrapped = match unwrap_incoming(&event, my_keys).await {
                         Ok(Some(u)) => u,
                         Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!("Error unwrapping NIP-59 message: {}", e);
+                            tracing::warn!("Error unwrapping incoming message: {}", e);
                             continue;
                         }
                     };

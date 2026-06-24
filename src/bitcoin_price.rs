@@ -1,423 +1,54 @@
-use crate::config::settings::Settings;
-use crate::lnurl::HTTP_CLIENT;
-use crate::nip33::new_exchange_rates_event;
-use crate::util::{get_keys, get_nostr_client};
-use chrono::Utc;
+//! Legacy `BitcoinPriceManager` shim (spec §9 Phase 1 / §10.1).
+//!
+//! The real price logic lives in [`crate::price`] from Phase 1 onward.
+//! This module survives only as a thin `get_price` delegate so any
+//! downstream caller still referring to `BitcoinPriceManager` keeps
+//! compiling; the type itself is scheduled for removal in Phase 5 once
+//! every consumer reads through `PriceManager` directly.
+#![allow(dead_code)]
+
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::*;
-use once_cell::sync::Lazy;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::RwLock;
-use tracing::{error, info, warn};
-
-#[derive(Debug, Deserialize)]
-struct YadioResponse {
-    // Yadio reports `null` for currencies it currently has no rate for
-    // (observed: `"BGN": null`). A strict `HashMap<String, f64>` makes serde
-    // reject the *entire* response on the first null, taking every currency
-    // down with it. Parse leniently as `Option<f64>` and drop the bad
-    // entries in `update_prices`.
-    #[serde(rename = "BTC")]
-    btc: HashMap<String, Option<f64>>,
-}
-
-static BITCOIN_PRICES: Lazy<RwLock<HashMap<String, f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 
 pub struct BitcoinPriceManager;
 
 impl BitcoinPriceManager {
-    pub async fn update_prices() -> Result<(), MostroError> {
-        let mostro_settings = Settings::get_mostro();
-        let api_url = format!("{}/exrates/BTC", mostro_settings.bitcoin_price_api_url);
-        let response = HTTP_CLIENT
-            .get(&api_url)
-            .send()
-            .await
-            .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
-        let yadio_response: YadioResponse = response
-            .json()
-            .await
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-
-        // Keep only currencies with a usable rate: drop `null` (currencies
-        // Yadio has no price for) and any non-finite / non-positive value.
-        let rates_clone: HashMap<String, f64> = yadio_response
-            .btc
-            .into_iter()
-            .filter_map(|(code, value)| match value {
-                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
-                _ => None,
-            })
-            .collect();
-
-        // A response with zero usable rates (everything null/invalid, or an
-        // empty BTC object) must NOT overwrite the cache — that would turn a
-        // transient provider hiccup into total price unavailability for every
-        // currency. Keep the last known prices and try again next tick.
-        if rates_clone.is_empty() {
-            warn!("Yadio returned no usable BTC rates; keeping previously cached prices");
-            return Ok(());
-        }
-
-        info!(
-            "Bitcoin prices updated. Got BTC price in {} fiat currencies",
-            rates_clone.len()
-        );
-
-        {
-            let mut prices_write = BITCOIN_PRICES
-                .write()
-                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-            *prices_write = rates_clone.clone();
-        } // Lock is dropped here
-
-        // Publish rates to Nostr if enabled (after releasing the lock)
-        if mostro_settings.publish_exchange_rates_to_nostr {
-            if let Err(e) = Self::publish_rates_to_nostr(&rates_clone).await {
-                error!("Failed to publish exchange rates to Nostr: {}", e);
-                // Don't fail the entire update if Nostr publishing fails
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Publishes exchange rates to Nostr as a NIP-33 addressable event (kind 30078)
-    async fn publish_rates_to_nostr(rates: &HashMap<String, f64>) -> Result<(), MostroError> {
-        let keys = get_keys().map_err(|e| {
-            error!("Failed to get Mostro keys: {}", e);
-            MostroInternalErr(ServiceError::IOError(e.to_string()))
-        })?;
-
-        // Publish in Yadio's exact format: {"BTC": {"USD": 50000.0, "EUR": 45000.0, ...}}
-        // This matches their API response structure
-        let mut wrapper = HashMap::new();
-        wrapper.insert("BTC".to_string(), rates.clone());
-        let formatted_rates = wrapper;
-
-        let content = serde_json::to_string(&formatted_rates)
-            .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
-
-        let timestamp = Utc::now().timestamp();
-
-        // Expiration should be at least 2x the update interval to allow for delays
-        // Cap at 1 hour to prevent stale data
-        // Note: We read settings here (instead of passing from scheduler) to ensure
-        // expiration stays aligned with interval if config is reloaded at runtime
-        let mostro_settings = Settings::get_mostro();
-        let update_interval = mostro_settings.exchange_rates_update_interval_seconds;
-        let expiration_seconds = std::cmp::min(update_interval * 2, 3600);
-        let expiration = timestamp + expiration_seconds as i64;
-
-        let tags = Tags::from_list(vec![
-            Tag::custom(
-                TagKind::Custom("published_at".into()),
-                vec![timestamp.to_string()],
-            ),
-            Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
-            Tag::expiration(Timestamp::from(expiration as u64)),
-        ]);
-
-        let event = new_exchange_rates_event(&keys, &content, tags).map_err(|e| {
-            error!("Failed to create exchange rates event: {}", e);
-            MostroInternalErr(ServiceError::MessageSerializationError)
-        })?;
-
-        let client = get_nostr_client().map_err(|e| {
-            error!("Failed to get Nostr client: {}", e);
-            e
-        })?;
-
-        // Publish with timeout to avoid blocking the scheduler
-        // Best-effort: log errors but don't fail the update job
-        let timeout_duration = std::time::Duration::from_secs(30);
-        match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
-            Ok(Ok(output)) => {
-                info!(
-                    "Exchange rates published to Nostr ({} currencies). Output: {:?}",
-                    rates.len(),
-                    output
-                );
-            }
-            Ok(Err(e)) => {
-                error!("Failed to send exchange rates event to relays: {}", e);
-            }
-            Err(_) => {
-                error!("Timeout publishing exchange rates to Nostr (30s exceeded)");
-            }
-        }
-
-        // Always return Ok - publishing is best-effort
-        Ok(())
-    }
-
+    /// Delegates to [`crate::price::get_bitcoin_price`]. Behaviour is
+    /// identical to the legacy implementation: an uppercase ISO-4217 code
+    /// returns the per-BTC value if the global [`crate::price::PriceManager`]
+    /// has it, otherwise `Err(NoAPIResponse)` (matching "no data yet" in
+    /// the pre-Phase-1 world).
     pub fn get_price(currency: &str) -> Result<f64, MostroError> {
-        let prices_read: std::sync::RwLockReadGuard<'_, HashMap<String, f64>> = BITCOIN_PRICES
-            .read()
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        prices_read
-            .get(currency)
-            .cloned()
-            .ok_or(MostroInternalErr(ServiceError::NoAPIResponse))
+        crate::price::get_bitcoin_price(currency)
+    }
+
+    /// Test-only: seed the price-override map consulted by
+    /// [`crate::price::get_bitcoin_price`] so unit tests in other modules
+    /// can exercise price-dependent paths (e.g. range-order bond sizing)
+    /// deterministically without hitting the network or installing the
+    /// global `PriceManager`. Use a unique `currency` per test to avoid
+    /// cross-test interference on the shared map.
+    #[cfg(test)]
+    pub(crate) fn set_price_for_test(currency: &str, price: f64) {
+        crate::price::test_price_overrides()
+            .write()
+            .expect("price override write lock")
+            .insert(currency.to_string(), price);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
-    fn test_rates_structure() {
-        // Test that Yadio rates are wrapped correctly
-        let mut input_rates = HashMap::new();
-        input_rates.insert("USD".to_string(), 50000.0);
-        input_rates.insert("EUR".to_string(), 45000.0);
-
-        // Wrap in Yadio format: {"BTC": {...}}
-        let mut wrapper = HashMap::new();
-        wrapper.insert("BTC".to_string(), input_rates.clone());
-
-        assert_eq!(wrapper.len(), 1);
-        assert!(wrapper.contains_key("BTC"));
-        assert_eq!(wrapper.get("BTC").unwrap().get("USD"), Some(&50000.0));
-        assert_eq!(wrapper.get("BTC").unwrap().get("EUR"), Some(&45000.0));
-    }
-
-    #[test]
-    fn test_rates_json_serialization() {
-        // Test that rates can be serialized to Yadio format
-        // Use only fiat currencies (Yadio includes BTC in the wrapper, not in the rates map)
-        let mut input_rates = HashMap::new();
-        input_rates.insert("USD".to_string(), 50000.0);
-        input_rates.insert("EUR".to_string(), 45000.0);
-
-        let mut wrapper = HashMap::new();
-        wrapper.insert("BTC".to_string(), input_rates);
-
-        let json = serde_json::to_string(&wrapper).unwrap();
-        assert!(json.contains("\"BTC\""));
-        assert!(json.contains("\"USD\""));
-        assert!(json.contains("50000"));
-        assert!(json.contains("\"EUR\""));
-        assert!(json.contains("45000"));
-        // Ensure we don't have nested BTC key (would be invalid)
-        assert!(!json.contains("\"BTC\":1"));
-    }
-
-    #[test]
-    fn test_yadio_response_deserialization() {
-        // Test that we can deserialize the expected API response format
-        let json_response = r#"
-        {
-            "BTC": {
-                "USD": 50000.0,
-                "EUR": 45000.0,
-                "GBP": 40000.0
-            }
-        }
-        "#;
-
-        let result: Result<YadioResponse, _> = serde_json::from_str(json_response);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.btc.get("USD"), Some(&Some(50000.0)));
-        assert_eq!(response.btc.get("EUR"), Some(&Some(45000.0)));
-        assert_eq!(response.btc.get("GBP"), Some(&Some(40000.0)));
-        assert_eq!(response.btc.len(), 3);
-    }
-
-    #[test]
-    fn test_yadio_response_with_null_rate_is_parsed_and_filtered() {
-        // Regression: Yadio now returns `null` for currencies it has no rate
-        // for (e.g. "BGN": null). The lenient `Option<f64>` parse must accept
-        // the whole payload, and the same filter `update_prices` applies must
-        // drop the null while keeping the good currencies.
-        let json_response = r#"
-        {
-            "BTC": { "USD": 75899.55, "EUR": 65393.99, "BGN": null },
-            "base": "BTC",
-            "timestamp": 1779480604069
-        }
-        "#;
-
-        let response: YadioResponse = serde_json::from_str(json_response).expect("must parse");
-        assert_eq!(response.btc.get("BGN"), Some(&None));
-
-        let rates: HashMap<String, f64> = response
-            .btc
-            .into_iter()
-            .filter_map(|(code, value)| match value {
-                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(rates.len(), 2, "null BGN must be dropped");
-        assert_eq!(rates.get("USD"), Some(&75899.55));
-        assert_eq!(rates.get("EUR"), Some(&65393.99));
-        assert!(!rates.contains_key("BGN"));
-    }
-
-    #[test]
-    fn test_yadio_response_all_null_filters_to_empty() {
-        // When every rate is null/invalid the payload still parses, but the
-        // filter yields an empty map — the condition under which
-        // `update_prices` preserves the previously cached prices instead of
-        // overwriting them with nothing.
-        let json_response = r#"{ "BTC": { "BGN": null, "ZZZ": null }, "base": "BTC" }"#;
-        let response: YadioResponse = serde_json::from_str(json_response).expect("must parse");
-        let rates: HashMap<String, f64> = response
-            .btc
-            .into_iter()
-            .filter_map(|(code, value)| match value {
-                Some(v) if v.is_finite() && v > 0.0 => Some((code, v)),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            rates.is_empty(),
-            "all-null response must filter to an empty rate set"
-        );
-    }
-
-    #[test]
-    fn test_yadio_response_invalid_json() {
-        // Test deserialization with invalid JSON
-        let invalid_json = r#"{"invalid": "structure"}"#;
-
-        let result: Result<YadioResponse, _> = serde_json::from_str(invalid_json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_yadio_response_empty_btc() {
-        // Test deserialization with empty BTC object
-        let json_response = r#"{"BTC": {}}"#;
-
-        let result: Result<YadioResponse, _> = serde_json::from_str(json_response);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.btc.len(), 0);
-    }
-
-    #[test]
-    fn test_currency_code_validation() {
-        // Test various currency code formats
-        let valid_currencies = vec!["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF"];
-        let invalid_currencies = vec!["", "us", "USDD", "123", "usd"];
-
-        // Test valid currencies (should not panic)
-        for currency in valid_currencies {
-            let _result = BitcoinPriceManager::get_price(currency);
-            // No assertion needed; this ensures no panic for valid input
-        }
-
-        // Test invalid currencies (should not panic)
-        for currency in invalid_currencies {
-            let _result = BitcoinPriceManager::get_price(currency);
-            // No assertion needed; this ensures no panic for invalid input
-        }
-    }
-
-    #[test]
-    fn test_bitcoin_price_manager_api_url() {
-        // Test that API URL configuration is properly handled
-        let expected_base = "https://api.yadio.io";
-        assert!(expected_base.starts_with("https://"));
-        assert!(expected_base.contains("yadio.io"));
-    }
-
-    mod error_handling_tests {
-        use super::*;
-
-        #[test]
-        fn test_json_parsing_errors() {
-            // Test various JSON parsing error scenarios
-            let invalid_responses = vec![
-                "",                               // Empty response
-                "{",                              // Incomplete JSON
-                "null",                           // Null response
-                "[]",                             // Array instead of object
-                r#"{"BTC": null}"#,               // Null BTC field
-                r#"{"BTC": []}"#,                 // Array instead of object for BTC
-                r#"{"BTC": {"USD": "invalid"}}"#, // Invalid number format
-            ];
-
-            for invalid_json in invalid_responses {
-                let result: Result<YadioResponse, _> = serde_json::from_str(invalid_json);
-                // All should fail to deserialize
-                assert!(result.is_err());
-            }
-        }
-    }
-
-    mod price_cache_tests {
-        use super::*;
-
-        #[test]
-        fn test_price_cache_operations() {
-            // Test the logical flow of price caching
-
-            // Test that we can conceptually store and retrieve prices
-            let test_currencies = HashMap::from([
-                ("USD".to_string(), 50000.0),
-                ("EUR".to_string(), 45000.0),
-                ("GBP".to_string(), 40000.0),
-            ]);
-
-            // Verify our test data is valid
-            assert_eq!(test_currencies.len(), 3);
-            assert!(test_currencies.contains_key("USD"));
-            assert_eq!(test_currencies.get("USD"), Some(&50000.0));
-
-            // Test currency code normalization (uppercase)
-            for currency in test_currencies.keys() {
-                assert_eq!(currency, &currency.to_uppercase());
-                assert!(currency.len() == 3); // Standard currency code length
-            }
-        }
-
-        #[test]
-        fn test_concurrent_access_safety() {
-            // Test that the static BITCOIN_PRICES can handle concurrent access
-            // This tests the thread safety of our RwLock usage
-
-            use std::sync::atomic::{AtomicBool, Ordering};
-            use std::sync::Arc;
-            use std::thread;
-
-            let success = Arc::new(AtomicBool::new(true));
-            let mut handles = vec![];
-
-            // Spawn multiple threads trying to read prices
-            for _ in 0..5 {
-                let success_clone = Arc::clone(&success);
-                let handle = thread::spawn(move || {
-                    for _ in 0..10 {
-                        match BitcoinPriceManager::get_price("USD") {
-                            Ok(_) | Err(_) => {
-                                // Both outcomes are acceptable for this test
-                                // We're just testing that it doesn't panic
-                            }
-                        }
-                    }
-                    success_clone.store(true, Ordering::Relaxed);
-                });
-                handles.push(handle);
-            }
-
-            // Wait for all threads to complete
-            for handle in handles {
-                handle.join().expect("Thread should not panic");
-            }
-
-            // All threads should have completed successfully
-            assert!(success.load(Ordering::Relaxed));
-        }
+    fn unset_manager_returns_no_api_response() {
+        // Unit tests never install the global PriceManager. The shim must
+        // surface the same error the legacy `BITCOIN_PRICES.get` empty-map
+        // path used to surface, so callers behave identically.
+        let err = BitcoinPriceManager::get_price("USD").unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroInternalErr(ServiceError::NoAPIResponse)
+        ));
     }
 }

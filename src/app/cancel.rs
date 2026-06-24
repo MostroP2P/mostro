@@ -146,9 +146,12 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     )
     .await;
 
-    // Phase 1: cooperative cancel always releases any taker bond. The
-    // dispute slash path lands in Phase 2.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "cooperative_cancel").await;
+    // Phase 1/6: cooperative cancel releases any taker bond and resolves
+    // the maker bond at range close (Phase 6 settle-at-close if earlier
+    // slices were slashed, else release; the close helper also covers the
+    // non-range maker bond via its non-range branch).
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "cooperative_cancel").await;
+    bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "cooperative_cancel").await;
 
     Ok(())
 }
@@ -235,8 +238,16 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     // Look at what's left on the order. If other concurrent takers
     // still have active bonds, do NOT reset the order — they are
     // still racing. Just message the sender that their take is cancelled.
+    //
+    // Phase 5: scope this to *taker* bonds. Under `apply_to = both` the
+    // order also carries a `Locked` maker bond (pubkey != the cancelling
+    // taker), which must not count as "another taker still racing" — that
+    // would wrongly keep the order in `WaitingTakerBond` and prevent it
+    // from dropping back to `Pending` when the last taker backs out.
     let remaining = crate::app::bond::db::find_active_bonds_for_order(pool, order_id).await?;
-    let others_remain = remaining.iter().any(|b| b.pubkey != sender_str);
+    let others_remain = remaining
+        .iter()
+        .any(|b| b.pubkey != sender_str && b.role == crate::app::bond::BondRole::Taker.to_string());
     if others_remain {
         enqueue_order_msg(
             request_id,
@@ -366,9 +377,12 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     )
     .await;
 
-    // Phase 1: maker cancelled before the trade went active — release any
-    // taker bond that had already been locked.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "maker_cancel").await;
+    // Phase 1/6: maker cancelled before the trade went active — release any
+    // taker bond that had already been locked, and resolve the maker bond at
+    // range close (release when no slice was slashed; settle-at-close
+    // otherwise).
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "maker_cancel").await;
+    bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "maker_cancel").await;
 
     Ok(())
 }
@@ -449,7 +463,8 @@ async fn cancel_pending_order_from_maker(
             );
         }
     }
-    bond::release_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "pending_maker_cancel").await;
+    bond::resolve_range_maker_bond_at_close_or_warn(pool, order, "pending_maker_cancel").await;
     Ok(())
 }
 

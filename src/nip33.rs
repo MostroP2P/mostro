@@ -531,6 +531,14 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
             TagKind::Custom(Cow::Borrowed("pow")),
             vec![mostro_settings.pow.to_string()],
         ),
+        // Capability advertisement: which Mostro protocol version this node
+        // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
+        // `transport` setting so clients pick the right wire format before
+        // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        Tag::custom(
+            TagKind::Custom(Cow::Borrowed("protocol_version")),
+            vec![mostro_settings.transport.protocol_version().to_string()],
+        ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("hold_invoice_expiration_window")),
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
@@ -1071,6 +1079,26 @@ mod tests {
             mapped,
             Status::Pending,
             "WaitingTakerBond must publish as Pending on the wire (NIP-69 invariant)"
+        );
+    }
+
+    /// Phase 5 (`docs/ANTI_ABUSE_BOND.md` §10.1 / §10.4): an order whose
+    /// daemon-internal status is `WaitingMakerBond` has **not** been
+    /// published to Nostr yet — the maker's bond is still outstanding.
+    /// `create_status_tags` must therefore signal "do not emit an event"
+    /// (`create_event == false`), so the order never appears in the book
+    /// until the bond locks and the order transitions to `Pending`. This
+    /// is the opposite of `WaitingTakerBond`, which is already advertised
+    /// and must keep emitting.
+    #[test]
+    fn waiting_maker_bond_is_not_published_on_wire() {
+        let mut order = make_pending_order();
+        order.status = Status::WaitingMakerBond.to_string();
+
+        let (emit, _mapped) = create_status_tags(&order).expect("status tags");
+        assert!(
+            !emit,
+            "WaitingMakerBond must NOT emit an order event — the order is invisible until the bond locks"
         );
     }
 

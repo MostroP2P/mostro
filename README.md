@@ -47,6 +47,7 @@ While @lnp2pBot works excellently, it relies on Telegram—a platform potentiall
 - **User Reputation** - Peer rating system to build trust between traders
 - **Automatic Timeouts** - Configurable expiration for orders and payment windows
 - **Payment Retry Logic** - Automatic retry for failed Lightning payments with configurable attempts
+- **Anti-Abuse Bond** - Optional, opt-in Lightning hold-invoice bond for makers and/or takers; released on honest trades, slashed only on a solver dispute directive or a waiting-state timeout (off by default — see [docs/ANTI_ABUSE_BOND.md](docs/ANTI_ABUSE_BOND.md))
 
 ### Advanced Features
 - **Development Fee System** - Transparent fee collection with Nostr audit events (kind 8383)
@@ -65,6 +66,26 @@ While @lnp2pBot works excellently, it relies on Telegram—a platform potentiall
 - **SQLite Backend** - Lightweight, embedded database with full migration support
 - **Nostr Protocol** - NIP-59 (GiftWrap), NIP-33 (replaceable events) compliance
 - **Observability** - Structured logging with `tracing`, configurable log levels
+
+### Nostr Event Kinds Used by the Daemon
+
+Mostro uses a small set of Nostr event kinds. Some are part of the public protocol, and some are transport-only details that live inside NIP-59 GiftWrap envelopes.
+
+| Kind | Name / Constant | Used for | Notes |
+| --- | --- | --- | --- |
+| `0` | `Metadata` | Mostro profile metadata | Standard Nostr profile event published at startup when metadata is configured. |
+| `1` | `TextNote` | Inner rumor in NIP-59 | Transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
+| `13` | `Seal` | Inner sealed envelope in NIP-59 | Transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
+| `1059` | `GiftWrap` | NIP-59 outer envelope | This is the relay-visible event kind that Mostro subscribes to and publishes for wrapped messages. |
+| `10002` | `RelayList` | Relay metadata | Standard Nostr relay list event published periodically by the scheduler. |
+| `8383` | `DEV_FEE_AUDIT_EVENT_KIND` | Dev fee audit event | Public audit event used for transparent fee accounting. |
+| `30078` | `NOSTR_EXCHANGE_RATES_EVENT_KIND` | Exchange rates | NIP-33 replaceable event for BTC/fiat rate publishing. |
+| `38383` | `NOSTR_ORDER_EVENT_KIND` | Orders | NIP-33 replaceable event for order publications. |
+| `38384` | `NOSTR_RATING_EVENT_KIND` | Ratings | NIP-33 replaceable event for reputation snapshots. |
+| `38385` | `NOSTR_INFO_EVENT_KIND` | Mostro info | NIP-33 replaceable event for operator / node metadata. |
+| `38386` | `NOSTR_DISPUTE_EVENT_KIND` | Disputes | NIP-33 replaceable event for dispute publications. |
+
+> Note: `kind 1` and `kind 13` are *inside* the `kind 1059` GiftWrap transport. They are created and verified by the wrapping/unwrapping code, but they are not emitted or consumed as standalone public relay events by the daemon.
 
 ---
 
@@ -179,6 +200,48 @@ sequenceDiagram
 ```
 
 **Dispute Tracking** (v0.15.6): Each dispute includes initiator identification (buyer or seller), arbiter assignment, resolution status, and audit trail in the database.
+
+---
+
+### Anti-Abuse Bond Flow (optional)
+
+Operators can require an **opt-in** anti-abuse bond — a *second* Lightning
+hold invoice, separate from the trade escrow — to discourage no-shows and
+griefing. It is **off by default**; nodes that leave
+`[anti_abuse_bond].enabled = false` behave exactly as before. Full design:
+[docs/ANTI_ABUSE_BOND.md](docs/ANTI_ABUSE_BOND.md).
+
+The feature deliberately keeps two axes separate:
+
+- **Maker / taker — *who posts the bond, and when.*** The bond is locked
+  at order-creation time (maker) or take time (taker). The `apply_to`
+  setting (`take` | `make` | `both`) selects which side(s) post one.
+- **Buyer / seller — *whose action can trigger a slash.*** All trade
+  duties (paying the hold invoice, sending the buyer invoice, sending
+  fiat, releasing) are buyer/seller duties, so a solver's slash directive
+  is expressed as `slash_seller` / `slash_buyer`. The order kind maps
+  these to the right bond row (sell → maker is seller; buy → maker is
+  buyer).
+
+Lifecycle:
+
+1. **Lock.** On take/create, Mostro sends the bonded party an
+   `Action::PayBondInvoice`; once the HTLC is held, the bond is `Locked`
+   and the trade proceeds.
+2. **Release (the common case).** On normal completion, or on any cancel
+   before a waiting-state timeout, the bond hold invoice is cancelled and
+   the bond is `Released` — nothing is captured.
+3. **Slash (only when unambiguous).** Either a solver directs it via the
+   `BondResolution` payload on `admin-settle` / `admin-cancel`, or a
+   waiting-state timeout elapses (when `slash_on_waiting_timeout = true`).
+   The bond HTLC is settled into Mostro's wallet, then split per
+   `slash_node_share_pct`: the node keeps its share (funds solver
+   compensation) and the winning counterparty is paid the rest
+   asynchronously after submitting a payout invoice.
+
+Nodes advertise their bond policy in the kind-38385 info event
+(`bond_enabled`, `bond_apply_to`, `bond_amount_pct`, …) so clients can
+warn users before they trade.
 
 ---
 
@@ -521,7 +584,7 @@ For better separation of secrets from config, Mostro can read the nsec from the
 Three common ways to provide it:
 
 1. **`~/.mostro/.env`** (auto-loaded at startup, `chmod 600` recommended):
-   ```
+   ```bash
    MOSTRO_NSEC_PRIVKEY=nsec1...
    ```
    The interactive setup wizard can create this file for you.
@@ -670,8 +733,8 @@ sqlite3 ~/.mostro/mostro.db "SELECT id, dev_fee, dev_fee_paid, dev_fee_payment_h
 **Query Nostr for Mostro info event**:
 ```bash
 # Install nostr tools: cargo install nostreq nostcat
-# Fetch Mostro settings (kind 38383)
-nostreq --kinds 38383 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
+# Fetch Mostro settings (kind 38385)
+nostreq --kinds 38385 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream wss://relay.damus.io | jq
 ```
 
 ---
@@ -1057,21 +1120,21 @@ Mostro implements a reputation system where users rate their experience with eac
 
 1. **Setup Infrastructure**: Follow [INSTALL.md](INSTALL.md) for production deployment
 2. **Configure Settings**: Set fee structure, currencies, limits in `settings.toml`
-3. **Announce Your Mostro**: Publish info event (kind 38383) - done automatically on startup
+3. **Announce Your Mostro**: Publish info event (kind 38385) - done automatically on startup
 4. **Add to Directories**: Submit your Mostro to community listings and websites
 5. **Assign Arbiters**: Add trusted npubs as dispute solvers via RPC or admin actions
 
 ### Finding Other Mostros
 
 Users can discover Mostro operators by:
-- Querying Nostr for kind 38383 events (Mostro info)
+- Querying Nostr for kind 38385 events (Mostro info)
 - Checking community-maintained directories (e.g., mostro.network)
 - Word-of-mouth and local Bitcoin communities
 
 **Example Query**:
 ```bash
 # Find all Mostro instances on Nostr
-nostreq --kinds 38383 | nostcat --stream wss://relay.damus.io | jq
+nostreq --kinds 38385 | nostcat --stream wss://relay.damus.io | jq
 ```
 
 ### Operator Support

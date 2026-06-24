@@ -2,10 +2,10 @@ use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::do_payment;
-use crate::bitcoin_price::BitcoinPriceManager;
 use crate::config;
 use crate::db::*;
 use crate::lightning::LndConnector;
+use crate::price::PriceManager;
 use crate::util;
 use crate::LN_STATUS;
 use crate::{Keys, PublicKey};
@@ -19,7 +19,7 @@ use sqlx_crud::Crud;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
@@ -31,12 +31,43 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_retry_failed_payments(ctx.clone()).await;
     job_process_dev_fee_payment(ctx.clone()).await;
     job_process_bond_payouts(ctx.clone()).await;
+    job_reconcile_stranded_maker_bonds(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
+    job_refresh_active_pubkeys(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
+/// cache from the DB (spec §6 Phase 2). Status mutations are scattered across
+/// many handlers with no single choke-point, so a periodic full reload is the
+/// robust, low-coupling refresh strategy: a just-taken order's keys begin
+/// fast-pathing within one `active_pubkeys_refresh_interval`. Inert on the v1
+/// transport (the event loop only consults the gate for kind-14 events).
+async fn job_refresh_active_pubkeys(ctx: AppContext) {
+    let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
+    tokio::spawn(async move {
+        loop {
+            match find_active_trade_pubkeys(ctx.pool()).await {
+                Ok(keys) => {
+                    if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                        let n = keys.len();
+                        gate.set_known(keys);
+                        tracing::debug!(
+                            "spam_gate: refreshed active-trade-pubkey cache ({n} keys)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("spam_gate: failed to refresh active-trade-pubkey cache: {e}")
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
 }
 
 async fn job_flush_messages_queue(ctx: AppContext) {
@@ -489,13 +520,39 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // that strips eligibility) — on persist failure
                             // the next tick retries this branch only; the
                             // slash is durable in `bonds.slashed_reason` and
-                            // a re-entry sees no `Locked` bond, so it is a
+                            // a re-entry sees no `Locked` bond (or an
+                            // already-recorded slice child), so it is a
                             // no-op (no duplicate notify).
-                            if let Err(e) = order_updated.update(pool).await {
-                                tracing::warn!(
-                                    "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
-                                    order_id, e
-                                );
+                            match order_updated.update(pool).await {
+                                Ok(_) => {
+                                    // Phase 7: a maker-responsible timeout
+                                    // cancels the order outright, terminating
+                                    // its range chain — resolve the range
+                                    // maker bond at close (settle + per-slice
+                                    // payouts + maker refund when a slice was
+                                    // slashed; plain release otherwise). The
+                                    // close helper is idempotent and a cheap
+                                    // no-op for non-range / already-resolved
+                                    // bonds; on transient failure the
+                                    // reconciliation sweep retries. The
+                                    // republish branch must NOT close: the
+                                    // order returns to the book with the
+                                    // maker still committed.
+                                    if matches!(new_status, Status::Canceled) {
+                                        bond::resolve_range_maker_bond_at_close_or_warn(
+                                            pool,
+                                            &order,
+                                            "scheduler_timeout",
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
+                                        order_id, e
+                                    );
+                                }
                             }
                         }
                     }
@@ -529,11 +586,46 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         order.id,
                         order.created_at
                     );
+
+                    // Phase 5: a `WaitingMakerBond` order was never
+                    // published to Nostr (the maker abandoned the bond
+                    // invoice), so there is no NIP-33 event to replace.
+                    // Going through `update_order_event` would publish a
+                    // brand-new Expired/Canceled event for an order that
+                    // never appeared in the book — a ghost entry the
+                    // §10.4 acceptance forbids. Mark it Expired directly
+                    // in the DB and release any bond row instead.
+                    if order.status == Status::WaitingMakerBond.to_string() {
+                        let order_id = order.id;
+                        let mut expired = order.clone();
+                        expired.status = Status::Expired.to_string();
+                        match expired.update(pool).await {
+                            Ok(_) => {
+                                bond::release_bonds_for_order_or_warn(
+                                    pool,
+                                    order_id,
+                                    "maker_bond_expiry",
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "maker_bond_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
+                                    order_id, e
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     // We update the order id with the new event_id
                     if let Ok(order_updated) =
                         crate::util::update_order_event(&keys, Status::Expired, order).await
                     {
                         let order_id = order_updated.id;
+                        // Snapshot before `update` consumes the row — the
+                        // Phase 6 close hook below needs an `&Order`.
+                        let order_snapshot = order_updated.clone();
                         // Same gate as the timeout job: only release
                         // bonds when the Expired status was actually
                         // persisted. On persist failure the next tick
@@ -551,9 +643,21 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                                 // expiry — Phase 1 promises "always
                                 // release" on every exit path,
                                 // expiry included.
-                                bond::release_bonds_for_order_or_warn(
+                                bond::release_taker_bonds_for_order_or_warn(
                                     pool,
                                     order_id,
+                                    "pending_expiry",
+                                )
+                                .await;
+                                // Phase 6: an expiring Pending order may be a
+                                // range remainder (or the range root) — resolve
+                                // the maker bond at range close (release when no
+                                // slice was slashed; settle-at-close otherwise).
+                                // Also covers the non-range maker bond via the
+                                // close helper's non-range release branch.
+                                bond::resolve_range_maker_bond_at_close_or_warn(
+                                    pool,
+                                    &order_snapshot,
                                     "pending_expiry",
                                 )
                                 .await;
@@ -582,16 +686,47 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
     });
 }
 
+/// Phase 6 hardening: periodically retry the settle-at-close for any range
+/// maker bond left `Locked` after a terminal hook's close failed (transient
+/// LND/DB error). The order's terminal-state commit is never gated on close
+/// success (best-effort bond design, §8.2), so without this sweep a stranded
+/// parent HTLC would sit `Locked` — blocking every slashed slice's payout —
+/// until the LND CLTV safety net. The close is idempotent (CAS), so the
+/// retry is safe; a parent is only touched once its whole range tree is
+/// terminal, so a legitimately-open range is never disturbed. Runs every
+/// 5 minutes — far below the CLTV horizon, far above any useful churn.
+async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            bond::reconcile_stranded_range_maker_bonds(pool).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
 async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
-        let mostro_settings = Settings::get_mostro();
-        let configured_interval = mostro_settings.exchange_rates_update_interval_seconds;
+        let Some(manager) = PriceManager::global() else {
+            // Defensive: `main` installs the manager before the scheduler
+            // is started. If that ever changes (or an embedding binary
+            // skips installation) this job must not panic — every other
+            // job keeps running.
+            error!("price: PriceManager not installed; skipping bitcoin price job");
+            return;
+        };
+        let configured_interval = manager.settings().update_interval_seconds;
 
-        // Validate interval: minimum 60 seconds to avoid API rate limits
+        // Validate interval: minimum 60 seconds to avoid API rate limits.
+        // Keeps the legacy guard's behaviour now that the interval moves
+        // from `[mostro].exchange_rates_update_interval_seconds` to
+        // `[price].update_interval_seconds` (spec §10.1).
         const MIN_INTERVAL: u64 = 60;
         let update_interval = if configured_interval < MIN_INTERVAL {
             error!(
-                "exchange_rates_update_interval_seconds too low: {}s (minimum: {}s). Using minimum.",
+                "price: update_interval_seconds too low: {}s (minimum: {}s). Using minimum.",
                 configured_interval, MIN_INTERVAL
             );
             MIN_INTERVAL
@@ -606,8 +741,32 @@ async fn job_update_bitcoin_prices() {
 
         loop {
             info!("Updating Bitcoin prices");
-            if let Err(e) = BitcoinPriceManager::update_prices().await {
-                error!("Failed to update Bitcoin prices: {}", e);
+            let report = manager.update_all().await;
+            // PriceManager already logs each provider's outcome per tick.
+            // The scheduler only surfaces the **outage** condition — every
+            // provider failed — because that's the moment ops cares about:
+            // the store is now reading last-known-good across the board.
+            if report.successes.is_empty() && !report.failures.is_empty() {
+                let failed: Vec<String> = report
+                    .failures
+                    .iter()
+                    .map(|(id, msg)| format!("{id}={msg}"))
+                    .collect();
+                error!(
+                    "price: all {} providers failed this tick — serving last-known-good [{}]",
+                    report.failures.len(),
+                    failed.join(", ")
+                );
+            } else if !report.failures.is_empty() {
+                // Partial outage: at least one provider failed but others
+                // covered. A summary at warn is enough; per-provider info
+                // is already in the manager's per-provider logs.
+                warn!(
+                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    report.failures.len(),
+                    report.failures.len() + report.successes.len(),
+                    report.fresh_currencies
+                );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
         }

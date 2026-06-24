@@ -214,7 +214,11 @@ pub async fn admin_settle_action(
     // payout (asking the winning counterparty for a bolt11,
     // `send_payment`, retries, forfeiture on the long-stop window) is
     // still Phase 3's job.
-    if let Err(e) = bond::apply_bond_resolution(
+    // #768: notify each slashed party with a best-effort `BondSlashed`
+    // forfeiture notice, mirroring the timeout-slash path. Only confirmed
+    // slashes are returned, so a dropped settle never produces an untruthful
+    // notice and an idempotent retry never re-notifies.
+    match bond::apply_bond_resolution(
         pool,
         ln_client,
         &order_updated,
@@ -223,9 +227,28 @@ pub async fn admin_settle_action(
     )
     .await
     {
+        Ok(slashed_rows) => {
+            for slashed in &slashed_rows {
+                bond::notify_bond_slashed(&order_updated, slashed).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                order_id = %order_updated.id,
+                "admin_settle: bond resolution apply failed: {}", e
+            );
+        }
+    }
+
+    // Phase 6: a dispute resolution ends the range (no remainder is
+    // republished), so resolve the maker bond at close — settle the parent
+    // HTLC once and refund the unslashed remainder if any slice was slashed,
+    // otherwise release. A no-op for non-range maker bonds (already handled
+    // inline by `apply_bond_resolution`) and for orders with no maker bond.
+    if let Err(e) = bond::resolve_range_maker_bond_at_close(pool, ln_client, &order_updated).await {
         tracing::warn!(
             order_id = %order_updated.id,
-            "admin_settle: bond resolution apply failed: {}", e
+            "admin_settle: maker bond close failed: {}", e
         );
     }
 

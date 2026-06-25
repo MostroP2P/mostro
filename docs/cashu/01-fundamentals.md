@@ -82,15 +82,29 @@ need a foundation PR.** Treat them as the frozen contract the tracks build on.
 | Item | Location | Notes |
 |------|----------|-------|
 | Migration `cashu_escrow_fields` | `migrations/20260530120000_cashu_escrow_fields.sql` | adds the 3 `cashu_*` columns; **schema is frozen — no track adds a migration for escrow fields** |
-| `EscrowBackend` trait | `src/escrow.rs` | `create_hold_invoice` / `settle_hold_invoice` / `cancel_hold_invoice` |
-| `impl EscrowBackend for LndConnector` | `src/escrow.rs` | behaviour-preserving Lightning pass-through |
-| `CashuBackend` stub | `src/escrow.rs` | methods return a typed "not implemented" error (no `panic!`) |
-| `release_action` routed through `&mut dyn EscrowBackend` | `src/app/release.rs` | the seam already exists for release |
 
-> **Design consequence:** because the protocol, schema, and the escrow seam are
-> already on `main`, the foundation is **much smaller** than the original F1–F6
-> plan. We do **not** re-open `mostro-core`, we do **not** add a migration, and we
-> do **not** do a large handler refactor. The risk surface shrinks accordingly.
+### Escrow seam — NOT yet on `main` (owned by CF-0)
+
+The narrow `EscrowBackend` seam is **not** in the tree yet: `rg 'trait
+EscrowBackend' src` is empty, there is no `src/escrow.rs`, and `release_action`
+still takes `&mut LndConnector` directly. It is therefore **not** a baseline
+assumption — it is the first foundation PR, **CF-0**, a behaviour-preserving
+refactor that must merge before CF-5 (which wires `Arc<dyn EscrowBackend>` into
+`AppContext`):
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `EscrowBackend` trait | `src/escrow.rs` (new) | `create_hold_invoice` / `settle_hold_invoice` / `cancel_hold_invoice` |
+| `impl EscrowBackend for LndConnector` | `src/escrow.rs` (new) | behaviour-preserving Lightning pass-through |
+| `CashuBackend` stub | `src/escrow.rs` (new) | methods return a typed "not implemented" error (no `panic!`) |
+| `release_action` routed through `&mut dyn EscrowBackend` | `src/app/release.rs` | replaces the direct `&mut LndConnector` parameter; Lightning behaviour unchanged |
+
+> **Design consequence:** because the protocol and schema are already on `main`,
+> the foundation is **much smaller** than the original F1–F6 plan. We do **not**
+> re-open `mostro-core` and we do **not** add a migration. The one refactor we do
+> need — establishing the `EscrowBackend` seam — is isolated into **CF-0** so no
+> later track has to touch `release.rs` or invent an unplanned shared-file
+> refactor mid-flight. The risk surface shrinks accordingly.
 
 ---
 
@@ -112,12 +126,13 @@ Carried from the architecture doc, restated as constraints:
    cashu.enabled` is a hard config error at startup.
 6. **`mostro-core 0.13.0` protocol is frozen** for the whole foundation +
    tracks effort (see §3).
-7. **Keep the existing narrow `EscrowBackend` seam; branch handlers on
+7. **Establish a narrow `EscrowBackend` seam (CF-0); branch handlers on
    `escrow_mode`.** We do **not** redesign `EscrowBackend` into a high-level
-   `lock`/`release`/`cancel`/`dispute` trait during foundation. The trait stays
-   the LN hold-invoice shape already on `main`; Cashu behaviour is added by
-   branching the relevant handlers on `Settings::escrow_mode()` /
-   `is_cashu_enabled()` (the pattern the existing `release_action` already uses).
+   `lock`/`release`/`cancel`/`dispute` trait during foundation. The trait keeps
+   the LN hold-invoice shape (`create`/`settle`/`cancel_hold_invoice`); Cashu
+   behaviour is added by branching the relevant handlers on
+   `Settings::escrow_mode()` / `is_cashu_enabled()` (the same pattern `release_action`
+   adopts once CF-0 routes it through `&mut dyn EscrowBackend`).
    Rationale: the high-traffic handler files (`take_*`, `cancel`, `admin_*`,
    `release`) stay behaviourally untouched on the Lightning path, which is the
    whole point of keeping `mostrod` stable. A higher-level escrow trait is
@@ -127,15 +142,18 @@ Carried from the architecture doc, restated as constraints:
 
 ## 5. Foundation milestone — overview
 
-Five PRs. Four are independent and parallelisable; one is the integration PR that
-must merge last.
+Six PRs. One precursor (CF-0) establishes the escrow seam and merges first; four
+are independent and parallelisable; one is the integration PR that merges last.
 
 ```mermaid
 flowchart TD
   subgraph BASE["Already on main (no PR)"]
     P["Protocol surface (mostro-core 0.13.0)"]
     M["cashu_* columns migration"]
-    E["EscrowBackend trait + Lightning impl + Cashu stub"]
+  end
+
+  subgraph WAVE0["Wave 0 — precursor (merges first)"]
+    CF0["CF-0 · EscrowBackend seam<br/>(trait + Lightning impl + Cashu stub,<br/>route release through it)"]
   end
 
   subgraph WAVE1["Wave 1 — fully parallel (4 devs)"]
@@ -150,6 +168,7 @@ flowchart TD
   end
 
   P --> CF2
+  CF0 --> CF5
   CF1 --> CF5
   CF2 --> CF5
   CF4 -. used by .-> CF5
@@ -158,10 +177,13 @@ flowchart TD
   CF5 --> END
 ```
 
-**Reading the graph:** `CF-1`, `CF-2`, `CF-3`, `CF-4` have no dependencies on
-each other and can be opened simultaneously. `CF-5` is the only sequential gate —
-it needs `CF-1` (to read the mode) and `CF-2` (to connect the mint) merged first,
-and soft-uses `CF-4`'s helpers for in-flight discovery.
+**Reading the graph:** `CF-0` is the behaviour-preserving precursor that lands the
+`EscrowBackend` seam (and routes `release` through it) before anything builds on
+it. `CF-1`, `CF-2`, `CF-3`, `CF-4` have no dependencies on each other and can be
+opened simultaneously once CF-0 is in. `CF-5` is the only sequential gate — it
+needs `CF-0` (the seam it wires into `AppContext`), `CF-1` (to read the mode) and
+`CF-2` (to connect the mint) merged first, and soft-uses `CF-4`'s helpers for
+in-flight discovery.
 
 ---
 
@@ -298,8 +320,11 @@ schema-adjacent code is frozen and reviewed once.
     cashu_escrow_locked_at IS NULL`, returning whether a row matched. No
     lock-without-advance window; replay-safe.
   - `async fn find_locked_cashu_orders(pool) -> Result<Vec<Order>, MostroError>`
-    — `WHERE cashu_escrow_locked_at IS NOT NULL AND status = <Active>` (bind the
-    `Status` enum, not a literal).
+    — `WHERE cashu_escrow_locked_at IS NOT NULL`. Do **not** add a `status`
+    predicate: `update_order_cashu_escrow` advances the status in the same write
+    as the lock, so filtering on `Active` would skip legitimately locked rows
+    that have already moved on. Only re-add a status predicate if a separate
+    invariant guarantees locked rows never leave `Active`.
 
 **Must NOT.** Add or alter any migration. Be called from a hot path yet.
 
@@ -356,8 +381,9 @@ unmodified.
 Cashu mode yields `CantDo(InvalidAction)`; scheduler skips LN jobs in Cashu mode.
 The "Lightning mode unchanged" guarantee is covered by the existing suite.
 
-**Dependencies.** **CF-1** (mode + `is_cashu_enabled`) and **CF-2** (mint
-connect) are hard prerequisites; **CF-4** is a soft prerequisite (used for
+**Dependencies.** **CF-0** (the `EscrowBackend` seam wired into `AppContext`),
+**CF-1** (mode + `is_cashu_enabled`) and **CF-2** (mint connect) are hard
+prerequisites; **CF-4** is a soft prerequisite (used for
 in-flight Cashu discovery / restore if included). **Conflict surface.** `main.rs`,
 `app.rs`, `app/context.rs`, `scheduler.rs` — the high-traffic shared files. This
 is why it merges **last and alone** in the milestone. **Parallel with.** Nothing
@@ -469,9 +495,9 @@ change.
 wrapper) and `cashu_client: Option<Arc<CashuClient>>`, with `escrow()` /
 `cashu_client()` accessors. Lightning constructs `LndConnector`-backed escrow and
 `cashu_client = None`; Cashu constructs the `CashuBackend` (still stubbed) and
-`cashu_client = Some(connected)`. The narrow `EscrowBackend` trait is unchanged
-(see §4.7) — handlers reach Cashu behaviour by branching on
-`Settings::escrow_mode()`, not through new trait methods.
+`cashu_client = Some(connected)`. The narrow `EscrowBackend` trait (established by
+CF-0, see §4.7) is consumed here unchanged — handlers reach Cashu behaviour by
+branching on `Settings::escrow_mode()`, not through new trait methods.
 
 ---
 
@@ -483,19 +509,21 @@ wrapper) and `cashu_client: Option<Arc<CashuClient>>`, with `escrow()` /
 
 | ID | Title | Wave | Depends on | Can run in parallel with | Conflict-prone files | Risk |
 |----|-------|------|-----------|--------------------------|----------------------|------|
+| **CF-0** | `EscrowBackend` seam (trait + `LndConnector` impl + `CashuBackend` stub; route `release_action` through `&mut dyn EscrowBackend`) | 0 | — | — (precursor, merges first) | new `src/escrow.rs`, `src/app/release.rs` | Low (behaviour-preserving) |
 | **CF-1** | Config + escrow mode (`CashuSettings`, `EscrowMode`, validation, wizard/template) | 1 | — | CF-2, CF-3, CF-4 | `config/*`, `settings.tpl.toml` | Low |
 | **CF-2** | `CashuClient` library (`cdk` wrapper, token/condition/DLEQ verification) | 1 | — (`cdk` only) | CF-1, CF-3, CF-4 | new `src/cashu/mod.rs`, `Cargo.toml` | Medium (crypto) |
 | **CF-3** | Cashu test harness (mint container + opt-in CI + integration skeleton) | 1 | — | CF-1, CF-2, CF-4 | `.github/workflows/ci.yml`, new test files | Low |
 | **CF-4** | DB escrow helpers (`update_order_cashu_escrow` CAS, `find_locked_cashu_orders`) | 1 | — (schema on `main`) | CF-1, CF-2, CF-3 | `src/db.rs` (additive) | Low |
-| **CF-5** | Cashu boot + `run_cashu` + `AppContext` wiring + scheduler gating | 2 | **CF-1, CF-2** (hard), CF-4 (soft) | — (integration join) | `main.rs`, `app.rs`, `app/context.rs`, `scheduler.rs` | Medium-High |
+| **CF-5** | Cashu boot + `run_cashu` + `AppContext` wiring + scheduler gating | 2 | **CF-0, CF-1, CF-2** (hard), CF-4 (soft) | — (integration join) | `main.rs`, `app.rs`, `app/context.rs`, `scheduler.rs` | Medium-High |
 
 ### Critical path
-`CF-1` + `CF-2` → `CF-5`. Everything else (`CF-3`, `CF-4`) hangs off the side and
-never blocks the critical path. With four developers, Wave 1 collapses to the
-duration of the slowest of `CF-1`/`CF-2`, then `CF-5`.
+`CF-0` → (`CF-1` + `CF-2`) → `CF-5`. Everything else (`CF-3`, `CF-4`) hangs off
+the side and never blocks the critical path. With four developers, CF-0 lands
+first (small, behaviour-preserving), then Wave 1 collapses to the duration of the
+slowest of `CF-1`/`CF-2`, then `CF-5`.
 
 ### Suggested assignment (4 devs)
-- Dev A → **CF-1** (config), then pairs on **CF-5**.
+- Dev A → **CF-0** (escrow seam, merges first), then **CF-1** (config), then pairs on **CF-5**.
 - Dev B → **CF-2** (mint client) — the longest pole; start first.
 - Dev C → **CF-3** (harness), then unblocks CF-2's mint-backed tests.
 - Dev D → **CF-4** (db helpers), then reviews **CF-5**.
@@ -506,7 +534,7 @@ duration of the slowest of `CF-1`/`CF-2`, then `CF-5`.
 
 The foundation is complete when **all** hold:
 
-1. `CF-1`…`CF-5` are merged to `main`, each as its own PR.
+1. `CF-0`…`CF-5` are merged to `main`, each as its own PR.
 2. A node with `[cashu] enabled = true` and a reachable `mint_url` **boots**,
    logs that it is in Cashu mode, connects to the mint, and runs `run_cashu`
    **without an LND node present**.

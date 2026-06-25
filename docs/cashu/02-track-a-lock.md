@@ -193,7 +193,8 @@ Fill in the CF-5 stub for `AddCashuEscrow` in its **own** file
 atomic CAS, the order-event publish, and the buyer notification. Unit-tested
 against the CF-3 mint (valid lock → `Active` + buyer notified; each rejection
 path; replay → idempotent no-op).
-*Depends on CF-2, CF-4, CF-5. Conflict surface: new file only.*
+*Depends on CF-2, CF-3, CF-4, CF-5 (CF-3 supplies the mint harness TA-1 is
+unit-tested against). Conflict surface: new file only.*
 
 ### TA-2 · `take_*` escrow request
 Add the Cashu branch to `take_sell_action` / `take_buy_action` and the
@@ -216,7 +217,7 @@ additive, cashu-gated.*
 
 | ID | Title | Depends on | Parallel with | Conflict surface | Risk |
 |----|-------|-----------|---------------|------------------|------|
-| **TA-1** | `add_cashu_escrow_action` handler (validate + atomic lock + notify) | CF-2, CF-4, CF-5 | TA-2 (until e2e) | new `src/app/add_cashu_escrow.rs` | Medium (crypto + state) |
+| **TA-1** | `add_cashu_escrow_action` handler (validate + atomic lock + notify) | CF-2, CF-3, CF-4, CF-5 | TA-2 (until e2e) | new `src/app/add_cashu_escrow.rs` | Medium (crypto + state) |
 | **TA-2** | `take_sell`/`take_buy` Cashu escrow request | CF-1, CF-5 | TA-1 | `take_*.rs`, `util.rs` | Low-Medium |
 | **TA-3** | Restore/monitor in-flight locked escrows | CF-4, CF-5 | TA-1, TA-2 | `main.rs`/restore (additive) | Low |
 
@@ -268,18 +269,24 @@ edits its arm of that match, `app.rs` becomes a **cross-track merge-conflict
 hotspot** — breaking the "tracks edit disjoint files" guarantee.
 
 **Fix (update CF-5).** Apply the "stub every integration point in foundation"
-principle: in CF-5, route each trade action to its **real handler function**
-(like `handle_message_action` does for Lightning), and:
+principle, but keep CF-5 inside its **own** files. In CF-5:
+- `run_cashu`'s `dispatch_cashu` maps **every** trade action to
+  `CantDo(InvalidAction)` by default — a single central **dispatch stub** in
+  CF-5-owned `app.rs`, which is what keeps cashu mode inert. This default is the
+  frozen seam; tracks do not edit it.
 - create `src/app/add_cashu_escrow.rs` with a stub `add_cashu_escrow_action`
-  returning `InvalidAction`;
-- give each existing trade handler (`take_*`, `release`, `cancel`, `admin_*`) a
-  minimal, behaviour-preserving `if is_cashu_enabled() { return
-  Err(CantDo(InvalidAction)) }` guard **in its own file**.
+  returning `InvalidAction` — the one new integration point that has no existing
+  owner.
 
-Then each track fills in **its own** handler's cashu branch and never touches
-`app.rs`. CF-5's `dispatch_cashu` is frozen after the milestone. The §6 allow-list
-(`Orders`, `LastTradeIndex`, `RestoreSession`, `TradePubkey` → `no_ln`) is
-unaffected — only the *mechanism* for the blocked/escrow actions changes.
+CF-5 does **not** add `is_cashu_enabled()` guards to the existing trade handler
+files (`take_*`, `release`, `cancel`, `admin_*`). Those files are **track-owned**
+(e.g. `take_*` is Track-A-owned per §7), so guarding them from CF-5 would
+reintroduce the very cross-track overlap this fix avoids. Instead, each track adds
+its **own** handler's cashu branch and wires that handler into `dispatch_cashu`
+when it implements it — replacing the default `InvalidAction` for exactly the
+actions it owns. The §6 allow-list (`Orders`, `LastTradeIndex`, `RestoreSession`,
+`TradePubkey` → `no_ln`) is unaffected — only the *mechanism* for the
+blocked/escrow actions changes.
 
 ### G-2 · `expected_amount` / fee policy is undefined
 **Problem.** `verify_escrow_token` needs an `expected_amount`, but whether the

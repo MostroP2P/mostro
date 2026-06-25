@@ -224,11 +224,11 @@ mod tests {
     use super::*;
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
+    use mostro_core::db::Crud;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
     use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
-    use sqlx_crud::Crud;
     use uuid::Uuid;
 
     fn init_test_settings() {

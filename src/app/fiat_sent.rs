@@ -1,8 +1,8 @@
 use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx_crud::Crud;
 
 // Handle fiat sent action
 pub async fn fiat_sent_action(

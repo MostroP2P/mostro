@@ -10,9 +10,9 @@ use crate::db::{
 use crate::lightning::LndConnector;
 use crate::nip33::{create_platform_tag_values, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx_crud::Crud;
 use tracing::{error, info};
 
 /// Admin-initiated order cancellation.

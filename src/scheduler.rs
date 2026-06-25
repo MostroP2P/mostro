@@ -12,10 +12,10 @@ use crate::{Keys, PublicKey};
 
 use chrono::{TimeDelta, Utc};
 use config::*;
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::EventBuilder;
 use nostr_sdk::{Kind as NostrKind, Tag};
-use sqlx_crud::Crud;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;

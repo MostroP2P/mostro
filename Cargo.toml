@@ -57,7 +57,6 @@ sqlx = { version = "0.6.2", features = [
   "uuid",
   "offline",
 ] }
-sqlx-crud = { version = "0.4.0", features = ["runtime-tokio-rustls"] }
 tokio = { version = "1.47.1", features = ["full"] }
 fedimint-tonic-lnd = "0.3.0"
 uuid = { version = "1.17.0", features = [
@@ -70,7 +69,7 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.13.0", features = ["sqlx"] }
+mostro-core = { version = "0.13.2", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

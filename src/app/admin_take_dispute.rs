@@ -7,7 +7,7 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
-use sqlx_crud::Crud;
+use mostro_core::db::Crud;
 use std::str::FromStr;
 use tracing::info;
 

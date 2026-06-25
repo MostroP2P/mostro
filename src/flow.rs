@@ -1,8 +1,8 @@
 use crate::util::{enqueue_order_msg, notify_taker_reputation};
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use tracing::info;
 
 pub async fn hold_invoice_paid(

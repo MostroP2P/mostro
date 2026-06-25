@@ -4,7 +4,7 @@ Summary of order lifecycle and key handlers.
 
 ## Core Types
 - Messages/Actions: `mostro_core::message::{Message, Action}`
-- Orders: `mostro_core::order::Order` persisted via `sqlx_crud`.
+- Orders: `mostro_core::order::Order` persisted via `mostro_core::db::Crud`.
 
 ## Handlers (entries)
 - New Order: `src/app/order.rs`

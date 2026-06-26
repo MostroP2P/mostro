@@ -42,6 +42,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 
 use chrono::Utc;
+use mostro_core::db::Crud;
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, MostroCantDo, MostroInternalErr},
@@ -51,7 +52,6 @@ use mostro_core::message::{Action, BondResolution, Message, Payload};
 use mostro_core::order::{Kind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::PublicKey;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1611,7 +1611,7 @@ mod tests {
         // No hash → release_bond skips the LND cancel branch entirely
         // (see `release_bond` in flow.rs).
         b.hash = None;
-        sqlx_crud::Crud::create(b.clone(), pool).await.unwrap();
+        b.clone().create(pool).await.unwrap();
         b
     }
 
@@ -3038,7 +3038,7 @@ mod tests {
         b.state = BondState::Locked.to_string();
         b.preimage = Some(stub_preimage());
         b.hash = None;
-        sqlx_crud::Crud::create(b.clone(), pool).await.unwrap();
+        b.clone().create(pool).await.unwrap();
         b
     }
 

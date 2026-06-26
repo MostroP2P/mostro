@@ -3,10 +3,10 @@
 //! Phase 0 exposes the CRUD surface later phases will need. Nothing in
 //! this module hits LND or the Nostr client — it's purely storage.
 
+use mostro_core::db::Crud;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use mostro_core::order::{Order, Status};
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use uuid::Uuid;
 
 use super::model::Bond;

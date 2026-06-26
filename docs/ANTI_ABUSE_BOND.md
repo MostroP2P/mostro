@@ -339,7 +339,8 @@ Purely additive. Touches no trade flow.
   code, not schema.
 
   Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
-- `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
+- `Bond` model (`src/app/bond/model.rs`) with `mostro_core::db::Crud` in
+  `src/app/bond/crud.rs`, and repository helpers in `src/app/bond/db.rs`:
   `create_bond`, `find_bond_by_order_and_role` (parent rows only —
   filters on `parent_bond_id IS NULL`), `find_bonds_by_state`,
   `update_bond`.

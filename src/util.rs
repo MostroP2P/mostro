@@ -17,13 +17,13 @@ use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;

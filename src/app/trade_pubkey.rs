@@ -1,9 +1,9 @@
 use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_order};
 
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx_crud::Crud;
 
 pub async fn trade_pubkey_action(
     ctx: &AppContext,

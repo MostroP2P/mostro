@@ -9,7 +9,7 @@ use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
-use sqlx_crud::traits::Crud;
+use mostro_core::db::Crud;
 use std::borrow::Cow;
 use uuid::Uuid;
 

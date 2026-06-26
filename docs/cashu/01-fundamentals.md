@@ -200,8 +200,10 @@ validation — but wire it to **nothing** at runtime yet (only config validation
 reads it).
 
 **Files.**
-- `src/config/types.rs` — `struct CashuSettings { enabled: bool, mint_url: String }`
-  (both `#[serde(default)]`); `enum EscrowMode { Lightning, Cashu }`.
+- `src/config/types.rs` — `struct CashuSettings { enabled: bool, mint_url: String,
+  escrow_locktime_days: u32 }` (all `#[serde(default)]`; `escrow_locktime_days`
+  defaults to **15** and must be `>= 1` — it is the seller-recovery locktime floor,
+  see Track A §4B); `enum EscrowMode { Lightning, Cashu }`.
 - `src/config/settings.rs` — `pub cashu: Option<CashuSettings>` on `Settings`
   (`#[serde(default)]`, mirroring `anti_abuse_bond`); `Settings::get_cashu()`,
   `Settings::is_cashu_enabled()`, `Settings::escrow_mode()`.
@@ -240,12 +242,17 @@ parse/validate tokens and talk to a mint. **Not wired into the daemon.**
     is reachable and supports the required NUTs (07 state, 11 P2PK, 12 DLEQ).
   - `async fn check_state(&self, ys) -> Result<CheckStateResponse, Error>` — NUT-07.
   - `fn verify_2of3_condition(token, p_b, p_s, p_m) -> Result<Token, Error>` —
-    parses, asserts exactly 2 required sigs, no locktime, no refund keys, and the
-    three expected pubkeys present (NUT-10/11).
+    parses, asserts exactly 2 required sigs (`n_sigs = 2`) over the three expected
+    pubkeys, **a `locktime` tag present**, and **`refund = [P_S]` with
+    `n_sigs_refund = 1`** and no other refund key (the seller-recovery path, Track A
+    §4B) (NUT-10/11). The locktime *value* (floor check) is verified by
+    `verify_escrow_token`, which holds the config.
   - `async fn verify_token_dleq(&self, token) -> Result<(), Error>` — NUT-12.
-  - `async fn verify_escrow_token(&self, token, p_b, p_s, p_m, expected_amount)` —
+  - `async fn verify_escrow_token(&self, token, p_b, p_s, p_m, expected_amount, min_locktime)` —
     composes the above into one acceptance check (condition + mint binding +
-    amount + DLEQ + unspent).
+    amount + DLEQ + unspent + **`token.locktime >= min_locktime`**, where the
+    caller passes `min_locktime = now + cashu.escrow_locktime_days`; the seller may
+    set a longer locktime for marketplace trades, never a shorter one — Track A §4B).
   - `fn cashu_pubkey_from_xonly_hex(hex) -> Result<PublicKey, Error>` — maps a
     Nostr x-only trade pubkey to a Cashu `PublicKey`.
 - `src/main.rs` — register `pub mod cashu;` **only** (a `mod` declaration is not
@@ -257,8 +264,9 @@ global state beyond what the unit tests need.
 **Backwards-compat guarantee.** Adding a dependency and an unreferenced module
 changes no runtime behaviour. The Lightning path never constructs a `CashuClient`.
 
-**Tests.** Unit tests for `verify_2of3_condition` (accept valid 2-of-3; reject
-wrong sig count, locktime present, refund keys present, missing/extra pubkey) and
+**Tests.** Unit tests for `verify_2of3_condition` (accept a valid 2-of-3 carrying a
+`locktime` + `refund = [P_S]`; reject wrong sig count, missing locktime, missing/
+wrong/extra refund key, missing/extra pubkey) and
 `cashu_pubkey_from_xonly_hex`. Mint-backed tests (`connect`, `check_state`,
 `verify_token_dleq`) run against the CF-3 container and are `#[ignore]`d /
 env-gated when the mint is absent, so they don't break offline CI.

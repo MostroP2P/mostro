@@ -89,7 +89,8 @@ this now — see §11).
 | Needs | From | Exact item |
 |-------|------|------------|
 | Mode + mint config | CF-1 | `Settings::is_cashu_enabled()`, `Settings::escrow_mode()`, `get_cashu().mint_url` |
-| Token validation | CF-2 | `CashuClient::verify_escrow_token(token, p_b, p_s, p_m, expected_amount)`, `verify_2of3_condition`, `check_state`, `verify_token_dleq`, `cashu_pubkey_from_xonly_hex` |
+| Token validation | CF-2 | `CashuClient::verify_escrow_token(token, p_b, p_s, p_m, expected_amount, min_locktime)` (2-of-3 **plus** the `locktime`/`refund=[P_S]` seller-recovery path, §4B), `verify_2of3_condition`, `check_state`, `verify_token_dleq`, `cashu_pubkey_from_xonly_hex` |
+| Locktime floor | CF-1 | `get_cashu().escrow_locktime_days` (default 15) → `min_locktime = now + days` (§4B) |
 | Fee-token validation | CF-2 | `CashuClient::verify_fee_token(token, p_m, expected_fee)` (new, §4A) |
 | Fee realisation | CF-2 | `CashuClient::sign_with_pm(proofs)` + a mint swap — the fee-only redeem capability (§4A) |
 | Fee amount | existing | `util::get_fee(amount)` → `order.fee` (per-party half); fee token value = `2 * order.fee` |
@@ -150,8 +151,10 @@ to `release_action` (compute/verify first, persist second, notify last).
    attacker-chosen keys.
 7. **Validate the token against the mint.**
    `ctx.cashu_client()` → `verify_escrow_token(&proof.token, p_b, p_s, p_m,
-   expected_amount)`. This composes: 2-of-3 condition (exactly 2 sigs, no
-   locktime, no refund keys, the three expected pubkeys present), mint binding,
+   expected_amount, min_locktime)`. This composes: 2-of-3 condition (exactly 2 sigs
+   over the three expected pubkeys) **with the seller-recovery locktime** (`locktime`
+   present, `refund = [P_S]`, `n_sigs_refund = 1`, and
+   `locktime >= now + cashu.escrow_locktime_days` — §4B), mint binding,
    amount, NUT-12 DLEQ (proofs really issued by the mint), and NUT-07 unspent
    check. Map failures: malformed/condition → `CantDo(InvalidCashuToken)`;
    mint unreachable → `CantDo(CashuMintUnavailable)`. `expected_amount` is the
@@ -389,8 +392,8 @@ TA-1.
 To avoid Mostro having to *proactively* refund (and the "Mostro forgot the token
 across a restart" failure mode), the fee token can instead be locked **P2PK to
 `P_M` with `locktime` = order expiry and `refund` pubkey = `P_S`** (NUT-11
-natively supports locktime + refund keys — note the *escrow* token must still
-forbid both, per `verify_2of3_condition`). Then:
+natively supports locktime + refund keys; the escrow token itself now carries a
+seller-recovery locktime too, see §4B). Then:
 
 - **Before locktime:** only `P_M` can spend ⇒ on success Mostro redeems promptly.
 - **After locktime:** if Mostro never redeemed (trade abandoned/cancelled), the
@@ -415,6 +418,65 @@ committed.
 
 ---
 
+## 4B. Seller-recovery locktime on the escrow token
+
+### Decision
+
+The 2-of-3 escrow token carries a **`locktime` + `refund = [P_S]`** so the seller
+can reclaim the funds **alone** after the locktime **if Mostro disappears *and* the
+buyer refuses to cooperate**. Without it a plain 2-of-3 has no escape hatch: if the
+arbitrator key `P_M` is gone and the buyer won't sign, the funds are locked
+forever. The horizon is configurable: **`cashu.escrow_locktime_days`, default 15**
+(CF-1).
+
+### Construction (NUT-11)
+
+The seller builds the P2PK secret with:
+- `data = P_S`, `pubkeys = [P_B, P_M]`, `n_sigs = 2` — the 2-of-3, unchanged.
+- `locktime = now + cashu.escrow_locktime_days`, `refund = [P_S]`,
+  `n_sigs_refund = 1`.
+
+NUT-11 then exposes two **independent** pathways:
+- **Before locktime:** the normal 2-of-3 (any 2 of `P_S`/`P_B`/`P_M`). Happy path
+  (Track B) and dispute (Track D) are unaffected.
+- **After locktime:** the *refund* pathway — `P_S` alone (1 sig) reclaims. This is
+  the seller's recovery.
+
+> `refund = [P_S]` is **mandatory**, not cosmetic: NUT-11 says a token with a
+> `locktime` but **no** `refund` tag becomes spendable by **anyone** without a
+> signature once it expires. A missing/empty refund tag must be rejected.
+
+### What `verify_escrow_token` enforces (the security floor)
+
+The locktime is double-edged: once it passes, the seller can reclaim the sats **even
+if the buyer already sent fiat**. A malicious seller who set a *short* locktime
+could stall past it and keep both the sats and the fiat. So the daemon never accepts
+an arbitrary locktime — it enforces:
+1. `locktime` present and `>= now + cashu.escrow_locktime_days` (the floor). The
+   seller MAY set it **longer** (slow marketplace trades), never shorter.
+2. `refund == [P_S]` exactly (the order's seller trade key) and `n_sigs_refund == 1`
+   — never an attacker-chosen key.
+
+The floor must comfortably exceed the worst-case settlement + dispute window; 15
+days is generous for that while still letting a node that wants a marketplace extend
+it per trade.
+
+### Buyer obligation
+
+The buyer must **redeem before the locktime** (with the seller's release signature —
+Track B — or `P_M`'s dispute signature — Track D). The locktime is in the token, so
+the client surfaces it and warns the buyer as it approaches. Once the buyer redeems,
+the token is spent and the locktime is moot.
+
+### Consequence for the marketplace motivation
+
+This makes the escrow **time-bounded** rather than indefinite — a deliberate
+trade-off for recoverability. The 15-day default (extendable per trade by the
+seller) keeps the long-lived/marketplace use case viable while guaranteeing the
+seller is never *permanently* locked out when Mostro and the buyer both go silent.
+
+---
+
 ## 5. `take_sell` / `take_buy` — the Cashu branch
 
 `take_sell_action` / `take_buy_action` keep one handler each; they branch on
@@ -425,7 +487,9 @@ seller hold invoice:
 - **Cashu:** instead emit an **escrow request** to the seller carrying everything
   needed to build the 2-of-3: the escrow amount to lock (`order.amount`), the
   **fee amount** to lock separately (`2 * order.fee`, Option 2 §4A), the node
-  `mint_url`, the buyer trade pubkey `P_B`, and Mostro's arbitrator pubkey `P_M`.
+  `mint_url`, the buyer trade pubkey `P_B`, Mostro's arbitrator pubkey `P_M`, and
+  the **locktime horizon** (`cashu.escrow_locktime_days`, §4B) so the seller sets
+  `locktime = now + days` with `refund = [P_S]`.
   (This is the `show_cashu_escrow_request(...)` helper.) The order is left in
   `WaitingPayment`, exactly where the CAS in step 8 expects it. The seller's
   client then builds **two** tokens — the 2-of-3 escrow and the 1-of-1 `P_M` fee

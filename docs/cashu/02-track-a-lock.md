@@ -241,7 +241,7 @@ for a second token. **`mostro-core 0.14.0` added the one field Option 2 needs**
 (`src/message.rs`); this is the *complete* change that landed, nothing else in
 the crate changed. Track A consumes it and requires `mostro-core ≥ 0.14.0`.
 
-**1 · The struct field** (`src/message.rs:592`). Add a single optional field,
+**1 · The struct field** (`CashuLockProof` in `src/message.rs`). Add a single optional field,
 with serde attributes that make it both backward- and forward-compatible on the
 wire:
 
@@ -266,7 +266,7 @@ pub struct CashuLockProof {
   **byte-identically** to today (the key is omitted, not emitted as `null`), so
   existing wire fixtures and signatures over the JSON are unaffected.
 
-**2 · The constructor** (`src/message.rs:609`). Keep the existing 5-arg `new()`
+**2 · The constructor** (`CashuLockProof::new` in `src/message.rs`). Keep the existing 5-arg `new()`
 exactly as-is (it sets `fee_token: None`), and add an **immutable builder** so
 the field is opt-in and no existing caller breaks:
 
@@ -287,7 +287,7 @@ impl CashuLockProof {
 
 `from_json` / `as_json` need no change (serde-derived).
 
-**3 · `MessageKind::verify()` — NO change** (`src/message.rs:825`). The
+**3 · `MessageKind::verify()` — NO change** (the `AddCashuEscrow` arm in `src/message.rs`). The
 `AddCashuEscrow` arm checks only `id.is_some()` and that the payload is
 `CashuLockProof(_)`. It stays exactly as-is, on purpose: `verify()` is a
 **protocol-shape** check with no access to `Settings`, so it **cannot** know
@@ -297,7 +297,7 @@ a protocol invariant. When `mostro.fee > 0` the handler rejects a `None` or
 mis-valued `fee_token` with `CantDo(CashuSignatureMissing)` /
 `InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid.
 
-**4 · Tests** (`src/message.rs`, existing Cashu test module ~`:2083`). Extend
+**4 · Tests** (the Cashu test module in `src/message.rs`). Extend
 `sample_lock_proof()`/round-trip coverage with two cases: (a) a proof built via
 `with_fee_token(..)` round-trips through `as_json`/`from_json` preserving
 `Some`; (b) a legacy JSON string **without** the `fee_token` key deserialises to

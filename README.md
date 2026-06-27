@@ -1,7 +1,7 @@
 # Mostro 🧌
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.93.0%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
@@ -374,7 +374,7 @@ flowchart TB
 - **Runtime**: Tokio async executor
 - **Nostr**: `nostr-sdk` v0.43 (NIP-59 GiftWrap, NIP-33 replaceable events)
 - **Lightning**: `fedimint-tonic-lnd` v0.3 (LND gRPC client)
-- **Database**: SQLite via `sqlx` v0.6 with offline compile-time query verification
+- **Database**: SQLite via `sqlx` v0.9 (runtime queries; migrations embedded with `sqlx::migrate!`)
 - **RPC**: `tonic` + `prost` (Protocol Buffers)
 
 For detailed architecture documentation, see the [docs/](docs/) directory:
@@ -392,7 +392,7 @@ Mostro supports three deployment methods. For production deployments, see [INSTA
 ### Prerequisites
 
 **All Methods**:
-- Rust 1.93.0+ (for native builds)
+- Rust 1.94.0+ (for native builds)
 - Lightning Network node (LND required)
   - Recommended: [Polar](https://lightningpolar.com/) for local testing
   - Production: Full LND node with adequate liquidity
@@ -435,9 +435,11 @@ mkdir -p ~/.mostro
 cp settings.tpl.toml ~/.mostro/settings.toml
 # Edit ~/.mostro/settings.toml (see Configuration section)
 
-# Initialize database
-cargo install sqlx-cli --version 0.6.2
-./init_db.sh
+# Initialize database (optional — mostrod also migrates on first connect)
+cargo install sqlx-cli --version 0.9.0 --no-default-features --features sqlite
+export DATABASE_URL=sqlite://mostro.db
+sqlx database create
+sqlx migrate run
 
 # Run daemon
 mostrod
@@ -913,11 +915,11 @@ cd mostro
 
 2. **Install development tools**:
 ```bash
-# Rust toolchain (1.93.0+)
+# Rust toolchain (1.94.0+)
 rustup update stable
 
 # SQLx CLI (for database migrations)
-cargo install sqlx-cli --version 0.6.2
+cargo install sqlx-cli --version 0.9.0
 
 # Development dependencies
 sudo apt install protobuf-compiler cmake build-essential  # Ubuntu
@@ -930,8 +932,10 @@ brew install protobuf cmake  # macOS
 cp settings.tpl.toml settings.toml
 # Edit settings.toml with your LND/Nostr config
 
-# Initialize database
-./init_db.sh
+# Database is created and migrated on first `cargo run` / `mostrod` start.
+# To apply migrations manually (optional):
+# export DATABASE_URL=sqlite://mostro.db  # match [database].url in settings.toml
+# sqlx migrate run
 ```
 
 4. **Run in development mode**:
@@ -1000,9 +1004,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # Run tests
 cargo test
-
-# Update SQLx offline data (after query/schema changes)
-cargo sqlx prepare -- --bin mostrod
 ```
 
 **After schema changes**:
@@ -1011,11 +1012,8 @@ cargo sqlx prepare -- --bin mostrod
 sqlx migrate add my_feature_name
 
 # Edit migrations/YYYYMMDDHHMMSS_my_feature_name.sql
-# Apply migration
+# Apply migration (optional — mostrod migrates on connect)
 sqlx migrate run
-
-# Update offline data
-cargo sqlx prepare -- --bin mostrod
 ```
 
 ---

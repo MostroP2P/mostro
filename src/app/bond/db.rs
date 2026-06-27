@@ -6,7 +6,7 @@
 use mostro_core::db::Crud;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use mostro_core::order::{Order, Status};
-use sqlx::{Pool, Sqlite};
+use sqlx::{AssertSqlSafe, Pool, Sqlite};
 use uuid::Uuid;
 
 use super::model::Bond;
@@ -301,7 +301,7 @@ pub async fn range_tree_fully_terminal(
          ) \
          SELECT COUNT(*) FROM tree WHERE status NOT IN ({placeholders})"
     );
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(root_id);
+    let mut query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql)).bind(root_id);
     for status in TERMINAL_ORDER_STATUSES {
         query = query.bind(status.to_string());
     }

@@ -7,7 +7,6 @@
   - `src/rpc/` – gRPC service and types.
   - `src/config/` – settings and loaders.
 - DB migrations in `migrations/`. Reusable assets in `static/`.
-- SQLx offline metadata in `sqlx-data.json`.
 - Docker assets in `docker/`. Cross‑compile targets in `archs/`.
 
 ## Build, Test, and Development Commands
@@ -17,7 +16,7 @@
 - `cargo fmt` – apply Rustfmt profile.
 - `cargo clippy --all-targets --all-features` – lints must be clean.
 - `make docker-up` / `make docker-down` – start/stop local relay stack.
-- After SQL/schema changes: `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
+- After schema changes: add a file under `migrations/`; `mostrod` applies pending migrations on connect.
 
 ## Coding Style & Naming Conventions
 - Rust 2021: 4‑space indent, `snake_case` functions, `PascalCase` types, `SCREAMING_SNAKE` constants.
@@ -29,7 +28,7 @@
 - Co‑locate tests in their modules under `mod tests`.
 - Name descriptively, e.g., `handles_expired_hold_invoice`.
 - Mirror fixtures under `src/app/` where applicable.
-- Run `cargo test` locally; update SQLx data after query changes.
+- Run `cargo test` locally after schema or query changes.
 
 ## Commit & Pull Request Guidelines
 - Base work on `main`; keep topics scoped.

@@ -4,8 +4,9 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::pool::Pool;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, Sqlite, SqlitePool};
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::fs::{set_permissions, Permissions};
 use std::path::Path;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     let order_query = format!(
         "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders WHERE status NOT IN ({TERMINAL_ORDER_STATUSES})"
     );
-    let order_rows = sqlx::query(&order_query)
+    let order_rows = sqlx::query(AssertSqlSafe(order_query))
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -63,7 +64,7 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     let dispute_query = format!(
         "SELECT solver_pubkey FROM disputes WHERE status IN ({ACTIVE_DISPUTE_STATUSES}) AND solver_pubkey IS NOT NULL"
     );
-    let dispute_rows = sqlx::query(&dispute_query)
+    let dispute_rows = sqlx::query(AssertSqlSafe(dispute_query))
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -380,7 +381,7 @@ async fn reconcile_existing_add_column_migration(
             continue;
         }
 
-        let Some(operations) = parse_add_column_statements(&migration.sql) else {
+        let Some(operations) = parse_add_column_statements(migration.sql.as_str()) else {
             continue;
         };
 
@@ -575,37 +576,34 @@ pub async fn get_admin_password(pool: &SqlitePool) -> Result<Option<String>, Mos
 
 pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Order, MostroError> {
     let null_key = None::<String>;
-    let column_name = if let Ok(order_kind) = order.get_order_kind() {
-        match order_kind {
-            OrderKind::Buy => "seller_pubkey",
-            OrderKind::Sell => "buyer_pubkey",
+    let result = match order.get_order_kind() {
+        Ok(OrderKind::Buy) => {
+            sqlx::query(
+                "UPDATE orders SET seller_pubkey = ?1, master_seller_pubkey = ?2 WHERE id = ?3",
+            )
+            .bind(null_key.clone())
+            .bind(null_key)
+            .bind(order.id)
+            .execute(pool)
+            .await
         }
-    } else {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(
-            "Order kind not found".to_string(),
-        )));
-    };
-
-    // Build the SQL query dynamically updating both regular and master pubkey
-    // Determine corresponding master key column name
-    let master_key_column = if column_name.contains("buyer") {
-        "master_buyer_pubkey"
-    } else {
-        "master_seller_pubkey"
-    };
-
-    let sql = format!(
-        "UPDATE orders SET {} = ?1, {} = ?2 WHERE id = ?3",
-        column_name, master_key_column
-    );
-
-    let result = sqlx::query(&sql)
-        .bind(null_key.clone())
-        .bind(null_key)
-        .bind(order.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        Ok(OrderKind::Sell) => {
+            sqlx::query(
+                "UPDATE orders SET buyer_pubkey = ?1, master_buyer_pubkey = ?2 WHERE id = ?3",
+            )
+            .bind(null_key.clone())
+            .bind(null_key)
+            .bind(order.id)
+            .execute(pool)
+            .await
+        }
+        Err(_) => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                "Order kind not found".to_string(),
+            )));
+        }
+    }
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
         return Err(MostroInternalErr(ServiceError::DbAccessError(
@@ -727,7 +725,7 @@ pub async fn update_order_to_initial_state(
     let preimage: Option<String> = None;
     let buyer_invoice: Option<String> = None;
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE orders
             SET
@@ -742,17 +740,17 @@ pub async fn update_order_to_initial_state(
             invoice_held_at = ?9
             WHERE id = ?10
         "#,
-        status,
-        amount,
-        fee,
-        dev_fee,
-        hash,
-        preimage,
-        buyer_invoice,
-        0,
-        0,
-        order_id,
     )
+    .bind(status)
+    .bind(amount)
+    .bind(fee)
+    .bind(dev_fee)
+    .bind(hash)
+    .bind(preimage)
+    .bind(buyer_invoice)
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind(order_id)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -765,17 +763,17 @@ pub async fn reset_order_taken_at_time(
     pool: &SqlitePool,
     order_id: Uuid,
 ) -> Result<bool, MostroError> {
-    let taken_at = 0;
-    let result = sqlx::query!(
+    let taken_at = 0_i64;
+    let result = sqlx::query(
         r#"
             UPDATE orders
             SET
             taken_at = ?1
             WHERE id = ?2
         "#,
-        taken_at,
-        order_id,
     )
+    .bind(taken_at)
+    .bind(order_id)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -789,16 +787,16 @@ pub async fn update_order_invoice_held_at_time(
     order_id: Uuid,
     invoice_held_at: i64,
 ) -> Result<bool, MostroError> {
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE orders
             SET
             invoice_held_at = ?1
             WHERE id = ?2
         "#,
-        invoice_held_at,
-        order_id,
     )
+    .bind(invoice_held_at)
+    .bind(order_id)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -935,13 +933,13 @@ pub async fn update_user_trade_index(
         return Err(MostroCantDo(CantDoReason::InvalidTradeIndex));
     }
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE users SET last_trade_index = ?1 WHERE pubkey = ?2
         "#,
-        trade_index,
-        public_key,
     )
+    .bind(trade_index)
+    .bind(public_key)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -976,14 +974,29 @@ async fn has_pending_order_with_status(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    let exists = sqlx::query_scalar::<_, bool>(&format!(
-        "SELECT EXISTS (SELECT 1 FROM orders WHERE {} = ? AND status = ?)",
-        master_key_field
-    ))
-    .bind(pubkey)
-    .bind(status)
-    .fetch_one(pool)
-    .await
+    let exists = match master_key_field {
+        "master_buyer_pubkey" => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM orders WHERE master_buyer_pubkey = ? AND status = ?)",
+            )
+            .bind(pubkey)
+            .bind(status)
+            .fetch_one(pool)
+            .await
+        }
+        "master_seller_pubkey" => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE master_seller_pubkey = ? AND status = ?)",
+        )
+        .bind(pubkey)
+        .bind(status)
+        .fetch_one(pool)
+        .await,
+        _ => {
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                "Invalid master key field".to_string(),
+            )));
+        }
+    }
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(exists)
 }
@@ -1020,17 +1033,17 @@ pub async fn update_user_rating(
     if !(min_rating <= last_rating && last_rating <= max_rating) {
         return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
             UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
         "#,
-        last_rating,
-        min_rating,
-        max_rating,
-        total_reviews,
-        total_rating,
-        public_key,
     )
+    .bind(last_rating)
+    .bind(min_rating)
+    .bind(max_rating)
+    .bind(total_reviews)
+    .bind(total_rating)
+    .bind(public_key)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1197,7 +1210,7 @@ pub async fn find_user_orders_by_master_key(
         "#,
         EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
     );
-    let orders = sqlx::query_as::<_, RestoredOrdersInfo>(&sql_query)
+    let orders = sqlx::query_as::<_, RestoredOrdersInfo>(AssertSqlSafe(sql_query))
         .bind(master_key)
         .bind(master_key)
         .fetch_all(pool)
@@ -1243,7 +1256,7 @@ pub async fn find_user_disputes_by_master_key(
         "#,
         ACTIVE_DISPUTE_STATUSES
     );
-    let restore_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(&sql_query)
+    let restore_disputes = sqlx::query_as::<_, RestoredDisputesInfo>(AssertSqlSafe(sql_query))
         //CASE
         .bind(master_key)
         .bind(master_key)
@@ -1344,7 +1357,7 @@ mod tests {
     use mostro_core::error::CantDoReason;
     use mostro_core::prelude::MostroError;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-    use sqlx::Error;
+    use sqlx::{AssertSqlSafe, Error};
     use std::collections::HashSet;
 
     const TEST_DB_URL: &str = "sqlite::memory:";
@@ -1635,7 +1648,7 @@ mod tests {
             params.push(value_string);
         }
 
-        let mut query = sqlx::query(&query_builder);
+        let mut query = sqlx::query(AssertSqlSafe(query_builder));
         for param in &params {
             query = query.bind(param);
         }

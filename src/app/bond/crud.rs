@@ -44,7 +44,7 @@ const BOND_INSERT_COLUMNS: &[&str] = &[
     "taker_dev_fee",
 ];
 
-fn push_bond_insert_binds<'a>(b: &mut Separated<'_, 'a, Sqlite, &'static str>, bond: &'a Bond) {
+fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
     b.push_bind(bond.id)
         .push_bind(bond.order_id)
         .push_bind(bond.parent_bond_id)
@@ -78,7 +78,7 @@ fn push_bond_insert_binds<'a>(b: &mut Separated<'_, 'a, Sqlite, &'static str>, b
         .push_bind(bond.taker_dev_fee);
 }
 
-fn push_bond_update_set<'a>(set: &mut Separated<'_, 'a, Sqlite, &'static str>, bond: &'a Bond) {
+fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
     set.push("order_id = ").push_bind_unseparated(bond.order_id);
     set.push("parent_bond_id = ")
         .push_bind_unseparated(bond.parent_bond_id);

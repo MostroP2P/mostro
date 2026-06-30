@@ -415,12 +415,8 @@ mod tests {
         Bond {
             id: Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap(),
             order_id,
-            parent_bond_id: Some(
-                Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
-            ),
-            child_order_id: Some(
-                Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
-            ),
+            parent_bond_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()),
+            child_order_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap()),
             pubkey: "5".repeat(64),
             role: BondRole::Taker.to_string(),
             amount_sats: 7,
@@ -498,17 +494,30 @@ mod tests {
                 .unwrap()
                 .map(|id| id.to_string()),
             "pubkey" | "role" | "state" => Some(row.try_get::<String, _>(column).unwrap()),
-            "amount_sats" | "slashed_share_sats" | "payout_attempts"
-            | "invoice_request_attempts" | "created_at" => {
-                Some(row.try_get::<i64, _>(column).unwrap().to_string())
-            }
-            "slashed_reason" | "hash" | "preimage" | "payment_request" | "payout_invoice"
-            | "payout_payment_hash" | "taker_identity" | "taker_invoice" => {
-                row.try_get::<Option<String>, _>(column).unwrap()
-            }
-            "payout_routing_fee_sats" | "node_share_sats" | "last_invoice_request_at"
-            | "locked_at" | "released_at" | "slashed_at" | "taker_trade_index"
-            | "taker_fiat_amount" | "taker_amount" | "taker_fee" | "taker_dev_fee" => row
+            "amount_sats"
+            | "slashed_share_sats"
+            | "payout_attempts"
+            | "invoice_request_attempts"
+            | "created_at" => Some(row.try_get::<i64, _>(column).unwrap().to_string()),
+            "slashed_reason"
+            | "hash"
+            | "preimage"
+            | "payment_request"
+            | "payout_invoice"
+            | "payout_payment_hash"
+            | "taker_identity"
+            | "taker_invoice" => row.try_get::<Option<String>, _>(column).unwrap(),
+            "payout_routing_fee_sats"
+            | "node_share_sats"
+            | "last_invoice_request_at"
+            | "locked_at"
+            | "released_at"
+            | "slashed_at"
+            | "taker_trade_index"
+            | "taker_fiat_amount"
+            | "taker_amount"
+            | "taker_fee"
+            | "taker_dev_fee" => row
                 .try_get::<Option<i64>, _>(column)
                 .unwrap()
                 .map(|v| v.to_string()),

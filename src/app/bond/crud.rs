@@ -9,8 +9,9 @@ use super::model::Bond;
 
 /// Persisted `bonds` INSERT column names, in bind order. Keep in sync with
 /// [`push_bond_insert_binds`], `mostrod` migrations, and [`Bond`]'s
-/// `FromRow` mapping. Drift is caught by bond integration tests in `db.rs`.
-const BOND_INSERT_COLUMNS: &[&str] = &[
+/// `FromRow` mapping. Positional bind alignment is verified by
+/// `bond_insert_column_bind_alignment` in `db.rs`.
+pub(crate) const BOND_INSERT_COLUMNS: &[&str] = &[
     "id",
     "order_id",
     "parent_bond_id",
@@ -79,6 +80,8 @@ fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
 }
 
 fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
+    // `created_at` is insert-only: omit from UPDATE so a mutated in-memory
+    // `Bond` cannot rewrite the row's creation timestamp (schedulers order by it).
     set.push("order_id = ").push_bind_unseparated(bond.order_id);
     set.push("parent_bond_id = ")
         .push_bind_unseparated(bond.parent_bond_id);
@@ -118,8 +121,6 @@ fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
         .push_bind_unseparated(bond.released_at);
     set.push("slashed_at = ")
         .push_bind_unseparated(bond.slashed_at);
-    set.push("created_at = ")
-        .push_bind_unseparated(bond.created_at);
     set.push("taker_identity = ")
         .push_bind_unseparated(&bond.taker_identity);
     set.push("taker_trade_index = ")

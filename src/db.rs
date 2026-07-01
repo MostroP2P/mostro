@@ -2575,4 +2575,275 @@ mod tests {
             "invoice_held_at should be set to provided value"
         );
     }
+
+    // -- Smoke tests for the runtime UPDATE helpers (issue #792) --
+    //
+    // The five helpers below were migrated off compile-time-checked
+    // `sqlx::query!` in the sqlx 0.9 upgrade. The tests above already
+    // assert that the target columns change; these add the other half of
+    // the safety net: sentinel-valued rows proving that untouched columns
+    // keep their values and that the WHERE clause never leaks onto other
+    // rows.
+
+    /// Insert an order whose non-target columns carry `tag`-derived
+    /// sentinels, so any accidental overwrite is detectable.
+    async fn insert_sentinel_order(pool: &SqlitePool, id: uuid::Uuid, tag: &str) {
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    hash, preimage, buyer_invoice, taken_at, invoice_held_at,
+                    fee, routing_fee)
+            VALUES (?1, 'sell', ?2, 'active', 7, 'face to face',
+                    111111, 'EUR', 42, 1700000001, 1700086401,
+                    0, 0, 33, 0,
+                    ?3, ?4, ?5, 1700001111, 1700002222,
+                    21, 9)"#,
+        )
+        .bind(id)
+        .bind(format!("ev-{tag}"))
+        .bind(format!("hash-{tag}"))
+        .bind(format!("preimage-{tag}"))
+        .bind(format!("invoice-{tag}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Insert a user whose non-target columns carry non-default sentinels.
+    async fn insert_sentinel_user(pool: &SqlitePool, pubkey: &str) {
+        sqlx::query(
+            r#"INSERT INTO users (pubkey, is_admin, is_solver, is_banned, category,
+                    last_trade_index, total_reviews, total_rating, last_rating,
+                    max_rating, min_rating, created_at)
+            VALUES (?1, 1, 1, 0, 2, 77, 8, 32.0, 4, 5, 2, 1700000123)"#,
+        )
+        .bind(pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_order_to_initial_state_leaves_untouched_columns_and_other_rows() {
+        let pool = setup_orders_db().await.unwrap();
+        let target = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        insert_sentinel_order(&pool, target, "a").await;
+        insert_sentinel_order(&pool, other, "b").await;
+
+        assert!(
+            super::update_order_to_initial_state(&pool, target, 50000, 250, 100)
+                .await
+                .unwrap()
+        );
+
+        // Target row: columns outside the UPDATE's SET list keep sentinels.
+        let untouched: (String, String, i64, String, String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT kind, event_id, premium, payment_method, fiat_code,
+                    fiat_amount, created_at, expires_at, routing_fee
+             FROM orders WHERE id = ?1",
+        )
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched.0, "sell", "kind must not change");
+        assert_eq!(untouched.1, "ev-a", "event_id must not change");
+        assert_eq!(untouched.2, 7, "premium must not change");
+        assert_eq!(
+            untouched.3, "face to face",
+            "payment_method must not change"
+        );
+        assert_eq!(untouched.4, "EUR", "fiat_code must not change");
+        assert_eq!(untouched.5, 42, "fiat_amount must not change");
+        assert_eq!(untouched.6, 1700000001, "created_at must not change");
+        assert_eq!(untouched.7, 1700086401, "expires_at must not change");
+        assert_eq!(untouched.8, 9, "routing_fee must not change");
+
+        // Other row: the columns the helper writes stay untouched (WHERE
+        // must pin the update to the target id).
+        let other_row: (String, i64, Option<String>, i64) =
+            sqlx::query_as("SELECT status, amount, hash, taken_at FROM orders WHERE id = ?1")
+                .bind(other)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(other_row.0, "active", "other row's status must not change");
+        assert_eq!(other_row.1, 111111, "other row's amount must not change");
+        assert_eq!(
+            other_row.2.as_deref(),
+            Some("hash-b"),
+            "other row's hash must not be cleared"
+        );
+        assert_eq!(
+            other_row.3, 1700001111,
+            "other row's taken_at must not be reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_order_taken_at_time_only_touches_taken_at_of_target_row() {
+        let pool = setup_orders_db().await.unwrap();
+        let target = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        insert_sentinel_order(&pool, target, "a").await;
+        insert_sentinel_order(&pool, other, "b").await;
+
+        assert!(super::reset_order_taken_at_time(&pool, target)
+            .await
+            .unwrap());
+
+        let row: (i64, String, i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT taken_at, status, amount, invoice_held_at, hash FROM orders WHERE id = ?1",
+        )
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 0, "taken_at must be reset");
+        assert_eq!(row.1, "active", "status must not change");
+        assert_eq!(row.2, 111111, "amount must not change");
+        assert_eq!(row.3, 1700002222, "invoice_held_at must not change");
+        assert_eq!(row.4.as_deref(), Some("hash-a"), "hash must not change");
+
+        let other_taken_at: (i64,) = sqlx::query_as("SELECT taken_at FROM orders WHERE id = ?1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            other_taken_at.0, 1700001111,
+            "other row's taken_at must not be reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_order_invoice_held_at_time_only_touches_target_row() {
+        let pool = setup_orders_db().await.unwrap();
+        let target = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        insert_sentinel_order(&pool, target, "a").await;
+        insert_sentinel_order(&pool, other, "b").await;
+
+        assert!(
+            super::update_order_invoice_held_at_time(&pool, target, 1700009999)
+                .await
+                .unwrap()
+        );
+
+        let row: (i64, String, i64, i64) = sqlx::query_as(
+            "SELECT invoice_held_at, status, amount, taken_at FROM orders WHERE id = ?1",
+        )
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1700009999, "invoice_held_at must be set");
+        assert_eq!(row.1, "active", "status must not change");
+        assert_eq!(row.2, 111111, "amount must not change");
+        assert_eq!(row.3, 1700001111, "taken_at must not change");
+
+        let other_held_at: (i64,) =
+            sqlx::query_as("SELECT invoice_held_at FROM orders WHERE id = ?1")
+                .bind(other)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_held_at.0, 1700002222,
+            "other row's invoice_held_at must not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_user_trade_index_only_touches_last_trade_index_of_target_user() {
+        let pool = setup_users_db().await.unwrap();
+        insert_sentinel_user(&pool, VALID_PUBKEY).await;
+        insert_sentinel_user(&pool, DAEMON_PUBKEY).await;
+
+        assert!(
+            super::update_user_trade_index(&pool, VALID_PUBKEY.to_string(), 100)
+                .await
+                .unwrap()
+        );
+
+        let row: (i64, i64, i64, i64, i64, f64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT last_trade_index, is_admin, is_solver, category, total_reviews,
+                    total_rating, last_rating, max_rating, min_rating, created_at
+             FROM users WHERE pubkey = ?1",
+        )
+        .bind(VALID_PUBKEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 100, "last_trade_index must be updated");
+        assert_eq!(row.1, 1, "is_admin must not change");
+        assert_eq!(row.2, 1, "is_solver must not change");
+        assert_eq!(row.3, 2, "category must not change");
+        assert_eq!(row.4, 8, "total_reviews must not change");
+        assert!(
+            (row.5 - 32.0).abs() < f64::EPSILON,
+            "total_rating must not change"
+        );
+        assert_eq!(row.6, 4, "last_rating must not change");
+        assert_eq!(row.7, 5, "max_rating must not change");
+        assert_eq!(row.8, 2, "min_rating must not change");
+        assert_eq!(row.9, 1700000123, "created_at must not change");
+
+        let other_idx: (i64,) =
+            sqlx::query_as("SELECT last_trade_index FROM users WHERE pubkey = ?1")
+                .bind(DAEMON_PUBKEY)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_idx.0, 77,
+            "other user's last_trade_index must not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_user_rating_only_touches_rating_columns_of_target_user() {
+        let pool = setup_users_db().await.unwrap();
+        insert_sentinel_user(&pool, VALID_PUBKEY).await;
+        insert_sentinel_user(&pool, DAEMON_PUBKEY).await;
+
+        assert!(
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0)
+                .await
+                .unwrap()
+        );
+
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT is_admin, is_solver, category, last_trade_index, created_at
+             FROM users WHERE pubkey = ?1",
+        )
+        .bind(VALID_PUBKEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1, "is_admin must not change");
+        assert_eq!(row.1, 1, "is_solver must not change");
+        assert_eq!(row.2, 2, "category must not change");
+        assert_eq!(row.3, 77, "last_trade_index must not change");
+        assert_eq!(row.4, 1700000123, "created_at must not change");
+
+        let other: (i64, i64, i64, i64, f64) = sqlx::query_as(
+            "SELECT last_rating, min_rating, max_rating, total_reviews, total_rating
+             FROM users WHERE pubkey = ?1",
+        )
+        .bind(DAEMON_PUBKEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(other.0, 4, "other user's last_rating must not change");
+        assert_eq!(other.1, 2, "other user's min_rating must not change");
+        assert_eq!(other.2, 5, "other user's max_rating must not change");
+        assert_eq!(other.3, 8, "other user's total_reviews must not change");
+        assert!(
+            (other.4 - 32.0).abs() < f64::EPSILON,
+            "other user's total_rating must not change"
+        );
+    }
 }

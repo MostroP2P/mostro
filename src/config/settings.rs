@@ -1,7 +1,7 @@
 use super::{DB_POOL, MOSTRO_CONFIG};
 use crate::config::types::{
-    AntiAbuseBondSettings, DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings,
-    NostrSettings, RpcSettings,
+    AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
+    LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::transport::Transport;
@@ -26,6 +26,11 @@ pub struct Settings {
     /// Anti-abuse bond configuration (issue #711). Absent section ≡ disabled.
     #[serde(default)]
     pub anti_abuse_bond: Option<AntiAbuseBondSettings>,
+    /// Cashu escrow configuration (docs/cashu/, CF-1). Absent section ≡
+    /// disabled (Lightning mode). Mutually exclusive with
+    /// `anti_abuse_bond`; enforced at startup.
+    #[serde(default)]
+    pub cashu: Option<CashuSettings>,
     /// Multi-source price configuration (see `docs/PRICE_PROVIDERS.md`).
     /// Absent section ≡ legacy single-source behaviour (synthesised in
     /// Phase 1's migration).
@@ -128,5 +133,33 @@ impl Settings {
     /// `false` when settings haven't been initialized.
     pub fn is_bond_enabled() -> bool {
         Self::get_bond().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// Retrieve the Cashu escrow configuration from the global
+    /// `MOSTRO_CONFIG`. Returns `None` when the `[cashu]` block is absent
+    /// (treated as disabled) and also when the global settings haven't
+    /// been initialized yet — the escrow-mode gate will sit on handler hot
+    /// paths, so it must never panic in unit tests that don't bring up the
+    /// full configuration, mirroring [`Settings::get_bond`].
+    pub fn get_cashu() -> Option<&'static CashuSettings> {
+        MOSTRO_CONFIG.get()?.cashu.as_ref()
+    }
+
+    /// True when the `[cashu]` block is present AND explicitly enabled.
+    /// The single gate every Cashu code path must check. Returns `false`
+    /// when settings haven't been initialized.
+    pub fn is_cashu_enabled() -> bool {
+        Self::get_cashu().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// The node-wide escrow mode (locked decision §4.1). `[cashu]` absent
+    /// or disabled ⇒ `Lightning`. Nothing calls this on a hot path during
+    /// the foundation milestone — CF-1 wires it to nothing at runtime.
+    pub fn escrow_mode() -> EscrowMode {
+        if Self::is_cashu_enabled() {
+            EscrowMode::Cashu
+        } else {
+            EscrowMode::Lightning
+        }
     }
 }

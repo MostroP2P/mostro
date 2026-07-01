@@ -202,3 +202,16 @@ port = 50051
 # # Days the winner has to claim their share by submitting a bolt11; after
 # # this the bond closes as `forfeited` and the node retains everything.
 # payout_claim_window_days = 15
+
+# Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
+# the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens
+# on the single mint configured below. Mutually exclusive with
+# [anti_abuse_bond] — enabling both is a startup error.
+#
+# [cashu]
+# enabled = false
+# # The one mint this node escrows on (http/https). Required when enabled.
+# mint_url = "https://mint.example.com"
+# # Seller-recovery locktime floor in days: escrow tokens must carry
+# # locktime >= now + this. Sellers may set a longer locktime, never shorter.
+# escrow_locktime_days = 15

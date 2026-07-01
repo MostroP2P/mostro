@@ -94,7 +94,7 @@ this now — see §11).
 | Fee-token validation | CF-2 | `CashuClient::verify_fee_token(token, p_m, expected_fee)` (new, §4A) |
 | Fee realisation | CF-2 | `CashuClient::sign_with_pm(proofs)` + a mint swap — the fee-only redeem capability (§4A) |
 | Fee amount | existing | `util::get_fee(amount)` → `order.fee` (per-party half); fee token value = `2 * order.fee` |
-| Atomic lock | CF-4 | `db::update_order_cashu_escrow(pool, order_id, mint_url, token, locked_at, expected_status, new_status) -> Result<bool>` |
+| Atomic lock | CF-4 | `db::update_order_cashu_escrow(pool, order_id, mint_url, token, locked_at, expected_status, new_status) -> Result<bool>` — TA-1f extends it with `fee_token` (§4A) |
 | In-flight discovery | CF-4 | `db::find_locked_cashu_orders(pool)` |
 | Client handle | CF-5 | `AppContext::cashu_client() -> Option<&Arc<CashuClient>>` |
 | Dispatch seam | CF-5 | `AddCashuEscrow` routed to `add_cashu_escrow_action` (a CF-5 stub Track A fills in) — see §11 |
@@ -362,19 +362,40 @@ Insert into `add_cashu_escrow_action`:
   `InvalidCashuToken`; mint unreachable ⇒ `CashuMintUnavailable`). **Both tokens
   must be valid before any state changes** — same validate-fully-then-commit
   discipline as §4.
-- **Step 8 (CAS) is unchanged** — it advances `WaitingPayment → Active` and
-  persists the escrow columns. The fee token is **not** persisted (no
-  `cashu_fee_token` column exists, and the schema is frozen — see the refinement
-  below for the alternative).
+- **Step 8 (CAS) also persists the fee token.** TA-1f ships a migration adding
+  `cashu_fee_token` + `cashu_fee_redeemed_at` to `orders` and extends the CF-4
+  CAS with a `fee_token` parameter, so the fee token is written **in the same
+  atomic UPDATE** that advances the status. Rationale (crash-safety): the fee
+  is redeemed *after* the CAS; if the token lived only in memory, a crash
+  between CAS and redeem would leave a correctly-`Active` order whose fee is
+  unrecoverable **and undetectable** — and the replay guard below would
+  correctly refuse a second submission, closing the recovery path forever.
+  Persisting it in the CAS makes the redeem retryable from the DB.
+- **Cross-order reuse guard (same transaction).** Nothing in the fee token
+  binds it to *this* order — it is P2PK to the node-wide `P_M`, unlike the
+  escrow token whose 2-of-3 embeds per-order trade keys — so
+  `verify_fee_token`'s unspent check only stops *sequential* reuse. Two
+  concurrent `AddCashuEscrow` for two same-fee orders could both validate the
+  same token before the first redeem (TOCTOU), leaving one order `Active` with
+  an uncollectable fee. TA-1f therefore records each fee-proof
+  `Y = hash_to_curve(secret)` (the same identifier NUT-07 uses) in a
+  `cashu_fee_proofs (y PRIMARY KEY, order_id, created_at)` table, inserted in
+  the same transaction as the CAS; a UNIQUE violation ⇒
+  `CantDo(InvalidCashuToken)`. (A cryptographic alternative — requiring an
+  `order_id` tag inside the P2PK secret — is cleaner but needs client-side
+  coordination; documented as future hardening, not TA-1f.)
 - **After a successful CAS, redeem the fee token** (`sign_with_pm` + swap). Order
   matters: advance state first, collect fee second, because the fee was already
-  proven valid-and-unspent during validation and the daemon can retry the redeem.
-  A redeem that fails after the CAS leaves the order correctly `Active` and the
-  fee retryable; it does **not** roll back the trade.
+  proven valid-and-unspent during validation and the redeem is retryable from
+  the persisted token. On success stamp `cashu_fee_redeemed_at`; on failure a
+  cashu-mode scheduler job retries pending redeems
+  (`cashu_fee_token IS NOT NULL AND cashu_fee_redeemed_at IS NULL`) — the
+  analogue of the LN payment-retry job. A failed redeem never rolls back the
+  trade.
 - **Idempotency / replay.** A replayed `AddCashuEscrow` finds the CAS matching
-  zero rows (already `Active`) → no-op, no second redeem. A fee token already
-  redeemed by a prior attempt fails `verify_fee_token`'s unspent check → rejected
-  cleanly. Never double-charge.
+  zero rows (already `Active`) → no-op, no second redeem. The same fee token
+  submitted for a *different* order hits the `cashu_fee_proofs` uniqueness
+  guard → rejected cleanly. Never double-charge, never double-accept.
 
 ### Refund obligation (executed by Tracks C/D)
 
@@ -399,10 +420,11 @@ seller-recovery locktime too, see §4B). Then:
 - **After locktime:** if Mostro never redeemed (trade abandoned/cancelled), the
   seller (`P_S`) reclaims the fee **unilaterally** — no daemon action needed.
 
-This trades **one migration** (a `cashu_fee_token` column to remember the token
-until release) and a slightly richer `verify_fee_token` (accept locktime +
-`P_S` refund) for self-service refunds and "fee only on success" semantics. It
-is a clean follow-up, not a TA-1 blocker; TA-1 ships the simpler 1-of-1 form.
+Since TA-1f already persists the fee token for crash-safety (§4A), this
+refinement no longer costs a migration — only a slightly richer
+`verify_fee_token` (accept locktime + `P_S` refund) in exchange for
+self-service refunds and "fee only on success" semantics. It is a clean
+follow-up, not a TA-1 blocker; TA-1f ships the simpler 1-of-1 form.
 
 ### What Option 2 does *not* solve
 
@@ -475,6 +497,33 @@ trade-off for recoverability. The 15-day default (extendable per trade by the
 seller) keeps the long-lived/marketplace use case viable while guaranteeing the
 seller is never *permanently* locked out when Mostro and the buyer both go silent.
 
+### Daemon-side remaining-locktime guards (cross-track obligation)
+
+The buyer-side warning is **not** a sufficient defence on its own, because the
+seller controls the fiat-side timing. Concrete attack: the seller stalls the
+pre-payment phase ("bank problems", re-negotiation) until little locktime
+remains, lets the buyer send fiat on day 13 of 15, goes silent, and reclaims
+via the refund path on day 15 — keeping both the fiat and the sats without
+failing a single protocol check. A dispute opened on day 14 doesn't save the
+buyer: human resolution (Track D) can easily take longer than the remaining
+window, and a `P_M` signature delivered after the seller reclaims is
+worthless.
+
+The daemon therefore enforces the remaining window at the points it controls —
+the same philosophy as the LN flow's server-side hold-invoice expiry handling
+(never trust the client to watch the clock):
+
+1. **`FiatSent` guard (Track B).** Reject `FiatSent` with a clear `CantDo`
+   when `locktime - now < escrow_settlement_margin_days` (a new
+   `#[serde(default)]` key on `CashuSettings`, default **3**, added by Track B
+   alongside its `FiatSent` branch — not needed during foundation). This cuts
+   the attack at the root: fiat can never be sent inside the danger window.
+2. **Dispute-open alert (Track D).** A dispute opened with less remaining
+   locktime than the resolution SLA flags the solver with priority (and is
+   logged): late `P_M` signatures are useless.
+3. **Monitor (TA-3).** The locked-escrow monitor warns the buyer proactively
+   as the locktime approaches on an unresolved order.
+
 ---
 
 ## 5. `take_sell` / `take_buy` — the Cashu branch
@@ -505,8 +554,12 @@ no cross-track conflict here.
 
 ## 6. PR breakdown (atomic, backwards-compatible)
 
-Track A is small enough for two core PRs plus one optional hardening PR. Each is
-off-by-default and leaves `main` shippable.
+Track A is three core PRs (TA-1, TA-1f, TA-2) plus one optional hardening PR
+(TA-3). Each is off-by-default and leaves `main` shippable. TA-1f is **not**
+optional for any nonzero-fee deployment: it carries the crash-safe fee
+persistence and `cashu_fee_proofs` anti-reuse guard §4A relies on — a
+`mostro.fee > 0` node must not enable cashu mode before TA-1f is merged (fold
+it into TA-1 if that ordering is hard to guarantee).
 
 ### TA-1 · `add_cashu_escrow_action` handler
 Fill in the CF-5 stub for `AddCashuEscrow` in its **own** file
@@ -518,24 +571,37 @@ path; replay → idempotent no-op).
 unit-tested against). Conflict surface: new file only.*
 
 ### TA-1f · Fee token (Option 2)
-The fee half of TA-1, separable for review. Three pieces:
+The fee half of TA-1, separable for review. Four pieces:
 1. **`mostro-core` ≥ 0.14.0 (released):** the `fee_token: Option<String>` field
    on `CashuLockProof` is already available; the daemon pins `≥ 0.14.0`.
 2. **CF-2 surface:** `CashuClient::verify_fee_token(token, p_m, expected_fee)`
    and the fee-only redeem (`sign_with_pm` + swap), unit-tested against the CF-3
    mint.
-3. **Handler:** validate the fee token after the escrow token, then redeem it
-   after the CAS (§4A). Tests: valid fee → `Active` + fee redeemed; missing/
-   mis-valued fee_token when `mostro.fee > 0` → rejected, order unchanged; replay
-   → no double-charge.
+3. **Persistence + anti-reuse (§4A):** the fee migration (`cashu_fee_token`,
+   `cashu_fee_redeemed_at` on `orders`; new `cashu_fee_proofs` table), the
+   `fee_token` extension of the CF-4 CAS, and the cashu-mode scheduler job that
+   retries pending redeems. This is the crash-safety + TOCTOU half; it is
+   **not** optional.
+4. **Handler:** validate the fee token after the escrow token, persist it in
+   the CAS, then redeem it (§4A). Tests: valid fee → `Active` + fee redeemed +
+   `cashu_fee_redeemed_at` stamped; missing/mis-valued fee_token when
+   `mostro.fee > 0` → rejected, order unchanged; replay → no double-charge;
+   the same fee token on a second order → rejected (Y-uniqueness); simulated
+   crash between CAS and redeem → the scheduler retry collects the fee.
 *Depends on `mostro-core ≥ 0.14.0` + CF-2 + TA-1. Conflict surface: `add_cashu_escrow.rs`
-(same new file as TA-1) + `cashu/mod.rs` (additive method). Can be folded into
+(same new file as TA-1) + `cashu/mod.rs` (additive method) + `migrations/` +
+`db.rs` + `scheduler.rs` (additive, cashu-gated). Can be folded into
 TA-1 or landed right after it.*
 
 ### TA-2 · `take_*` escrow request
 Add the Cashu branch to `take_sell_action` / `take_buy_action` and the
 `show_cashu_escrow_request` helper, so a taken order asks the seller to lock
 instead of to pay a hold invoice. Completes the lock flow end-to-end with TA-1.
+TA-2 also **unblocks `NewOrder`** in `dispatch_cashu` (routing it to
+`handle_message_action_no_ln`, per the CF-5 action-ownership matrix): order
+creation touches no escrow, but unblocking it any earlier than the take flow
+would populate the book with untakeable orders — the orphan-order hazard
+CF-5's rationale warns about. Creatable and takeable ship together.
 *Depends on CF-1, CF-5 (and TA-1 for a full e2e test). Conflict surface:
 `take_sell.rs`, `take_buy.rs`, `util.rs` — Track-A-owned.*
 
@@ -554,7 +620,7 @@ additive, cashu-gated.*
 | ID | Title | Depends on | Parallel with | Conflict surface | Risk |
 |----|-------|-----------|---------------|------------------|------|
 | **TA-1** | `add_cashu_escrow_action` handler (validate + atomic lock + notify) | CF-2, CF-3, CF-4, CF-5 | TA-2 (until e2e) | new `src/app/add_cashu_escrow.rs` | Medium (crypto + state) |
-| **TA-1f** | Fee token Option 2 (`verify_fee_token` + redeem; uses `CashuLockProof.fee_token`) | `mostro-core` ≥ 0.14.0, CF-2, TA-1 | TA-2 | `add_cashu_escrow.rs`, `cashu/mod.rs` | Medium (crypto + revenue) |
+| **TA-1f** | Fee token Option 2 (`verify_fee_token` + persistence/anti-reuse + redeem; uses `CashuLockProof.fee_token`) | `mostro-core` ≥ 0.14.0, CF-2, TA-1 | TA-2 | `add_cashu_escrow.rs`, `cashu/mod.rs`, `migrations/`, `db.rs`, `scheduler.rs` | Medium (crypto + revenue) |
 | **TA-2** | `take_sell`/`take_buy` Cashu escrow request | CF-1, CF-5 | TA-1 | `take_*.rs`, `util.rs` | Low-Medium |
 | **TA-3** | Restore/monitor in-flight locked escrows | CF-4, CF-5 | TA-1, TA-2 | `main.rs`/restore (additive) | Low |
 
@@ -582,6 +648,10 @@ Tracks B/C/D** — it only edits its own files plus the pre-wired CF-5 stub.
    and redeemed on success; Mostro's total revenue equals the Lightning-mode
    `2 * order.fee`, and dev-fee accounting is unchanged (Option 2, §4A). The
    refund-on-non-success obligation is documented for Tracks C/D.
+3c. The fee token is persisted in the same atomic write as the lock, so a
+   redeem interrupted by a crash is collected by the scheduler retry; and the
+   same fee token is never accepted for two orders (`cashu_fee_proofs`
+   uniqueness) — both verified by tests (§6 TA-1f).
 4. With Cashu disabled, behaviour is identical to `main`; existing tests pass
    unmodified.
 5. `cargo fmt --check`, `clippy -D warnings`, `cargo test`, and the mint-backed
@@ -593,9 +663,26 @@ Tracks B/C/D** — it only edits its own files plus the pre-wired CF-5 stub.
 
 All four merge gates from [`01-fundamentals.md`](./01-fundamentals.md) §2 apply
 unchanged: off-by-default & behaviour-preserving, atomic & shippable, additive
-only (no schema change — the columns exist), and inert-until-enabled. Track A adds
-behaviour **only** inside the cashu branch; the Lightning lock/funding path is
+only, and inert-until-enabled. One reviewed exception to "no schema change":
+TA-1f ships the fee-persistence migration (§4A) — additive columns plus one new
+table, both unreachable while Cashu is off. Track A otherwise adds behaviour
+**only** inside the cashu branch; the Lightning lock/funding path is
 untouched.
+
+---
+
+## 10. Cross-track obligations (contract summary)
+
+Obligations Track A *defines* but other PRs *execute* — each owning track's
+Definition of Done must reference its row:
+
+| Obligation | Defined in | Executed by |
+|------------|-----------|-------------|
+| Fee refund on every non-success path (`2 * order.fee` to the seller's trade pubkey) | §4A | Tracks C/D + integration |
+| `FiatSent` rejected when remaining locktime < `escrow_settlement_margin_days` | §4B | Track B |
+| Dispute-near-locktime solver alert | §4B | Track D |
+| Locked-escrow monitor + buyer locktime warnings | §4B | TA-3 |
+| `dispatch_cashu` action→owner matrix (no ownerless actions) | 01 §6 (CF-5) | every track |
 
 ---
 
@@ -628,7 +715,10 @@ its **own** handler's cashu branch and wires that handler into `dispatch_cashu`
 when it implements it — replacing the default `InvalidAction` for exactly the
 actions it owns. The §6 allow-list (`Orders`, `LastTradeIndex`, `RestoreSession`,
 `TradePubkey` → `no_ln`) is unaffected — only the *mechanism* for the
-blocked/escrow actions changes.
+blocked/escrow actions changes. The complete **action→owner matrix** now lives
+in fundamentals §6 (CF-5): no blocked action may be left without an owner or an
+explicit permanently-blocked decision — otherwise the tracks can complete and
+still leave cashu mode unable to trade (e.g. an ownerless `NewOrder`).
 
 ### G-2 · `expected_amount` / fee policy — RESOLVED (Option 2)
 **Problem.** `verify_escrow_token` needs an `expected_amount`, but whether the
@@ -645,12 +735,14 @@ revenue and dev-fee accounting identical to Lightning; the only shift is that th
 seller bears the buyer's half too.
 
 **Cost.** One additive `mostro-core` field (`CashuLockProof.fee_token:
-Option<String>`, **released in 0.14.0**; Track A requires `≥ 0.14.0`) and a
-narrow fee-only redeem capability in the
+Option<String>`, **released in 0.14.0**; Track A requires `≥ 0.14.0`), the
+TA-1f fee-persistence migration (crash-safety + cross-order anti-reuse, §4A),
+and a narrow fee-only redeem capability in the
 daemon (its own revenue only; user escrow funds stay non-custodial). Refund of
-the fee on non-success paths is an obligation handed to Tracks C/D. The
-self-service-refund refinement (NUT-11 locktime + `P_S` refund, costing one
-`cashu_fee_token` migration) is documented as optional future hardening.
+the fee on non-success paths is an obligation handed to Tracks C/D (§10). The
+self-service-refund refinement (NUT-11 locktime + `P_S` refund — no longer
+costing a migration, since TA-1f persists the token, §4A) is documented as
+optional future hardening.
 
 ### G-3 · Confirm the take-flow status the CAS expects
 **Problem.** The CF-4 CAS takes `expected_status`/`new_status`. Track A assumes

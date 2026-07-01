@@ -124,8 +124,11 @@ Carried from the architecture doc, restated as constraints:
    key.
 5. **Bonds ⊕ Cashu are mutually exclusive.** `anti_abuse_bond.enabled &&
    cashu.enabled` is a hard config error at startup.
-6. **`mostro-core 0.13.0` protocol is frozen** for the whole foundation +
-   tracks effort (see §3).
+6. **`mostro-core 0.13.0` protocol is the frozen baseline** for the foundation
+   + tracks effort (see §3) — frozen *except* for additive, versioned releases
+   that a track explicitly justifies (the escape hatch §3's design-consequence
+   note already allows). Exercised once so far: Track A requires
+   `mostro-core ≥ 0.14.0` for `CashuLockProof.fee_token` (see 02 §4A).
 7. **Establish a narrow `EscrowBackend` seam (CF-0); branch handlers on
    `escrow_mode`.** We do **not** redesign `EscrowBackend` into a high-level
    `lock`/`release`/`cancel`/`dispute` trait during foundation. The trait keeps
@@ -193,6 +196,35 @@ Each PR below lists: **scope**, **files**, **what it must NOT do**,
 **backwards-compat guarantee**, **tests**, **dependencies**, and **conflict
 surface**.
 
+### CF-0 · `EscrowBackend` seam (precursor, Wave 0)
+
+**Scope.** Behaviour-preserving refactor only: introduce the narrow escrow
+seam described in §3/§4.7 and route `release_action` through it. No new
+runtime behaviour, no config, no Cashu logic.
+
+**Files.**
+- `src/escrow.rs` (new) — `trait EscrowBackend { create_hold_invoice /
+  settle_hold_invoice / cancel_hold_invoice }`; `impl EscrowBackend for
+  LndConnector` as a literal pass-through; `CashuBackend` stub whose methods
+  return a typed "not implemented" error (never `panic!` / `unimplemented!`).
+- `src/app/release.rs` — `release_action` takes `&mut dyn EscrowBackend`
+  instead of `&mut LndConnector`; Lightning behaviour unchanged.
+
+**Must NOT.** Touch boot (`main.rs`), `AppContext` (CF-5 wires the seam),
+config, the scheduler, or any other handler. Implement any Cashu method body.
+
+**Backwards-compat guarantee.** Lightning calls flow through the pass-through
+impl unchanged; the existing release/dispute test suite passes unmodified.
+
+**Tests.** Existing suite green unmodified; a unit test that every
+`CashuBackend` method returns the typed error (no panic).
+
+**Dependencies.** None. **Conflict surface.** new `src/escrow.rs`,
+`src/app/release.rs`. **Parallel with.** Nothing — it is the Wave-0 precursor
+and merges first.
+
+---
+
 ### CF-1 · Config + escrow mode (no boot change)
 
 **Scope.** Introduce Cashu configuration and the escrow-mode resolution, with
@@ -239,7 +271,11 @@ parse/validate tokens and talk to a mint. **Not wired into the daemon.**
 - `src/cashu/mod.rs` — `pub struct CashuClient` and an `Error` enum
   (`impl std::error::Error`). Public API:
   - `async fn connect(mint_url: &str) -> Result<Self, Error>` — verifies the mint
-    is reachable and supports the required NUTs (07 state, 11 P2PK, 12 DLEQ).
+    is reachable, supports the required NUTs (07 state, 11 P2PK, 12 DLEQ), **and
+    that its active keysets are denominated in `sat`** (NUT-06 `unit`); any other
+    unit is a hard connect error — token values are compared against sat amounts
+    downstream, so a `usd`/`msat` keyset would make every amount check
+    economically meaningless.
   - `async fn check_state(&self, ys) -> Result<CheckStateResponse, Error>` — NUT-07.
   - `fn verify_2of3_condition(token, p_b, p_s, p_m) -> Result<Token, Error>` —
     parses, asserts exactly 2 required sigs (`n_sigs = 2`) over the three expected
@@ -250,6 +286,8 @@ parse/validate tokens and talk to a mint. **Not wired into the daemon.**
   - `async fn verify_token_dleq(&self, token) -> Result<(), Error>` — NUT-12.
   - `async fn verify_escrow_token(&self, token, p_b, p_s, p_m, expected_amount, min_locktime)` —
     composes the above into one acceptance check (condition + mint binding +
+    per-proof **`sat` keyset unit** — a token may mix keysets, so the boot-time
+    check alone does not cover it — +
     amount + DLEQ + unspent + **`token.locktime >= min_locktime`**, where the
     caller passes `min_locktime = now + cashu.escrow_locktime_days`; the seller may
     set a longer locktime for marketplace trades, never a shorter one — Track A §4B).
@@ -334,6 +372,13 @@ schema-adjacent code is frozen and reviewed once.
     that have already moved on. Only re-add a status predicate if a separate
     invariant guarantees locked rows never leave `Active`.
 
+> **Forward note (Track A).** TA-1f later extends `update_order_cashu_escrow`
+> with a `fee_token` parameter plus a fee-persistence migration
+> (`cashu_fee_token`, `cashu_fee_redeemed_at` on `orders`; new
+> `cashu_fee_proofs` table) so the seller-funded fee survives a crash between
+> lock and redeem and can never be reused across orders — see 02 §4A. CF-4
+> itself ships without it.
+
 **Must NOT.** Add or alter any migration. Be called from a hot path yet.
 
 **Backwards-compat guarantee.** New, unreferenced functions. The columns already
@@ -341,7 +386,9 @@ exist on `main`, so no schema change ships here.
 
 **Tests.** Unit tests on an in-memory SQLite: CAS succeeds once and is idempotent
 on replay; status-mismatch matches zero rows; `find_locked_cashu_orders` excludes
-unlocked and non-active orders.
+unlocked orders and **includes locked orders regardless of status** (e.g. a
+locked order that already advanced to `FiatSent`) — the test asserts the
+no-status-predicate design above instead of contradicting it.
 
 **Dependencies.** None (schema already on `main`). **Conflict surface.** `db.rs`
 (additive functions + their tests). **Parallel with.** CF-1, CF-2, CF-3.
@@ -488,6 +535,28 @@ that can never be taken to completion (no escrow), producing orphan/half-state
 orders. The allow-list is deliberately the *narrowest* set that keeps the node
 observable without ever moving an order's lifecycle. `RateUser` is blocked
 because nothing can reach a rateable terminal state during foundation.
+
+**Action-ownership matrix (merge gate for the tracks).** Every blocked action
+must have an owner that eventually unblocks it, or an explicit
+*permanently-blocked* decision. A track PR replaces the `InvalidAction` arm
+**only** for the actions it owns below. The rule: **no action may be left
+without a row** — an ownerless action means the feature ships incomplete (a
+cashu node where, e.g., `NewOrder` is still rejected after all four tracks can
+never trade at all; the first Cashu attempt hit exactly this bug in code).
+
+| Action | Unblocked by | Final routing |
+|--------|-------------|---------------|
+| `NewOrder` | **TA-2** (Track A — bundled with the take flow, so orders become creatable and takeable in the same PR; scoped in 02 §6 TA-2) | `handle_message_action_no_ln` — creating a pending order touches no escrow |
+| `TakeBuy`, `TakeSell` | **TA-2** (Track A) | cashu branch → `show_cashu_escrow_request` |
+| `AddCashuEscrow` | **TA-1** (Track A) | `add_cashu_escrow_action` |
+| `FiatSent` | **Track B** | cashu branch (state advance, no LND; carries the §4B locktime guard — see 02 §4B) |
+| `Release` | **Track B** | cashu release handler |
+| `RateUser` | **Track B** | `no_ln` once terminal states are reachable |
+| `Cancel` | **Track C** | cashu cancel handler |
+| `Dispute`, `AdminCancel`, `AdminSettle`, `AdminTakeDispute` | **Track D** | cashu dispute handlers |
+| `AdminAddSolver` | **Track D** (dispute setup needs solvers) | `handle_message_action_no_ln` — solver management touches no escrow/LND |
+| `AddInvoice` | **never** — the buyer-invoice step does not exist in cashu mode (02 §2) | permanently `InvalidAction` (documented decision) |
+| `AddBondInvoice` | **never** — bonds ⊕ cashu are mutually exclusive (§4.5) | permanently `InvalidAction` |
 
 **Backwards-compatibility proof obligation.** Extracting `accept_event` /
 `finalize_dispatch` is a pure refactor of `run`. The merge gate is: the existing

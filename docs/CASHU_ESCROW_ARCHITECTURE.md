@@ -97,7 +97,7 @@ The introduction of Cashu Escrow modifies the responsibility of core action hand
 ## CDK Implementation Details
 
 ### Generating Spending Conditions
-Sellers construct the 2-of-3 spending condition using `cdk::nuts::nut10`. We recommend the `SIG_INPUTS` flag. This allows the seller to sign the authorization once and pass it to the buyer, allowing the buyer to specify their own target outputs independently.
+Sellers construct the 2-of-3 spending condition using `cdk::nuts::nut10`. We recommend the `SIG_INPUTS` flag. This allows the seller to sign the authorization once and pass it to the buyer, allowing the buyer to specify their own target outputs independently. The same condition also carries a **seller-recovery `locktime` + `refund = [P_S]`** (see the note after the snippet, and Track A §4B for the exact rules).
 
 ```rust
 use cdk::nuts::nut10::{Conditions, SpendingConditions, SigFlag};
@@ -123,6 +123,18 @@ let conditions = Conditions::new(
 let secret = SpendingConditions::new_p2pk(p_s, Some(conditions));
 ```
 
+> **Note — the snippet omits the seller-recovery locktime for brevity.** The
+> production condition MUST also set a NUT-11 `locktime = now +
+> cashu.escrow_locktime_days` (default **15 days**) and `refund = [P_S]` with
+> `n_sigs_refund = 1`. Before the locktime it is the plain 2-of-3; after it, the
+> seller (`P_S`) can reclaim **alone**, so funds are never permanently stuck if
+> Mostro vanishes and the buyer won't cooperate. The daemon enforces a floor on
+> the locktime and that `refund` is exactly `[P_S]`. Exact construction and the
+> security rationale (the "short-locktime theft" vector) are in
+> [`cashu/02-track-a-lock.md`](./cashu/02-track-a-lock.md) §4B. (The exact
+> `Conditions::new` argument order is whatever the pinned `cdk` version uses —
+> confirm against it; the snippet above is illustrative.)
+
 ### Signature Flags: `SIG_INPUTS` vs `SIG_ALL`
 *   **`SIG_INPUTS`:** The easiest UX. The Seller only signs the intent to release. The Buyer receives the signature via Nostr DM, crafts their own unblinded outputs, signs the request, and asks the Mint to swap.
 *   **`SIG_ALL`:** The safest UX against malicious Mints. The Buyer must pre-construct their outputs, send the hash to the Seller, and the Seller signs the entire bundle. 
@@ -131,7 +143,7 @@ let secret = SpendingConditions::new_p2pk(p_s, Some(conditions));
 ## Advantages over Lightning Hold Invoices
 
 1. **Non-Custodial:** Mostro drops all legal and technical burdens of custody. A compromised Mostro server only leaks 1 of 3 keys, meaning attacker cannot steal active escrows.
-2. **Offline Resilience:** If Mostro's daemon crashes or vanishes permanently, the Buyer and Seller can still cooperate out-of-band to settle the trade (Seller + Buyer = 2 keys).
+2. **Offline Resilience:** If Mostro's daemon crashes or vanishes permanently, the Buyer and Seller can still cooperate out-of-band to settle the trade (Seller + Buyer = 2 keys). And if the buyer *also* goes silent, the NUT-11 `locktime` lets the **seller reclaim alone** once it expires (`cashu.escrow_locktime_days`, default 15 — see Track A §4B), so the funds are never permanently stuck.
 3. **No Routing Failures:** Bypasses Lightning Network topology, channel liquidity constraints, and unpredictable routing fees.
 4. **Zero Capital Lockup:** Mostro does not require inbound/outbound channel liquidity to facilitate trades.
 

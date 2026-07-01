@@ -29,7 +29,7 @@ untouched while the feature is off, and lets several developers work in parallel
 |---|----------|-------|--------|
 | 00 | [`../CASHU_ESCROW_ARCHITECTURE.md`](../CASHU_ESCROW_ARCHITECTURE.md) | Architecture, motivation, crypto model, trust model | Reference |
 | 01 | [`01-fundamentals.md`](./01-fundamentals.md) | **Foundation milestone** — config, mint client, DB helpers, test harness, boot wiring | **Draft (this PR)** |
-| 02 | `02-track-a-lock.md` | Escrow lock / setup (`AddCashuEscrow`) | Planned |
+| 02 | [`02-track-a-lock.md`](./02-track-a-lock.md) | Escrow lock / setup (`AddCashuEscrow`) | **Draft** |
 | 03 | `03-track-b-release.md` | Release happy path | Planned |
 | 04 | `04-track-c-coop-cancel.md` | Cooperative cancel | Planned |
 | 05 | `05-track-d-dispute.md` | Dispute resolution (`P_M` signs) | Planned |
@@ -42,7 +42,7 @@ disjoint files and can proceed independently. Start there.
 
 1. Read [`01-fundamentals.md`](./01-fundamentals.md) end to end.
 2. Look at the **"Already on `main`"** table — do not re-implement those pieces.
-3. Pick a fundamentals PR (`CF-1` … `CF-5`) from the **issues table**; the table
+3. Pick a fundamentals PR (`CF-0` … `CF-5`) from the **issues table**; the table
    says what it depends on and what it can run in parallel with.
 4. Each PR has an explicit **Definition of Done** and **backwards-compatibility
    guarantee** — both are merge gates.

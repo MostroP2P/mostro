@@ -10,7 +10,7 @@ use super::model::Bond;
 /// Persisted `bonds` INSERT column names, in bind order. Keep in sync with
 /// [`push_bond_insert_binds`], `mostrod` migrations, and [`Bond`]'s
 /// `FromRow` mapping. Positional bind alignment is verified by
-/// `bond_insert_column_bind_alignment` in `db.rs`.
+/// `bond_insert_column_bind_alignment` in `bond/db.rs`.
 pub(crate) const BOND_INSERT_COLUMNS: &[&str] = &[
     "id",
     "order_id",

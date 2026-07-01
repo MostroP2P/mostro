@@ -1401,6 +1401,30 @@ pub async fn enqueue_order_msg(
         .push((message, destination_key));
 }
 
+/// Enqueue an order-type message onto the restore-session queue.
+///
+/// The scheduler drains `queue_order_msg` before `queue_restore_session_msg`
+/// in each tick, so an AddInvoice enqueued via `enqueue_order_msg` would be
+/// sent BEFORE the restore-session response even when enqueued after it.
+/// Routing the AddInvoice through the restore-session queue instead preserves
+/// FIFO ordering relative to the restore response: the client receives the
+/// restore-session list first, then the AddInvoice prompt for an order it now
+/// knows about.
+pub async fn enqueue_order_msg_on_restore_queue(
+    order_id: Option<Uuid>,
+    action: Action,
+    payload: Option<Payload>,
+    destination_key: PublicKey,
+    trade_index: Option<i64>,
+) {
+    let message = Message::new_order(order_id, None, trade_index, action, payload);
+    MESSAGE_QUEUES
+        .queue_restore_session_msg
+        .write()
+        .await
+        .push((message, destination_key));
+}
+
 pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
     // Check if order is range and get amount request after checking boundaries
     // set order fiat amount to the value requested preparing for hold invoice

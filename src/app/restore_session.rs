@@ -1,5 +1,7 @@
 use crate::app::context::AppContext;
-use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
+use crate::config::settings::get_db_pool;
+use crate::db::{find_failed_payment_for_master_key, RestoreSessionManager};
+use crate::util::{enqueue_order_msg_on_restore_queue, enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -42,14 +44,18 @@ pub async fn restore_session_action(
 
     // Start a background task to handle the results
     tokio::spawn(async move {
-        handle_restore_session_results(manager, trade_key).await;
+        handle_restore_session_results(manager, trade_key, master_key).await;
     });
 
     Ok(())
 }
 
 /// Handle restore session results in the background
-async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
+async fn handle_restore_session_results(
+    mut manager: RestoreSessionManager,
+    trade_key: String,
+    master_key: String,
+) {
     // Wait for the result with a timeout
     let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
 
@@ -58,6 +64,7 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
             // Send the restore session response
             if let Err(e) = send_restore_session_response(
                 &trade_key,
+                &master_key,
                 result.restore_orders,
                 result.restore_disputes,
             )
@@ -82,6 +89,7 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
 /// Send restore session response to the user
 async fn send_restore_session_response(
     trade_key: &str,
+    master_key: &str,
     orders: Vec<RestoredOrdersInfo>,
     disputes: Vec<RestoredDisputesInfo>,
 ) -> Result<(), MostroError> {
@@ -99,7 +107,59 @@ async fn send_restore_session_response(
     )
     .await;
 
-    tracing::info!("Restore session response sent to user {}", trade_key,);
+    tracing::info!("Restore session response sent to user {}", trade_key);
+
+    // Re-send AddInvoice for any orders stuck in settled-hold-invoice with a failed payment.
+    // Uses get_db_pool() since pool is not available in this function's scope.
+    //
+    // `find_failed_payment_for_master_key` filters on `master_buyer_pubkey =
+    // master_key`, so every order returned belongs to this restoring user as
+    // the BUYER. The correct AddInvoice recipient is therefore the order's
+    // own buyer trade key (`order.buyer_pubkey` / get_buyer_pubkey()) — the
+    // key the client actually listens on for order DMs. Sending to the
+    // master/identity key instead would (a) never reach the client, since
+    // order messages are only delivered to trade keys, and (b) publish the
+    // identity key as a gift-wrap recipient on Nostr, linking it to this
+    // order and breaking trade-key unlinkability.
+    let pool = get_db_pool();
+    match find_failed_payment_for_master_key(&pool, master_key).await {
+        Ok(failed_orders) => {
+            for order in failed_orders {
+                let buyer_trade_pubkey = match order.get_buyer_pubkey() {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Order {} has no valid buyer_pubkey (trade key); skipping AddInvoice re-send",
+                            order.id
+                        );
+                        continue;
+                    }
+                };
+                // Route through the restore-session queue so this AddInvoice
+                // is sent AFTER the restore-session response (same queue =
+                // FIFO), not before it.
+                enqueue_order_msg_on_restore_queue(
+                    Some(order.id),
+                    Action::AddInvoice,
+                    Some(Payload::Order(SmallOrder::from(order.clone()))),
+                    buyer_trade_pubkey,
+                    order.trade_index_buyer,
+                )
+                .await;
+                tracing::info!(
+                    "Re-sent AddInvoice for order {} to buyer trade key {} (failed payment)",
+                    order.id,
+                    buyer_trade_pubkey
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to query failed payments during restore-session: {}",
+                e
+            );
+        }
+    }
 
     Ok(())
 }

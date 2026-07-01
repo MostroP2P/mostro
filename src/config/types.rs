@@ -158,6 +158,55 @@ impl Default for AntiAbuseBondSettings {
     }
 }
 
+/// Cashu escrow configuration (Cashu foundation CF-1,
+/// `docs/cashu/01-fundamentals.md` §6).
+///
+/// Opt-in. When the `[cashu]` block is absent or `enabled = false` (the
+/// default) every Cashu code path remains inert — the daemon behaves
+/// exactly as a Lightning node. Mutually exclusive with
+/// `[anti_abuse_bond]` (locked decision §4.5); enforced at startup.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct CashuSettings {
+    /// Master switch. When false, the node runs in Lightning mode.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The one mint this node escrows on (locked decision §4.2:
+    /// node-configured, fixed — no per-order mint). Required (non-empty,
+    /// `http`/`https`) when `enabled = true`; validated at startup.
+    #[serde(default)]
+    pub mint_url: String,
+    /// Seller-recovery locktime floor, in days (Track A §4B): escrow
+    /// tokens must carry `locktime >= now + escrow_locktime_days`. The
+    /// seller may set a longer locktime, never a shorter one. Must be
+    /// `>= 1`; validated at startup.
+    #[serde(default = "default_escrow_locktime_days")]
+    pub escrow_locktime_days: u32,
+}
+
+fn default_escrow_locktime_days() -> u32 {
+    15
+}
+
+impl Default for CashuSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mint_url: String::new(),
+            escrow_locktime_days: default_escrow_locktime_days(),
+        }
+    }
+}
+
+/// The node-wide escrow mode (locked decision §4.1: a node runs in exactly
+/// one mode, fixed in `settings.toml` — never per-order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscrowMode {
+    /// LND hold-invoice escrow (the default).
+    Lightning,
+    /// Cashu NUT-11 2-of-3 escrow.
+    Cashu,
+}
+
 /// Event expiration configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExpirationSettings {
@@ -702,5 +751,63 @@ payout_claim_window_days = 30"#,
         // Other fields on the same block must still deserialize correctly.
         assert_eq!(parsed.anti_abuse_bond.slash_node_share_pct, 0.25);
         assert_eq!(parsed.anti_abuse_bond.payout_claim_window_days, 30);
+    }
+}
+
+#[cfg(test)]
+mod cashu_settings_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Stub {
+        #[serde(default)]
+        cashu: Option<CashuSettings>,
+    }
+
+    #[test]
+    fn defaults_are_off() {
+        let cfg = CashuSettings::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.mint_url.is_empty());
+        assert_eq!(cfg.escrow_locktime_days, 15);
+    }
+
+    #[test]
+    fn toml_omits_block() {
+        // CF-1 backwards-compat guarantee: a config that does not mention
+        // Cashu parses exactly as before.
+        let parsed: Stub = toml::from_str("").expect("empty toml is valid");
+        assert!(parsed.cashu.is_none());
+    }
+
+    #[test]
+    fn toml_minimal_block_defaults() {
+        let parsed: Stub = toml::from_str("[cashu]\n").expect("minimal block");
+        let cashu = parsed.cashu.expect("block present");
+        assert!(!cashu.enabled);
+        assert!(cashu.mint_url.is_empty());
+        assert_eq!(cashu.escrow_locktime_days, 15);
+    }
+
+    #[test]
+    fn toml_disabled_block() {
+        let parsed: Stub =
+            toml::from_str("[cashu]\nenabled = false\nmint_url = \"https://mint.example.com\"\n")
+                .expect("disabled block");
+        let cashu = parsed.cashu.expect("block present");
+        assert!(!cashu.enabled);
+        assert_eq!(cashu.mint_url, "https://mint.example.com");
+    }
+
+    #[test]
+    fn toml_enabled_block_with_overrides() {
+        let parsed: Stub = toml::from_str(
+            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"\nescrow_locktime_days = 30\n",
+        )
+        .expect("enabled block");
+        let cashu = parsed.cashu.expect("block present");
+        assert!(cashu.enabled);
+        assert_eq!(cashu.mint_url, "https://mint.example.com");
+        assert_eq!(cashu.escrow_locktime_days, 30);
     }
 }

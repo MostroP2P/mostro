@@ -437,6 +437,7 @@ mod tests {
             rpc: Default::default(),
             expiration: Some(Default::default()),
             anti_abuse_bond: None,
+            cashu: None,
             price: None,
         });
     }

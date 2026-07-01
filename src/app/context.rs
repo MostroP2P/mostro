@@ -268,6 +268,7 @@ pub mod test_utils {
             rpc: RpcSettings::default(),
             expiration: Some(ExpirationSettings::default()),
             anti_abuse_bond: None,
+            cashu: None,
             price: None,
         }
     }

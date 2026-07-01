@@ -805,6 +805,68 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Atomically persist a validated Cashu escrow and advance the order status
+/// (Cashu foundation CF-4, `docs/cashu/01-fundamentals.md` §6).
+///
+/// Compare-and-set: the three `cashu_*` columns and the status transition
+/// are written in one `UPDATE … WHERE id = ? AND status = ? AND
+/// cashu_escrow_locked_at IS NULL`, so there is no lock-without-advance
+/// window, and a replayed or concurrent submission (already locked, or the
+/// status moved on) matches zero rows instead of double-writing. Returns
+/// whether a row matched.
+pub async fn update_order_cashu_escrow(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    mint_url: &str,
+    token: &str,
+    locked_at: i64,
+    expected_status: Status,
+    new_status: Status,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        r#"
+            UPDATE orders
+            SET
+            cashu_mint_url = ?1,
+            cashu_escrow_token = ?2,
+            cashu_escrow_locked_at = ?3,
+            status = ?4
+            WHERE id = ?5 AND status = ?6 AND cashu_escrow_locked_at IS NULL
+        "#,
+    )
+    .bind(mint_url)
+    .bind(token)
+    .bind(locked_at)
+    .bind(new_status.to_string())
+    .bind(order_id)
+    .bind(expected_status.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Every order with a locked Cashu escrow, for restore/monitoring after a
+/// restart (CF-4). Deliberately **no** `status` predicate:
+/// [`update_order_cashu_escrow`] advances the status in the same write as
+/// the lock, so filtering on a status would skip legitimately locked rows
+/// that have already moved on. Only re-add a status predicate if a separate
+/// invariant guarantees locked rows never leave that status.
+pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE cashu_escrow_locked_at IS NOT NULL
+          ORDER BY cashu_escrow_locked_at ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -2844,6 +2906,154 @@ mod tests {
         assert!(
             (other.4 - 32.0).abs() < f64::EPSILON,
             "other user's total_rating must not change"
+        );
+    }
+
+    // -- Tests for the CF-4 cashu escrow helpers --
+
+    use mostro_core::order::Status;
+
+    async fn insert_cashu_test_order(pool: &SqlitePool, id: uuid::Uuid, status: &str) {
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'sell', ?2, ?3, 0, 'face to face',
+                    100000, 'EUR', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0)"#,
+        )
+        .bind(id)
+        .bind(format!("ev-{id}"))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn cashu_columns(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+    ) -> (Option<String>, Option<String>, Option<i64>, String) {
+        sqlx::query_as(
+            "SELECT cashu_mint_url, cashu_escrow_token, cashu_escrow_locked_at, status
+             FROM orders WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_cas_locks_once_and_replay_is_noop() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
+
+        // First submission: persists the escrow and advances the status in
+        // one write.
+        let locked = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert!(locked, "first CAS must match the row");
+
+        let (mint, token, locked_at, status) = cashu_columns(&pool, id).await;
+        assert_eq!(mint.as_deref(), Some("https://mint.example.com"));
+        assert_eq!(token.as_deref(), Some("cashuAtoken"));
+        assert_eq!(locked_at, Some(1700000100));
+        assert_eq!(status, Status::Active.to_string());
+
+        // Replay: cashu_escrow_locked_at is no longer NULL (and the status
+        // moved on), so the CAS matches zero rows and nothing is rewritten.
+        let replayed = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://evil.example.com",
+            "cashuAother",
+            1700009999,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert!(!replayed, "replayed CAS must match zero rows");
+
+        let (mint, token, locked_at, _) = cashu_columns(&pool, id).await;
+        assert_eq!(mint.as_deref(), Some("https://mint.example.com"));
+        assert_eq!(token.as_deref(), Some("cashuAtoken"));
+        assert_eq!(locked_at, Some(1700000100), "original lock must survive");
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_cas_status_mismatch_matches_zero_rows() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, id, &Status::Pending.to_string()).await;
+
+        let locked = super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert!(!locked, "status mismatch must match zero rows");
+
+        let (mint, token, locked_at, status) = cashu_columns(&pool, id).await;
+        assert!(mint.is_none(), "escrow columns must stay untouched");
+        assert!(token.is_none());
+        assert!(locked_at.is_none());
+        assert_eq!(status, Status::Pending.to_string());
+    }
+
+    #[tokio::test]
+    async fn find_locked_cashu_orders_includes_locked_regardless_of_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let locked_id = uuid::Uuid::new_v4();
+        let unlocked_id = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, locked_id, &Status::WaitingPayment.to_string()).await;
+        insert_cashu_test_order(&pool, unlocked_id, &Status::Active.to_string()).await;
+
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            locked_id,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
+
+        // Move the locked order past Active: the finder must still return
+        // it (CF-4: no status predicate — the escrow is what matters).
+        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+            .bind(Status::FiatSent.to_string())
+            .bind(locked_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let locked = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert_eq!(locked.len(), 1, "only the locked order is returned");
+        assert_eq!(locked[0].id, locked_id);
+        assert_eq!(
+            locked[0].status,
+            Status::FiatSent.to_string(),
+            "a locked order past Active must still be found"
         );
     }
 }

@@ -554,6 +554,7 @@ never trade at all; the first Cashu attempt hit exactly this bug in code).
 | `RateUser` | **Track B** | `no_ln` once terminal states are reachable |
 | `Cancel` | **Track C** | cashu cancel handler |
 | `Dispute`, `AdminCancel`, `AdminSettle`, `AdminTakeDispute` | **Track D** | cashu dispute handlers |
+| `AdminAddSolver` | **Track D** (dispute setup needs solvers) | `handle_message_action_no_ln` — solver management touches no escrow/LND |
 | `AddInvoice` | **never** — the buyer-invoice step does not exist in cashu mode (02 §2) | permanently `InvalidAction` (documented decision) |
 | `AddBondInvoice` | **never** — bonds ⊕ cashu are mutually exclusive (§4.5) | permanently `InvalidAction` |
 

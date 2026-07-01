@@ -554,8 +554,12 @@ no cross-track conflict here.
 
 ## 6. PR breakdown (atomic, backwards-compatible)
 
-Track A is small enough for two core PRs plus one optional hardening PR. Each is
-off-by-default and leaves `main` shippable.
+Track A is three core PRs (TA-1, TA-1f, TA-2) plus one optional hardening PR
+(TA-3). Each is off-by-default and leaves `main` shippable. TA-1f is **not**
+optional for any nonzero-fee deployment: it carries the crash-safe fee
+persistence and `cashu_fee_proofs` anti-reuse guard §4A relies on — a
+`mostro.fee > 0` node must not enable cashu mode before TA-1f is merged (fold
+it into TA-1 if that ordering is hard to guarantee).
 
 ### TA-1 · `add_cashu_escrow_action` handler
 Fill in the CF-5 stub for `AddCashuEscrow` in its **own** file

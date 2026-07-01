@@ -112,11 +112,13 @@ Here some parameters you might want to change:
 
 The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.
 
-Before start building we need to initialize the database, for this we need to use `sqlx_cli`:
+Before start building you can initialize the database manually with `sqlx-cli` (optional — `mostrod` creates the file and runs migrations on first connect):
 
 ```bash
-cargo install sqlx-cli --version 0.6.2
-./init_db.sh
+cargo install sqlx-cli --version 0.9.0 --no-default-features --features sqlite
+export DATABASE_URL=sqlite://mostro.db
+sqlx database create
+sqlx migrate run
 ```
 
 Check the DB files are there

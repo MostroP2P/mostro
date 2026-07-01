@@ -6,7 +6,7 @@
 use mostro_core::db::Crud;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use mostro_core::order::{Order, Status};
-use sqlx::{Pool, Sqlite};
+use sqlx::{AssertSqlSafe, Pool, Sqlite};
 use uuid::Uuid;
 
 use super::model::Bond;
@@ -75,9 +75,7 @@ pub async fn find_bond_by_id(
     pool: &Pool<Sqlite>,
     id: Uuid,
 ) -> Result<Option<Bond>, mostro_core::error::MostroError> {
-    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ? LIMIT 1")
-        .bind(id)
-        .fetch_optional(pool)
+    Bond::by_id(pool, id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
@@ -301,7 +299,7 @@ pub async fn range_tree_fully_terminal(
          ) \
          SELECT COUNT(*) FROM tree WHERE status NOT IN ({placeholders})"
     );
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(root_id);
+    let mut query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql)).bind(root_id);
     for status in TERMINAL_ORDER_STATUSES {
         query = query.bind(status.to_string());
     }
@@ -325,8 +323,9 @@ pub async fn update_bond(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::bond::crud::BOND_INSERT_COLUMNS;
     use crate::app::bond::model::Bond;
-    use crate::app::bond::types::BondRole;
+    use crate::app::bond::types::{BondRole, BondSlashReason, BondState};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn setup_pool() -> Pool<Sqlite> {
@@ -408,6 +407,145 @@ mod tests {
 
     fn dummy_bond(order_id: Uuid, role: BondRole) -> Bond {
         Bond::new_requested(order_id, "a".repeat(64), role, 1_500)
+    }
+
+    /// Bond with a unique scalar sentinel per INSERT column so
+    /// `bond_insert_column_bind_alignment` can detect positional drift.
+    fn sentinel_bond_for_insert(order_id: Uuid) -> Bond {
+        Bond {
+            id: Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap(),
+            order_id,
+            parent_bond_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()),
+            child_order_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap()),
+            pubkey: "5".repeat(64),
+            role: BondRole::Taker.to_string(),
+            amount_sats: 7,
+            slashed_share_sats: 8,
+            state: BondState::Locked.to_string(),
+            slashed_reason: Some(BondSlashReason::LostDispute.to_string()),
+            hash: Some("h".repeat(64)),
+            preimage: Some("p".repeat(64)),
+            payment_request: Some("pr-sentinel".into()),
+            payout_invoice: Some("pi-sentinel".into()),
+            payout_routing_fee_sats: Some(15),
+            payout_payment_hash: Some("q".repeat(64)),
+            node_share_sats: Some(17),
+            payout_attempts: 18,
+            invoice_request_attempts: 19,
+            last_invoice_request_at: Some(20),
+            locked_at: Some(21),
+            released_at: Some(22),
+            slashed_at: Some(23),
+            created_at: 24,
+            taker_identity: Some("t".repeat(64)),
+            taker_trade_index: Some(26),
+            taker_invoice: Some("ti-sentinel".into()),
+            taker_fiat_amount: Some(28),
+            taker_amount: Some(29),
+            taker_fee: Some(30),
+            taker_dev_fee: Some(31),
+        }
+    }
+
+    fn expected_db_text(column: &str, bond: &Bond) -> Option<String> {
+        match column {
+            "id" => Some(bond.id.to_string()),
+            "order_id" => Some(bond.order_id.to_string()),
+            "parent_bond_id" => bond.parent_bond_id.map(|id| id.to_string()),
+            "child_order_id" => bond.child_order_id.map(|id| id.to_string()),
+            "pubkey" => Some(bond.pubkey.clone()),
+            "role" => Some(bond.role.clone()),
+            "amount_sats" => Some(bond.amount_sats.to_string()),
+            "slashed_share_sats" => Some(bond.slashed_share_sats.to_string()),
+            "state" => Some(bond.state.clone()),
+            "slashed_reason" => bond.slashed_reason.clone(),
+            "hash" => bond.hash.clone(),
+            "preimage" => bond.preimage.clone(),
+            "payment_request" => bond.payment_request.clone(),
+            "payout_invoice" => bond.payout_invoice.clone(),
+            "payout_routing_fee_sats" => bond.payout_routing_fee_sats.map(|v| v.to_string()),
+            "payout_payment_hash" => bond.payout_payment_hash.clone(),
+            "node_share_sats" => bond.node_share_sats.map(|v| v.to_string()),
+            "payout_attempts" => Some(bond.payout_attempts.to_string()),
+            "invoice_request_attempts" => Some(bond.invoice_request_attempts.to_string()),
+            "last_invoice_request_at" => bond.last_invoice_request_at.map(|v| v.to_string()),
+            "locked_at" => bond.locked_at.map(|v| v.to_string()),
+            "released_at" => bond.released_at.map(|v| v.to_string()),
+            "slashed_at" => bond.slashed_at.map(|v| v.to_string()),
+            "created_at" => Some(bond.created_at.to_string()),
+            "taker_identity" => bond.taker_identity.clone(),
+            "taker_trade_index" => bond.taker_trade_index.map(|v| v.to_string()),
+            "taker_invoice" => bond.taker_invoice.clone(),
+            "taker_fiat_amount" => bond.taker_fiat_amount.map(|v| v.to_string()),
+            "taker_amount" => bond.taker_amount.map(|v| v.to_string()),
+            "taker_fee" => bond.taker_fee.map(|v| v.to_string()),
+            "taker_dev_fee" => bond.taker_dev_fee.map(|v| v.to_string()),
+            other => panic!("BOND_INSERT_COLUMNS entry {other:?} has no sentinel expectation"),
+        }
+    }
+
+    fn row_text(row: &sqlx::sqlite::SqliteRow, column: &str) -> Option<String> {
+        use sqlx::Row;
+
+        match column {
+            "id" | "order_id" => Some(row.try_get::<Uuid, _>(column).unwrap().to_string()),
+            "parent_bond_id" | "child_order_id" => row
+                .try_get::<Option<Uuid>, _>(column)
+                .unwrap()
+                .map(|id| id.to_string()),
+            "pubkey" | "role" | "state" => Some(row.try_get::<String, _>(column).unwrap()),
+            "amount_sats"
+            | "slashed_share_sats"
+            | "payout_attempts"
+            | "invoice_request_attempts"
+            | "created_at" => Some(row.try_get::<i64, _>(column).unwrap().to_string()),
+            "slashed_reason"
+            | "hash"
+            | "preimage"
+            | "payment_request"
+            | "payout_invoice"
+            | "payout_payment_hash"
+            | "taker_identity"
+            | "taker_invoice" => row.try_get::<Option<String>, _>(column).unwrap(),
+            "payout_routing_fee_sats"
+            | "node_share_sats"
+            | "last_invoice_request_at"
+            | "locked_at"
+            | "released_at"
+            | "slashed_at"
+            | "taker_trade_index"
+            | "taker_fiat_amount"
+            | "taker_amount"
+            | "taker_fee"
+            | "taker_dev_fee" => row
+                .try_get::<Option<i64>, _>(column)
+                .unwrap()
+                .map(|v| v.to_string()),
+            other => panic!("BOND_INSERT_COLUMNS entry {other:?} has no row decoder"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bond_insert_column_bind_alignment() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+
+        let bond = sentinel_bond_for_insert(order_id);
+        let bond_id = bond.id;
+        create_bond(&pool, bond.clone()).await.unwrap();
+
+        let row = sqlx::query("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch bond row");
+
+        for &column in BOND_INSERT_COLUMNS {
+            let expected = expected_db_text(column, &bond);
+            let actual = row_text(&row, column);
+            assert_eq!(actual, expected, "column {column}");
+        }
     }
 
     #[tokio::test]
@@ -679,6 +817,30 @@ mod tests {
         assert_eq!(fetched.taker_amount, Some(45_678));
         assert_eq!(fetched.taker_fee, Some(89));
         assert_eq!(fetched.taker_dev_fee, Some(7));
+    }
+
+    #[tokio::test]
+    async fn update_preserves_created_at() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+
+        let mut bond = dummy_bond(order_id, BondRole::Taker);
+        bond.created_at = 1;
+        let created = create_bond(&pool, bond).await.unwrap();
+        assert_eq!(created.created_at, 1);
+
+        let mut updated = created.clone();
+        updated.state = BondState::Locked.to_string();
+        updated.created_at = 999;
+        update_bond(&pool, updated).await.unwrap();
+
+        let fetched = find_bond_by_id(&pool, created.id)
+            .await
+            .unwrap()
+            .expect("bond present");
+        assert_eq!(fetched.created_at, 1);
+        assert_eq!(fetched.state, BondState::Locked.to_string());
     }
 
     #[tokio::test]

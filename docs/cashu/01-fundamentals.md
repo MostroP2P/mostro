@@ -546,7 +546,7 @@ never trade at all; the first Cashu attempt hit exactly this bug in code).
 
 | Action | Unblocked by | Final routing |
 |--------|-------------|---------------|
-| `NewOrder` | **TA-2** (Track A) | `handle_message_action_no_ln` — creating a pending order touches no escrow |
+| `NewOrder` | **TA-2** (Track A — bundled with the take flow, so orders become creatable and takeable in the same PR; scoped in 02 §6 TA-2) | `handle_message_action_no_ln` — creating a pending order touches no escrow |
 | `TakeBuy`, `TakeSell` | **TA-2** (Track A) | cashu branch → `show_cashu_escrow_request` |
 | `AddCashuEscrow` | **TA-1** (Track A) | `add_cashu_escrow_action` |
 | `FiatSent` | **Track B** | cashu branch (state advance, no LND; carries the §4B locktime guard — see 02 §4B) |

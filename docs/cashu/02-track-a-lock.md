@@ -593,6 +593,11 @@ TA-1 or landed right after it.*
 Add the Cashu branch to `take_sell_action` / `take_buy_action` and the
 `show_cashu_escrow_request` helper, so a taken order asks the seller to lock
 instead of to pay a hold invoice. Completes the lock flow end-to-end with TA-1.
+TA-2 also **unblocks `NewOrder`** in `dispatch_cashu` (routing it to
+`handle_message_action_no_ln`, per the CF-5 action-ownership matrix): order
+creation touches no escrow, but unblocking it any earlier than the take flow
+would populate the book with untakeable orders — the orphan-order hazard
+CF-5's rationale warns about. Creatable and takeable ship together.
 *Depends on CF-1, CF-5 (and TA-1 for a full e2e test). Conflict surface:
 `take_sell.rs`, `take_buy.rs`, `util.rs` — Track-A-owned.*
 

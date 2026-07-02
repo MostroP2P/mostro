@@ -1,0 +1,56 @@
+name: Cashu Integration
+
+on:
+  # NOTE: intentionally NOT part of the default required PR checks (CF-3,
+  # docs/cashu/01-fundamentals.md §6): non-Cashu PRs and the Lightning path
+  # never pay the cost or flakiness of a live mint. Mirrors the mutation
+  # workflow's pattern — nightly audit (schedule) + on demand
+  # (workflow_dispatch) + opt-in per-PR via the `cashu` label.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  schedule:
+    # Nightly against main at 4 AM UTC, so a mint-facing regression is
+    # caught even if a PR author forgets the label.
+    - cron: '0 4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  CASHU_TEST_MINT_URL: http://127.0.0.1:3338
+
+jobs:
+  mint-integration:
+    runs-on: ubuntu-latest
+    # Opt-in only on PRs: add the `cashu` label when needed.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'cashu')
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Start test mint
+        run: docker compose -f docker-compose.cashu.yml up -d
+
+      - name: Run mint-backed integration tests
+        run: cargo test --test cashu_mint -- --nocapture
+
+      - name: Run env-gated in-tree cashu tests
+        # Picks up any `#[ignore]`-gated mint-backed tests later PRs add
+        # inside src (e.g. CashuClient's connect/check_state/DLEQ paths).
+        # Zero matching tests is a clean pass.
+        run: cargo test cashu -- --ignored --nocapture
+
+      - name: Stop test mint
+        if: always()
+        run: docker compose -f docker-compose.cashu.yml down -v

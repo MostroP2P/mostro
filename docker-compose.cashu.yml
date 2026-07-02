@@ -1,0 +1,30 @@
+# Throwaway Cashu test mint — Cashu foundation CF-3
+# (docs/cashu/01-fundamentals.md §6).
+#
+# A nutshell mint on the FakeWallet backend: no Lightning node, no real
+# funds — mint requests are auto-settled, which is exactly what the
+# env-gated integration tests (tests/cashu_mint.rs and the in-tree
+# `--ignored` cashu tests) need to build and verify real 2-of-3 tokens.
+#
+# NEVER point production config at this. MINT_PRIVATE_KEY below is a
+# NON-SENSITIVE, documented test fixture (per the CF-3 spec) so the mint's
+# keysets are deterministic across runs; it guards nothing.
+#
+# Usage:
+#   docker compose -f docker-compose.cashu.yml up -d
+#   CASHU_TEST_MINT_URL=http://127.0.0.1:3338 cargo test --test cashu_mint
+#   docker compose -f docker-compose.cashu.yml down -v
+
+services:
+  mint:
+    image: cashubtc/nutshell:0.20.1
+    container_name: mostro-cashu-test-mint
+    ports:
+      - "3338:3338"
+    environment:
+      - MINT_BACKEND_BOLT11_SAT=FakeWallet
+      - MINT_LISTEN_HOST=0.0.0.0
+      - MINT_LISTEN_PORT=3338
+      # Non-sensitive test fixture (see header note).
+      - MINT_PRIVATE_KEY=TEST_PRIVATE_KEY
+    command: ["poetry", "run", "mint"]

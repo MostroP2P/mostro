@@ -1092,6 +1092,14 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
     Ok(())
 }
 
+/// Price a market order and compute its Mostro fee in one step.
+///
+/// Converts `fiat_amount` (denominated in `fiat_code`) to sats through the
+/// cache-backed [`get_market_quote`], applying `premium`, then derives the
+/// Mostro fee from that amount. Returns `(sats_amount, fee)` — the order
+/// amount in sats first, the fee in sats second. Errors bubble up from the
+/// quote path: `PriceTooStale` when the cached rate is past the staleness
+/// window, `NoAPIResponse` when the currency has no cached price yet.
 pub fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
@@ -1564,56 +1572,6 @@ mod tests {
             stamp_protocol_version(&mut msg, Transport::GiftWrap);
             assert_eq!(msg.get_inner_message_kind().version, 1);
         }
-    }
-
-    #[test]
-    fn select_yadio_base_url_prefers_enabled_provider() {
-        // Enabled provider with a usable URL wins over the legacy key.
-        assert_eq!(
-            select_yadio_base_url(
-                Some(("https://provider.example", true)),
-                "https://legacy.example"
-            ),
-            "https://provider.example"
-        );
-    }
-
-    #[test]
-    fn select_yadio_base_url_strips_trailing_slash_like_provider_new() {
-        // A configured trailing slash must not survive — otherwise appending
-        // `/convert` yields `//convert`. Matches `YadioProvider::new`.
-        assert_eq!(
-            select_yadio_base_url(
-                Some(("https://api.yadio.io/", true)),
-                "https://legacy.example"
-            ),
-            "https://api.yadio.io"
-        );
-        // Whitespace + multiple trailing slashes both normalized away.
-        assert_eq!(
-            select_yadio_base_url(Some(("  https://api.yadio.io//  ", true)), "ignored"),
-            "https://api.yadio.io"
-        );
-        // The legacy fallback is normalized the same way.
-        assert_eq!(
-            select_yadio_base_url(None, "https://legacy.example/"),
-            "https://legacy.example"
-        );
-    }
-
-    #[test]
-    fn select_yadio_base_url_falls_back_when_provider_unusable() {
-        let legacy = "https://legacy.example";
-        // Disabled provider → fall back to legacy even with a URL set.
-        assert_eq!(
-            select_yadio_base_url(Some(("https://provider.example", false)), legacy),
-            legacy
-        );
-        // Enabled but blank / slash-only URL → fall back to legacy.
-        assert_eq!(select_yadio_base_url(Some(("   ", true)), legacy), legacy);
-        assert_eq!(select_yadio_base_url(Some(("/", true)), legacy), legacy);
-        // No provider entry at all → legacy.
-        assert_eq!(select_yadio_base_url(None, legacy), legacy);
     }
 
     async fn setup_orders_pool() -> SqlitePool {

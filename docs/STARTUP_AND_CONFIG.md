@@ -179,7 +179,7 @@ There is **no** database password or separate global for SQLite; the daemon open
 ## Commands
 - Build: `cargo build`
 - Run: `cargo run`
-- SQLx offline data: `cargo sqlx prepare -- --bin mostrod`
+- Migrations: applied automatically on connect; manual `sqlx migrate run` optional when using `sqlx-cli`.
 
 ## Security
 - Do not commit populated `settings.toml`.

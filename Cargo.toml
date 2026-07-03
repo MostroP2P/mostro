@@ -49,15 +49,14 @@ nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
 serde = { version = "1.0.210" }
 toml = "0.9.5"
 serde_json = "1.0.128"
-sqlx = { version = "0.6.2", features = [
-  "runtime-tokio-rustls",
+sqlx = { version = "0.9.0", features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
   "sqlite",
   "macros",
   "chrono",
   "uuid",
-  "offline",
 ] }
-sqlx-crud = { version = "0.4.0", features = ["runtime-tokio-rustls"] }
 tokio = { version = "1.47.1", features = ["full"] }
 fedimint-tonic-lnd = "0.3.0"
 uuid = { version = "1.17.0", features = [
@@ -70,9 +69,7 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-# 0.13.1 carries `ServiceError::PriceTooStale` / `CantDoReason::PriceTooStale`
-# (MostroP2P/mostro-core#153), consumed by the Phase 4 staleness enforcement.
-mostro-core = { version = "0.13.1", features = ["sqlx"] }
+mostro-core = { version = "0.14", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

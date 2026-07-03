@@ -53,6 +53,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
+use mostro_core::db::Crud;
 use mostro_core::error::{
     CantDoReason,
     MostroError::{self, MostroCantDo, MostroInternalErr},
@@ -63,7 +64,6 @@ use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::order::{Order, SmallOrder};
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use tokio::sync::mpsc::channel;
 use tokio::time::timeout;
 use tracing::{error, info, warn};

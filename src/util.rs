@@ -15,13 +15,13 @@ use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
-use sqlx_crud::Crud;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -618,6 +618,25 @@ async fn prepare_new_order(
     Ok(new_order_db)
 }
 
+/// Overwrite the inner protocol version of `message` so it matches the wire
+/// `transport` (`gift-wrap` -> v1, `nip44` -> v2).
+///
+/// `MessageKind::new` always stamps the crate-wide `PROTOCOL_VER`, so without
+/// this every reply would advertise v2 even when it is served over the v1
+/// gift-wrap transport. Keeping the inner version aligned with the transport
+/// lets the protocol version follow the negotiated wire format.
+fn stamp_protocol_version(message: &mut Message, transport: Transport) {
+    let version = transport.protocol_version();
+    match message {
+        Message::Order(k)
+        | Message::Dispute(k)
+        | Message::CantDo(k)
+        | Message::Rate(k)
+        | Message::Dm(k)
+        | Message::Restore(k) => k.version = version,
+    }
+}
+
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
     sender_keys: &Keys,
@@ -629,12 +648,17 @@ pub async fn send_dm(
         sender_keys.public_key().to_hex(),
         receiver_pubkey.to_hex()
     );
-    let message = Message::from_json(payload)
+    let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
     let transport = Settings::get_transport();
+
+    // Stamp the inner protocol version to match the active wire transport.
+    // Done before wrapping so the version is covered by the message/trade
+    // signatures.
+    stamp_protocol_version(&mut message, transport);
 
     // Kind-14 events are visible to relays, so they always carry a NIP-40
     // expiration tag (default 30 days via `dm_days`) instead of lingering
@@ -1305,16 +1329,14 @@ pub async fn get_dispute(msg: &Message, pool: &Pool<Sqlite>) -> Result<Dispute, 
 
 pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, MostroError> {
     let order_msg = msg.get_inner_message_kind();
-    let order_id = order_msg
-        .id
-        .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
+    let order_id = order_msg.id.ok_or(MostroCantDo(CantDoReason::NotFound))?;
     let order = Order::by_id(pool, order_id)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     if let Some(order) = order {
         Ok(order)
     } else {
-        Err(MostroInternalErr(ServiceError::InvalidOrderId))
+        Err(MostroCantDo(CantDoReason::NotFound))
     }
 }
 
@@ -1503,6 +1525,95 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    #[test]
+    fn stamp_protocol_version_follows_transport() {
+        use mostro_core::message::Action;
+
+        // A v2-stamped message (the `MessageKind::new` default) must be
+        // downgraded to v1 when served over the gift-wrap transport...
+        let mut msg = Message::new_order(
+            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
+            Some(1),
+            None,
+            Action::NewOrder,
+            None,
+        );
+        stamp_protocol_version(&mut msg, Transport::GiftWrap);
+        assert_eq!(msg.get_inner_message_kind().version, 1);
+
+        // ...and stamped back to v2 over the nip44 direct transport.
+        stamp_protocol_version(&mut msg, Transport::Nip44Direct);
+        assert_eq!(msg.get_inner_message_kind().version, 2);
+    }
+
+    #[test]
+    fn stamp_protocol_version_covers_all_variants() {
+        use mostro_core::message::Action;
+
+        let kind = MessageKind::new(None, Some(1), None, Action::CantDo, None);
+        for mut msg in [
+            Message::Order(kind.clone()),
+            Message::Dispute(kind.clone()),
+            Message::CantDo(kind.clone()),
+            Message::Rate(kind.clone()),
+            Message::Dm(kind.clone()),
+            Message::Restore(kind.clone()),
+        ] {
+            stamp_protocol_version(&mut msg, Transport::GiftWrap);
+            assert_eq!(msg.get_inner_message_kind().version, 1);
+        }
+    }
+
+    #[test]
+    fn select_yadio_base_url_prefers_enabled_provider() {
+        // Enabled provider with a usable URL wins over the legacy key.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://provider.example", true)),
+                "https://legacy.example"
+            ),
+            "https://provider.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_strips_trailing_slash_like_provider_new() {
+        // A configured trailing slash must not survive — otherwise appending
+        // `/convert` yields `//convert`. Matches `YadioProvider::new`.
+        assert_eq!(
+            select_yadio_base_url(
+                Some(("https://api.yadio.io/", true)),
+                "https://legacy.example"
+            ),
+            "https://api.yadio.io"
+        );
+        // Whitespace + multiple trailing slashes both normalized away.
+        assert_eq!(
+            select_yadio_base_url(Some(("  https://api.yadio.io//  ", true)), "ignored"),
+            "https://api.yadio.io"
+        );
+        // The legacy fallback is normalized the same way.
+        assert_eq!(
+            select_yadio_base_url(None, "https://legacy.example/"),
+            "https://legacy.example"
+        );
+    }
+
+    #[test]
+    fn select_yadio_base_url_falls_back_when_provider_unusable() {
+        let legacy = "https://legacy.example";
+        // Disabled provider → fall back to legacy even with a URL set.
+        assert_eq!(
+            select_yadio_base_url(Some(("https://provider.example", false)), legacy),
+            legacy
+        );
+        // Enabled but blank / slash-only URL → fall back to legacy.
+        assert_eq!(select_yadio_base_url(Some(("   ", true)), legacy), legacy);
+        assert_eq!(select_yadio_base_url(Some(("/", true)), legacy), legacy);
+        // No provider entry at all → legacy.
+        assert_eq!(select_yadio_base_url(None, legacy), legacy);
     }
 
     async fn setup_orders_pool() -> SqlitePool {
@@ -1710,6 +1821,65 @@ mod tests {
             .unwrap();
 
         assert!(orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_id_missing() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let message = Message::Order(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_not_found_when_order_absent() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let missing_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(missing_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let err = get_order(&message, &pool).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_returns_order_when_found() {
+        initialize();
+        let pool = setup_orders_pool().await;
+        let user_pubkey = "a".repeat(64);
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, Some(&user_pubkey), None, &user_pubkey).await;
+
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AdminSettle,
+            None,
+        ));
+
+        let order = get_order(&message, &pool).await.unwrap();
+        assert_eq!(order.id, order_id);
     }
 
     #[test]

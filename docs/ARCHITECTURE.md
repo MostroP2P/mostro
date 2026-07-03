@@ -345,5 +345,5 @@ flowchart TD
 
 - POW threshold: `Settings::get_mostro().pow` (gate early).
 - Trade index: `check_trade_index` rejects replays/out-of-order and bootstraps new users.
-- SQLx: update offline data after query/schema changes: `cargo sqlx prepare -- --bin mostrod`.
+- SQLx: add migrations under `migrations/`; `mostrod` applies them on database connect.
 - Sensitive config: keep templates in `settings.tpl.toml`; never commit populated `settings.toml`.

@@ -9,6 +9,7 @@
 //! Everything here is **inert** unless `Settings::is_bond_enabled()` is true.
 //! Callers must gate on that flag.
 
+pub mod crud;
 pub mod db;
 pub mod flow;
 pub mod math;

@@ -4,10 +4,10 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
+use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
-use sqlx_crud::Crud;
 use std::str::FromStr;
 use tracing::{info, warn};
 
@@ -692,9 +692,9 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use mostro_core::db::Crud;
     use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
-    use sqlx_crud::Crud;
     use std::sync::Arc;
 
     /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)

@@ -7,7 +7,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use sqlx_crud::SqlxCrud;
 use uuid::Uuid;
 
 use super::types::{BondRole, BondState};
@@ -19,8 +18,7 @@ use super::types::{BondRole, BondState};
 /// attached to, because a slashed bond still needs a payout to complete;
 /// that's why fields that only become meaningful after slash (e.g.
 /// `payout_invoice`) are optional.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, FromRow, SqlxCrud, PartialEq, Eq)]
-#[external_id]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, FromRow, PartialEq, Eq)]
 pub struct Bond {
     /// Unique identifier for the bond row.
     pub id: Uuid,
@@ -151,7 +149,7 @@ pub struct Bond {
 
 impl Bond {
     /// Construct a new `Requested` bond row. The caller is responsible for
-    /// inserting it via `Crud::create`.
+    /// inserting it via [`mostro_core::db::Crud::create`].
     pub fn new_requested(order_id: Uuid, pubkey: String, role: BondRole, amount_sats: i64) -> Self {
         Self {
             id: Uuid::new_v4(),

@@ -53,8 +53,7 @@ change.
    own lifecycle. It must not be deducted from or conflated with trade
    escrow.
 7. **Tests accompany every phase.** Rust unit tests co-located with the
-   module; `cargo test`, `cargo clippy --all-targets --all-features`, and
-   `cargo sqlx prepare -- --bin mostrod` must stay green.
+   module;    `cargo test`, `cargo clippy --all-targets --all-features` must stay green.
 8. **Bonds must not block the order book.** While a taker's bond is
    outstanding (between `Requested` and `Locked`), the order **must
    remain visible and takeable** to other potential takers — the
@@ -338,8 +337,9 @@ Purely additive. Touches no trade flow.
   rather than staging ALTER TABLEs per phase. Later phases only add
   code, not schema.
 
-  Run `cargo sqlx prepare -- --bin mostrod` to refresh `sqlx-data.json`.
-- `Bond` model (sqlx-crud) and repository helpers in `src/app/bond/db.rs`:
+  Schema lives in `migrations/`; `mostrod` applies pending migrations on connect.
+- `Bond` model (`src/app/bond/model.rs`) with `mostro_core::db::Crud` in
+  `src/app/bond/crud.rs`, and repository helpers in `src/app/bond/db.rs`:
   `create_bond`, `find_bond_by_order_and_role` (parent rows only —
   filters on `parent_bond_id IS NULL`), `find_bonds_by_state`,
   `update_bond`.

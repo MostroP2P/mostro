@@ -54,7 +54,9 @@ publish_relays_interval = 60
 pow = 0
 # Wire transport for protocol messages. A node speaks exactly one:
 #   "gift-wrap" - protocol v1, NIP-59 gift wraps (kind 1059). DEPRECATED,
-#                 will be removed in v0.19.0.
+#                 will be removed in v0.19.0 — mostrod will then run protocol
+#                 v2 only and this setting disappears. See
+#                 https://github.com/MostroP2P/mostro/issues/786
 #   "nip44"     - protocol v2, signed kind-14 events with NIP-44 encrypted
 #                 content. Rate-limitable by relays; switch once the clients
 #                 your community uses support protocol v2.

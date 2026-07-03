@@ -19,6 +19,11 @@ async fn calculate_and_check_quote(
                 let quote = *fiat_amount as f64 / price;
                 (quote * 1E8) as i64
             }
+            // No fresh rate within the staleness window — refuse the
+            // market-priced order cleanly instead of pricing on stale data.
+            Err(MostroInternalErr(ServiceError::PriceTooStale)) => {
+                return Err(MostroCantDo(CantDoReason::PriceTooStale));
+            }
             Err(_) => {
                 return Err(MostroInternalErr(ServiceError::NoAPIResponse));
             }

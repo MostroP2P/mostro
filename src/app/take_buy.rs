@@ -119,13 +119,18 @@ pub async fn take_buy_action(
 
     // If the order amount is zero, calculate the market price in sats
     if order.has_no_amount() {
-        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium).await {
+        match get_market_amount_and_fee(order.fiat_amount, &order.fiat_code, order.premium) {
             Ok(amount_fees) => {
                 order.amount = amount_fees.0;
                 order.fee = amount_fees.1;
                 // Calculate dev_fee now that we know the fee amount
                 let total_mostro_fee = order.fee * 2;
                 order.dev_fee = get_dev_fee(total_mostro_fee);
+            }
+            // No fresh rate within the staleness window — refuse cleanly so
+            // the taker can retry rather than pricing on stale data.
+            Err(MostroInternalErr(ServiceError::PriceTooStale)) => {
+                return Err(MostroCantDo(CantDoReason::PriceTooStale))
             }
             Err(_) => return Err(MostroInternalErr(ServiceError::WrongAmountError)),
         };

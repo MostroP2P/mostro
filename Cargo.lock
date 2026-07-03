@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "mostro"
-version = "0.17.5"
+version = "0.18.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1843,9 +1843,9 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d73bbd0d6b8b283ec477d11330617bd55d3b1e40dc07db8a084e74cc22f01c2"
+checksum = "30391197a9de16ce45b7ee5a92d5b3f74c3d12da4d13d442aff00c93c2424038"
 dependencies = [
  "bitcoin",
  "chrono",

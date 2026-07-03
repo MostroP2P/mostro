@@ -233,6 +233,8 @@ mod tests {
     }
 
     #[test]
+    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
+    #[allow(deprecated)]
     fn transport_defaults_to_gift_wrap() {
         // v0.18.x default: wire-identical to pre-v2 daemons. The default
         // flips to nip44 in v0.19.0 (docs/TRANSPORT_V2_SPEC.md §5).
@@ -449,8 +451,15 @@ pub struct MostroSettings {
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
     /// Wire transport for protocol messages: `"gift-wrap"` (protocol v1,
-    /// NIP-59, DEPRECATED) or `"nip44"` (protocol v2, kind-14 direct).
-    /// A node speaks exactly one. See docs/TRANSPORT_V2_SPEC.md.
+    /// NIP-59) or `"nip44"` (protocol v2, kind-14 direct). A node speaks
+    /// exactly one. See docs/TRANSPORT_V2_SPEC.md.
+    ///
+    /// DEPRECATED(v0.19.0, #786): transitional knob for the v1→v2 protocol
+    /// migration. v0.19.0 removes it and runs protocol v2 (`nip44`) only.
+    #[deprecated(
+        since = "0.18.0",
+        note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
+    )]
     #[serde(default)]
     pub transport: Transport,
     /// Proof-of-work difficulty (leading-zero bits) demanded of a
@@ -501,6 +510,8 @@ fn default_active_pubkeys_refresh_interval() -> u64 {
 }
 
 impl Default for MostroSettings {
+    // DEPRECATED(v0.19.0, #786): `transport` init goes away with the field.
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             fee: 0.0,

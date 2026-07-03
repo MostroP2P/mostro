@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         transport.protocol_version(),
         transport.event_kind().as_u16()
     );
+    #[allow(deprecated)]
     if transport == mostro_core::transport::Transport::GiftWrap {
         tracing::warn!(
             "transport = \"gift-wrap\" (protocol v1) is DEPRECATED and will be removed in \

@@ -113,13 +113,15 @@ jobs:
 
       - name: Build release
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+          if [[ "$TARGET" == "x86_64-pc-windows-gnu" ]]; then
             export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --target "$TARGET"
           else
-            cross build --release --locked --target ${{ matrix.target }}
+            cross build --release --locked --target "$TARGET"
           fi
 
       - name: Prepare conventional artifact name

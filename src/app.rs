@@ -304,6 +304,9 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // The node speaks exactly one transport (protocol v1 gift wrap or v2
     // NIP-44 direct); events of any other kind are dropped before any
     // decryption work. See docs/TRANSPORT_V2_SPEC.md.
+    // DEPRECATED(v0.19.0, #786): with the `transport` knob gone this becomes
+    // unconditionally kind 14 and the v1/v2 branching below collapses.
+    #[allow(deprecated)]
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): on the v2 (kind
     // 14) transport the visible author is the trade key, so the daemon can

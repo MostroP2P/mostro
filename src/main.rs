@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
 
     // Subscribe only to the configured transport's kind: 1059 (protocol v1
     // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
+    // DEPRECATED(v0.19.0, #786): the `transport` knob disappears in v0.19.0
+    // and this subscription becomes unconditionally kind 14.
+    #[allow(deprecated)]
     let transport = Settings::get_mostro().transport;
     tracing::info!(
         "Transport: {} (protocol v{}, event kind {})",
@@ -83,6 +86,14 @@ async fn main() -> Result<()> {
         transport.protocol_version(),
         transport.event_kind().as_u16()
     );
+    if transport == mostro_core::transport::Transport::GiftWrap {
+        tracing::warn!(
+            "transport = \"gift-wrap\" (protocol v1) is DEPRECATED and will be removed in \
+             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. Switch \
+             once the clients your community uses support protocol v2. \
+             See https://github.com/MostroP2P/mostro/issues/786"
+        );
+    }
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())
         .kind(transport.event_kind())

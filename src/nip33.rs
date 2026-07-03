@@ -489,6 +489,10 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
     let bond_settings = Settings::get_bond();
+    // DEPRECATED(v0.19.0, #786): once the `transport` knob is gone the
+    // `protocol_version` tag is hardcoded to the crate-wide `PROTOCOL_VER`.
+    #[allow(deprecated)]
+    let protocol_version = mostro_settings.transport.protocol_version();
 
     let mut tags_vec: Vec<Tag> = vec![
         Tag::custom(
@@ -537,7 +541,7 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("protocol_version")),
-            vec![mostro_settings.transport.protocol_version().to_string()],
+            vec![protocol_version.to_string()],
         ),
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("hold_invoice_expiration_window")),

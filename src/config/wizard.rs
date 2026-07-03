@@ -73,6 +73,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         rpc: RpcSettings::default(),
         expiration: None,
         anti_abuse_bond: None,
+        cashu: None,
         price: None,
     };
 

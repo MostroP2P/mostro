@@ -68,6 +68,67 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
         ))));
     }
 
+    validate_cashu_settings(
+        settings.cashu.as_ref(),
+        settings
+            .anti_abuse_bond
+            .as_ref()
+            .is_some_and(|bond| bond.enabled),
+    )?;
+
+    Ok(())
+}
+
+/// Validate the `[cashu]` block (Cashu foundation CF-1,
+/// `docs/cashu/01-fundamentals.md` §6). Standalone so it is unit-testable
+/// without building a full `Settings`.
+///
+/// Rules (all startup-fatal, so the daemon refuses to boot rather than
+/// silently misbehave):
+/// - `cashu.enabled` and `anti_abuse_bond.enabled` are mutually exclusive
+///   (locked decision §4.5).
+/// - When enabled, `mint_url` must be non-empty and parse as `http`/`https`.
+/// - When enabled, `escrow_locktime_days >= 1` (the seller-recovery
+///   locktime floor of Track A §4B cannot be zero).
+fn validate_cashu_settings(
+    cashu: Option<&crate::config::types::CashuSettings>,
+    bond_enabled: bool,
+) -> Result<(), MostroError> {
+    let Some(cashu) = cashu else {
+        return Ok(());
+    };
+    if !cashu.enabled {
+        return Ok(());
+    }
+
+    if bond_enabled {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "cashu.enabled and anti_abuse_bond.enabled are mutually exclusive: \
+             a node runs bonds or Cashu escrow, never both"
+                .to_string(),
+        )));
+    }
+
+    let url = reqwest::Url::parse(&cashu.mint_url).map_err(|e| {
+        MostroInternalErr(ServiceError::IOError(format!(
+            "cashu.mint_url ({:?}) is not a valid URL: {e}",
+            cashu.mint_url
+        )))
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "cashu.mint_url must use http or https, got scheme {:?}",
+            url.scheme()
+        ))));
+    }
+
+    if cashu.escrow_locktime_days < 1 {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "cashu.escrow_locktime_days ({}) must be >= 1",
+            cashu.escrow_locktime_days
+        ))));
+    }
+
     Ok(())
 }
 
@@ -199,6 +260,7 @@ mod tests {
             rpc: RpcSettings::default(),
             expiration: None,
             anti_abuse_bond: None,
+            cashu: None,
             price: None,
         }
     }
@@ -271,5 +333,67 @@ mod tests {
             toml::from_str(toml_without_nsec).expect("nsec_privkey should be optional in TOML");
         assert_eq!(nostr.nsec_privkey, "");
         assert_eq!(nostr.relays, vec!["wss://relay.test"]);
+    }
+}
+
+#[cfg(test)]
+mod cashu_validation_tests {
+    use super::*;
+    use crate::config::types::CashuSettings;
+
+    fn enabled(mint_url: &str, days: u32) -> CashuSettings {
+        CashuSettings {
+            enabled: true,
+            mint_url: mint_url.to_string(),
+            escrow_locktime_days: days,
+        }
+    }
+
+    #[test]
+    fn absent_block_is_valid_regardless_of_bonds() {
+        assert!(validate_cashu_settings(None, false).is_ok());
+        assert!(validate_cashu_settings(None, true).is_ok());
+    }
+
+    #[test]
+    fn disabled_block_is_valid_even_with_bonds() {
+        let cashu = CashuSettings::default();
+        assert!(validate_cashu_settings(Some(&cashu), true).is_ok());
+    }
+
+    #[test]
+    fn rejects_cashu_and_bonds_together() {
+        // Locked decision §4.5: a node runs bonds or Cashu, never both.
+        let cashu = enabled("https://mint.example.com", 15);
+        assert!(validate_cashu_settings(Some(&cashu), true).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_enabled_config() {
+        let cashu = enabled("https://mint.example.com", 15);
+        assert!(validate_cashu_settings(Some(&cashu), false).is_ok());
+        let cashu_http = enabled("http://localhost:3338", 1);
+        assert!(validate_cashu_settings(Some(&cashu_http), false).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_or_malformed_mint_url() {
+        assert!(validate_cashu_settings(Some(&enabled("", 15)), false).is_err());
+        assert!(validate_cashu_settings(Some(&enabled("not a url", 15)), false).is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let cashu = enabled("ftp://mint.example.com", 15);
+        assert!(validate_cashu_settings(Some(&cashu), false).is_err());
+        let cashu_ws = enabled("wss://mint.example.com", 15);
+        assert!(validate_cashu_settings(Some(&cashu_ws), false).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_locktime_days() {
+        // Track A §4B: the seller-recovery locktime floor cannot be zero.
+        let cashu = enabled("https://mint.example.com", 0);
+        assert!(validate_cashu_settings(Some(&cashu), false).is_err());
     }
 }

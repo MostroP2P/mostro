@@ -623,6 +623,23 @@ they can land in one PR or be split per provider.
 > `CantDoReason::PriceTooStale`. The dedicated error variants landed in
 > **mostro-core 0.13.1** (MostroP2P/mostro-core#153), replacing the
 > interim `NoAPIResponse` reuse described in §10.2.
+>
+> **Known gap — bonded takes (follow-up).** With taker bonds enabled,
+> the staleness check runs at take-time, but the resulting quote is
+> snapshotted into the bond's `taker_*` columns and copied verbatim onto
+> the order when the bond locks (`promote_taker_context_to_order`), with
+> no re-pricing or staleness re-check. A taker who pays the bond after
+> the TTL elapses therefore completes on a quote the direct path would
+> refuse. Until the bond flow revalidates (or expires) the snapshot at
+> lock time, the Phase 4 guarantee applies to the **direct (bond-less)
+> path only**.
+>
+> **Legacy configs.** Enforcement does **not** require a `[price]`
+> block: when the section is absent, §10.1 synthesises one (single
+> Yadio provider) and staleness applies with the **default TTL of
+> 1800 s**. Tuning `max_price_staleness_seconds` does require adding a
+> `[price]` block, since the legacy `[mostro]` keys carry no staleness
+> setting.
 
 ### Phase 5 — Nostr publishing, paid providers, exposure, cleanup
 

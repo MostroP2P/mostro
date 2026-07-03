@@ -5,10 +5,10 @@ use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
 use crate::db::is_user_present;
+use crate::escrow::EscrowBackend;
 use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
-use crate::lightning::LndConnector;
 use crate::messages;
 use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
 use crate::NOSTR_CLIENT;
@@ -1217,7 +1217,7 @@ pub async fn rate_counterpart(
 #[allow(clippy::too_many_arguments)]
 pub async fn settle_seller_hold_invoice(
     event: &UnwrappedMessage,
-    ln_client: &mut LndConnector,
+    escrow: &mut dyn EscrowBackend,
     action: Action,
     is_admin: bool,
     order: &Order,
@@ -1236,7 +1236,7 @@ pub async fn settle_seller_hold_invoice(
 
     // Settling the hold invoice
     if let Some(preimage) = order.preimage.as_ref() {
-        ln_client.settle_hold_invoice(preimage).await?;
+        escrow.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));

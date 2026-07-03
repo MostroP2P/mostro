@@ -105,7 +105,15 @@ impl Settings {
     /// initialized yet — `send_dm()` sits on every reply path and must
     /// degrade to v1 behavior rather than panic in unit tests that don't
     /// bring up the full configuration, mirroring [`Settings::get_bond`].
+    ///
+    /// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting —
+    /// v0.19.0 hardcodes the protocol-v2 (`nip44`) wire format.
+    #[deprecated(
+        since = "0.18.0",
+        note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
+    )]
     pub fn get_transport() -> Transport {
+        #[allow(deprecated)]
         MOSTRO_CONFIG
             .get()
             .map(|s| s.mostro.transport)

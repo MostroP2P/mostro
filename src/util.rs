@@ -625,6 +625,14 @@ async fn prepare_new_order(
 /// this every reply would advertise v2 even when it is served over the v1
 /// gift-wrap transport. Keeping the inner version aligned with the transport
 /// lets the protocol version follow the negotiated wire format.
+///
+/// DEPRECATED(v0.19.0, #786): transitional mechanism from PR #785. v0.19.0
+/// runs protocol v2 only, the inner version becomes the `PROTOCOL_VER`
+/// constant again and this function is deleted.
+#[deprecated(
+    since = "0.18.0",
+    note = "transitional version-follows-transport stamping; removed in v0.19.0 (protocol v2 only) — see issue #786"
+)]
 fn stamp_protocol_version(message: &mut Message, transport: Transport) {
     let version = transport.protocol_version();
     match message {
@@ -653,11 +661,15 @@ pub async fn send_dm(
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
+    // DEPRECATED(v0.19.0, #786): both calls below go away with the
+    // `transport` setting.
+    #[allow(deprecated)]
     let transport = Settings::get_transport();
 
     // Stamp the inner protocol version to match the active wire transport.
     // Done before wrapping so the version is covered by the message/trade
     // signatures.
+    #[allow(deprecated)]
     stamp_protocol_version(&mut message, transport);
 
     // Kind-14 events are visible to relays, so they always carry a NIP-40
@@ -1536,6 +1548,8 @@ mod tests {
     }
 
     #[test]
+    // DEPRECATED(v0.19.0, #786): delete along with `stamp_protocol_version`.
+    #[allow(deprecated)]
     fn stamp_protocol_version_follows_transport() {
         use mostro_core::message::Action;
 
@@ -1557,6 +1571,8 @@ mod tests {
     }
 
     #[test]
+    // DEPRECATED(v0.19.0, #786): delete along with `stamp_protocol_version`.
+    #[allow(deprecated)]
     fn stamp_protocol_version_covers_all_variants() {
         use mostro_core::message::Action;
 

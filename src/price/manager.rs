@@ -76,11 +76,15 @@ pub struct PriceManager {
     store: Arc<PriceStore>,
     settings: PriceSettings,
     http: reqwest::Client,
-    /// One-shot guards for the two transient log conditions (spec §10.4
-    /// asks for transitions, not per-poll spam). Kept as two independent
-    /// sets so a `Stale` flag never clobbers a `SingleSource` flag (and
-    /// vice versa) for the same currency — both can hold simultaneously.
+    /// One-shot guards for the transient log conditions (spec §10.4 asks
+    /// for transitions, not per-poll spam). Kept as independent sets so
+    /// one flag never clobbers another for the same currency — all can
+    /// hold simultaneously. `warned_stale` covers "stale but within TTL,
+    /// still served" (`observe_freshness`); `warned_refused` covers
+    /// "past TTL — refusing" (`get_price`), so an earlier within-TTL
+    /// warning cannot suppress the refusal transition warning.
     warned_stale: RwLock<HashSet<String>>,
+    warned_refused: RwLock<HashSet<String>>,
     warned_single_source: RwLock<HashSet<String>>,
 }
 
@@ -130,6 +134,7 @@ impl PriceManager {
             settings,
             http,
             warned_stale: RwLock::new(HashSet::new()),
+            warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
         })
     }
@@ -397,8 +402,9 @@ impl PriceManager {
                 // transition so the log isn't spammed every read while the
                 // outage persists; a later fresh tick clears the flag (via
                 // `observe_freshness`) so the next slide past the TTL warns
-                // again.
-                if self.mark_warned(&self.warned_stale, &key) {
+                // again. This flag is distinct from `warned_stale` so a
+                // prior within-TTL warning can't swallow this one.
+                if self.mark_warned(&self.warned_refused, &key) {
                     let age = self
                         .store
                         .snapshot(currency)
@@ -440,9 +446,12 @@ impl PriceManager {
         let age = now.saturating_sub(entry.as_of);
         let one_interval = self.settings.update_interval_seconds as i64;
         if age <= one_interval {
-            // Fully fresh — also wipe any past-TTL flag so a future slide
-            // past `max_price_staleness_seconds` warns once more.
+            // Fully fresh — also wipe both stale flags so a future slide
+            // past one interval (within-TTL warning) or past
+            // `max_price_staleness_seconds` (refusal warning) warns once
+            // more.
             self.clear_warned(&self.warned_stale, key);
+            self.clear_warned(&self.warned_refused, key);
             return;
         }
         if self.mark_warned(&self.warned_stale, key) {
@@ -717,6 +726,7 @@ mod tests {
             settings,
             http: reqwest::Client::new(),
             warned_stale: RwLock::new(HashSet::new()),
+            warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
         }
     }
@@ -790,6 +800,7 @@ mod tests {
             settings,
             http: reqwest::Client::new(),
             warned_stale: RwLock::new(HashSet::new()),
+            warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
         };
         let r = manager.update_all().await;
@@ -1228,9 +1239,9 @@ mod tests {
     #[tokio::test]
     async fn stale_warning_is_one_shot_then_re_arms_on_fresh_read() {
         // Build a manager whose only stored value is intentionally past
-        // the TTL, then call get_price() many times: the warned_stale set
-        // must grow by at most one entry. A fresh tick clears the flag
-        // so a future regression past TTL warns again.
+        // the TTL, then call get_price() many times: the warned_refused
+        // set must grow by at most one entry. A fresh tick clears the
+        // flag so a future regression past TTL warns again.
         let mut quotes = ProviderQuotes::new();
         quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
         let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes.clone())]);
@@ -1253,14 +1264,14 @@ mod tests {
         let now = Utc::now().timestamp();
         manager.store.update(agg, now - 1_000_000);
 
-        // 10 reads against a stale value: warned_stale must end with
+        // 10 reads against a stale value: warned_refused must end with
         // exactly one entry, regardless of how many times the legacy
         // code would have logged.
         for _ in 0..10 {
             let _ = manager.get_price("USD");
         }
         assert_eq!(
-            manager.warned_stale.read().unwrap().len(),
+            manager.warned_refused.read().unwrap().len(),
             1,
             "TooStale must warn at most once between fresh reads"
         );
@@ -1281,8 +1292,59 @@ mod tests {
         // Read once at fresh time so observe_freshness clears the flag.
         let _ = manager.get_price("USD");
         assert!(
-            manager.warned_stale.read().unwrap().is_empty(),
-            "fresh read must re-arm the stale guard"
+            manager.warned_refused.read().unwrap().is_empty(),
+            "fresh read must re-arm the refusal guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_ttl_refusal_warning_not_suppressed_by_within_ttl_warning() {
+        // Regression for a review finding: the within-TTL "stale" warning
+        // (`observe_freshness`) and the past-TTL "refusing" warning
+        // (`get_price`) used to share one flag set, so a served-but-stale
+        // read swallowed the later refusal transition warning for the
+        // same currency.
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+        manager.settings.update_interval_seconds = 1;
+        manager.settings.max_price_staleness_seconds = 1_800;
+
+        // Seed an entry old enough to trip the within-TTL warning (older
+        // than one update interval) while staying inside the TTL.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+            },
+        );
+        let now = Utc::now().timestamp();
+        manager.store.update(agg, now - 60);
+
+        assert!(
+            manager.get_price("USD").is_ok(),
+            "within-TTL stale value is still served"
+        );
+        assert_eq!(
+            manager.warned_stale.read().unwrap().len(),
+            1,
+            "within-TTL warning recorded"
+        );
+        assert!(manager.warned_refused.read().unwrap().is_empty());
+
+        // Shrink the TTL so the same entry is now past it: the refusal
+        // path must record its own transition warning despite the
+        // earlier within-TTL flag.
+        manager.settings.max_price_staleness_seconds = 30;
+        assert!(manager.get_price("USD").is_err());
+        assert_eq!(
+            manager.warned_refused.read().unwrap().len(),
+            1,
+            "past-TTL refusal warning must not be suppressed by the within-TTL flag"
         );
     }
 

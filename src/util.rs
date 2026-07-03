@@ -9,9 +9,7 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::lightning::LndConnector;
-use crate::lnurl::HTTP_CLIENT;
 use crate::messages;
-use crate::models::Yadio;
 use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
 use crate::NOSTR_CLIENT;
 
@@ -27,171 +25,45 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
-use std::thread;
 use tokio::sync::mpsc::channel;
 use tracing::info;
 use uuid::Uuid;
 
-pub type FiatNames = std::collections::HashMap<String, String>;
-const MAX_RETRY: u16 = 4;
-
 // Redefined for convenience
 type OrderKind = mostro_core::order::Kind;
-
-/// Resolve the Yadio base URL for the live market-quote path (`/convert`,
-/// `/currencies`).
-///
-/// Phase 1 transition (spec §10.1): the cached aggregate path reads
-/// `[price.providers.yadio].url`, but this live path historically read the
-/// legacy `[mostro].bitcoin_price_api_url`. If an operator customises only
-/// the new key, the two paths would silently hit different Yadio bases.
-/// Prefer the configured Yadio provider URL when it is *usable* — the provider
-/// is enabled and has a non-empty URL — otherwise fall back to the legacy key.
-/// A disabled or blank provider entry must not suppress that fallback. The
-/// chosen URL is normalized exactly as [`YadioProvider::new`] does
-/// (`trim_end_matches('/')`) so appending `/convert` / `/currencies` can never
-/// produce a `//`, keeping the live and aggregate paths on an identical base.
-/// Phase 4 removes this live HTTP path entirely, at which point the legacy key
-/// only feeds legacy synthesis.
-fn yadio_base_url() -> String {
-    let provider = Settings::get_price().and_then(|price| {
-        price
-            .providers
-            .get(&crate::price::ProviderId::Yadio.to_string())
-            .map(|yadio| (yadio.url.as_str(), yadio.enabled))
-    });
-    let legacy = Settings::get_mostro().bitcoin_price_api_url.clone();
-    select_yadio_base_url(provider, &legacy)
-}
-
-/// Drop surrounding whitespace and any trailing slash, matching
-/// [`crate::price::providers::yadio::YadioProvider::new`]. A URL that is only
-/// slashes/whitespace normalizes to empty and is treated as "not configured".
-fn normalize_base_url(raw: &str) -> String {
-    raw.trim().trim_end_matches('/').to_string()
-}
-
-/// Pure selection logic behind [`yadio_base_url`], split out so it is unit
-/// testable without the write-once global `Settings`. `provider` is
-/// `(url, enabled)` for the `[price.providers.yadio]` entry when present.
-/// Prefer that URL only when it is *usable* — the provider is enabled and the
-/// URL is non-empty after normalization — otherwise fall back to the
-/// (normalized) legacy `bitcoin_price_api_url`.
-fn select_yadio_base_url(provider: Option<(&str, bool)>, legacy: &str) -> String {
-    if let Some((url, enabled)) = provider {
-        if enabled {
-            let url = normalize_base_url(url);
-            if !url.is_empty() {
-                return url;
-            }
-        }
-    }
-    normalize_base_url(legacy)
-}
-
-pub async fn retries_yadio_request(
-    req_string: &str,
-    fiat_code: &str,
-) -> Result<(Option<reqwest::Response>, bool), MostroError> {
-    // Get Fiat list and check if currency exchange is available
-    let api_req_string = format!("{}/currencies", yadio_base_url());
-    let fiat_list_check = HTTP_CLIENT
-        .get(api_req_string)
-        .send()
-        .await
-        .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?
-        .json::<FiatNames>()
-        .await
-        .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?
-        .contains_key(fiat_code);
-
-    // Exit with error - no currency
-    if !fiat_list_check {
-        return Ok((None, fiat_list_check));
-    }
-
-    let res = HTTP_CLIENT
-        .get(req_string)
-        .send()
-        .await
-        .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
-
-    Ok((Some(res), fiat_list_check))
-}
 
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
     crate::price::get_bitcoin_price(fiat_code)
 }
 
-/// Request market quote from Yadio to have sats amount at actual market price
-pub async fn get_market_quote(
+/// Convert a fiat amount to sats at the current market rate, applying the
+/// order premium.
+///
+/// Phase 4 (spec §6.4, §9 Phase 4): reads the aggregated, multi-source rate
+/// from the in-memory price store instead of making a live Yadio `/convert`
+/// call per take. The store is refreshed by the scheduler tick, so this is a
+/// lock-read with no network I/O. Staleness is enforced upstream by
+/// [`crate::price::get_bitcoin_price`]: a rate older than the configured
+/// window returns `ServiceError::PriceTooStale` rather than pricing on stale
+/// data, which order create/take surface to the user as
+/// `CantDoReason::PriceTooStale`.
+pub fn get_market_quote(
     fiat_amount: &i64,
     fiat_code: &str,
     premium: i64,
 ) -> Result<i64, MostroError> {
-    // Add here check for market price
-    let req_string = format!(
-        "{}/convert/{}/{}/BTC",
-        yadio_base_url(),
-        fiat_amount,
-        fiat_code
-    );
-    info!("Requesting API price: {}", req_string);
-
-    let mut req = (None, false);
-    let mut no_answer_api = false;
-
-    // Retry for 4 times
-    for retries_num in 1..=MAX_RETRY {
-        match retries_yadio_request(&req_string, fiat_code).await {
-            Ok(response) => {
-                req = response;
-                break;
-            }
-            Err(_e) => {
-                if retries_num == MAX_RETRY {
-                    no_answer_api = true;
-                }
-                println!(
-                    "API price request failed retrying - {} tentatives left.",
-                    (MAX_RETRY - retries_num)
-                );
-                thread::sleep(std::time::Duration::from_secs(2));
-            }
-        };
-    }
-
-    // Case no answers from Yadio
-    if no_answer_api {
+    // Fiat units per 1 BTC (staleness-enforced).
+    let price = get_bitcoin_price(fiat_code)?;
+    if price <= 0.0 {
         return Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse));
     }
 
-    // No currency present
-    if !req.1 {
-        return Err(MostroError::MostroInternalErr(ServiceError::NoCurrency));
-    }
+    // sats = (fiat_amount / fiat_per_btc) × 1e8.
+    let mut sats = (*fiat_amount as f64 / price) * 100_000_000_f64;
 
-    if req.0.is_none() {
-        return Err(MostroError::MostroInternalErr(
-            ServiceError::MalformedAPIRes,
-        ));
-    }
-
-    let quote = if let Some(q) = req.0 {
-        q.json::<Yadio>()
-            .await
-            .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?
-    } else {
-        return Err(MostroError::MostroInternalErr(
-            ServiceError::MalformedAPIRes,
-        ));
-    };
-
-    let mut sats = quote.result * 100_000_000_f64;
-
-    // Added premium value to have correct sats value
+    // Apply the order premium to the sats value.
     if premium != 0 {
-        sats = sats - (premium as f64) / 100_f64 * sats;
+        sats -= (premium as f64) / 100_f64 * sats;
     }
 
     Ok(sats as i64)
@@ -1220,13 +1092,21 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
     Ok(())
 }
 
-pub async fn get_market_amount_and_fee(
+/// Price a market order and compute its Mostro fee in one step.
+///
+/// Converts `fiat_amount` (denominated in `fiat_code`) to sats through the
+/// cache-backed [`get_market_quote`], applying `premium`, then derives the
+/// Mostro fee from that amount. Returns `(sats_amount, fee)` — the order
+/// amount in sats first, the fee in sats second. Errors bubble up from the
+/// quote path: `PriceTooStale` when the cached rate is past the staleness
+/// window, `NoAPIResponse` when the currency has no cached price yet.
+pub fn get_market_amount_and_fee(
     fiat_amount: i64,
     fiat_code: &str,
     premium: i64,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64), MostroError> {
     // Update amount order
-    let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium).await?;
+    let new_sats_amount = get_market_quote(&fiat_amount, fiat_code, premium)?;
     let fee = get_fee(new_sats_amount);
 
     Ok((new_sats_amount, fee))
@@ -1694,56 +1574,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_yadio_base_url_prefers_enabled_provider() {
-        // Enabled provider with a usable URL wins over the legacy key.
-        assert_eq!(
-            select_yadio_base_url(
-                Some(("https://provider.example", true)),
-                "https://legacy.example"
-            ),
-            "https://provider.example"
-        );
-    }
-
-    #[test]
-    fn select_yadio_base_url_strips_trailing_slash_like_provider_new() {
-        // A configured trailing slash must not survive — otherwise appending
-        // `/convert` yields `//convert`. Matches `YadioProvider::new`.
-        assert_eq!(
-            select_yadio_base_url(
-                Some(("https://api.yadio.io/", true)),
-                "https://legacy.example"
-            ),
-            "https://api.yadio.io"
-        );
-        // Whitespace + multiple trailing slashes both normalized away.
-        assert_eq!(
-            select_yadio_base_url(Some(("  https://api.yadio.io//  ", true)), "ignored"),
-            "https://api.yadio.io"
-        );
-        // The legacy fallback is normalized the same way.
-        assert_eq!(
-            select_yadio_base_url(None, "https://legacy.example/"),
-            "https://legacy.example"
-        );
-    }
-
-    #[test]
-    fn select_yadio_base_url_falls_back_when_provider_unusable() {
-        let legacy = "https://legacy.example";
-        // Disabled provider → fall back to legacy even with a URL set.
-        assert_eq!(
-            select_yadio_base_url(Some(("https://provider.example", false)), legacy),
-            legacy
-        );
-        // Enabled but blank / slash-only URL → fall back to legacy.
-        assert_eq!(select_yadio_base_url(Some(("   ", true)), legacy), legacy);
-        assert_eq!(select_yadio_base_url(Some(("/", true)), legacy), legacy);
-        // No provider entry at all → legacy.
-        assert_eq!(select_yadio_base_url(None, legacy), legacy);
-    }
-
     async fn setup_orders_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1821,23 +1651,6 @@ mod tests {
         let bytes = vec![0xde, 0xad, 0xbe, 0xef];
         let result = bytes_to_string(&bytes);
         assert_eq!(result, "deadbeef");
-    }
-
-    #[tokio::test]
-    async fn test_get_market_quote_url_construction() {
-        initialize();
-        // Test the URL construction logic without making actual API calls
-        // This test verifies that the API URL format is correct
-        let base_url = "https://api.yadio.io";
-        let fiat_amount = 1000;
-        let fiat_code = "USD";
-
-        let expected_url = format!("{}/convert/{}/{}/BTC", base_url, fiat_amount, fiat_code);
-        assert_eq!(expected_url, "https://api.yadio.io/convert/1000/USD/BTC");
-
-        // Test currency list URL construction
-        let currencies_url = format!("{}/currencies", base_url);
-        assert_eq!(currencies_url, "https://api.yadio.io/currencies");
     }
 
     #[tokio::test]

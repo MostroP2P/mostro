@@ -87,19 +87,40 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # cross 0.2.5's windows-gnu image ships a mingw-w64 older than 2021,
+      # whose libws2_32.a lacks GetHostNameW — a symbol current Rust std
+      # references (std::sys::net::hostname) — so linking fails. The runner's
+      # own mingw-w64 (>= 11, Ubuntu 24.04) exports it, so that target builds
+      # natively with cargo instead of cross.
+      - name: Install mingw-w64 (Windows target only)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 protobuf-compiler
+          rustup target add x86_64-pc-windows-gnu
+
       - name: Cache cross binary
         id: cache-cross
+        if: matrix.target != 'x86_64-pc-windows-gnu'
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cross
           key: cross-${{ runner.os }}-0.2.5
 
       - name: Install cross ( pinned version for reproducibility )
-        if: steps.cache-cross.outputs.cache-hit != 'true'
+        if: matrix.target != 'x86_64-pc-windows-gnu' && steps.cache-cross.outputs.cache-hit != 'true'
         run: cargo install cross --version 0.2.5
 
       - name: Build release
-        run: cross build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+            export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+            cargo build --release --locked --target ${{ matrix.target }}
+          else
+            cross build --release --locked --target ${{ matrix.target }}
+          fi
 
       - name: Prepare conventional artifact name
         shell: bash

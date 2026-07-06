@@ -15,8 +15,10 @@ use std::str::FromStr;
 use cdk::error::Error as CdkClientError;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::ShortKeysetId;
-use cdk::nuts::nut10::SpendingConditions;
-use cdk::nuts::{CheckStateRequest, CheckStateResponse, CurrencyUnit, PublicKey, State, Token};
+use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions, TagKind};
+use cdk::nuts::{
+    CheckStateRequest, CheckStateResponse, CurrencyUnit, PublicKey, SigFlag, State, Token,
+};
 use cdk::wallet::MintConnector;
 use cdk::HttpClient;
 
@@ -166,7 +168,19 @@ impl CashuClient {
         }
 
         for secret in secrets {
-            let spending_conditions = SpendingConditions::try_from(secret)
+            // NUT-11 marks a secret carrying duplicate standard tags as
+            // malformed, but cdk's `Conditions` parser silently keeps only
+            // the first occurrence of each and drops the rest. Inspect the
+            // raw NUT-10 tag list and reject duplicates *before* that lossy
+            // conversion; otherwise a forged second `refund`/`locktime`/
+            // `n_sigs`/`sigflag`/… tag passes every check below while a
+            // non-cdk mint could settle the token under different spend
+            // conditions than the daemon verified.
+            let nut10_secret =
+                Nut10Secret::try_from(secret).map_err(|e| Error::Condition(e.to_string()))?;
+            reject_duplicate_standard_tags(&nut10_secret)?;
+
+            let spending_conditions = SpendingConditions::try_from(nut10_secret)
                 .map_err(|e| Error::Condition(e.to_string()))?;
 
             // Only NUT-11 P2PK backs the escrow; an HTLC condition with
@@ -182,6 +196,19 @@ impl CashuClient {
             };
             let conditions = conditions
                 .ok_or_else(|| Error::Condition("P2PK condition carries no NUT-11 tags".into()))?;
+
+            // The documented release/refund flow signs inputs only
+            // (`SIG_INPUTS`): the seller signs the escrow once and the buyer
+            // later chooses their own swap outputs at redeem time. A
+            // `SIG_ALL` token instead binds specific outputs and cannot be
+            // redeemed by that flow, stranding the locked order — reject any
+            // escrow whose sig flag is not `SIG_INPUTS`.
+            if conditions.sig_flag != SigFlag::SigInputs {
+                return Err(Error::Condition(format!(
+                    "escrow sig flag {:?} is not SIG_INPUTS",
+                    conditions.sig_flag
+                )));
+            }
 
             if conditions.num_sigs != Some(2) {
                 return Err(Error::Condition(
@@ -423,6 +450,38 @@ impl CashuClient {
     }
 }
 
+/// Reject a NUT-10 secret that repeats any standard NUT-11 tag.
+///
+/// NUT-11 marks a secret carrying duplicate standard tags as malformed, but
+/// cdk's [`SpendingConditions`] parser keeps only the *first* occurrence of
+/// each and silently drops the rest. Without this guard a forged secret
+/// with a second `refund`, `locktime`, `n_sigs`, `n_sigs_refund`, `pubkeys`
+/// or `sigflag` tag satisfies every check in
+/// [`CashuClient::verify_2of3_condition`], yet a non-cdk mint could accept
+/// or settle it under spend conditions the daemon never verified. Custom
+/// (non-standard) tags may legitimately repeat and are ignored.
+fn reject_duplicate_standard_tags(secret: &Nut10Secret) -> Result<(), Error> {
+    let Some(tags) = secret.secret_data().tags() else {
+        return Ok(());
+    };
+    let mut seen: HashSet<TagKind> = HashSet::new();
+    for tag in tags {
+        let Some(key) = tag.first() else {
+            continue;
+        };
+        let kind = TagKind::from(key);
+        if matches!(kind, TagKind::Custom(_)) {
+            continue;
+        }
+        if !seen.insert(kind) {
+            return Err(Error::Condition(format!(
+                "duplicate NUT-11 `{key}` tag (malformed per NUT-11)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Offline half of the escrow-token acceptance check: the 2-of-3 condition
 /// ([`CashuClient::verify_2of3_condition`]) plus the **locktime floor** —
 /// every proof's `locktime` must be `>= min_locktime`. Split out of
@@ -558,6 +617,29 @@ mod tests {
         .to_string()
     }
 
+    /// Build a serialized single-proof token from a raw NUT-10 secret JSON
+    /// string. Used to forge tag shapes cdk's own `Conditions`/constructor
+    /// would reject or silently normalize (duplicate tags, `SIG_ALL`,
+    /// `n_sigs_refund` extremes), which an attacker hands us directly.
+    fn raw_secret_token(raw_secret: &str) -> String {
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(100u64),
+            secret: Secret::new(raw_secret.to_string()),
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string()
+    }
+
     /// The §4B escrow shape: data = P_S, pubkeys = [P_B, P_M], n_sigs = 2,
     /// locktime present, refund = [P_S].
     fn valid_escrow_token(p_b: PublicKey, p_s: PublicKey, p_m: PublicKey) -> String {
@@ -671,27 +753,69 @@ mod tests {
                 p_m.to_hex(),
                 p_s.to_hex(),
             );
-            let proof = Proof {
-                keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
-                amount: Amount::from(100u64),
-                secret: Secret::new(raw_secret),
-                c: PublicKey::from_str(TEST_C).unwrap(),
-                witness: None,
-                dleq: None,
-                p2pk_e: None,
-            };
-            let token = Token::new(
-                MintUrl::from_str(TEST_MINT).unwrap(),
-                vec![proof],
-                None,
-                CurrencyUnit::Sat,
-            )
-            .to_string();
+            let token = raw_secret_token(&raw_secret);
             assert!(
                 CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_err(),
                 "a forged n_sigs_refund {n_sigs_refund} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_sig_all_escrow_token() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // A `SIG_ALL` escrow binds specific outputs and cannot be redeemed
+        // by the documented SIG_INPUTS release/refund flow. cdk parses the
+        // flag but `verify_2of3_condition` must reject it. Forge a raw
+        // secret since `token_with_condition` hardcodes `SIG_INPUTS`.
+        let raw_secret = format!(
+            r#"["P2PK",{{"nonce":"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f","data":"{}","tags":[["pubkeys","{}","{}"],["locktime","{LOCKTIME}"],["refund","{}"],["n_sigs","2"],["sigflag","SIG_ALL"]]}}]"#,
+            p_s.to_hex(),
+            p_b.to_hex(),
+            p_m.to_hex(),
+            p_s.to_hex(),
+        );
+        let token = raw_secret_token(&raw_secret);
+        assert!(
+            CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_err(),
+            "a SIG_ALL escrow token must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_standard_tags() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // cdk keeps the first `locktime` (valid) and drops the second, but a
+        // non-cdk mint could honour the second (`1`, long past) instead —
+        // NUT-11 marks duplicate tags malformed, so reject before parsing.
+        let dup_locktime = format!(
+            r#"["P2PK",{{"nonce":"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f","data":"{}","tags":[["pubkeys","{}","{}"],["locktime","{LOCKTIME}"],["locktime","1"],["refund","{}"],["n_sigs","2"],["sigflag","SIG_INPUTS"]]}}]"#,
+            p_s.to_hex(),
+            p_b.to_hex(),
+            p_m.to_hex(),
+            p_s.to_hex(),
+        );
+        let token = raw_secret_token(&dup_locktime);
+        assert!(
+            CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_err(),
+            "a duplicate `locktime` tag must be rejected"
+        );
+
+        // A second `refund` tag pointing at the buyer: cdk keeps the seller
+        // refund, but the malformed token must not be accepted at all.
+        let dup_refund = format!(
+            r#"["P2PK",{{"nonce":"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f","data":"{}","tags":[["pubkeys","{}","{}"],["locktime","{LOCKTIME}"],["refund","{}"],["refund","{}"],["n_sigs","2"],["sigflag","SIG_INPUTS"]]}}]"#,
+            p_s.to_hex(),
+            p_b.to_hex(),
+            p_m.to_hex(),
+            p_s.to_hex(),
+            p_b.to_hex(),
+        );
+        let token = raw_secret_token(&dup_refund);
+        assert!(
+            CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_err(),
+            "a duplicate `refund` tag must be rejected"
+        );
     }
 
     #[test]

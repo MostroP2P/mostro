@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::time::Duration;
 
 use cdk::error::Error as CdkClientError;
 use cdk::mint_url::MintUrl;
@@ -21,6 +22,12 @@ use cdk::nuts::{
 };
 use cdk::wallet::MintConnector;
 use cdk::HttpClient;
+
+/// Per-request bound on every mint HTTP call. `HttpClient` wraps a
+/// `reqwest` client with **no default timeout**, so without this a slow or
+/// unreachable mint could hang `connect`, `check_state` or the DLEQ keyset
+/// fetch indefinitely, stranding the calling handler.
+const MINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Error type for Cashu client operations.
 #[derive(Debug)]
@@ -85,10 +92,9 @@ impl CashuClient {
             client,
         };
 
-        let info = cashu_client
-            .client
-            .get_mint_info()
+        let info = tokio::time::timeout(MINT_REQUEST_TIMEOUT, cashu_client.client.get_mint_info())
             .await
+            .map_err(|_| Error::MintConnection("timed out fetching mint info".into()))?
             .map_err(|e| Error::MintConnection(e.to_string()))?;
         if !info.nuts.nut11.supported {
             return Err(Error::MintConnection(
@@ -106,11 +112,11 @@ impl CashuClient {
             ));
         }
 
-        let keysets = cashu_client
-            .client
-            .get_mint_keysets()
-            .await
-            .map_err(|e| Error::MintConnection(e.to_string()))?;
+        let keysets =
+            tokio::time::timeout(MINT_REQUEST_TIMEOUT, cashu_client.client.get_mint_keysets())
+                .await
+                .map_err(|_| Error::MintConnection("timed out fetching mint keysets".into()))?
+                .map_err(|e| Error::MintConnection(e.to_string()))?;
         if !keysets
             .keysets
             .iter()
@@ -309,6 +315,12 @@ impl CashuClient {
             )));
         }
 
+        // Reject a token that repeats a proof before its value is trusted: a
+        // duplicated proof inflates `value()` below and is reported unspent
+        // once per copy by checkstate (step 5), so one proof could satisfy a
+        // larger escrow than it is actually worth.
+        reject_duplicate_proofs(&token)?;
+
         // 3: the locked amount must equal the order amount exactly, and be
         // denominated in sats. `value()` is a bare integer, so without the
         // unit guard a mint exposing multiple units would let a
@@ -370,11 +382,11 @@ impl CashuClient {
     /// use [`Self::verify_token_dleq`] for that.
     pub async fn check_state(&self, ys: Vec<PublicKey>) -> Result<CheckStateResponse, Error> {
         let request = CheckStateRequest { ys };
-        let response = self
-            .client
-            .post_check_state(request)
-            .await
-            .map_err(Error::Client)?;
+        let response =
+            tokio::time::timeout(MINT_REQUEST_TIMEOUT, self.client.post_check_state(request))
+                .await
+                .map_err(|_| Error::MintConnection("timed out checking proof state".into()))?
+                .map_err(Error::Client)?;
         Ok(response)
     }
 
@@ -390,7 +402,10 @@ impl CashuClient {
         // is safe, but before Track B verifies older tokens this must fall
         // back to fetching the specific keyset via `/v1/keys/{keyset_id}`
         // for inactive keyset ids.
-        let keysets = self.client.get_mint_keys().await.map_err(Error::Client)?;
+        let keysets = tokio::time::timeout(MINT_REQUEST_TIMEOUT, self.client.get_mint_keys())
+            .await
+            .map_err(|_| Error::MintConnection("timed out fetching mint keys".into()))?
+            .map_err(Error::Client)?;
 
         match token {
             Token::TokenV3(token_v3) => {
@@ -477,6 +492,29 @@ fn reject_duplicate_standard_tags(secret: &Nut10Secret) -> Result<(), Error> {
             return Err(Error::Condition(format!(
                 "duplicate NUT-11 `{key}` tag (malformed per NUT-11)"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a token that repeats a proof, keyed by its secret (which fixes
+/// the checkstate `Y = hash_to_curve(secret)`).
+///
+/// [`Token::value`] sums *every* proof and NUT-07 `/v1/checkstate` answers
+/// in request order, so a duplicated proof is both counted toward the
+/// escrow amount **and** reported `Unspent` once per copy: a token backed by
+/// a single 50-sat proof repeated twice would satisfy a 100-sat escrow even
+/// though the mint will only ever let that proof be spent once. Deduplicate
+/// the proof secrets before [`CashuClient::verify_escrow_token`]'s amount
+/// and unspent checks trust the token value.
+fn reject_duplicate_proofs(token: &Token) -> Result<(), Error> {
+    let secrets = token.token_secrets();
+    let mut seen: HashSet<&cdk::secret::Secret> = HashSet::with_capacity(secrets.len());
+    for secret in secrets {
+        if !seen.insert(secret) {
+            return Err(Error::Token(
+                "token repeats a proof (duplicate secret)".into(),
+            ));
         }
     }
     Ok(())
@@ -875,6 +913,47 @@ mod tests {
         // Below the floor: a malicious seller could stall past a short
         // locktime and reclaim after the buyer sent fiat (Track A §4B).
         assert!(verify_escrow_conditions(&token, p_b, p_s, p_m, LOCKTIME + 1).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_proofs_in_token() {
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(50u64),
+            secret: Secret::generate(),
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        // The same proof twice: `value()` would double-count to 100 and
+        // checkstate would report each copy unspent, so a 50-sat proof could
+        // satisfy a 100-sat escrow. `reject_duplicate_proofs` must catch it.
+        let dup = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![proof.clone(), proof],
+            None,
+            CurrencyUnit::Sat,
+        );
+        assert!(reject_duplicate_proofs(&dup).is_err());
+
+        // Two distinct proofs (different secrets) pass.
+        let mk = |amount: u64| Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(amount),
+            secret: Secret::generate(),
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let distinct = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![mk(50), mk(50)],
+            None,
+            CurrencyUnit::Sat,
+        );
+        assert!(reject_duplicate_proofs(&distinct).is_ok());
     }
 
     #[test]

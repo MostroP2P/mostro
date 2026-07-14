@@ -15,12 +15,14 @@ In order to verify the release, you'll need to have gpg or gpg2 installed on you
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/arkanoider.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/catrya.asc | gpg --import
+curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/andreadiazcorreia.asc | gpg --import
 ```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya and manifest.txt are in the current directory) with:
+Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya, manifest.txt.sig.andreadiazcorreia and manifest.txt are in the current directory) with:
 ```bash
 gpg --verify manifest.txt.sig.negrunch manifest.txt
 gpg --verify manifest.txt.sig.arkanoider manifest.txt
 gpg --verify manifest.txt.sig.catrya manifest.txt
+gpg --verify manifest.txt.sig.andreadiazcorreia manifest.txt
 
 gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 1E41631D137BA2ADE55344F73852B843679AD6F0
@@ -33,6 +35,10 @@ gpg: Good signature from "Arkanoider <github.913zc@simplelogin.com>" [ultimate]
 gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 9A718444050F091D3D24CF6CE15E232F243D73E6
 gpg: Good signature from "Catrya (github) <140891948+Catrya@users.noreply.github.com>" [ultimate]
+
+gpg: Signature made fri 10 oct 2025 11:28:03 -03
+gpg:                using EDDSA key 57376B6467F41F565ADDC65B1ED8B40E3A46E21D
+gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [ultimate]
 
 ```
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.

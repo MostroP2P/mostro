@@ -263,3 +263,94 @@ pub async fn admin_cancel_action(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use mostro_core::error::CantDoReason;
+    use mostro_core::prelude::MostroError;
+
+    const DAEMON_PUBKEY: &str = "b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const READ_ONLY_SOLVER: &str =
+        "c1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const READ_WRITE_SOLVER: &str =
+        "d1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    async fn setup_permission_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn seed_solver(pool: &sqlx::SqlitePool, pubkey: &str, category: i64) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, is_solver, category, created_at) VALUES (?1, 1, ?2, 1700000000)",
+        )
+        .bind(pubkey)
+        .bind(category)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_dispute(pool: &sqlx::SqlitePool, order_id: uuid::Uuid, solver_pubkey: &str) {
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at)
+             VALUES (?1, ?2, 'in-progress', 'dispute', ?3, 1700000000)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(order_id)
+        .bind(solver_pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// admin_cancel: read-only solver is rejected with NotAuthorized
+    #[tokio::test]
+    async fn admin_cancel_read_only_solver_is_rejected() {
+        let pool = setup_permission_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        seed_solver(&pool, READ_ONLY_SOLVER, 1).await;
+        seed_dispute(&pool, order_id, READ_ONLY_SOLVER).await;
+
+        let result = crate::db::ensure_dispute_finalize_permission(
+            &pool,
+            READ_ONLY_SOLVER,
+            DAEMON_PUBKEY,
+            order_id,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::NotAuthorized))
+            ),
+            "read-only solver must be rejected with NotAuthorized, got: {:?}",
+            result
+        );
+    }
+
+    /// admin_cancel: read-write solver is allowed through the permission gate
+    #[tokio::test]
+    async fn admin_cancel_read_write_solver_is_allowed() {
+        let pool = setup_permission_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        seed_solver(&pool, READ_WRITE_SOLVER, 2).await;
+        seed_dispute(&pool, order_id, READ_WRITE_SOLVER).await;
+
+        let result = crate::db::ensure_dispute_finalize_permission(
+            &pool,
+            READ_WRITE_SOLVER,
+            DAEMON_PUBKEY,
+            order_id,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "read-write solver must pass the permission gate, got: {:?}",
+            result
+        );
+    }
+}

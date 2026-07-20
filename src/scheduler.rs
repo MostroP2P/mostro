@@ -797,8 +797,9 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
 
     tokio::spawn(async move {
         let pool = ctx.pool();
+        let keys = ctx.keys();
         loop {
-            run_dev_fee_cycle(pool, &mut ln_client, &mut confirmed).await;
+            run_dev_fee_cycle(pool, &mut ln_client, &mut confirmed, keys).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

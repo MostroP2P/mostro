@@ -583,6 +583,148 @@ mod tests {
             assert!(result.is_ok());
         }
 
+        async fn create_migrated_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        /// Insert a user row for `identity` with the given last_trade_index.
+        async fn insert_user(ctx: &AppContext, identity: &PublicKey, index: i64) {
+            add_new_user(
+                ctx.pool(),
+                User {
+                    pubkey: identity.to_string(),
+                    last_trade_index: index,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert user");
+        }
+
+        /// Build a signed trade-index message: the trade key (event.sender)
+        /// signs the serialized message, mirroring what clients do.
+        fn signed_event_and_message(trade_index: u32) -> (UnwrappedMessage, Message) {
+            let identity = create_test_keys();
+            let trade = create_test_keys();
+            let message = create_test_message(Action::NewOrder, Some(trade_index));
+            let sig = Message::sign(message.as_json().expect("json"), &trade);
+            let event = UnwrappedMessage {
+                message: message.clone(),
+                signature: Some(sig),
+                sender: trade.public_key(),
+                identity: identity.public_key(),
+                created_at: Timestamp::now(),
+            };
+            (event, message)
+        }
+
+        #[tokio::test]
+        async fn known_user_with_fresh_index_and_valid_signature_passes() {
+            let ctx = create_migrated_ctx().await;
+            let (event, message) = signed_event_and_message(3);
+            insert_user(&ctx, &event.identity, 2).await;
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(
+                result.is_ok(),
+                "fresh index + valid sig must pass: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn known_user_with_stale_index_is_rejected() {
+            let ctx = create_migrated_ctx().await;
+            let (event, message) = signed_event_and_message(3);
+            insert_user(&ctx, &event.identity, 5).await;
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex))
+            ));
+        }
+
+        #[tokio::test]
+        async fn known_user_with_wrong_signature_is_rejected() {
+            let ctx = create_migrated_ctx().await;
+            let (mut event, message) = signed_event_and_message(3);
+            // Signature from an unrelated key must not verify against the
+            // trade key that authored the rumor.
+            let interloper = create_test_keys();
+            event.signature = Some(Message::sign(message.as_json().expect("json"), &interloper));
+            insert_user(&ctx, &event.identity, 0).await;
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature))
+            ));
+        }
+
+        #[tokio::test]
+        async fn known_user_missing_signature_is_rejected() {
+            let ctx = create_migrated_ctx().await;
+            let (mut event, message) = signed_event_and_message(3);
+            event.signature = None;
+            insert_user(&ctx, &event.identity, 0).await;
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidSignature))
+            ));
+        }
+
+        #[tokio::test]
+        async fn known_user_with_index_zero_skips_index_checks() {
+            let ctx = create_migrated_ctx().await;
+            let identity = create_test_keys();
+            insert_user(&ctx, &identity.public_key(), 5).await;
+            let mut event = create_test_unwrapped_message();
+            event.identity = identity.public_key();
+            // trade_index None → trade_index() == 0 → `1..` arm not taken.
+            let message = create_test_message(Action::NewOrder, None);
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn unknown_user_with_index_zero_is_rejected() {
+            let ctx = create_migrated_ctx().await;
+            let event = create_test_unwrapped_message();
+            let message = create_test_message(Action::NewOrder, Some(0));
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(matches!(
+                result,
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex))
+            ));
+        }
+
+        #[tokio::test]
+        async fn unknown_user_with_valid_index_is_registered() {
+            let ctx = create_migrated_ctx().await;
+            let event = create_test_unwrapped_message();
+            let message = create_test_message(Action::TakeBuy, Some(4));
+
+            let result = check_trade_index(&ctx, &event, &message).await;
+            assert!(result.is_ok(), "new user must be created: {result:?}");
+
+            let user = is_user_present(ctx.pool(), event.identity.to_string())
+                .await
+                .expect("user must have been created");
+            assert_eq!(user.last_trade_index, 4);
+        }
+
         #[tokio::test]
         async fn test_check_trade_index_with_valid_index() {
             let ctx = create_test_ctx().await;
@@ -680,6 +822,51 @@ mod tests {
             // Routing assertion: we only require that the specific handler path is invoked
             // and its result is propagated; the exact business error is handler-owned.
             assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn routes_every_no_ln_action_to_its_handler_without_panicking() {
+            // Globals some handlers reach for; installing them is idempotent.
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            // Every arm of the no-LN router: against an empty database each
+            // handler returns its own business error (or Ok for no-op paths).
+            // The routing contract under test is "dispatch + propagate, never
+            // panic".
+            for action in [
+                Action::NewOrder,
+                Action::TakeSell,
+                Action::TakeBuy,
+                Action::FiatSent,
+                Action::AddInvoice,
+                Action::AddBondInvoice,
+                Action::Dispute,
+                Action::RateUser,
+                Action::AdminAddSolver,
+                Action::AdminTakeDispute,
+                Action::TradePubkey,
+                // Not routed by the no-LN handler → default informational arm.
+                Action::Release,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let _ = handle_message_action_no_ln(&action, msg, &event, &my_keys, &ctx).await;
+            }
         }
 
         #[tokio::test]

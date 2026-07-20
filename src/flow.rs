@@ -159,6 +159,129 @@ mod tests {
         Keys::generate()
     }
 
+    async fn create_migrated_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn init_global_settings() {
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+    }
+
+    /// Insert a sell order carrying `hash` so `find_order_by_hash` resolves it.
+    async fn insert_order_with_hash(
+        pool: &SqlitePool,
+        hash: &str,
+        status: Status,
+        buyer_invoice: Option<String>,
+        buyer_pubkey: Option<String>,
+        seller_pubkey: Option<String>,
+        master_buyer_pubkey: Option<String>,
+    ) -> Order {
+        let order = Order {
+            id: uuid::Uuid::new_v4(),
+            kind: OrderKind::Sell.to_string(),
+            status: status.to_string(),
+            creator_pubkey: seller_pubkey.clone().unwrap_or_default(),
+            payment_method: "SEPA".to_string(),
+            amount: 1_000,
+            fee: 10,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            hash: Some(hash.to_string()),
+            buyer_invoice,
+            buyer_pubkey,
+            seller_pubkey,
+            master_buyer_pubkey,
+            created_at: Timestamp::now().as_secs() as i64,
+            expires_at: Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        order.create(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_with_buyer_invoice_activates_order() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "aa".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingPayment,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, Some(1), &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "active path must succeed: {result:?}");
+
+        // The order row must be flipped to Active with invoice_held_at set.
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_without_buyer_invoice_requests_one() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "bb".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        // Status WaitingBuyerInvoice keeps notify_taker_reputation on its
+        // allowed-status path (sell order → PayInvoice to seller).
+        insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "add-invoice path must succeed: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
+        assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_errors_when_buyer_pubkey_missing() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "cc".repeat(32);
+        insert_order_with_hash(&pool, &hash, Status::WaitingPayment, None, None, None, None).await;
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::NostrError(_)))),
+            "missing buyer pubkey must surface as NostrError: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_settlement_and_cancel_resolve_existing_order() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "dd".repeat(32);
+        insert_order_with_hash(&pool, &hash, Status::Active, None, None, None, None).await;
+
+        assert!(hold_invoice_settlement(&hash, &pool).await.is_ok());
+        assert!(hold_invoice_canceled(&hash, &pool).await.is_ok());
+    }
+
     #[tokio::test]
     async fn test_hold_invoice_paid_structure() {
         let pool = create_test_pool().await;

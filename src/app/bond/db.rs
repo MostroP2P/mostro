@@ -359,6 +359,23 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_slice_slash_unique migration");
+        // Later ALTER-only migrations add columns `Order::by_id` SELECTs
+        // (dev_fee, cashu escrow). Apply each statement separately —
+        // sqlx::query treats the whole string as one statement.
+        for stmt in include_str!("../../../migrations/20251126120000_dev_fee.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt).execute(&pool).await.expect("dev_fee");
+        }
+        for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.lines().all(|l| l.trim_start().starts_with("--")))
+        {
+            sqlx::query(stmt).execute(&pool).await.expect("cashu");
+        }
         // SQLite doesn't enforce FKs unless asked. Turn them on so the FK to
         // `orders` is a real constraint in tests (mirrors production).
         sqlx::query("PRAGMA foreign_keys = ON")
@@ -886,5 +903,53 @@ mod tests {
             .await
             .unwrap();
         assert!(after_release.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_range_root_order_stops_at_missing_parent_row() {
+        // A dangling `range_parent_id` (parent row deleted / never
+        // created) must terminate the walk at the deepest order we could
+        // load instead of erroring — the caller still gets a usable
+        // "root" to resolve the maker bond against.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+        let missing_parent = Uuid::new_v4(); // never inserted
+        sqlx::query("UPDATE orders SET range_parent_id = ? WHERE id = ?")
+            .bind(missing_parent)
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        let root = find_range_root_order(&pool, order).await.unwrap();
+        assert_eq!(
+            root.id, order_id,
+            "walk must stop at the deepest loadable order"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_range_root_order_rejects_parent_cycle() {
+        // A self-referencing `range_parent_id` is a corrupted chain: the
+        // walk must terminate after MAX_RANGE_CHAIN_DEPTH hops with an
+        // explicit error instead of looping forever.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_parent_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET range_parent_id = ? WHERE id = ?")
+            .bind(order_id)
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        let err = find_range_root_order(&pool, order).await.unwrap_err();
+        assert!(
+            err.to_string().contains("max depth"),
+            "cycle must surface the max-depth error, got: {err}"
+        );
     }
 }

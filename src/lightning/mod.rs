@@ -467,7 +467,11 @@ mod tests {
         // Defaults set `max_routing_fee = 0.002`.
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
-            nostr: Default::default(),
+            nostr: crate::config::NostrSettings {
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
             mostro: Default::default(),
             lightning: Default::default(),
             rpc: Default::default(),
@@ -597,5 +601,162 @@ mod tests {
             // Assert
             assert_hold_invoice_err(err, "preimage", &value);
         }
+    }
+}
+
+#[cfg(test)]
+mod offline_connector_tests {
+    //! `fedimint_tonic_lnd::connect` is lazy: it reads the TLS cert and
+    //! macaroon files and builds a channel, but never touches the network
+    //! until the first RPC. That lets these tests construct a real
+    //! `LndConnector` pointed at a dead localhost port and exercise every
+    //! RPC method's transport-error path without a live LND node.
+    use super::*;
+    use crate::config::MOSTRO_CONFIG;
+    use fedimint_tonic_lnd::lnrpc::GetInfoResponse;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+    }
+
+    /// Build a connector whose channel points at a closed localhost port.
+    /// Empty cert (rustls_pemfile yields zero certs) and empty macaroon are
+    /// both accepted by the lazy connector.
+    async fn offline_connector() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-lnd-offline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("tls.cert");
+        let macaroon = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").expect("write cert");
+        std::fs::write(&macaroon, b"").expect("write macaroon");
+        let client = fedimint_tonic_lnd::connect("https://127.0.0.1:1".to_string(), cert, macaroon)
+            .await
+            .expect("lazy connect must not touch the network");
+        LndConnector { client }
+    }
+
+    /// Amount-carrying regtest invoice (500u = 50_000 sats), reused from the
+    /// `lightning::invoice` test fixtures.
+    const INVOICE_500U: &str = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n";
+
+    #[tokio::test]
+    async fn new_fails_without_reachable_files() {
+        init_test_settings();
+        // Default LightningSettings point at empty paths: the cert read
+        // fails before any network activity, so `new` errors cleanly.
+        let result = LndConnector::new().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_hold_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let res = ln.create_hold_invoice("test hold invoice", 1_000).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn settle_hold_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let preimage = "aa".repeat(32);
+        assert!(ln.settle_hold_invoice(&preimage).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_hold_invoice_error_carries_grpc_code_prefix() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let hash = "bb".repeat(32);
+        let err = ln
+            .cancel_hold_invoice(&hash)
+            .await
+            .expect_err("dead port must error");
+        // Bond release parses the stable `code=<Code>` prefix; pin it.
+        assert!(
+            err.to_string().contains("code="),
+            "error must carry the code= prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(ln.subscribe_invoice(vec![0u8; 32], tx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_node_info_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        assert!(ln.get_node_info().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_payment_status_maps_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let err = ln
+            .lookup_payment_status(&[0u8; 32])
+            .await
+            .expect_err("transport failure must be Err, not Ok(None)");
+        assert!(err.to_string().contains("code="));
+    }
+
+    #[tokio::test]
+    async fn check_payment_status_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        assert!(ln.check_payment_status(&[0u8; 32]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_payment_rejects_wrong_amount_before_paying() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Invoice is 50_000 sats; passing 100 must abort with Wrong amount.
+        let err = ln
+            .send_payment(INVOICE_500U, 100, tx)
+            .await
+            .expect_err("wrong amount must be rejected");
+        assert!(err.to_string().contains("Wrong amount"));
+    }
+
+    #[tokio::test]
+    async fn send_payment_with_matching_amount_fails_on_transport() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Amount matches the invoice, so the failure comes from the dead
+        // port at send_payment_v2 time.
+        assert!(ln.send_payment(INVOICE_500U, 50_000, tx).await.is_err());
+    }
+
+    #[test]
+    fn ln_status_maps_get_info_response_fields() {
+        let info = GetInfoResponse {
+            version: "0.18.0-beta".to_string(),
+            identity_pubkey: "02abc".to_string(),
+            commit_hash: "deadbeef".to_string(),
+            alias: "test-node".to_string(),
+            chains: vec![fedimint_tonic_lnd::lnrpc::Chain {
+                chain: "bitcoin".to_string(),
+                network: "regtest".to_string(),
+            }],
+            uris: vec!["02abc@127.0.0.1:9735".to_string()],
+            ..Default::default()
+        };
+        let status = LnStatus::from_get_info_response(info);
+        assert_eq!(status.version, "0.18.0-beta");
+        assert_eq!(status.node_pubkey, "02abc");
+        assert_eq!(status.commit_hash, "deadbeef");
+        assert_eq!(status.node_alias, "test-node");
+        assert_eq!(status.chains, vec!["bitcoin".to_string()]);
+        assert_eq!(status.networks, vec!["regtest".to_string()]);
+        assert_eq!(status.uris, vec!["02abc@127.0.0.1:9735".to_string()]);
     }
 }

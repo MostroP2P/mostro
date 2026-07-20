@@ -171,3 +171,57 @@ impl Settings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::test_settings;
+
+    /// Every test-side initializer in this crate installs a default-shaped
+    /// `Settings` (no bond, no cashu, no price, expiration present), so
+    /// these assertions hold regardless of which module's init wins the
+    /// OnceLock race.
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    #[test]
+    fn typed_getters_read_the_global_config() {
+        init_test_settings();
+        // Mostro / Lightning / RPC blocks are `Default` in every test
+        // initializer — pin a representative field from each.
+        assert_eq!(
+            Settings::get_mostro().expiration_seconds,
+            MostroSettings::default().expiration_seconds
+        );
+        assert_eq!(
+            Settings::get_ln().payment_attempts,
+            LightningSettings::default().payment_attempts
+        );
+        assert_eq!(Settings::get_rpc().port, RpcSettings::default().port);
+        // Nostr/database blocks vary slightly per initializer — only
+        // assert they are readable without panicking.
+        let _ = Settings::get_nostr();
+        let _ = Settings::get_db();
+        assert!(Settings::get_expiration().is_some());
+    }
+
+    #[test]
+    fn optional_blocks_absent_in_test_configuration() {
+        init_test_settings();
+        assert!(Settings::get_bond().is_none());
+        assert!(!Settings::is_bond_enabled());
+        assert!(Settings::get_cashu().is_none());
+        assert!(!Settings::is_cashu_enabled());
+        assert!(Settings::get_price().is_none());
+        assert_eq!(Settings::escrow_mode(), EscrowMode::Lightning);
+    }
+
+    #[test]
+    fn transport_falls_back_to_default() {
+        init_test_settings();
+        #[allow(deprecated)]
+        let transport = Settings::get_transport();
+        assert_eq!(transport, Transport::default());
+    }
+}

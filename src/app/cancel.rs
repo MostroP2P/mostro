@@ -869,4 +869,588 @@ mod tests {
             "an intruder with no bond row must not be routed to the taker-cancel path"
         );
     }
+
+    async fn setup_pool() -> Arc<SqlitePool> {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn build_ctx(pool: Arc<SqlitePool>) -> AppContext {
+        TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build()
+    }
+
+    /// Publishing paths (`update_order_event`) read the global config
+    /// (`Settings::get_nostr` / `get_mostro` / `get_expiration`). The
+    /// `OnceLock` may already be set by a concurrent test — that is fine
+    /// because every unit test uses the same `test_settings()` values.
+    fn set_global_config() {
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// The republish-to-`Pending` path (`update_order_event` with target
+    /// `Status::Pending`) additionally calls `get_db_pool()`, which panics
+    /// unless the global `DB_POOL` is set. Another test may have won the
+    /// race with a different pool; tests relying on this therefore pin
+    /// `master_*_pubkey == trade pubkey` so the rating lookup falls back
+    /// to `(0.0, 0, 0)` deterministically regardless of which pool won.
+    fn set_global_db_pool(pool: &Arc<SqlitePool>) {
+        let _ = crate::config::DB_POOL.set(pool.clone());
+    }
+
+    fn cancel_msg(order_id: uuid::Uuid) -> Message {
+        Message::new_order(Some(order_id), Some(1), None, Action::Cancel, None)
+    }
+
+    /// Actions queued for `destination` on the process-global queue.
+    /// Other tests push to the same queue concurrently, so callers must
+    /// only assert on destinations built from this test's fresh keys.
+    async fn queued_actions_for(destination: PublicKey) -> Vec<Action> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == destination)
+            .map(|(m, _)| m.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    async fn order_by_id(pool: &SqlitePool, id: uuid::Uuid) -> Order {
+        Order::by_id(pool, id).await.unwrap().unwrap()
+    }
+
+    async fn insert_requested_taker_bond(
+        pool: &SqlitePool,
+        order_id: uuid::Uuid,
+        pubkey: &PublicKey,
+    ) {
+        // `hash: None` keeps `release_bond` off the LND connect path.
+        let bond = crate::app::bond::Bond::new_requested(
+            order_id,
+            pubkey.to_string(),
+            crate::app::bond::BondRole::Taker,
+            1_000,
+        );
+        bond.create(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_action_rejects_orders_already_in_terminal_cancel_state() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let mut ln_client = StubLnClient;
+
+        for status in [
+            Status::Canceled,
+            Status::CooperativelyCanceled,
+            Status::CanceledByAdmin,
+        ] {
+            let mut order = create_pending_order(maker, taker);
+            order.status = status.to_string();
+            let order = order.create(ctx.pool()).await.unwrap();
+            let event = create_unwrapped_message_with_pubkey(maker);
+
+            let result =
+                cancel_action_generic(&ctx, cancel_msg(order.id), &event, &my_keys, &mut ln_client)
+                    .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(MostroCantDo(CantDoReason::OrderAlreadyCanceled))
+                ),
+                "status {status} must short-circuit as already canceled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maker_cancel_of_pending_order_persists_canceled_and_notifies_bonded_taker() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let bonded_taker = Keys::generate().public_key();
+
+        let order = create_pending_order(maker, taker)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        insert_requested_taker_bond(ctx.pool(), order.id, &bonded_taker).await;
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "maker cancel must succeed: {result:?}");
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Canceled.to_string()
+        );
+        assert!(
+            queued_actions_for(maker).await.contains(&Action::Canceled),
+            "maker must be notified of the cancellation"
+        );
+        assert!(
+            queued_actions_for(bonded_taker)
+                .await
+                .contains(&Action::Canceled),
+            "the bonded taker must be notified so they stop waiting"
+        );
+        let remaining = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "the taker bond must be released");
+    }
+
+    #[tokio::test]
+    async fn taker_self_cancel_with_other_active_bonds_keeps_order_parked() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let rival_taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingTakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        insert_requested_taker_bond(ctx.pool(), order.id, &taker).await;
+        insert_requested_taker_bond(ctx.pool(), order.id, &rival_taker).await;
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "scoped taker cancel must succeed: {result:?}"
+        );
+        // The rival is still racing, so the order must NOT be reset.
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingTakerBond.to_string()
+        );
+        let remaining = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1, "only the sender's bond is released");
+        assert_eq!(remaining[0].pubkey, rival_taker.to_string());
+        assert!(queued_actions_for(taker).await.contains(&Action::Canceled));
+    }
+
+    #[tokio::test]
+    async fn taker_self_cancel_of_last_bond_resets_order_to_pending() {
+        set_global_config();
+        let pool = setup_pool().await;
+        set_global_db_pool(&pool);
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        // Deterministic rating fallback: identity pubkey == trade pubkey.
+        order.master_seller_pubkey = Some(maker.to_string());
+        order.price_from_api = true;
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+        insert_requested_taker_bond(ctx.pool(), order.id, &taker).await;
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "last-bond taker cancel must succeed: {result:?}"
+        );
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Pending.to_string());
+        assert_eq!(after.amount, 0, "api-priced amount must be reset");
+        assert_eq!(after.fee, 0, "api-priced fee must be reset");
+        assert!(after.hash.is_none(), "hold invoice hash must be cleared");
+        assert!(
+            after.buyer_pubkey.is_none(),
+            "the sell-order taker side must be cleared for republish"
+        );
+        assert!(queued_actions_for(taker).await.contains(&Action::Canceled));
+        assert!(
+            queued_actions_for(maker).await.contains(&Action::NewOrder),
+            "the creator must see the republished order"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_taker_without_bond_row_can_still_self_cancel() {
+        set_global_config();
+        let pool = setup_pool().await;
+        set_global_db_pool(&pool);
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.master_seller_pubkey = Some(maker.to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // No bond row: routing must fall back to the in-memory taker
+        // pubkey match (buyer_pubkey == sender != creator).
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "legacy non-bond taker cancel must succeed: {result:?}"
+        );
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Pending.to_string());
+        assert!(after.buyer_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn maker_cancel_of_waiting_payment_order_cancels_and_notifies_both() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "maker cancel must succeed: {result:?}");
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Canceled.to_string()
+        );
+        assert!(queued_actions_for(maker).await.contains(&Action::Canceled));
+        assert!(queued_actions_for(taker).await.contains(&Action::Canceled));
+    }
+
+    #[tokio::test]
+    async fn taker_cancel_of_waiting_buyer_invoice_order_republishes() {
+        set_global_config();
+        let pool = setup_pool().await;
+        set_global_db_pool(&pool);
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingBuyerInvoice.to_string();
+        order.master_seller_pubkey = Some(maker.to_string());
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "taker cancel must succeed: {result:?}");
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Pending.to_string());
+        assert!(after.hash.is_none());
+        assert!(after.buyer_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_not_active_order_rejects_intruder() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(Keys::generate().public_key());
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_not_active_order_with_foreign_creator_is_internal_error() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        // Corrupt state: the creator matches neither buyer nor seller.
+        order.creator_pubkey = Keys::generate().public_key().to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_active_order_step_1_records_buyer_as_initiator() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Active.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // The buyer (taker on this sell order) initiates.
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "step 1 must succeed: {result:?}");
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.cancel_initiator_pubkey, Some(taker.to_string()));
+        assert!(after.buyer_cooperativecancel);
+        assert!(!after.seller_cooperativecancel);
+        assert!(queued_actions_for(taker)
+            .await
+            .contains(&Action::CooperativeCancelInitiatedByYou));
+        assert!(queued_actions_for(maker)
+            .await
+            .contains(&Action::CooperativeCancelInitiatedByPeer));
+    }
+
+    #[tokio::test]
+    async fn cancel_fiat_sent_step_1_records_seller_as_initiator() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::FiatSent.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // The seller (maker on this sell order) initiates.
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "step 1 must succeed: {result:?}");
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.cancel_initiator_pubkey, Some(maker.to_string()));
+        assert!(after.seller_cooperativecancel);
+        assert!(!after.buyer_cooperativecancel);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_order_step_2_rejects_same_party_confirmation() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Active.to_string();
+        order.cancel_initiator_pubkey = Some(taker.to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // Same party (the buyer/initiator) tries to confirm its own cancel.
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_dispute_step_2_completes_cooperative_cancel_and_closes_dispute() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Dispute.to_string();
+        order.cancel_initiator_pubkey = Some(taker.to_string());
+        order.buyer_dispute = true;
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        Dispute::new(order.id, order.status.clone())
+            .create(ctx.pool())
+            .await
+            .unwrap();
+
+        // The seller (maker) confirms the buyer-initiated cancel.
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(result.is_ok(), "step 2 must succeed: {result:?}");
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::CooperativelyCanceled.to_string()
+        );
+        let dispute = crate::db::find_dispute_by_order_id(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispute.status,
+            DisputeStatus::SellerRefunded.to_string(),
+            "the open dispute must be closed as seller-refunded"
+        );
+        assert!(queued_actions_for(maker)
+            .await
+            .contains(&Action::CooperativeCancelAccepted));
+        assert!(queued_actions_for(taker)
+            .await
+            .contains(&Action::CooperativeCancelAccepted));
+    }
+
+    #[tokio::test]
+    async fn cancel_action_rejects_unhandled_status() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    #[tokio::test]
+    async fn notify_creator_enqueues_new_order_and_rejects_invalid_creator() {
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let order = create_pending_order(maker, taker);
+        notify_creator(&order, Some(7)).await.unwrap();
+        assert!(
+            queued_actions_for(maker).await.contains(&Action::NewOrder),
+            "the creator must receive the republished order payload"
+        );
+
+        let mut bad_order = create_pending_order(maker, taker);
+        bad_order.creator_pubkey = "not-a-valid-pubkey".to_string();
+        assert!(matches!(
+            notify_creator(&bad_order, None).await,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
 }

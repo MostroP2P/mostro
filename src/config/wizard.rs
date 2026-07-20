@@ -421,4 +421,86 @@ mod tests {
         let path = "/absolute/path";
         assert_eq!(expand_tilde(path), PathBuf::from(path));
     }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mostro-wizard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn test_validate_file_exists_accepts_regular_file() {
+        let dir = temp_dir("file-ok");
+        let file = dir.join("tls.cert");
+        std::fs::write(&file, b"cert bytes").expect("write file");
+        assert!(validate_file_exists(&file.to_string_lossy()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_exists_rejects_directory() {
+        let dir = temp_dir("file-dir");
+        let err = validate_file_exists(&dir.to_string_lossy())
+            .expect_err("a directory is not a regular file");
+        assert!(err.contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_resolve_file_path_canonicalizes_existing_file() {
+        let dir = temp_dir("resolve-ok");
+        let file = dir.join("admin.macaroon");
+        std::fs::write(&file, b"macaroon").expect("write file");
+        let resolved = resolve_file_path(&file.to_string_lossy()).expect("existing file resolves");
+        assert!(resolved.ends_with("admin.macaroon"));
+        assert!(PathBuf::from(resolved).is_absolute());
+    }
+
+    #[test]
+    fn test_resolve_file_path_errors_on_missing_file() {
+        assert!(resolve_file_path("/definitely/not/here.macaroon").is_err());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("stat env file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn test_write_env_file_creates_file_with_owner_only_permissions() {
+        let dir = temp_dir("env-new");
+        let env_path = dir.join(ENV_FILENAME);
+
+        write_env_file(&env_path, "nsec1testvalue").expect("write env file");
+
+        let contents = std::fs::read_to_string(&env_path).expect("read env file");
+        assert_eq!(contents, format!("{}=nsec1testvalue\n", NSEC_ENV_VAR));
+        #[cfg(unix)]
+        assert_eq!(mode_of(&env_path), 0o600);
+    }
+
+    #[test]
+    fn test_write_env_file_tightens_preexisting_broader_permissions() {
+        let dir = temp_dir("env-existing");
+        let env_path = dir.join(ENV_FILENAME);
+        std::fs::write(&env_path, "OLD=stale\n").expect("seed env file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o644))
+                .expect("loosen permissions");
+        }
+
+        write_env_file(&env_path, "nsec1replaced").expect("rewrite env file");
+
+        // Old content truncated, permissions tightened back to 0600.
+        let contents = std::fs::read_to_string(&env_path).expect("read env file");
+        assert_eq!(contents, format!("{}=nsec1replaced\n", NSEC_ENV_VAR));
+        #[cfg(unix)]
+        assert_eq!(mode_of(&env_path), 0o600);
+    }
 }

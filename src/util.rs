@@ -1669,22 +1669,39 @@ mod tests {
         assert_eq!(result, "deadbeef");
     }
 
+    /// `NOSTR_CLIENT` is a process-wide `OnceLock` that `initialize()` and
+    /// every other test's `init_globals()` also install into, so the two
+    /// halves of this used to live in separate tests: one asserted
+    /// `get_nostr_client()` errors while the lock reads `None`, the other
+    /// asserted it succeeds once set.
+    ///
+    /// That split was racy. Reading `NOSTR_CLIENT.get()` and then asserting
+    /// on `get_nostr_client()` is a check-then-act on shared state: a
+    /// concurrent test can install the client in between and flip the result
+    /// from `Err` to `Ok`. Serializing just these two wouldn't fix it either,
+    /// since any `init_globals()` caller sets the same lock.
+    ///
+    /// A `OnceLock` is monotonic — once installed it never reverts — so the
+    /// post-set direction is the only one that holds no matter who wins the
+    /// race. Assert that, and only that. The uninitialized branch is not
+    /// deterministically reachable in a shared-process test binary.
     #[tokio::test]
-    async fn test_get_nostr_client_failure() {
+    async fn get_nostr_client_succeeds_once_the_global_is_installed() {
         initialize();
-        // Ensure NOSTR_CLIENT is not initialized for the test
-        let client = NOSTR_CLIENT.get();
-        assert!(client.is_none());
-    }
+        // Idempotent: whoever won the race already installed an equivalent
+        // client, and `set` on an initialized `OnceLock` is a no-op.
+        let _ = NOSTR_CLIENT.set(Client::default());
 
-    #[tokio::test]
-    async fn test_get_nostr_client_success() {
-        initialize();
-        // Mock NOSTR_CLIENT initialization
-        let client = Client::default();
-        NOSTR_CLIENT.set(client).unwrap();
-        let client_result = get_nostr_client();
-        assert!(client_result.is_ok());
+        assert!(
+            NOSTR_CLIENT.get().is_some(),
+            "the global must be installed after set()"
+        );
+        assert!(
+            get_nostr_client().is_ok(),
+            "an installed global must be readable"
+        );
+        // Monotonic: a second read cannot regress to Err.
+        assert!(get_nostr_client().is_ok(), "OnceLock must not revert");
     }
 
     #[test]
@@ -1935,5 +1952,837 @@ mod tests {
             matches!(err, MostroInternalErr(ServiceError::UnexpectedError(_))),
             "expected UnexpectedError for non-positive max_amount, got {err:?}"
         );
+    }
+
+    // ───────────────── shared helpers for the coverage tests below ─────────────────
+
+    /// Install the process-wide globals handlers reach for. Idempotent —
+    /// whichever test wins the OnceLock race, values stay consistent.
+    fn init_globals() {
+        let _ = MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let _ = NOSTR_CLIENT.set(Client::default());
+    }
+
+    /// In-memory pool with the full production schema.
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_user_row(pool: &SqlitePool, pubkey: &str, last_trade_index: i64) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, last_trade_index, created_at, total_rating, total_reviews) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(pubkey)
+        .bind(last_trade_index)
+        .bind(Timestamp::now().as_secs() as i64 - 86_400)
+        .bind(4.5_f64)
+        .bind(3_i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn base_order(kind: OrderKind, status: Status) -> Order {
+        Order {
+            id: Uuid::new_v4(),
+            kind: kind.to_string(),
+            status: status.to_string(),
+            payment_method: "SEPA".to_string(),
+            amount: 1_000,
+            fee: 10,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            created_at: Timestamp::now().as_secs() as i64,
+            expires_at: Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        }
+    }
+
+    /// Ensure the process-wide DB pool exists (migrated, in-memory).
+    ///
+    /// `DB_POOL` is a set-once global shared by every test in the binary, so
+    /// whichever test runs first wins the race and installs its pool. That
+    /// winner may have set up a different (or partial) schema, so we run our
+    /// migrations against the live pool unconditionally — they are idempotent
+    /// (tracked in `_sqlx_migrations`) and guarantee the tables these tests
+    /// need exist regardless of who won.
+    async fn ensure_global_db_pool() -> std::sync::Arc<SqlitePool> {
+        if DB_POOL.get().is_none() {
+            let pool = migrated_pool().await;
+            let _ = DB_POOL.set(std::sync::Arc::new(pool));
+        }
+        let pool = get_db_pool();
+        // Surface a migration failure instead of discarding it. Swallowing it
+        // would hand back a pool with a partial schema, and the tests built on
+        // it would fail much later with a confusing "no such table" instead of
+        // the real cause. The migrator is idempotent (tracked in
+        // `_sqlx_migrations`) and every `CREATE TABLE` in `migrations/` is
+        // `IF NOT EXISTS`, so re-running it against an already-migrated pool
+        // is a no-op — a failure here means a genuinely broken global pool.
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .expect("the process-global test pool must be fully migrated");
+        pool
+    }
+
+    /// Freshly-signed BOLT11 invoice built locally (no network, no LND).
+    fn build_test_invoice(amount_msat: u64, expiry_secs: u64) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        use std::time::Duration;
+
+        let secp = Secp256k1::new();
+        let private_key = SecretKey::from_slice(&[0x42; 32]).expect("valid secret key");
+        let payment_hash = sha256::Hash::hash(&[0u8; 32]);
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .description("mostro util coverage invoice".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([42u8; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .expiry_time(Duration::from_secs(expiry_secs))
+            .amount_milli_satoshis(amount_msat)
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &private_key))
+            .expect("valid signed invoice")
+            .to_string()
+    }
+
+    // ───────────────────────── market quote & fees ─────────────────────────
+
+    #[test]
+    fn market_quote_converts_fiat_and_applies_premium() {
+        BitcoinPriceManager::set_price_for_test("UTILQ1", 50_000.0);
+        // 100 / 50_000 * 1e8 = 200_000 sats without premium…
+        assert_eq!(get_market_quote(&100, "UTILQ1", 0).unwrap(), 200_000);
+        // …and 10% premium knocks 10% off the sats value.
+        assert_eq!(get_market_quote(&100, "UTILQ1", 10).unwrap(), 180_000);
+    }
+
+    #[test]
+    fn market_quote_rejects_non_positive_price() {
+        BitcoinPriceManager::set_price_for_test("UTILQ2", 0.0);
+        let err = get_market_quote(&100, "UTILQ2", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            MostroError::MostroInternalErr(ServiceError::NoAPIResponse)
+        ));
+    }
+
+    #[test]
+    fn market_amount_and_fee_returns_quote_and_fee() {
+        init_globals();
+        BitcoinPriceManager::set_price_for_test("UTILQ3", 50_000.0);
+        let (sats, fee) = get_market_amount_and_fee(100, "UTILQ3", 0).unwrap();
+        assert_eq!(sats, 200_000);
+        // Both candidate global configs carry fee = 0.
+        assert_eq!(fee, 0);
+        assert_eq!(get_fee(1_000), 0);
+    }
+
+    #[test]
+    fn dev_fee_uses_configured_percentage() {
+        init_globals();
+        // Both candidate global configs carry dev_fee_percentage = 0.30.
+        assert_eq!(get_dev_fee(1_000), 300);
+    }
+
+    #[test]
+    fn maker_bond_notional_market_path_converts_at_cached_price() {
+        BitcoinPriceManager::set_price_for_test("UTILQ4", 40_000.0);
+        let order = Order {
+            amount: 0,
+            fiat_code: "UTILQ4".to_string(),
+            fiat_amount: 100,
+            ..Default::default()
+        };
+        // 100 / 40_000 * 1e8 = 250_000 sats.
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 250_000);
+    }
+
+    #[test]
+    fn maker_bond_notional_rejects_non_positive_price() {
+        BitcoinPriceManager::set_price_for_test("UTILQ5", 0.0);
+        // Market-priced single order.
+        let order = Order {
+            amount: 0,
+            fiat_code: "UTILQ5".to_string(),
+            fiat_amount: 100,
+            ..Default::default()
+        };
+        assert!(matches!(
+            maker_bond_notional_sats(&order).unwrap_err(),
+            MostroInternalErr(ServiceError::NoAPIResponse)
+        ));
+        // Range order against a non-positive price.
+        let range = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(100),
+            fiat_code: "UTILQ5".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            maker_bond_notional_sats(&range).unwrap_err(),
+            MostroInternalErr(ServiceError::NoAPIResponse)
+        ));
+    }
+
+    // ───────────────────────── expiration helpers ─────────────────────────
+
+    #[test]
+    fn expiration_date_defaults_and_clamps() {
+        init_globals();
+        let now = Timestamp::now().as_secs() as i64;
+        // Both candidate global configs: 24h default, 15d max.
+        let default_exp = get_expiration_date(None);
+        assert!((default_exp - now - 86_400).abs() <= 2);
+
+        // A user-supplied value inside the window is kept…
+        let wanted = now + 100;
+        assert_eq!(get_expiration_date(Some(wanted)), wanted);
+
+        // …and one beyond the max is clamped to now + 15 days.
+        let clamped = get_expiration_date(Some(now + 90 * 86_400));
+        assert!((clamped - now - 15 * 86_400).abs() <= 2);
+    }
+
+    #[test]
+    fn expiration_timestamp_by_kind_uses_config_and_ignores_unknown_kinds() {
+        init_globals();
+        let now = Timestamp::now().as_secs() as i64;
+        // Known kinds resolve through the expiration configuration.
+        let order_exp = get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
+            .expect("order events always expire");
+        assert!(order_exp > now);
+        assert!(get_expiration_timestamp_for_kind(DM_EVENT_KIND).is_some());
+        // Unknown kinds never get an expiration.
+        assert!(get_expiration_timestamp_for_kind(12_345).is_none());
+    }
+
+    // ───────────────────────── order tags & publication ─────────────────────────
+
+    #[tokio::test]
+    async fn get_tags_for_new_order_covers_user_and_privacy_paths() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let identity = Keys::generate().public_key();
+        let trade = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending);
+
+        // Known user → reputation-tagged event.
+        insert_user_row(&pool, &identity.to_string(), 1).await;
+        let tags = get_tags_for_new_order(&order, &pool, &identity, &trade, &keys)
+            .await
+            .unwrap();
+        assert!(tags.is_some());
+
+        // Unknown user in full-privacy shape (identity == trade) → zeroed reputation.
+        let privacy = Keys::generate().public_key();
+        let tags = get_tags_for_new_order(&order, &pool, &privacy, &privacy, &keys)
+            .await
+            .unwrap();
+        assert!(tags.is_some());
+
+        // Unknown user with mismatched keys → invalid pubkey.
+        let stranger = Keys::generate().public_key();
+        let err = get_tags_for_new_order(&order, &pool, &stranger, &trade, &keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MostroInternalErr(ServiceError::InvalidPubkey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn publish_order_persists_row_and_fails_only_at_broadcast() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let trade = Keys::generate().public_key();
+        let new_order = SmallOrder {
+            kind: Some(OrderKind::Sell),
+            amount: 1_000,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            payment_method: "SEPA".to_string(),
+            ..Default::default()
+        };
+
+        // Full-privacy maker (identity == trade). The offline client cannot
+        // broadcast, so the pipeline must fail at the very last step…
+        let res = publish_order(
+            &pool,
+            &keys,
+            &new_order,
+            trade,
+            trade,
+            trade,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+
+        // …with the order row already persisted as pending.
+        let (status, event_id, seller): (String, String, Option<String>) =
+            sqlx::query_as("SELECT status, event_id, seller_pubkey FROM orders LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending");
+        assert!(!event_id.is_empty());
+        assert_eq!(seller.as_deref(), Some(trade.to_string().as_str()));
+    }
+
+    #[tokio::test]
+    async fn publish_order_buy_kind_market_priced_sets_buyer_fields() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let identity = Keys::generate().public_key();
+        let trade = Keys::generate().public_key();
+        insert_user_row(&pool, &identity.to_string(), 1).await;
+        let new_order = SmallOrder {
+            kind: Some(OrderKind::Buy),
+            amount: 0, // market priced → price_from_api = true
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            payment_method: "SEPA".to_string(),
+            ..Default::default()
+        };
+
+        let res = publish_order(
+            &pool,
+            &keys,
+            &new_order,
+            trade,
+            identity,
+            trade,
+            Some(1),
+            Some(2),
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+
+        let (kind, buyer, price_from_api): (String, Option<String>, bool) =
+            sqlx::query_as("SELECT kind, buyer_pubkey, price_from_api FROM orders LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "buy");
+        assert_eq!(buyer.as_deref(), Some(trade.to_string().as_str()));
+        assert!(price_from_api);
+    }
+
+    #[tokio::test]
+    async fn publish_order_without_kind_is_rejected() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let trade = Keys::generate().public_key();
+        let new_order = SmallOrder {
+            kind: None,
+            amount: 1_000,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            ..Default::default()
+        };
+
+        let res = publish_order(&pool, &keys, &new_order, trade, trade, trade, None, None).await;
+        assert!(matches!(
+            res,
+            Err(MostroCantDo(CantDoReason::InvalidOrderKind))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_publish_after_maker_bond_claims_and_publishes() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let trade = Keys::generate().public_key();
+
+        // Sell order parked at WaitingMakerBond, full-privacy maker.
+        let mut order = base_order(OrderKind::Sell, Status::WaitingMakerBond);
+        order.seller_pubkey = Some(trade.to_string());
+        order.master_seller_pubkey = Some(trade.to_string());
+        order.trade_index_seller = Some(1);
+        let order = order.create(&pool).await.unwrap();
+
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, Some(1)).await;
+        // Offline broadcast failure — but the CAS must have flipped the row.
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM orders LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[tokio::test]
+    async fn resume_publish_after_maker_bond_buy_kind() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let trade = Keys::generate().public_key();
+
+        let mut order = base_order(OrderKind::Buy, Status::WaitingMakerBond);
+        order.buyer_pubkey = Some(trade.to_string());
+        order.master_buyer_pubkey = Some(trade.to_string());
+        order.trade_index_buyer = Some(1);
+        let order = order.create(&pool).await.unwrap();
+
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, None).await;
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_publish_after_maker_bond_skips_when_status_moved_on() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+
+        // Already pending → CAS affects 0 rows → clean skip.
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, None).await;
+        assert!(res.is_ok(), "stale deferred publish must skip: {res:?}");
+    }
+
+    // ───────────────────── order event updates & ratings ─────────────────────
+
+    #[tokio::test]
+    async fn update_order_event_covers_reputation_paths() {
+        init_globals();
+        let gpool = ensure_global_db_pool().await;
+        let keys = Keys::generate();
+        let trade = Keys::generate().public_key();
+
+        // Full privacy (master == trade, no user row) → zeroed reputation.
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.seller_pubkey = Some(trade.to_string());
+        order.master_seller_pubkey = Some(trade.to_string());
+        let updated = update_order_event(&keys, Status::Pending, &order)
+            .await
+            .unwrap();
+        assert_eq!(updated.status, Status::Pending.to_string());
+        assert!(!updated.event_id.is_empty(), "a NIP-33 event must be built");
+
+        // Known user → reputation from the users table.
+        let master = Keys::generate().public_key();
+        insert_user_row(&gpool, &master.to_string(), 1).await;
+        let mut order2 = base_order(OrderKind::Sell, Status::Pending);
+        order2.seller_pubkey = Some(trade.to_string());
+        order2.master_seller_pubkey = Some(master.to_string());
+        let updated2 = update_order_event(&keys, Status::Pending, &order2)
+            .await
+            .unwrap();
+        assert!(!updated2.event_id.is_empty());
+
+        // Buy order resolves the buyer-side keys.
+        let mut order3 = base_order(OrderKind::Buy, Status::Pending);
+        order3.buyer_pubkey = Some(trade.to_string());
+        order3.master_buyer_pubkey = Some(trade.to_string());
+        assert!(update_order_event(&keys, Status::Pending, &order3)
+            .await
+            .is_ok());
+
+        // Unknown master ≠ trade → invalid pubkey.
+        let stranger = Keys::generate().public_key();
+        let mut order4 = base_order(OrderKind::Sell, Status::Pending);
+        order4.seller_pubkey = Some(trade.to_string());
+        order4.master_seller_pubkey = Some(stranger.to_string());
+        let err = update_order_event(&keys, Status::Pending, &order4)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MostroInternalErr(ServiceError::InvalidPubkey)
+        ));
+
+        // Non-pending status → no reputation lookup, no event emitted.
+        let order5 = base_order(OrderKind::Sell, Status::Active);
+        let updated5 = update_order_event(&keys, Status::Active, &order5)
+            .await
+            .unwrap();
+        assert!(updated5.event_id.is_empty());
+    }
+
+    // ───────────────────────── nostr client plumbing ─────────────────────────
+
+    #[tokio::test]
+    async fn connect_nostr_builds_client_with_configured_relays() {
+        init_globals();
+        let client = connect_nostr().await.expect("client must build offline");
+        assert!(
+            !client.relays().await.is_empty(),
+            "configured relays must be registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_nostr_relays_returns_map_when_client_installed() {
+        init_globals();
+        assert!(get_nostr_relays().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_keys_follows_global_config() {
+        init_globals();
+        match get_keys() {
+            Ok(keys) => assert_eq!(keys.public_key().to_hex().len(), 64),
+            // The settings template carries a placeholder nsec — whichever
+            // config won the global OnceLock race, behaviour must be typed.
+            Err(MostroInternalErr(ServiceError::NostrError(_))) => {}
+            Err(e) => panic!("unexpected error kind: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_dev_fee_audit_event_fails_offline() {
+        init_globals();
+        let order = base_order(OrderKind::Sell, Status::Success);
+        // Either the placeholder nsec fails key parsing (template config) or
+        // the offline client fails the broadcast — both are typed errors.
+        assert!(publish_dev_fee_audit_event(&order, "deadbeef")
+            .await
+            .is_err());
+    }
+
+    // ───────────────────────── LND-dependent early failures ─────────────────────────
+
+    #[tokio::test]
+    async fn show_hold_invoice_fails_fast_without_lnd() {
+        init_globals();
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::WaitingPayment);
+
+        let res = show_hold_invoice(&keys, None, &buyer, &seller, order, None).await;
+        assert!(res.is_err(), "no LND reachable in unit tests");
+    }
+
+    #[tokio::test]
+    async fn invoice_subscribe_fails_fast_without_lnd() {
+        init_globals();
+        assert!(invoice_subscribe(vec![0u8; 32], None).await.is_err());
+    }
+
+    // ───────────────────────── messaging helpers ─────────────────────────
+
+    #[tokio::test]
+    async fn set_waiting_invoice_status_notifies_both_parties() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Active);
+        order.seller_pubkey = Some(seller.to_string());
+
+        let amount = set_waiting_invoice_status(&mut order, buyer, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(amount, 1_000);
+    }
+
+    #[tokio::test]
+    async fn rate_counterpart_enqueues_rate_requests() {
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Success);
+        assert!(rate_counterpart(&buyer, &seller, &order, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn enqueue_helpers_push_into_global_queues() {
+        // The queues are process-wide and concurrently drained by the
+        // scheduler flush-job tests, so asserting on queue contents here
+        // would race. The contract under test is "enqueue completes and
+        // never panics"; delivery is covered by the scheduler tests.
+        let key = Keys::generate().public_key();
+        enqueue_cant_do_msg(Some(1), None, CantDoReason::NotFound, key).await;
+        enqueue_restore_session_msg(None, key).await;
+        enqueue_order_msg(Some(1), None, Action::Rate, None, key, None).await;
+    }
+
+    // ───────────────────────── escrow settlement ─────────────────────────
+
+    struct FakeEscrow {
+        settle_ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::escrow::EscrowBackend for FakeEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            Ok((String::new(), vec![], vec![]))
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            if self.settle_ok {
+                Ok(())
+            } else {
+                Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+                    "forced failure".to_string(),
+                )))
+            }
+        }
+
+        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+    }
+
+    fn unwrapped_from(trade: &Keys) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::new_order(None, None, None, Action::Release, None),
+            signature: None,
+            sender: trade.public_key(),
+            identity: trade.public_key(),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_seller_hold_invoice_success_and_error_paths() {
+        let seller = Keys::generate();
+        let mut order = base_order(OrderKind::Sell, Status::Active);
+        order.seller_pubkey = Some(seller.public_key().to_string());
+        order.preimage = Some("00".repeat(32));
+
+        // Seller with matching key and a preimage settles fine.
+        let mut escrow = FakeEscrow { settle_ok: true };
+        let event = unwrapped_from(&seller);
+        assert!(
+            settle_seller_hold_invoice(&event, &mut escrow, Action::Release, false, &order)
+                .await
+                .is_ok()
+        );
+
+        // A non-seller sender is rejected unless admin.
+        let interloper = Keys::generate();
+        let event = unwrapped_from(&interloper);
+        let err = settle_seller_hold_invoice(&event, &mut escrow, Action::Release, false, &order)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidPubkey)));
+
+        // Admin without a stored preimage → invalid invoice.
+        let mut no_preimage = order.clone();
+        no_preimage.preimage = None;
+        let event = unwrapped_from(&interloper);
+        let err = settle_seller_hold_invoice(
+            &event,
+            &mut escrow,
+            Action::AdminSettle,
+            true,
+            &no_preimage,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)));
+
+        // Escrow backend failures propagate.
+        let mut failing = FakeEscrow { settle_ok: false };
+        let event = unwrapped_from(&seller);
+        assert!(
+            settle_seller_hold_invoice(&event, &mut failing, Action::Release, false, &order)
+                .await
+                .is_err()
+        );
+    }
+
+    // ───────────────────────── dispute & invoice lookups ─────────────────────────
+
+    #[tokio::test]
+    async fn get_dispute_resolves_or_rejects() {
+        let pool = migrated_pool().await;
+
+        // No id in the message.
+        let msg = Message::Dispute(MessageKind::new(None, None, None, Action::Dispute, None));
+        assert!(get_dispute(&msg, &pool).await.is_err());
+
+        // Unknown id.
+        let msg = Message::Dispute(MessageKind::new(
+            Some(Uuid::new_v4()),
+            None,
+            None,
+            Action::Dispute,
+            None,
+        ));
+        assert!(get_dispute(&msg, &pool).await.is_err());
+
+        // Known dispute row resolves.
+        let dispute_id = Uuid::new_v4();
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, created_at) \
+             VALUES (?, ?, 'initiated', 'active', ?)",
+        )
+        .bind(dispute_id)
+        .bind(order_id)
+        .bind(Timestamp::now().as_secs() as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let msg = Message::Dispute(MessageKind::new(
+            Some(dispute_id),
+            None,
+            None,
+            Action::Dispute,
+            None,
+        ));
+        let dispute = get_dispute(&msg, &pool).await.unwrap();
+        assert_eq!(dispute.order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn validate_invoice_paths() {
+        init_globals();
+        let mut order = base_order(OrderKind::Sell, Status::Active);
+        order.amount = 1_100;
+        order.fee = 100;
+
+        // No payment request in the message → nothing to validate.
+        let msg = Message::new_order(None, None, None, Action::AddInvoice, None);
+        assert_eq!(validate_invoice(&msg, &order).await.unwrap(), None);
+
+        // Garbage payment request → invalid invoice.
+        let msg = Message::new_order(
+            None,
+            None,
+            None,
+            Action::AddInvoice,
+            Some(Payload::PaymentRequest(
+                None,
+                "notaninvoice".to_string(),
+                None,
+            )),
+        );
+        let err = validate_invoice(&msg, &order).await.unwrap_err();
+        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)));
+
+        // Freshly-built invoice for amount - fee = 1000 sats validates.
+        let pr = build_test_invoice(1_000_000, 86_400);
+        let msg = Message::new_order(
+            None,
+            None,
+            None,
+            Action::AddInvoice,
+            Some(Payload::PaymentRequest(None, pr.clone(), None)),
+        );
+        assert_eq!(validate_invoice(&msg, &order).await.unwrap(), Some(pr));
+    }
+
+    // ───────────────────────── taker reputation notification ─────────────────────────
+
+    #[tokio::test]
+    async fn notify_taker_reputation_covers_all_branches() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let master = Keys::generate().public_key();
+
+        // Sell order without master buyer key → invalid pubkey.
+        let order = base_order(OrderKind::Sell, Status::WaitingBuyerInvoice);
+        let err = notify_taker_reputation(&pool, &order).await.unwrap_err();
+        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidPubkey)));
+
+        // Sell + WaitingBuyerInvoice → PayInvoice to seller (unknown taker →
+        // zeroed reputation).
+        let mut order = base_order(OrderKind::Sell, Status::WaitingBuyerInvoice);
+        order.master_buyer_pubkey = Some(master.to_string());
+        order.seller_pubkey = Some(seller.to_string());
+        assert!(notify_taker_reputation(&pool, &order).await.is_ok());
+
+        // Known taker → reputation loaded from the users table.
+        insert_user_row(&pool, &master.to_string(), 1).await;
+        assert!(notify_taker_reputation(&pool, &order).await.is_ok());
+
+        // Buy + WaitingBuyerInvoice → maker is adding the invoice → no-op Ok.
+        let mut order = base_order(OrderKind::Buy, Status::WaitingBuyerInvoice);
+        order.master_seller_pubkey = Some(master.to_string());
+        assert!(notify_taker_reputation(&pool, &order).await.is_ok());
+
+        // Buy + WaitingPayment → AddInvoice to buyer.
+        let mut order = base_order(OrderKind::Buy, Status::WaitingPayment);
+        order.master_seller_pubkey = Some(master.to_string());
+        order.buyer_pubkey = Some(buyer.to_string());
+        assert!(notify_taker_reputation(&pool, &order).await.is_ok());
+
+        // Sell + WaitingPayment → not allowed.
+        let mut order = base_order(OrderKind::Sell, Status::WaitingPayment);
+        order.master_buyer_pubkey = Some(master.to_string());
+        let err = notify_taker_reputation(&pool, &order).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroCantDo(CantDoReason::NotAllowedByStatus)
+        ));
+
+        // Any other status → not allowed.
+        let mut order = base_order(OrderKind::Sell, Status::Active);
+        order.master_buyer_pubkey = Some(master.to_string());
+        let err = notify_taker_reputation(&pool, &order).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MostroCantDo(CantDoReason::NotAllowedByStatus)
+        ));
+    }
+
+    // ───────────────────────── fiat amount extraction ─────────────────────────
+
+    #[test]
+    fn fiat_amount_requested_covers_range_and_fixed_orders() {
+        // Fixed order → always its own fiat amount.
+        let order = base_order(OrderKind::Sell, Status::Pending);
+        let msg = Message::new_order(None, None, None, Action::TakeSell, None);
+        assert_eq!(get_fiat_amount_requested(&order, &msg), Some(100));
+
+        // Range order with an out-of-bounds request → None.
+        let mut range = base_order(OrderKind::Sell, Status::Pending);
+        range.min_amount = Some(50);
+        range.max_amount = Some(200);
+        let msg = Message::new_order(
+            None,
+            None,
+            None,
+            Action::TakeSell,
+            Some(Payload::Amount(1_000)),
+        );
+        assert_eq!(get_fiat_amount_requested(&range, &msg), None);
+
+        // Range order without any requested amount → None.
+        let msg = Message::new_order(None, None, None, Action::TakeSell, None);
+        assert_eq!(get_fiat_amount_requested(&range, &msg), None);
     }
 }

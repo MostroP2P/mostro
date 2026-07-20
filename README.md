@@ -1055,6 +1055,28 @@ cd mostro-regtest
 # Follow README for complete regtest environment
 ```
 
+**Code Coverage**: Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+```bash
+# One-time install
+cargo install cargo-llvm-cov
+
+# Per-file + total line coverage in the terminal
+cargo llvm-cov --summary-only
+
+# Generate an HTML report and open it
+cargo llvm-cov --html         # writes target/llvm-cov/html/index.html
+cargo llvm-cov --open         # ...and opens it in the browser
+
+# Emit lcov for CI or editor gutters
+cargo llvm-cov --lcov --output-path lcov.info
+```
+
+The unit-test suite runs entirely offline (in-memory SQLite, locally-built
+invoices — no relay, LND, or network). The remaining uncovered lines are the
+paths that structurally require a live LND node, a Cashu mint, a network relay,
+interactive stdin (the config wizard), or the `main()` / `app::run` bootstrap
+loop — none of which are exercisable in an offline unit test.
+
 ---
 
 ### Documentation

@@ -760,3 +760,966 @@ async fn order_for_greater(
 
     Ok((new_order.clone(), event))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::app::context::AppContext;
+    use crate::config::{MESSAGE_QUEUES, MOSTRO_CONFIG};
+    use async_trait::async_trait;
+    use nostr_sdk::{Keys, Timestamp};
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    /// The `MOSTRO_CONFIG` OnceLock is process-global: set it to the shared
+    /// `test_settings()` defaults (idempotent across concurrent tests).
+    fn init_global_config() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    fn build_ctx(pool: &SqlitePool) -> AppContext {
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build()
+    }
+
+    /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)
+    /// is `pubkey`, mirroring the fixture used by the cancel handler tests.
+    fn create_unwrapped_message_with_pubkey(pubkey: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::Order(MessageKind::new(
+                Some(uuid::Uuid::new_v4()),
+                Some(1),
+                None,
+                Action::Release,
+                None,
+            )),
+            signature: None,
+            sender: pubkey,
+            identity: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    /// Sell order in `FiatSent` with a preimage so the hold invoice can be
+    /// settled. Master keys equal the trade keys (normal mode, deterministic).
+    fn fiat_sent_sell_order(seller: PublicKey, buyer: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::FiatSent.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: seller.to_string(),
+            seller_pubkey: Some(seller.to_string()),
+            master_seller_pubkey: Some(seller.to_string()),
+            buyer_pubkey: Some(buyer.to_string()),
+            master_buyer_pubkey: Some(buyer.to_string()),
+            preimage: Some("aa".to_string()),
+            amount: 21_000,
+            fee: 21,
+            fiat_amount: 40,
+            ..Default::default()
+        }
+    }
+
+    fn release_message(order_id: uuid::Uuid, payload: Option<Payload>) -> Message {
+        Message::new_order(Some(order_id), Some(1), None, Action::Release, payload)
+    }
+
+    /// Actions queued on the process-global order queue for a given order id.
+    /// The queue is shared across concurrently running tests, so assertions
+    /// must always filter by our own order id.
+    async fn queued_actions_for(order_id: uuid::Uuid) -> Vec<Action> {
+        MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(msg, _)| msg.get_inner_message_kind().id == Some(order_id))
+            .map(|(msg, _)| msg.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    struct StubEscrow;
+
+    #[async_trait]
+    impl EscrowBackend for StubEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            Ok(("lnbc1".to_string(), vec![0u8; 32], vec![1u8; 32]))
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+
+        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+    }
+
+    struct FailingSettleEscrow;
+
+    #[async_trait]
+    impl EscrowBackend for FailingSettleEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            Ok(("lnbc1".to_string(), vec![0u8; 32], vec![1u8; 32]))
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+                "stub settle failure".to_string(),
+            )))
+        }
+
+        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // check_failure_retries
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_failure_retries_notifies_buyer_on_first_failure() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.payment_attempts = 0;
+        order.failed_payment = false;
+        let order = order.create(&pool).await.unwrap();
+
+        // Act
+        let result = check_failure_retries(&ctx, &order, None).await;
+
+        // Assert
+        let updated = result.unwrap();
+        assert!(updated.failed_payment);
+        assert_eq!(updated.payment_attempts, 1);
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
+        assert_eq!(db_order.payment_attempts, 1);
+        assert!(queued_actions_for(order.id)
+            .await
+            .contains(&Action::PaymentFailed));
+    }
+
+    #[tokio::test]
+    async fn check_failure_retries_sends_add_invoice_when_retries_exhausted() {
+        // Arrange: custom per-ctx settings with a 3-attempt budget.
+        let pool = create_test_pool().await;
+        let mut settings = test_settings();
+        settings.lightning.payment_attempts = 3;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(settings)
+            .build();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.payment_attempts = 3;
+        order.failed_payment = true;
+        order.amount = 5_000;
+        order.fee = 100;
+        let order = order.create(&pool).await.unwrap();
+
+        // Act
+        let result = check_failure_retries(&ctx, &order, None).await;
+
+        // Assert
+        let updated = result.unwrap();
+        assert_eq!(updated.payment_attempts, 3);
+        assert!(queued_actions_for(order.id)
+            .await
+            .contains(&Action::AddInvoice));
+    }
+
+    #[tokio::test]
+    async fn check_failure_retries_rejects_non_positive_amount() {
+        // Arrange: amount minus fee is zero on the retry-exhausted branch.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.payment_attempts = 1;
+        order.failed_payment = true;
+        order.amount = 100;
+        order.fee = 100;
+
+        // Act
+        let result = check_failure_retries(&ctx, &order, None).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidAmount))
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_failure_retries_rejects_invalid_order_kind() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.payment_attempts = 1;
+        order.failed_payment = true;
+        order.kind = "bogus-kind".to_string();
+
+        // Act
+        let result = check_failure_retries(&ctx, &order, None).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidOrderKind))
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_failure_retries_rejects_invalid_order_status() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.payment_attempts = 1;
+        order.failed_payment = true;
+        order.status = "bogus-status".to_string();
+
+        // Act
+        let result = check_failure_retries(&ctx, &order, None).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidOrderStatus))
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // release_action
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn release_action_rejects_non_seller_sender() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let intruder = Keys::generate().public_key();
+        let event = create_unwrapped_message_with_pubkey(intruder);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPeer))
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_action_rejects_order_with_wrong_status() {
+        // Arrange: Active is neither FiatSent nor Dispute.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_action_propagates_escrow_settle_failure() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = FailingSettleEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert: escrow error propagates and the order does not move.
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::HoldInvoiceError(_)))
+        ));
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::FiatSent.to_string());
+    }
+
+    #[tokio::test]
+    async fn release_action_settles_and_notifies_on_happy_path() {
+        // Arrange: non-range order, no buyer invoice (do_payment fails fast).
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert
+        assert!(result.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::Released));
+        assert!(actions.contains(&Action::HoldInvoicePaymentSettled));
+        assert!(actions.contains(&Action::Rate));
+    }
+
+    #[tokio::test]
+    async fn release_action_closes_open_dispute() {
+        // Arrange: disputed order with an open dispute row.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::Dispute.to_string();
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+        Dispute::new(order.id, Status::Dispute.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert: order settled and dispute auto-closed as Settled.
+        assert!(result.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        let dispute = crate::db::find_dispute_by_order_id(&pool, order.id)
+            .await
+            .unwrap();
+        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+    }
+
+    #[tokio::test]
+    async fn release_action_creates_child_order_for_range_order() {
+        // Arrange: sell range order with remaining budget and a next-trade key.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(100);
+        order.min_amount = Some(10);
+        order.fiat_amount = 40;
+        let order = order.create(&pool).await.unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(
+            order.id,
+            Some(Payload::NextTrade(next_seller.to_string(), 2)),
+        );
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert: a pending child order carries the remaining range.
+        assert!(result.is_ok());
+        let child: Order =
+            sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE range_parent_id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(child.status, Status::Pending.to_string());
+        assert_eq!(child.max_amount, Some(60));
+        assert_eq!(child.fiat_amount, 0);
+        assert_eq!(child.seller_pubkey, Some(next_seller.to_string()));
+        assert_eq!(child.trade_index_seller, Some(2));
+        assert!(queued_actions_for(child.id)
+            .await
+            .contains(&Action::NewOrder));
+    }
+
+    #[tokio::test]
+    async fn release_action_still_succeeds_when_child_order_creation_fails() {
+        // Arrange: range order whose child event cannot be built (no master
+        // seller pubkey), driving the `Err` arm of the child-order match.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.master_seller_pubkey = None;
+        order.max_amount = Some(100);
+        order.min_amount = Some(10);
+        let order = order.create(&pool).await.unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert: release completes, no child order was persisted.
+        assert!(result.is_ok());
+        let children = sqlx::query("SELECT id FROM orders WHERE range_parent_id = ?")
+            .bind(order.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(children.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // handle_buy_child_order / handle_sell_child_order
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn handle_buy_child_order_requires_next_trade_pubkey() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+        let mut child = order.clone();
+
+        let result = handle_buy_child_order(&mut child, &order, None);
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+        ));
+    }
+
+    #[test]
+    fn handle_buy_child_order_uses_identity_key_in_normal_mode() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_buyer = Keys::generate().public_key();
+        let idkey = Keys::generate().public_key().to_string();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.next_trade_pubkey = Some(next_buyer.to_string());
+        order.next_trade_index = Some(5);
+        let mut child = order.clone();
+
+        let (notify_pubkey, trade_index) =
+            handle_buy_child_order(&mut child, &order, Some(idkey.clone())).unwrap();
+
+        assert_eq!(notify_pubkey, Some(next_buyer.to_string()));
+        assert_eq!(trade_index, Some(5));
+        assert_eq!(child.master_buyer_pubkey, Some(idkey));
+        assert_eq!(child.creator_pubkey, next_buyer.to_string());
+        assert_eq!(child.next_trade_pubkey, None);
+        assert_eq!(child.next_trade_index, None);
+    }
+
+    #[test]
+    fn handle_buy_child_order_uses_trade_key_in_full_privacy_mode() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.next_trade_pubkey = Some(next_buyer.to_string());
+        order.next_trade_index = Some(7);
+        let mut child = order.clone();
+
+        handle_buy_child_order(&mut child, &order, None).unwrap();
+
+        assert_eq!(child.master_buyer_pubkey, Some(next_buyer.to_string()));
+    }
+
+    #[test]
+    fn handle_sell_child_order_requires_next_trade() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut child = fiat_sent_sell_order(seller, buyer);
+
+        let result = handle_sell_child_order(&mut child, None, None);
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+        ));
+    }
+
+    #[test]
+    fn handle_sell_child_order_rejects_invalid_pubkey() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut child = fiat_sent_sell_order(seller, buyer);
+
+        let result =
+            handle_sell_child_order(&mut child, Some(("not-a-pubkey".to_string(), 1)), None);
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[test]
+    fn handle_sell_child_order_sets_seller_fields_for_both_privacy_modes() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+        let idkey = Keys::generate().public_key().to_string();
+
+        // Normal mode: identity key becomes the master seller pubkey.
+        let mut child = fiat_sent_sell_order(seller, buyer);
+        let (notify_pubkey, trade_index) = handle_sell_child_order(
+            &mut child,
+            Some((next_seller.to_string(), 3)),
+            Some(idkey.clone()),
+        )
+        .unwrap();
+        assert_eq!(notify_pubkey, Some(next_seller.to_string()));
+        assert_eq!(trade_index, Some(3));
+        assert_eq!(child.master_seller_pubkey, Some(idkey));
+        assert_eq!(child.creator_pubkey, next_seller.to_string());
+
+        // Full privacy mode: the next trade key doubles as master pubkey.
+        let mut child = fiat_sent_sell_order(seller, buyer);
+        handle_sell_child_order(&mut child, Some((next_seller.to_string(), 3)), None).unwrap();
+        assert_eq!(child.master_seller_pubkey, Some(next_seller.to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // handle_child_order
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_child_order_creates_buy_child_when_creator_is_buyer() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.kind = mostro_core::order::Kind::Buy.to_string();
+        order.creator_pubkey = buyer.to_string();
+        order.next_trade_pubkey = Some(next_buyer.to_string());
+        order.next_trade_index = Some(4);
+        let mut child = order.clone();
+        child.id = uuid::Uuid::new_v4();
+        child.status = Status::Pending.to_string();
+
+        // Act
+        let result = handle_child_order(child.clone(), &order, None, &pool, None).await;
+
+        // Assert: child persisted and next buyer notified.
+        assert!(result.is_ok());
+        let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
+        assert_eq!(db_child.buyer_pubkey, Some(next_buyer.to_string()));
+        assert_eq!(db_child.trade_index_buyer, Some(4));
+        assert!(queued_actions_for(child.id)
+            .await
+            .contains(&Action::NewOrder));
+    }
+
+    #[tokio::test]
+    async fn handle_child_order_creates_sell_child_when_creator_is_seller() {
+        // Arrange
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+        let mut child = order.clone();
+        child.id = uuid::Uuid::new_v4();
+        child.status = Status::Pending.to_string();
+
+        // Act
+        let result = handle_child_order(
+            child.clone(),
+            &order,
+            Some((next_seller.to_string(), 6)),
+            &pool,
+            None,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok());
+        let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
+        assert_eq!(db_child.seller_pubkey, Some(next_seller.to_string()));
+        assert_eq!(db_child.trade_index_seller, Some(6));
+    }
+
+    #[tokio::test]
+    async fn handle_child_order_rejects_invalid_type_or_creator() {
+        // Arrange: sell order whose creator is the buyer — neither branch fits.
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.creator_pubkey = buyer.to_string();
+        let child = order.clone();
+
+        // Act
+        let result = handle_child_order(child, &order, None, &pool, None).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_child_order_fails_when_next_trade_is_missing() {
+        // Arrange: sell-creator branch without a next trade key.
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+        let child = order.clone();
+
+        // Act
+        let result = handle_child_order(child, &order, None, &pool, None).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // create_base_order / get_child_order
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn create_base_order_resets_trade_state_for_sell_orders() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+
+        let base = create_base_order(&order).unwrap();
+
+        assert_ne!(base.id, order.id);
+        assert_eq!(base.status, Status::Pending.to_string());
+        assert_eq!(base.amount, 0);
+        assert_eq!(base.preimage, None);
+        assert_eq!(base.buyer_invoice, None);
+        assert_eq!(base.range_parent_id, Some(order.id));
+        // Sell orders clear the buyer side.
+        assert_eq!(base.buyer_pubkey, None);
+        assert_eq!(base.master_buyer_pubkey, None);
+        assert_eq!(base.trade_index_buyer, None);
+        // ... and keep the seller side.
+        assert_eq!(base.seller_pubkey, order.seller_pubkey);
+    }
+
+    #[test]
+    fn create_base_order_clears_seller_side_for_buy_orders() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.kind = mostro_core::order::Kind::Buy.to_string();
+
+        let base = create_base_order(&order).unwrap();
+
+        assert_eq!(base.seller_pubkey, None);
+        assert_eq!(base.master_seller_pubkey, None);
+        assert_eq!(base.trade_index_seller, None);
+        assert_eq!(base.buyer_pubkey, order.buyer_pubkey);
+    }
+
+    #[test]
+    fn create_base_order_rejects_invalid_kind() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.kind = "bogus-kind".to_string();
+
+        assert!(create_base_order(&order).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_child_order_returns_none_for_non_range_order() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+        let my_keys = Keys::generate();
+
+        let (child, event) = get_child_order(&ctx, order, &my_keys).await.unwrap();
+
+        assert!(child.is_none());
+        assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_child_order_consumes_range_when_remainder_equals_min() {
+        // Arrange: user present in db → rating branch of create_order_event.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(100);
+        order.min_amount = Some(50);
+        order.fiat_amount = 50;
+        crate::db::add_new_user(
+            &pool,
+            mostro_core::user::User::new(seller.to_string(), 0, 0, 0, 0, 0),
+        )
+        .await
+        .unwrap();
+        let my_keys = Keys::generate();
+
+        // Act
+        let (child, event) = get_child_order(&ctx, order, &my_keys).await.unwrap();
+
+        // Assert: the child becomes a fixed-amount order at the minimum.
+        let child = child.unwrap();
+        let event = event.unwrap();
+        assert_eq!(child.fiat_amount, 50);
+        assert_eq!(child.max_amount, None);
+        assert_eq!(child.min_amount, None);
+        assert_eq!(child.event_id, event.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn get_child_order_keeps_range_when_remainder_exceeds_min() {
+        // Arrange: user absent from db → fallback rating branch.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(100);
+        order.min_amount = Some(10);
+        order.fiat_amount = 40;
+        let my_keys = Keys::generate();
+
+        // Act
+        let (child, event) = get_child_order(&ctx, order, &my_keys).await.unwrap();
+
+        // Assert: the child keeps a shrunk range.
+        let child = child.unwrap();
+        assert!(event.is_some());
+        assert_eq!(child.max_amount, Some(60));
+        assert_eq!(child.min_amount, Some(10));
+        assert_eq!(child.fiat_amount, 0);
+    }
+
+    #[tokio::test]
+    async fn get_child_order_returns_none_when_remainder_below_min() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(100);
+        order.min_amount = Some(80);
+        order.fiat_amount = 50;
+        let my_keys = Keys::generate();
+
+        let (child, event) = get_child_order(&ctx, order, &my_keys).await.unwrap();
+
+        assert!(child.is_none());
+        assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_child_order_returns_none_on_subtraction_overflow() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(i64::MIN);
+        order.min_amount = Some(0);
+        order.fiat_amount = 1;
+        let my_keys = Keys::generate();
+
+        let (child, event) = get_child_order(&ctx, order, &my_keys).await.unwrap();
+
+        assert!(child.is_none());
+        assert!(event.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // do_payment / payment_success
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn do_payment_fails_without_buyer_invoice() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer);
+
+        let result = do_payment(&ctx, order, None).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        ));
+    }
+
+    #[tokio::test]
+    async fn do_payment_fails_when_amount_is_consumed_by_fee() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.amount = 100;
+        order.fee = 100;
+
+        let result = do_payment(&ctx, order, None).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        ));
+    }
+
+    #[tokio::test]
+    async fn do_payment_fails_fast_when_lnd_is_unreachable() {
+        // Arrange: with the global config set to test defaults, the LND cert
+        // path is invalid, so LndConnector::new() returns an error without
+        // any network access.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_invoice = Some("lnbc1notchecked".to_string());
+
+        // Act
+        let result = do_payment(&ctx, order, None).await;
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn payment_success_transitions_settled_order_to_success() {
+        // Arrange
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let mut order = order.create(&pool).await.unwrap();
+        let my_keys = Keys::generate();
+
+        // Act
+        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+
+        // Assert
+        assert!(result.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::PurchaseCompleted));
+        assert!(actions.contains(&Action::Rate));
+    }
+
+    #[tokio::test]
+    async fn payment_success_skips_orders_already_processed() {
+        // Arrange: DB row is Active, so the guarded UPDATE matches no rows.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        let mut order = order.create(&pool).await.unwrap();
+        let my_keys = Keys::generate();
+
+        // Act
+        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+
+        // Assert: early return — status untouched, no Rate message queued.
+        assert!(result.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Active.to_string());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::PurchaseCompleted));
+        assert!(!actions.contains(&Action::Rate));
+    }
+}

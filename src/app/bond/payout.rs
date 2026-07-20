@@ -1897,6 +1897,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_payout_invoice_proceeds_after_cadence_window_elapsed() {
+        // The counterpart of `respects_cadence_window`: `last_invoice_request_at`
+        // is `Some`, but old enough that `invoice_window_seconds` has already
+        // elapsed. Execution must fall through the inner `if` (not return
+        // early) and issue a fresh request exactly like the no-prior-request
+        // case — this is the branch the cadence guard's "not yet expired"
+        // twin never exercises.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let now = Utc::now().timestamp();
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now,
+            None,
+            Some(now - 400), // 400s ago, past the 300s window
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = count_add_bond_invoice_msgs(order_id).await;
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
+        let after = count_add_bond_invoice_msgs(order_id).await;
+
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT invoice_request_attempts, last_invoice_request_at FROM bonds WHERE id = ?",
+        )
+        .bind(bond.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1);
+        assert!(row.1.is_some_and(|t| t >= now));
+        assert_eq!(after - before, 1);
+    }
+
+    #[tokio::test]
     async fn request_payout_invoice_skips_enqueue_when_state_moved_off_pending_payout() {
         // Persist-first guarantee: if the row's state moved out of
         // `PendingPayout` between the scheduler snapshot and the
@@ -2284,6 +2323,47 @@ mod tests {
         assert_eq!(after.0, BondState::Slashed.to_string());
     }
 
+    #[tokio::test]
+    async fn finalize_node_only_cas_miss_leaves_row_untouched() {
+        // If the row moved off `PendingPayout` between the scheduler's
+        // snapshot and this CAS (e.g. a concurrent operator transition),
+        // the `WHERE state = 'pending-payout'` predicate must miss and the
+        // function must leave the row exactly as it found it — no
+        // clobbering a state that already advanced under us.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            10_000, // node_share == amount → counterparty_share = 0
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Forfeited.to_string())
+            .bind(bond.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        finalize_node_only(&pool, &bond).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.0,
+            BondState::Forfeited.to_string(),
+            "CAS miss must not clobber the concurrently-moved state"
+        );
+    }
+
     // ── apply_payout_invoice / resurrection ───────────────────────────
 
     const CLAIM_WINDOW_SECONDS: i64 = 15 * 86_400;
@@ -2668,6 +2748,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_payout_invoice_rejects_unparseable_bond_state() {
+        // Defensive guard at the very top of the helper: a row whose
+        // `state` column doesn't parse via `BondState::from_str` (should
+        // never happen — every writer uses the enum's `Display`) must be
+        // rejected before any SQL runs, not panic or fall into one of the
+        // named-state branches.
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+        let mut bond =
+            pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, now, None, None);
+        bond.state = "quantum-superposition".to_string();
+
+        let outcome = apply_payout_invoice(&pool, &bond, "lnbc1pFRESH", now, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, InvoiceApplyOutcome::Rejected);
+    }
+
+    #[tokio::test]
     async fn apply_payout_invoice_resurrection_clears_payout_payment_hash() {
         // Failed → PendingPayout resurrection must NULL out the
         // `payout_payment_hash` column so the reconciliation branch in
@@ -2928,5 +3027,1152 @@ mod tests {
             .unwrap();
         assert_eq!(state.0, BondState::Slashed.to_string());
         assert_eq!(after.len(), before); // no new notification
+    }
+
+    // ── LND-dependent paths, driven against a lazily-connected client ──
+
+    /// Initialize the process-wide settings (first-set-wins OnceCell;
+    /// every init in the binary uses the same defaults).
+    fn init_test_settings() {
+        use crate::config::MOSTRO_CONFIG;
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::config::settings::Settings {
+            database: Default::default(),
+            nostr: crate::config::NostrSettings {
+                // Valid canonical test nsec: whichever module wins the
+                // MOSTRO_CONFIG race must install a parseable key, or tests
+                // that reach get_keys() flake on init ordering.
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+            anti_abuse_bond: None,
+            cashu: None,
+            price: None,
+        });
+        let _ = &MOSTRO_CONFIG;
+    }
+
+    /// Build a real `LndConnector` against a dead endpoint.
+    /// `fedimint_tonic_lnd::connect` is lazy (no TCP at build time), so
+    /// this always succeeds; every RPC then fails in ~1ms with a
+    /// transport error — exactly the "LND unreachable" shape the retry
+    /// and reconciliation branches are written for.
+    async fn dead_lnd() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-test-lnd-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("tls.cert");
+        let mac = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").unwrap();
+        std::fs::write(&mac, [1u8, 2u8]).unwrap();
+        let client = fedimint_tonic_lnd::connect(
+            "https://127.0.0.1:1".to_string(),
+            cert.to_str().unwrap().to_string(),
+            mac.to_str().unwrap().to_string(),
+        )
+        .await
+        .expect("lazy connect never dials");
+        LndConnector { client }
+    }
+
+    /// Freshly-signed bolt11 for `amount_sats`, valid for one hour.
+    /// Signed with a throwaway key — decoding and amount/expiry
+    /// validation don't care whose key it is.
+    fn signed_test_invoice(amount_sats: u64) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[42u8; 32]).unwrap();
+        let payment_hash = sha256::Hash::hash(&Uuid::new_v4().into_bytes());
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .description("mostro payout test".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([7u8; 32]))
+            .amount_milli_satoshis(amount_sats * 1_000)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .expiry_time(std::time::Duration::from_secs(3_600))
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &sk))
+            .expect("valid invoice")
+            .to_string()
+    }
+
+    #[test]
+    fn counterparty_share_missing_node_share_is_invariant_violation() {
+        let mut bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 0, 0, None, None);
+        bond.node_share_sats = None;
+        assert!(counterparty_share_sats(&bond).is_err());
+    }
+
+    #[test]
+    fn counterparty_share_out_of_range_node_share_is_rejected() {
+        let bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, -1, 0, None, None);
+        assert!(counterparty_share_sats(&bond).is_err());
+        let bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 10_001, 0, None, None);
+        assert!(counterparty_share_sats(&bond).is_err());
+    }
+
+    #[tokio::test]
+    async fn child_blocked_when_parent_bond_row_missing() {
+        // Defensive arm: a child row whose parent bond id resolves to
+        // nothing must be skipped (treated as blocked), never driven.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut child = pending_payout_bond(order_id, maker_pk(), 400, 0, 0, None, None);
+        child.parent_bond_id = Some(Uuid::new_v4()); // dangling
+        child.child_order_id = Some(order_id);
+        let child = create_bond(&pool, child).await.unwrap();
+
+        assert!(child_payout_blocked_by_locked_parent(&pool, &child)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn run_cycle_no_pending_bonds_is_a_cheap_noop() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let mut ln = dead_lnd().await;
+        run_bond_payout_cycle(&pool, &mut ln).await;
+    }
+
+    #[tokio::test]
+    async fn run_cycle_survives_enumeration_failure() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut ln = dead_lnd().await;
+        // Must log-and-return, not panic or propagate.
+        run_bond_payout_cycle(&pool, &mut ln).await;
+    }
+
+    #[tokio::test]
+    async fn run_cycle_processes_rows_and_warns_on_bad_ones() {
+        // One row missing `slashed_at` (invariant violation → per-bond
+        // warn) and one node-only row (finalized to Slashed). The cycle
+        // must finish and leave each row in the right state.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+
+        let mut broken = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, 0, None, None);
+        broken.slashed_at = None;
+        let broken = create_bond(&pool, broken).await.unwrap();
+
+        let order2 = Uuid::new_v4();
+        insert_order(&pool, order2, maker_pk(), taker_pk()).await;
+        let node_only = pending_payout_bond(
+            order2,
+            taker_pk(),
+            10_000,
+            10_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let node_only = create_bond(&pool, node_only).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        run_bond_payout_cycle(&pool, &mut ln).await;
+
+        let broken_after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(broken.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(broken_after.0, BondState::PendingPayout.to_string());
+        let node_after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(node_only.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(node_after.0, BondState::Slashed.to_string());
+    }
+
+    #[tokio::test]
+    async fn process_one_bond_skips_blocked_child_row() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+
+        let mut parent =
+            Bond::new_requested(order_id, maker_pk().to_string(), BondRole::Maker, 1_000);
+        parent.state = BondState::Locked.to_string();
+        let parent = create_bond(&pool, parent).await.unwrap();
+
+        let mut child = pending_payout_bond(order_id, maker_pk(), 400, 0, 0, None, None);
+        child.parent_bond_id = Some(parent.id);
+        child.child_order_id = Some(order_id);
+        let child = create_bond(&pool, child).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        process_one_bond(&pool, &mut ln, &child).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(child.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn process_one_bond_forfeits_after_claim_window() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let slashed_at = Utc::now().timestamp() - (CLAIM_WINDOW_SECONDS + 86_400);
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, slashed_at, None, None);
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+
+        let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, BondState::Forfeited.to_string());
+    }
+
+    #[tokio::test]
+    async fn process_one_bond_requests_invoice_when_none_submitted() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = count_add_bond_invoice_msgs(order_id).await;
+        let mut ln = dead_lnd().await;
+        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+        let after = count_add_bond_invoice_msgs(order_id).await;
+        assert_eq!(after - before, 1);
+    }
+
+    #[tokio::test]
+    async fn process_one_bond_pays_counterparty_when_invoice_present() {
+        // The other arm of `process_one_bond`'s `match bond.payout_invoice`:
+        // when an invoice is already on the row, it must route to
+        // `pay_counterparty` (not `request_payout_invoice`). Against
+        // `dead_lnd`, the send fails immediately (indeterminate), so the
+        // observable signature is `payout_attempts` bumped to 1 while the
+        // row stays `PendingPayout`.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_attempts, 1);
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn request_invoice_skips_when_order_row_missing() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM orders WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
+        // No cadence bump: the helper bailed before the CAS.
+        let row: (i64,) = sqlx::query_as("SELECT invoice_request_attempts FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+    }
+
+    #[tokio::test]
+    async fn request_invoice_errors_on_unparseable_slash_reason() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        bond.slashed_reason = Some("cosmic-rays".to_string());
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        assert!(request_payout_invoice(&pool, &bond, 300).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn request_invoice_skips_when_recipient_unresolvable() {
+        // Order has no buyer pubkey → recipient resolution yields None →
+        // skip-and-retry-next-tick, not an error.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (
+                id, kind, event_id, status, premium, payment_method,
+                amount, fiat_code, fiat_amount, created_at, expires_at,
+                seller_pubkey
+            ) VALUES (?, 'sell', ?, 'dispute', 0, 'cash', 100000, 'USD', 10, 0, 0, ?)"#,
+        )
+        .bind(order_id)
+        .bind(order_id.simple().to_string())
+        .bind(maker_pk())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let before = count_add_bond_invoice_msgs(order_id).await;
+        request_payout_invoice(&pool, &bond, 300).await.unwrap();
+        assert_eq!(count_add_bond_invoice_msgs(order_id).await, before);
+    }
+
+    #[tokio::test]
+    async fn request_invoice_errors_when_slashed_at_missing() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, 0, None, None);
+        bond.slashed_at = None;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        assert!(request_payout_invoice(&pool, &bond, 300).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pay_counterparty_undecodable_invoice_is_terminal_failure() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("not-an-invoice"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            "not-an-invoice",
+            5,
+            CLAIM_WINDOW_SECONDS,
+        )
+        .await
+        .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_attempts, 1, "terminal failure bumps attempts");
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn pay_counterparty_fresh_send_persists_hash_then_fails_indeterminate() {
+        // The pre-send CAS must persist the routing-fee cap and the
+        // invoice's payment hash BEFORE send_payment; the dead endpoint
+        // then fails the send → indeterminate failure, attempts bumped,
+        // invoice + hash retained for reconciliation.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let expected_hash =
+            bytes_to_string(decode_invoice(&invoice).unwrap().payment_hash().as_ref());
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_payment_hash.as_deref(), Some(&*expected_hash));
+        assert_eq!(
+            after.payout_routing_fee_sats,
+            Some(routing_fee_cap_sats(5_000))
+        );
+        assert_eq!(after.payout_attempts, 1);
+        assert_eq!(after.payout_invoice.as_deref(), Some(invoice.as_str()));
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn pay_counterparty_reconcile_lookup_failure_falls_through_to_send() {
+        // A persisted hash matching the invoice triggers the entry
+        // reconciliation; with LND unreachable the lookup errors and the
+        // code must fall through to a fresh send attempt (which also
+        // fails → attempts bumped) instead of aborting.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let hash = bytes_to_string(decode_invoice(&invoice).unwrap().payment_hash().as_ref());
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        bond.payout_payment_hash = Some(hash.clone());
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let mut ln = dead_lnd().await;
+        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_attempts, 1);
+        assert_eq!(after.payout_payment_hash.as_deref(), Some(hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn pay_counterparty_skips_send_when_row_left_pending_payout() {
+        // Snapshot says PendingPayout but the DB row moved (Forfeited):
+        // the hash-persist CAS misses and the send must be skipped.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Forfeited.to_string())
+            .bind(bond.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut ln = dead_lnd().await;
+        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
+            .await
+            .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.state, BondState::Forfeited.to_string());
+        assert_eq!(
+            after.payout_attempts, 0,
+            "no failure bump on a skipped send"
+        );
+        assert!(after.payout_payment_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn slash_after_success_exhausts_cas_retries_on_db_failure() {
+        // A RAISE trigger forces every CAS attempt to error; after
+        // SLASH_CAS_MAX_ATTEMPTS the helper surfaces the DB error so the
+        // next tick reconciles via the persisted payment hash.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("lnbc1pPAID"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_bonds_update BEFORE UPDATE ON bonds \
+             BEGIN SELECT RAISE(ABORT, 'forced bonds failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = slash_after_success(&pool, &bond, 5_000).await;
+        assert!(
+            result.is_err(),
+            "exhausted CAS retries must surface the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failure_re_arm_cas_miss_leaves_row_as_is() {
+        // Terminal failure at the retry budget, inside the window, but
+        // the row moved off PendingPayout concurrently: the re-arm CAS
+        // misses and the row is left untouched.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("lnbc1pSTALE"),
+            None,
+        );
+        bond.payout_attempts = 2;
+        let bond = create_bond(&pool, bond).await.unwrap();
+        // Row moves on under us.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::Slashed.to_string())
+            .bind(bond.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Snapshot still claims PendingPayout with 2 prior attempts.
+        let mut snapshot = bond.clone();
+        snapshot.state = BondState::PendingPayout.to_string();
+
+        on_send_payment_failure(
+            &pool,
+            &snapshot,
+            3,
+            CLAIM_WINDOW_SECONDS,
+            PaymentFailureKind::Terminal,
+            "unroutable",
+        )
+        .await
+        .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.state, BondState::Slashed.to_string());
+        assert_eq!(after.payout_invoice.as_deref(), Some("lnbc1pSTALE"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_payout_ack_skips_unbuildable_small_order() {
+        // An order with an unparseable kind cannot produce a SmallOrder:
+        // the ack is skipped, never panicking.
+        let order = Order {
+            kind: "bogus".to_string(),
+            ..Order::default()
+        };
+        let recipient = PublicKey::from_str(maker_pk()).unwrap();
+        let before = ack_recipients(order.id, Action::BondInvoiceAccepted)
+            .await
+            .len();
+        enqueue_payout_ack(&order, Action::BondInvoiceAccepted, recipient, 1_000).await;
+        let after = ack_recipients(order.id, Action::BondInvoiceAccepted).await;
+        assert_eq!(after.len(), before);
+    }
+
+    #[tokio::test]
+    async fn notify_helpers_skip_when_order_row_missing() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        // Bond references an order that does not exist.
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, 0, None, None);
+        let recipient = PublicKey::from_str(maker_pk()).unwrap();
+        notify_invoice_received(&pool, &bond, recipient, 5_000).await;
+        notify_payout_completed(&pool, &bond, 5_000).await;
+        assert_eq!(
+            ack_recipients(order_id, Action::BondInvoiceAccepted)
+                .await
+                .len(),
+            0
+        );
+        assert_eq!(
+            ack_recipients(order_id, Action::BondPayoutCompleted)
+                .await
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_helpers_skip_on_order_load_db_error() {
+        // Distinct from the "order row missing" case (`Ok(None)`): here the
+        // `Order::by_id` query itself errors (dropped table simulates a DB
+        // blip). Both best-effort notifiers must log-and-return rather than
+        // propagate or panic — a failed *notification* must never surface
+        // as an error to callers that already committed the underlying
+        // state transition.
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order_id = Uuid::new_v4();
+        let bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, 0, None, None);
+        let recipient = PublicKey::from_str(maker_pk()).unwrap();
+
+        notify_invoice_received(&pool, &bond, recipient, 5_000).await;
+        notify_payout_completed(&pool, &bond, 5_000).await;
+
+        assert_eq!(
+            ack_recipients(order_id, Action::BondInvoiceAccepted)
+                .await
+                .len(),
+            0
+        );
+        assert_eq!(
+            ack_recipients(order_id, Action::BondPayoutCompleted)
+                .await
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_payout_completed_skips_bad_reason_and_bad_recipient() {
+        let pool = setup_pool().await;
+
+        // Unparseable slashed_reason.
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(order_id, taker_pk(), 10_000, 5_000, 0, None, None);
+        bond.slashed_reason = Some("cosmic-rays".to_string());
+        notify_payout_completed(&pool, &bond, 5_000).await;
+        assert_eq!(
+            ack_recipients(order_id, Action::BondPayoutCompleted)
+                .await
+                .len(),
+            0
+        );
+
+        // Recipient unresolvable: bond pubkey matches neither side.
+        let order_id2 = Uuid::new_v4();
+        insert_order(&pool, order_id2, maker_pk(), taker_pk()).await;
+        let bond2 = pending_payout_bond(order_id2, "unrelated", 10_000, 5_000, 0, None, None);
+        notify_payout_completed(&pool, &bond2, 5_000).await;
+        assert_eq!(
+            ack_recipients(order_id2, Action::BondPayoutCompleted)
+                .await
+                .len(),
+            0
+        );
+
+        // Recipient resolution errors: counterparty pubkey is not valid hex.
+        let order_id3 = Uuid::new_v4();
+        insert_order(&pool, order_id3, "not-a-valid-pubkey", taker_pk()).await;
+        let bond3 = pending_payout_bond(order_id3, taker_pk(), 10_000, 5_000, 0, None, None);
+        notify_payout_completed(&pool, &bond3, 5_000).await;
+        assert_eq!(
+            ack_recipients(order_id3, Action::BondPayoutCompleted)
+                .await
+                .len(),
+            0
+        );
+    }
+
+    // ── add_bond_invoice_action (inbound handler) ─────────────────────
+
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use mostro_core::message::MessageKind;
+    use nostr_sdk::Timestamp;
+
+    fn build_ctx(pool: &Pool<Sqlite>) -> crate::app::context::AppContext {
+        TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build()
+    }
+
+    fn add_invoice_msg(order_id: Option<Uuid>, invoice: Option<&str>) -> Message {
+        Message::Order(MessageKind::new(
+            order_id,
+            None,
+            None,
+            Action::AddBondInvoice,
+            invoice.map(|i| Payload::PaymentRequest(None, i.to_string(), None)),
+        ))
+    }
+
+    fn unwrapped_from(sender: PublicKey, msg: &Message) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
+            sender,
+            identity: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_missing_order_id_and_invoice() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let sender = PublicKey::from_str(maker_pk()).unwrap();
+
+        // No order id → InvalidPayload.
+        let msg = add_invoice_msg(None, Some("lnbc1p"));
+        let event = unwrapped_from(sender, &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::InvalidPayload))
+        ));
+
+        // No payment request → InvalidInvoice.
+        let order_id = Uuid::new_v4();
+        let msg = add_invoice_msg(Some(order_id), None);
+        let event = unwrapped_from(sender, &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::InvalidInvoice))
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_when_no_recoverable_bond() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        // No bond rows at all on the order.
+        let msg = add_invoice_msg(Some(order_id), Some("lnbc1p"));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_node_only_bond() {
+        // Counterparty share is 0 (full retention): the sender must be
+        // told there is nothing to invoice for.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            10_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, bond).await.unwrap();
+
+        let msg = add_invoice_msg(Some(order_id), Some("lnbc1p"));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_undecodable_bolt11() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, bond).await.unwrap();
+
+        let msg = add_invoice_msg(Some(order_id), Some("garbage-bolt11"));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::InvalidInvoice))
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_happy_path_persists_and_acks() {
+        // Full inbound flow: fresh signed bolt11 whose amount equals the
+        // counterparty share, sent by the resolved recipient → invoice
+        // persisted, BondInvoiceAccepted ack enqueued.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let invoice = signed_test_invoice(5_000);
+        let msg = add_invoice_msg(Some(order_id), Some(&invoice));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        let before = ack_recipients(order_id, Action::BondInvoiceAccepted)
+            .await
+            .len();
+        add_bond_invoice_action(&ctx, msg, &event, &keys)
+            .await
+            .expect("valid submission must be accepted");
+        let after = ack_recipients(order_id, Action::BondInvoiceAccepted).await;
+        assert_eq!(after.len() - before, 1);
+
+        let row: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.payout_invoice.as_deref(), Some(invoice.as_str()));
+        assert_eq!(row.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_resurrects_failed_bond_within_window() {
+        // The `InvoiceApplyOutcome::Resurrected` arm: a `Failed` row, still
+        // inside the claim window, receiving a fresh valid bolt11 from the
+        // resolved recipient. Must be accepted (unlike the `PendingPayout`
+        // happy path already covered) and the row must come back to
+        // `PendingPayout` with both attempt counters reset.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let mut bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(), // recent slash → well within the window
+            Some("lnbc1pOLDFAILED"),
+            None,
+        );
+        bond.state = BondState::Failed.to_string();
+        bond.payout_attempts = 5;
+        bond.invoice_request_attempts = 2;
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let invoice = signed_test_invoice(5_000);
+        let msg = add_invoice_msg(Some(order_id), Some(&invoice));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        add_bond_invoice_action(&ctx, msg, &event, &keys)
+            .await
+            .expect("resurrection within the claim window must be accepted");
+
+        let row: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.state, BondState::PendingPayout.to_string());
+        assert_eq!(row.payout_invoice.as_deref(), Some(invoice.as_str()));
+        assert_eq!(row.payout_attempts, 0);
+        assert_eq!(row.invoice_request_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_when_invoice_already_persisted() {
+        // `InvoiceApplyOutcome::Rejected` reached via the `PendingPayout`
+        // CAS's `AND payout_invoice IS NULL` guard: a fresh, otherwise-valid
+        // bolt11 submitted against a row that already has one on file must
+        // be turned away with the same `NotAllowedByStatus` the caller
+        // cannot distinguish from any other unroutable case — the existing
+        // bolt11 is not clobbered.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some("lnbc1pALREADYSET"),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let invoice = signed_test_invoice(5_000);
+        let msg = add_invoice_msg(Some(order_id), Some(&invoice));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT payout_invoice FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0.as_deref(), Some("lnbc1pALREADYSET"));
+    }
+
+    // ── find_recoverable_bond_for_recipient ───────────────────────────
+
+    #[tokio::test]
+    async fn find_recoverable_bond_returns_none_when_order_row_missing() {
+        // At least one candidate bond row exists for `order_id`, but the
+        // order itself is gone — the finder must bail with `Ok(None)`
+        // rather than error, exactly like the "no candidate at all" case
+        // looks from the caller's perspective.
+        let pool = setup_pool().await;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order_id = Uuid::new_v4();
+        // Deliberately no `insert_order` call.
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, bond).await.unwrap();
+
+        let result = find_recoverable_bond_for_recipient(&pool, order_id, maker_pk(), None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_recoverable_bond_skips_bad_reason_and_recipient_mismatch() {
+        // Three candidate rows on the same order: one with an unparseable
+        // `slashed_reason` (skipped via `continue`), one whose `pubkey`
+        // matches neither side of the order (recipient unresolvable, so it
+        // is never pushed into `matches`), and one legitimate match. Only
+        // the legitimate one may be returned.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await; // seller=maker, buyer=taker
+
+        let mut bad_reason = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            1_000,
+            500,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        bad_reason.slashed_reason = Some("cosmic-rays".to_string());
+        create_bond(&pool, bad_reason).await.unwrap();
+
+        let unrelated = pending_payout_bond(
+            order_id,
+            "unrelated-pubkey",
+            1_000,
+            500,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, unrelated).await.unwrap();
+
+        let good = pending_payout_bond(
+            order_id,
+            taker_pk(), // buyer → recipient is the seller, maker_pk()
+            2_000,
+            1_000,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let good = create_bond(&pool, good).await.unwrap();
+
+        let result = find_recoverable_bond_for_recipient(&pool, order_id, maker_pk(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.map(|b| b.id), Some(good.id));
+    }
+
+    #[tokio::test]
+    async fn find_recoverable_bond_disambiguates_multiple_debts_by_share() {
+        // Phase 6: two debts on the same order resolving to the same
+        // recipient (distinct counterparty shares). When the submitted
+        // invoice's amount matches one of them, that row must win over the
+        // "first / most-recently-slashed" fallback used for the
+        // single-candidate case.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+
+        let low = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            4_000,
+            1_000, // counterparty share = 3_000
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, low).await.unwrap();
+        let high = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            9_000,
+            2_000, // counterparty share = 7_000
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let high = create_bond(&pool, high).await.unwrap();
+
+        let exact = find_recoverable_bond_for_recipient(&pool, order_id, maker_pk(), Some(7_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            exact.map(|b| b.id),
+            Some(high.id),
+            "exact share match must win the disambiguation"
+        );
+
+        // No candidate matches the submitted amount: falls back to the
+        // first (most-recently-slashed) match rather than erroring.
+        let fallback = find_recoverable_bond_for_recipient(&pool, order_id, maker_pk(), Some(42))
+            .await
+            .unwrap();
+        assert!(
+            fallback.is_some(),
+            "an unmatched amount must still fall back to a candidate, not None"
+        );
     }
 }

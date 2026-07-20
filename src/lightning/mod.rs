@@ -55,6 +55,41 @@ pub fn routing_fee_cap_sats(amount: i64) -> i64 {
     max_fee as i64
 }
 
+/// Length in bytes of a Lightning payment preimage and of the payment
+/// hash derived from it (both are SHA-256 sized).
+const HASH_LEN: usize = 32;
+
+/// Decode a hex-encoded 32-byte preimage or payment hash — as stored in
+/// the `orders` / `bonds` tables — into the raw bytes LND expects.
+///
+/// This must never panic. The main event loop in `src/app.rs` processes
+/// messages sequentially on a single task with no panic boundary, so an
+/// `.expect()` here would turn a single malformed row (corruption, a
+/// partial write, a manual DB edit) into a full-daemon outage for every
+/// user of the instance. Returning a typed error keeps the blast radius
+/// at the one operation that touched the bad row.
+///
+/// `field` names the column for the log line. The value itself is never
+/// included in the error: the preimage is the secret that claims the
+/// HTLC, and errors end up in logs.
+fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
+    let bytes = Vec::<u8>::from_hex(value).map_err(|e| {
+        MostroInternalErr(ServiceError::HoldInvoiceError(format!(
+            "invalid {field}: not valid hex ({e})"
+        )))
+    })?;
+
+    if bytes.len() != HASH_LEN {
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(format!(
+            "invalid {field}: expected {} bytes, got {}",
+            HASH_LEN,
+            bytes.len()
+        ))));
+    }
+
+    Ok(bytes)
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -147,7 +182,7 @@ impl LndConnector {
         &mut self,
         preimage: &str,
     ) -> Result<SettleInvoiceResp, MostroError> {
-        let preimage = FromHex::from_hex(preimage).expect("Wrong preimage");
+        let preimage = decode_hash32("preimage", preimage)?;
 
         let preimage_message = SettleInvoiceMsg { preimage };
         let settle = self
@@ -167,7 +202,7 @@ impl LndConnector {
         &mut self,
         hash: &str,
     ) -> Result<CancelInvoiceResp, MostroError> {
-        let payment_hash = FromHex::from_hex(hash).expect("Wrong payment hash");
+        let payment_hash = decode_hash32("payment hash", hash)?;
 
         let cancel_message = CancelInvoiceMsg { payment_hash };
         let cancel = self.client.invoices().cancel_invoice(cancel_message).await;
@@ -423,15 +458,20 @@ impl LnStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::routing_fee_cap_sats;
+    use super::{decode_hash32, routing_fee_cap_sats};
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
+    use mostro_core::prelude::*;
 
     fn init_test_settings() {
         // Defaults set `max_routing_fee = 0.002`.
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
-            nostr: Default::default(),
+            nostr: crate::config::NostrSettings {
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
             mostro: Default::default(),
             lightning: Default::default(),
             rpc: Default::default(),
@@ -460,5 +500,263 @@ mod tests {
         assert_eq!(routing_fee_cap_sats(1001), 2); // 2.002 -> 2
         assert_eq!(routing_fee_cap_sats(2001), 4); // 4.002 -> 4
         assert_eq!(routing_fee_cap_sats(100_000), 200);
+    }
+
+    // --- decode_hash32 -----------------------------------------------
+    //
+    // These guard the CRITICAL fix for #804: a malformed `preimage` /
+    // `hash` column must fail *that* operation, never panic the daemon.
+
+    /// Assert the error is the typed hold-invoice error naming `field`,
+    /// and that it never echoes the raw value back into logs.
+    fn assert_hold_invoice_err(err: MostroError, field: &str, value: &str) {
+        match err {
+            MostroInternalErr(ServiceError::HoldInvoiceError(msg)) => {
+                assert!(
+                    msg.contains(field),
+                    "error should name the offending column, got: {msg}"
+                );
+                assert!(
+                    !msg.contains(value),
+                    "error must not leak the secret value, got: {msg}"
+                );
+            }
+            other => panic!("expected HoldInvoiceError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_valid_32_byte_hex() {
+        // Arrange
+        let value = "ab".repeat(32);
+
+        // Act
+        let bytes = decode_hash32("preimage", &value).expect("valid hex must decode");
+
+        // Assert
+        assert_eq!(bytes, vec![0xab; 32]);
+    }
+
+    #[test]
+    fn accepts_uppercase_hex() {
+        // Arrange: LND and some tooling emit uppercase hex; rejecting it
+        // would strand otherwise-valid rows.
+        let value = "AB".repeat(32);
+
+        // Act
+        let bytes = decode_hash32("preimage", &value).expect("uppercase hex must decode");
+
+        // Assert
+        assert_eq!(bytes, vec![0xab; 32]);
+    }
+
+    #[test]
+    fn returns_error_instead_of_panicking_on_non_hex() {
+        // Arrange: `bonds` fixtures and hand-edited rows have produced
+        // values like this; before #804 they panicked the process.
+        let value = "p".repeat(64);
+
+        // Act
+        let err = decode_hash32("preimage", &value).expect_err("non-hex must be rejected");
+
+        // Assert
+        assert_hold_invoice_err(err, "preimage", &value);
+    }
+
+    #[test]
+    fn returns_error_on_odd_length_hex() {
+        // Arrange: a truncated / partially written column.
+        let value = "abc";
+
+        // Act
+        let err = decode_hash32("payment hash", value).expect_err("odd length must be rejected");
+
+        // Assert
+        assert_hold_invoice_err(err, "payment hash", value);
+    }
+
+    #[test]
+    fn returns_error_on_empty_string() {
+        // Arrange / Act
+        let err = decode_hash32("preimage", "").expect_err("empty must be rejected");
+
+        // Assert: empty is valid hex for a zero-length Vec, so it is the
+        // length check that has to catch it.
+        match err {
+            MostroInternalErr(ServiceError::HoldInvoiceError(msg)) => {
+                assert!(msg.contains("expected 32 bytes, got 0"), "got: {msg}")
+            }
+            other => panic!("expected HoldInvoiceError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_error_on_wrong_length_hex() {
+        // Arrange: well-formed hex, wrong size — LND would reject it
+        // anyway, but we want a clear error at the boundary.
+        for value in ["00".repeat(31), "00".repeat(33)] {
+            // Act
+            let err = decode_hash32("preimage", &value).expect_err("wrong length must be rejected");
+
+            // Assert
+            assert_hold_invoice_err(err, "preimage", &value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod offline_connector_tests {
+    //! `fedimint_tonic_lnd::connect` is lazy: it reads the TLS cert and
+    //! macaroon files and builds a channel, but never touches the network
+    //! until the first RPC. That lets these tests construct a real
+    //! `LndConnector` pointed at a dead localhost port and exercise every
+    //! RPC method's transport-error path without a live LND node.
+    use super::*;
+    use crate::config::MOSTRO_CONFIG;
+    use fedimint_tonic_lnd::lnrpc::GetInfoResponse;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+    }
+
+    /// Build a connector whose channel points at a closed localhost port.
+    /// Empty cert (rustls_pemfile yields zero certs) and empty macaroon are
+    /// both accepted by the lazy connector.
+    async fn offline_connector() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-lnd-offline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("tls.cert");
+        let macaroon = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").expect("write cert");
+        std::fs::write(&macaroon, b"").expect("write macaroon");
+        let client = fedimint_tonic_lnd::connect("https://127.0.0.1:1".to_string(), cert, macaroon)
+            .await
+            .expect("lazy connect must not touch the network");
+        LndConnector { client }
+    }
+
+    /// Amount-carrying regtest invoice (500u = 50_000 sats), reused from the
+    /// `lightning::invoice` test fixtures.
+    const INVOICE_500U: &str = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n";
+
+    #[tokio::test]
+    async fn new_fails_without_reachable_files() {
+        init_test_settings();
+        // Default LightningSettings point at empty paths: the cert read
+        // fails before any network activity, so `new` errors cleanly.
+        let result = LndConnector::new().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_hold_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let res = ln.create_hold_invoice("test hold invoice", 1_000).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn settle_hold_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let preimage = "aa".repeat(32);
+        assert!(ln.settle_hold_invoice(&preimage).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_hold_invoice_error_carries_grpc_code_prefix() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let hash = "bb".repeat(32);
+        let err = ln
+            .cancel_hold_invoice(&hash)
+            .await
+            .expect_err("dead port must error");
+        // Bond release parses the stable `code=<Code>` prefix; pin it.
+        assert!(
+            err.to_string().contains("code="),
+            "error must carry the code= prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_invoice_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(ln.subscribe_invoice(vec![0u8; 32], tx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_node_info_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        assert!(ln.get_node_info().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_payment_status_maps_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let err = ln
+            .lookup_payment_status(&[0u8; 32])
+            .await
+            .expect_err("transport failure must be Err, not Ok(None)");
+        assert!(err.to_string().contains("code="));
+    }
+
+    #[tokio::test]
+    async fn check_payment_status_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        assert!(ln.check_payment_status(&[0u8; 32]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_payment_rejects_wrong_amount_before_paying() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Invoice is 50_000 sats; passing 100 must abort with Wrong amount.
+        let err = ln
+            .send_payment(INVOICE_500U, 100, tx)
+            .await
+            .expect_err("wrong amount must be rejected");
+        assert!(err.to_string().contains("Wrong amount"));
+    }
+
+    #[tokio::test]
+    async fn send_payment_with_matching_amount_fails_on_transport() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Amount matches the invoice, so the failure comes from the dead
+        // port at send_payment_v2 time.
+        assert!(ln.send_payment(INVOICE_500U, 50_000, tx).await.is_err());
+    }
+
+    #[test]
+    fn ln_status_maps_get_info_response_fields() {
+        let info = GetInfoResponse {
+            version: "0.18.0-beta".to_string(),
+            identity_pubkey: "02abc".to_string(),
+            commit_hash: "deadbeef".to_string(),
+            alias: "test-node".to_string(),
+            chains: vec![fedimint_tonic_lnd::lnrpc::Chain {
+                chain: "bitcoin".to_string(),
+                network: "regtest".to_string(),
+            }],
+            uris: vec!["02abc@127.0.0.1:9735".to_string()],
+            ..Default::default()
+        };
+        let status = LnStatus::from_get_info_response(info);
+        assert_eq!(status.version, "0.18.0-beta");
+        assert_eq!(status.node_pubkey, "02abc");
+        assert_eq!(status.commit_hash, "deadbeef");
+        assert_eq!(status.node_alias, "test-node");
+        assert_eq!(status.chains, vec!["bitcoin".to_string()]);
+        assert_eq!(status.networks, vec!["regtest".to_string()]);
+        assert_eq!(status.uris, vec!["02abc@127.0.0.1:9735".to_string()]);
     }
 }

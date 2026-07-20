@@ -332,3 +332,431 @@ pub async fn close_dispute_after_user_resolution(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::config::MESSAGE_QUEUES;
+    use nostr_sdk::Keys;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    fn build_ctx(pool: &SqlitePool) -> AppContext {
+        // The publish path reads the global config (event expiration);
+        // seed it once, ignoring the error when another test already did.
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build()
+    }
+
+    /// Build an `UnwrappedMessage` whose trade key (rumor author / `sender`)
+    /// is `sender`. The identity key is generated separately, mirroring the
+    /// dual-key flow used by the cancel tests.
+    fn create_event(sender: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::new_order(None, Some(1), None, Action::Dispute, None),
+            signature: None,
+            sender,
+            identity: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn create_order(buyer: Option<PublicKey>, seller: Option<PublicKey>, status: Status) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: status.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: seller.map(|p| p.to_string()).unwrap_or_default(),
+            seller_pubkey: seller.map(|p| p.to_string()),
+            buyer_pubkey: buyer.map(|p| p.to_string()),
+            amount: 21_000,
+            ..Default::default()
+        }
+    }
+
+    fn dispute_msg_for(order_id: Option<uuid::Uuid>) -> Message {
+        Message::new_order(order_id, Some(1), None, Action::Dispute, None)
+    }
+
+    #[test]
+    fn get_counterpart_info_identifies_initiator_and_rejects_stranger() {
+        let buyer = "buyer-pubkey";
+        let seller = "seller-pubkey";
+
+        assert_eq!(get_counterpart_info(buyer, buyer, seller), Ok(true));
+        assert_eq!(get_counterpart_info(seller, buyer, seller), Ok(false));
+        assert_eq!(
+            get_counterpart_info("stranger", buyer, seller),
+            Err(CantDoReason::InvalidPubkey)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispute_action_without_order_id_returns_not_found() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let sender = Keys::generate().public_key();
+        let event = create_event(sender);
+
+        let result = dispute_action(&ctx, dispute_msg_for(None), &event, &Keys::generate()).await;
+
+        assert!(matches!(result, Err(MostroCantDo(CantDoReason::NotFound))));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_with_unknown_order_id_returns_not_found() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let sender = Keys::generate().public_key();
+        let event = create_event(sender);
+
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(uuid::Uuid::new_v4())),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(MostroCantDo(CantDoReason::NotFound))));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_that_already_has_a_dispute() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+        Dispute::new(order.id, order.status.clone())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DisputeAlreadyExists))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_with_non_disputable_status() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_missing_seller_pubkey() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), None, Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_missing_buyer_pubkey() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(None, Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(seller);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_sender_that_is_not_a_party() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let intruder = Keys::generate().public_key();
+        let event = create_event(intruder);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
+    /// Full buyer-initiated flow on an `Active` order. All DB side effects
+    /// (order flags/status, dispute row) and both queue notifications happen
+    /// before the final Nostr publish, which fails offline (default client
+    /// with no relays), so the handler ends in `DisputeEventError`. The
+    /// publish-success branch of `publish_dispute_event` is unreachable in
+    /// unit tests.
+    #[tokio::test]
+    async fn dispute_action_buyer_initiated_flow_persists_dispute_and_notifies() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DisputeEventError))
+        ));
+
+        // Order flags and status were persisted before the publish failed
+        let stored_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(stored_order.buyer_dispute);
+        assert!(!stored_order.seller_dispute);
+        assert_eq!(stored_order.status, Status::Dispute.to_string());
+
+        // Dispute row was created preserving the previous order status
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        assert_eq!(dispute.status, DisputeStatus::Initiated.to_string());
+        assert_eq!(dispute.order_previous_status, Status::Active.to_string());
+
+        // Both parties were notified (queue is global; filter by order id)
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let notifications: Vec<_> = queue
+            .iter()
+            .filter(|(m, _)| m.get_inner_message_kind().id == Some(order.id))
+            .collect();
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications.iter().any(|(m, dest)| {
+            m.get_inner_message_kind().action == Action::DisputeInitiatedByPeer && *dest == seller
+        }));
+        assert!(notifications.iter().any(|(m, dest)| {
+            m.get_inner_message_kind().action == Action::DisputeInitiatedByYou && *dest == buyer
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_seller_initiated_flow_on_fiat_sent_order() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::FiatSent)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(seller);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DisputeEventError))
+        ));
+
+        let stored_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(stored_order.seller_dispute);
+        assert!(!stored_order.buyer_dispute);
+        assert_eq!(stored_order.status, Status::Dispute.to_string());
+
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        assert_eq!(dispute.order_previous_status, Status::FiatSent.to_string());
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let notifications: Vec<_> = queue
+            .iter()
+            .filter(|(m, _)| m.get_inner_message_kind().id == Some(order.id))
+            .collect();
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications.iter().any(|(m, dest)| {
+            m.get_inner_message_kind().action == Action::DisputeInitiatedByPeer && *dest == buyer
+        }));
+        assert!(notifications.iter().any(|(m, dest)| {
+            m.get_inner_message_kind().action == Action::DisputeInitiatedByYou && *dest == seller
+        }));
+    }
+
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_is_noop_without_dispute_row() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = create_order(Some(buyer), Some(seller), Status::Active);
+
+        // No dispute row exists: must be a silent no-op
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::Settled,
+            &Keys::generate(),
+            "release",
+        )
+        .await;
+
+        assert!(find_dispute_by_order_id(&pool, order.id).await.is_err());
+    }
+
+    /// Consistent flags (`seller_dispute` only) resolve to the "seller"
+    /// initiator branch; the dispute row is updated even though the final
+    /// event publish fails offline (error is only logged).
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_updates_dispute_status() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+        Dispute::new(order.id, Status::Active.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::SellerRefunded,
+            &Keys::generate(),
+            "cooperative cancel",
+        )
+        .await;
+
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        assert_eq!(dispute.status, DisputeStatus::SellerRefunded.to_string());
+    }
+
+    /// Inconsistent flags (both unset) fall into the "unknown" initiator
+    /// branch; the dispute status update must still be persisted.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_handles_inconsistent_flags() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        // Neither dispute flag set: inconsistent with an existing dispute row
+        let order = create_order(Some(buyer), Some(seller), Status::Dispute)
+            .create(&pool)
+            .await
+            .unwrap();
+        Dispute::new(order.id, Status::Active.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::Settled,
+            &Keys::generate(),
+            "release",
+        )
+        .await;
+
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+    }
+}

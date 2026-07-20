@@ -296,6 +296,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_accessors_expose_injected_dependencies() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let keys = nostr_sdk::Keys::generate();
+        let client = nostr_sdk::Client::default();
+
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool.clone())
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(keys.clone())
+            .build();
+
+        // pool() and pool_arc() must expose the same injected pool.
+        assert!(Arc::ptr_eq(&ctx.pool_arc(), &pool));
+        assert!(std::ptr::eq(ctx.pool(), pool.as_ref()));
+
+        // keys() must return the injected keys instead of parsing settings.
+        assert_eq!(ctx.keys().public_key(), keys.public_key());
+
+        // nostr_client() returns the injected client (no relays configured).
+        assert!(ctx.nostr_client().relays().await.is_empty());
+
+        // settings() exposes the injected settings.
+        assert_eq!(ctx.settings().database.url, "sqlite::memory:");
+    }
+
+    #[tokio::test]
+    async fn default_builders_and_mock_queue_helpers_work() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+
+        // Default impls delegate to new().
+        let mock: super::test_utils::MockOrderMsgQueue = Default::default();
+        let builder: super::test_utils::TestContextBuilder = Default::default();
+
+        let ctx = builder
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_mock_order_msg_queue(mock.clone())
+            .build();
+
+        // Fresh queue starts empty.
+        assert!(mock.is_empty().await);
+        assert_eq!(mock.len().await, 0);
+
+        // Push through the context handle, observe through the mock handle.
+        let msg = mostro_core::prelude::Message::new_restore(None);
+        let key = nostr_sdk::Keys::generate().public_key();
+        ctx.order_msg_queue().write().await.push((msg, key));
+        assert_eq!(mock.len().await, 1);
+        assert!(!mock.is_empty().await);
+
+        // clear() drains it again.
+        mock.clear().await;
+        assert!(mock.is_empty().await);
+    }
+
+    #[tokio::test]
     async fn builder_can_use_custom_queue() {
         let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
         let queue: super::OrderMsgQueue = Arc::new(tokio::sync::RwLock::new(Vec::new()));

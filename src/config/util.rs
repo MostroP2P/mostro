@@ -313,6 +313,29 @@ mod tests {
     }
 
     #[test]
+    fn env_guard_restores_preexisting_value_on_drop() {
+        // When the env var already held a value, the guard must restore that
+        // exact value on drop (the `Some(previous)` restore arm), not leave
+        // the test's override leaking into sibling tests.
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var(NSEC_ENV_VAR, "preexisting_value");
+        {
+            let guard = EnvVarGuard::new(NSEC_ENV_VAR);
+            guard.set("temporary_override");
+            assert_eq!(
+                std::env::var(NSEC_ENV_VAR).as_deref(),
+                Ok("temporary_override")
+            );
+        }
+        // Drop restored the original value.
+        assert_eq!(
+            std::env::var(NSEC_ENV_VAR).as_deref(),
+            Ok("preexisting_value")
+        );
+        std::env::remove_var(NSEC_ENV_VAR);
+    }
+
+    #[test]
     fn env_var_value_is_trimmed() {
         let _lock = ENV_LOCK.lock().unwrap();
         let guard = EnvVarGuard::new(NSEC_ENV_VAR);
@@ -395,5 +418,156 @@ mod cashu_validation_tests {
         // Track A §4B: the seller-recovery locktime floor cannot be zero.
         let cashu = enabled("https://mint.example.com", 0);
         assert!(validate_cashu_settings(Some(&cashu), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod startup_validation_tests {
+    use super::*;
+    use crate::config::constants::{MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+    use crate::config::types::{
+        AntiAbuseBondSettings, CashuSettings, DatabaseSettings, LightningSettings, MostroSettings,
+        NostrSettings, RpcSettings,
+    };
+
+    fn base_settings() -> Settings {
+        Settings {
+            database: DatabaseSettings::default(),
+            lightning: LightningSettings::default(),
+            nostr: NostrSettings::default(),
+            mostro: MostroSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: None,
+            anti_abuse_bond: None,
+            cashu: None,
+            price: None,
+        }
+    }
+
+    #[test]
+    fn default_settings_pass_validation() {
+        assert!(validate_mostro_settings(&base_settings()).is_ok());
+    }
+
+    #[test]
+    fn dev_fee_below_minimum_is_rejected() {
+        let mut settings = base_settings();
+        settings.mostro.dev_fee_percentage = MIN_DEV_FEE_PERCENTAGE - 0.01;
+        let err = validate_mostro_settings(&settings).expect_err("below-min dev fee must fail");
+        assert!(err.to_string().contains("below minimum"));
+    }
+
+    #[test]
+    fn dev_fee_above_maximum_is_rejected() {
+        let mut settings = base_settings();
+        settings.mostro.dev_fee_percentage = MAX_DEV_FEE_PERCENTAGE + 0.01;
+        let err = validate_mostro_settings(&settings).expect_err("above-max dev fee must fail");
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn cashu_and_bond_conflict_is_rejected_through_full_validation() {
+        let mut settings = base_settings();
+        settings.anti_abuse_bond = Some(AntiAbuseBondSettings {
+            enabled: true,
+            ..Default::default()
+        });
+        settings.cashu = Some(CashuSettings {
+            enabled: true,
+            mint_url: "https://mint.example.com".to_string(),
+            escrow_locktime_days: 15,
+        });
+        assert!(validate_mostro_settings(&settings).is_err());
+    }
+}
+
+#[cfg(test)]
+mod env_file_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mostro-config-util-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn missing_env_file_is_a_noop() {
+        let dir = temp_dir("no-env");
+        // Must not error or panic when `<dir>/.env` is absent.
+        load_env_file(&dir);
+    }
+
+    #[test]
+    fn env_file_values_become_process_env() {
+        let dir = temp_dir("with-env");
+        // A variable name no other test uses, so parallel runs can't race.
+        std::fs::write(
+            dir.join(ENV_FILENAME),
+            "MOSTRO_TEST_ENV_FILE_MARKER=loaded\n",
+        )
+        .expect("write .env");
+        load_env_file(&dir);
+        assert_eq!(
+            std::env::var("MOSTRO_TEST_ENV_FILE_MARKER").as_deref(),
+            Ok("loaded")
+        );
+    }
+
+    #[test]
+    fn unreadable_env_file_logs_and_continues() {
+        let dir = temp_dir("bad-env");
+        // A directory named `.env` makes dotenvy fail; the loader must warn
+        // and fall back instead of propagating the error.
+        std::fs::create_dir_all(dir.join(ENV_FILENAME)).expect("create .env dir");
+        load_env_file(&dir);
+    }
+}
+
+#[cfg(test)]
+mod init_configuration_file_tests {
+    use super::*;
+
+    fn temp_config_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mostro-init-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    // NOTE: the success path (valid settings.toml) calls
+    // `init_mostro_settings`, which panics when the global OnceLock is
+    // already set by another test — and the missing-file path calls
+    // `std::process::exit(0)` when stdin is not a terminal, which would
+    // kill the whole test binary. Only the error paths are testable here.
+
+    #[test]
+    fn malformed_toml_is_rejected() {
+        let dir = temp_config_dir("bad-toml");
+        std::fs::write(dir.join("settings.toml"), "this is not = [valid toml")
+            .expect("write settings.toml");
+        let result = init_configuration_file(Some(dir.to_string_lossy().into_owned()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn structurally_valid_toml_with_bad_dev_fee_is_rejected() {
+        let dir = temp_config_dir("bad-dev-fee");
+        // Start from the shipped template so the TOML parses, then push the
+        // dev fee out of range so validation (not parsing) rejects it.
+        let template = std::str::from_utf8(include_bytes!("../../settings.tpl.toml"))
+            .expect("template is UTF-8");
+        let tampered =
+            template.replace("dev_fee_percentage = ", "dev_fee_percentage = 99.0 # was: ");
+        assert!(
+            tampered.contains("99.0"),
+            "template must contain dev_fee_percentage for this test to be meaningful"
+        );
+        std::fs::write(dir.join("settings.toml"), tampered).expect("write settings.toml");
+        let result = init_configuration_file(Some(dir.to_string_lossy().into_owned()));
+        assert!(result.is_err());
     }
 }

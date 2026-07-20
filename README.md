@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
+[![Coverage](https://img.shields.io/endpoint?url=https://mostro.network/mostro/coverage/badge.json)](https://mostro.network/mostro/coverage/)
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
 
@@ -1054,6 +1055,41 @@ git clone https://github.com/MostroP2P/mostro-regtest.git
 cd mostro-regtest
 # Follow README for complete regtest environment
 ```
+
+**Code Coverage**: Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+
+The published report lives at **<https://mostro.network/mostro/coverage/>** —
+the same browsable HTML `cargo llvm-cov --html` produces locally, regenerated
+by the `Coverage` workflow every Sunday and on demand from the Actions tab.
+No account or sign-up is needed to read it, and the badge above is served from
+that same page (`coverage/badge.json`), so it always matches the report.
+(It shares the `gh-pages` branch with the mutation-testing report, which keeps
+its own `/mutation-testing/` subdirectory.)
+Note the report reflects the last scheduled run, not the current tip of `main`.
+Raw lcov for editors and external tools: `coverage/lcov.info` on that page.
+
+To reproduce it locally:
+
+```bash
+# One-time install
+cargo install cargo-llvm-cov
+
+# Per-file + total line coverage in the terminal
+cargo llvm-cov --summary-only
+
+# Generate an HTML report and open it
+cargo llvm-cov --html         # writes target/llvm-cov/html/index.html
+cargo llvm-cov --open         # ...and opens it in the browser
+
+# Emit lcov for CI or editor gutters
+cargo llvm-cov --lcov --output-path lcov.info
+```
+
+The unit-test suite runs entirely offline (in-memory SQLite, locally-built
+invoices — no relay, LND, or network). The remaining uncovered lines are the
+paths that structurally require a live LND node, a Cashu mint, a network relay,
+interactive stdin (the config wizard), or the `main()` / `app::run` bootstrap
+loop — none of which are exercisable in an offline unit test.
 
 ---
 

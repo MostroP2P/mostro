@@ -127,25 +127,156 @@ async fn send_restore_session_timeout(trade_key: &str) -> Result<(), MostroError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::config::MESSAGE_QUEUES;
+    use nostr_sdk::Keys;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    fn create_event(identity: PublicKey, sender: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::new_restore(None),
+            signature: None,
+            sender,
+            identity,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    /// Count queued restore-session messages destined for `dest`. The queue
+    /// is a global shared across concurrently running tests, so assertions
+    /// always filter by destination key.
+    async fn queued_restore_msgs_for(dest: &PublicKey) -> Vec<Message> {
+        MESSAGE_QUEUES
+            .queue_restore_session_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, key)| key == dest)
+            .map(|(msg, _)| msg.clone())
+            .collect()
+    }
+
+    /// Happy path: real Nostr keys always stringify as 64-char hex, so both
+    /// validation guards pass and the background restore session starts.
+    /// (The hex-format guards on `master_key`/`trade_key` are dead code for
+    /// real `PublicKey` values — see module report.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_session_action_starts_background_restore() {
+        let pool = create_test_pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+
+        let identity = Keys::generate().public_key();
+        let trade = Keys::generate().public_key();
+        let event = create_event(identity, trade);
+
+        let result = restore_session_action(&ctx, &event).await;
+
+        assert!(result.is_ok());
+    }
+
+    /// Drives `handle_restore_session_results` through the `Ok(Some(_))`
+    /// branch: the background worker finds no orders/disputes for the master
+    /// key and the (empty) restore payload is queued for the trade key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_restore_session_results_queues_response() {
+        let pool = create_test_pool().await;
+        let master_key = Keys::generate().public_key().to_string();
+        let trade_pubkey = Keys::generate().public_key();
+        let trade_key = trade_pubkey.to_string();
+
+        let manager = RestoreSessionManager::new();
+        manager
+            .start_restore_session(pool.clone(), master_key)
+            .await
+            .unwrap();
+
+        handle_restore_session_results(manager, trade_key).await;
+
+        let queued = queued_restore_msgs_for(&trade_pubkey).await;
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            queued[0].get_inner_message_kind().payload,
+            Some(Payload::RestoreData(_))
+        ));
+    }
+
+    /// Same flow with an invalid trade key: the result arrives but the
+    /// response cannot be built, exercising the logged-error branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_restore_session_results_logs_invalid_trade_key() {
+        let pool = create_test_pool().await;
+        let master_key = Keys::generate().public_key().to_string();
+
+        let manager = RestoreSessionManager::new();
+        manager
+            .start_restore_session(pool.clone(), master_key)
+            .await
+            .unwrap();
+
+        // Must not panic; the send failure is logged and swallowed
+        handle_restore_session_results(manager, "not-a-hex-key".to_string()).await;
+    }
+
+    #[tokio::test]
+    async fn send_restore_session_response_queues_message_for_valid_key() {
+        let trade_pubkey = Keys::generate().public_key();
+
+        let result =
+            send_restore_session_response(&trade_pubkey.to_string(), Vec::new(), Vec::new()).await;
+
+        assert!(result.is_ok());
+        let queued = queued_restore_msgs_for(&trade_pubkey).await;
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            queued[0].get_inner_message_kind().payload,
+            Some(Payload::RestoreData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_restore_session_response_rejects_invalid_key() {
+        let result = send_restore_session_response("invalid-key", Vec::new(), Vec::new()).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_restore_session_timeout_queues_message_for_valid_key() {
+        let trade_pubkey = Keys::generate().public_key();
+
+        let result = send_restore_session_timeout(&trade_pubkey.to_string()).await;
+
+        assert!(result.is_ok());
+        let queued = queued_restore_msgs_for(&trade_pubkey).await;
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].get_inner_message_kind().payload.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_restore_session_timeout_rejects_invalid_key() {
+        let result = send_restore_session_timeout("invalid-key").await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
 
     #[test]
     fn restore_session_timeout_is_one_hour() {
         assert_eq!(RESTORE_SESSION_TIMEOUT_SECS, 3600);
-    }
-
-    #[tokio::test]
-    async fn send_restore_session_response_rejects_invalid_trade_key() {
-        let err = send_restore_session_response("not-a-pubkey", vec![], vec![])
-            .await
-            .unwrap_err();
-        assert_eq!(err, MostroError::MostroCantDo(CantDoReason::InvalidPubkey));
-    }
-
-    #[tokio::test]
-    async fn send_restore_session_timeout_rejects_invalid_trade_key() {
-        let err = send_restore_session_timeout("not-a-pubkey")
-            .await
-            .unwrap_err();
-        assert_eq!(err, MostroError::MostroCantDo(CantDoReason::InvalidPubkey));
     }
 }

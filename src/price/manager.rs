@@ -1391,3 +1391,240 @@ mod tests {
         ));
     }
 }
+
+// Coverage-focused additions: global install, timeout arm, scoping edge
+// cases, warn-flag plumbing, and the Nostr publish path.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::price::provider::{ProviderQuotes, Quote};
+    use async_trait::async_trait;
+
+    /// A provider whose fetch never resolves — drives `update_all`'s
+    /// timeout arm under a paused tokio clock.
+    struct HangingProvider;
+
+    #[async_trait]
+    impl PriceProvider for HangingProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::Yadio
+        }
+        async fn fetch(&self, _http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    fn bare_manager(settings: PriceSettings, providers: Vec<EnabledProvider>) -> PriceManager {
+        PriceManager {
+            providers,
+            store: Arc::new(PriceStore::new()),
+            settings,
+            http: reqwest::Client::new(),
+            warned_stale: RwLock::new(HashSet::new()),
+            warned_refused: RwLock::new(HashSet::new()),
+            warned_single_source: RwLock::new(HashSet::new()),
+        }
+    }
+
+    fn quotes(pairs: &[(&str, f64)]) -> ProviderQuotes {
+        pairs
+            .iter()
+            .map(|(c, v)| (c.to_string(), Quote::PerBtc(*v)))
+            .collect()
+    }
+
+    #[test]
+    fn install_error_display_and_traits() {
+        let err = InstallError::AlreadyInstalled;
+        assert_eq!(err.to_string(), "PriceManager already installed");
+        // It is a std::error::Error.
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn settings_accessor_returns_active_settings() {
+        let settings = PriceSettings {
+            update_interval_seconds: 123,
+            ..PriceSettings::default()
+        };
+        let manager = bare_manager(settings, Vec::new());
+        assert_eq!(manager.settings().update_interval_seconds, 123);
+    }
+
+    /// The one deliberate global installation in the whole test binary: an
+    /// empty-provider manager with a sub-minimum interval, so the scheduler
+    /// smoke test exercises its interval clamp without any provider HTTP.
+    /// Every other test drives managers through `&self`, never the global.
+    #[tokio::test]
+    async fn install_global_accepts_once_then_refuses() {
+        let manager = PriceManager::from_settings(PriceSettings {
+            update_interval_seconds: 30,
+            providers: HashMap::new(),
+            ..PriceSettings::default()
+        })
+        .expect("empty provider set builds");
+        // First install wins (or another test's identical install did).
+        let _ = manager.install_global();
+        assert!(PriceManager::global().is_some());
+
+        let second = PriceManager::from_settings(PriceSettings {
+            update_interval_seconds: 30,
+            providers: HashMap::new(),
+            ..PriceSettings::default()
+        })
+        .expect("empty provider set builds");
+        assert_eq!(second.install_global(), Err(InstallError::AlreadyInstalled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_all_times_out_hung_provider_and_records_failure() {
+        let mut settings = PriceSettings {
+            publish_to_nostr: false,
+            provider_timeout_seconds: 1,
+            ..PriceSettings::default()
+        };
+        settings.providers.insert(
+            ProviderId::Yadio.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: "http://test".into(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+            },
+        );
+        let manager = bare_manager(
+            settings,
+            vec![EnabledProvider {
+                id: ProviderId::Yadio,
+                provider: Box::new(HangingProvider),
+                health: Mutex::new(ProviderHealth::new()),
+            }],
+        );
+
+        let report = manager.update_all().await;
+        assert!(report.successes.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].1, "timeout");
+    }
+
+    #[test]
+    fn poll_budget_defaults_to_single_attempt_for_unknown_provider() {
+        // No config entry for the id: one attempt plus one second of slack.
+        let manager = bare_manager(
+            PriceSettings {
+                provider_timeout_seconds: 4,
+                ..PriceSettings::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            manager.poll_budget(ProviderId::CoinGecko),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn scope_quotes_passes_through_without_config_entry() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        let q = quotes(&[("USD", 50_000.0)]);
+        let scoped = manager.scope_quotes(ProviderId::Blockchain, q.clone());
+        assert_eq!(scoped.len(), q.len());
+    }
+
+    #[test]
+    fn observe_freshness_ignores_unknown_currency() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        // No store entry: must be a silent no-op.
+        manager.observe_freshness("ZZZ", "ZZZ", Utc::now().timestamp());
+    }
+
+    #[test]
+    fn mark_warned_treats_poisoned_lock_as_already_warned() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        // Poison the warned_stale lock by panicking while holding it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.warned_stale.write().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(
+            !manager.mark_warned(&manager.warned_stale, "USD"),
+            "poisoned lock must read as already-warned (stay quiet)"
+        );
+        // clear_warned on the poisoned lock is a silent no-op.
+        manager.clear_warned(&manager.warned_stale, "USD");
+    }
+
+    #[tokio::test]
+    async fn publish_rates_to_nostr_is_best_effort_without_relays() {
+        // Publishing must never fail the tick: with keys derivable from the
+        // global test settings and no reachable Nostr client/relays, every
+        // failure is swallowed and logged.
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        let mut aggregates: HashMap<String, AggregateResult> = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+            },
+        );
+        manager
+            .publish_rates_to_nostr(&aggregates, &[ProviderId::Yadio])
+            .await;
+    }
+
+    #[tokio::test]
+    async fn update_all_with_publish_flag_runs_publish_path() {
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let mut settings = PriceSettings {
+            publish_to_nostr: true,
+            provider_timeout_seconds: 5,
+            ..PriceSettings::default()
+        };
+        settings.providers.insert(
+            ProviderId::Yadio.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: "http://test".into(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+            },
+        );
+
+        struct OneShot;
+        #[async_trait]
+        impl PriceProvider for OneShot {
+            fn id(&self) -> ProviderId {
+                ProviderId::Yadio
+            }
+            async fn fetch(
+                &self,
+                _http: &reqwest::Client,
+            ) -> Result<ProviderQuotes, ProviderError> {
+                Ok([("USD".to_string(), Quote::PerBtc(50_000.0))]
+                    .into_iter()
+                    .collect())
+            }
+        }
+
+        let manager = bare_manager(
+            settings,
+            vec![EnabledProvider {
+                id: ProviderId::Yadio,
+                provider: Box::new(OneShot),
+                health: Mutex::new(ProviderHealth::new()),
+            }],
+        );
+        let report = manager.update_all().await;
+        assert_eq!(report.fresh_currencies, 1);
+        assert_eq!(report.contributors, vec![ProviderId::Yadio]);
+    }
+}

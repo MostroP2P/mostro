@@ -1061,6 +1061,264 @@ mod tests {
         );
     }
 
+    // ── Event constructors (kinds 38383/38384/38385/38386/30078) ─────────
+
+    #[test]
+    fn event_constructors_emit_expected_kinds_and_identifier() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let tags = Tags::from_list(vec![]);
+
+        let order = super::new_order_event(&keys, "", "order-id".to_string(), tags.clone())
+            .expect("order event");
+        assert_eq!(order.kind.as_u16(), NOSTR_ORDER_EVENT_KIND);
+
+        let rating = super::new_rating_event(&keys, "", "user-pk".to_string(), tags.clone())
+            .expect("rating event");
+        assert_eq!(rating.kind.as_u16(), NOSTR_RATING_EVENT_KIND);
+
+        // Kind 38385 has no configured expiration → exercises the
+        // "no expiration tag" path of create_event.
+        let info =
+            super::new_info_event(&keys, "", "mostro-pk".to_string(), tags.clone()).expect("info");
+        assert_eq!(info.kind.as_u16(), NOSTR_INFO_EVENT_KIND);
+        assert!(
+            !info
+                .tags
+                .iter()
+                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            "info events must not carry an expiration tag"
+        );
+
+        let dispute = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags.clone())
+            .expect("dispute event");
+        assert_eq!(dispute.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
+
+        let rates =
+            super::new_exchange_rates_event(&keys, "{}", tags.clone()).expect("rates event");
+        assert_eq!(
+            rates.kind.as_u16(),
+            crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND
+        );
+        // NIP-33 d tag is fixed for the rates event.
+        let d_tag = rates
+            .tags
+            .identifier()
+            .expect("rates event must carry a d tag");
+        assert_eq!(d_tag, "mostro-rates");
+
+        // Order events DO get an expiration tag from configuration.
+        assert!(
+            order
+                .tags
+                .iter()
+                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            "order events must carry an expiration tag"
+        );
+    }
+
+    // ── create_rating_tag ────────────────────────────────────────────────
+
+    #[test]
+    fn create_rating_tag_serializes_reputation_or_empty_object() {
+        // Established user: days computed from created_at.
+        let created_at = Timestamp::now().as_secs() as i64 - 2 * 86_400;
+        let json = super::create_rating_tag(Some((4.5, 12, created_at)));
+        assert!(json.contains("\"total_reviews\":12"));
+        assert!(json.contains("\"total_rating\":4.5"));
+        assert!(json.contains("\"days\":2"));
+
+        // Brand-new user: created_at == 0 → days must be 0.
+        let json_new = super::create_rating_tag(Some((0.0, 0, 0)));
+        assert!(json_new.contains("\"days\":0"));
+
+        // No reputation data at all → placeholder object.
+        assert_eq!(super::create_rating_tag(None), "{}");
+    }
+
+    // ── create_fiat_amt_array ────────────────────────────────────────────
+
+    #[test]
+    fn fiat_amount_array_advertises_range_only_while_takeable() {
+        // Pending range order → [min, max].
+        let mut order = make_pending_order();
+        order.min_amount = Some(10);
+        order.max_amount = Some(100);
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["10".to_string(), "100".to_string()]
+        );
+
+        // Pending single-amount order → [fiat_amount].
+        let mut single = make_pending_order();
+        single.fiat_amount = 42;
+        assert_eq!(
+            super::create_fiat_amt_array(&single),
+            vec!["42".to_string()]
+        );
+
+        // Taken (active) order → exact amount even if min/max present.
+        order.status = Status::Active.to_string();
+        order.fiat_amount = 55;
+        assert_eq!(super::create_fiat_amt_array(&order), vec!["55".to_string()]);
+    }
+
+    // ── create_status_tags remaining arms ────────────────────────────────
+
+    #[test]
+    fn status_tags_map_lifecycle_statuses_to_nip69_buckets() {
+        let mut order = make_pending_order();
+
+        // WaitingBuyerInvoice on a sell order → publish as InProgress.
+        order.status = Status::WaitingBuyerInvoice.to_string();
+        assert_eq!(
+            create_status_tags(&order).unwrap(),
+            (true, Status::InProgress)
+        );
+
+        // WaitingPayment on a sell order → not a buy order → don't emit.
+        order.status = Status::WaitingPayment.to_string();
+        assert_eq!(
+            create_status_tags(&order).unwrap(),
+            (false, Status::InProgress)
+        );
+
+        // WaitingPayment on a buy order → emit as InProgress.
+        order.kind = mostro_core::order::Kind::Buy.to_string();
+        assert_eq!(
+            create_status_tags(&order).unwrap(),
+            (true, Status::InProgress)
+        );
+
+        // Cancellation family collapses into Canceled.
+        for cancelish in [
+            Status::Canceled,
+            Status::CanceledByAdmin,
+            Status::CooperativelyCanceled,
+            Status::Expired,
+        ] {
+            order.status = cancelish.to_string();
+            assert_eq!(
+                create_status_tags(&order).unwrap(),
+                (true, Status::Canceled)
+            );
+        }
+
+        // Success family keeps its own status.
+        order.status = Status::Success.to_string();
+        assert_eq!(create_status_tags(&order).unwrap(), (true, Status::Success));
+        order.status = Status::CompletedByAdmin.to_string();
+        assert_eq!(
+            create_status_tags(&order).unwrap(),
+            (true, Status::CompletedByAdmin)
+        );
+
+        // Internal statuses are not published.
+        order.status = Status::Dispute.to_string();
+        assert_eq!(
+            create_status_tags(&order).unwrap(),
+            (false, Status::Dispute)
+        );
+    }
+
+    // ── order_to_tags: non-pending, reputation, and get_keys paths ───────
+
+    #[test]
+    fn order_to_tags_returns_none_for_internal_statuses() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::Dispute.to_string();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error");
+        assert!(
+            tags.is_none(),
+            "internal statuses must not produce a publishable event"
+        );
+    }
+
+    #[test]
+    fn order_to_tags_inserts_rating_tag_when_reputation_present() {
+        init_test_settings();
+        // Publishing LN status also exercises the LN_STATUS-Some branch.
+        let _ = crate::LN_STATUS.set(make_ln_status());
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, Some((4.2, 7, 0)), Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce tags");
+
+        let rating = get_tag_value(&tags, "rating").expect("rating tag must be inserted");
+        assert!(rating.contains("\"total_reviews\":7"));
+        assert!(rating.contains("\"total_rating\":4.2"));
+    }
+
+    #[test]
+    fn order_to_tags_derives_pubkey_from_global_keys_when_none() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        // Whether this succeeds depends on which global settings won the
+        // process-wide OnceLock race (the settings template carries a
+        // placeholder nsec). Either way the get_keys() path is exercised
+        // and must not panic.
+        match order_to_tags(&order, None, None) {
+            Ok(Some(tags)) => {
+                let source = get_source_tag_value(&tags).expect("source tag");
+                assert!(source.contains("&mostro="));
+            }
+            Ok(None) => panic!("pending order must not map to None"),
+            Err(_) => { /* template settings won the race: invalid nsec */ }
+        }
+    }
+
+    // ── bond_policy_tags remaining branches ──────────────────────────────
+
+    #[test]
+    fn bond_policy_tags_cover_all_apply_to_variants_and_disabled_block() {
+        use crate::config::types::{AntiAbuseBondSettings, BondApplyTo};
+
+        let base = AntiAbuseBondSettings {
+            enabled: true,
+            amount_pct: 0.01,
+            base_amount_sats: 1_000,
+            apply_to: BondApplyTo::Take,
+            slash_on_waiting_timeout: false,
+            slash_node_share_pct: 0.5,
+            payout_invoice_window_seconds: 300,
+            payout_max_retries: 3,
+            payout_claim_window_days: 14,
+        };
+
+        let take_tags = bond_tags(Some(&base));
+        assert_eq!(
+            get_tag_value(&take_tags, "bond_apply_to").as_deref(),
+            Some("take")
+        );
+
+        let make_bond = AntiAbuseBondSettings {
+            apply_to: BondApplyTo::Make,
+            ..base.clone()
+        };
+        let make_tags = bond_tags(Some(&make_bond));
+        assert_eq!(
+            get_tag_value(&make_tags, "bond_apply_to").as_deref(),
+            Some("make")
+        );
+
+        // Present-but-disabled block: only the bond_enabled=false marker.
+        let disabled = AntiAbuseBondSettings {
+            enabled: false,
+            ..base
+        };
+        let disabled_tags = bond_tags(Some(&disabled));
+        assert_eq!(
+            get_tag_value(&disabled_tags, "bond_enabled").as_deref(),
+            Some("false")
+        );
+        assert!(get_tag_value(&disabled_tags, "bond_apply_to").is_none());
+    }
+
     // ── Phase 1.5 NIP-69 mapping tests ───────────────────────────────────
 
     /// Load-bearing for the non-blockability invariant

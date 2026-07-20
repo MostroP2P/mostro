@@ -122,3 +122,54 @@ pub async fn resolv_ln_address(address: &str, amount: u64) -> Result<String, Mos
         Ok("".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Parsing/validation coverage only: the HTTP round-trips of
+    //! `ln_exists` / `resolv_ln_address` need a live LNURL endpoint and are
+    //! exercised by the integration-style server tests in
+    //! `lightning::invoice`.
+    use super::*;
+
+    #[tokio::test]
+    async fn extract_lnurl_decodes_bech32_lnurl() {
+        let url = "https://example.com/.well-known/lnurlp/alice";
+        let encoded = LnUrl {
+            url: url.to_string(),
+        }
+        .encode();
+        assert!(encoded.to_lowercase().starts_with("lnurl1"));
+
+        let extracted = extract_lnurl(&encoded).await.expect("valid LNURL decodes");
+        assert_eq!(extracted, url);
+    }
+
+    #[tokio::test]
+    async fn extract_lnurl_rejects_malformed_bech32() {
+        assert!(extract_lnurl("lnurl1notvalidbech32").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn extract_lnurl_builds_wellknown_url_for_lightning_address() {
+        // cfg!(test) pins lightning addresses to the local test host form.
+        let extracted = extract_lnurl("alice@127.0.0.1")
+            .await
+            .expect("lightning address parses");
+        assert_eq!(extracted, "http://127.0.0.1:8080/.well-known/lnurlp/alice");
+    }
+
+    #[tokio::test]
+    async fn extract_lnurl_rejects_address_without_at() {
+        assert!(extract_lnurl("not-a-lightning-address").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ln_exists_propagates_parse_error_before_any_request() {
+        assert!(ln_exists("no-at-sign-here").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolv_ln_address_propagates_parse_error_before_any_request() {
+        assert!(resolv_ln_address("no-at-sign-here", 1_000).await.is_err());
+    }
+}

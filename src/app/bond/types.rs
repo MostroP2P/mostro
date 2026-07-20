@@ -246,6 +246,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_display_and_error_trait() {
+        // Every `BondParseError` variant must render its offending value
+        // so operator logs can pinpoint the corrupted column. The enum
+        // also implements `std::error::Error`, so it must be usable as a
+        // trait object.
+        let role_err = BondRole::from_str("solver").unwrap_err();
+        assert_eq!(role_err.to_string(), "unknown bond role: solver");
+
+        let state_err = BondState::from_str("in-progress").unwrap_err();
+        assert_eq!(state_err.to_string(), "unknown bond state: in-progress");
+
+        let reason_err = BondSlashReason::from_str("whatever").unwrap_err();
+        assert_eq!(
+            reason_err.to_string(),
+            "unknown bond slash reason: whatever"
+        );
+
+        let boxed: Box<dyn std::error::Error> = Box::new(role_err);
+        assert!(boxed.source().is_none());
+    }
+
+    #[test]
     fn terminal_and_active_helpers() {
         for s in [
             BondState::Released,

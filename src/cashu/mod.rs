@@ -1060,4 +1060,353 @@ mod tests {
             "a proof with no DLEQ must be rejected (fabricated-token defense)"
         );
     }
+
+    // ── Error type surface ───────────────────────────────────────────────
+
+    #[test]
+    fn error_display_covers_every_variant() {
+        assert_eq!(
+            Error::InvalidMintUrl("bad".into()).to_string(),
+            "Invalid mint URL: bad"
+        );
+        assert_eq!(
+            Error::MintConnection("down".into()).to_string(),
+            "Mint connection error: down"
+        );
+        assert_eq!(Error::Token("odd".into()).to_string(), "Token error: odd");
+        assert_eq!(
+            Error::Condition("shape".into()).to_string(),
+            "Condition error: shape"
+        );
+        let client_err: Error = CdkClientError::UnknownErrorResponse("boom".into()).into();
+        assert!(matches!(client_err, Error::Client(_)));
+        assert!(client_err.to_string().starts_with("Client error:"));
+    }
+
+    // ── Offline connect() / client construction ──────────────────────────
+
+    /// Build a client bound to `mint_url` without touching the network
+    /// (test-module access to the private fields).
+    fn offline_client(mint_url: &str) -> CashuClient {
+        let url = MintUrl::from_str(mint_url).expect("valid mint url");
+        CashuClient {
+            mint_url: url.clone(),
+            client: HttpClient::new(url, None),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_unparseable_mint_url() {
+        match CashuClient::connect("not a url").await {
+            Err(Error::InvalidMintUrl(_)) => {}
+            Err(other) => panic!("expected InvalidMintUrl, got {other}"),
+            Ok(_) => panic!("malformed URL must fail before any request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_reports_unreachable_mint() {
+        // Dead localhost port: connection refused immediately, no network.
+        match CashuClient::connect("http://127.0.0.1:1").await {
+            Err(Error::MintConnection(_)) => {}
+            Err(other) => panic!("expected MintConnection, got {other}"),
+            Ok(_) => panic!("dead port must fail"),
+        }
+    }
+
+    #[test]
+    fn mint_url_returns_bound_url() {
+        let client = offline_client(TEST_MINT);
+        assert_eq!(
+            client.mint_url().to_string().trim_end_matches('/'),
+            TEST_MINT
+        );
+    }
+
+    // ── verify_2of3_condition edge shapes ────────────────────────────────
+
+    #[test]
+    fn rejects_non_distinct_expected_pubkeys() {
+        let (p_b, p_m) = (keypair(1), keypair(3));
+        // p_s == p_b: the daemon must refuse before inspecting the token.
+        let token = valid_escrow_token(p_b, p_b, p_m);
+        let err = CashuClient::verify_2of3_condition(&token, p_b, p_b, p_m)
+            .expect_err("non-distinct pubkeys must be rejected");
+        assert!(err.to_string().contains("distinct"));
+    }
+
+    #[test]
+    fn rejects_unparseable_token_string() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        assert!(CashuClient::verify_2of3_condition("cashuAnotatoken", p_b, p_s, p_m).is_err());
+    }
+
+    #[test]
+    fn rejects_htlc_spending_condition() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // An HTLC secret with escrow-looking tags must not slip through the
+        // P2PK-only gate. (Data is a 32-byte hash preimage-hash for HTLC.)
+        let raw_secret = format!(
+            r#"["HTLC",{{"nonce":"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f","data":"{}","tags":[["pubkeys","{}","{}"],["locktime","{LOCKTIME}"],["refund","{}"],["n_sigs","2"],["sigflag","SIG_INPUTS"]]}}]"#,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            p_b.to_hex(),
+            p_m.to_hex(),
+            p_s.to_hex(),
+        );
+        let token = raw_secret_token(&raw_secret);
+        assert!(
+            CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_err(),
+            "an HTLC condition must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_p2pk_condition_without_tags() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // Bare P2PK (no NUT-11 tag list): also exercises the no-tags early
+        // return of `reject_duplicate_standard_tags`.
+        let secret: Secret = SpendingConditions::P2PKConditions {
+            data: p_s,
+            conditions: None,
+        }
+        .try_into()
+        .expect("valid bare p2pk secret");
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(100u64),
+            secret,
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let token = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string();
+        let err = CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m)
+            .expect_err("tag-less P2PK cannot satisfy the escrow shape");
+        assert!(err.to_string().contains("no NUT-11 tags"));
+    }
+
+    #[test]
+    fn duplicate_custom_and_empty_tags_pass_the_dedup_guard() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // Custom (non-standard) tags may repeat per NUT-11 and an empty tag
+        // has no key: both must pass `reject_duplicate_standard_tags`
+        // (cdk's stricter `Conditions` parser may still reject the secret
+        // downstream — the guard must just never call it a duplicate).
+        let raw_secret = format!(
+            r#"["P2PK",{{"nonce":"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f","data":"{}","tags":[[],["x_custom","1"],["x_custom","2"],["pubkeys","{}","{}"],["locktime","{LOCKTIME}"],["refund","{}"],["n_sigs","2"],["sigflag","SIG_INPUTS"]]}}]"#,
+            p_s.to_hex(),
+            p_b.to_hex(),
+            p_m.to_hex(),
+            p_s.to_hex(),
+        );
+        let token = raw_secret_token(&raw_secret);
+        if let Err(e) = CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m) {
+            assert!(
+                !e.to_string().contains("duplicate NUT-11"),
+                "custom/empty tags must not trip the duplicate-tag guard, got: {e}"
+            );
+        }
+    }
+
+    // ── verify_escrow_token: offline steps (mint-backed steps need CF-3) ─
+
+    #[tokio::test]
+    async fn escrow_token_on_foreign_mint_is_rejected() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        let client = offline_client("https://other-mint.example.com");
+        let token = valid_escrow_token(p_b, p_s, p_m); // minted at TEST_MINT
+        let err = client
+            .verify_escrow_token(&token, p_b, p_s, p_m, 100, LOCKTIME)
+            .await
+            .expect_err("foreign-mint token must be rejected");
+        assert!(err.to_string().contains("does not match configured mint"));
+    }
+
+    #[tokio::test]
+    async fn escrow_token_with_duplicate_proofs_is_rejected_before_amount() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        let client = offline_client(TEST_MINT);
+        // Two copies of one valid escrow proof: 2×100 "value" from one
+        // 100-sat proof.
+        let secret: Secret = SpendingConditions::P2PKConditions {
+            data: p_s,
+            conditions: Some(Conditions {
+                locktime: Some(LOCKTIME),
+                pubkeys: Some(vec![p_b, p_m]),
+                refund_keys: Some(vec![p_s]),
+                num_sigs: Some(2),
+                sig_flag: SigFlag::SigInputs,
+                num_sigs_refund: None,
+            }),
+        }
+        .try_into()
+        .expect("valid p2pk secret");
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(100u64),
+            secret,
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let token = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![proof.clone(), proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string();
+        let err = client
+            .verify_escrow_token(&token, p_b, p_s, p_m, 200, LOCKTIME)
+            .await
+            .expect_err("duplicated proof must be rejected");
+        assert!(err.to_string().contains("duplicate secret"));
+    }
+
+    #[tokio::test]
+    async fn escrow_token_amount_mismatch_is_rejected() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        let client = offline_client(TEST_MINT);
+        let token = valid_escrow_token(p_b, p_s, p_m); // 100 sats
+        let err = client
+            .verify_escrow_token(&token, p_b, p_s, p_m, 50, LOCKTIME)
+            .await
+            .expect_err("amount mismatch must be rejected");
+        assert!(err.to_string().contains("does not match expected"));
+    }
+
+    #[tokio::test]
+    async fn escrow_token_reaching_dleq_step_fails_on_unreachable_mint() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        // Token minted at (and client bound to) a dead localhost port: all
+        // offline steps pass and the first mint-backed step (DLEQ keyset
+        // fetch) fails with connection refused — still no real network.
+        let dead_mint = "http://127.0.0.1:1";
+        let client = offline_client(dead_mint);
+        let secret: Secret = SpendingConditions::P2PKConditions {
+            data: p_s,
+            conditions: Some(Conditions {
+                locktime: Some(LOCKTIME),
+                pubkeys: Some(vec![p_b, p_m]),
+                refund_keys: Some(vec![p_s]),
+                num_sigs: Some(2),
+                sig_flag: SigFlag::SigInputs,
+                num_sigs_refund: None,
+            }),
+        }
+        .try_into()
+        .expect("valid p2pk secret");
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(100u64),
+            secret,
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let token = Token::new(
+            MintUrl::from_str(dead_mint).unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string();
+        let err = client
+            .verify_escrow_token(&token, p_b, p_s, p_m, 100, LOCKTIME)
+            .await
+            .expect_err("unreachable mint must fail the DLEQ step");
+        assert!(matches!(
+            err,
+            Error::Client(_) | Error::MintConnection(_) | Error::Token(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_state_fails_on_unreachable_mint() {
+        let client = offline_client("http://127.0.0.1:1");
+        let ys = vec![PublicKey::from_str(TEST_C).unwrap()];
+        assert!(client.check_state(ys).await.is_err());
+    }
+
+    /// A token whose serialized form carries no proofs must be rejected by
+    /// `verify_2of3_condition` before any per-secret work — otherwise an
+    /// empty token would vacuously "satisfy" every condition. Exercises the
+    /// `secrets.is_empty()` guard.
+    #[test]
+    fn rejects_token_with_no_secrets() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        let empty = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            Vec::new(),
+            None,
+            CurrencyUnit::Sat,
+        );
+        // Some cdk versions refuse to *parse* an empty token; either way the
+        // daemon must never accept it. When it does round-trip, the
+        // `secrets.is_empty()` branch is what rejects it.
+        let serialized = empty.to_string();
+        let err = CashuClient::verify_2of3_condition(&serialized, p_b, p_s, p_m)
+            .expect_err("an empty token must never satisfy the escrow shape");
+        // Whether it failed at parse or at the emptiness guard, it is a Token
+        // error, never a spuriously-accepted condition.
+        assert!(matches!(err, Error::Token(_)));
+    }
+
+    /// The token-level unit guard (step 3 of `verify_escrow_token`): a token
+    /// carrying the correct 2-of-3 escrow shape, on the configured mint, but
+    /// denominated in a non-`sat` unit must be rejected before its bare
+    /// integer `value()` is trusted against the sats order amount. Reaches
+    /// the `token.unit()` match's non-Sat arm using only offline steps.
+    #[tokio::test]
+    async fn escrow_token_with_non_sat_unit_is_rejected() {
+        let (p_b, p_s, p_m) = (keypair(1), keypair(2), keypair(3));
+        let client = offline_client(TEST_MINT);
+        let secret: Secret = SpendingConditions::P2PKConditions {
+            data: p_s,
+            conditions: Some(Conditions {
+                locktime: Some(LOCKTIME),
+                pubkeys: Some(vec![p_b, p_m]),
+                refund_keys: Some(vec![p_s]),
+                num_sigs: Some(2),
+                sig_flag: SigFlag::SigInputs,
+                num_sigs_refund: None,
+            }),
+        }
+        .try_into()
+        .expect("valid p2pk secret");
+        let proof = Proof {
+            keyset_id: Id::from_str(TEST_KEYSET_ID).unwrap(),
+            amount: Amount::from(100u64),
+            secret,
+            c: PublicKey::from_str(TEST_C).unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        // Same mint, valid escrow condition, but the token is in msat.
+        let token = Token::new(
+            MintUrl::from_str(TEST_MINT).unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Msat,
+        )
+        .to_string();
+        let err = client
+            .verify_escrow_token(&token, p_b, p_s, p_m, 100, LOCKTIME)
+            .await
+            .expect_err("a non-sat token must be rejected");
+        assert!(
+            err.to_string().contains("is not sat"),
+            "expected the unit guard to reject, got: {err}"
+        );
+    }
 }

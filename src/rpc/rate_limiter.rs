@@ -176,6 +176,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_default_uses_one_hour_retention() {
+        let limiter = RateLimiter::default();
+        assert_eq!(limiter.retention, DEFAULT_RETENTION);
+        assert!(limiter.check_rate_limit(&test_addr(7)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_expired_lockout_resets_state() {
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
+        let addr = test_addr(8);
+
+        // Arrange: a client whose lockout has already expired.
+        {
+            let mut clients = limiter.clients.lock().await;
+            clients.insert(
+                addr.ip().to_string(),
+                ClientState {
+                    failed_attempts: MAX_ATTEMPTS,
+                    last_attempt: Instant::now(),
+                    locked_until: Some(Instant::now()),
+                },
+            );
+        }
+
+        // Act: the expired lockout must be cleared and the request allowed.
+        assert!(limiter.check_rate_limit(&addr).await.is_ok());
+
+        // Assert: failure counter was reset by the expired-lockout branch.
+        let clients = limiter.clients.lock().await;
+        let state = clients.get(&addr.ip().to_string()).expect("entry kept");
+        assert_eq!(state.failed_attempts, 0);
+        assert!(state.locked_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_backoff_window_rejects_with_message() {
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
+        let addr = test_addr(9);
+
+        // Arrange: two recent failures put the client in a 2s backoff window.
+        {
+            let mut clients = limiter.clients.lock().await;
+            clients.insert(
+                addr.ip().to_string(),
+                ClientState {
+                    failed_attempts: 2,
+                    last_attempt: Instant::now(),
+                    locked_until: None,
+                },
+            );
+        }
+
+        let err = limiter
+            .check_rate_limit(&addr)
+            .await
+            .expect_err("inside the backoff window the request must be refused");
+        assert!(err.contains("Rate limited"));
+    }
+
+    #[tokio::test]
+    async fn test_backoff_window_elapsed_allows_request() {
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
+        let addr = test_addr(10);
+
+        // Arrange: one failure whose 1s backoff has already elapsed.
+        {
+            let mut clients = limiter.clients.lock().await;
+            clients.insert(
+                addr.ip().to_string(),
+                ClientState {
+                    failed_attempts: 1,
+                    last_attempt: Instant::now() - Duration::from_secs(2),
+                    locked_until: None,
+                },
+            );
+        }
+
+        assert!(limiter.check_rate_limit(&addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lockout_error_message_reports_remaining_seconds() {
+        let limiter = RateLimiter::new(DEFAULT_RETENTION);
+        let addr = test_addr(11);
+
+        {
+            let mut clients = limiter.clients.lock().await;
+            clients.insert(
+                addr.ip().to_string(),
+                ClientState {
+                    failed_attempts: MAX_ATTEMPTS,
+                    last_attempt: Instant::now(),
+                    locked_until: Some(Instant::now() + LOCKOUT_DURATION),
+                },
+            );
+        }
+
+        let err = limiter
+            .check_rate_limit(&addr)
+            .await
+            .expect_err("active lockout must refuse");
+        assert!(err.contains("Locked out"));
+    }
+
+    #[tokio::test]
     async fn test_first_attempt_allowed() {
         let limiter = RateLimiter::new(DEFAULT_RETENTION);
         assert!(limiter.check_rate_limit(&test_addr(1)).await.is_ok());

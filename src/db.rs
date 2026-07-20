@@ -1534,6 +1534,48 @@ mod tests {
     /// disputed ones** — and the solvers of active disputes, while excluding
     /// terminal orders and resolved disputes.
     #[tokio::test]
+    async fn find_active_trade_pubkeys_skips_empty_string_pubkeys() {
+        // A present-but-empty pubkey column (`Some("")`) must be skipped, not
+        // inserted as a zero-length "active key" — exercises the
+        // `if !pk.is_empty()` guard for both the orders and disputes loops.
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "waiting-payment",
+            Some("creator_only"),
+            Some(""), // empty buyer pubkey → skipped
+            Some(""), // empty seller pubkey → skipped
+        )
+        .await;
+        // Active dispute whose solver pubkey is the empty string → skipped.
+        sqlx::query(
+            "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+             VALUES (?1, ?2, 'in-progress', 'fiat-sent', '', 1700000000)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert!(keys.contains("creator_only"));
+        assert!(
+            !keys.contains(""),
+            "empty-string pubkeys must never be treated as active keys"
+        );
+        assert_eq!(keys.len(), 1, "only the non-empty creator key is active");
+    }
+
+    #[tokio::test]
     async fn find_active_trade_pubkeys_covers_active_and_disputed_excludes_terminal() {
         let pool = setup_orders_db().await.unwrap();
         setup_disputes_table(&pool).await;
@@ -2845,5 +2887,712 @@ mod tests {
             (other.4 - 32.0).abs() < f64::EPSILON,
             "other user's total_rating must not change"
         );
+    }
+}
+
+// Coverage-focused tests running against the real migration set, so schema
+// helpers, admin/dispute permission checks and the restore-session pipeline
+// are exercised on the production schema.
+#[cfg(test)]
+mod migration_and_query_tests {
+    use super::*;
+    use crate::app::context::test_utils::test_settings;
+    use crate::config::MOSTRO_CONFIG;
+    use mostro_core::prelude::CantDoReason;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// Migrated in-memory pool pinned to **one** connection.
+    ///
+    /// `sqlite::memory:` gives every *connection* its own private database,
+    /// so a multi-connection pool can hand a second caller a blank schema.
+    /// `restore_session_manager_delivers_background_results` clones this pool
+    /// into a `spawn_blocking` worker: on a different connection that worker
+    /// would find neither the migrations nor the inserted order, log an
+    /// error, deliver nothing, and leave the untimed `wait_for_result()`
+    /// blocked forever. Capping at one connection keeps every acquisition on
+    /// the same database.
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    const HEX_KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_order(
+        pool: &SqlitePool,
+        id: Uuid,
+        kind: &str,
+        status: &str,
+        buyer: Option<&str>,
+        seller: Option<&str>,
+        creator: &str,
+        taken_at: i64,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO orders (
+                id, kind, event_id, creator_pubkey, buyer_pubkey, master_buyer_pubkey,
+                seller_pubkey, master_seller_pubkey, status, payment_method, amount,
+                fiat_code, fiat_amount, premium, taken_at, created_at, expires_at,
+                trade_index_buyer, trade_index_seller
+            ) VALUES (?1, ?2, 'ev', ?3, ?4, ?5, ?6, ?7, ?8, 'bank', 1000, 'USD', 10, 0,
+                      ?9, 0, 0, 7, 9)"#,
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(creator)
+        .bind(buyer)
+        .bind(buyer)
+        .bind(seller)
+        .bind(seller)
+        .bind(status)
+        .bind(taken_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_dispute(pool: &SqlitePool, order_id: Uuid, status: &str, solver: Option<&str>) {
+        sqlx::query(
+            r#"INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at, taken_at)
+               VALUES (?1, ?2, ?3, 'active', ?4, 0, 0)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(order_id)
+        .bind(status)
+        .bind(solver)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_user(
+        pool: &SqlitePool,
+        pubkey: &str,
+        is_admin: bool,
+        admin_password: Option<&str>,
+        is_solver: bool,
+        category: i64,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO users (pubkey, is_admin, admin_password, is_solver, is_banned,
+               category, last_trade_index, total_reviews, total_rating, last_rating,
+               max_rating, min_rating, created_at)
+               VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, 0, 0, 0, 0, 0, 0)"#,
+        )
+        .bind(pubkey)
+        .bind(is_admin)
+        .bind(admin_password)
+        .bind(is_solver)
+        .bind(category)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // ── schema helpers ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn table_column_exists_detects_present_and_absent_columns() {
+        let pool = migrated_pool().await;
+        assert!(table_column_exists(&pool, "orders", "dev_fee")
+            .await
+            .unwrap());
+        assert!(!table_column_exists(&pool, "orders", "no_such_column")
+            .await
+            .unwrap());
+        assert!(!table_column_exists(&pool, "no_such_table", "x")
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn strip_sql_comments_removes_only_comment_lines() {
+        let sql = "-- header comment\nALTER TABLE t ADD COLUMN c INTEGER;\n  -- indented comment\nSELECT 1;";
+        let stripped = strip_sql_comments(sql);
+        assert!(!stripped.contains("comment"));
+        assert!(stripped.contains("ALTER TABLE t ADD COLUMN c INTEGER;"));
+        assert!(stripped.contains("SELECT 1;"));
+    }
+
+    #[test]
+    fn normalize_sql_identifier_strips_quotes_and_commas() {
+        assert_eq!(normalize_sql_identifier(" \"orders\","), "orders");
+        assert_eq!(normalize_sql_identifier("`bonds`"), "bonds");
+        assert_eq!(normalize_sql_identifier("[users]"), "users");
+        assert_eq!(normalize_sql_identifier("plain"), "plain");
+    }
+
+    #[test]
+    fn parse_add_column_statements_accepts_only_pure_add_column_migrations() {
+        let ops = parse_add_column_statements(
+            "-- adds two columns\nALTER TABLE orders ADD COLUMN dev_fee INTEGER DEFAULT 0;\nALTER TABLE \"orders\" ADD COLUMN dev_fee_paid INTEGER NOT NULL DEFAULT 0;",
+        )
+        .expect("pure add-column migration parses");
+        assert_eq!(
+            ops,
+            vec![
+                ("orders".to_string(), "dev_fee".to_string()),
+                ("orders".to_string(), "dev_fee_paid".to_string()),
+            ]
+        );
+
+        // Mixed statement kinds: not a pure add-column migration.
+        assert!(parse_add_column_statements(
+            "ALTER TABLE orders ADD COLUMN a INTEGER; CREATE INDEX i ON orders(a);"
+        )
+        .is_none());
+        // Too few tokens.
+        assert!(parse_add_column_statements("ALTER TABLE orders ADD COLUMN").is_none());
+        // Empty input.
+        assert!(parse_add_column_statements("-- only comments\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn applied_migration_versions_lists_all_applied_migrations() {
+        let pool = migrated_pool().await;
+        let versions = applied_migration_versions(&pool).await.unwrap();
+        assert!(!versions.is_empty());
+        let mut sorted = versions.clone();
+        sorted.sort();
+        assert_eq!(versions, sorted, "versions must come back ordered");
+    }
+
+    /// Replaying an add-column migration on a database that already has the
+    /// columns produces the exact "duplicate column name" error `connect`
+    /// reconciles; pin the parser on the real error object.
+    #[tokio::test]
+    async fn parse_duplicate_column_name_extracts_column_from_real_migrate_error() {
+        let pool = migrated_pool().await;
+        // Forget the dev_fee add-column migration was applied.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20251126120000")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = sqlx::migrate!()
+            .run(&pool)
+            .await
+            .expect_err("replaying the add-column migration must fail");
+        let column = parse_duplicate_column_name(&err).expect("duplicate column error parses");
+        assert_eq!(column, "dev_fee");
+    }
+
+    #[tokio::test]
+    async fn reconcile_add_column_migration_records_and_unblocks_migrator() {
+        let pool = migrated_pool().await;
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20251126120000")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let migrator = sqlx::migrate!();
+        let reconciled = reconcile_existing_add_column_migration(&pool, &migrator, "dev_fee")
+            .await
+            .unwrap();
+        assert!(reconciled, "existing columns must be recorded as applied");
+
+        // The migrator must now run cleanly again.
+        migrator.run(&pool).await.expect("migrations run clean");
+
+        // A column no pending migration adds is not reconcilable.
+        let not_reconciled =
+            reconcile_existing_add_column_migration(&pool, &migrator, "no_such_column")
+                .await
+                .unwrap();
+        assert!(!not_reconciled);
+    }
+
+    // ── legacy disputes-table token-column migration ─────────────────────
+
+    #[tokio::test]
+    async fn migrate_remove_token_columns_is_noop_without_token_columns() {
+        let pool = migrated_pool().await;
+        migrate_remove_token_columns(&pool).await.unwrap();
+        assert!(!table_column_exists(&pool, "disputes", "buyer_token")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn migrate_remove_token_columns_drops_legacy_columns_and_keeps_rows() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+        // Recreate the legacy shape.
+        sqlx::query("ALTER TABLE disputes ADD COLUMN buyer_token INTEGER")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE disputes ADD COLUMN seller_token INTEGER")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "initiated", Some(HEX_KEY_A)).await;
+
+        migrate_remove_token_columns(&pool).await.unwrap();
+
+        assert!(!table_column_exists(&pool, "disputes", "buyer_token")
+            .await
+            .unwrap());
+        assert!(!table_column_exists(&pool, "disputes", "seller_token")
+            .await
+            .unwrap());
+        let dispute = find_dispute_by_order_id(&pool, order_id).await.unwrap();
+        assert_eq!(dispute.order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn migrate_remove_token_columns_handles_single_legacy_column() {
+        let pool = migrated_pool().await;
+        sqlx::query("ALTER TABLE disputes ADD COLUMN seller_token INTEGER")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate_remove_token_columns(&pool).await.unwrap();
+        assert!(!table_column_exists(&pool, "disputes", "seller_token")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn rebuild_disputes_table_preserves_rows() {
+        let pool = migrated_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "in-progress", Some(HEX_KEY_B)).await;
+
+        rebuild_disputes_table_without_tokens(&pool).await.unwrap();
+
+        let dispute = find_dispute_by_order_id(&pool, order_id).await.unwrap();
+        assert_eq!(dispute.order_id, order_id);
+        assert_eq!(dispute.status, "in-progress");
+    }
+
+    // ── admin / permission queries ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_admin_password_returns_none_without_admin_row() {
+        let pool = migrated_pool().await;
+        assert_eq!(get_admin_password(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_admin_password_returns_stored_hash() {
+        let pool = migrated_pool().await;
+        insert_user(&pool, HEX_KEY_A, true, Some("argon2-hash"), false, 0).await;
+        assert_eq!(
+            get_admin_password(&pool).await.unwrap(),
+            Some("argon2-hash".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_finalize_permission_rejects_unassigned_caller() {
+        let pool = migrated_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "in-progress", Some(HEX_KEY_A)).await;
+        let err = ensure_dispute_finalize_permission(&pool, HEX_KEY_B, HEX_KEY_A, order_id)
+            .await
+            .expect_err("unassigned caller must be rejected");
+        assert!(matches!(
+            err,
+            MostroError::MostroCantDo(CantDoReason::IsNotYourDispute)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_finalize_permission_allows_read_write_solver() {
+        let pool = migrated_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "in-progress", Some(HEX_KEY_A)).await;
+        insert_user(&pool, HEX_KEY_A, false, None, true, 2).await;
+        // Caller is the assigned solver with category 2 (read-write), and is
+        // NOT the daemon key — the solver_has_write_permission branch runs.
+        ensure_dispute_finalize_permission(&pool, HEX_KEY_A, HEX_KEY_B, order_id)
+            .await
+            .expect("read-write assigned solver may finalize");
+    }
+
+    #[tokio::test]
+    async fn user_has_solver_write_permission_requires_category_two() {
+        let pool = migrated_pool().await;
+        insert_user(&pool, HEX_KEY_A, false, None, true, 2).await;
+        insert_user(&pool, HEX_KEY_B, false, None, true, 1).await;
+        assert!(user_has_solver_write_permission(&pool, HEX_KEY_A)
+            .await
+            .unwrap());
+        assert!(!user_has_solver_write_permission(&pool, HEX_KEY_B)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_dispute_taken_by_admin_distinguishes_solver_and_admin() {
+        let pool = migrated_pool().await;
+        let admin = HEX_KEY_A;
+
+        // No dispute at all.
+        assert!(!is_dispute_taken_by_admin(&pool, Uuid::new_v4(), admin)
+            .await
+            .unwrap());
+
+        // In-progress dispute taken by the admin key.
+        let admin_order = Uuid::new_v4();
+        insert_dispute(&pool, admin_order, "in-progress", Some(admin)).await;
+        assert!(is_dispute_taken_by_admin(&pool, admin_order, admin)
+            .await
+            .unwrap());
+
+        // In-progress dispute taken by a human solver.
+        let human_order = Uuid::new_v4();
+        insert_dispute(&pool, human_order, "in-progress", Some(HEX_KEY_B)).await;
+        assert!(!is_dispute_taken_by_admin(&pool, human_order, admin)
+            .await
+            .unwrap());
+
+        // In-progress dispute with no solver assigned.
+        let orphan_order = Uuid::new_v4();
+        insert_dispute(&pool, orphan_order, "in-progress", None).await;
+        assert!(!is_dispute_taken_by_admin(&pool, orphan_order, admin)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn find_solver_pubkey_returns_solver_row() {
+        let pool = migrated_pool().await;
+        insert_user(&pool, HEX_KEY_A, false, None, true, 2).await;
+        let user = find_solver_pubkey(&pool, HEX_KEY_A.to_string())
+            .await
+            .unwrap();
+        assert_eq!(user.pubkey, HEX_KEY_A);
+        assert!(find_solver_pubkey(&pool, HEX_KEY_B.to_string())
+            .await
+            .is_err());
+    }
+
+    // ── order queries ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn edit_pubkeys_order_clears_counterparty_keys_by_kind() {
+        let pool = migrated_pool().await;
+
+        // Buy order: seller side must be cleared.
+        let buy_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            buy_id,
+            "buy",
+            "pending",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+        let buy_order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?1")
+            .bind(buy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let edited = edit_pubkeys_order(&pool, &buy_order).await.unwrap();
+        assert_eq!(edited.seller_pubkey, None);
+        assert_eq!(edited.master_seller_pubkey, None);
+        assert_eq!(edited.buyer_pubkey.as_deref(), Some(HEX_KEY_A));
+
+        // Sell order: buyer side must be cleared.
+        let sell_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            sell_id,
+            "sell",
+            "pending",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            0,
+        )
+        .await;
+        let sell_order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?1")
+            .bind(sell_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let edited = edit_pubkeys_order(&pool, &sell_order).await.unwrap();
+        assert_eq!(edited.buyer_pubkey, None);
+        assert_eq!(edited.master_buyer_pubkey, None);
+        assert_eq!(edited.seller_pubkey.as_deref(), Some(HEX_KEY_B));
+    }
+
+    #[tokio::test]
+    async fn edit_pubkeys_order_rejects_invalid_kind_and_missing_row() {
+        let pool = migrated_pool().await;
+
+        // Unknown kind string.
+        let bogus = Order {
+            id: Uuid::new_v4(),
+            kind: "swap".to_string(),
+            ..Default::default()
+        };
+        assert!(edit_pubkeys_order(&pool, &bogus).await.is_err());
+
+        // Valid kind but no matching row.
+        let missing = Order {
+            id: Uuid::new_v4(),
+            kind: "sell".to_string(),
+            ..Default::default()
+        };
+        assert!(edit_pubkeys_order(&pool, &missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn find_order_by_seconds_returns_only_stale_waiting_orders() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+
+        // Stale waiting-buyer-invoice: eligible.
+        let stale_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            stale_id,
+            "sell",
+            "waiting-buyer-invoice",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            1, // taken long ago
+        )
+        .await;
+        // Fresh waiting-payment: not yet eligible.
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "waiting-payment",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            Timestamp::now().as_secs() as i64 + 10_000,
+        )
+        .await;
+        // Stale but active: wrong status.
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "sell",
+            "active",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            1,
+        )
+        .await;
+
+        let stale = find_order_by_seconds(&pool).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, stale_id);
+    }
+
+    #[tokio::test]
+    async fn find_dispute_by_order_id_finds_and_misses() {
+        let pool = migrated_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "initiated", None).await;
+        assert_eq!(
+            find_dispute_by_order_id(&pool, order_id)
+                .await
+                .unwrap()
+                .order_id,
+            order_id
+        );
+        assert!(find_dispute_by_order_id(&pool, Uuid::new_v4())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn has_pending_order_rejects_unknown_master_key_field() {
+        let pool = migrated_pool().await;
+        let err = has_pending_order_with_status(
+            &pool,
+            HEX_KEY_A.to_string(),
+            "not_a_key_field",
+            "waiting-payment",
+        )
+        .await
+        .expect_err("unknown master key field must be rejected");
+        assert!(err.to_string().contains("Invalid master key field"));
+    }
+
+    #[tokio::test]
+    async fn update_user_rating_rejects_out_of_range_min_max_and_below_floor() {
+        let pool = migrated_pool().await;
+        // min_rating outside 0..=5
+        assert!(matches!(
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 6, 5, 1, 5.0).await,
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
+        ));
+        // max_rating outside 0..=5
+        assert!(matches!(
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 0, 9, 1, 5.0).await,
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
+        ));
+        // last_rating below the MIN_RATING floor (0 < 1)
+        assert!(matches!(
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 0, 0, 5, 1, 0.0).await,
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
+        ));
+    }
+
+    // ── restore session ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_validates_and_finds_both_sides() {
+        let pool = migrated_pool().await;
+        assert!(find_user_orders_by_master_key(&pool, "not-hex")
+            .await
+            .is_err());
+
+        // One active order as buyer, one as seller, one terminal (excluded).
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "active",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "sell",
+            "waiting-payment",
+            Some(HEX_KEY_B),
+            Some(HEX_KEY_A),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "canceled",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+
+        let orders = find_user_orders_by_master_key(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        assert_eq!(orders.len(), 2, "terminal orders are excluded");
+    }
+
+    #[tokio::test]
+    async fn find_user_disputes_by_master_key_validates_and_joins_orders() {
+        let pool = migrated_pool().await;
+        assert!(find_user_disputes_by_master_key(&pool, "xyz")
+            .await
+            .is_err());
+
+        let order_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            order_id,
+            "buy",
+            "dispute",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+        insert_dispute(&pool, order_id, "initiated", None).await;
+
+        let disputes = find_user_disputes_by_master_key(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn restore_session_manager_delivers_background_results() {
+        let pool = migrated_pool().await;
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "active",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+
+        // Default delegates to new().
+        let mut manager = RestoreSessionManager::default();
+        // Nothing pending yet.
+        assert!(manager.check_results().await.is_none());
+
+        manager
+            .start_restore_session(pool.clone(), HEX_KEY_A.to_string())
+            .await
+            .unwrap();
+        let info = manager
+            .wait_for_result()
+            .await
+            .expect("background restore session must deliver");
+        assert_eq!(info.restore_orders.len(), 1);
+        assert!(info.restore_disputes.is_empty());
+
+        // Invalid master key: worker logs the error, nothing is delivered.
+        manager
+            .start_restore_session(pool.clone(), "not-hex".to_string())
+            .await
+            .unwrap();
+        // Give the blocking task a moment, then confirm no result arrived.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(manager.check_results().await.is_none());
+    }
+
+    // ── connect() ────────────────────────────────────────────────────────
+
+    /// `connect()` reads the database URL from the global settings, which in
+    /// the test binary depend on whichever module initialized them first
+    /// (canonical `sqlite::memory:` or a default empty URL). Both are
+    /// exercised tolerantly: either the pool comes up (in-memory) or a
+    /// clean error surfaces — never a panic. Any stray file the in-memory
+    /// URL shape creates in the CWD is removed.
+    #[tokio::test]
+    async fn connect_is_panic_free_under_test_configuration() {
+        init_test_settings();
+        let first = connect().await;
+        let second = connect().await;
+        match (&first, &second) {
+            (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
+            other => panic!("connect() must behave consistently, got {other:?}"),
+        }
+        // Clean up the artifact of the "sqlite::memory:" URL shape.
+        let stray = std::path::Path::new("sqlite::memory:");
+        if stray.exists() {
+            let _ = std::fs::remove_file(stray);
+        }
     }
 }

@@ -1,0 +1,4 @@
+# Cap test-thread fan-out per mutant run. Without this, each cargo-mutants
+# job spawns a test binary with --test-threads = num_cpus, which multiplies
+# with CARGO_MUTANTS_JOBS (see `make mutation-test`) and can exhaust RAM.
+additional_cargo_test_args = ["--test-threads=4"]

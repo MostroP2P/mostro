@@ -8,6 +8,7 @@ lnurl-test-server/target
 .idea
 .vscode
 .cursor
+.claude
 
 # settings file
 settings.toml

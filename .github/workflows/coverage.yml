@@ -39,11 +39,6 @@ jobs:
   coverage:
     name: Generate and publish report
     runs-on: ubuntu-latest
-    env:
-      # Surfaced as an env var so the upload step can be skipped when Codecov
-      # is not configured: the `secrets` context is not available in a
-      # step-level `if:`.
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -84,24 +79,46 @@ jobs:
       - name: Render HTML report
         run: cargo llvm-cov report --html --output-dir target/llvm-cov
 
+      # Published next to the HTML so editors and external tools can consume
+      # the raw data without re-running the suite.
       - name: Render lcov report
-        run: cargo llvm-cov report --lcov --output-path lcov.info
+        run: cargo llvm-cov report --lcov --output-path target/llvm-cov/html/lcov.info
 
       - name: Coverage summary
         run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
 
-      # Skipped entirely when CODECOV_TOKEN is unset, so an unconfigured
-      # Codecov is visible as a skipped step rather than a silent no-op. When
-      # it does run, a failed upload fails the job: `fail_ci_if_error: false`
-      # would let the workflow stay green while nothing reaches Codecov,
-      # leaving the README badge permanently blank with no signal.
-      - name: Upload to Codecov
-        if: env.CODECOV_TOKEN != ''
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+      # Self-hosted badge data, so the README number comes from this repo's
+      # own Pages site instead of a third-party service that would make
+      # readers sign up to see it. shields.io renders it via its `endpoint`
+      # type; the repo already depends on shields for the license, Rust and
+      # version badges, so this adds no new dependency.
+      #
+      # The percentage is read from the machine-readable summary rather than
+      # scraped from the human table: `--json` with `--summary-only` is the
+      # supported combination and its shape is stable
+      # (`.data[0].totals.lines.percent`).
+      - name: Generate badge data
+        run: |
+          set -euo pipefail
+          # Force the C locale: printf's decimal separator follows LC_NUMERIC,
+          # so on a localised machine "%.1f" yields "92,8" and shields.io then
+          # renders a comma in the badge.
+          export LC_ALL=C
+          cargo llvm-cov report --json --summary-only --output-path summary.json
+          pct=$(jq -r '.data[0].totals.lines.percent' summary.json)
+          printf -v rounded '%.1f' "$pct"
+          # Thresholds mirror the usual shields palette so the colour keeps
+          # meaning something if coverage regresses.
+          if   (( $(echo "$pct >= 90" | bc -l) )); then colour=brightgreen
+          elif (( $(echo "$pct >= 75" | bc -l) )); then colour=green
+          elif (( $(echo "$pct >= 60" | bc -l) )); then colour=yellow
+          elif (( $(echo "$pct >= 40" | bc -l) )); then colour=orange
+          else                                          colour=red
+          fi
+          jq -n --arg m "${rounded}%" --arg c "$colour" \
+            '{schemaVersion: 1, label: "coverage", message: $m, color: $c}' \
+            > target/llvm-cov/html/badge.json
+          echo "coverage: ${rounded}% ($colour)"
 
       # Same action and same branch as `mutation.yml`, into a sibling
       # subdirectory. `keep_files` is left at its default: with

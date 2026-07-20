@@ -1047,6 +1047,85 @@ pub async fn show_hold_invoice(
     Ok(())
 }
 
+/// Cashu analogue of [`show_hold_invoice`] (Track A **TA-2**,
+/// `docs/cashu/02-track-a-lock.md` §5).
+///
+/// Instead of creating a Lightning hold invoice, ask the **seller** to lock the
+/// trade amount in a 2-of-3 Cashu token: advance the order to `WaitingPayment`
+/// (where the CAS in `add_cashu_escrow_action` expects it), record both trade
+/// pubkeys, publish the updated order event, and enqueue an escrow request to
+/// the seller carrying everything the client needs to build the 2-of-3
+/// (`order.amount`, the buyer and seller trade pubkeys). The buyer (taker) gets
+/// a "waiting for the seller" notice — the buyer redeems the ecash directly
+/// later, so there is **no** buyer payout invoice in Cashu mode.
+///
+/// The escrow token locks `order.amount` **exactly** — the Mostro fee is a
+/// separate token (Option 2, added in TA-1f). The **mint URL** and the
+/// **locktime floor** are node policy the daemon enforces authoritatively when
+/// the seller submits (`add_cashu_escrow_action` §5/§7), so a client that funds
+/// against the wrong mint or with too short a locktime is simply rejected and
+/// retries — they are not carried in this request payload (the 0.14.0 protocol
+/// has no field for them).
+///
+/// The request is delivered as `Action::WaitingSellerToPay` carrying a
+/// `Payload::Order` whose `buyer_trade_pubkey`/`seller_trade_pubkey` are set;
+/// on a Cashu node the seller's client reads that as "lock the escrow" (the
+/// Lightning path instead sends `Action::PayInvoice` with a bolt11).
+pub async fn show_cashu_escrow_request(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
+    mut order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    order.status = Status::WaitingPayment.to_string();
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.seller_pubkey = Some(seller_pubkey.to_string());
+
+    // Publish the updated (WaitingPayment) order event and persist it.
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Build the escrow request for the seller.
+    let mut new_order = order.as_new_order();
+    new_order.status = Some(Status::WaitingPayment);
+    new_order.amount = order.amount;
+    new_order.buyer_trade_pubkey = Some(buyer_pubkey.to_string());
+    new_order.seller_trade_pubkey = Some(seller_pubkey.to_string());
+    // No buyer invoice in Cashu mode.
+    new_order.buyer_invoice = None;
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        Some(Payload::Order(new_order)),
+        *seller_pubkey,
+        order.trade_index_seller,
+    )
+    .await;
+
+    // Notify the buyer (taker) that their order was taken and the seller must
+    // lock the escrow.
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        None,
+        *buyer_pubkey,
+        order.trade_index_buyer,
+    )
+    .await;
+
+    Ok(())
+}
+
 // Create function to reuse in case of resubscription
 pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result<(), MostroError> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
@@ -2431,6 +2510,75 @@ mod tests {
             .await
             .unwrap();
         assert!(updated5.event_id.is_empty());
+    }
+
+    // ───────────────────────── cashu escrow request (TA-2) ─────────────────────────
+
+    /// `show_cashu_escrow_request` advances the order to `WaitingPayment`,
+    /// records both trade pubkeys, and enqueues the escrow request to the
+    /// seller (carrying the trade pubkeys + bare amount) plus a "wait" notice
+    /// to the buyer — no buyer invoice, no Lightning.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_advances_status_and_notifies_both_parties() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.trade_index_seller = Some(2);
+        order.trade_index_buyer = Some(3);
+        let order = order.create(&pool).await.unwrap();
+
+        show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(7))
+            .await
+            .expect("escrow request must succeed offline");
+
+        // Status advanced + both trade pubkeys recorded.
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(buyer.to_string()));
+        assert_eq!(db.seller_pubkey, Some(seller.to_string()));
+
+        // Collect our order's queued messages (the queue is shared across tests).
+        let msgs: Vec<(Message, PublicKey)> = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| m.get_inner_message_kind().id == Some(order.id))
+            .cloned()
+            .collect();
+
+        // The seller gets the escrow request carrying the 2-of-3 build inputs.
+        let (seller_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == seller)
+            .expect("seller escrow request");
+        assert_eq!(
+            seller_msg.get_inner_message_kind().action,
+            Action::WaitingSellerToPay
+        );
+        match seller_msg.get_inner_message_kind().get_payload() {
+            Some(Payload::Order(so)) => {
+                assert_eq!(so.buyer_trade_pubkey, Some(buyer.to_string()));
+                assert_eq!(so.seller_trade_pubkey, Some(seller.to_string()));
+                assert_eq!(so.amount, order.amount);
+                assert!(so.buyer_invoice.is_none());
+            }
+            other => panic!("expected Order payload for the seller, got {other:?}"),
+        }
+
+        // The buyer gets a bare "waiting for the seller" notice.
+        let (buyer_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == buyer)
+            .expect("buyer notice");
+        assert_eq!(
+            buyer_msg.get_inner_message_kind().action,
+            Action::WaitingSellerToPay
+        );
+        assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
     }
 
     // ───────────────────────── nostr client plumbing ─────────────────────────

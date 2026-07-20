@@ -59,7 +59,9 @@ jobs:
         run: docker compose -f docker-compose.cashu.yml up -d
 
       - name: Run mint-backed integration tests
-        run: cargo test --test cashu_mint -- --nocapture
+        # `--ignored`: the smoke test is `#[ignore]`d so a plain local
+        # `cargo test` reports it as skipped rather than a hollow pass.
+        run: cargo test --test cashu_mint -- --ignored --nocapture
 
       - name: Run env-gated in-tree cashu tests
         # Picks up any `#[ignore]`-gated mint-backed tests later PRs add

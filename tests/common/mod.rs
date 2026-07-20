@@ -45,11 +45,45 @@ pub fn mint_url_from_env() -> Option<String> {
     url
 }
 
+/// Per-request cap. A bare `reqwest::Client` has no default timeout, so a
+/// mint that accepts the TCP connection but never answers `/v1/info` would
+/// hang `send().await` forever — the `wait_for_mint` deadline is only
+/// re-checked *between* requests, so it would never fire, and the job would
+/// run until GitHub's global timeout. This bounds every individual probe.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Client with a per-request timeout, so a hung endpoint surfaces as a
+/// retryable error instead of an unbounded await.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client with a timeout must build")
+}
+
+/// GET `{mint_url}{path}` once and parse the body as JSON. Each call is
+/// bounded by [`REQUEST_TIMEOUT`].
+pub async fn mint_get_json(mint_url: &str, path: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{mint_url}{path}");
+    let resp = http_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url} returned {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("{url} body was not JSON: {e}"))
+}
+
 /// Poll the mint's NUT-06 info endpoint until it answers or `timeout`
 /// elapses (the container needs a few seconds to come up in CI). Returns
-/// the parsed `/v1/info` JSON.
+/// the parsed `/v1/info` JSON. Each probe is bounded by [`REQUEST_TIMEOUT`],
+/// so a hung endpoint cannot stall the loop past the deadline.
 pub async fn wait_for_mint(mint_url: &str, timeout: Duration) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let info_url = format!("{mint_url}/v1/info");
     let deadline = Instant::now() + timeout;
     loop {

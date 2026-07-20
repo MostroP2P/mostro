@@ -25,13 +25,26 @@ use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 pub async fn start_scheduler(ctx: AppContext) {
     info!("Creating scheduler");
 
+    // Mode-agnostic jobs run in both Lightning and Cashu mode.
     job_expire_pending_older_orders(ctx.clone()).await;
     job_update_rate_events(ctx.clone()).await;
-    job_cancel_orders(ctx.clone()).await;
-    job_retry_failed_payments(ctx.clone()).await;
-    job_process_dev_fee_payment(ctx.clone()).await;
-    job_process_bond_payouts(ctx.clone()).await;
-    job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+
+    // Lightning-only jobs: they settle/cancel hold invoices, retry LN
+    // payments, pay the dev fee over LN, and service anti-abuse bonds — all of
+    // which require an LND node that Cashu mode never initialises (CF-5).
+    // Bonds are additionally mutually exclusive with Cashu mode (CF-1). Gating
+    // the spawns here keeps them from calling `LndConnector::new()` on a node
+    // that has no LND. Lightning mode is unaffected (`is_cashu_enabled()` is
+    // `false`, so every job below still starts exactly as before).
+    if !Settings::is_cashu_enabled() {
+        job_cancel_orders(ctx.clone()).await;
+        job_retry_failed_payments(ctx.clone()).await;
+        job_process_dev_fee_payment(ctx.clone()).await;
+        job_process_bond_payouts(ctx.clone()).await;
+        job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+    }
+
+    // Mode-agnostic jobs (the info event self-skips when LN status is absent).
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
@@ -169,7 +182,13 @@ async fn job_info_event_send(ctx: AppContext) {
     let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
-    let ln_status = LN_STATUS.get().unwrap();
+    // The info event embeds LN node stats (`info_to_tags`). In Cashu mode there
+    // is no LND, so `LN_STATUS` is never set — skip the job rather than panic
+    // on `unwrap()`. A Cashu-aware info event is future work (CF-5).
+    let Some(ln_status) = LN_STATUS.get() else {
+        info!("Skipping mostro info event: no LN status (Cashu mode)");
+        return;
+    };
     tokio::spawn(async move {
         loop {
             info!("Sending info about mostro");

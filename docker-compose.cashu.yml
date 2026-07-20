@@ -18,7 +18,9 @@
 services:
   mint:
     image: cashubtc/nutshell:0.20.1
-    container_name: mostro-cashu-test-mint
+    # No fixed container_name: a pinned name blocks two runs on one host
+    # (a stale container from an aborted run, or a second checkout) with a
+    # name collision. Compose derives a unique name per project instead.
     ports:
       - "3338:3338"
     environment:

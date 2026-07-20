@@ -12,12 +12,25 @@ on:
   workflow_dispatch:
   schedule:
     # Nightly against main at 4 AM UTC, so a mint-facing regression is
-    # caught even if a PR author forgets the label.
+    # caught even if a PR author forgets the label. Off the weekly slots
+    # used by mutation (Sun 03:00) and coverage (Sun 05:00) so the three
+    # long jobs don't contend for runners.
     - cron: '0 4 * * *'
 
 env:
   CARGO_TERM_COLOR: always
   CASHU_TEST_MINT_URL: http://127.0.0.1:3338
+  # Turn a missing/empty mint URL into a hard failure instead of a silent
+  # skip: libtest reports a skipped test as `1 passed`, so without this a
+  # broken `env:` block above would leave this job green having tested
+  # nothing. See `mint_url_from_env` in tests/common/mod.rs.
+  CASHU_REQUIRE_MINT: '1'
+
+# Read-only: this job builds and tests, it never writes back to the repo.
+# Dropping the default write scopes keeps the token out of the mint
+# container and the long test run (zizmor `artipacked`).
+permissions:
+  contents: read
 
 jobs:
   mint-integration:
@@ -26,6 +39,9 @@ jobs:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'cashu')
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Nothing here needs the checkout credential after clone.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 

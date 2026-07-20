@@ -12,13 +12,37 @@
 
 use std::time::{Duration, Instant};
 
+/// Set by CI to turn a missing mint URL from "skip" into a hard failure.
+const REQUIRE_MINT_VAR: &str = "CASHU_REQUIRE_MINT";
+
 /// The test-mint URL, if the harness is active. Trailing slashes are
 /// trimmed so callers can naively join paths.
+///
+/// Returns `None` when `CASHU_TEST_MINT_URL` is unset so a plain local
+/// `cargo test` stays offline — but panics instead when `CASHU_REQUIRE_MINT`
+/// is set, which `.github/workflows/cashu.yml` does.
+///
+/// The distinction matters because skipping is indistinguishable from
+/// succeeding in libtest output: a skipped mint test still reports
+/// `1 passed`, not `ignored`. Without this guard a renamed variable, a typo
+/// or a dropped `env:` block would leave the Cashu job green while it
+/// exercised nothing at all — the one failure mode a mint harness must not
+/// have.
 pub fn mint_url_from_env() -> Option<String> {
-    std::env::var("CASHU_TEST_MINT_URL")
+    let url = std::env::var("CASHU_TEST_MINT_URL")
         .ok()
         .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty());
+
+    assert!(
+        !(url.is_none() && std::env::var_os(REQUIRE_MINT_VAR).is_some()),
+        "{REQUIRE_MINT_VAR} is set but CASHU_TEST_MINT_URL is empty or missing: \
+         the mint-backed suite would have silently reported success without \
+         testing anything. Check the `env:` block in \
+         .github/workflows/cashu.yml."
+    );
+
+    url
 }
 
 /// Poll the mint's NUT-06 info endpoint until it answers or `timeout`

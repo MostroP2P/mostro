@@ -55,6 +55,41 @@ pub fn routing_fee_cap_sats(amount: i64) -> i64 {
     max_fee as i64
 }
 
+/// Length in bytes of a Lightning payment preimage and of the payment
+/// hash derived from it (both are SHA-256 sized).
+const HASH_LEN: usize = 32;
+
+/// Decode a hex-encoded 32-byte preimage or payment hash — as stored in
+/// the `orders` / `bonds` tables — into the raw bytes LND expects.
+///
+/// This must never panic. The main event loop in `src/app.rs` processes
+/// messages sequentially on a single task with no panic boundary, so an
+/// `.expect()` here would turn a single malformed row (corruption, a
+/// partial write, a manual DB edit) into a full-daemon outage for every
+/// user of the instance. Returning a typed error keeps the blast radius
+/// at the one operation that touched the bad row.
+///
+/// `field` names the column for the log line. The value itself is never
+/// included in the error: the preimage is the secret that claims the
+/// HTLC, and errors end up in logs.
+fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
+    let bytes = Vec::<u8>::from_hex(value).map_err(|e| {
+        MostroInternalErr(ServiceError::HoldInvoiceError(format!(
+            "invalid {field}: not valid hex ({e})"
+        )))
+    })?;
+
+    if bytes.len() != HASH_LEN {
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(format!(
+            "invalid {field}: expected {} bytes, got {}",
+            HASH_LEN,
+            bytes.len()
+        ))));
+    }
+
+    Ok(bytes)
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -147,7 +182,7 @@ impl LndConnector {
         &mut self,
         preimage: &str,
     ) -> Result<SettleInvoiceResp, MostroError> {
-        let preimage = FromHex::from_hex(preimage).expect("Wrong preimage");
+        let preimage = decode_hash32("preimage", preimage)?;
 
         let preimage_message = SettleInvoiceMsg { preimage };
         let settle = self
@@ -167,7 +202,7 @@ impl LndConnector {
         &mut self,
         hash: &str,
     ) -> Result<CancelInvoiceResp, MostroError> {
-        let payment_hash = FromHex::from_hex(hash).expect("Wrong payment hash");
+        let payment_hash = decode_hash32("payment hash", hash)?;
 
         let cancel_message = CancelInvoiceMsg { payment_hash };
         let cancel = self.client.invoices().cancel_invoice(cancel_message).await;
@@ -423,9 +458,10 @@ impl LnStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::routing_fee_cap_sats;
+    use super::{decode_hash32, routing_fee_cap_sats};
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
+    use mostro_core::prelude::*;
 
     fn init_test_settings() {
         // Defaults set `max_routing_fee = 0.002`.
@@ -460,5 +496,106 @@ mod tests {
         assert_eq!(routing_fee_cap_sats(1001), 2); // 2.002 -> 2
         assert_eq!(routing_fee_cap_sats(2001), 4); // 4.002 -> 4
         assert_eq!(routing_fee_cap_sats(100_000), 200);
+    }
+
+    // --- decode_hash32 -----------------------------------------------
+    //
+    // These guard the CRITICAL fix for #804: a malformed `preimage` /
+    // `hash` column must fail *that* operation, never panic the daemon.
+
+    /// Assert the error is the typed hold-invoice error naming `field`,
+    /// and that it never echoes the raw value back into logs.
+    fn assert_hold_invoice_err(err: MostroError, field: &str, value: &str) {
+        match err {
+            MostroInternalErr(ServiceError::HoldInvoiceError(msg)) => {
+                assert!(
+                    msg.contains(field),
+                    "error should name the offending column, got: {msg}"
+                );
+                assert!(
+                    !msg.contains(value),
+                    "error must not leak the secret value, got: {msg}"
+                );
+            }
+            other => panic!("expected HoldInvoiceError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_valid_32_byte_hex() {
+        // Arrange
+        let value = "ab".repeat(32);
+
+        // Act
+        let bytes = decode_hash32("preimage", &value).expect("valid hex must decode");
+
+        // Assert
+        assert_eq!(bytes, vec![0xab; 32]);
+    }
+
+    #[test]
+    fn accepts_uppercase_hex() {
+        // Arrange: LND and some tooling emit uppercase hex; rejecting it
+        // would strand otherwise-valid rows.
+        let value = "AB".repeat(32);
+
+        // Act
+        let bytes = decode_hash32("preimage", &value).expect("uppercase hex must decode");
+
+        // Assert
+        assert_eq!(bytes, vec![0xab; 32]);
+    }
+
+    #[test]
+    fn returns_error_instead_of_panicking_on_non_hex() {
+        // Arrange: `bonds` fixtures and hand-edited rows have produced
+        // values like this; before #804 they panicked the process.
+        let value = "p".repeat(64);
+
+        // Act
+        let err = decode_hash32("preimage", &value).expect_err("non-hex must be rejected");
+
+        // Assert
+        assert_hold_invoice_err(err, "preimage", &value);
+    }
+
+    #[test]
+    fn returns_error_on_odd_length_hex() {
+        // Arrange: a truncated / partially written column.
+        let value = "abc";
+
+        // Act
+        let err = decode_hash32("payment hash", value).expect_err("odd length must be rejected");
+
+        // Assert
+        assert_hold_invoice_err(err, "payment hash", value);
+    }
+
+    #[test]
+    fn returns_error_on_empty_string() {
+        // Arrange / Act
+        let err = decode_hash32("preimage", "").expect_err("empty must be rejected");
+
+        // Assert: empty is valid hex for a zero-length Vec, so it is the
+        // length check that has to catch it.
+        match err {
+            MostroInternalErr(ServiceError::HoldInvoiceError(msg)) => {
+                assert!(msg.contains("expected 32 bytes, got 0"), "got: {msg}")
+            }
+            other => panic!("expected HoldInvoiceError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_error_on_wrong_length_hex() {
+        // Arrange: well-formed hex, wrong size — LND would reject it
+        // anyway, but we want a clear error at the boundary.
+        for value in ["00".repeat(31), "00".repeat(33)] {
+            // Act
+            let err = decode_hash32("preimage", &value).expect_err("wrong length must be rejected");
+
+            // Assert
+            assert_hold_invoice_err(err, "preimage", &value);
+        }
     }
 }

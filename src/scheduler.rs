@@ -349,8 +349,21 @@ async fn job_cancel_orders(ctx: AppContext) {
                         // If hold invoice is paid return funds to seller
                         // We return funds to seller
                         if let Some(hash) = order.hash.as_ref() {
+                            // The cancel must succeed before we clear the
+                            // order. Falling through on error would take the
+                            // order out of `find_order_by_seconds`'s
+                            // waiting-state eligibility window — and log
+                            // "funds returned" — while the hold invoice is
+                            // still encumbered, with no later tick to fix it.
+                            // Same reasoning as the bond slash/release below:
+                            // stay eligible and retry rather than persist a
+                            // state that doesn't match the HTLC.
                             if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
-                                error!("{e}");
+                                error!(
+                                    "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
+                                    order.id
+                                );
+                                continue;
                             }
                             info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
                         };

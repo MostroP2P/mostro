@@ -1669,27 +1669,39 @@ mod tests {
         assert_eq!(result, "deadbeef");
     }
 
+    /// `NOSTR_CLIENT` is a process-wide `OnceLock` that `initialize()` and
+    /// every other test's `init_globals()` also install into, so the two
+    /// halves of this used to live in separate tests: one asserted
+    /// `get_nostr_client()` errors while the lock reads `None`, the other
+    /// asserted it succeeds once set.
+    ///
+    /// That split was racy. Reading `NOSTR_CLIENT.get()` and then asserting
+    /// on `get_nostr_client()` is a check-then-act on shared state: a
+    /// concurrent test can install the client in between and flip the result
+    /// from `Err` to `Ok`. Serializing just these two wouldn't fix it either,
+    /// since any `init_globals()` caller sets the same lock.
+    ///
+    /// A `OnceLock` is monotonic — once installed it never reverts — so the
+    /// post-set direction is the only one that holds no matter who wins the
+    /// race. Assert that, and only that. The uninitialized branch is not
+    /// deterministically reachable in a shared-process test binary.
     #[tokio::test]
-    async fn test_get_nostr_client_failure() {
+    async fn get_nostr_client_succeeds_once_the_global_is_installed() {
         initialize();
-        // NOSTR_CLIENT is a process-wide OnceLock that other tests may have
-        // installed already, so assert consistency with the global state
-        // instead of assuming a fresh process.
-        match NOSTR_CLIENT.get() {
-            None => assert!(get_nostr_client().is_err()),
-            Some(_) => assert!(get_nostr_client().is_ok()),
-        }
-    }
+        // Idempotent: whoever won the race already installed an equivalent
+        // client, and `set` on an initialized `OnceLock` is a no-op.
+        let _ = NOSTR_CLIENT.set(Client::default());
 
-    #[tokio::test]
-    async fn test_get_nostr_client_success() {
-        initialize();
-        // Mock NOSTR_CLIENT initialization (idempotent: another test may have
-        // installed the global client already).
-        let client = Client::default();
-        let _ = NOSTR_CLIENT.set(client);
-        let client_result = get_nostr_client();
-        assert!(client_result.is_ok());
+        assert!(
+            NOSTR_CLIENT.get().is_some(),
+            "the global must be installed after set()"
+        );
+        assert!(
+            get_nostr_client().is_ok(),
+            "an installed global must be readable"
+        );
+        // Monotonic: a second read cannot regress to Err.
+        assert!(get_nostr_client().is_ok(), "OnceLock must not revert");
     }
 
     #[test]
@@ -2007,7 +2019,17 @@ mod tests {
             let _ = DB_POOL.set(std::sync::Arc::new(pool));
         }
         let pool = get_db_pool();
-        let _ = sqlx::migrate!("./migrations").run(pool.as_ref()).await;
+        // Surface a migration failure instead of discarding it. Swallowing it
+        // would hand back a pool with a partial schema, and the tests built on
+        // it would fail much later with a confusing "no such table" instead of
+        // the real cause. The migrator is idempotent (tracked in
+        // `_sqlx_migrations`) and every `CREATE TABLE` in `migrations/` is
+        // `IF NOT EXISTS`, so re-running it against an already-migrated pool
+        // is a no-op — a failure here means a genuinely broken global pool.
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .expect("the process-global test pool must be fully migrated");
         pool
     }
 

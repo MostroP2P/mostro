@@ -2899,13 +2899,28 @@ mod migration_and_query_tests {
     use crate::app::context::test_utils::test_settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::CantDoReason;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     fn init_test_settings() {
         let _ = MOSTRO_CONFIG.set(test_settings());
     }
 
+    /// Migrated in-memory pool pinned to **one** connection.
+    ///
+    /// `sqlite::memory:` gives every *connection* its own private database,
+    /// so a multi-connection pool can hand a second caller a blank schema.
+    /// `restore_session_manager_delivers_background_results` clones this pool
+    /// into a `spawn_blocking` worker: on a different connection that worker
+    /// would find neither the migrations nor the inserted order, log an
+    /// error, deliver nothing, and leave the untimed `wait_for_result()`
+    /// blocked forever. Capping at one connection keeps every acquisition on
+    /// the same database.
     async fn migrated_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
     }

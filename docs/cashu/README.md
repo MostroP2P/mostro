@@ -30,9 +30,9 @@ untouched while the feature is off, and lets several developers work in parallel
 | 00 | [`../CASHU_ESCROW_ARCHITECTURE.md`](../CASHU_ESCROW_ARCHITECTURE.md) | Architecture, motivation, crypto model, trust model | Reference |
 | 01 | [`01-fundamentals.md`](./01-fundamentals.md) | **Foundation milestone** — config, mint client, DB helpers, test harness, boot wiring | **Draft (this PR)** |
 | 02 | [`02-track-a-lock.md`](./02-track-a-lock.md) | Escrow lock / setup (`AddCashuEscrow`) | **Draft** |
-| 03 | `03-track-b-release.md` | Release happy path | Planned |
-| 04 | `04-track-c-coop-cancel.md` | Cooperative cancel | Planned |
-| 05 | `05-track-d-dispute.md` | Dispute resolution (`P_M` signs) | Planned |
+| 03 | [`03-track-b-release.md`](./03-track-b-release.md) | Release happy path (`FiatSent` + `Release`) | **Draft** |
+| 04 | [`04-track-c-coop-cancel.md`](./04-track-c-coop-cancel.md) | Cooperative cancel + fee refund | **Draft** |
+| 05 | [`05-track-d-dispute.md`](./05-track-d-dispute.md) | Dispute resolution (`P_M` signs) | **Draft** |
 
 The **fundamentals** document (01) is the only one that touches shared,
 conflict-prone files. Once it has merged, the feature tracks (02–05) edit

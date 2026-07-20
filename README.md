@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
-[![Coverage](https://codecov.io/gh/MostroP2P/mostro/branch/main/graph/badge.svg)](https://codecov.io/gh/MostroP2P/mostro)
+[![Coverage](https://img.shields.io/endpoint?url=https://mostro.network/mostro/coverage/badge.json)](https://mostro.network/mostro/coverage/)
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MostroP2P/mostro)
 
@@ -1058,13 +1058,15 @@ cd mostro-regtest
 
 **Code Coverage**: Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
 
-The published report lives at **<https://mostrop2p.github.io/mostro/coverage/>**
-— the same browsable HTML `cargo llvm-cov --html` produces locally, regenerated
+The published report lives at **<https://mostro.network/mostro/coverage/>** —
+the same browsable HTML `cargo llvm-cov --html` produces locally, regenerated
 by the `Coverage` workflow every Sunday and on demand from the Actions tab.
+No account or sign-up is needed to read it, and the badge above is served from
+that same page (`coverage/badge.json`), so it always matches the report.
 (It shares the `gh-pages` branch with the mutation-testing report, which keeps
 its own `/mutation-testing/` subdirectory.)
-[Codecov](https://codecov.io/gh/MostroP2P/mostro) tracks the trend over time.
 Note the report reflects the last scheduled run, not the current tip of `main`.
+Raw lcov for editors and external tools: `coverage/lcov.info` on that page.
 
 To reproduce it locally:
 

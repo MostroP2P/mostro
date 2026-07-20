@@ -3056,4 +3056,64 @@ mod tests {
             "a locked order past Active must still be found"
         );
     }
+
+    #[tokio::test]
+    async fn cashu_escrow_cas_on_missing_order_matches_zero_rows() {
+        // A CAS against an id that isn't in the table must report no match
+        // (not error), the same "matches zero rows" contract a replay hits.
+        let pool = setup_orders_db().await.unwrap();
+        let locked = super::update_order_cashu_escrow(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert!(!locked, "CAS on a non-existent order must match zero rows");
+    }
+
+    #[tokio::test]
+    async fn find_locked_cashu_orders_includes_terminal_status_orders() {
+        // Pins the deliberate CF-4 design (M-1): the finder has no status
+        // predicate and nothing ever clears `cashu_escrow_locked_at`, so a
+        // locked order that reached a terminal status is STILL returned.
+        // This is a conscious, tested contract — if CF-5 needs terminal
+        // orders excluded, it must clear the lock or filter, not rely on
+        // this finder to drop them.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
+
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            id,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
+
+        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+            .bind(Status::Canceled.to_string())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let locked = super::find_locked_cashu_orders(&pool).await.unwrap();
+        assert_eq!(
+            locked.len(),
+            1,
+            "a canceled-but-locked order is still found"
+        );
+        assert_eq!(locked[0].id, id);
+        assert_eq!(locked[0].status, Status::Canceled.to_string());
+    }
 }

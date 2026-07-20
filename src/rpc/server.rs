@@ -102,6 +102,79 @@ mod tests {
         assert_eq!(expected_addr, "127.0.0.1:50051");
     }
 
+    use crate::app::context::test_utils::test_settings;
+    use crate::config::MOSTRO_CONFIG;
+    use nostr_sdk::Keys;
+    use std::sync::Arc;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// Offline `LndConnector` (lazy connect, no network until first RPC).
+    async fn offline_ln_client() -> Arc<tokio::sync::Mutex<LndConnector>> {
+        let dir = std::env::temp_dir().join(format!("mostro-rpcsrv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("tls.cert");
+        let macaroon = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").expect("write cert");
+        std::fs::write(&macaroon, b"").expect("write macaroon");
+        let client = fedimint_tonic_lnd::connect("https://127.0.0.1:1".to_string(), cert, macaroon)
+            .await
+            .expect("lazy connect must not touch the network");
+        Arc::new(tokio::sync::Mutex::new(LndConnector { client }))
+    }
+
+    #[test]
+    fn new_reads_settings_and_default_delegates() {
+        init_test_settings();
+        let server = RpcServer::new();
+        let rpc = Settings::get_rpc();
+        assert_eq!(server.listen_address, rpc.listen_address);
+        assert_eq!(server.port, rpc.port);
+
+        let defaulted = RpcServer::default();
+        assert_eq!(defaulted.listen_address, server.listen_address);
+        assert_eq!(defaulted.port, server.port);
+    }
+
+    #[test]
+    fn is_enabled_reflects_settings() {
+        init_test_settings();
+        // Canonical test settings keep the RPC server disabled.
+        assert!(!RpcServer::is_enabled());
+    }
+
+    #[tokio::test]
+    async fn start_rejects_unparseable_address() {
+        init_test_settings();
+        let server = RpcServer {
+            listen_address: "not an address".to_string(),
+            port: 50051,
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let result = server
+            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn start_surfaces_bind_failure() {
+        init_test_settings();
+        // 8.8.8.8 is not a local interface: the bind fails immediately, so
+        // the server error path is exercised without serving traffic.
+        let server = RpcServer {
+            listen_address: "8.8.8.8".to_string(),
+            port: 1,
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let result = server
+            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_default_rpc_settings() {
         let default_settings = RpcSettings::default();

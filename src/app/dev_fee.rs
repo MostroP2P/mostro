@@ -1044,7 +1044,14 @@ mod tests {
     fn init_test_settings() {
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
-            nostr: Default::default(),
+            nostr: crate::config::NostrSettings {
+                // Valid canonical test nsec: whichever module wins the
+                // MOSTRO_CONFIG race must install a parseable key, or tests
+                // that reach get_keys() flake on init ordering.
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
             mostro: Default::default(),
             lightning: Default::default(),
             rpc: Default::default(),
@@ -1230,6 +1237,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_missing_separator_dash() {
+        // Long enough to pass the length check, but byte 36 (where the
+        // UUID/timestamp separator dash must sit) is not '-': must
+        // return None without ever attempting to parse a timestamp.
+        let marker = format!("PENDING-{}", "x".repeat(50));
+        assert_eq!(parse_pending_timestamp(&marker), None);
+    }
+
+    #[test]
     fn test_parse_current_timestamp() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1321,6 +1337,36 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(hash_after, None);
+    }
+
+    #[tokio::test]
+    async fn release_pending_claim_logs_db_failure_without_panic() {
+        // A RAISE trigger forces the release UPDATE to fail; the helper
+        // must log and return without panicking, leaving the marker as-is.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some("PENDING-marker")).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        release_pending_claim(&pool, id, "PENDING-marker").await;
+
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            hash.as_deref(),
+            Some("PENDING-marker"),
+            "failed release must leave the marker in place"
+        );
     }
 
     #[tokio::test]
@@ -1443,5 +1489,510 @@ mod tests {
         assert_eq!(row.1, 1);
         assert_eq!(row.2.as_deref(), Some("deadbeef"));
         assert!(confirmed.contains(&order_id));
+    }
+
+    // ── LND-dependent phases against a lazily-connected dead client ──
+
+    use super::{
+        handle_payment_timeout, process_new_dev_fee_payments, recover_partial_payments,
+        resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment, verify_confirmed_orders,
+    };
+    use crate::lightning::LndConnector;
+
+    /// Real `LndConnector` against a dead endpoint: `connect` is lazy,
+    /// so it always builds; every RPC fails in ~1ms with a transport
+    /// error — the "LN node unreachable" shape the recovery phases
+    /// classify as `Unknown`.
+    async fn dead_lnd() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-test-lnd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("tls.cert");
+        let mac = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").unwrap();
+        std::fs::write(&mac, [1u8, 2u8]).unwrap();
+        let client = fedimint_tonic_lnd::connect(
+            "https://127.0.0.1:1".to_string(),
+            cert.to_str().unwrap().to_string(),
+            mac.to_str().unwrap().to_string(),
+        )
+        .await
+        .expect("lazy connect never dials");
+        LndConnector { client }
+    }
+
+    /// Freshly-signed bolt11 for `amount_sats` (1h expiry, throwaway key).
+    fn signed_test_invoice(amount_sats: u64) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[42u8; 32]).unwrap();
+        let payment_hash = sha256::Hash::hash(&uuid::Uuid::new_v4().into_bytes());
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .description("mostro dev fee test".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([7u8; 32]))
+            .amount_milli_satoshis(amount_sats * 1_000)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .expiry_time(std::time::Duration::from_secs(3_600))
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &sk))
+            .expect("valid invoice")
+            .to_string()
+    }
+
+    const VALID_HEX_HASH: &str = "abababababababababababababababababababababababababababababababab";
+
+    #[tokio::test]
+    async fn run_dev_fee_cycle_on_empty_db_is_a_noop() {
+        let pool = setup_orders_db().await;
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        run_dev_fee_cycle(&pool, &mut ln, &mut confirmed).await;
+        assert!(confirmed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_resets_legacy_marker_without_timestamp() {
+        // A pre-timestamp marker (`PENDING-{uuid}` only) has no age
+        // anchor: it must be treated as stale and reset.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .await;
+
+        cleanup_stale_pending_markers(&pool).await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, None, "legacy marker must be cleared");
+    }
+
+    #[tokio::test]
+    async fn cleanup_survives_query_and_update_failures() {
+        // UPDATE failure: a RAISE trigger fires on the reset attempt;
+        // cleanup must log and continue, leaving the marker in place.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-1"),
+        )
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        cleanup_stale_pending_markers(&pool).await;
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(hash.is_some(), "marker untouched after failed UPDATE");
+
+        // SELECT failure: no orders table at all → phase returns early.
+        let pool2 = setup_orders_db().await;
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool2)
+            .await
+            .unwrap();
+        cleanup_stale_pending_markers(&pool2).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_reset_when_marker_changes_concurrently() {
+        // Two stale orders. Once the first is reset (hash -> NULL), a
+        // trigger models a concurrent scheduler cycle claiming the
+        // second order's marker before this cycle's own per-row UPDATE
+        // (guarded on the *original* marker snapshot) gets to run.
+        // That guarded UPDATE must then affect 0 rows, hitting the
+        // "marker changed concurrently" skip branch instead of clobbering
+        // the concurrently-claimed row.
+        let pool = setup_orders_db().await;
+        let first_id = uuid::Uuid::new_v4();
+        let raced_id = uuid::Uuid::new_v4();
+
+        insert_test_order(
+            &pool,
+            first_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-1"),
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            raced_id,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440001-1"),
+        )
+        .await;
+
+        sqlx::query(
+            "CREATE TRIGGER simulate_concurrent_claim AFTER UPDATE OF dev_fee_payment_hash ON orders
+             WHEN NEW.dev_fee_payment_hash IS NULL
+             BEGIN
+                 UPDATE orders SET dev_fee_payment_hash = 'PENDING-raced-9999999999'
+                 WHERE dev_fee_payment_hash LIKE 'PENDING-%' AND id != NEW.id;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        cleanup_stale_pending_markers(&pool).await;
+
+        let first_hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(first_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(first_hash, None, "first stale order resets normally");
+
+        let raced: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(raced_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            raced.1.as_deref(),
+            Some("PENDING-raced-9999999999"),
+            "concurrently-changed marker must be left untouched, not reset"
+        );
+        assert_eq!(raced.0, 0);
+    }
+
+    #[tokio::test]
+    async fn verify_confirmed_skips_cached_and_leaves_unknown_alone() {
+        let pool = setup_orders_db().await;
+        let cached = uuid::Uuid::new_v4();
+        let unknown_rpc = uuid::Uuid::new_v4();
+        let unknown_hex = uuid::Uuid::new_v4();
+        insert_test_order(&pool, cached, "success", 100, true, Some(VALID_HEX_HASH)).await;
+        insert_test_order(
+            &pool,
+            unknown_rpc,
+            "success",
+            100,
+            true,
+            Some(VALID_HEX_HASH),
+        )
+        .await;
+        // Undecodable hash → Unknown via the hex-decode error path.
+        insert_test_order(&pool, unknown_hex, "success", 100, true, Some("zz-not-hex")).await;
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        confirmed.insert(cached);
+        verify_confirmed_orders(&pool, &mut ln, &mut confirmed).await;
+
+        // Unknown outcomes must not add to (or remove from) the set.
+        assert!(confirmed.contains(&cached));
+        assert!(!confirmed.contains(&unknown_rpc));
+        assert!(!confirmed.contains(&unknown_hex));
+
+        // Query-error arm: drop the table and re-run.
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        verify_confirmed_orders(&pool, &mut ln, &mut confirmed).await;
+    }
+
+    #[tokio::test]
+    async fn recover_partial_payment_with_unknown_ln_status_is_left_alone() {
+        // Hash stored, unpaid, LN unreachable → Unknown → the order must
+        // keep its hash (the #620 duplicate-payment guard).
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        recover_partial_payments(&pool, &mut ln, &mut confirmed).await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1.as_deref(), Some(VALID_HEX_HASH));
+        assert!(confirmed.is_empty());
+
+        // Query-error arm.
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        recover_partial_payments(&pool, &mut ln, &mut confirmed).await;
+    }
+
+    #[tokio::test]
+    async fn payment_timeout_with_unknown_status_keeps_hash() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        handle_payment_timeout(order, &pool, &mut ln, &mut confirmed).await;
+
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash.as_deref(), Some(VALID_HEX_HASH));
+        assert!(confirmed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn payment_timeout_with_untrackable_hash_keeps_row() {
+        // A PENDING- marker is not a trackable hash: status resolves to
+        // Unknown without ever dialing LN.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some("PENDING-x-1")).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        handle_payment_timeout(order, &pool, &mut ln, &mut confirmed).await;
+        assert!(confirmed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_new_payments_claim_failure_skips_order() {
+        // A RAISE trigger makes the atomic claim UPDATE fail: the order
+        // is skipped (error branch) and nothing else runs — crucially, no
+        // LNURL resolution is attempted for it.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed).await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, None);
+        assert!(confirmed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_new_payments_query_failure_returns_early() {
+        let pool = setup_orders_db().await;
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed).await;
+        assert!(confirmed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_payment_success_warns_on_hash_mismatch_and_uses_lnd_value() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some("stored-hash")).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mut confirmed = HashSet::new();
+        handle_payment_success(order, &pool, &mut confirmed, "lnd-hash").await;
+
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("lnd-hash"), "LND's hash wins");
+        assert!(confirmed.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn handle_payment_success_confirms_already_paid_row() {
+        // The guarded UPDATE (`WHERE dev_fee_paid = 0`) misses because a
+        // concurrent path already marked the row paid: the handler must
+        // still add the order to `confirmed` after re-checking the DB.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, true, Some("deadbeef")).await;
+        let mut order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Stale snapshot claims unpaid.
+        order.dev_fee_paid = false;
+
+        let mut confirmed = HashSet::new();
+        handle_payment_success(order, &pool, &mut confirmed, "deadbeef").await;
+        assert!(confirmed.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn handle_payment_success_db_failure_logs_critical_without_panic() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut confirmed = HashSet::new();
+        handle_payment_success(order, &pool, &mut confirmed, "deadbeef").await;
+        // Payment was delivered but the DB write failed: the handler
+        // logs CRITICAL and does NOT mark the order confirmed.
+        assert!(!confirmed.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn handle_payment_failure_db_failure_is_logged_not_propagated() {
+        use mostro_core::prelude::ServiceError;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some("h")).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = MostroError::MostroInternalErr(ServiceError::UnexpectedError("x".into()));
+        handle_payment_failure(order, &pool, id, &err).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_dev_fee_invoice_rejects_non_positive_fee() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 0, false, None).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(resolve_dev_fee_invoice(&order).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_dev_fee_payment_rejects_non_positive_fee() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 0, false, None).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut ln = dead_lnd().await;
+        assert!(send_dev_fee_payment(&order, "lnbc1p", &mut ln)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn send_dev_fee_payment_fails_fast_when_lnd_unreachable() {
+        // Full send path against the dead endpoint: the pre-send track
+        // check errors (treated as "never attempted"), the amount check
+        // passes (invoice amount == dev_fee), and send_payment_v2 then
+        // fails with a transport error → the helper surfaces Err.
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        let order =
+            sqlx::query_as::<_, mostro_core::order::Order>("SELECT * FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let invoice = signed_test_invoice(100);
+        let mut ln = dead_lnd().await;
+        let result = send_dev_fee_payment(&order, &invoice, &mut ln).await;
+        assert!(result.is_err(), "dead endpoint must fail the send");
     }
 }

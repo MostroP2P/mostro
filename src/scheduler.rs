@@ -835,3 +835,209 @@ async fn job_process_bond_payouts(ctx: AppContext) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::config::MOSTRO_CONFIG;
+    use uuid::Uuid;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    async fn migrated_ctx() -> AppContext {
+        init_test_settings();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .build()
+    }
+
+    fn hex_key() -> String {
+        nostr_sdk::Keys::generate().public_key().to_hex()
+    }
+
+    fn order_for_cancel(kind: Kind, with_pubkeys: bool) -> Order {
+        let (buyer, seller, creator) = if with_pubkeys {
+            (Some(hex_key()), Some(hex_key()), hex_key())
+        } else {
+            (None, None, String::new())
+        };
+        Order {
+            id: Uuid::new_v4(),
+            kind: kind.to_string(),
+            status: Status::WaitingBuyerInvoice.to_string(),
+            buyer_pubkey: buyer,
+            seller_pubkey: seller,
+            creator_pubkey: creator,
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn queued_actions_for(order_id: Uuid) -> Vec<Action> {
+        MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(msg, _)| msg.get_inner_message_kind().id == Some(order_id))
+            .map(|(msg, _)| msg.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    // ── notify_users_canceled_order ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn notify_cancel_enqueues_republish_for_maker_and_cancel_for_taker() {
+        init_test_settings();
+        // Sell order: taker is the buyer.
+        let order = order_for_cancel(Kind::Sell, true);
+        notify_users_canceled_order(&order, &order, Some(Action::NewOrder)).await;
+
+        let actions = queued_actions_for(order.id).await;
+        assert_eq!(actions.len(), 2, "maker and taker must both be notified");
+        assert!(actions.contains(&Action::NewOrder));
+        assert!(actions.contains(&Action::Canceled));
+    }
+
+    #[tokio::test]
+    async fn notify_cancel_enqueues_two_cancel_notices_when_order_dies() {
+        init_test_settings();
+        // Buy order: taker is the seller; maker action is Canceled.
+        let order = order_for_cancel(Kind::Buy, true);
+        notify_users_canceled_order(&order, &order, Some(Action::Canceled)).await;
+
+        let actions = queued_actions_for(order.id).await;
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|a| *a == Action::Canceled));
+    }
+
+    #[tokio::test]
+    async fn notify_cancel_bails_out_on_unparseable_kind() {
+        init_test_settings();
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.kind = "swap".to_string();
+        notify_users_canceled_order(&order, &order, None).await;
+        assert!(queued_actions_for(order.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_cancel_bails_out_when_pubkeys_are_missing() {
+        init_test_settings();
+        let order = order_for_cancel(Kind::Sell, false);
+        notify_users_canceled_order(&order, &order, None).await;
+        assert!(queued_actions_for(order.id).await.is_empty());
+    }
+
+    // ── job smoke tests ──────────────────────────────────────────────────
+    //
+    // The jobs are infinite `tokio::spawn` loops; under a paused clock
+    // their sleeps auto-advance, so a short virtual wait drives several
+    // iterations against the (empty) migrated database. Tasks die with the
+    // test runtime. LND-backed jobs exercise their startup-failure paths:
+    // the default lightning settings point at unreadable cert/macaroon
+    // paths, so `LndConnector::new()` fails fast without any network.
+
+    #[tokio::test]
+    async fn start_scheduler_spawns_all_jobs_without_panicking() {
+        let ctx = migrated_ctx().await;
+
+        // job_info_event_send unwraps the LN status global.
+        let _ = LN_STATUS.set(crate::lightning::LnStatus {
+            version: "test".to_string(),
+            node_pubkey: "00".repeat(32),
+            commit_hash: "test".to_string(),
+            node_alias: "test-node".to_string(),
+            chains: vec!["bitcoin".to_string()],
+            networks: vec!["regtest".to_string()],
+            uris: vec![],
+        });
+        // job_update_bitcoin_prices consults the global price manager; the
+        // canonical test install (empty providers, 30s interval — below the
+        // 60s floor) also exercises the interval clamp.
+        let _ = PriceManager::from_settings(crate::price::PriceSettings {
+            update_interval_seconds: 30,
+            providers: std::collections::HashMap::new(),
+            ..Default::default()
+        })
+        .expect("empty provider set builds")
+        .install_global();
+
+        // Push one message into the restore-session queue so the flush
+        // job's send-failure/retry path runs (no Nostr relays reachable).
+        MESSAGE_QUEUES
+            .queue_restore_session_msg
+            .write()
+            .await
+            .push((
+                Message::new_order(Some(Uuid::new_v4()), None, None, Action::Canceled, None),
+                ctx.keys().public_key(),
+            ));
+
+        // Pause only after the pool and globals exist: pool setup under a
+        // paused clock trips sqlx's acquire timeout via auto-advance.
+        tokio::time::pause();
+        start_scheduler(ctx).await;
+
+        // Let every loop take a few virtual-time laps (60s cadence jobs run
+        // ~6 times; the 250ms flush loop drains its retry budget).
+        tokio::time::sleep(tokio::time::Duration::from_secs(400)).await;
+
+        // The flush job must have dropped the undeliverable message after
+        // exhausting its retries.
+        assert!(
+            MESSAGE_QUEUES
+                .queue_restore_session_msg
+                .read()
+                .await
+                .is_empty(),
+            "undeliverable restore-session message must be dropped after retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_events_job_drains_the_rate_queue() {
+        let ctx = migrated_ctx().await;
+        // Seed a signed dummy event; the job publishes (best-effort, no
+        // relays) and clears the queue.
+        let keys = nostr_sdk::Keys::generate();
+        let event = nostr_sdk::EventBuilder::text_note("rate")
+            .sign_with_keys(&keys)
+            .unwrap();
+        MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
+
+        tokio::time::pause();
+        job_update_rate_events(ctx).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        assert!(MESSAGE_QUEUES.queue_order_rate.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiry_and_retry_jobs_iterate_on_empty_database() {
+        let ctx = migrated_ctx().await;
+        tokio::time::pause();
+        job_expire_pending_older_orders(ctx.clone()).await;
+        job_retry_failed_payments(ctx.clone()).await;
+        job_refresh_active_pubkeys(ctx.clone()).await;
+        job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_relay_list(ctx).await;
+        // Several virtual minutes: every loop body runs repeatedly.
+        tokio::time::sleep(tokio::time::Duration::from_secs(200)).await;
+    }
+
+    #[tokio::test]
+    async fn ln_backed_jobs_fail_fast_without_lnd() {
+        let ctx = migrated_ctx().await;
+        // Both return early (error log) because LndConnector::new() cannot
+        // read the default cert/macaroon paths.
+        job_cancel_orders(ctx.clone()).await;
+        job_process_dev_fee_payment(ctx).await;
+    }
+}

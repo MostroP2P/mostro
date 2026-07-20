@@ -1251,6 +1251,12 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
     })
 }
 
+/// A Nostr pubkey, as carried on the wire, is a 64-char hex string
+/// (case-insensitive).
+pub fn is_valid_hex_pubkey(key: &str) -> bool {
+    key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub async fn enqueue_cant_do_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
@@ -1693,6 +1699,43 @@ mod tests {
         let bytes: Vec<u8> = vec![];
         let result = bytes_to_string(&bytes);
         assert_eq!(result, "");
+    }
+
+    const VALID_HEX_PUBKEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn valid_hex_pubkey_is_accepted() {
+        assert_eq!(VALID_HEX_PUBKEY.len(), 64);
+        assert!(is_valid_hex_pubkey(VALID_HEX_PUBKEY));
+    }
+
+    #[test]
+    fn valid_hex_pubkey_accepts_uppercase() {
+        assert!(is_valid_hex_pubkey(&VALID_HEX_PUBKEY.to_uppercase()));
+    }
+
+    #[test]
+    fn valid_hex_pubkey_rejects_too_short_key() {
+        assert!(!is_valid_hex_pubkey(&VALID_HEX_PUBKEY[..63]));
+    }
+
+    #[test]
+    fn valid_hex_pubkey_rejects_too_long_key() {
+        let too_long = format!("{VALID_HEX_PUBKEY}1");
+        assert!(!is_valid_hex_pubkey(&too_long));
+    }
+
+    #[test]
+    fn valid_hex_pubkey_rejects_non_hex_characters() {
+        let mut key = VALID_HEX_PUBKEY[..63].to_string();
+        key.push('g');
+        assert!(!is_valid_hex_pubkey(&key));
+    }
+
+    #[test]
+    fn valid_hex_pubkey_rejects_empty_key() {
+        assert!(!is_valid_hex_pubkey(""));
     }
 
     #[tokio::test]

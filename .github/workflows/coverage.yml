@@ -1,0 +1,104 @@
+# Line-coverage report: publishes the browsable `cargo llvm-cov` HTML to
+# GitHub Pages and uploads lcov to Codecov for the PR delta / trend.
+#
+# NOTE: intentionally NOT run on push or per-PR. `cargo llvm-cov` rebuilds the
+# whole tree with instrumentation and then runs the full suite (~1000 tests),
+# so wiring it to every push burns CI minutes to regenerate a report nobody
+# reads between merges. Same reasoning as `mutation.yml`: a weekly audit plus
+# on-demand runs. Trigger it by hand from the Actions tab after a merge that
+# you expect to move coverage.
+name: Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sundays at 05:00 UTC — two hours after the mutation audit so the
+    # two long jobs don't contend for runners.
+    - cron: '0 5 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: the report job only reads code. Pages deployment gets its
+# own scopes, granted per-job below.
+permissions:
+  contents: read
+
+# Never let two runs deploy Pages at once; the later one wins.
+concurrency:
+  group: coverage-pages
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Generate report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-cov needs the profdata/profraw tooling shipped here.
+          components: llvm-tools-preview
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Run the instrumented suite once, then render both reports from the
+      # same profile data. Rendering separately would otherwise re-run all
+      # ~1000 tests a second time.
+      # Default features only, matching `cargo test` in ci.yml. `--all-features`
+      # would pull in `startos`, a packaging feature with no test surface, and
+      # the published percentage would stop matching what contributors get from
+      # `cargo llvm-cov --summary-only` locally.
+      - name: Run instrumented tests
+        run: cargo llvm-cov --no-report
+
+      # `--output-dir DIR` writes into `DIR/html`, not `DIR`. Passing
+      # `target/llvm-cov/html` here would nest it one level deeper and Pages
+      # would serve a directory with no index.html at its root — a 404.
+      - name: Render HTML report
+        run: cargo llvm-cov report --html --output-dir target/llvm-cov
+
+      - name: Render lcov report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          # Public repo: tokenless upload works, but a token avoids Codecov's
+          # rate limiting on shared runners. Add CODECOV_TOKEN as a repo secret
+          # to use it; the step still succeeds while the secret is unset.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/llvm-cov/html
+
+  deploy:
+    name: Publish to Pages
+    needs: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

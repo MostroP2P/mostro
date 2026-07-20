@@ -1,0 +1,115 @@
+# Line-coverage report: publishes the browsable `cargo llvm-cov` HTML to
+# GitHub Pages and uploads lcov to Codecov for the badge / trend.
+#
+# NOTE: intentionally NOT run on push or per-PR. `cargo llvm-cov` rebuilds the
+# whole tree with instrumentation and then runs the full suite (~1000 tests),
+# so wiring it to every push burns CI minutes to regenerate a report nobody
+# reads between merges. Same reasoning as `mutation.yml`: a weekly audit plus
+# on-demand runs. Trigger it by hand from the Actions tab after a merge that
+# you expect to move coverage.
+#
+# PUBLISHING PATH: branch-based (`gh-pages`), deliberately matching
+# `mutation.yml`. GitHub Pages has a single Source setting per repo, so a
+# repo cannot serve both a branch and an `actions/deploy-pages` artifact.
+# Using `deploy-pages` here would make the coverage artifact the *entire*
+# site and silently stop serving `/mutation-testing/`. Each report owns a
+# subdirectory instead: `/coverage/` and `/mutation-testing/`.
+name: Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sundays at 05:00 UTC — two hours after the mutation audit so the
+    # two long jobs don't contend for runners.
+    - cron: '0 5 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `contents: write` is required to push the rendered report to `gh-pages`.
+permissions:
+  contents: write
+
+# Never let two runs push `gh-pages` at once; the later one wins.
+concurrency:
+  group: coverage-pages
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Generate and publish report
+    runs-on: ubuntu-latest
+    env:
+      # Surfaced as an env var so the upload step can be skipped when Codecov
+      # is not configured: the `secrets` context is not available in a
+      # step-level `if:`.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Nothing after this step needs the checkout token; the publish step
+          # gets its own. Keeps the credential out of the later cargo/llvm-cov
+          # steps and out of any artifact they produce.
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-cov needs the profdata/profraw tooling shipped here.
+          components: llvm-tools-preview
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Run the instrumented suite once, then render every report from the
+      # same profile data. Rendering separately would re-run all ~1000 tests.
+      #
+      # Default features only, matching `cargo test` in ci.yml. `--all-features`
+      # would pull in `startos`, a packaging feature with no test surface, and
+      # the published percentage would stop matching what contributors get from
+      # `cargo llvm-cov --summary-only` locally.
+      - name: Run instrumented tests
+        run: cargo llvm-cov --no-report
+
+      # `--output-dir DIR` writes into `DIR/html`, not `DIR`. Passing
+      # `target/llvm-cov/html` here would nest it one level deeper and the
+      # published directory would have no index.html at its root — a 404.
+      - name: Render HTML report
+        run: cargo llvm-cov report --html --output-dir target/llvm-cov
+
+      - name: Render lcov report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+      # Skipped entirely when CODECOV_TOKEN is unset, so an unconfigured
+      # Codecov is visible as a skipped step rather than a silent no-op. When
+      # it does run, a failed upload fails the job: `fail_ci_if_error: false`
+      # would let the workflow stay green while nothing reaches Codecov,
+      # leaving the README badge permanently blank with no signal.
+      - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+      # Same action and same branch as `mutation.yml`, into a sibling
+      # subdirectory. `keep_files` is left at its default: with
+      # `destination_dir` set, only `coverage/` is replaced, so
+      # `mutation-testing/` on the same branch is untouched.
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/llvm-cov/html
+          destination_dir: coverage

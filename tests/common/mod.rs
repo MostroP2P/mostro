@@ -61,10 +61,20 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client with a timeout must build")
 }
 
-/// GET `{mint_url}{path}` once and parse the body as JSON. Each call is
+/// GET `{mint_url}/{path}` once and parse the body as JSON. Each call is
 /// bounded by [`REQUEST_TIMEOUT`].
+///
+/// The join is normalized to exactly one `/` between base and path,
+/// regardless of a trailing slash on `mint_url` or a leading slash on
+/// `path`, so callers can pass either form. This matches the naive-join
+/// convention `mint_url_from_env` already sets up by trimming trailing
+/// slashes.
 pub async fn mint_get_json(mint_url: &str, path: &str) -> Result<serde_json::Value, String> {
-    let url = format!("{mint_url}{path}");
+    let url = format!(
+        "{}/{}",
+        mint_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let resp = http_client()
         .get(&url)
         .send()

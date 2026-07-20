@@ -847,6 +847,144 @@ pub async fn update_order_cashu_escrow(
     Ok(result.rows_affected() > 0)
 }
 
+/// Outcome of the fee-carrying Cashu lock (TA-1f, Option 2).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CashuLockOutcome {
+    /// Escrow locked, status advanced, and the fee token persisted — all in one
+    /// atomic transaction.
+    Locked,
+    /// The compare-and-set matched zero rows (replay / status moved on) — a safe
+    /// idempotent no-op. Nothing was written.
+    StatusMismatch,
+    /// A fee proof `Y` is already recorded (for this or another order): the same
+    /// fee token was reused. The whole transaction rolled back.
+    FeeReuse,
+}
+
+/// Whether a sqlx error is a SQLite UNIQUE-constraint violation — used to turn
+/// a `cashu_fee_proofs` primary-key clash into [`CashuLockOutcome::FeeReuse`]
+/// rather than an opaque DB error.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
+/// Atomically persist a validated Cashu escrow **and its seller-funded fee
+/// token**, advance the status, and record every fee proof's `Y` for
+/// cross-order anti-reuse — all in one transaction (Track A TA-1f, §4A).
+///
+/// The escrow CAS (`WHERE id = ? AND status = ? AND cashu_escrow_locked_at IS
+/// NULL`) and the `cashu_fee_proofs` inserts commit together, so a crash can
+/// never leave a locked order whose fee is unrecorded, and two concurrent
+/// submissions of the same fee token cannot both succeed (the second hits the
+/// `y` PRIMARY KEY and rolls back → [`CashuLockOutcome::FeeReuse`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_order_cashu_escrow_with_fee(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    mint_url: &str,
+    token: &str,
+    fee_token: &str,
+    fee_proof_ys: &[String],
+    locked_at: i64,
+    expected_status: Status,
+    new_status: Status,
+) -> Result<CashuLockOutcome, MostroError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let result = sqlx::query(
+        r#"
+            UPDATE orders
+            SET
+            cashu_mint_url = ?1,
+            cashu_escrow_token = ?2,
+            cashu_escrow_locked_at = ?3,
+            cashu_fee_token = ?4,
+            status = ?5
+            WHERE id = ?6 AND status = ?7 AND cashu_escrow_locked_at IS NULL
+        "#,
+    )
+    .bind(mint_url)
+    .bind(token)
+    .bind(locked_at)
+    .bind(fee_token)
+    .bind(new_status.to_string())
+    .bind(order_id)
+    .bind(expected_status.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        // Nothing changed; dropping `tx` rolls back the (empty) transaction.
+        return Ok(CashuLockOutcome::StatusMismatch);
+    }
+
+    for y in fee_proof_ys {
+        let insert = sqlx::query(
+            "INSERT INTO cashu_fee_proofs (y, order_id, created_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(y)
+        .bind(order_id)
+        .bind(locked_at)
+        .execute(&mut *tx)
+        .await;
+
+        if let Err(e) = insert {
+            if is_unique_violation(&e) {
+                // Cross-order (or concurrent) fee-token reuse. Drop `tx` to roll
+                // back the escrow UPDATE too — the lock must not stand without
+                // an exclusively-owned fee token.
+                return Ok(CashuLockOutcome::FeeReuse);
+            }
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(CashuLockOutcome::Locked)
+}
+
+/// Orders whose fee token is persisted but not yet redeemed (TA-1f). The
+/// cashu-mode scheduler retry job collects these so a redeem interrupted by a
+/// crash between the lock and the mint swap is retried from the DB.
+pub async fn find_pending_cashu_fee_redeems(
+    pool: &SqlitePool,
+) -> Result<Vec<(Uuid, String)>, MostroError> {
+    sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+          SELECT id, cashu_fee_token
+          FROM orders
+          WHERE cashu_fee_token IS NOT NULL AND cashu_fee_redeemed_at IS NULL
+          ORDER BY cashu_escrow_locked_at ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Stamp a fee token as redeemed (TA-1f), so the retry job stops picking it up.
+pub async fn mark_cashu_fee_redeemed(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    redeemed_at: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query("UPDATE orders SET cashu_fee_redeemed_at = ?1 WHERE id = ?2")
+        .bind(redeemed_at)
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Every order with a locked Cashu escrow, for restore/monitoring after a
 /// restart (CF-4). Deliberately **no** `status` predicate:
 /// [`update_order_cashu_escrow`] advances the status in the same write as
@@ -1502,7 +1640,22 @@ mod tests {
                 dev_fee_payment_hash char(64),
                 cashu_mint_url text,
                 cashu_escrow_token text,
-                cashu_escrow_locked_at integer
+                cashu_escrow_locked_at integer,
+                cashu_fee_token text,
+                cashu_fee_redeemed_at integer
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        // Cashu fee anti-reuse table (TA-1f) — mirrors the migration.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cashu_fee_proofs (
+                y text primary key not null,
+                order_id text not null,
+                created_at integer not null
             )
             "#,
         )
@@ -2984,6 +3137,104 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cashu_fee_cas_locks_persists_fee_and_blocks_cross_order_reuse() {
+        let pool = setup_orders_db().await.unwrap();
+        let id1 = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, id1, &Status::WaitingPayment.to_string()).await;
+
+        // First lock: escrow + fee token + fee-proof Y recorded atomically.
+        let out = super::update_order_cashu_escrow_with_fee(
+            &pool,
+            id1,
+            "https://mint.example.com",
+            "cashuEscrow",
+            "cashuFee",
+            &["y-aaaa".to_string()],
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, super::CashuLockOutcome::Locked);
+
+        let (fee_token, redeemed): (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT cashu_fee_token, cashu_fee_redeemed_at FROM orders WHERE id = ?1",
+        )
+        .bind(id1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fee_token.as_deref(), Some("cashuFee"));
+        assert_eq!(redeemed, None, "fee is not redeemed at lock time");
+
+        // The pending-redeem query surfaces the un-redeemed fee.
+        let pending = super::find_pending_cashu_fee_redeems(&pool).await.unwrap();
+        assert_eq!(pending, vec![(id1, "cashuFee".to_string())]);
+
+        // A second order reusing the SAME fee proof Y is rejected, and its
+        // escrow UPDATE rolls back (still WaitingPayment, no token persisted).
+        let id2 = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, id2, &Status::WaitingPayment.to_string()).await;
+        let reuse = super::update_order_cashu_escrow_with_fee(
+            &pool,
+            id2,
+            "https://mint.example.com",
+            "cashuEscrow2",
+            "cashuFeeReuse",
+            &["y-aaaa".to_string()],
+            1700000200,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reuse, super::CashuLockOutcome::FeeReuse);
+        let (mint2, token2, locked2, status2) = cashu_columns(&pool, id2).await;
+        assert_eq!(mint2, None, "reuse must roll back the escrow write");
+        assert_eq!(token2, None);
+        assert_eq!(locked2, None);
+        assert_eq!(status2, Status::WaitingPayment.to_string());
+
+        // Stamping the fee redeemed removes it from the pending set.
+        assert!(super::mark_cashu_fee_redeemed(&pool, id1, 1700000300)
+            .await
+            .unwrap());
+        assert!(super::find_pending_cashu_fee_redeems(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cashu_fee_cas_on_status_mismatch_is_noop() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        // Not WaitingPayment ⇒ the CAS matches zero rows and the fee proof is
+        // never recorded.
+        insert_cashu_test_order(&pool, id, &Status::Pending.to_string()).await;
+
+        let out = super::update_order_cashu_escrow_with_fee(
+            &pool,
+            id,
+            "https://mint.example.com",
+            "cashuEscrow",
+            "cashuFee",
+            &["y-bbbb".to_string()],
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, super::CashuLockOutcome::StatusMismatch);
+        assert!(super::find_pending_cashu_fee_redeems(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

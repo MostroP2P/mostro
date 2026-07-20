@@ -42,6 +42,9 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+    } else {
+        // Cashu-only: retry collecting seller-funded fee tokens (TA-1f).
+        job_retry_cashu_fee_redeem(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -204,6 +207,41 @@ async fn job_info_event_send(ctx: AppContext) {
             let _ = client.send_event(&info_ev).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// How often the cashu-mode fee-redeem retry job polls the DB (seconds).
+const CASHU_FEE_REDEEM_INTERVAL_SECS: u64 = 60;
+
+/// Cashu fee-redeem retry (Track A TA-1f). Collects seller-funded fee tokens
+/// that the lock persisted but Mostro has not yet redeemed — the analogue of
+/// the Lightning payment-retry job — so a redeem interrupted by a crash between
+/// the lock CAS and the mint swap is retried from the DB. Cashu mode only.
+///
+/// NOTE: the live redeem (sign each fee proof with `P_M`, swap at the mint,
+/// then `mark_cashu_fee_redeemed`) is a scoped follow-up — it needs an ecash
+/// revenue store (Cashu mode has no LND to melt to). Until then this surfaces
+/// the pending backlog; the fee tokens are already validated, persisted, and
+/// anti-reuse-guarded, so no revenue is lost, only deferred.
+async fn job_retry_cashu_fee_redeem(ctx: AppContext) {
+    tokio::spawn(async move {
+        loop {
+            match find_pending_cashu_fee_redeems(ctx.pool()).await {
+                Ok(pending) if !pending.is_empty() => {
+                    info!(
+                        "cashu fee redeem: {} fee token(s) pending collection \
+                         (live mint swap not yet wired — see TA-1f follow-up)",
+                        pending.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!("cashu fee redeem: failed to load pending redeems: {e}"),
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                CASHU_FEE_REDEEM_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 }

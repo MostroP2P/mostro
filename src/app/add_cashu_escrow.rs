@@ -16,9 +16,9 @@
 //! Fee collection (Option 2, §4A) is **not** handled here — it lands in TA-1f.
 
 use crate::app::context::AppContext;
-use crate::cashu::{cashu_pubkey_from_xonly_hex, Error as CashuError};
+use crate::cashu::{cashu_pubkey_from_xonly_hex, proof_ys_hex, Error as CashuError};
 use crate::config::settings::Settings;
-use crate::db::update_order_cashu_escrow;
+use crate::db::{update_order_cashu_escrow, update_order_cashu_escrow_with_fee, CashuLockOutcome};
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use chrono::Utc;
 use mostro_core::db::Crud;
@@ -140,27 +140,86 @@ pub async fn add_cashu_escrow_action(
         .await
         .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
 
-    // 8. Atomically persist the escrow and advance the status in one write. A
-    //    `false` return means the status changed concurrently or the escrow is
-    //    already locked (replay) — log and return `Ok(())` without notifying
-    //    (idempotent; same shape as the `rows_affected() == 0` guard in
-    //    `release_action`).
-    let locked = update_order_cashu_escrow(
-        pool,
-        order.id,
-        &configured_mint,
-        &proof.token,
-        now,
-        Status::WaitingPayment,
-        Status::Active,
-    )
-    .await?;
-    if !locked {
-        tracing::info!(
-            "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
-            order.id
-        );
-        return Ok(());
+    // 7A. Fee token (Option 2, §4A). When the node charges a fee, the seller
+    //     must fund the WHOLE Mostro fee (`2 * order.fee`) as a separate
+    //     P2PK-1-of-1 token locked to `P_M`, submitted in the same message. It
+    //     is validated against the mint alongside the escrow token — both must
+    //     be valid before any state changes. A fee-free node (`mostro.fee == 0`)
+    //     accepts a `None` fee token.
+    let charges_fee = Settings::get_mostro().fee > 0.0;
+    let fee_ctx = if charges_fee {
+        let fee_token = proof
+            .fee_token
+            .clone()
+            .ok_or(MostroCantDo(CantDoReason::CashuSignatureMissing))?;
+        let expected_fee = u64::try_from(order.fee.saturating_mul(2))
+            .map_err(|_| MostroCantDo(CantDoReason::InvalidAmount))?;
+        let fee_token_parsed = cashu_client
+            .verify_fee_token(&fee_token, p_m, expected_fee)
+            .await
+            .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+        let fee_ys = proof_ys_hex(&fee_token_parsed).map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+        Some((fee_token, fee_ys))
+    } else {
+        None
+    };
+
+    // 8. Atomically persist the escrow (+ fee token & anti-reuse guard when
+    //    charging) and advance the status in one write. A no-match means the
+    //    status changed concurrently or the escrow is already locked (replay) —
+    //    log and return `Ok(())` without notifying (idempotent; same shape as
+    //    the `rows_affected() == 0` guard in `release_action`).
+    match &fee_ctx {
+        Some((fee_token, fee_ys)) => {
+            match update_order_cashu_escrow_with_fee(
+                pool,
+                order.id,
+                &configured_mint,
+                &proof.token,
+                fee_token,
+                fee_ys,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?
+            {
+                CashuLockOutcome::Locked => {}
+                CashuLockOutcome::StatusMismatch => {
+                    tracing::info!(
+                        "cashu lock: CAS matched zero rows for order {} (replay or status moved on) — no-op",
+                        order.id
+                    );
+                    return Ok(());
+                }
+                CashuLockOutcome::FeeReuse => {
+                    tracing::warn!(
+                        "cashu lock: fee token reused across orders for {} — rejected",
+                        order.id
+                    );
+                    return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+                }
+            }
+        }
+        None => {
+            let locked = update_order_cashu_escrow(
+                pool,
+                order.id,
+                &configured_mint,
+                &proof.token,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?;
+            if !locked {
+                tracing::info!(
+                    "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
+                    order.id
+                );
+                return Ok(());
+            }
+        }
     }
 
     // 9. Publish the updated (Active) order event so the public state stays

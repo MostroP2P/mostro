@@ -376,6 +376,36 @@ impl CashuClient {
         Ok(token)
     }
 
+    /// Whether **every** proof of a stored escrow token is still unspent at
+    /// the mint (NUT-07). Used by the restore/monitor path (Track A TA-3) to
+    /// re-hydrate in-flight locks after a restart and surface any escrow that
+    /// was redeemed or double-spent while the daemon was down.
+    ///
+    /// This intentionally does **not** re-run the full `verify_escrow_token`
+    /// acceptance check (condition/DLEQ/amount): those were validated when the
+    /// lock was accepted and the token is immutable. It only answers "is this
+    /// locked token still live?". Returns `false` if any proof is spent/pending
+    /// or the mint reports fewer states than proofs (fail-closed).
+    pub async fn check_token_unspent(&self, token_str: &str) -> Result<bool, Error> {
+        let token = Token::from_str(token_str).map_err(|e| Error::Token(e.to_string()))?;
+        let secrets = token.token_secrets();
+        if secrets.is_empty() {
+            return Err(Error::Token("Token contains no secrets".into()));
+        }
+        let ys = secrets
+            .iter()
+            .map(|s| cdk::dhke::hash_to_curve(s.as_bytes()))
+            .collect::<Result<Vec<PublicKey>, _>>()
+            .map_err(|e| Error::Token(format!("proof Y: {e}")))?;
+        let expected = ys.len();
+        let states = self.check_state(ys).await?;
+        // Fail closed: a missing state entry must never read as unspent.
+        if states.states.len() != expected {
+            return Ok(false);
+        }
+        Ok(states.states.iter().all(|s| s.state == State::Unspent))
+    }
+
     /// Check the state of proofs against the mint's `/v1/checkstate`
     /// endpoint (NUT-07). This only proves the secrets are unspent — it
     /// does **not** authenticate that the proofs were signed by the mint;

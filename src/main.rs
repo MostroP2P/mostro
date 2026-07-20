@@ -1,6 +1,7 @@
 pub mod app;
 mod bitcoin_price;
 pub mod cashu;
+pub mod cashu_restore;
 pub mod cli;
 pub mod config;
 pub mod db;
@@ -192,6 +193,10 @@ async fn main() -> Result<()> {
 
         // Warm the anti-spam gate exactly as the Lightning path does.
         install_spam_gate().await;
+
+        // Re-hydrate in-flight locked escrows after a restart (TA-3), the
+        // Cashu analogue of the Lightning `find_held_invoices` resubscribe.
+        cashu_restore::restore_cashu_escrows(get_db_pool().as_ref(), &cashu_client).await;
 
         let settings = Arc::new(
             MOSTRO_CONFIG

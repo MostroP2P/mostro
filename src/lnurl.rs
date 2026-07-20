@@ -98,6 +98,12 @@ fn build_callback_url(
     Ok(url)
 }
 
+/// Resolve a Lightning Address or LNURL-pay string into a BOLT11 invoice
+/// for `amount` sats.
+///
+/// `comment` is attached per LUD-12 when the server advertises support for
+/// it (`commentAllowed > 0`); otherwise it's silently dropped, matching the
+/// pre-LUD-12 behavior.
 pub async fn resolv_ln_address(
     address: &str,
     amount: u64,

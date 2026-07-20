@@ -1,0 +1,74 @@
+name: Cashu Integration
+
+on:
+  # NOTE: intentionally NOT part of the default required PR checks (CF-3,
+  # docs/cashu/01-fundamentals.md §6): non-Cashu PRs and the Lightning path
+  # never pay the cost or flakiness of a live mint. Mirrors the mutation
+  # workflow's pattern — nightly audit (schedule) + on demand
+  # (workflow_dispatch) + opt-in per-PR via the `cashu` label.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  schedule:
+    # Nightly against main at 4 AM UTC, so a mint-facing regression is
+    # caught even if a PR author forgets the label. Off the weekly slots
+    # used by mutation (Sun 03:00) and coverage (Sun 05:00) so the three
+    # long jobs don't contend for runners.
+    - cron: '0 4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  CASHU_TEST_MINT_URL: http://127.0.0.1:3338
+  # Turn a missing/empty mint URL into a hard failure instead of a silent
+  # skip: libtest reports a skipped test as `1 passed`, so without this a
+  # broken `env:` block above would leave this job green having tested
+  # nothing. See `mint_url_from_env` in tests/common/mod.rs.
+  CASHU_REQUIRE_MINT: '1'
+
+# Read-only: this job builds and tests, it never writes back to the repo.
+# Dropping the default write scopes keeps the token out of the mint
+# container and the long test run (zizmor `artipacked`).
+permissions:
+  contents: read
+
+jobs:
+  mint-integration:
+    runs-on: ubuntu-latest
+    # Opt-in only on PRs: add the `cashu` label when needed.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'cashu')
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Nothing here needs the checkout credential after clone.
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Start test mint
+        run: docker compose -f docker-compose.cashu.yml up -d
+
+      - name: Run mint-backed integration tests
+        # `--ignored`: the smoke test is `#[ignore]`d so a plain local
+        # `cargo test` reports it as skipped rather than a hollow pass.
+        run: cargo test --test cashu_mint -- --ignored --nocapture
+
+      - name: Run env-gated in-tree cashu tests
+        # Picks up any `#[ignore]`-gated mint-backed tests later PRs add
+        # inside src (e.g. CashuClient's connect/check_state/DLEQ paths).
+        # Zero matching tests is a clean pass.
+        run: cargo test cashu -- --ignored --nocapture
+
+      - name: Stop test mint
+        if: always()
+        run: docker compose -f docker-compose.cashu.yml down -v

@@ -66,3 +66,7 @@ docker-build-startos:
 	cd docker && \
 	docker compose build mostro-startos
 
+mutation-test:
+	@set -o pipefail; \
+	CARGO_MUTANTS_JOBS=2 cargo mutants $(ARGS)
+

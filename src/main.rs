@@ -177,6 +177,19 @@ async fn main() -> Result<()> {
             }
         };
 
+        // The admin gRPC server takes a Lightning client that Cashu mode never
+        // initialises, so it is not started here. Warn (rather than silently
+        // skip) when an operator has RPC enabled, so the missing API is not a
+        // surprise. Starting the LN-independent RPC subset in Cashu mode is a
+        // follow-up (see PR #828 review).
+        if RpcServer::is_enabled() {
+            tracing::warn!(
+                "[rpc].enabled = true but the admin gRPC server is NOT started in Cashu mode: \
+                 it requires a Lightning client Cashu mode does not initialise. Disable [rpc], \
+                 or run in Lightning mode, if you need the RPC API."
+            );
+        }
+
         // Warm the anti-spam gate exactly as the Lightning path does.
         install_spam_gate().await;
 

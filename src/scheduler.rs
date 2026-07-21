@@ -625,12 +625,20 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         expired.status = Status::Expired.to_string();
                         match expired.update(pool).await {
                             Ok(_) => {
-                                bond::release_bonds_for_order_or_warn(
-                                    pool,
-                                    order_id,
-                                    "maker_bond_expiry",
-                                )
-                                .await;
+                                // Bonds are Lightning-only and mutually exclusive
+                                // with Cashu mode (CF-1), which has no LND — the
+                                // release helpers open `LndConnector::new()`, so
+                                // skip them here. A cashu node should carry no
+                                // bond rows; any left over (e.g. a reused DB) are
+                                // a misconfiguration, not this job's concern.
+                                if !Settings::is_cashu_enabled() {
+                                    bond::release_bonds_for_order_or_warn(
+                                        pool,
+                                        order_id,
+                                        "maker_bond_expiry",
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -657,34 +665,41 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         // expiry is the eventual safety net.
                         match order_updated.update(pool).await {
                             Ok(_) => {
-                                // Phase 1: a Pending order may be
-                                // carrying a still-active taker bond
-                                // (Phase 1 keeps the order in `Pending`
-                                // while the taker funds the bond hold
-                                // invoice). Without this hook the bond
-                                // stays in `Requested`/`Locked` and
-                                // the HTLC sits in LND until CLTV
-                                // expiry — Phase 1 promises "always
-                                // release" on every exit path,
-                                // expiry included.
-                                bond::release_taker_bonds_for_order_or_warn(
-                                    pool,
-                                    order_id,
-                                    "pending_expiry",
-                                )
-                                .await;
-                                // Phase 6: an expiring Pending order may be a
-                                // range remainder (or the range root) — resolve
-                                // the maker bond at range close (release when no
-                                // slice was slashed; settle-at-close otherwise).
-                                // Also covers the non-range maker bond via the
-                                // close helper's non-range release branch.
-                                bond::resolve_range_maker_bond_at_close_or_warn(
-                                    pool,
-                                    &order_snapshot,
-                                    "pending_expiry",
-                                )
-                                .await;
+                                // Bonds are Lightning-only and mutually exclusive
+                                // with Cashu mode (CF-1); the release helpers open
+                                // `LndConnector::new()`, which a cashu node has
+                                // not initialised. Skip them — a cashu node
+                                // carries no bond rows by construction.
+                                if !Settings::is_cashu_enabled() {
+                                    // Phase 1: a Pending order may be
+                                    // carrying a still-active taker bond
+                                    // (Phase 1 keeps the order in `Pending`
+                                    // while the taker funds the bond hold
+                                    // invoice). Without this hook the bond
+                                    // stays in `Requested`/`Locked` and
+                                    // the HTLC sits in LND until CLTV
+                                    // expiry — Phase 1 promises "always
+                                    // release" on every exit path,
+                                    // expiry included.
+                                    bond::release_taker_bonds_for_order_or_warn(
+                                        pool,
+                                        order_id,
+                                        "pending_expiry",
+                                    )
+                                    .await;
+                                    // Phase 6: an expiring Pending order may be a
+                                    // range remainder (or the range root) — resolve
+                                    // the maker bond at range close (release when no
+                                    // slice was slashed; settle-at-close otherwise).
+                                    // Also covers the non-range maker bond via the
+                                    // close helper's non-range release branch.
+                                    bond::resolve_range_maker_bond_at_close_or_warn(
+                                        pool,
+                                        &order_snapshot,
+                                        "pending_expiry",
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(

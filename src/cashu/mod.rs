@@ -376,6 +376,79 @@ impl CashuClient {
         Ok(token)
     }
 
+    /// Full fee-token validation for Track A's fee collection
+    /// (Option 2, §4A). The fee token is a **P2PK 1-of-1** locked to exactly
+    /// Mostro's arbitrator key `p_m` (no extra pubkeys, no locktime/refund
+    /// required), value `expected_fee` sats, hosted on the configured mint,
+    /// DLEQ-valid (NUT-12) and unspent (NUT-07). Mirrors
+    /// [`Self::verify_escrow_token`] but for the single-key fee token and
+    /// without the seller-recovery locktime the escrow token carries.
+    pub async fn verify_fee_token(
+        &self,
+        token_str: &str,
+        p_m: PublicKey,
+        expected_fee: u64,
+    ) -> Result<Token, Error> {
+        // 1: condition — exactly p_m signs, 1-of-1 (offline).
+        let token = verify_fee_condition(token_str, p_m)?;
+
+        // 2: the token must be hosted on the node's configured mint.
+        let token_mint = token
+            .mint_url()
+            .map_err(|e| Error::Token(format!("token mint url: {e}")))?;
+        if token_mint != self.mint_url {
+            return Err(Error::Token(format!(
+                "fee token mint {token_mint} does not match configured mint {}",
+                self.mint_url
+            )));
+        }
+
+        reject_duplicate_proofs(&token)?;
+
+        // 3: amount must equal the expected fee exactly, denominated in sats.
+        match token.unit() {
+            Some(CurrencyUnit::Sat) => {}
+            other => {
+                return Err(Error::Token(format!("fee token unit {other:?} is not sat")));
+            }
+        }
+        let value = token
+            .value()
+            .map_err(|e| Error::Token(format!("fee token value: {e}")))?
+            .to_u64();
+        if value != expected_fee {
+            return Err(Error::Token(format!(
+                "fee token amount {value} does not match expected {expected_fee}"
+            )));
+        }
+
+        // 4: mint-issued (DLEQ / NUT-12) + per-proof sat keyset.
+        self.verify_token_dleq(&token).await?;
+
+        // 5: every proof unspent (NUT-07), fail-closed on a short reply.
+        let secrets = token.token_secrets();
+        let ys = secrets
+            .iter()
+            .map(|s| cdk::dhke::hash_to_curve(s.as_bytes()))
+            .collect::<Result<Vec<PublicKey>, _>>()
+            .map_err(|e| Error::Token(format!("proof Y: {e}")))?;
+        let expected_states = ys.len();
+        let states = self.check_state(ys).await?;
+        if states.states.len() != expected_states {
+            return Err(Error::Token(format!(
+                "checkstate returned {} states for {expected_states} fee proofs",
+                states.states.len()
+            )));
+        }
+        if states.states.iter().any(|s| s.state != State::Unspent) {
+            return Err(Error::Token(
+                "one or more fee proofs are not unspent".into(),
+            ));
+        }
+
+        Ok(token)
+    }
+
     /// Whether **every** proof of a stored escrow token is still unspent at
     /// the mint (NUT-07). Used by the restore/monitor path (Track A TA-3) to
     /// re-hydrate in-flight locks after a restart and surface any escrow that
@@ -592,6 +665,93 @@ pub fn verify_escrow_conditions(
     Ok(token)
 }
 
+/// Offline condition check for the Option 2 fee token (§4A): a **P2PK 1-of-1**
+/// locked to exactly `p_m`. Every proof must be P2PK with `SIG_INPUTS`, sign to
+/// exactly `p_m` (the NUT-10 `data` key) with no extra pubkeys, and require at
+/// most one signature (NUT-11 defaults an absent `n_sigs` to 1). Unlike the
+/// escrow token there is no locktime/refund requirement — the simple 1-of-1
+/// form redeemed by Mostro (the locktime+`P_S`-refund refinement is future
+/// work). Split out so it is unit-testable without a mint.
+pub fn verify_fee_condition(token_str: &str, p_m: PublicKey) -> Result<Token, Error> {
+    let token = Token::from_str(token_str).map_err(|e| Error::Token(e.to_string()))?;
+
+    let secrets = token.token_secrets();
+    if secrets.is_empty() {
+        return Err(Error::Token("Token contains no secrets".into()));
+    }
+
+    for secret in secrets {
+        let nut10_secret =
+            Nut10Secret::try_from(secret).map_err(|e| Error::Condition(e.to_string()))?;
+        reject_duplicate_standard_tags(&nut10_secret)?;
+
+        let spending_conditions = SpendingConditions::try_from(nut10_secret)
+            .map_err(|e| Error::Condition(e.to_string()))?;
+
+        let (data, conditions) = match spending_conditions {
+            SpendingConditions::P2PKConditions { data, conditions } => (data, conditions),
+            other => {
+                return Err(Error::Condition(format!(
+                    "fee spending condition kind {:?} is not P2PK",
+                    other.kind()
+                )));
+            }
+        };
+
+        // The NUT-11 tag block is optional for a bare 1-of-1 (absent ⇒
+        // SIG_INPUTS, n_sigs = 1, no extra keys). When present, enforce it.
+        if let Some(conditions) = conditions {
+            if conditions.sig_flag != SigFlag::SigInputs {
+                return Err(Error::Condition(format!(
+                    "fee sig flag {:?} is not SIG_INPUTS",
+                    conditions.sig_flag
+                )));
+            }
+            if let Some(n) = conditions.num_sigs {
+                if n != 1 {
+                    return Err(Error::Condition(format!(
+                        "fee token must require exactly 1 signature, got {n}"
+                    )));
+                }
+            }
+            if conditions
+                .pubkeys
+                .as_ref()
+                .is_some_and(|extra| !extra.is_empty())
+            {
+                return Err(Error::Condition(
+                    "fee token must lock to exactly Mostro's key (no extra pubkeys)".into(),
+                ));
+            }
+        }
+
+        if data != p_m {
+            return Err(Error::Condition(
+                "fee token is not locked to Mostro's key".into(),
+            ));
+        }
+    }
+
+    Ok(token)
+}
+
+/// The NUT-07 `Y = hash_to_curve(secret)` of every proof in a token, as hex.
+///
+/// Track A TA-1f records these for the fee token in the `cashu_fee_proofs`
+/// anti-reuse table, in the same transaction as the lock CAS, so the same fee
+/// token can never be accepted for two orders.
+pub fn proof_ys_hex(token: &Token) -> Result<Vec<String>, Error> {
+    token
+        .token_secrets()
+        .iter()
+        .map(|s| {
+            cdk::dhke::hash_to_curve(s.as_bytes())
+                .map(|y| y.to_hex())
+                .map_err(|e| Error::Token(format!("proof Y: {e}")))
+        })
+        .collect()
+}
+
 /// Convert a Nostr (BIP340 x-only) public key, given as 64-char hex, into a
 /// Cashu (compressed secp256k1) [`PublicKey`].
 ///
@@ -748,6 +908,39 @@ mod tests {
             None,
         );
         assert!(CashuClient::verify_2of3_condition(&token, p_b, p_s, p_m).is_ok());
+    }
+
+    #[test]
+    fn fee_condition_accepts_1of1_to_mostro() {
+        let p_m = keypair(3);
+        // 1-of-1: data = p_m, no extra pubkeys, num_sigs = 1, no locktime.
+        let token = token_with_condition(p_m, vec![], Some(1), None, None, None);
+        assert!(verify_fee_condition(&token, p_m).is_ok());
+    }
+
+    #[test]
+    fn fee_condition_rejects_wrong_key_extra_key_or_wrong_sig_count() {
+        let (p_b, p_m) = (keypair(1), keypair(3));
+        // Locked to the wrong key.
+        let wrong = token_with_condition(p_b, vec![], Some(1), None, None, None);
+        assert!(verify_fee_condition(&wrong, p_m).is_err());
+        // An extra co-signer widens the accepted set — must be rejected.
+        let extra = token_with_condition(p_m, vec![p_b], Some(1), None, None, None);
+        assert!(verify_fee_condition(&extra, p_m).is_err());
+        // More than one required signature is not a 1-of-1.
+        let two = token_with_condition(p_m, vec![p_b], Some(2), None, None, None);
+        assert!(verify_fee_condition(&two, p_m).is_err());
+    }
+
+    #[test]
+    fn fee_proof_ys_are_derivable_and_stable() {
+        let p_m = keypair(3);
+        let token_str = token_with_condition(p_m, vec![], Some(1), None, None, None);
+        let token = Token::from_str(&token_str).unwrap();
+        let ys = proof_ys_hex(&token).unwrap();
+        assert_eq!(ys.len(), 1);
+        // Deterministic: the same token yields the same Y.
+        assert_eq!(proof_ys_hex(&token).unwrap(), ys);
     }
 
     #[test]

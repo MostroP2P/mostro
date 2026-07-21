@@ -1052,10 +1052,11 @@ mod tests {
         }
 
         /// Every action that creates, advances, or settles an order — plus the
-        /// permanently-blocked buyer-invoice/bond actions and the not-yet-
-        /// implemented `AddCashuEscrow` (its CF-5 stub returns `InvalidAction`
-        /// too) — must be rejected with `CantDo(InvalidAction)` in Cashu
-        /// foundation mode. This is the DoD "no trade can complete yet" gate.
+        /// permanently-blocked buyer-invoice/bond actions — must be rejected
+        /// with `CantDo(InvalidAction)` in Cashu foundation mode. This is the
+        /// DoD "no trade can complete yet" gate. `AddCashuEscrow` is excluded:
+        /// Track A (TA-1) implements it, so it no longer routes to
+        /// `InvalidAction` — it runs the real lock handler.
         #[tokio::test]
         async fn blocks_every_order_lifecycle_action_with_invalid_action() {
             let _ =
@@ -1075,7 +1076,6 @@ mod tests {
                 Action::Cancel,
                 Action::Dispute,
                 Action::RateUser,
-                Action::AddCashuEscrow,
                 Action::AdminCancel,
                 Action::AdminSettle,
                 Action::AddBondInvoice,

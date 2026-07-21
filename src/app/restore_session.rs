@@ -26,10 +26,10 @@ pub async fn restore_session_action(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    tracing::info!(
-        "Starting background restore session for master key: {}",
-        master_key
-    );
+    // No key in the log line — master_key is the user's persistent Nostr
+    // identity, not a per-trade ephemeral one (AGENTS.md: scrub Nostr keys
+    // from logs).
+    tracing::info!("Starting background restore session");
 
     // Create a new manager for this specific restore session
     let manager = RestoreSessionManager::new();
@@ -99,7 +99,8 @@ async fn send_restore_session_response(
     )
     .await;
 
-    tracing::info!("Restore session response sent to user {}", trade_key,);
+    // No key in the log line (AGENTS.md: scrub Nostr keys from logs).
+    tracing::info!("Restore session response sent to user");
 
     Ok(())
 }
@@ -112,7 +113,8 @@ async fn send_restore_session_timeout(trade_key: &str) -> Result<(), MostroError
     // Send timeout message without payload since Text doesn't exist
     enqueue_restore_session_msg(None, trade_pubkey).await;
 
-    tracing::warn!("Restore session timed out for user: {}", trade_key);
+    // No key in the log line (AGENTS.md: scrub Nostr keys from logs).
+    tracing::warn!("Restore session timed out for user");
 
     Ok(())
 }

@@ -561,12 +561,21 @@ async fn dispatch_cashu(
         Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
+        // Order creation + the take flow (Track A TA-2). Creating a pending
+        // order touches no escrow; the take handlers branch on cashu mode and
+        // emit the escrow request (`show_cashu_escrow_request`) instead of a
+        // hold invoice. Creatable and takeable ship together so the book never
+        // fills with untakeable orders.
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
         // Cashu escrow lock — TA-1 fills the stub body; the routing is frozen.
         Action::AddCashuEscrow => add_cashu_escrow_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        // Everything that creates, advances, or settles an order has no escrow
-        // behind it during the foundation milestone — reject it cleanly.
+        // Everything that advances or settles an order past the lock has no
+        // handler yet during Track A — reject it cleanly. Later tracks
+        // (release/cancel/dispute) replace these arms one at a time.
         _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
     }
 }
@@ -1051,12 +1060,12 @@ mod tests {
             )
         }
 
-        /// Every action that creates, advances, or settles an order — plus the
-        /// permanently-blocked buyer-invoice/bond actions — must be rejected
-        /// with `CantDo(InvalidAction)` in Cashu foundation mode. This is the
-        /// DoD "no trade can complete yet" gate. `AddCashuEscrow` is excluded:
-        /// Track A (TA-1) implements it, so it no longer routes to
-        /// `InvalidAction` — it runs the real lock handler.
+        /// Actions with no Cashu handler yet — release/cancel/dispute, the
+        /// permanently-blocked buyer-invoice/bond actions, and Track D admin
+        /// actions — must still be rejected with `CantDo(InvalidAction)`. The
+        /// Track A actions (`NewOrder`, `TakeBuy`, `TakeSell` in TA-2;
+        /// `AddCashuEscrow` in TA-1) are excluded: they now route to their real
+        /// handlers, not to `InvalidAction`.
         #[tokio::test]
         async fn blocks_every_order_lifecycle_action_with_invalid_action() {
             let _ =
@@ -1067,9 +1076,6 @@ mod tests {
             let event = create_test_unwrapped_message();
 
             for action in [
-                Action::NewOrder,
-                Action::TakeBuy,
-                Action::TakeSell,
                 Action::AddInvoice,
                 Action::FiatSent,
                 Action::Release,

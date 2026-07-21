@@ -1,10 +1,12 @@
 use crate::app::bond;
 use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
+    get_order, set_waiting_invoice_status, show_cashu_escrow_request, show_hold_invoice,
+    update_order_event, validate_invoice,
 };
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -216,6 +218,24 @@ pub async fn take_sell_action(
     order.master_buyer_pubkey = Some(event.identity.to_string());
     order.trade_index_buyer = Some(trade_index);
     order.set_timestamp_now();
+
+    // Cashu escrow mode (Track A TA-2): the seller (maker) locks a 2-of-3 token
+    // instead of paying a hold invoice, and the buyer redeems ecash directly —
+    // so the buyer payout invoice is skipped entirely (a supplied one is
+    // ignored). Emit the escrow request to the seller and leave the order in
+    // WaitingPayment, where the CAS in `add_cashu_escrow_action` expects it.
+    if Settings::is_cashu_enabled() {
+        show_cashu_escrow_request(
+            pool,
+            my_keys,
+            &event.sender,
+            &seller_pubkey,
+            order,
+            request_id,
+        )
+        .await?;
+        return Ok(());
+    }
 
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {

@@ -60,15 +60,24 @@ jobs:
             exit 0
           fi
 
-          # Build --file flags for each changed file
-          file_args=""
-          for f in $changed_rs; do
-            file_args="$file_args --file $f"
-          done
-
           echo "Running mutation testing for changed files:"
           echo "$changed_rs"
-          make mutation-test ARGS="$file_args"
+
+          # These filenames come from a PR diff, so they're attacker-controlled.
+          # Built as a bash array (never joined into a string) and passed with
+          # "${file_args[@]}" so a crafted filename can only ever be a single
+          # --file value, never additional argv tokens — the intermediate
+          # string-then-make(ARGS)-then-shell round trip this used to take was
+          # an argument-injection vector into cargo-mutants/cargo/rustc's own
+          # flag surface. This deliberately bypasses `make mutation-test`,
+          # whose $(ARGS) is a plain string splice safe only for
+          # human-typed, trusted input (the baseline job below still uses it).
+          file_args=()
+          while IFS= read -r f; do
+            file_args+=(--file "$f")
+          done <<< "$changed_rs"
+
+          CARGO_MUTANTS_JOBS=2 cargo mutants "${file_args[@]}"
 
       - name: Upload mutation report
         uses: actions/upload-artifact@v4

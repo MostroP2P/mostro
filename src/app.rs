@@ -5,6 +5,7 @@
 pub mod context;
 
 // Submodules for different trading actions
+pub mod add_cashu_escrow; // Cashu escrow lock handler (Track A / CF-5 stub)
 pub mod add_invoice; // Handles invoice creation
 pub mod admin_add_solver; // Admin functionality to add dispute solvers
 pub mod admin_cancel; // Admin order cancellation
@@ -26,6 +27,7 @@ pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
 
 // Import action handlers from submodules
+use crate::app::add_cashu_escrow::add_cashu_escrow_action;
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
@@ -290,6 +292,145 @@ async fn handle_message_action(
     }
 }
 
+/// Decode and fully validate one relay event into a dispatchable
+/// `(action, message, unwrapped)` triple, or `None` if it must be skipped
+/// (failed PoW, wrong kind, spam-gate drop, decrypt failure, stale, missing
+/// inner signature, failed trade-index, failed inner verify, no action).
+///
+/// This is the transport + validation **prologue** shared VERBATIM by `run`
+/// (Lightning) and `run_cashu` (Cashu) so the two event loops cannot drift
+/// (CF-5, see `docs/cashu/01-fundamentals.md` §6). Its body is a literal cut of
+/// the pre-dispatch logic `run` used to inline; each former `continue` becomes
+/// `return None`.
+async fn accept_event(
+    ctx: &AppContext,
+    event: &Event,
+    my_keys: &Keys,
+    pow: u8,
+    pow_first_contact: u8,
+    accepted_kind: Kind,
+    is_v2: bool,
+) -> Option<(Action, Message, UnwrappedMessage)> {
+    // Verify proof of work
+    if !event.check_pow(pow) {
+        // Discard events that don't meet POW requirements
+        tracing::info!("Not POW verified event!");
+        return None;
+    }
+    if event.kind != accepted_kind {
+        return None;
+    }
+    // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
+    // cheap pre-validation BEFORE paying the NIP-44 decrypt
+    // cost. v1 gift wraps skip this — their outer key is a
+    // throwaway with no pre-validatable signal.
+    if is_v2 {
+        if let Some(gate) = crate::spam_gate::SpamGate::global() {
+            let now = chrono::Utc::now().timestamp();
+            // Dedup: drop a re-sent identical event (defense in
+            // depth against replay floods).
+            if gate.is_replay(event.id, now) {
+                tracing::debug!("Dropping replayed event {}", event.id);
+                return None;
+            }
+            // Two lanes: a sender already in an active trade is
+            // fast-pathed (only the base `pow` already checked
+            // above applies); an unseen first-contact sender
+            // must clear the stiffer `pow_first_contact` before
+            // we decrypt. New orders/takes legitimately arrive
+            // here — so does spam, hence the PoW toll.
+            if !gate.is_known(&event.pubkey.to_string()) && !event.check_pow(pow_first_contact) {
+                tracing::info!(
+                    "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
+                    event.pubkey,
+                    pow_first_contact
+                );
+                return None;
+            }
+        }
+    }
+
+    // Validate event signature
+    if event.verify().is_err() {
+        tracing::warn!("Error in event verification")
+    };
+
+    // Mostro-core dispatches on the event kind: the gift wrap
+    // path handles the dual-key layout (identity key signs
+    // seal, trade key authors rumor), the kind-14 path the
+    // 3-element tuple with its in-ciphertext identity proof.
+    // Both decode and verify signatures in one shot and yield
+    // the same transport-agnostic `UnwrappedMessage`.
+    let unwrapped = match unwrap_incoming(event, my_keys).await {
+        Ok(Some(u)) => u,
+        // NIP-44 decrypt failed: not addressed to this node.
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("Error unwrapping incoming message: {}", e);
+            return None;
+        }
+    };
+    // Discard events older than 10 seconds to prevent replay attacks
+    let since_time = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::seconds(10))
+        .unwrap()
+        .timestamp() as u64;
+    if unwrapped.created_at.as_secs() < since_time {
+        return None;
+    }
+    let message = unwrapped.message.clone();
+
+    // Full-privacy clients reuse the trade key as identity and send
+    // unsigned rumors. Any other shape must carry a valid inner
+    // signature — unwrap_message already verified it, so if identity
+    // and sender differ here without a signature we bail out.
+    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+        tracing::warn!(
+            "Missing inner signature: identity {} differs from trade key {}",
+            unwrapped.identity,
+            unwrapped.sender
+        );
+        return None;
+    }
+
+    // Get inner message kind
+    let inner_message = message.get_inner_message_kind();
+    // Check if message is message with trade index
+    if let Err(e) = check_trade_index(ctx, &unwrapped, &message).await {
+        tracing::warn!("Error checking trade index: {}", e);
+        return None;
+    }
+
+    if !inner_message.verify() {
+        return None;
+    }
+    let action = message.inner_action()?;
+    Some((action, message, unwrapped))
+}
+
+/// Shared post-dispatch error handling (identical in both loops). A handler
+/// `Err` is downcast to a `MostroError` and turned into the right reply
+/// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
+/// with [`accept_event`] so `run` and `run_cashu` share one error tail (CF-5).
+async fn finalize_dispatch(
+    result: Result<()>,
+    message: Message,
+    unwrapped: UnwrappedMessage,
+    action: &Action,
+) {
+    if let Err(e) = result {
+        match e.downcast::<MostroError>() {
+            Ok(err) => {
+                manage_errors(*err, message, unwrapped, action).await;
+            }
+            Err(e) => {
+                tracing::error!("Unexpected error type: {}", e);
+                warning_msg(action, ServiceError::UnexpectedError(e.to_string()));
+            }
+        }
+    }
+}
+
 /// Main event loop that processes incoming Nostr events.
 /// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
 ///
@@ -321,126 +462,112 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                // Verify proof of work
-                if !event.check_pow(pow) {
-                    // Discard events that don't meet POW requirements
-                    tracing::info!("Not POW verified event!");
+                let Some((action, message, unwrapped)) = accept_event(
+                    &ctx,
+                    &event,
+                    my_keys,
+                    pow,
+                    pow_first_contact,
+                    accepted_kind,
+                    is_v2,
+                )
+                .await
+                else {
                     continue;
-                }
-                if event.kind == accepted_kind {
-                    // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
-                    // cheap pre-validation BEFORE paying the NIP-44 decrypt
-                    // cost. v1 gift wraps skip this — their outer key is a
-                    // throwaway with no pre-validatable signal.
-                    if is_v2 {
-                        if let Some(gate) = crate::spam_gate::SpamGate::global() {
-                            let now = chrono::Utc::now().timestamp();
-                            // Dedup: drop a re-sent identical event (defense in
-                            // depth against replay floods).
-                            if gate.is_replay(event.id, now) {
-                                tracing::debug!("Dropping replayed event {}", event.id);
-                                continue;
-                            }
-                            // Two lanes: a sender already in an active trade is
-                            // fast-pathed (only the base `pow` already checked
-                            // above applies); an unseen first-contact sender
-                            // must clear the stiffer `pow_first_contact` before
-                            // we decrypt. New orders/takes legitimately arrive
-                            // here — so does spam, hence the PoW toll.
-                            if !gate.is_known(&event.pubkey.to_string())
-                                && !event.check_pow(pow_first_contact)
-                            {
-                                tracing::info!(
-                                    "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
-                                    event.pubkey,
-                                    pow_first_contact
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Validate event signature
-                    if event.verify().is_err() {
-                        tracing::warn!("Error in event verification")
-                    };
-
-                    // Mostro-core dispatches on the event kind: the gift wrap
-                    // path handles the dual-key layout (identity key signs
-                    // seal, trade key authors rumor), the kind-14 path the
-                    // 3-element tuple with its in-ciphertext identity proof.
-                    // Both decode and verify signatures in one shot and yield
-                    // the same transport-agnostic `UnwrappedMessage`.
-                    let unwrapped = match unwrap_incoming(&event, my_keys).await {
-                        Ok(Some(u)) => u,
-                        // NIP-44 decrypt failed: not addressed to this node.
-                        Ok(None) => continue,
-                        Err(e) => {
-                            tracing::warn!("Error unwrapping incoming message: {}", e);
-                            continue;
-                        }
-                    };
-                    // Discard events older than 10 seconds to prevent replay attacks
-                    let since_time = chrono::Utc::now()
-                        .checked_sub_signed(chrono::Duration::seconds(10))
-                        .unwrap()
-                        .timestamp() as u64;
-                    if unwrapped.created_at.as_secs() < since_time {
-                        continue;
-                    }
-                    let message = unwrapped.message.clone();
-
-                    // Full-privacy clients reuse the trade key as identity and send
-                    // unsigned rumors. Any other shape must carry a valid inner
-                    // signature — unwrap_message already verified it, so if identity
-                    // and sender differ here without a signature we bail out.
-                    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
-                        tracing::warn!(
-                            "Missing inner signature: identity {} differs from trade key {}",
-                            unwrapped.identity,
-                            unwrapped.sender
-                        );
-                        continue;
-                    }
-
-                    // Get inner message kind
-                    let inner_message = message.get_inner_message_kind();
-                    // Check if message is message with trade index
-                    if let Err(e) = check_trade_index(&ctx, &unwrapped, &message).await {
-                        tracing::warn!("Error checking trade index: {}", e);
-                        continue;
-                    }
-
-                    if inner_message.verify() {
-                        if let Some(action) = message.inner_action() {
-                            if let Err(e) = handle_message_action(
-                                &action,
-                                message.clone(),
-                                &unwrapped,
-                                my_keys,
-                                ln_client,
-                                &ctx,
-                            )
-                            .await
-                            {
-                                match e.downcast::<MostroError>() {
-                                    Ok(err) => {
-                                        manage_errors(*err, message, unwrapped, &action).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Unexpected error type: {}", e);
-                                        warning_msg(
-                                            &action,
-                                            ServiceError::UnexpectedError(e.to_string()),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                };
+                let result = handle_message_action(
+                    &action,
+                    message.clone(),
+                    &unwrapped,
+                    my_keys,
+                    ln_client,
+                    &ctx,
+                )
+                .await;
+                finalize_dispatch(result, message, unwrapped, &action).await;
             }
         }
+    }
+}
+
+/// Cashu-mode event loop (CF-5). Mirrors [`run`]'s transport/validation
+/// pipeline through the shared [`accept_event`]/[`finalize_dispatch`] helpers,
+/// but dispatches through [`dispatch_cashu`] instead of
+/// [`handle_message_action`] — there is no `ln_client` in Cashu mode. It
+/// differs from `run` in exactly one line: the dispatch call.
+///
+/// During the foundation milestone every escrow/trade action is rejected with
+/// `CantDo(InvalidAction)`; the feature tracks replace those arms one at a time
+/// (see `docs/cashu/01-fundamentals.md` §6 action-ownership matrix).
+pub async fn run_cashu(ctx: AppContext) -> Result<()> {
+    let my_keys = ctx.keys();
+    let client = ctx.nostr_client();
+    let pow = ctx.settings().mostro.pow;
+    #[allow(deprecated)]
+    let accepted_kind = ctx.settings().mostro.transport.event_kind();
+    let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
+    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+
+    loop {
+        let mut notifications = client.notifications();
+
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                let Some((action, message, unwrapped)) = accept_event(
+                    &ctx,
+                    &event,
+                    my_keys,
+                    pow,
+                    pow_first_contact,
+                    accepted_kind,
+                    is_v2,
+                )
+                .await
+                else {
+                    continue;
+                };
+                let result =
+                    dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
+                finalize_dispatch(result, message, unwrapped, &action).await;
+            }
+        }
+    }
+}
+
+/// Route a validated action in Cashu mode (CF-5).
+///
+/// The allow-list is drawn at *"escrow-independent actions that neither create
+/// nor advance an order"* (`docs/cashu/01-fundamentals.md` §6, closed
+/// decision):
+///
+/// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
+///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
+///   `RestoreSession`, `TradePubkey`.
+/// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
+///   fills in). Frozen here so Track A edits only its own file (G-1).
+/// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
+///   or settles an order (there is no escrow behind it yet). The feature tracks
+///   replace these arms one at a time; the action-ownership matrix in
+///   fundamentals §6 guarantees every blocked action has an owner.
+async fn dispatch_cashu(
+    action: &Action,
+    msg: Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+    ctx: &AppContext,
+) -> Result<()> {
+    match action {
+        // Escrow-independent, read-only / session actions — safe in Cashu mode.
+        Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Cashu escrow lock — TA-1 fills the stub body; the routing is frozen.
+        Action::AddCashuEscrow => add_cashu_escrow_action(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
+        // Everything that creates, advances, or settles an order has no escrow
+        // behind it during the foundation milestone — reject it cleanly.
+        _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
     }
 }
 
@@ -895,6 +1022,91 @@ mod tests {
                     if e.downcast_ref::<MostroError>()
                         == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
             ));
+        }
+    }
+
+    mod dispatch_cashu_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use sqlx::SqlitePool;
+        use std::sync::Arc;
+
+        async fn create_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        fn is_invalid_action(result: Result<()>) -> bool {
+            matches!(
+                result,
+                Err(e) if e.downcast_ref::<MostroError>()
+                    == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
+            )
+        }
+
+        /// Every action that creates, advances, or settles an order — plus the
+        /// permanently-blocked buyer-invoice/bond actions and the not-yet-
+        /// implemented `AddCashuEscrow` (its CF-5 stub returns `InvalidAction`
+        /// too) — must be rejected with `CantDo(InvalidAction)` in Cashu
+        /// foundation mode. This is the DoD "no trade can complete yet" gate.
+        #[tokio::test]
+        async fn blocks_every_order_lifecycle_action_with_invalid_action() {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+            let ctx = create_ctx().await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [
+                Action::NewOrder,
+                Action::TakeBuy,
+                Action::TakeSell,
+                Action::AddInvoice,
+                Action::FiatSent,
+                Action::Release,
+                Action::Cancel,
+                Action::Dispute,
+                Action::RateUser,
+                Action::AddCashuEscrow,
+                Action::AdminCancel,
+                Action::AdminSettle,
+                Action::AddBondInvoice,
+                Action::AdminTakeDispute,
+                Action::AdminAddSolver,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_invalid_action(result),
+                    "{action:?} must be blocked with InvalidAction in Cashu mode"
+                );
+            }
+        }
+
+        /// The allow-list (`Orders`, `LastTradeIndex`, `RestoreSession`,
+        /// `TradePubkey`) is routed to `handle_message_action_no_ln`. We assert
+        /// routing by observing that `RestoreSession` reaches its handler and
+        /// returns `Ok` — proving it was NOT short-circuited to `InvalidAction`.
+        #[tokio::test]
+        async fn allows_restore_session_through_no_ln_router() {
+            let ctx = create_ctx().await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+            let msg = Message::new_restore(None);
+
+            let result = dispatch_cashu(&Action::RestoreSession, msg, &event, &my_keys, &ctx).await;
+            assert!(
+                result.is_ok(),
+                "RestoreSession must route to the no-LN handler, got {result:?}"
+            );
         }
     }
 

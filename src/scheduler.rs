@@ -25,13 +25,26 @@ use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 pub async fn start_scheduler(ctx: AppContext) {
     info!("Creating scheduler");
 
+    // Mode-agnostic jobs run in both Lightning and Cashu mode.
     job_expire_pending_older_orders(ctx.clone()).await;
     job_update_rate_events(ctx.clone()).await;
-    job_cancel_orders(ctx.clone()).await;
-    job_retry_failed_payments(ctx.clone()).await;
-    job_process_dev_fee_payment(ctx.clone()).await;
-    job_process_bond_payouts(ctx.clone()).await;
-    job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+
+    // Lightning-only jobs: they settle/cancel hold invoices, retry LN
+    // payments, pay the dev fee over LN, and service anti-abuse bonds — all of
+    // which require an LND node that Cashu mode never initialises (CF-5).
+    // Bonds are additionally mutually exclusive with Cashu mode (CF-1). Gating
+    // the spawns here keeps them from calling `LndConnector::new()` on a node
+    // that has no LND. Lightning mode is unaffected (`is_cashu_enabled()` is
+    // `false`, so every job below still starts exactly as before).
+    if !Settings::is_cashu_enabled() {
+        job_cancel_orders(ctx.clone()).await;
+        job_retry_failed_payments(ctx.clone()).await;
+        job_process_dev_fee_payment(ctx.clone()).await;
+        job_process_bond_payouts(ctx.clone()).await;
+        job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+    }
+
+    // Mode-agnostic jobs (the info event self-skips when LN status is absent).
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
@@ -169,7 +182,13 @@ async fn job_info_event_send(ctx: AppContext) {
     let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
-    let ln_status = LN_STATUS.get().unwrap();
+    // The info event embeds LN node stats (`info_to_tags`). In Cashu mode there
+    // is no LND, so `LN_STATUS` is never set — skip the job rather than panic
+    // on `unwrap()`. A Cashu-aware info event is future work (CF-5).
+    let Some(ln_status) = LN_STATUS.get() else {
+        info!("Skipping mostro info event: no LN status (Cashu mode)");
+        return;
+    };
     tokio::spawn(async move {
         loop {
             info!("Sending info about mostro");
@@ -606,12 +625,20 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         expired.status = Status::Expired.to_string();
                         match expired.update(pool).await {
                             Ok(_) => {
-                                bond::release_bonds_for_order_or_warn(
-                                    pool,
-                                    order_id,
-                                    "maker_bond_expiry",
-                                )
-                                .await;
+                                // Bonds are Lightning-only and mutually exclusive
+                                // with Cashu mode (CF-1), which has no LND — the
+                                // release helpers open `LndConnector::new()`, so
+                                // skip them here. A cashu node should carry no
+                                // bond rows; any left over (e.g. a reused DB) are
+                                // a misconfiguration, not this job's concern.
+                                if !Settings::is_cashu_enabled() {
+                                    bond::release_bonds_for_order_or_warn(
+                                        pool,
+                                        order_id,
+                                        "maker_bond_expiry",
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -638,34 +665,41 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                         // expiry is the eventual safety net.
                         match order_updated.update(pool).await {
                             Ok(_) => {
-                                // Phase 1: a Pending order may be
-                                // carrying a still-active taker bond
-                                // (Phase 1 keeps the order in `Pending`
-                                // while the taker funds the bond hold
-                                // invoice). Without this hook the bond
-                                // stays in `Requested`/`Locked` and
-                                // the HTLC sits in LND until CLTV
-                                // expiry — Phase 1 promises "always
-                                // release" on every exit path,
-                                // expiry included.
-                                bond::release_taker_bonds_for_order_or_warn(
-                                    pool,
-                                    order_id,
-                                    "pending_expiry",
-                                )
-                                .await;
-                                // Phase 6: an expiring Pending order may be a
-                                // range remainder (or the range root) — resolve
-                                // the maker bond at range close (release when no
-                                // slice was slashed; settle-at-close otherwise).
-                                // Also covers the non-range maker bond via the
-                                // close helper's non-range release branch.
-                                bond::resolve_range_maker_bond_at_close_or_warn(
-                                    pool,
-                                    &order_snapshot,
-                                    "pending_expiry",
-                                )
-                                .await;
+                                // Bonds are Lightning-only and mutually exclusive
+                                // with Cashu mode (CF-1); the release helpers open
+                                // `LndConnector::new()`, which a cashu node has
+                                // not initialised. Skip them — a cashu node
+                                // carries no bond rows by construction.
+                                if !Settings::is_cashu_enabled() {
+                                    // Phase 1: a Pending order may be
+                                    // carrying a still-active taker bond
+                                    // (Phase 1 keeps the order in `Pending`
+                                    // while the taker funds the bond hold
+                                    // invoice). Without this hook the bond
+                                    // stays in `Requested`/`Locked` and
+                                    // the HTLC sits in LND until CLTV
+                                    // expiry — Phase 1 promises "always
+                                    // release" on every exit path,
+                                    // expiry included.
+                                    bond::release_taker_bonds_for_order_or_warn(
+                                        pool,
+                                        order_id,
+                                        "pending_expiry",
+                                    )
+                                    .await;
+                                    // Phase 6: an expiring Pending order may be a
+                                    // range remainder (or the range root) — resolve
+                                    // the maker bond at range close (release when no
+                                    // slice was slashed; settle-at-close otherwise).
+                                    // Also covers the non-range maker bond via the
+                                    // close helper's non-range release branch.
+                                    bond::resolve_range_maker_bond_at_close_or_warn(
+                                        pool,
+                                        &order_snapshot,
+                                        "pending_expiry",
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(

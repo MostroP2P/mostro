@@ -32,6 +32,12 @@ use uuid::Uuid;
 // Redefined for convenience
 type OrderKind = mostro_core::order::Kind;
 
+/// `true` only for `http`/`https` — the one scheme allow-list every outbound
+/// URL this daemon fetches (LNURL callbacks, Cashu mint URLs) should pass.
+pub fn is_http_or_https(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
 pub fn get_bitcoin_price(fiat_code: &str) -> Result<f64, MostroError> {
     crate::price::get_bitcoin_price(fiat_code)
 }

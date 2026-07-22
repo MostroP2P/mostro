@@ -115,7 +115,7 @@ fn validate_cashu_settings(
             cashu.mint_url
         )))
     })?;
-    if url.scheme() != "http" && url.scheme() != "https" {
+    if !crate::util::is_http_or_https(&url) {
         return Err(MostroInternalErr(ServiceError::IOError(format!(
             "cashu.mint_url must use http or https, got scheme {:?}",
             url.scheme()

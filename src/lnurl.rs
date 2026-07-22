@@ -3,6 +3,7 @@ use mostro_core::prelude::*;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde_json::Value;
+use tracing::{error, warn};
 
 pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -21,6 +22,11 @@ pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
 /// # Returns
 /// * `Ok(String)` - The extracted LNURL
 /// * `Err(MostroError)` - If the address is invalid or cannot be resolved
+///
+/// Validates the scheme is `http`/`https` before returning: a bech32-decoded
+/// LNURL is attacker-controlled input, and every caller of this function
+/// (`ln_exists`, `resolv_ln_address`) does an unguarded GET against the
+/// result, so this is the one place that check has to hold for all of them.
 async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
     let url = if address.to_lowercase().starts_with("lnurl") {
         let lnurl = LnUrl::decode(address.to_string())
@@ -39,6 +45,11 @@ async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
         };
         format!("{base_url}/.well-known/lnurlp/{user}")
     };
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
+    if !crate::util::is_http_or_https(&parsed) {
+        return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+    }
     Ok(url)
 }
 
@@ -69,19 +80,30 @@ pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     }
 }
 
-/// LUD-12: returns the comment truncated to `max_len` chars, or `None` if
-/// there's no comment to send or the server advertises no support for one
-/// (`max_len == 0`).
+/// LUD-12: returns the comment when it fits within `max_len` chars, or
+/// `None` if there's no comment to send, the server advertises no support
+/// for one (`max_len == 0`), or the comment would have to be truncated — a
+/// half-written order id or node pubkey is a worse trace than no trace.
 fn fit_comment(comment: Option<&str>, max_len: usize) -> Option<String> {
-    let comment = comment.filter(|_| max_len > 0)?;
-    Some(comment.chars().take(max_len).collect())
+    let comment = comment.filter(|c| max_len > 0 && c.chars().count() <= max_len)?;
+    Some(comment.to_string())
 }
 
 /// Builds the LNURL-pay callback URL, adding `amount` (and `comment`, per
 /// LUD-12, when the server allows it) as proper query parameters via
 /// `query_pairs_mut` — never by string-concatenating onto `callback`, which
 /// silently mangles the query if `callback` already carries one (a real LNURL
-/// server behavior, e.g. `https://host/cb?id=abc`).
+/// server behavior, e.g. `https://host/cb?id=abc`). Any pre-existing
+/// `amount`/`comment` pair on `callback` is dropped first so the values we
+/// compute here are the ones actually sent, not appended duplicates.
+///
+/// Only `http`/`https` callbacks are accepted (same check as `extract_lnurl`
+/// applies to the initial address): `callback` comes from a remote LNURL
+/// server's response and, for dev-fee payments, can be reached via a
+/// buyer-supplied lightning address. This blocks scheme confusion
+/// (`javascript:`, `file:`, ...) but not host-based SSRF — a malicious
+/// server can still return an `http(s)` callback pointed at a private or
+/// link-local address; that's a known gap, tracked separately.
 fn build_callback_url(
     callback: &str,
     amount_msat: u64,
@@ -90,10 +112,25 @@ fn build_callback_url(
 ) -> Result<reqwest::Url, MostroError> {
     let mut url = reqwest::Url::parse(callback)
         .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
+    if !crate::util::is_http_or_https(&url) {
+        return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+    }
+    let kept_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "amount" && k != "comment")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
     url.query_pairs_mut()
+        .clear()
+        .extend_pairs(&kept_pairs)
         .append_pair("amount", &amount_msat.to_string());
     if let Some(value) = fit_comment(comment, comment_allowed) {
         url.query_pairs_mut().append_pair("comment", &value);
+    } else if let Some(c) = comment.filter(|_| comment_allowed > 0) {
+        warn!(
+            "LUD-12 comment dropped: {} chars exceeds server limit of {comment_allowed}; dev-fee trace will be incomplete",
+            c.chars().count()
+        );
     }
     Ok(url)
 }
@@ -128,6 +165,11 @@ pub async fn resolv_ln_address(
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
         let body: Value = serde_json::from_str(&body)
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        if body["status"].as_str() == Some("ERROR") {
+            let reason = body["reason"].as_str().unwrap_or("unknown");
+            error!("LNURL address rejected: {reason}");
+            return Ok("".to_string());
+        }
         let tag = body["tag"].as_str().unwrap_or("");
         if tag != "payRequest" {
             return Ok("".to_string());
@@ -154,6 +196,11 @@ pub async fn resolv_ln_address(
                 .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
             let body: Value = serde_json::from_str(&body)
                 .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+            if body["status"].as_str() == Some("ERROR") {
+                let reason = body["reason"].as_str().unwrap_or("unknown");
+                error!("LNURL callback rejected: {reason}");
+                return Ok("".to_string());
+            }
             let pr = body["pr"].as_str().unwrap_or("");
 
             return Ok(pr.to_string());
@@ -188,6 +235,18 @@ mod tests {
     #[tokio::test]
     async fn extract_lnurl_rejects_malformed_bech32() {
         assert!(extract_lnurl("lnurl1notvalidbech32").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn extract_lnurl_rejects_non_http_scheme() {
+        // A bech32-decoded LNURL is attacker-controlled: it must not be
+        // able to smuggle a javascript:/file:/ftp: URL past extract_lnurl,
+        // since every caller does an unguarded GET on the result.
+        let encoded = LnUrl {
+            url: "javascript:alert(1)".to_string(),
+        }
+        .encode();
+        assert!(extract_lnurl(&encoded).await.is_err());
     }
 
     #[tokio::test]
@@ -282,10 +341,31 @@ mod tests {
     }
 
     #[test]
-    fn fit_comment_truncates_to_server_limit() {
+    fn fit_comment_none_when_too_long_for_server_limit() {
+        assert_eq!(fit_comment(Some("order=1 node=abc"), 7), None);
+    }
+
+    #[test]
+    fn build_callback_url_rejects_non_http_scheme() {
+        assert!(build_callback_url("javascript:alert(1)", 100_000, None, 0).is_err());
+        assert!(build_callback_url("ftp://host/cb", 100_000, None, 0).is_err());
+    }
+
+    #[test]
+    fn build_callback_url_drops_preexisting_amount_and_comment() {
+        let url = build_callback_url(
+            "https://pay.example.com/cb?amount=5&comment=old",
+            100_000,
+            Some("new"),
+            10,
+        )
+        .unwrap();
         assert_eq!(
-            fit_comment(Some("order=1 node=abc"), 7),
-            Some("order=1".to_string())
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("amount".into(), "100000".into()),
+                ("comment".into(), "new".into())
+            ]
         );
     }
 }

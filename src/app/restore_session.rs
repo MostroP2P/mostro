@@ -1,7 +1,14 @@
 use crate::app::context::AppContext;
-use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
+use crate::{
+    db::RestoreSessionManager,
+    util::{enqueue_restore_session_msg, is_valid_hex_pubkey},
+};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+
+/// Restore session results wait for this long before the requester is told
+/// to retry instead of hanging forever.
+const RESTORE_SESSION_TIMEOUT_SECS: u64 = 60 * 60;
 
 /// Handle restore session action
 /// This function starts a background task to process the restore session
@@ -17,12 +24,12 @@ pub async fn restore_session_action(
     let trade_key = event.sender.to_string();
 
     // Validate the master key format
-    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+    if !is_valid_hex_pubkey(&master_key) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
     // Validate the trade key format
-    if !trade_key.chars().all(|c| c.is_ascii_hexdigit()) || trade_key.len() != 64 {
+    if !is_valid_hex_pubkey(&trade_key) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
@@ -51,7 +58,7 @@ pub async fn restore_session_action(
 /// Handle restore session results in the background
 async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
     // Wait for the result with a timeout
-    let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
+    let timeout = tokio::time::Duration::from_secs(RESTORE_SESSION_TIMEOUT_SECS);
 
     match tokio::time::timeout(timeout, manager.wait_for_result()).await {
         Ok(Some(result)) => {
@@ -268,5 +275,10 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidPubkey))
         ));
+    }
+
+    #[test]
+    fn restore_session_timeout_is_one_hour() {
+        assert_eq!(RESTORE_SESSION_TIMEOUT_SECS, 3600);
     }
 }

@@ -141,6 +141,15 @@ fn build_callback_url(
 /// `comment` is attached per LUD-12 when the server advertises support for
 /// it (`commentAllowed > 0`); otherwise it's silently dropped, matching the
 /// pre-LUD-12 behavior.
+/// # Arguments
+/// * `address` - A Lightning Address or LNURL to resolve
+/// * `amount` - Payment amount in satoshis (converted to msat internally)
+/// * `comment` - Optional LUD-12 comment, sent only if the server allows it
+/// # Returns
+/// * `Ok(String)` - The resolved bolt11 invoice, or an empty string if the
+///   server rejected the request or doesn't support `payRequest`
+/// * `Err(MostroError)` - If the address/LNURL can't be resolved or the HTTP
+///   exchange fails
 pub async fn resolv_ln_address(
     address: &str,
     amount: u64,
@@ -166,8 +175,8 @@ pub async fn resolv_ln_address(
         let body: Value = serde_json::from_str(&body)
             .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
         if body["status"].as_str() == Some("ERROR") {
-            let reason = body["reason"].as_str().unwrap_or("unknown");
-            error!("LNURL address rejected: {reason}");
+            let reason_len = body["reason"].as_str().map(str::len).unwrap_or(0);
+            error!("LNURL address rejected by server (reason length: {reason_len} bytes)");
             return Ok("".to_string());
         }
         let tag = body["tag"].as_str().unwrap_or("");
@@ -197,8 +206,8 @@ pub async fn resolv_ln_address(
             let body: Value = serde_json::from_str(&body)
                 .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
             if body["status"].as_str() == Some("ERROR") {
-                let reason = body["reason"].as_str().unwrap_or("unknown");
-                error!("LNURL callback rejected: {reason}");
+                let reason_len = body["reason"].as_str().map(str::len).unwrap_or(0);
+                error!("LNURL callback rejected by server (reason length: {reason_len} bytes)");
                 return Ok("".to_string());
             }
             let pr = body["pr"].as_str().unwrap_or("");

@@ -1,0 +1,6 @@
+{
+  "note": "Track A TA-1 e2e harness. These keys redeem the escrow token — do not delete until the sats are swept.",
+  "buyer_trade_key":  { "secret": "0386e6f387013afa38d3898f4b33bd44ec6d0556aa0cdf6f28e88395940974a3", "pubkey": "01c42757ad2c54e32d6eac4418ad5daa423a299ce505c19398715c416d8b500a" },
+  "seller_trade_key": { "secret": "ac6a69bb9c0b3e9f9ac26d258a0c3a853ff0636345b833efdca9b7c399d91bfe", "pubkey": "411e87c8e32e3ac517220c62f60e49f28eed35b1c0f04099bf7bc0d14a01219e" },
+  "mostro_key":       { "secret": "ab50a599fc20ac4c832a16dce530657c8f6d0af4ab228867a5dad545c07e5430", "pubkey": "6ff598b082ce48bde87776dbf47a75b41ce98141ba991b0867d04f201c8a16a7" }
+}

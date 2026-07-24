@@ -874,6 +874,42 @@ pub async fn update_order_cashu_escrow(
     Ok(result.rows_affected() > 0)
 }
 
+/// Atomically claim an order's status transition (Track A **TA-2**).
+///
+/// Two concurrent `TakeBuy`/`TakeSell` events for the same pending order both
+/// read a `Pending` copy and both pass the in-memory `check_status`, so without
+/// this the loser goes on to write a full row built from its **stale** copy —
+/// rewriting the status back to `WaitingPayment` and nulling every column it
+/// does not know about, including a `cashu_escrow_token` the TA-1 CAS may have
+/// persisted in the meantime. Claiming the transition first means only one
+/// taker ever reaches the write, and the loser aborts having changed nothing.
+///
+/// `cashu_escrow_locked_at IS NULL` is belt-and-braces: an order whose escrow
+/// is already funded must never be dragged back to an earlier status, whatever
+/// its current one.
+pub async fn claim_order_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    expected_status: Status,
+    new_status: Status,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        r#"
+            UPDATE orders
+            SET status = ?1
+            WHERE id = ?2 AND status = ?3 AND cashu_escrow_locked_at IS NULL
+        "#,
+    )
+    .bind(new_status.to_string())
+    .bind(order_id)
+    .bind(expected_status.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Whether some **other** order already holds this exact escrow token.
 ///
 /// The escrow token's 2-of-3 condition commits to `{P_B, P_S, P_M}` — trade

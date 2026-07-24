@@ -575,7 +575,15 @@ seller hold invoice:
   the **locktime horizon** (`cashu.escrow_locktime_days`, §4B) so the seller sets
   `locktime = now + days` with `refund = [P_S]`.
   (This is the `show_cashu_escrow_request(...)` helper.) The order is left in
-  `WaitingPayment`, exactly where the CAS in step 8 expects it. The seller's
+  `WaitingPayment`, exactly where the CAS in step 8 expects it.
+  The helper **claims the `Pending → WaitingPayment` transition atomically**
+  (`db::claim_order_status`) before it writes anything: two concurrent takes
+  both pass the caller's in-memory `check_status`, and the loser's full-row
+  write is built from a copy read before either ran — it would drag the status
+  back with its own trade keys and null every column its stale copy does not
+  carry, including a `cashu_escrow_token` step 8 may already have persisted.
+  The claim also refuses any order whose escrow is already funded. The loser
+  gets `CantDo(NotAllowedByStatus)` and changes nothing. The seller's
   client then builds **two** tokens — the 2-of-3 escrow and the 1-of-1 `P_M` fee
   token — and submits both in `AddCashuEscrow`.
 

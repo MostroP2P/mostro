@@ -4,7 +4,7 @@ use crate::config::constants::{
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
-use crate::db::is_user_present;
+use crate::db::{claim_order_status, is_user_present};
 use crate::escrow::EscrowBackend;
 use crate::flow;
 use crate::lightning;
@@ -1684,6 +1684,21 @@ pub async fn show_cashu_escrow_request(
     mut order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    // Claim the transition before writing anything. Two concurrent takes on the
+    // same pending order both pass the caller's in-memory `check_status`, and
+    // the full-row `update` below is built from a copy read before either ran:
+    // the loser would rewrite the status back to `WaitingPayment` with its own
+    // trade keys and null every column its stale copy does not carry —
+    // including a `cashu_escrow_token` the TA-1 CAS may already have persisted.
+    // Only the winner proceeds; the loser aborts having changed nothing.
+    if !claim_order_status(pool, order.id, Status::Pending, Status::WaitingPayment).await? {
+        tracing::info!(
+            "cashu take: order {} was claimed concurrently or already funded — refusing the take",
+            order.id
+        );
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
     order.status = Status::WaitingPayment.to_string();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
@@ -3512,6 +3527,79 @@ mod tests {
             Action::WaitingSellerToPay
         );
         assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
+    }
+
+    /// Two concurrent takes on the same pending order: the second one holds a
+    /// stale `Pending` copy, and without the status claim its full-row write
+    /// would drag the order back and null the columns it does not carry. It
+    /// must be refused instead, leaving the first taker's state intact.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_refuses_a_second_concurrent_take() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let first_buyer = Keys::generate().public_key();
+        let second_buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // The stale copy the loser carries: still Pending, read before the
+        // winner ran.
+        let stale = order.clone();
+
+        show_cashu_escrow_request(&pool, &keys, &first_buyer, &seller, order.clone(), Some(1))
+            .await
+            .expect("the first take must win");
+
+        let result =
+            show_cashu_escrow_request(&pool, &keys, &second_buyer, &seller, stale, Some(2)).await;
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "the second take must be refused, got {result:?}"
+        );
+
+        // The winner's taker is still on the order.
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(first_buyer.to_string()));
+    }
+
+    /// An order whose escrow is already funded must never be dragged back by a
+    /// late take, whatever its status.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_refuses_a_take_on_a_funded_order() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE orders SET cashu_escrow_token = ?1, cashu_escrow_locked_at = ?2 WHERE id = ?3",
+        )
+        .bind("cashuAtoken")
+        .bind(1700000100_i64)
+        .bind(order.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result =
+            show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(3)).await;
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a funded order must not be re-taken, got {result:?}"
+        );
+
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.cashu_escrow_token.as_deref(), Some("cashuAtoken"));
+        assert_eq!(db.cashu_escrow_locked_at, Some(1700000100));
     }
 
     // ───────────────────────── nostr client plumbing ─────────────────────────

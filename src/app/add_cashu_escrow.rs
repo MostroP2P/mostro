@@ -18,7 +18,7 @@
 use crate::app::context::AppContext;
 use crate::cashu::{cashu_pubkey_from_xonly_hex, Error as CashuError};
 use crate::config::settings::Settings;
-use crate::db::update_order_cashu_escrow;
+use crate::db::{cashu_escrow_token_in_use, update_order_cashu_escrow};
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use chrono::Utc;
 use mostro_core::db::Crud;
@@ -41,13 +41,51 @@ fn cashu_reason(e: &CashuError) -> CantDoReason {
     }
 }
 
+/// Tell both parties the escrow is live: the buyer learns it can send fiat,
+/// the seller gets an ack carrying its request id.
+///
+/// Shared by the happy path (step 10) and the replay-recovery path (step 3b),
+/// which is the whole point of factoring it out — a retry after a lost
+/// notification must produce exactly the same pair of messages as the original
+/// lock.
+async fn notify_escrow_locked(
+    order_id: uuid::Uuid,
+    buyer_pubkey: PublicKey,
+    seller_pubkey: PublicKey,
+    request_id: Option<u64>,
+) {
+    enqueue_order_msg(
+        None,
+        Some(order_id),
+        Action::CashuEscrowLocked,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
+    enqueue_order_msg(
+        request_id,
+        Some(order_id),
+        Action::CashuEscrowLocked,
+        None,
+        seller_pubkey,
+        None,
+    )
+    .await;
+}
+
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
 ///
 /// On success the order advances `WaitingPayment → Active` in one atomic write
 /// and both parties are notified with `CashuEscrowLocked` (the buyer's cue to
 /// send fiat). Every rejection path returns the matching `CantDoReason` and
-/// leaves the order unchanged; a replayed or concurrent submission matches zero
-/// rows in the compare-and-set and is a safe idempotent no-op.
+/// leaves the order unchanged.
+///
+/// Replays never write twice. A concurrent submission matches zero rows in the
+/// compare-and-set and is a safe no-op; a *sequential* retry of an escrow this
+/// handler already locked re-sends the notifications and returns (step 3b), so
+/// a crash between the commit and the send queue cannot strand the trade with
+/// a funded escrow and an uninformed buyer.
 pub async fn add_cashu_escrow_action(
     ctx: &AppContext,
     msg: Message,
@@ -66,11 +104,25 @@ pub async fn add_cashu_escrow_action(
     if seller_pubkey != event.sender {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
-    // 3. The order must be waiting for the seller to fund it.
-    order
-        .check_status(Status::WaitingPayment)
-        .map_err(MostroCantDo)?;
+    // 3. The order must be waiting for the seller to fund it — with exactly one
+    //    exception, handled in 3b below: an order this handler already locked
+    //    (escrow stored, status `Active`) is a *replay*, not a stray request.
+    //    Rejecting it here would make the documented idempotent retry
+    //    unreachable and strand a trade whose notifications were lost between
+    //    the commit and the send queue. Any other status — including an
+    //    `Active` order with no escrow, or a locked order that has since moved
+    //    past `Active` — still falls through to the normal rejection, so a
+    //    stale "escrow locked, send fiat" is never replayed onto a trade that
+    //    has advanced.
+    let replayable =
+        order.cashu_escrow_locked_at.is_some() && order.status == Status::Active.to_string();
+    if !replayable {
+        order
+            .check_status(Status::WaitingPayment)
+            .map_err(MostroCantDo)?;
+    }
 
     // 4. Extract the lock proof. `MessageKind::verify()` already guarantees the
     //    payload shape; re-check defensively.
@@ -78,6 +130,25 @@ pub async fn add_cashu_escrow_action(
         Some(Payload::CashuLockProof(p)) => p.clone(),
         _ => return Err(MostroCantDo(CantDoReason::InvalidCashuToken)),
     };
+
+    // 3b. Replay recovery. The order is already locked and `Active`: if this
+    //     submission carries the very token we stored, re-send the post-commit
+    //     notifications and stop — no mint round-trip, no second write, and the
+    //     buyer finally gets its cue to send fiat. A *different* token on an
+    //     already-locked order is a second funding attempt, which the escrow
+    //     can never honour, so it is rejected outright. Only the seller trade
+    //     key (checked in step 2) can reach this path.
+    if replayable {
+        if order.cashu_escrow_token.as_deref() != Some(proof.token.as_str()) {
+            return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+        }
+        tracing::info!(
+            "cashu lock: replayed AddCashuEscrow for already-locked order {} — re-notifying both parties",
+            order.id
+        );
+        notify_escrow_locked(order.id, buyer_pubkey, seller_pubkey, request_id).await;
+        return Ok(());
+    }
 
     // 5. Bind the mint: the node only escrows on its own configured mint. This
     //    is a cheap field pre-check; `verify_escrow_token` (step 7) enforces
@@ -98,7 +169,6 @@ pub async fn add_cashu_escrow_action(
     //    both reject a proof whose stated keys disagree with the order (a cheap
     //    offline check) AND derive the authoritative `{P_B, P_S, P_M}` from the
     //    order — never from the proof — to hand to the mint validation.
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
     let mostro_pubkey = my_keys.public_key();
     if proof.buyer_pubkey != buyer_pubkey.to_string()
         || proof.seller_pubkey != seller_pubkey.to_string()
@@ -119,6 +189,22 @@ pub async fn add_cashu_escrow_action(
         u64::try_from(order.amount).map_err(|_| MostroCantDo(CantDoReason::InvalidAmount))?;
     if expected_amount == 0 {
         return Err(MostroCantDo(CantDoReason::InvalidAmount));
+    }
+
+    // 6b. Reject a token already escrowed by another order. The 2-of-3 commits
+    //     to `{P_B, P_S, P_M}` — trade keys, not an order id — so the checks
+    //     above cannot tell this order apart from another one sharing the same
+    //     trade keys, and the mint reports the proofs unspent until the first
+    //     redeem: without this guard both orders would validate the same token
+    //     and go `Active` against a single redeemable escrow. Checked before
+    //     the mint round-trip so the seller gets a clear reason cheaply; the
+    //     CAS in step 8 repeats it atomically for the concurrent case.
+    if cashu_escrow_token_in_use(pool, &proof.token, order.id).await? {
+        tracing::warn!(
+            "cashu lock: escrow token for order {} is already locked to another order — rejected",
+            order.id
+        );
+        return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
     }
 
     // 7. Validate the token against the mint: 2-of-3 condition + seller-recovery
@@ -156,6 +242,19 @@ pub async fn add_cashu_escrow_action(
     )
     .await?;
     if !locked {
+        // Zero rows means one of three things. Two are benign (the status moved
+        // on, or a concurrent submission won the race and already locked this
+        // order) and stay idempotent no-ops. The third — a concurrent
+        // submission that locked this same token onto a *different* order,
+        // losing the step-6b race — must surface as a rejection so the seller
+        // is not left believing an escrow it can no longer fund is live.
+        if cashu_escrow_token_in_use(pool, &proof.token, order.id).await? {
+            tracing::warn!(
+                "cashu lock: escrow token for order {} was locked to another order concurrently — rejected",
+                order.id
+            );
+            return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+        }
         tracing::info!(
             "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
             order.id
@@ -187,25 +286,9 @@ pub async fn add_cashu_escrow_action(
     }
 
     // 10. Notify both parties. The buyer learns the escrow is live and can send
-    //     fiat; the seller gets an ack carrying the request id.
-    enqueue_order_msg(
-        None,
-        Some(order.id),
-        Action::CashuEscrowLocked,
-        None,
-        buyer_pubkey,
-        None,
-    )
-    .await;
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::CashuEscrowLocked,
-        None,
-        seller_pubkey,
-        None,
-    )
-    .await;
+    //     fiat; the seller gets an ack carrying the request id. If this send is
+    //     lost (crash, dropped queue), the seller's retry replays it via 3b.
+    notify_escrow_locked(order.id, buyer_pubkey, seller_pubkey, request_id).await;
 
     Ok(())
 }
@@ -249,6 +332,45 @@ mod tests {
             fiat_amount: 40,
             ..Default::default()
         }
+    }
+
+    /// Stamp the escrow columns straight onto a row, standing in for a lock
+    /// this handler already committed (the state a replay arrives against).
+    async fn mark_locked(pool: &SqlitePool, id: uuid::Uuid, token: &str, status: Status) {
+        sqlx::query(
+            "UPDATE orders SET cashu_mint_url = ?1, cashu_escrow_token = ?2,
+             cashu_escrow_locked_at = ?3, status = ?4 WHERE id = ?5",
+        )
+        .bind("https://mint.example.com")
+        .bind(token)
+        .bind(1700000100_i64)
+        .bind(status.to_string())
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The escrow columns as stored, to assert a rejected or replayed
+    /// submission rewrote nothing.
+    async fn escrow_columns(pool: &SqlitePool, id: uuid::Uuid) -> (Option<String>, Option<i64>) {
+        sqlx::query_as(
+            "SELECT cashu_escrow_token, cashu_escrow_locked_at FROM orders WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn lock_proof(token: &str, buyer: PublicKey, seller: PublicKey, mostro: PublicKey) -> Payload {
+        Payload::CashuLockProof(CashuLockProof::new(
+            token.to_string(),
+            "https://mint.example.com".to_string(),
+            buyer.to_string(),
+            seller.to_string(),
+            mostro.to_string(),
+        ))
     }
 
     fn unwrapped_from(sender: PublicKey) -> UnwrappedMessage {
@@ -363,5 +485,115 @@ mod tests {
         let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db.status, Status::WaitingPayment.to_string());
         assert!(db.cashu_escrow_token.is_none());
+    }
+
+    /// Step 3b: a seller retrying after the lock committed but the
+    /// notifications were lost gets the notifications replayed, not a status
+    /// rejection — otherwise the escrow is funded and the buyer never learns
+    /// to send fiat. The retry must not touch state or contact the mint (this
+    /// test runs with no mint and no `[cashu]` settings; reaching step 5 would
+    /// fail).
+    #[tokio::test]
+    async fn replayed_lock_on_locked_order_renotifies_without_rewriting_state() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let order = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, order.id, "cashuAlockedtoken", Status::Active).await;
+
+        let event = unwrapped_from(seller);
+        let msg = lock_message(
+            order.id,
+            Some(lock_proof(
+                "cashuAlockedtoken",
+                buyer,
+                seller,
+                my_keys.public_key(),
+            )),
+        );
+
+        let result = add_cashu_escrow_action(&ctx, msg, &event, &my_keys).await;
+        assert!(result.is_ok(), "a replay of our own lock must be a no-op");
+
+        let (token, locked_at) = escrow_columns(&pool, order.id).await;
+        assert_eq!(token.as_deref(), Some("cashuAlockedtoken"));
+        assert_eq!(locked_at, Some(1700000100), "the original lock must stand");
+    }
+
+    /// A *different* token on an already-locked order is a second funding
+    /// attempt the escrow can never honour — rejected, and the stored escrow
+    /// is left alone.
+    #[tokio::test]
+    async fn rejects_a_second_token_on_an_already_locked_order() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let order = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, order.id, "cashuAlockedtoken", Status::Active).await;
+
+        let event = unwrapped_from(seller);
+        let msg = lock_message(
+            order.id,
+            Some(lock_proof(
+                "cashuAdifferent",
+                buyer,
+                seller,
+                my_keys.public_key(),
+            )),
+        );
+
+        let result = add_cashu_escrow_action(&ctx, msg, &event, &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+
+        let (token, locked_at) = escrow_columns(&pool, order.id).await;
+        assert_eq!(token.as_deref(), Some("cashuAlockedtoken"));
+        assert_eq!(locked_at, Some(1700000100));
+    }
+
+    /// The replay path is scoped to `Active`: a locked order whose trade has
+    /// moved on must NOT get a stale "escrow locked, send fiat" replayed onto
+    /// it — it falls through to the ordinary status rejection.
+    #[tokio::test]
+    async fn does_not_replay_notifications_for_a_locked_order_past_active() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let order = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, order.id, "cashuAlockedtoken", Status::FiatSent).await;
+
+        let event = unwrapped_from(seller);
+        let msg = lock_message(
+            order.id,
+            Some(lock_proof(
+                "cashuAlockedtoken",
+                buyer,
+                seller,
+                my_keys.public_key(),
+            )),
+        );
+
+        let result = add_cashu_escrow_action(&ctx, msg, &event, &my_keys).await;
+        assert!(
+            matches!(result, Err(MostroCantDo(_))),
+            "a locked order past Active must be rejected, not re-notified"
+        );
     }
 }

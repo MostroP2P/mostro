@@ -133,6 +133,19 @@ to `release_action` (compute/verify first, persist second, notify last).
    `CantDo(InvalidPeer)`. (Same identity check shape as `release_action`.)
 3. **Check status.** The order must be in the "waiting for seller to fund" status
    (`WaitingPayment`); otherwise `CantDo(NotAllowedByStatus)`.
+3b. **Replay recovery (the one exception to step 3).** An order this handler
+   already locked — `cashu_escrow_locked_at` set **and** status still `Active` —
+   is a *replay*, not a stray request: step 10's notifications are sent after
+   the commit, so a crash (or a lost send queue) in between leaves the escrow
+   funded and the buyer never cued to send fiat, while step 3 would reject every
+   retry. If the submitted token equals the stored one, **re-send the step-10
+   notifications and return `Ok(())`** — no mint round-trip, no second write. A
+   *different* token on an already-locked order ⇒ `CantDo(InvalidCashuToken)`
+   (a second funding the escrow can never honour). The exception is deliberately
+   scoped to `Active`: a locked order that has moved on (`FiatSent`, `Success`,
+   …) falls through to the step-3 rejection, so a stale "escrow locked, send
+   fiat" is never replayed onto an advanced trade. Only the seller trade key
+   (step 2) can reach this path.
 4. **Extract the proof.** `Payload::CashuLockProof(proof)`; absent ⇒
    `CantDo(InvalidCashuToken)`. (`MessageKind::verify()` already guarantees the
    payload shape, but the handler re-checks defensively.)
@@ -149,6 +162,21 @@ to `release_action` (compute/verify first, persist second, notify last).
    Any mismatch ⇒ `CantDo(InvalidCashuToken)`. This is the security core:
    the 2-of-3 must lock to the keys Mostro already holds for this order, never
    attacker-chosen keys.
+6b. **Reject a token already escrowed by another order.** The 2-of-3 commits to
+   `{P_B, P_S, P_M}` — trade keys, not an order id — so step 6 cannot tell this
+   order apart from another one that reuses the same trade keys, and the mint
+   reports the proofs unspent until the first redeem: without a guard both
+   orders validate the same token and go `Active` against a single redeemable
+   escrow. `db::cashu_escrow_token_in_use(pool, &proof.token, order.id)` ⇒
+   `CantDo(InvalidCashuToken)`, checked here so the seller gets a clear reason
+   before the mint round-trip. The CF-4 CAS (step 8) repeats the predicate as a
+   `NOT EXISTS` leg, which is what actually closes the check-then-act race
+   between two concurrent submissions; a `false` CAS whose token turns out to be
+   held elsewhere is reported as `InvalidCashuToken` rather than a silent no-op.
+   This is *token-level* uniqueness — proof-level (`Y = hash_to_curve(secret)`)
+   uniqueness, which also catches a token re-serialised around the same proofs,
+   arrives with TA-1f's `cashu_fee_proofs` table (§4A) and should be extended to
+   the escrow token there.
 7. **Validate the token against the mint.**
    `ctx.cashu_client()` → `verify_escrow_token(&proof.token, p_b, p_s, p_m,
    expected_amount, min_locktime)`. This composes: 2-of-3 condition (exactly 2 sigs
@@ -164,7 +192,9 @@ to `release_action` (compute/verify first, persist second, notify last).
    now, /*expected*/ WaitingPayment, /*new*/ Active)`. If it returns `false`
    (status changed concurrently, or escrow already locked — replay), log and
    return `Ok(())` without notifying (idempotent; same pattern as the
-   `rows_affected() == 0` guard in `release_action`).
+   `rows_affected() == 0` guard in `release_action`) — **unless** the token is
+   meanwhile held by another order, the lost-race case of §6b, which is a
+   rejection rather than a no-op.
 9. **Publish the updated order event** (kind 38383) via `update_order_event`, as
    the LN funding path does, so the order's public state stays consistent.
 10. **Notify the buyer.** Enqueue `Action::CashuEscrowLocked` to the buyer plus
@@ -642,8 +672,11 @@ Tracks B/C/D** — it only edits its own files plus the pre-wired CF-5 stub.
    unchanged (wrong sender, wrong status, wrong mint, pubkey mismatch, malformed
    token, mint unavailable, double-spent, replay, **missing/mis-valued
    fee_token when `mostro.fee > 0`**).
-3. The lock is atomic and idempotent (concurrent/replayed submission matches zero
-   rows and is a safe no-op; **the fee token is never redeemed twice**).
+3. The lock is atomic and idempotent: a concurrent submission matches zero rows
+   and is a safe no-op, a sequential retry of an already-locked escrow replays
+   the notifications instead of being rejected (§4 step 3b), the same token is
+   never escrowed by two orders (§4 step 6b), and **the fee token is never
+   redeemed twice**.
 3b. The seller-funded fee token of `2 * order.fee` is validated against the mint
    and redeemed on success; Mostro's total revenue equals the Lightning-mode
    `2 * order.fee`, and dev-fee accounting is unchanged (Option 2, §4A). The

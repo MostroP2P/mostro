@@ -24,6 +24,7 @@ use chrono::Utc;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 
 /// Seconds in a day — the escrow locktime floor is configured in days
 /// (`cashu.escrow_locktime_days`, §4B) and enforced here in seconds.
@@ -72,6 +73,51 @@ async fn notify_escrow_locked(
         None,
     )
     .await;
+}
+
+/// Decide what a compare-and-set that matched zero rows actually means.
+///
+/// Three causes reach here and they do **not** share an outcome:
+/// - the token was locked onto a *different* order concurrently (the step-6b
+///   race, lost) — this order can never be funded by it ⇒ reject;
+/// - a concurrent submission locked *this* order with a **different** token in
+///   the window since step 1 — this submission was not the one accepted, and
+///   answering `Ok(())` would let the seller believe an untouched, unspent
+///   token is escrowed ⇒ reject;
+/// - anything else — the same token already locked (a duplicate delivery), or
+///   the status simply moved on ⇒ benign no-op.
+///
+/// `Ok(())` therefore means "safe idempotent no-op", never "accepted".
+async fn classify_zero_row_cas(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    token: &str,
+) -> Result<(), MostroError> {
+    if cashu_escrow_token_in_use(pool, token, order_id).await? {
+        tracing::warn!(
+            "cashu lock: escrow token for order {order_id} was locked to another order concurrently — rejected"
+        );
+        return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+    }
+
+    match Order::by_id(pool, order_id).await {
+        Ok(Some(fresh))
+            if fresh.cashu_escrow_locked_at.is_some()
+                && fresh.cashu_escrow_token.as_deref() != Some(token) =>
+        {
+            tracing::warn!(
+                "cashu lock: order {order_id} was locked with a different token concurrently — rejected"
+            );
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        }
+        // Unclassifiable: nothing of ours was written, so fall back to the
+        // conservative no-op rather than inventing a rejection.
+        Err(e) => {
+            tracing::error!("cashu lock: refetch after a zero-row CAS failed for {order_id}: {e}");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
@@ -227,10 +273,10 @@ pub async fn add_cashu_escrow_action(
         .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
 
     // 8. Atomically persist the escrow and advance the status in one write. A
-    //    `false` return means the status changed concurrently or the escrow is
-    //    already locked (replay) — log and return `Ok(())` without notifying
-    //    (idempotent; same shape as the `rows_affected() == 0` guard in
-    //    `release_action`).
+    //    `false` return is classified by `classify_zero_row_cas`: a benign
+    //    no-op returns `Ok(())` without notifying (idempotent; same shape as
+    //    the `rows_affected() == 0` guard in `release_action`), while a race
+    //    that left this submission's token unaccepted is rejected.
     let locked = update_order_cashu_escrow(
         pool,
         order.id,
@@ -242,19 +288,7 @@ pub async fn add_cashu_escrow_action(
     )
     .await?;
     if !locked {
-        // Zero rows means one of three things. Two are benign (the status moved
-        // on, or a concurrent submission won the race and already locked this
-        // order) and stay idempotent no-ops. The third — a concurrent
-        // submission that locked this same token onto a *different* order,
-        // losing the step-6b race — must surface as a rejection so the seller
-        // is not left believing an escrow it can no longer fund is live.
-        if cashu_escrow_token_in_use(pool, &proof.token, order.id).await? {
-            tracing::warn!(
-                "cashu lock: escrow token for order {} was locked to another order concurrently — rejected",
-                order.id
-            );
-            return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
-        }
+        classify_zero_row_cas(pool, order.id, &proof.token).await?;
         tracing::info!(
             "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
             order.id
@@ -561,6 +595,94 @@ mod tests {
         let (token, locked_at) = escrow_columns(&pool, order.id).await;
         assert_eq!(token.as_deref(), Some("cashuAlockedtoken"));
         assert_eq!(locked_at, Some(1700000100));
+    }
+
+    /// Step 8, cause (b): a concurrent submission locked THIS order with a
+    /// different token, so this submission was never accepted. Answering
+    /// `Ok(())` would let the seller believe an untouched, still-unspent token
+    /// is escrowed.
+    #[tokio::test]
+    async fn zero_row_cas_rejects_when_the_order_was_locked_with_another_token() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, order.id, "cashuAwinner", Status::Active).await;
+
+        let result = classify_zero_row_cas(&pool, order.id, "cashuAloser").await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+    }
+
+    /// Step 8, cause (a): the token itself went to a different order.
+    #[tokio::test]
+    async fn zero_row_cas_rejects_when_the_token_went_to_another_order() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mine = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let theirs = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, theirs.id, "cashuAtoken", Status::Active).await;
+
+        let result = classify_zero_row_cas(&pool, mine.id, "cashuAtoken").await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+    }
+
+    /// The benign causes stay no-ops: a duplicate delivery of the token that
+    /// actually won, and an order whose status simply moved on unlocked.
+    #[tokio::test]
+    async fn zero_row_cas_is_a_noop_for_duplicate_delivery_and_moved_status() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        // (b') Locked with the very token we submitted — a duplicate.
+        let duplicate = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, duplicate.id, "cashuAtoken", Status::Active).await;
+        assert!(classify_zero_row_cas(&pool, duplicate.id, "cashuAtoken")
+            .await
+            .is_ok());
+
+        // (c) Never locked, status moved on under us. A token of its own: the
+        // one above is legitimately taken, and reusing it here would trip the
+        // cross-order guard instead of exercising this branch.
+        let moved = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+            .bind(Status::Canceled.to_string())
+            .bind(moved.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(classify_zero_row_cas(&pool, moved.id, "cashuAmoved")
+            .await
+            .is_ok());
+
+        // A vanished order is unclassifiable, never a rejection.
+        assert!(
+            classify_zero_row_cas(&pool, uuid::Uuid::new_v4(), "cashuAvanished")
+                .await
+                .is_ok()
+        );
     }
 
     /// The replay path is scoped to `Active`: a locked order whose trade has

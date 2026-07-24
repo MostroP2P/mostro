@@ -192,9 +192,14 @@ to `release_action` (compute/verify first, persist second, notify last).
    now, /*expected*/ WaitingPayment, /*new*/ Active)`. If it returns `false`
    (status changed concurrently, or escrow already locked — replay), log and
    return `Ok(())` without notifying (idempotent; same pattern as the
-   `rows_affected() == 0` guard in `release_action`) — **unless** the token is
-   meanwhile held by another order, the lost-race case of §6b, which is a
-   rejection rather than a no-op.
+   `rows_affected() == 0` guard in `release_action`) — **unless** the zero rows
+   are a lost race that left this submission's token unaccepted, in which case
+   it is a rejection. Two such races: the token was locked onto another order
+   (the §6b case), or a concurrent submission locked *this* order with a
+   **different** token. Both ⇒ `CantDo(InvalidCashuToken)`, because answering
+   `Ok(())` would leave the seller believing an untouched, still-unspent token
+   is escrowed. A duplicate delivery of the token that actually won, and a
+   status that simply moved on, stay no-ops.
 9. **Publish the updated order event** (kind 38383) via `update_order_event`, as
    the LN funding path does, so the order's public state stays consistent.
 10. **Notify the buyer.** Enqueue `Action::CashuEscrowLocked` to the buyer plus

@@ -588,6 +588,11 @@ pub fn cashu_pubkey_from_xonly_hex(xonly_hex: &str) -> Result<PublicKey, Error> 
         .map_err(|e| Error::Condition(format!("pubkey convert: {e}")))
 }
 
+/// Mint-backed end-to-end harness for the TA-1 escrow lock — `#[ignore]`d and
+/// env-gated, so it never runs in a plain `cargo test`.
+#[cfg(test)]
+mod e2e_lock;
+
 #[cfg(test)]
 mod tests {
     use super::*;

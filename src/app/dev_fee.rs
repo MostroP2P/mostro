@@ -71,6 +71,8 @@ use mostro_core::error::MostroError;
 use mostro_core::error::MostroError::MostroInternalErr;
 use mostro_core::error::ServiceError;
 use mostro_core::order::Order;
+use nostr_sdk::prelude::ToBech32;
+use nostr_sdk::{Keys, PublicKey};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
@@ -87,13 +89,14 @@ pub async fn run_dev_fee_cycle(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
+    keys: &Keys,
 ) {
     info!("Checking for unpaid development fees");
 
     cleanup_stale_pending_markers(pool).await;
     verify_confirmed_orders(pool, ln_client, confirmed).await;
     recover_partial_payments(pool, ln_client, confirmed).await;
-    process_new_dev_fee_payments(pool, ln_client, confirmed).await;
+    process_new_dev_fee_payments(pool, ln_client, confirmed, keys).await;
 }
 
 // ── Phase 1: Stale PENDING cleanup ──────────────────────────────────────
@@ -392,6 +395,7 @@ async fn process_new_dev_fee_payments(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
+    keys: &Keys,
 ) {
     let unpaid_orders = match find_unpaid_dev_fees(pool).await {
         Ok(orders) => orders,
@@ -434,7 +438,7 @@ async fn process_new_dev_fee_payments(
 
         let (payment_request, payment_hash_hex) = match tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            resolve_dev_fee_invoice(&order),
+            resolve_dev_fee_invoice(&order, keys),
         )
         .await
         {
@@ -876,6 +880,14 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
 
 // ── Invoice resolution & payment (moved from release.rs) ───────────────
 
+/// LUD-12 comment identifying which order/node a dev fee payment came
+/// from. `node` is rendered as `npub…` rather than hex: it's the
+/// self-describing form in a nostr project, and it's shorter.
+fn dev_fee_comment(order_id: &uuid::Uuid, node: &PublicKey) -> String {
+    let node_id = node.to_bech32().unwrap_or_else(|_| node.to_string());
+    format!("mostro-dev-fee order={order_id} node={node_id}")
+}
+
 /// Resolve a dev fee LNURL invoice for the given order.
 ///
 /// Contacts the dev fee lightning address, obtains a fresh invoice,
@@ -883,7 +895,10 @@ fn parse_pending_timestamp(marker: &str) -> Option<u64> {
 ///
 /// # Timeouts
 /// - LNURL resolution: 15 seconds
-pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), MostroError> {
+pub async fn resolve_dev_fee_invoice(
+    order: &Order,
+    keys: &Keys,
+) -> Result<(String, String), MostroError> {
     info!(
         "Resolving dev fee invoice for order {} - amount: {} sats to {}",
         order.id, order.dev_fee, DEV_FEE_LIGHTNING_ADDRESS
@@ -893,9 +908,17 @@ pub async fn resolve_dev_fee_invoice(order: &Order) -> Result<(String, String), 
         return Err(MostroInternalErr(ServiceError::WrongAmountError));
     }
 
+    // LUD-12 comment so the receiving end can trace which order/node a dev
+    // fee payment came from.
+    let comment = dev_fee_comment(&order.id, &keys.public_key());
+
     let payment_request = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        resolv_ln_address(DEV_FEE_LIGHTNING_ADDRESS, order.dev_fee as u64),
+        resolv_ln_address(
+            DEV_FEE_LIGHTNING_ADDRESS,
+            order.dev_fee as u64,
+            Some(comment.as_str()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -1494,10 +1517,12 @@ mod tests {
     // ── LND-dependent phases against a lazily-connected dead client ──
 
     use super::{
-        handle_payment_timeout, process_new_dev_fee_payments, recover_partial_payments,
-        resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment, verify_confirmed_orders,
+        dev_fee_comment, handle_payment_timeout, process_new_dev_fee_payments,
+        recover_partial_payments, resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment,
+        verify_confirmed_orders,
     };
     use crate::lightning::LndConnector;
+    use nostr_sdk::Keys;
 
     /// Real `LndConnector` against a dead endpoint: `connect` is lazy,
     /// so it always builds; every RPC fails in ~1ms with a transport
@@ -1549,7 +1574,7 @@ mod tests {
         let pool = setup_orders_db().await;
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        run_dev_fee_cycle(&pool, &mut ln, &mut confirmed).await;
+        run_dev_fee_cycle(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
         assert!(confirmed.is_empty());
     }
 
@@ -1820,7 +1845,7 @@ mod tests {
 
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed).await;
+        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
 
         let row: (i32, Option<String>) =
             sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
@@ -1842,7 +1867,7 @@ mod tests {
             .unwrap();
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed).await;
+        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
         assert!(confirmed.is_empty());
     }
 
@@ -1955,7 +1980,28 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(resolve_dev_fee_invoice(&order).await.is_err());
+        assert!(resolve_dev_fee_invoice(&order, &Keys::generate())
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn dev_fee_comment_has_expected_shape() {
+        use nostr_sdk::prelude::ToBech32;
+
+        let order_id = uuid::Uuid::new_v4();
+        let keys = Keys::generate();
+        let comment = dev_fee_comment(&order_id, &keys.public_key());
+        assert_eq!(
+            comment,
+            format!(
+                "mostro-dev-fee order={} node={}",
+                order_id,
+                keys.public_key().to_bech32().unwrap()
+            )
+        );
+        assert!(comment.starts_with("mostro-dev-fee order="));
+        assert!(comment.contains(" node=npub1"));
     }
 
     #[tokio::test]

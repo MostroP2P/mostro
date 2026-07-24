@@ -496,7 +496,7 @@ pub async fn do_payment(
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount)
+        resolv_ln_address(&addr.to_string(), amount, None)
             .await
             .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
     } else {

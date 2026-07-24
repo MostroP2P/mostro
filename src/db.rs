@@ -814,6 +814,15 @@ pub async fn update_order_invoice_held_at_time(
 /// window, and a replayed or concurrent submission (already locked, or the
 /// status moved on) matches zero rows instead of double-writing. Returns
 /// whether a row matched.
+///
+/// The `NOT EXISTS` leg makes the escrow token **unique across orders**: the
+/// 2-of-3 condition binds the token to a pair of trade keys, not to an order
+/// id, so two orders that reuse the same trade keys would otherwise both
+/// accept the very same token and go `Active` against a single redeemable
+/// escrow. Callers should reject the reuse up front with a clear
+/// `CantDoReason` (see [`cashu_escrow_token_in_use`]); this predicate is the
+/// atomic backstop that closes the check-then-act race between two concurrent
+/// submissions.
 pub async fn update_order_cashu_escrow(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -832,6 +841,10 @@ pub async fn update_order_cashu_escrow(
             cashu_escrow_locked_at = ?3,
             status = ?4
             WHERE id = ?5 AND status = ?6 AND cashu_escrow_locked_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM orders other
+                WHERE other.cashu_escrow_token = ?2 AND other.id <> ?5
+              )
         "#,
     )
     .bind(mint_url)
@@ -845,6 +858,45 @@ pub async fn update_order_cashu_escrow(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Whether some **other** order already holds this exact escrow token.
+///
+/// The escrow token's 2-of-3 condition commits to `{P_B, P_S, P_M}` — trade
+/// keys, not an order id — so a client that reuses its trade keys across two
+/// orders could submit the same token to both: the mint still reports the
+/// proofs unspent until the first redeem, so both orders would pass validation
+/// and go `Active` while only one escrow is redeemable. Used by
+/// `add_cashu_escrow_action` to reject the reuse before touching the mint;
+/// [`update_order_cashu_escrow`] repeats the predicate inside the CAS so two
+/// concurrent submissions cannot both slip past this check.
+///
+/// This is token-level (whole-token) uniqueness. Proof-level uniqueness —
+/// recording each `Y = hash_to_curve(secret)`, which also catches a token
+/// re-serialised or re-split around the same proofs — lands with the
+/// `cashu_fee_proofs` table in TA-1f (`docs/cashu/02-track-a-lock.md` §4A).
+pub async fn cashu_escrow_token_in_use(
+    pool: &SqlitePool,
+    token: &str,
+    exclude_order_id: Uuid,
+) -> Result<bool, MostroError> {
+    // `SELECT 1` rather than a column: existence is the whole question, and
+    // `orders.id` is stored as a BLOB uuid that would need decoding for nothing.
+    let found: Option<(i64,)> = sqlx::query_as(
+        r#"
+          SELECT 1
+          FROM orders
+          WHERE cashu_escrow_token = ?1 AND id <> ?2
+          LIMIT 1
+        "#,
+    )
+    .bind(token)
+    .bind(exclude_order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(found.is_some())
 }
 
 /// Every order with a locked Cashu escrow, for restore/monitoring after a
@@ -3097,6 +3149,118 @@ mod tests {
             Status::FiatSent.to_string(),
             "a locked order past Active must still be found"
         );
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_token_in_use_ignores_the_order_being_locked() {
+        // The reuse lookup answers "does SOME OTHER order hold this token?".
+        // It must never flag the order currently being locked, or a retry of
+        // its own escrow would be rejected as reuse.
+        let pool = setup_orders_db().await.unwrap();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, first, &Status::WaitingPayment.to_string()).await;
+        insert_cashu_test_order(&pool, second, &Status::WaitingPayment.to_string()).await;
+
+        // Nothing is locked yet.
+        assert!(
+            !super::cashu_escrow_token_in_use(&pool, "cashuAtoken", second)
+                .await
+                .unwrap()
+        );
+
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            first,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
+
+        // Seen from another order the token is taken; seen from its own order
+        // it is not.
+        assert!(
+            super::cashu_escrow_token_in_use(&pool, "cashuAtoken", second)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !super::cashu_escrow_token_in_use(&pool, "cashuAtoken", first)
+                .await
+                .unwrap()
+        );
+        // A different token is untouched by either lock.
+        assert!(
+            !super::cashu_escrow_token_in_use(&pool, "cashuAother", second)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_cas_refuses_a_token_locked_to_another_order() {
+        // The 2-of-3 condition commits to trade keys, not to an order id, so
+        // two orders sharing trade keys could submit the SAME token. The CAS
+        // must accept it exactly once: the second order matches zero rows and
+        // keeps its escrow columns empty, so only one order can be Active
+        // against one redeemable escrow.
+        let pool = setup_orders_db().await.unwrap();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        insert_cashu_test_order(&pool, first, &Status::WaitingPayment.to_string()).await;
+        insert_cashu_test_order(&pool, second, &Status::WaitingPayment.to_string()).await;
+
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            first,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
+
+        let reused = super::update_order_cashu_escrow(
+            &pool,
+            second,
+            "https://mint.example.com",
+            "cashuAtoken",
+            1700000200,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap();
+        assert!(!reused, "a token already escrowed elsewhere must not lock");
+
+        let (mint, token, locked_at, status) = cashu_columns(&pool, second).await;
+        assert!(mint.is_none(), "escrow columns must stay untouched");
+        assert!(token.is_none());
+        assert!(locked_at.is_none());
+        assert_eq!(
+            status,
+            Status::WaitingPayment.to_string(),
+            "a refused lock must not advance the status"
+        );
+
+        // A distinct token on the same order still locks normally.
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            second,
+            "https://mint.example.com",
+            "cashuAother",
+            1700000300,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]

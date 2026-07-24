@@ -408,8 +408,8 @@ pub struct LightningSettings {
 pub struct NostrSettings {
     /// Nostr private key. Optional when `MOSTRO_NSEC_PRIVKEY` is provided via
     /// environment variable or `<settings_dir>/.env`.
-    #[serde(default)]
-    pub nsec_privkey: String,
+    #[serde(default, serialize_with = "crate::config::secret::serialize_nsec")]
+    pub nsec_privkey: secrecy::SecretString,
     /// Nostr relays list
     pub relays: Vec<String>,
 }

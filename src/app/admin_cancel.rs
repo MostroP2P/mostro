@@ -115,6 +115,18 @@ pub async fn admin_cancel_action(
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
+    // Resolve the dispute initiator *before* the escrow is touched (#805).
+    // This match rejects orders whose initiator flags are unset or ambiguous,
+    // and `cancel_hold_invoice` below is irreversible: running it first meant
+    // a rejected request could still refund the seller while leaving the order
+    // in `Dispute`, so the LN side and the DB disagreed with no way back.
+    // Every check that can reject the call now precedes the refund.
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+    };
+
     if order.hash.is_some() {
         // We return funds to seller
         if let Some(hash) = order.hash.as_ref() {
@@ -125,13 +137,6 @@ pub async fn admin_cancel_action(
 
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
-
-    // Get the creator of the dispute
-    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-        (true, false) => "seller",
-        (false, true) => "buyer",
-        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
-    };
 
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
@@ -559,6 +564,49 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::DisputeEventError))
         ));
+    }
+
+    /// Regression for #805: an order carrying a hold-invoice `hash` whose
+    /// dispute-initiator flags are unset must fail validation *before* the
+    /// irreversible `cancel_hold_invoice`. Reaching the LND seam here would
+    /// surface as `LnNodeError` and would mean the seller was already
+    /// refunded on a request that goes on to be rejected.
+    #[tokio::test]
+    async fn dispute_without_initiator_flag_errors_before_refunding() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        // Hold invoice present, but neither side is flagged as the dispute
+        // initiator, so `dispute_initiator` resolution must reject the call.
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DisputeEventError))
+            ),
+            "expected the initiator check to reject before the LND cancel, got {result:?}"
+        );
+
+        // The order must be left untouched so the solver can retry.
+        let stored = get_order(&cancel_msg(order.id), ctx.pool()).await.unwrap();
+        assert_eq!(stored.status, Status::Dispute.to_string());
     }
 
     /// A dispute order carrying a hold-invoice `hash` returns funds to the

@@ -120,7 +120,9 @@ pub async fn admin_cancel_action(
     // and `cancel_hold_invoice` below is irreversible: running it first meant
     // a rejected request could still refund the seller while leaving the order
     // in `Dispute`, so the LN side and the DB disagreed with no way back.
-    // Every check that can reject the call now precedes the refund.
+    // This initiator check now precedes the refund. Operations after the
+    // refund can still fail (dispute/order events, DB updates, DM delivery);
+    // making that path atomic is tracked separately in #810.
     let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
         (true, false) => "seller",
         (false, true) => "buyer",

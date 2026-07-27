@@ -108,7 +108,7 @@ impl PriceManager {
             }
             match id_str.parse::<ProviderId>() {
                 Ok(id) => {
-                    let provider = build_provider(id, cfg)?;
+                    let provider = build_provider(id, cfg, settings.provider_timeout_seconds)?;
                     providers.push(EnabledProvider {
                         id,
                         provider,
@@ -570,7 +570,11 @@ fn sources_to_tag(ids: &[ProviderId]) -> String {
 /// Single designated extension point (spec §5.4 Step 3). Adding a new
 /// provider adds exactly one match arm here — the aggregation core, the
 /// store, the scheduler, and every order handler stay untouched.
-fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceProvider>, String> {
+fn build_provider(
+    id: ProviderId,
+    cfg: &ProviderConfig,
+    provider_timeout_seconds: u64,
+) -> Result<Box<dyn PriceProvider>, String> {
     match id {
         ProviderId::Yadio => Ok(Box::new(YadioProvider::new(cfg))),
         ProviderId::CoinGecko => Ok(Box::new(CoinGeckoProvider::new(cfg))),
@@ -582,7 +586,10 @@ fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceP
         ProviderId::ElToque => Ok(Box::new(ElToqueProvider::new(cfg)?)),
         // Nostr trusted-node relay mode (§11.7). `new` returns `Err` when
         // `trusted_nodes` is empty or contains an unparsable hex pubkey.
-        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(cfg)?)),
+        // `provider_timeout_seconds` sizes its one-shot relay query so it
+        // stays in sync with the shared budget instead of a fixed constant
+        // (CodeRabbit, PR #841).
+        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(cfg, provider_timeout_seconds)?)),
     }
 }
 

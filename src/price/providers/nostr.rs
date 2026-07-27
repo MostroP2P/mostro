@@ -21,12 +21,6 @@ use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::price::config::ProviderConfig;
 use crate::price::provider::{PriceProvider, ProviderError, ProviderId, ProviderQuotes, Quote};
 
-/// Upper bound on the one-shot relay query. Deliberately not a config knob:
-/// the outer `PriceManager::poll_budget` (`provider_timeout_seconds`,
-/// default 10s) already bounds the whole `fetch()` call for every provider,
-/// so this just needs to sit comfortably under that default.
-const RELAY_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
-
 /// Same wrapper the daemon publishes: `{"BTC": {ccy: price}}`.
 #[derive(Debug, Deserialize)]
 struct RatesContent {
@@ -37,6 +31,13 @@ struct RatesContent {
 /// Trusted-node Nostr quoter.
 pub struct NostrProvider {
     trusted_nodes: Vec<PublicKey>,
+    /// One-shot relay query bound, derived from the shared
+    /// `provider_timeout_seconds` (see `new`) rather than a fixed constant —
+    /// an operator who lowers that setting must not have this provider's
+    /// queries consistently swallowed by `PriceManager::poll_budget`'s outer
+    /// timeout before they can complete or fail on their own (CodeRabbit,
+    /// PR #841).
+    query_timeout: Duration,
 }
 
 impl NostrProvider {
@@ -46,7 +47,14 @@ impl NostrProvider {
     /// `trusted_nodes` is empty or contains a pubkey that isn't valid hex —
     /// `ProviderConfig::validate` only checks the list is non-empty, not
     /// that its entries parse (spec §7).
-    pub fn new(cfg: &ProviderConfig) -> Result<Self, String> {
+    ///
+    /// `provider_timeout_seconds` is the shared `[price]` setting (not
+    /// per-provider config): `query_timeout` is set to exactly that value,
+    /// so it fits under `poll_budget`'s `provider_timeout_seconds + 1s`
+    /// (no `fallback_urls` for this provider ⇒ one attempt) with the same
+    /// 1s of slack every other provider gets from the shared `reqwest`
+    /// client's own per-attempt timeout.
+    pub fn new(cfg: &ProviderConfig, provider_timeout_seconds: u64) -> Result<Self, String> {
         if cfg.trusted_nodes.is_empty() {
             return Err(
                 "price provider 'nostr': enabled provider requires at least one \
@@ -66,7 +74,22 @@ impl NostrProvider {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { trusted_nodes })
+        Ok(Self {
+            trusted_nodes,
+            query_timeout: Duration::from_secs(provider_timeout_seconds.max(1)),
+        })
+    }
+
+    /// The relay query for this tick: the latest `mostro-rates` (kind
+    /// 30078) event from any configured trusted node. Split out from
+    /// [`PriceProvider::fetch`] so its shape is unit-testable without a
+    /// relay (spec §10.5) — a wrong `kind`/`identifier` here would
+    /// otherwise only surface via the `#[ignore]`d live-relay test.
+    pub(crate) fn build_filter(&self) -> Filter {
+        Filter::new()
+            .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
+            .authors(self.trusted_nodes.clone())
+            .identifier("mostro-rates")
     }
 
     /// Parse a rate event's `content` into [`ProviderQuotes`]. Split out so
@@ -109,13 +132,8 @@ impl PriceProvider for NostrProvider {
         let client = crate::util::get_nostr_client()
             .map_err(|e| ProviderError::Http(format!("nostr: {e}")))?;
 
-        let filter = Filter::new()
-            .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
-            .authors(self.trusted_nodes.clone())
-            .identifier("mostro-rates");
-
         let events = client
-            .fetch_events(filter, RELAY_QUERY_TIMEOUT)
+            .fetch_events(self.build_filter(), self.query_timeout)
             .await
             .map_err(|e| ProviderError::Http(format!("nostr: relay query failed: {e}")))?
             .into_iter()
@@ -209,7 +227,50 @@ mod tests {
             except: None,
             trusted_nodes: vec![Keys::generate().public_key().to_hex()],
         };
-        assert!(NostrProvider::new(&cfg).is_ok());
+        assert!(NostrProvider::new(&cfg, 10).is_ok());
+    }
+
+    #[test]
+    fn new_derives_query_timeout_from_provider_timeout_seconds() {
+        let cfg = ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+            trusted_nodes: vec![Keys::generate().public_key().to_hex()],
+        };
+        let provider = NostrProvider::new(&cfg, 7).unwrap();
+        assert_eq!(provider.query_timeout, Duration::from_secs(7));
+
+        // A misconfigured 0 must not produce a zero-duration timeout.
+        let provider = NostrProvider::new(&cfg, 0).unwrap();
+        assert_eq!(provider.query_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn build_filter_has_kind_authors_and_identifier() {
+        let node_a = Keys::generate().public_key();
+        let node_b = Keys::generate().public_key();
+        let cfg = ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+            trusted_nodes: vec![node_a.to_hex(), node_b.to_hex()],
+        };
+        let provider = NostrProvider::new(&cfg, 10).unwrap();
+
+        let expected = Filter::new()
+            .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
+            .authors([node_a, node_b])
+            .identifier("mostro-rates");
+        assert_eq!(provider.build_filter(), expected);
     }
 
     #[test]
@@ -224,7 +285,7 @@ mod tests {
             except: None,
             trusted_nodes: vec![],
         };
-        assert!(NostrProvider::new(&cfg).is_err());
+        assert!(NostrProvider::new(&cfg, 10).is_err());
     }
 
     #[test]
@@ -239,7 +300,7 @@ mod tests {
             except: None,
             trusted_nodes: vec!["not-a-pubkey".to_string()],
         };
-        assert!(NostrProvider::new(&cfg).is_err());
+        assert!(NostrProvider::new(&cfg, 10).is_err());
     }
 
     /// Live-relay evidence for issue #697: exercises the real `fetch()` path
@@ -277,7 +338,7 @@ mod tests {
                 "00000235a3e904cfe1213a8a54d6f1ec1bef7cc6bfaabd6193e82931ccf1366a".to_string(),
             ],
         };
-        let provider = NostrProvider::new(&cfg).expect("valid hex pubkeys");
+        let provider = NostrProvider::new(&cfg, 10).expect("valid hex pubkeys");
         let http = reqwest::Client::new();
 
         let quotes = provider.fetch(&http).await.expect("live relay fetch");

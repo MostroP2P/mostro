@@ -42,6 +42,7 @@ use super::providers::blockchain::BlockchainProvider;
 use super::providers::coingecko::CoinGeckoProvider;
 use super::providers::currency_api::CurrencyApiProvider;
 use super::providers::eltoque::ElToqueProvider;
+use super::providers::nostr::NostrProvider;
 use super::providers::yadio::YadioProvider;
 use super::store::{PriceError, PriceStore};
 
@@ -579,6 +580,9 @@ fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceP
         // required Bearer token is missing, so an enabled-but-unconfigured
         // provider fails fast at startup (spec §7).
         ProviderId::ElToque => Ok(Box::new(ElToqueProvider::new(cfg)?)),
+        // Nostr trusted-node relay mode (§11.7). `new` returns `Err` when
+        // `trusted_nodes` is empty or contains an unparsable hex pubkey.
+        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(cfg)?)),
     }
 }
 
@@ -640,6 +644,7 @@ pub fn synthesise_legacy_price_settings(
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         },
     );
     PriceSettings {
@@ -712,6 +717,7 @@ mod tests {
                     token: None,
                     only: None,
                     except: None,
+                    trusted_nodes: vec![],
                 },
             );
             providers.push(EnabledProvider {
@@ -854,6 +860,7 @@ mod tests {
             token: token.map(String::from),
             only: Some(vec!["CUP".into(), "MLC".into()]),
             except: None,
+            trusted_nodes: vec![],
         }
     }
 
@@ -882,6 +889,52 @@ mod tests {
     }
 
     #[test]
+    fn from_settings_builds_nostr_with_trusted_nodes() {
+        // §11.7: Nostr trusted-node relay mode builds into the registry like
+        // any other provider once it has at least one valid pubkey.
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Nostr.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec![
+                    "82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390".into(),
+                ],
+            },
+        );
+        let m = PriceManager::from_settings(settings).expect("nostr builds with trusted_nodes");
+        assert_eq!(m.providers.len(), 1);
+        assert_eq!(m.providers[0].id, ProviderId::Nostr);
+    }
+
+    #[test]
+    fn from_settings_rejects_nostr_with_invalid_pubkey() {
+        // §11.7 fail-fast: an enabled Nostr provider with an unparsable
+        // trusted-node pubkey must not silently produce no quotes.
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Nostr.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec!["not-a-pubkey".into()],
+            },
+        );
+        assert!(PriceManager::from_settings(settings).is_err());
+    }
+
+    #[test]
     fn from_settings_builds_all_phase2_providers() {
         // Spec §9 Phase 2: the three keyless backups join Yadio in the
         // registry — the §7 example config must now build cleanly.
@@ -902,6 +955,7 @@ mod tests {
                     token: None,
                     only: None,
                     except: None,
+                    trusted_nodes: vec![],
                 },
             );
         }
@@ -925,6 +979,7 @@ mod tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
         let m = PriceManager::from_settings(settings).expect("unknown id is non-fatal");
@@ -944,6 +999,7 @@ mod tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
         let m = PriceManager::from_settings(settings).unwrap();
@@ -1493,6 +1549,7 @@ mod coverage_tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
         let manager = bare_manager(
@@ -1596,6 +1653,7 @@ mod coverage_tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
 

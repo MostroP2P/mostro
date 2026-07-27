@@ -480,6 +480,14 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 
 Phases 3 and 4 both depend on Phase 2 and can land in either order.
 
+> **Out-of-band addition — Nostr *subscribe* (issue #697, §11.7).** The
+> five phases above only ever covered *publishing* rates to Nostr (Phase 5).
+> A separate, independently-landing addition — the `nostr` provider — makes
+> `mostrod` able to *consume* another Mostro node's published rates instead
+> of an HTTP API, for operators in regions where the price APIs are
+> network-blocked. It slots into the existing registry (§5.4) like any
+> other provider and does not otherwise depend on Phase 5.
+
 ---
 
 ## 9. Phase details
@@ -837,6 +845,52 @@ BTCPayServer solves the same problem; contrasting choices clarify ours:
   premium/fee is the only markup. We call this out so the spread concept
   is not reintroduced by accident when porting a provider idea from
   BTCPay.
+
+### 11.7 Nostr (subscribe, trusted-node relay mode) — issue #697
+
+Every source above is an HTTP API. This one is not: it sources quotes from
+**other Mostro nodes**, over Nostr, for operators whose network blocks the
+HTTP price APIs outright (the motivating case: `api.yadio.io` is DNS-blocked
+for Venezuelan ISPs) but who can still reach a Nostr relay.
+
+- **Not a new publish path.** Mostro nodes already publish their aggregated
+  rates as a kind-30078 NIP-33 event (`d = "mostro-rates"`, content
+  `{"BTC": {ccy: price}}`) — see `docs/NOSTR_EXCHANGE_RATES.md` and
+  `nip33::new_exchange_rates_event`. The `nostr` provider is a **consumer**
+  of that exact same event, from other operators' nodes instead of its own.
+- **Config (`[price.providers.nostr]`, §7):** no `url` — `trusted_nodes` (a
+  list of hex pubkeys) is the provider's only required field. Enabled
+  without at least one valid `trusted_nodes` pubkey is a startup error
+  (mirrors El Toque's missing-token fail-fast, §7).
+- **Relays are not reconfigured.** The provider reuses the process-wide
+  Nostr client already connected to the node's own `[nostr]` relays — it
+  does not open a second set of connections or accept a separate relay list.
+- **One-shot query per tick, not a persistent subscription.** `fetch()` is
+  called once per `update_interval_seconds` tick like every other provider
+  (spec §5.3); it issues a single `kind=30078, authors=trusted_nodes,
+  #d=mostro-rates` relay query bounded by a short fixed timeout, rather than
+  keeping an open `REQ` subscription running between ticks.
+- **Freshest wins — no cross-node combine.** With several `trusted_nodes`
+  configured, the provider does **not** run the §6.2 median+outlier combine
+  across their individual events; it takes the single event with the
+  highest `created_at` among the trusted, valid ones. Rationale (confirmed
+  with the maintainer): the issue frames multiple `trusted_nodes` as
+  *redundancy* (if one is down or stale, use another), not as independent
+  samples to statistically combine, and skipping a second aggregation layer
+  inside a single provider keeps the adapter's contract identical to every
+  HTTP provider (one `ProviderQuotes` map out of `fetch()`, no new state).
+  A compromised single trusted node can therefore still push a bad price
+  with no in-provider outlier guard; operators mitigate by choosing
+  `trusted_nodes` they actually trust, same as any other single-sourced
+  provider.
+- **Client-side pubkey verification.** Even though the relay-side `authors`
+  filter already restricts the query, the adapter re-checks each returned
+  event's `pubkey` against `trusted_nodes` before trusting its content —
+  the same verification `docs/NOSTR_EXCHANGE_RATES.md` requires of mobile
+  clients, applied here on the operator side.
+- **Currency codes are re-upper-cased** (§6.6) even though a Mostro
+  publisher already emits uppercase codes — a third-party trusted node is
+  outside this codebase's control.
 
 ---
 

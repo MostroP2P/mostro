@@ -180,6 +180,17 @@ port = 50051
 # url = "https://tasas.eltoque.com"
 # # token = "xxxx"        # REQUIRED when enabled; provider refuses to start otherwise
 # only = ["CUP", "MLC"]
+#
+# # Subscribe to prices published (kind 30078) by trusted Mostro nodes over
+# # Nostr instead of an HTTP API — for operators in regions where price APIs
+# # are DNS/IP blocked (docs/PRICE_PROVIDERS.md §11.7). Reuses the relays
+# # already configured in [nostr]; no url needed. With several trusted_nodes,
+# # the freshest valid event wins — not a cross-node combine.
+# [price.providers.nostr]
+# enabled = false
+# trusted_nodes = [
+#     # hex pubkeys of Mostro nodes you trust to publish accurate rates
+# ]
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

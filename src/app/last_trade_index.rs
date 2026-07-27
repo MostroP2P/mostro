@@ -82,11 +82,9 @@ pub async fn last_trade_index(
         .as_json()
         .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
 
-    // Print the last trade index message
-    tracing::info!(
-        "User with pubkey: {} requested last trade index",
-        user.pubkey
-    );
+    // Print the last trade index message. No key in the log line — user
+    // pubkey (AGENTS.md:48).
+    tracing::info!("User requested last trade index");
     tracing::info!("Last trade index: {}", user.last_trade_index);
 
     // Send message back to the requester

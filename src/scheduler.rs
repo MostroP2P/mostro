@@ -310,11 +310,10 @@ pub(crate) async fn notify_users_canceled_order(
 
     // Neutral wording on purpose: this helper serves several closure paths
     // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
-    // specific cause is logged by each caller, not here.
+    // specific cause is logged by each caller, not here. No keys in the log
+    // line (AGENTS.md, Security & Configuration Tips).
     tracing::info!(
-        "Notifying maker {} and taker {} that order {} was not completed",
-        maker_pubkey.to_string(),
-        taker_pubkey.to_string(),
+        "Notifying maker and taker that order {} was not completed",
         old_order.id
     );
 

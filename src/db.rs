@@ -1543,11 +1543,8 @@ pub async fn is_assigned_solver(
     solver_pubkey: &str,
     order_id: Uuid,
 ) -> Result<bool, MostroError> {
-    tracing::info!(
-        "Solver_pubkey: {} assigned to order {}",
-        solver_pubkey,
-        order_id
-    );
+    // No key in the log line — solver pubkey (AGENTS.md:48).
+    tracing::info!("Solver assigned to order {}", order_id);
     let result = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM disputes WHERE solver_pubkey = ? AND order_id = ?)",
     )

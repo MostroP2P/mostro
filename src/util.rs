@@ -670,11 +670,11 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
+    // No keys in the log line — sender/receiver pubkeys (AGENTS.md:48). This
+    // is the highest-frequency send path in the daemon (every outbound
+    // protocol message), so it's also the highest-blast-radius instance of
+    // this pattern.
+    info!("Sending DM");
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -717,11 +717,10 @@ pub async fn send_dm(
     )
     .await?;
 
+    // No key in the log line — receiver pubkey (AGENTS.md:48).
     info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        payload
+        "Sending message, Event ID: {} with payload: {:#?}",
+        event.id, payload
     );
 
     if let Ok(client) = get_nostr_client() {

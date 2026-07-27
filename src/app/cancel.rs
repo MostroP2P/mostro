@@ -216,7 +216,6 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
     my_keys: &Keys,
     request_id: Option<u64>,
     ln_client: &mut L,
-    taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
     let order_id = order.id;
     let sender_str = event.sender.to_string();
@@ -263,16 +262,7 @@ async fn cancel_order_by_taker<L: CancelLightning + Send>(
 
     // No surviving bonds: run the full reset-and-republish path so
     // the order goes back into the book exactly as before.
-    cancel_order_by_taker_inner(
-        pool,
-        event,
-        order,
-        my_keys,
-        request_id,
-        ln_client,
-        taker_pubkey,
-    )
-    .await
+    cancel_order_by_taker_inner(pool, event, order, my_keys, request_id, ln_client).await
 }
 
 async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
@@ -282,7 +272,6 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
     my_keys: &Keys,
     request_id: Option<u64>,
     ln_client: &mut L,
-    taker_pubkey: PublicKey,
 ) -> Result<(), MostroError> {
     // Cancel hold invoice if present
     if let Some(hash) = &order.hash {
@@ -318,10 +307,8 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    info!(
-        "{}: Canceled order Id {} republishing order",
-        taker_pubkey, order.id
-    );
+    // No key in the log line — taker pubkey (AGENTS.md:48).
+    info!("Canceled order Id {} republishing order", order.id);
 
     // Notify the creator about the republished order after the taker-side cancellation flow completes
     notify_creator(&order_updated, request_id).await?;
@@ -568,16 +555,7 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
                 .as_deref()
                 .is_some_and(|p| p == sender_str && p != order.creator_pubkey);
         if bond_match || order_taker_match {
-            cancel_order_by_taker(
-                pool,
-                event,
-                order,
-                my_keys,
-                request_id,
-                ln_client,
-                event.sender,
-            )
-            .await?;
+            cancel_order_by_taker(pool, event, order, my_keys, request_id, ln_client).await?;
             return Ok(());
         }
         return Err(MostroCantDo(CantDoReason::IsNotYourOrder));
@@ -698,16 +676,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
         )
         .await?;
     } else if event.sender == taker_pubkey {
-        cancel_order_by_taker(
-            pool,
-            event,
-            order,
-            my_keys,
-            request_id,
-            ln_client,
-            taker_pubkey,
-        )
-        .await?;
+        cancel_order_by_taker(pool, event, order, my_keys, request_id, ln_client).await?;
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }

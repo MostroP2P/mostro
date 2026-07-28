@@ -15,7 +15,9 @@ use mostro_core::prelude::*;
 use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
 use std::cmp::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use tokio::time::timeout;
 use tracing::info;
 
 #[derive(Clone)]
@@ -90,17 +92,39 @@ fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
     Ok(bytes)
 }
 
+/// Cap on establishing a gRPC connection to LND.
+///
+/// `fedimint_tonic_lnd::connect` has no deadline of its own, and several
+/// handlers open a fresh connection while running on the single event-loop
+/// task in `app::run` — so an unreachable or wedged LND would otherwise stall
+/// message processing for everyone, with no upper bound.
+///
+/// Bounding the *connection* is safe in a way that bounding the RPCs after it
+/// is not: if this elapses, no request was issued and no invoice state was
+/// touched, so failing is unambiguous. The RPCs themselves are deliberately
+/// left unbounded here — a timeout on `settle_invoice` would report failure
+/// for an operation LND may still have completed.
+const LND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
 
         // Connecting to LND requires only host, port, cert file, and macaroon file
-        let client = fedimint_tonic_lnd::connect(
-            ln_settings.lnd_grpc_host.clone(),
-            ln_settings.lnd_cert_file.clone(),
-            ln_settings.lnd_macaroon_file.clone(),
+        let client = timeout(
+            LND_CONNECT_TIMEOUT,
+            fedimint_tonic_lnd::connect(
+                ln_settings.lnd_grpc_host.clone(),
+                ln_settings.lnd_cert_file.clone(),
+                ln_settings.lnd_macaroon_file.clone(),
+            ),
         )
         .await
+        .map_err(|_| {
+            MostroInternalErr(ServiceError::LnNodeError(format!(
+                "timed out connecting to LND after {LND_CONNECT_TIMEOUT:?}"
+            )))
+        })?
         .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
 
         // Safe unwrap here

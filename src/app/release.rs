@@ -496,9 +496,37 @@ pub async fn do_payment(
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount, None)
-            .await
-            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
+        // Resolving a lightning address is a network round-trip to a host the
+        // buyer chose. When it yields no invoice — host unreachable, too slow,
+        // or answering without a `pr` — that is a payment failure like any
+        // other and has to go through the same bookkeeping.
+        //
+        // Returning early instead would leave `failed_payment = false`, and
+        // that flag is exactly the predicate `find_failed_payment` selects on
+        // (`db.rs`). The order would sit in `SettledHoldInvoice` with the
+        // seller's funds captured, the buyer unpaid and unnotified, and
+        // invisible to the retry job — and a buyer sending a corrected
+        // invoice wouldn't help either, since that path only resets
+        // `payment_attempts` and relies on the same job to act on it.
+        match resolv_ln_address(&addr.to_string(), amount, None).await {
+            Ok(pr) if !pr.is_empty() => pr,
+            outcome => {
+                match outcome {
+                    Err(e) => info!(
+                        "Order id {}: could not resolve payout address: {:?}",
+                        order.id, e
+                    ),
+                    _ => info!("Order id {}: payout address returned no invoice", order.id),
+                }
+                if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
+                    info!(
+                        "Order id {} has {} failed payments retries",
+                        failed_payment.id, failed_payment.payment_attempts
+                    );
+                }
+                return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+            }
+        }
     } else {
         payment_request
     };
@@ -1651,6 +1679,55 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+    }
+
+    /// A payout address that yields no invoice must be recorded as a payment
+    /// failure, not returned as a bare error.
+    ///
+    /// The distinction is the whole point: `find_failed_payment` retries on
+    /// `failed_payment == true`, so an order that fails resolution without
+    /// setting that flag is settled, unpaid and invisible to the retry job —
+    /// and the buyer never hears about it.
+    #[tokio::test]
+    async fn do_payment_records_failure_when_payout_address_yields_no_invoice() {
+        // Arrange: an order settled and awaiting payout, whose buyer invoice
+        // is a lightning address that cannot produce an invoice. Under
+        // cfg(test) the address resolves to a local well-known path that
+        // isn't served, so this never leaves the machine.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        order.buyer_invoice = Some("nosuchpayee@localhost".to_string());
+        order.amount = 1_000;
+        order.fee = 10;
+        order.payment_attempts = 0;
+        order.failed_payment = false;
+        let order = order.create(&pool).await.unwrap();
+
+        // Act
+        let result = do_payment(&ctx, order.clone(), None).await;
+
+        // Assert: the call still fails, but it left the bookkeeping behind
+        // that makes the failure recoverable.
+        assert!(result.is_err(), "unresolvable payout address must fail");
+        let (failed_payment, payment_attempts): (bool, i64) =
+            sqlx::query_as("SELECT failed_payment, payment_attempts FROM orders WHERE id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            failed_payment,
+            "failed_payment must be set so find_failed_payment can retry the order"
+        );
+        assert_eq!(
+            payment_attempts, 1,
+            "the failed attempt must be counted, not silently dropped"
+        );
     }
 
     #[tokio::test]

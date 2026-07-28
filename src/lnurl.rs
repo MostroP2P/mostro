@@ -3,11 +3,39 @@ use mostro_core::prelude::*;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{error, warn};
+
+/// Cap on a single HTTP round-trip to an LNURL endpoint.
+const LNURL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Cap on establishing the TCP/TLS connection. Separate from the request
+/// timeout so an unroutable or filtered host fails fast instead of spending
+/// the whole request budget on a handshake that will never complete.
+const LNURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Redirect budget. Refusing redirects outright would break real endpoints
+/// (`www` to apex, provider migrations), but the chain has to be finite.
+const LNURL_MAX_REDIRECTS: usize = 3;
+
+/// Total wall-clock budget for one LNURL operation, covering every HTTP
+/// round-trip it makes.
+///
+/// [`HTTP_CLIENT`]'s own timeout is *per request*, and [`resolv_ln_address`]
+/// issues two sequential requests where the second host is chosen by the
+/// first response — so a per-request cap alone lets a remote endpoint cost
+/// twice that. This constant is the one that actually bounds the operation.
+///
+/// It matters because the callers run on the single event-loop task in
+/// `app::run`: this is how long one message can hold up everyone else's.
+pub const LNURL_TOTAL_BUDGET: Duration = Duration::from_secs(5);
 
 pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(LNURL_REQUEST_TIMEOUT)
+        .connect_timeout(LNURL_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(LNURL_MAX_REDIRECTS))
         .user_agent(concat!("mostro/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("valid reqwest Client")
@@ -53,7 +81,22 @@ async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
     Ok(url)
 }
 
+/// Check that `address` resolves to a live LNURL-pay endpoint.
+///
+/// Bounded by [`LNURL_TOTAL_BUDGET`]: the address is remote input and the
+/// host it names is under no obligation to answer, so a caller on the event
+/// loop must not be able to wait on it indefinitely. A host that exhausts
+/// the budget is reported as unreachable, which is what it is from here.
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
+    timeout(LNURL_TOTAL_BUDGET, ln_exists_inner(address))
+        .await
+        .map_err(|_| {
+            warn!("LNURL existence check exceeded the {LNURL_TOTAL_BUDGET:?} budget");
+            MostroInternalErr(ServiceError::NoAPIResponse)
+        })?
+}
+
+async fn ln_exists_inner(address: &str) -> Result<(), MostroError> {
     // Get the url from the str - could be a LNURL or a Lightning Address
     let url = extract_lnurl(address).await?;
     // Make the request to the LNURL
@@ -150,7 +193,27 @@ fn build_callback_url(
 ///   server rejected the request or doesn't support `payRequest`
 /// * `Err(MostroError)` - If the address/LNURL can't be resolved or the HTTP
 ///   exchange fails
+///
+/// Bounded by [`LNURL_TOTAL_BUDGET`] across *both* round-trips it makes: the
+/// callback host comes from the first response, so without a total budget a
+/// remote server could spend the per-request timeout twice.
 pub async fn resolv_ln_address(
+    address: &str,
+    amount: u64,
+    comment: Option<&str>,
+) -> Result<String, MostroError> {
+    timeout(
+        LNURL_TOTAL_BUDGET,
+        resolv_ln_address_inner(address, amount, comment),
+    )
+    .await
+    .map_err(|_| {
+        warn!("LNURL resolution exceeded the {LNURL_TOTAL_BUDGET:?} budget");
+        MostroInternalErr(ServiceError::NoAPIResponse)
+    })?
+}
+
+async fn resolv_ln_address_inner(
     address: &str,
     amount: u64,
     comment: Option<&str>,

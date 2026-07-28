@@ -1,7 +1,7 @@
 use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
-    validate_invoice,
+    validate_invoice, InvoiceCheck,
 };
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -51,7 +51,12 @@ pub async fn add_invoice_action(
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
     // We save the invoice on db
-    order.buyer_invoice = validate_invoice(&msg, &order).await?;
+    //
+    // `Online` keeps the pre-existing behavior: the buyer is submitting the
+    // destination their payout will go to, so an unreachable one should be
+    // rejected now rather than at release. Bounded by
+    // `lnurl::LNURL_TOTAL_BUDGET`.
+    order.buyer_invoice = validate_invoice(&msg, &order, InvoiceCheck::Online).await?;
     // Buyer can add invoice orders with WaitingBuyerInvoice status
     match ord_status {
         Status::SettledHoldInvoice => {

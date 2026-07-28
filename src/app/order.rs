@@ -1,6 +1,6 @@
 use crate::app::context::AppContext;
 use crate::db::update_user_trade_index;
-use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
+use crate::util::{get_bitcoin_price, publish_order, validate_invoice, InvoiceCheck};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use nostr_sdk::Keys;
@@ -92,9 +92,6 @@ pub async fn order_action(
     let request_id = msg.get_inner_message_kind().request_id;
 
     if let Some(order) = msg.get_inner_message_kind().get_order() {
-        // Validate invoice
-        let _invoice = validate_invoice(&msg, &Order::from(order.clone())).await?;
-
         // Check if fiat currency is accepted
         let mostro_settings = &ctx.settings().mostro;
         if let Err(cause) = order.check_fiat_currency(&mostro_settings.fiat_currencies_accepted) {
@@ -131,6 +128,19 @@ pub async fn order_action(
         for fiat_amount in amount_vec.iter() {
             calculate_and_check_quote(ctx, order, fiat_amount).await?;
         }
+
+        // Validate the payment request last: every check above is local and
+        // cheap, so a malformed order is rejected without touching it.
+        //
+        // `Offline` deliberately skips resolving a lightning address or LNURL
+        // over the network. Creating an order only records the payment
+        // request — the result here is discarded — and the address still has
+        // to resolve when the payout is actually made, which is where an
+        // unreachable host is worth acting on. Checking it here would put an
+        // HTTP request to a sender-chosen host on the event loop for every
+        // order created, delaying every other message behind it.
+        let _invoice =
+            validate_invoice(&msg, &Order::from(order.clone()), InvoiceCheck::Offline).await?;
 
         let trade_index = match msg.get_inner_message_kind().trade_index {
             Some(trade_index) => trade_index,

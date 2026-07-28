@@ -194,6 +194,43 @@ pub async fn is_valid_invoice(
     validate_bolt11_invoice(&payment_request, amount, fee).await
 }
 
+/// Validates a payment request without performing any network I/O.
+///
+/// Identical to [`is_valid_invoice`] for BOLT11 invoices — every BOLT11 check
+/// is local, so none of them are skipped. The difference is lightning
+/// addresses and LNURLs: those are accepted on syntax alone, with no
+/// round-trip to the host they name.
+///
+/// # Why a separate entry point
+///
+/// Resolving a lightning address means an HTTP request to a host the sender
+/// picked, and callers on the event loop pay that latency before anything
+/// else can be processed. Where reachability isn't yet needed, checking it
+/// early buys nothing: the address still has to resolve at payout time, and
+/// that's where an unreachable host is actually actionable. Order creation
+/// is the clear case — it stores the address and discards the validation
+/// result — so it uses this variant and lets the network check happen when
+/// the address is really used.
+///
+/// Use [`is_valid_invoice`] where reachability is part of the decision being
+/// made, such as accepting a buyer's payout destination on a take.
+pub async fn is_valid_invoice_offline(
+    payment_request: String,
+    amount: Option<u64>,
+    fee: Option<u64>,
+) -> Result<(), MostroError> {
+    // A parseable lightning address or LNURL is all this variant checks:
+    // both constructors fully validate the syntax they accept.
+    if LightningAddress::from_str(&payment_request).is_ok()
+        || LnUrl::from_str(&payment_request).is_ok()
+    {
+        return Ok(());
+    }
+
+    // Anything else must still clear full BOLT11 validation, which is local.
+    validate_bolt11_invoice(&payment_request, amount, fee).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +451,108 @@ mod tests {
         assert_eq!(
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
             min_amount_err.await
+        );
+    }
+
+    /// Bind a listener that completes the TCP handshake and then never
+    /// answers, on an OS-assigned port, and return an LNURL pointing at it.
+    ///
+    /// A lightning address can't be used here: under `cfg(test)`
+    /// `extract_lnurl` pins those to port 8080, which `start_test_server`
+    /// already owns. An LNURL carries its own URL, so it can target an
+    /// ephemeral port and stay independent of the other tests.
+    async fn start_blackhole_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = tokio::spawn(async move {
+            // Hold every accepted socket open without writing a response.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/.well-known/lnurlp/blackhole");
+        (LnUrl { url }.encode(), handle)
+    }
+
+    /// A host that accepts the connection and then stalls must not be able to
+    /// hold invoice validation open for longer than the LNURL budget. The
+    /// connect timeout is deliberately not exercised: the handshake succeeds,
+    /// so only the total budget can end this.
+    #[tokio::test]
+    async fn lnurl_validation_against_unresponsive_host_is_time_bounded() {
+        init_settings_test();
+        let (lnurl, handle) = start_blackhole_server().await;
+
+        let start = std::time::Instant::now();
+        let result = is_valid_invoice(lnurl, None, None).await;
+        let elapsed = start.elapsed();
+        handle.abort();
+
+        assert!(result.is_err(), "an unresponsive host must not validate");
+        assert!(
+            elapsed < crate::lnurl::LNURL_TOTAL_BUDGET + std::time::Duration::from_secs(2),
+            "validation took {elapsed:?}, which exceeds the LNURL budget of {:?}",
+            crate::lnurl::LNURL_TOTAL_BUDGET
+        );
+    }
+
+    /// The offline variant is what order creation uses: a syntactically valid
+    /// LNURL passes without any HTTP round-trip, so an unresponsive host costs
+    /// nothing at all.
+    #[tokio::test]
+    async fn offline_validation_of_lnurl_does_no_network_io() {
+        init_settings_test();
+        let (lnurl, handle) = start_blackhole_server().await;
+
+        let start = std::time::Instant::now();
+        let result = is_valid_invoice_offline(lnurl, None, None).await;
+        let elapsed = start.elapsed();
+        handle.abort();
+
+        assert!(
+            result.is_ok(),
+            "a syntactically valid LNURL must pass offline validation: {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "offline validation must not contact the host, but took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_validation_accepts_well_formed_lightning_address() {
+        init_settings_test();
+        assert!(
+            is_valid_invoice_offline("MostroP2P@example.com".to_string(), None, None)
+                .await
+                .is_ok(),
+            "a well-formed lightning address must pass offline validation"
+        );
+    }
+
+    /// Dropping the network round-trip must not drop the local checks: a
+    /// payment request that is neither an address nor an LNURL still has to
+    /// clear full BOLT11 validation.
+    #[tokio::test]
+    async fn offline_validation_still_rejects_malformed_payment_request() {
+        init_settings_test();
+        assert!(
+            is_valid_invoice_offline("not-a-payment-request".to_string(), None, None)
+                .await
+                .is_err(),
+            "garbage must still be rejected without network access"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_validation_still_enforces_bolt11_amount_checks() {
+        init_settings_test();
+        let payment_request = build_test_invoice(Some(1_000_000), 86_400);
+        assert_eq!(
+            is_valid_invoice_offline(payment_request, Some(5_000), None).await,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "BOLT11 amount mismatch must still be caught offline"
         );
     }
 

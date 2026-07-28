@@ -8,7 +8,7 @@ use crate::db::is_user_present;
 use crate::escrow::EscrowBackend;
 use crate::flow;
 use crate::lightning;
-use crate::lightning::invoice::is_valid_invoice;
+use crate::lightning::invoice::{is_valid_invoice, is_valid_invoice_offline};
 use crate::messages;
 use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
 use crate::NOSTR_CLIENT;
@@ -1426,7 +1426,33 @@ pub async fn get_user_orders_by_id(
     Ok(found_orders)
 }
 
-pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<String>, MostroError> {
+/// How thoroughly [`validate_invoice`] should check a payment request.
+///
+/// The distinction only affects lightning addresses and LNURLs. BOLT11
+/// invoices are validated identically either way, since every BOLT11 check
+/// is local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceCheck {
+    /// Syntax and local BOLT11 rules only — no network I/O.
+    ///
+    /// The right choice when the payment request is merely being recorded
+    /// and reachability isn't part of the decision. Callers run on the
+    /// event loop, so skipping the round-trip here keeps one sender's
+    /// choice of host from delaying every other user's messages.
+    Offline,
+    /// Additionally resolve lightning addresses and LNURLs over the network,
+    /// bounded by `lnurl::LNURL_TOTAL_BUDGET`.
+    ///
+    /// The right choice when an unreachable destination should block the
+    /// action outright.
+    Online,
+}
+
+pub async fn validate_invoice(
+    msg: &Message,
+    order: &Order,
+    check: InvoiceCheck,
+) -> Result<Option<String>, MostroError> {
     // init payment request to None
     let mut payment_request = None;
     // if payment request is present
@@ -1435,15 +1461,15 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
         // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
         let total_buyer_fees = order.fee;
 
+        let amount = Some(order.amount as u64);
+        let fee = Some(total_buyer_fees as u64);
+        let outcome = match check {
+            InvoiceCheck::Offline => is_valid_invoice_offline(pr.clone(), amount, fee).await,
+            InvoiceCheck::Online => is_valid_invoice(pr.clone(), amount, fee).await,
+        };
+
         // if invoice is valid
-        if is_valid_invoice(
-            pr.clone(),
-            Some(order.amount as u64),
-            Some(total_buyer_fees as u64),
-        )
-        .await
-        .is_err()
-        {
+        if outcome.is_err() {
             return Err(MostroCantDo(CantDoReason::InvalidInvoice));
         }
         // if invoice is valid return it
@@ -2671,6 +2697,10 @@ mod tests {
         assert_eq!(dispute.order_id, order_id);
     }
 
+    /// Every case here uses a BOLT11 payment request, which is validated
+    /// entirely locally — so both check modes must agree on all of them.
+    /// Running the table twice is what pins that equivalence down: `Offline`
+    /// drops the network round-trip for addresses/LNURLs and nothing else.
     #[tokio::test]
     async fn validate_invoice_paths() {
         init_globals();
@@ -2678,35 +2708,48 @@ mod tests {
         order.amount = 1_100;
         order.fee = 100;
 
-        // No payment request in the message → nothing to validate.
-        let msg = Message::new_order(None, None, None, Action::AddInvoice, None);
-        assert_eq!(validate_invoice(&msg, &order).await.unwrap(), None);
-
-        // Garbage payment request → invalid invoice.
-        let msg = Message::new_order(
-            None,
-            None,
-            None,
-            Action::AddInvoice,
-            Some(Payload::PaymentRequest(
+        for check in [InvoiceCheck::Offline, InvoiceCheck::Online] {
+            // No payment request in the message → nothing to validate.
+            let msg = Message::new_order(None, None, None, Action::AddInvoice, None);
+            assert_eq!(
+                validate_invoice(&msg, &order, check).await.unwrap(),
                 None,
-                "notaninvoice".to_string(),
-                None,
-            )),
-        );
-        let err = validate_invoice(&msg, &order).await.unwrap_err();
-        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)));
+                "{check:?}: an absent payment request must validate to None"
+            );
 
-        // Freshly-built invoice for amount - fee = 1000 sats validates.
-        let pr = build_test_invoice(1_000_000, 86_400);
-        let msg = Message::new_order(
-            None,
-            None,
-            None,
-            Action::AddInvoice,
-            Some(Payload::PaymentRequest(None, pr.clone(), None)),
-        );
-        assert_eq!(validate_invoice(&msg, &order).await.unwrap(), Some(pr));
+            // Garbage payment request → invalid invoice.
+            let msg = Message::new_order(
+                None,
+                None,
+                None,
+                Action::AddInvoice,
+                Some(Payload::PaymentRequest(
+                    None,
+                    "notaninvoice".to_string(),
+                    None,
+                )),
+            );
+            let err = validate_invoice(&msg, &order, check).await.unwrap_err();
+            assert!(
+                matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)),
+                "{check:?}: garbage must be rejected, got {err:?}"
+            );
+
+            // Freshly-built invoice for amount - fee = 1000 sats validates.
+            let pr = build_test_invoice(1_000_000, 86_400);
+            let msg = Message::new_order(
+                None,
+                None,
+                None,
+                Action::AddInvoice,
+                Some(Payload::PaymentRequest(None, pr.clone(), None)),
+            );
+            assert_eq!(
+                validate_invoice(&msg, &order, check).await.unwrap(),
+                Some(pr),
+                "{check:?}: a matching BOLT11 invoice must validate"
+            );
+        }
     }
 
     // ───────────────────────── taker reputation notification ─────────────────────────

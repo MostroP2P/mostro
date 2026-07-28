@@ -5,6 +5,7 @@ use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
     get_order, set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
+    InvoiceCheck,
 };
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -171,7 +172,12 @@ pub async fn take_sell_action(
 
     // Validate invoice and get payment request if present
     // NOW dev_fee is set correctly for proper validation
-    let payment_request = validate_invoice(&msg, &order).await?;
+    //
+    // `Online` keeps the pre-existing behavior: this is the buyer committing
+    // to a payout destination, so an unreachable one should block the take
+    // rather than surface at release time. The round-trip is bounded by
+    // `lnurl::LNURL_TOTAL_BUDGET`.
+    let payment_request = validate_invoice(&msg, &order, InvoiceCheck::Online).await?;
 
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,

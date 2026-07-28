@@ -16,7 +16,36 @@ use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::info;
+use tracing::{error, info};
+
+/// Record a failed payout attempt so the order stays recoverable.
+///
+/// Every path that gives up on paying the buyer after the hold invoice has
+/// been settled has to come through here. `find_failed_payment` selects orders
+/// on `failed_payment == true`, so an attempt that returns without setting it
+/// leaves the order settled, the buyer unpaid and unnotified, and invisible to
+/// the retry job — and a buyer sending a corrected invoice does not help,
+/// since that path only resets `payment_attempts` and relies on that same job.
+///
+/// The bookkeeping can itself fail: the `UPDATE` may error, or an order whose
+/// amount or kind no longer validates bails out on the retries-exhausted
+/// branch. That leaves exactly the unrecoverable state this function exists to
+/// prevent, so it is logged at `error` rather than dropped — both callers of
+/// [`do_payment`] discard its `Result`, which makes the log the only signal an
+/// operator ever gets.
+async fn record_payout_failure(ctx: &AppContext, order: &Order, request_id: Option<u64>) {
+    match check_failure_retries(ctx, order, request_id).await {
+        Ok(failed_payment) => info!(
+            "Order id {} has {} failed payments retries",
+            failed_payment.id, failed_payment.payment_attempts
+        ),
+        Err(e) => error!(
+            "Order id {}: could not record the payment failure ({:?}); the order may stay \
+             settled and unpaid until it is recovered manually",
+            order.id, e
+        ),
+    }
+}
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -518,30 +547,34 @@ pub async fn do_payment(
                     ),
                     _ => info!("Order id {}: payout address returned no invoice", order.id),
                 }
-                if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
-                    info!(
-                        "Order id {} has {} failed payments retries",
-                        failed_payment.id, failed_payment.payment_attempts
-                    );
-                }
+                record_payout_failure(ctx, &order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
         }
     } else {
         payment_request
     };
-    let mut ln_client_payment = LndConnector::new().await?;
+    // Reaching LND is part of paying, so a handshake that fails or times out
+    // is a failed payout attempt — not a reason to return ahead of the
+    // bookkeeping. `LndConnector::new` now bounds that handshake, which makes
+    // this path reachable on a node whose LND is wedged rather than down.
+    let mut ln_client_payment = match LndConnector::new().await {
+        Ok(client) => client,
+        Err(e) => {
+            info!(
+                "Order id {}: could not connect to LND for payout: {:?}",
+                order.id, e
+            );
+            record_payout_failure(ctx, &order, request_id).await;
+            return Err(e);
+        }
+    };
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
         info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
-            info!(
-                "Order id {} has {} failed payments retries",
-                failed_payment.id, failed_payment.payment_attempts
-            );
-        }
+        record_payout_failure(ctx, &order, request_id).await;
     }
 
     // Get Mostro keys from context
@@ -1730,24 +1763,47 @@ mod tests {
         );
     }
 
+    /// Failing to reach LND is a failed payout attempt like any other, so it
+    /// has to leave the same bookkeeping behind. Without it a settled order
+    /// whose LND handshake fails would never be retried, since
+    /// `find_failed_payment` only selects on `failed_payment == true`.
     #[tokio::test]
     async fn do_payment_fails_fast_when_lnd_is_unreachable() {
         // Arrange: with the global config set to test defaults, the LND cert
         // path is invalid, so LndConnector::new() returns an error without
-        // any network access.
+        // any network access. The buyer invoice is not a lightning address,
+        // so address resolution is skipped and LND is the first thing tried.
         init_global_config();
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
         let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.payment_attempts = 0;
+        order.failed_payment = false;
+        let order = order.create(&pool).await.unwrap();
 
         // Act
-        let result = do_payment(&ctx, order, None).await;
+        let result = do_payment(&ctx, order.clone(), None).await;
 
         // Assert
         assert!(result.is_err());
+        let (failed_payment, payment_attempts): (bool, i64) =
+            sqlx::query_as("SELECT failed_payment, payment_attempts FROM orders WHERE id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            failed_payment,
+            "an unreachable LND must still mark the payout as failed so it can be retried"
+        );
+        assert_eq!(
+            payment_attempts, 1,
+            "the failed attempt must be counted, not silently dropped"
+        );
     }
 
     #[tokio::test]

@@ -143,8 +143,14 @@ pub async fn order_action(
         // created, delaying every other message behind it, in exchange for a
         // liveness answer that can go stale before it is ever used.
         //
-        // The returned value is discarded because it is the same string this
-        // function already holds: `validate_invoice` re-reads it from `msg`.
+        // The returned value is discarded because it is the same string that
+        // gets persisted, not a different one. For a `NewOrder` the payload is
+        // `Payload::Order`, and `Message::get_payment_request` — what
+        // `validate_invoice` reads — resolves that to `ord.buyer_invoice`,
+        // which is the exact field `prepare_new_order` copies into the stored
+        // order. (A `NewOrder` carrying any other payload never reaches here:
+        // `get_order` returns `None` and this whole block is skipped.) So the
+        // invoice that is checked and the invoice that is saved are one value.
         let _invoice =
             validate_invoice(&msg, &Order::from(order.clone()), InvoiceCheck::Offline).await?;
 

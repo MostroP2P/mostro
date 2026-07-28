@@ -912,22 +912,16 @@ pub async fn resolve_dev_fee_invoice(
     // fee payment came from.
     let comment = dev_fee_comment(&order.id, &keys.public_key());
 
-    let payment_request = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        resolv_ln_address(
-            DEV_FEE_LIGHTNING_ADDRESS,
-            order.dev_fee as u64,
-            Some(comment.as_str()),
-        ),
+    // No timeout wrapper here: `resolv_ln_address` bounds itself with
+    // `lnurl::LNURL_TOTAL_BUDGET`, which covers both round-trips it makes.
+    // A second, longer deadline layered on top could never fire, and would
+    // only advertise a limit that isn't the real one.
+    let payment_request = resolv_ln_address(
+        DEV_FEE_LIGHTNING_ADDRESS,
+        order.dev_fee as u64,
+        Some(comment.as_str()),
     )
     .await
-    .map_err(|_| {
-        error!(
-            "Dev fee LNURL resolution timeout for order {} ({} sats)",
-            order.id, order.dev_fee
-        );
-        MostroInternalErr(ServiceError::LnAddressParseError)
-    })?
     .map_err(|e| {
         error!(
             "Dev fee LNURL resolution failed for order {} ({} sats): {:?}",

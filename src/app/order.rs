@@ -133,12 +133,18 @@ pub async fn order_action(
         // cheap, so a malformed order is rejected without touching it.
         //
         // `Offline` deliberately skips resolving a lightning address or LNURL
-        // over the network. Creating an order only records the payment
-        // request — the result here is discarded — and the address still has
-        // to resolve when the payout is actually made, which is where an
-        // unreachable host is worth acting on. Checking it here would put an
-        // HTTP request to a sender-chosen host on the event loop for every
-        // order created, delaying every other message behind it.
+        // over the network. Note this is not a throwaway value — the address
+        // is persisted as `orders.buyer_invoice` (see `prepare_new_order`) and
+        // is what `do_payment` pays out to. Skipping the reachability probe
+        // here is safe *because* a failure to resolve at payout time is now
+        // handled as a payment failure: the buyer is notified and the retry
+        // job picks the order up. Checking it here instead would put an HTTP
+        // request to a sender-chosen host on the event loop for every order
+        // created, delaying every other message behind it, in exchange for a
+        // liveness answer that can go stale before it is ever used.
+        //
+        // The returned value is discarded because it is the same string this
+        // function already holds: `validate_invoice` re-reads it from `msg`.
         let _invoice =
             validate_invoice(&msg, &Order::from(order.clone()), InvoiceCheck::Offline).await?;
 

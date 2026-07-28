@@ -50,6 +50,17 @@ pub async fn add_invoice_action(
     if buyer_pubkey != event.sender {
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
+    // Reject on status before the payment request is looked at. The status
+    // check is a local comparison while validating the request reaches out to
+    // a host named by the sender, so an order that can't accept an invoice at
+    // all should never pay for that round-trip.
+    if !matches!(
+        ord_status,
+        Status::SettledHoldInvoice | Status::WaitingBuyerInvoice
+    ) {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
     // We save the invoice on db
     //
     // `Online` keeps the pre-existing behavior: the buyer is submitting the
@@ -57,16 +68,11 @@ pub async fn add_invoice_action(
     // rejected now rather than at release. Bounded by
     // `lnurl::LNURL_TOTAL_BUDGET`.
     order.buyer_invoice = validate_invoice(&msg, &order, InvoiceCheck::Online).await?;
+
     // Buyer can add invoice orders with WaitingBuyerInvoice status
-    match ord_status {
-        Status::SettledHoldInvoice => {
-            pay_new_invoice(&mut order, pool, &msg).await?;
-            return Ok(());
-        }
-        Status::WaitingBuyerInvoice => {}
-        _ => {
-            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-        }
+    if ord_status == Status::SettledHoldInvoice {
+        pay_new_invoice(&mut order, pool, &msg).await?;
+        return Ok(());
     }
 
     // Notify taker reputation
@@ -250,6 +256,62 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidPeer))
         ));
+    }
+
+    /// A disallowed status must be rejected without the payment request ever
+    /// being resolved. The status check is a local string comparison; the
+    /// resolution is a round-trip to a host the sender chose, and the handler
+    /// runs on the shared event loop, so the cheap check has to come first.
+    #[tokio::test]
+    async fn add_invoice_action_rejects_disallowed_status_before_resolving_address() {
+        use lnurl::lnurl::LnUrl;
+
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = waiting_invoice_sell_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // A host that completes the handshake and then never answers: any
+        // attempt to resolve this address would burn the full LNURL budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let lnurl = LnUrl {
+            url: format!("http://127.0.0.1:{port}/.well-known/lnurlp/blackhole"),
+        }
+        .encode();
+
+        let msg = Message::new_order(
+            Some(order.id),
+            Some(1),
+            None,
+            Action::AddInvoice,
+            Some(Payload::PaymentRequest(None, lnurl, None)),
+        );
+        let event = buyer_event(buyer);
+
+        let start = std::time::Instant::now();
+        let result = add_invoice_action(&ctx, msg, &event, &Keys::generate()).await;
+        let elapsed = start.elapsed();
+        listener_task.abort();
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a disallowed status must be rejected, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "status rejection must not wait on the payment request, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

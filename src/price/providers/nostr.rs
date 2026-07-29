@@ -142,6 +142,9 @@ impl NostrProvider {
         events
             .iter()
             .filter(|e| trusted.contains(&e.pubkey))
+            // A future-dated `created_at` (forged or clock-skewed relay) would
+            // otherwise saturate the age check to 0 and win `max_by_key` outright.
+            .filter(|e| e.created_at <= now)
             .filter(|e| now.as_secs().saturating_sub(e.created_at.as_secs()) <= max_age_secs)
             .max_by_key(|e| e.created_at)
     }
@@ -164,19 +167,15 @@ impl PriceProvider for NostrProvider {
             .into_iter()
             .collect::<Vec<Event>>();
 
-        let event = Self::select_freshest(
-            &events,
-            &self.trusted_nodes,
-            Timestamp::now(),
-            self.max_age,
-        )
-        .ok_or_else(|| {
-            ProviderError::Http(
-                "nostr: no fresh trusted-node rate event found \
+        let event =
+            Self::select_freshest(&events, &self.trusted_nodes, Timestamp::now(), self.max_age)
+                .ok_or_else(|| {
+                    ProviderError::Http(
+                        "nostr: no fresh trusted-node rate event found \
                  (all missing, untrusted, or older than max_price_staleness_seconds)"
-                    .to_string(),
-            )
-        })?;
+                            .to_string(),
+                    )
+                })?;
 
         Self::parse_content(&event.content)
     }
@@ -227,13 +226,9 @@ mod tests {
     #[test]
     fn select_freshest_returns_none_for_empty_events() {
         let trusted = vec![Keys::generate().public_key()];
-        assert!(NostrProvider::select_freshest(
-            &[],
-            &trusted,
-            Timestamp::from(NOW),
-            MAX_AGE
-        )
-        .is_none());
+        assert!(
+            NostrProvider::select_freshest(&[], &trusted, Timestamp::from(NOW), MAX_AGE).is_none()
+        );
     }
 
     #[test]
@@ -245,13 +240,10 @@ mod tests {
         let untrusted_event = signed_event(&untrusted_keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![untrusted_event];
 
-        assert!(NostrProvider::select_freshest(
-            &events,
-            &trusted,
-            Timestamp::from(NOW),
-            MAX_AGE
-        )
-        .is_none());
+        assert!(
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .is_none()
+        );
     }
 
     #[test]
@@ -293,13 +285,10 @@ mod tests {
         let stale = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs() - 1);
         let events = vec![stale];
 
-        assert!(NostrProvider::select_freshest(
-            &events,
-            &trusted,
-            Timestamp::from(NOW),
-            MAX_AGE
-        )
-        .is_none());
+        assert!(
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .is_none()
+        );
     }
 
     #[test]
@@ -314,6 +303,23 @@ mod tests {
             NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
                 .unwrap();
         assert_eq!(picked.id, at_boundary.id);
+    }
+
+    #[test]
+    fn select_freshest_rejects_future_dated_events() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        // A forged or clock-skewed `created_at` in the future must not win
+        // `max_by_key` over a legitimately current event.
+        let future = signed_event(&keys, SAMPLE_CONTENT, NOW + 1_000);
+        let current = signed_event(&keys, SAMPLE_CONTENT, NOW - 100);
+        let events = vec![future, current.clone()];
+
+        let picked =
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .unwrap();
+        assert_eq!(picked.id, current.id);
     }
 
     fn sample_cfg(trusted_hex: String) -> ProviderConfig {

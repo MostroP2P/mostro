@@ -8,7 +8,10 @@
 //! (already connected to the `[nostr]` relays) for the latest such event
 //! from each configured `trusted_nodes` pubkey and takes the **freshest**
 //! one as this tick's source — no cross-node statistical combine; a stale or
-//! unreachable trusted node is simply outrun by a fresher one.
+//! unreachable trusted node is simply outrun by a fresher one. Events whose
+//! `created_at` is older than `[price].max_price_staleness_seconds` are
+//! discarded so a relay that still serves an expired kind-30078 cannot keep
+//! refreshing the local cache clock with zombie rates.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -38,6 +41,10 @@ pub struct NostrProvider {
     /// timeout before they can complete or fail on their own (CodeRabbit,
     /// PR #841).
     query_timeout: Duration,
+    /// Maximum age of a trusted-node rate event (`created_at`), taken from
+    /// the shared `[price].max_price_staleness_seconds` so upstream Nostr
+    /// freshness uses the same TTL the store enforces on cached quotes.
+    max_age: Duration,
 }
 
 impl NostrProvider {
@@ -54,7 +61,15 @@ impl NostrProvider {
     /// (no `fallback_urls` for this provider ⇒ one attempt) with the same
     /// 1s of slack every other provider gets from the shared `reqwest`
     /// client's own per-attempt timeout.
-    pub fn new(cfg: &ProviderConfig, provider_timeout_seconds: u64) -> Result<Self, String> {
+    ///
+    /// `max_price_staleness_seconds` is the same shared TTL used by
+    /// [`crate::price::store::PriceStore`]: events older than that are not
+    /// eligible as this tick's source.
+    pub fn new(
+        cfg: &ProviderConfig,
+        provider_timeout_seconds: u64,
+        max_price_staleness_seconds: i64,
+    ) -> Result<Self, String> {
         if cfg.trusted_nodes.is_empty() {
             return Err(
                 "price provider 'nostr': enabled provider requires at least one \
@@ -77,6 +92,9 @@ impl NostrProvider {
         Ok(Self {
             trusted_nodes,
             query_timeout: Duration::from_secs(provider_timeout_seconds.max(1)),
+            // `PriceSettings::validate` already rejects non-positive values;
+            // clamp here so a zero can never make every event look fresh.
+            max_age: Duration::from_secs(max_price_staleness_seconds.max(1) as u64),
         })
     }
 
@@ -107,17 +125,24 @@ impl NostrProvider {
             .collect())
     }
 
-    /// Among `events`, the freshest one authored by a trusted pubkey — a
-    /// second client-side trust check even though the relay-side `authors`
-    /// filter should already guarantee it (spec §10.3 / `NOSTR_EXCHANGE_RATES.md`
-    /// "clients MUST verify pubkey"). Pure and unit-testable without a relay.
+    /// Among `events`, the freshest one authored by a trusted pubkey whose
+    /// `created_at` is within `max_age` of `now` — a second client-side trust
+    /// check even though the relay-side `authors` filter should already
+    /// guarantee the pubkey (spec §10.3 / `NOSTR_EXCHANGE_RATES.md`
+    /// "clients MUST verify pubkey"), plus a freshness gate so relays that
+    /// ignore NIP-40 expiration cannot serve zombie rates. Pure and
+    /// unit-testable without a relay.
     pub(crate) fn select_freshest<'a>(
         events: &'a [Event],
         trusted: &[PublicKey],
+        now: Timestamp,
+        max_age: Duration,
     ) -> Option<&'a Event> {
+        let max_age_secs = max_age.as_secs();
         events
             .iter()
             .filter(|e| trusted.contains(&e.pubkey))
+            .filter(|e| now.as_secs().saturating_sub(e.created_at.as_secs()) <= max_age_secs)
             .max_by_key(|e| e.created_at)
     }
 }
@@ -139,8 +164,18 @@ impl PriceProvider for NostrProvider {
             .into_iter()
             .collect::<Vec<Event>>();
 
-        let event = Self::select_freshest(&events, &self.trusted_nodes).ok_or_else(|| {
-            ProviderError::Http("nostr: no trusted-node rate event found".to_string())
+        let event = Self::select_freshest(
+            &events,
+            &self.trusted_nodes,
+            Timestamp::now(),
+            self.max_age,
+        )
+        .ok_or_else(|| {
+            ProviderError::Http(
+                "nostr: no fresh trusted-node rate event found \
+                 (all missing, untrusted, or older than max_price_staleness_seconds)"
+                    .to_string(),
+            )
         })?;
 
         Self::parse_content(&event.content)
@@ -183,10 +218,22 @@ mod tests {
             .expect("event must sign")
     }
 
+    /// Relative clock for `select_freshest` unit tests — events use small
+    /// synthetic `created_at` values, so tests pass an explicit `now`
+    /// instead of wall-clock time.
+    const NOW: u64 = 10_000;
+    const MAX_AGE: Duration = Duration::from_secs(5_000);
+
     #[test]
     fn select_freshest_returns_none_for_empty_events() {
         let trusted = vec![Keys::generate().public_key()];
-        assert!(NostrProvider::select_freshest(&[], &trusted).is_none());
+        assert!(NostrProvider::select_freshest(
+            &[],
+            &trusted,
+            Timestamp::from(NOW),
+            MAX_AGE
+        )
+        .is_none());
     }
 
     #[test]
@@ -195,10 +242,16 @@ mod tests {
         let untrusted_keys = Keys::generate();
         let trusted = vec![trusted_keys.public_key()];
 
-        let untrusted_event = signed_event(&untrusted_keys, SAMPLE_CONTENT, 2_000);
+        let untrusted_event = signed_event(&untrusted_keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![untrusted_event];
 
-        assert!(NostrProvider::select_freshest(&events, &trusted).is_none());
+        assert!(NostrProvider::select_freshest(
+            &events,
+            &trusted,
+            Timestamp::from(NOW),
+            MAX_AGE
+        )
+        .is_none());
     }
 
     #[test]
@@ -207,32 +260,64 @@ mod tests {
         let newer_keys = Keys::generate();
         let trusted = vec![older_keys.public_key(), newer_keys.public_key()];
 
-        let older = signed_event(&older_keys, SAMPLE_CONTENT, 1_000);
-        let newer = signed_event(&newer_keys, SAMPLE_CONTENT, 2_000);
+        let older = signed_event(&older_keys, SAMPLE_CONTENT, NOW - 2_000);
+        let newer = signed_event(&newer_keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![older, newer.clone()];
 
-        let picked = NostrProvider::select_freshest(&events, &trusted).unwrap();
+        let picked =
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .unwrap();
         assert_eq!(picked.id, newer.id);
     }
 
     #[test]
-    fn new_parses_valid_hex_trusted_nodes() {
-        let cfg = ProviderConfig {
-            enabled: true,
-            url: String::new(),
-            fallback_urls: vec![],
-            api_key: None,
-            token: None,
-            only: None,
-            except: None,
-            trusted_nodes: vec![Keys::generate().public_key().to_hex()],
-        };
-        assert!(NostrProvider::new(&cfg, 10).is_ok());
+    fn select_freshest_discards_events_older_than_max_age() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        let stale = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs() - 1);
+        let fresh = signed_event(&keys, SAMPLE_CONTENT, NOW - 100);
+        let events = vec![stale, fresh.clone()];
+
+        let picked =
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .unwrap();
+        assert_eq!(picked.id, fresh.id);
     }
 
     #[test]
-    fn new_derives_query_timeout_from_provider_timeout_seconds() {
-        let cfg = ProviderConfig {
+    fn select_freshest_returns_none_when_all_trusted_are_stale() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        let stale = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs() - 1);
+        let events = vec![stale];
+
+        assert!(NostrProvider::select_freshest(
+            &events,
+            &trusted,
+            Timestamp::from(NOW),
+            MAX_AGE
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn select_freshest_keeps_event_exactly_at_max_age_boundary() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        let at_boundary = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs());
+        let events = vec![at_boundary.clone()];
+
+        let picked =
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .unwrap();
+        assert_eq!(picked.id, at_boundary.id);
+    }
+
+    fn sample_cfg(trusted_hex: String) -> ProviderConfig {
+        ProviderConfig {
             enabled: true,
             url: String::new(),
             fallback_urls: vec![],
@@ -240,14 +325,27 @@ mod tests {
             token: None,
             only: None,
             except: None,
-            trusted_nodes: vec![Keys::generate().public_key().to_hex()],
-        };
-        let provider = NostrProvider::new(&cfg, 7).unwrap();
-        assert_eq!(provider.query_timeout, Duration::from_secs(7));
+            trusted_nodes: vec![trusted_hex],
+        }
+    }
 
-        // A misconfigured 0 must not produce a zero-duration timeout.
-        let provider = NostrProvider::new(&cfg, 0).unwrap();
+    #[test]
+    fn new_parses_valid_hex_trusted_nodes() {
+        let cfg = sample_cfg(Keys::generate().public_key().to_hex());
+        assert!(NostrProvider::new(&cfg, 10, 1_800).is_ok());
+    }
+
+    #[test]
+    fn new_derives_query_timeout_and_max_age_from_shared_settings() {
+        let cfg = sample_cfg(Keys::generate().public_key().to_hex());
+        let provider = NostrProvider::new(&cfg, 7, 1_800).unwrap();
+        assert_eq!(provider.query_timeout, Duration::from_secs(7));
+        assert_eq!(provider.max_age, Duration::from_secs(1_800));
+
+        // A misconfigured 0 must not produce a zero-duration timeout/age.
+        let provider = NostrProvider::new(&cfg, 0, 0).unwrap();
         assert_eq!(provider.query_timeout, Duration::from_secs(1));
+        assert_eq!(provider.max_age, Duration::from_secs(1));
     }
 
     #[test]
@@ -264,7 +362,7 @@ mod tests {
             except: None,
             trusted_nodes: vec![node_a.to_hex(), node_b.to_hex()],
         };
-        let provider = NostrProvider::new(&cfg, 10).unwrap();
+        let provider = NostrProvider::new(&cfg, 10, 1_800).unwrap();
 
         let expected = Filter::new()
             .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
@@ -285,22 +383,13 @@ mod tests {
             except: None,
             trusted_nodes: vec![],
         };
-        assert!(NostrProvider::new(&cfg, 10).is_err());
+        assert!(NostrProvider::new(&cfg, 10, 1_800).is_err());
     }
 
     #[test]
     fn new_rejects_invalid_hex_pubkey() {
-        let cfg = ProviderConfig {
-            enabled: true,
-            url: String::new(),
-            fallback_urls: vec![],
-            api_key: None,
-            token: None,
-            only: None,
-            except: None,
-            trusted_nodes: vec!["not-a-pubkey".to_string()],
-        };
-        assert!(NostrProvider::new(&cfg, 10).is_err());
+        let cfg = sample_cfg("not-a-pubkey".to_string());
+        assert!(NostrProvider::new(&cfg, 10, 1_800).is_err());
     }
 
     /// Live-relay evidence for issue #697: exercises the real `fetch()` path
@@ -338,7 +427,7 @@ mod tests {
                 "00000235a3e904cfe1213a8a54d6f1ec1bef7cc6bfaabd6193e82931ccf1366a".to_string(),
             ],
         };
-        let provider = NostrProvider::new(&cfg, 10).expect("valid hex pubkeys");
+        let provider = NostrProvider::new(&cfg, 10, 1_800).expect("valid hex pubkeys");
         let http = reqwest::Client::new();
 
         let quotes = provider.fetch(&http).await.expect("live relay fetch");

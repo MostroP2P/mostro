@@ -108,7 +108,12 @@ impl PriceManager {
             }
             match id_str.parse::<ProviderId>() {
                 Ok(id) => {
-                    let provider = build_provider(id, cfg, settings.provider_timeout_seconds)?;
+                    let provider = build_provider(
+                        id,
+                        cfg,
+                        settings.provider_timeout_seconds,
+                        settings.max_price_staleness_seconds,
+                    )?;
                     providers.push(EnabledProvider {
                         id,
                         provider,
@@ -574,6 +579,7 @@ fn build_provider(
     id: ProviderId,
     cfg: &ProviderConfig,
     provider_timeout_seconds: u64,
+    max_price_staleness_seconds: i64,
 ) -> Result<Box<dyn PriceProvider>, String> {
     match id {
         ProviderId::Yadio => Ok(Box::new(YadioProvider::new(cfg))),
@@ -586,10 +592,14 @@ fn build_provider(
         ProviderId::ElToque => Ok(Box::new(ElToqueProvider::new(cfg)?)),
         // Nostr trusted-node relay mode (§11.7). `new` returns `Err` when
         // `trusted_nodes` is empty or contains an unparsable hex pubkey.
-        // `provider_timeout_seconds` sizes its one-shot relay query so it
-        // stays in sync with the shared budget instead of a fixed constant
-        // (CodeRabbit, PR #841).
-        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(cfg, provider_timeout_seconds)?)),
+        // `provider_timeout_seconds` sizes its one-shot relay query;
+        // `max_price_staleness_seconds` is the freshness gate on event
+        // `created_at` so zombie relay data cannot refresh the store clock.
+        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(
+            cfg,
+            provider_timeout_seconds,
+            max_price_staleness_seconds,
+        )?)),
     }
 }
 

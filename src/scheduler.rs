@@ -602,7 +602,6 @@ async fn job_cancel_orders(ctx: AppContext) {
 
                         // Get edited order to use for update_order_event
                         let edited_order = if let Ok(edited_order) = edited_order {
-                            println!("Edited order: {:?}", edited_order);
                             edited_order
                         } else {
                             tracing::warn!("Error editing pubkeys in order {} cancel", order.id);

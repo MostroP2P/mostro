@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Regression-test the log-redaction checker itself
+        run: python3 scripts/check_log_redaction_test.py
       - name: Check for Nostr key/identity leaks in tracing calls
         run: python3 scripts/check_log_redaction.py
 

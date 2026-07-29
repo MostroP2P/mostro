@@ -20,7 +20,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
 
-MACRO_RE = re.compile(r"\b(?:tracing::)?(trace|debug|info|warn|error)!\s*\(")
+MACRO_RE = re.compile(r"\b(?:tracing::)?(?:trace|debug|info|warn|error)!\s*([({\[])")
+
+# Rust macros accept any of these three delimiter pairs; the matcher must
+# track whichever one was actually opened.
+DELIMITER_PAIRS = {"(": ")", "{": "}", "[": "]"}
 
 # Identifiers that name a Nostr key/identity in this codebase. Extend this
 # list, don't loosen it to a bare `key` — that also matches innocuous things
@@ -28,8 +32,8 @@ MACRO_RE = re.compile(r"\b(?:tracing::)?(trace|debug|info|warn|error)!\s*\(")
 SUSPICIOUS_RE = re.compile(
     r"\b("
     r"\w*pubkey\w*"
-    r"|identity"
-    r"|sender"
+    r"|identity\w*"
+    r"|sender\w*"
     r"|master_key"
     r"|trade_key"
     r"|nsec\w*"
@@ -43,19 +47,23 @@ SUSPICIOUS_RE = re.compile(
 ALLOW_COMMENT = "pubkey-log-allow:"
 
 
-def find_call_span(text: str, open_paren: int) -> tuple[int, str]:
-    """Return (index just past the `)` matching `text[open_paren] == '('`,
-    the call's source with string-literal *contents* blanked out).
+def find_call_span(text: str, open_delim: int) -> tuple[int, str]:
+    """Return (index just past the delimiter matching
+    `text[open_delim]`, the call's source with string-literal *contents*
+    blanked out). Handles all three Rust macro delimiter pairs: `()`,
+    `{}`, `[]`.
 
-    Blanking string contents (not just skipping them for paren-matching)
+    Blanking string contents (not just skipping them for delimiter-matching)
     matters: a format string's own English prose can contain a key-shaped
     word ("...pubkey in order...") that isn't an interpolated argument at
     all — only the blanked version should be searched for suspicious
     identifiers, or every message that merely *mentions* a pubkey false-
     positives.
     """
+    open_ch = text[open_delim]
+    close_ch = DELIMITER_PAIRS[open_ch]
     depth = 0
-    i = open_paren
+    i = open_delim
     n = len(text)
     out = []
     while i < n:
@@ -69,9 +77,9 @@ def find_call_span(text: str, open_paren: int) -> tuple[int, str]:
             out.append('"' * (i - start))
             continue
         out.append(c)
-        if c == "(":
+        if c == open_ch:
             depth += 1
-        elif c == ")":
+        elif c == close_ch:
             depth -= 1
             if depth == 0:
                 return i + 1, "".join(out)
@@ -89,8 +97,8 @@ def check_file(path: Path) -> list[tuple[int, str]]:
     text = path.read_text(encoding="utf-8")
     violations = []
     for m in MACRO_RE.finditer(text):
-        open_paren = text.index("(", m.end() - 1)
-        _end, code_only = find_call_span(text, open_paren)
+        open_delim = m.end() - 1
+        _end, code_only = find_call_span(text, open_delim)
         found = SUSPICIOUS_RE.search(code_only)
         if not found:
             continue

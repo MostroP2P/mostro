@@ -717,11 +717,9 @@ pub async fn send_dm(
     )
     .await?;
 
-    // No key in the log line — receiver pubkey (AGENTS.md:48).
-    info!(
-        "Sending message, Event ID: {} with payload: {:#?}",
-        event.id, payload
-    );
+    // No key in the log line — payload can carry a Nostr pubkey (e.g.
+    // Payload::Peer sent by admin_take_dispute_action) (AGENTS.md:48).
+    info!("Sending message, Event ID: {}", event.id);
 
     if let Ok(client) = get_nostr_client() {
         client

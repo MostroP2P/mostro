@@ -169,13 +169,14 @@ pub async fn dispute_action(
     let dispute = Dispute::new(order_id, order.status.clone());
 
     // Setup dispute
-    if order.setup_dispute(is_buyer_dispute).is_ok() {
-        order
-            .clone()
-            .update(pool)
-            .await
-            .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
-    }
+    order
+        .setup_dispute(is_buyer_dispute)
+        .map_err(MostroCantDo)?;
+    order
+        .clone()
+        .update(pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
     // Save dispute to database
     let dispute = dispute

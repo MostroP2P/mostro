@@ -79,105 +79,14 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     Ok(keys.into_iter().collect())
 }
 
-/// Helper function to rebuild disputes table without token columns when DROP COLUMN is unsupported.
-async fn rebuild_disputes_table_without_tokens(pool: &SqlitePool) -> Result<(), MostroError> {
-    tracing::info!("Rebuilding disputes table without token columns (SQLite compatibility mode)");
-
-    // Create temporary table with new schema (without token columns)
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS disputes_temp (
-            id char(36) primary key not null,
-            order_id char(36) unique not null,
-            status varchar(10) not null,
-            order_previous_status varchar(10) not null,
-            solver_pubkey char(64),
-            created_at integer not null,
-            taken_at integer default 0
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        MostroInternalErr(ServiceError::DbAccessError(format!(
-            "Failed to create temporary disputes table: {}",
-            e
-        )))
-    })?;
-
-    // Copy data from original table to temporary table (excluding token columns)
-    sqlx::query(
-        r#"
-        INSERT INTO disputes_temp (id, order_id, status, order_previous_status, solver_pubkey, created_at, taken_at)
-        SELECT id, order_id, status, order_previous_status, solver_pubkey, created_at, taken_at
-        FROM disputes
-        "#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(format!(
-        "Failed to copy data to temporary table: {}", e
-    ))))?;
-
-    // Drop original table
-    sqlx::query("DROP TABLE disputes")
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            MostroInternalErr(ServiceError::DbAccessError(format!(
-                "Failed to drop original disputes table: {}",
-                e
-            )))
-        })?;
-
-    // Rename temporary table to disputes
-    sqlx::query("ALTER TABLE disputes_temp RENAME TO disputes")
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            MostroInternalErr(ServiceError::DbAccessError(format!(
-                "Failed to rename temporary table: {}",
-                e
-            )))
-        })?;
-
-    tracing::info!("Successfully rebuilt disputes table without token columns");
-    Ok(())
-}
-
-/// Migrates legacy disputes table by removing deprecated buyer_token and seller_token columns if present.
+/// Removes deprecated `buyer_token` and `seller_token` columns from the disputes table if present.
 ///
-/// This function uses transactions for atomic operations and includes fallback logic for older SQLite versions
-/// that don't support ALTER TABLE DROP COLUMN. The function handles both cases where columns exist (legacy databases)
-/// and don't exist (newer databases).
+/// Both drops run inside a single transaction so either both succeed or neither does.
+/// This is a no-op when neither column exists (fresh installs and already-migrated databases).
 async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroError> {
-    // Check if token columns exist
-    let buyer_token_exists = sqlx::query_scalar::<_, i32>(
-        r#"
-        SELECT COUNT(*) 
-        FROM pragma_table_info('disputes') 
-        WHERE name = 'buyer_token'
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        > 0;
+    let buyer_token_exists = table_column_exists(pool, "disputes", "buyer_token").await?;
+    let seller_token_exists = table_column_exists(pool, "disputes", "seller_token").await?;
 
-    let seller_token_exists = sqlx::query_scalar::<_, i32>(
-        r#"
-        SELECT COUNT(*) 
-        FROM pragma_table_info('disputes') 
-        WHERE name = 'seller_token'
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        > 0;
-
-    // If no token columns exist, no migration needed
     if !buyer_token_exists && !seller_token_exists {
         tracing::debug!(
             "No deprecated token columns found in disputes table - migration not needed"
@@ -185,99 +94,48 @@ async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroErr
         return Ok(());
     }
 
-    // Check SQLite version to determine if DROP COLUMN is supported
-    let sqlite_version = sqlx::query_scalar::<_, String>("SELECT sqlite_version()")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| {
-            MostroInternalErr(ServiceError::DbAccessError(format!(
-                "Failed to get SQLite version: {}",
-                e
-            )))
-        })?;
+    let mut tx = pool.begin().await.map_err(|e| {
+        MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Failed to begin transaction: {}",
+            e
+        )))
+    })?;
 
-    tracing::info!("SQLite version: {}", sqlite_version);
-
-    // Parse version to check if DROP COLUMN is supported (requires 3.35.0+)
-    let supports_drop_column = sqlite_version
-        .split('.')
-        .take(3)
-        .map(|v| v.parse::<u32>().unwrap_or(0))
-        .collect::<Vec<_>>()
-        .get(..3)
-        .map(|parts| {
-            let major = parts[0];
-            let minor = parts.get(1).copied().unwrap_or(0);
-            major > 3 || (major == 3 && minor >= 35)
-        })
-        .unwrap_or(false);
-
-    if supports_drop_column {
-        // Try DROP COLUMN approach with transaction
-        tracing::info!(
-            "Attempting to remove token columns using DROP COLUMN (SQLite {})...",
-            sqlite_version
-        );
-
-        let mut transaction = pool.begin().await.map_err(|e| {
-            MostroInternalErr(ServiceError::DbAccessError(format!(
-                "Failed to begin transaction: {}",
-                e
-            )))
-        })?;
-
-        // Attempt to drop columns within transaction
-        let drop_result = async {
-            if buyer_token_exists {
-                sqlx::query("ALTER TABLE disputes DROP COLUMN buyer_token")
-                    .execute(&mut *transaction)
-                    .await?;
-                tracing::info!("Dropped buyer_token column");
-            }
-
-            if seller_token_exists {
-                sqlx::query("ALTER TABLE disputes DROP COLUMN seller_token")
-                    .execute(&mut *transaction)
-                    .await?;
-                tracing::info!("Dropped seller_token column");
-            }
-
-            Ok::<(), sqlx::Error>(())
-        }
-        .await;
-
-        match drop_result {
-            Ok(_) => {
-                transaction.commit().await.map_err(|e| {
-                    MostroInternalErr(ServiceError::DbAccessError(format!(
-                        "Failed to commit transaction: {}",
-                        e
-                    )))
-                })?;
-                tracing::info!("Successfully removed token columns using DROP COLUMN");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("DROP COLUMN failed ({}), falling back to table rebuild", e);
-                transaction.rollback().await.map_err(|rollback_err| {
-                    MostroInternalErr(ServiceError::DbAccessError(format!(
-                        "Failed to rollback transaction: {}",
-                        rollback_err
-                    )))
-                })?;
-
-                // Fall back to table rebuild
-                rebuild_disputes_table_without_tokens(pool).await
-            }
-        }
-    } else {
-        // SQLite version doesn't support DROP COLUMN, use table rebuild
-        tracing::info!(
-            "SQLite version {} doesn't support DROP COLUMN, using table rebuild method",
-            sqlite_version
-        );
-        rebuild_disputes_table_without_tokens(pool).await
+    if buyer_token_exists {
+        sqlx::query("ALTER TABLE disputes DROP COLUMN buyer_token")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                MostroInternalErr(ServiceError::DbAccessError(format!(
+                    "Failed to drop buyer_token column: {}",
+                    e
+                )))
+            })?;
+        tracing::info!("Dropped buyer_token column from disputes table");
     }
+
+    if seller_token_exists {
+        sqlx::query("ALTER TABLE disputes DROP COLUMN seller_token")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                MostroInternalErr(ServiceError::DbAccessError(format!(
+                    "Failed to drop seller_token column: {}",
+                    e
+                )))
+            })?;
+        tracing::info!("Dropped seller_token column from disputes table");
+    }
+
+    tx.commit().await.map_err(|e| {
+        MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Failed to commit transaction: {}",
+            e
+        )))
+    })?;
+
+    tracing::info!("Successfully removed deprecated token columns from disputes table");
+    Ok(())
 }
 
 async fn table_column_exists(
@@ -4971,19 +4829,6 @@ mod migration_and_query_tests {
         assert!(!table_column_exists(&pool, "disputes", "seller_token")
             .await
             .unwrap());
-    }
-
-    #[tokio::test]
-    async fn rebuild_disputes_table_preserves_rows() {
-        let pool = migrated_pool().await;
-        let order_id = Uuid::new_v4();
-        insert_dispute(&pool, order_id, "in-progress", Some(HEX_KEY_B)).await;
-
-        rebuild_disputes_table_without_tokens(&pool).await.unwrap();
-
-        let dispute = find_dispute_by_order_id(&pool, order_id).await.unwrap();
-        assert_eq!(dispute.order_id, order_id);
-        assert_eq!(dispute.status, "in-progress");
     }
 
     // ── admin / permission queries ───────────────────────────────────────

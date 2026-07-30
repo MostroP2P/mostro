@@ -19,6 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
+use tracing::debug;
 
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::price::config::ProviderConfig;
@@ -125,33 +126,82 @@ impl NostrProvider {
             .collect())
     }
 
-    /// Among `events`, the freshest one authored by a trusted pubkey whose
-    /// `created_at` is within `max_age` of `now` — a second client-side trust
-    /// check even though the relay-side `authors` filter should already
-    /// guarantee the pubkey (spec §10.3 / `NOSTR_EXCHANGE_RATES.md`
-    /// "clients MUST verify pubkey"), plus a freshness gate so relays that
-    /// ignore NIP-40 expiration cannot serve zombie rates. The event's own
-    /// NIP-40 `expiration` tag, if any, is also honored directly via
-    /// `Event::is_expired_at` — the `max_age` gate alone only bounds
-    /// staleness by this node's clock, so a trusted node advertising a
-    /// shorter self-declared expiry is still respected. Pure and
+    /// Every event from `events` that passes every event-level trust and
+    /// freshness gate, newest first:
+    ///
+    /// - authored by a trusted pubkey — a second client-side check even
+    ///   though the relay-side `authors` filter should already guarantee it
+    ///   (spec §10.3 / `NOSTR_EXCHANGE_RATES.md` "clients MUST verify
+    ///   pubkey");
+    /// - the exact expected envelope (`kind` 30078, `d` = `mostro-rates`) —
+    ///   `build_filter`'s relay-side query asks for this, but
+    ///   `nostr-relay-pool`'s `verify_subscriptions` defaults to `false` (not
+    ///   enabled by `connect_nostr`), so a noncompliant relay could still
+    ///   hand back a validly-signed event from a trusted pubkey of a
+    ///   different kind/`d` (CodeRabbit / re-review, PR #841);
+    /// - not future-dated (a forged or clock-skewed `created_at` must not
+    ///   look artificially fresh);
+    /// - `created_at` within `max_age` of `now`, so a relay that ignores
+    ///   NIP-40 expiration cannot keep serving a zombie rate;
+    /// - not expired per its own NIP-40 `expiration` tag, if any
+    ///   (`Event::is_expired_at`) — a trusted node's shorter self-declared
+    ///   expiry is honored even within `max_age`.
+    ///
+    /// Ranking (rather than returning a single winner) lets [`Self::fetch`]
+    /// fall through to the next-freshest candidate when the newest one turns
+    /// out to be unparsable or empty — see `parse_content` — instead of
+    /// letting one bad event from a trusted node shadow a perfectly good
+    /// older one from the same or another trusted node. Pure and
     /// unit-testable without a relay.
-    pub(crate) fn select_freshest<'a>(
+    pub(crate) fn rank_candidates<'a>(
         events: &'a [Event],
         trusted: &[PublicKey],
         now: Timestamp,
         max_age: Duration,
-    ) -> Option<&'a Event> {
+    ) -> Vec<&'a Event> {
         let max_age_secs = max_age.as_secs();
-        events
+        let mut candidates: Vec<&Event> = events
             .iter()
             .filter(|e| trusted.contains(&e.pubkey))
+            .filter(|e| e.kind == Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
+            .filter(|e| e.tags.identifier() == Some("mostro-rates"))
             // A future-dated `created_at` (forged or clock-skewed relay) would
-            // otherwise saturate the age check to 0 and win `max_by_key` outright.
+            // otherwise saturate the age check to 0 and win the ranking outright.
             .filter(|e| e.created_at <= now)
             .filter(|e| now.as_secs().saturating_sub(e.created_at.as_secs()) <= max_age_secs)
             .filter(|e| !e.is_expired_at(&now))
-            .max_by_key(|e| e.created_at)
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
+        candidates
+    }
+
+    /// Try `candidates` newest-first, returning the first one whose content
+    /// parses into a non-empty rate map. A malformed body or a `{"BTC":{}}`
+    /// empty one from the freshest candidate must not shadow a good, still-
+    /// fresh body from an older candidate — that would fail the whole tick
+    /// even though a usable redundant trusted node is right there. Split out
+    /// from [`Self::fetch`] so the fallback behavior is unit-testable
+    /// without a relay.
+    pub(crate) fn pick_first_usable(
+        candidates: &[&Event],
+    ) -> Result<ProviderQuotes, ProviderError> {
+        for event in candidates {
+            match Self::parse_content(&event.content) {
+                Ok(quotes) if !quotes.is_empty() => return Ok(quotes),
+                Ok(_) => debug!(
+                    "price: nostr: candidate event {} parsed to zero usable rates, trying next",
+                    event.id
+                ),
+                Err(e) => debug!(
+                    "price: nostr: candidate event {} failed to parse ({e}), trying next",
+                    event.id
+                ),
+            }
+        }
+        Err(ProviderError::Parse(
+            "nostr: every fresh trusted-node candidate failed to parse or yielded no usable rates"
+                .to_string(),
+        ))
     }
 }
 
@@ -172,17 +222,17 @@ impl PriceProvider for NostrProvider {
             .into_iter()
             .collect::<Vec<Event>>();
 
-        let event =
-            Self::select_freshest(&events, &self.trusted_nodes, Timestamp::now(), self.max_age)
-                .ok_or_else(|| {
-                    ProviderError::Http(
-                        "nostr: no fresh trusted-node rate event found \
+        let candidates =
+            Self::rank_candidates(&events, &self.trusted_nodes, Timestamp::now(), self.max_age);
+        if candidates.is_empty() {
+            return Err(ProviderError::Http(
+                "nostr: no fresh trusted-node rate event found \
                  (all missing, untrusted, or older than max_price_staleness_seconds)"
-                            .to_string(),
-                    )
-                })?;
+                    .to_string(),
+            ));
+        }
 
-        Self::parse_content(&event.content)
+        Self::pick_first_usable(&candidates)
     }
 }
 
@@ -247,12 +297,24 @@ mod tests {
     const NOW: u64 = 10_000;
     const MAX_AGE: Duration = Duration::from_secs(5_000);
 
+    /// The single freshest candidate, if any — these tests only care about
+    /// the winner, not the full fallback order `rank_candidates` exposes for
+    /// `pick_first_usable`.
+    fn freshest<'a>(
+        events: &'a [Event],
+        trusted: &[PublicKey],
+        now: Timestamp,
+        max_age: Duration,
+    ) -> Option<&'a Event> {
+        NostrProvider::rank_candidates(events, trusted, now, max_age)
+            .into_iter()
+            .next()
+    }
+
     #[test]
     fn select_freshest_returns_none_for_empty_events() {
         let trusted = vec![Keys::generate().public_key()];
-        assert!(
-            NostrProvider::select_freshest(&[], &trusted, Timestamp::from(NOW), MAX_AGE).is_none()
-        );
+        assert!(freshest(&[], &trusted, Timestamp::from(NOW), MAX_AGE).is_none());
     }
 
     #[test]
@@ -264,10 +326,7 @@ mod tests {
         let untrusted_event = signed_event(&untrusted_keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![untrusted_event];
 
-        assert!(
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .is_none()
-        );
+        assert!(freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).is_none());
     }
 
     #[test]
@@ -280,9 +339,7 @@ mod tests {
         let newer = signed_event(&newer_keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![older, newer.clone()];
 
-        let picked =
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .unwrap();
+        let picked = freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).unwrap();
         assert_eq!(picked.id, newer.id);
     }
 
@@ -295,9 +352,7 @@ mod tests {
         let fresh = signed_event(&keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![stale, fresh.clone()];
 
-        let picked =
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .unwrap();
+        let picked = freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).unwrap();
         assert_eq!(picked.id, fresh.id);
     }
 
@@ -309,10 +364,7 @@ mod tests {
         let stale = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs() - 1);
         let events = vec![stale];
 
-        assert!(
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .is_none()
-        );
+        assert!(freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).is_none());
     }
 
     #[test]
@@ -323,9 +375,7 @@ mod tests {
         let at_boundary = signed_event(&keys, SAMPLE_CONTENT, NOW - MAX_AGE.as_secs());
         let events = vec![at_boundary.clone()];
 
-        let picked =
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .unwrap();
+        let picked = freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).unwrap();
         assert_eq!(picked.id, at_boundary.id);
     }
 
@@ -340,9 +390,7 @@ mod tests {
         let current = signed_event(&keys, SAMPLE_CONTENT, NOW - 100);
         let events = vec![future, current.clone()];
 
-        let picked =
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .unwrap();
+        let picked = freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).unwrap();
         assert_eq!(picked.id, current.id);
     }
 
@@ -358,9 +406,7 @@ mod tests {
         let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
         let events = vec![expired, valid.clone()];
 
-        let picked =
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .unwrap();
+        let picked = freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).unwrap();
         assert_eq!(picked.id, valid.id);
     }
 
@@ -372,10 +418,99 @@ mod tests {
         let expired = signed_event_expiring_at(&keys, SAMPLE_CONTENT, NOW - 100, NOW - 50);
         let events = vec![expired];
 
+        assert!(freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE).is_none());
+    }
+
+    /// Like `signed_event`, but with an envelope (`kind`/`d`) that does not
+    /// match what `mostro-rates` events use — for exercising
+    /// `rank_candidates`'s client-side envelope revalidation.
+    fn signed_event_with_envelope(
+        keys: &Keys,
+        content: &str,
+        created_at: u64,
+        kind: u16,
+        identifier: &str,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(vec![Tag::identifier(identifier)])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("event must sign")
+    }
+
+    #[test]
+    fn rank_candidates_rejects_a_trusted_event_of_the_wrong_kind() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        // Correctly signed by a trusted node, correct `d` tag, but not the
+        // mostro-rates kind (30078) — e.g. some other event kind that
+        // pubkey happens to also publish. A relay ignoring the `authors`
+        // *and* `kind` filter (verify_subscriptions defaults to false)
+        // could still hand this back.
+        let wrong_kind =
+            signed_event_with_envelope(&keys, SAMPLE_CONTENT, NOW - 100, 1, "mostro-rates");
+        let events = vec![wrong_kind];
+
         assert!(
-            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
-                .is_none()
+            NostrProvider::rank_candidates(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn rank_candidates_rejects_a_trusted_event_with_the_wrong_identifier() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        // Right kind, right pubkey, but a `d` tag that isn't "mostro-rates"
+        // — some other NIP-33 replaceable event this trusted node happens
+        // to also publish under the same kind.
+        let wrong_identifier = signed_event_with_envelope(
+            &keys,
+            SAMPLE_CONTENT,
+            NOW - 100,
+            NOSTR_EXCHANGE_RATES_EVENT_KIND,
+            "something-else",
+        );
+        let events = vec![wrong_identifier];
+
+        assert!(
+            NostrProvider::rank_candidates(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pick_first_usable_skips_a_malformed_newest_candidate_for_an_older_valid_one() {
+        let keys = Keys::generate();
+        let malformed = signed_event(&keys, "not json", NOW - 100);
+        let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
+        let candidates = vec![&malformed, &valid];
+
+        let quotes = NostrProvider::pick_first_usable(&candidates).unwrap();
+        assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(50_000.0)));
+    }
+
+    #[test]
+    fn pick_first_usable_skips_an_empty_newest_candidate_for_an_older_valid_one() {
+        let keys = Keys::generate();
+        let empty = signed_event(&keys, r#"{"BTC": {}}"#, NOW - 100);
+        let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
+        let candidates = vec![&empty, &valid];
+
+        let quotes = NostrProvider::pick_first_usable(&candidates).unwrap();
+        assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(50_000.0)));
+    }
+
+    #[test]
+    fn pick_first_usable_errs_when_every_candidate_is_unusable() {
+        let keys = Keys::generate();
+        let malformed = signed_event(&keys, "not json", NOW - 100);
+        let empty = signed_event(&keys, r#"{"BTC": {}}"#, NOW - 200);
+        let candidates = vec![&malformed, &empty];
+
+        assert!(NostrProvider::pick_first_usable(&candidates).is_err());
     }
 
     fn sample_cfg(trusted_hex: String) -> ProviderConfig {

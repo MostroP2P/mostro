@@ -288,6 +288,14 @@ impl PriceManager {
                 (id, self.scope_quotes(id, fiat_only))
             })
             .collect();
+        // Nostr is a relay of another node's *already-aggregated* rate, not
+        // an independent peer observation (re-review, PR #841): that node's
+        // own direct sources already fed into the value it published, so
+        // blending it into the median/mean here alongside this node's own
+        // direct sources would double-count correlated information and skew
+        // the result. Keep it strictly fallback — only for currencies no
+        // other provider covered this tick.
+        let filtered_with_ids = restrict_nostr_to_fallback(filtered_with_ids);
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
@@ -497,10 +505,14 @@ impl PriceManager {
         successes: &[ProviderId],
     ) {
         // Build the `{"BTC": {ccy: value}}` body the legacy format used.
-        let rates: HashMap<String, f64> = aggregates
-            .iter()
-            .map(|(c, a)| (c.clone(), a.value))
-            .collect();
+        let rates = republishable_rates(aggregates);
+        if rates.is_empty() {
+            debug!(
+                "price: nothing to republish to Nostr this tick \
+                 (every fresh currency was Nostr-only sourced)"
+            );
+            return;
+        }
         let mut wrapper: HashMap<String, HashMap<String, f64>> = HashMap::new();
         wrapper.insert("BTC".to_string(), rates);
 
@@ -554,13 +566,67 @@ impl PriceManager {
         match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
             Ok(Ok(output)) => info!(
                 "price: published exchange rates to Nostr ({} currencies). Output: {:?}",
-                aggregates.len(),
+                wrapper["BTC"].len(),
                 output
             ),
             Ok(Err(e)) => error!("price: send_event to relays failed: {e}"),
             Err(_) => error!("price: timeout publishing exchange rates to Nostr (30s exceeded)"),
         }
     }
+}
+
+/// Drop the `Nostr` provider's quotes for any currency another provider
+/// already covered this tick, leaving every other provider untouched.
+///
+/// A trusted-node `nostr` quote is a relayed *aggregate*, not an
+/// independent local observation — the remote node already ran its own
+/// direct sources through `combine` to produce it. Feeding it into this
+/// node's `aggregate_tick` alongside those same kinds of direct sources
+/// would let one upstream signal count twice (once locally, once via the
+/// remote's combine) and skew the median/mean. Restricting it to
+/// currencies nobody else reported keeps it strictly a gap-filler — its
+/// documented purpose (spec §11.7: operators whose direct APIs are
+/// blocked) — while a fully-covered currency's value stays whatever the
+/// direct sources agree on.
+fn restrict_nostr_to_fallback(
+    results: Vec<(ProviderId, ProviderQuotes)>,
+) -> Vec<(ProviderId, ProviderQuotes)> {
+    let mut covered_elsewhere: HashSet<String> = HashSet::new();
+    for (id, quotes) in &results {
+        if *id != ProviderId::Nostr {
+            covered_elsewhere.extend(quotes.keys().cloned());
+        }
+    }
+    results
+        .into_iter()
+        .map(|(id, quotes)| {
+            if id != ProviderId::Nostr {
+                return (id, quotes);
+            }
+            let fallback_only: ProviderQuotes = quotes
+                .into_iter()
+                .filter(|(currency, _)| !covered_elsewhere.contains(currency))
+                .collect();
+            (id, fallback_only)
+        })
+        .collect()
+}
+
+/// Currencies fit to republish to Nostr this tick: everything **except**
+/// those whose only surviving contributor is `Nostr` itself.
+///
+/// Republishing a Nostr-only-sourced value with this node's own fresh
+/// `created_at`/`expiration` would erase how old the underlying quote
+/// actually is — a self-trust or A↔B trust cycle could keep a long-dead
+/// upstream quote looking perpetually fresh, one relay hop at a time
+/// (re-review, PR #841). A currency this node independently corroborated
+/// (any non-Nostr contributor) is unaffected and republishes as before.
+fn republishable_rates(aggregates: &HashMap<String, AggregateResult>) -> HashMap<String, f64> {
+    aggregates
+        .iter()
+        .filter(|(_, a)| a.contributors != [ProviderId::Nostr])
+        .map(|(c, a)| (c.clone(), a.value))
+        .collect()
 }
 
 /// Joined list of contributing provider ids for the Nostr `source` tag.
@@ -1027,6 +1093,103 @@ mod tests {
     fn sources_to_tag_is_deterministic() {
         let tag = sources_to_tag(&[ProviderId::CoinGecko, ProviderId::Yadio]);
         assert_eq!(tag, "coingecko,yadio");
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_drops_currencies_another_provider_covers() {
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_500.0)); // same currency, different value
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0)); // nobody else has this
+
+        let out = restrict_nostr_to_fallback(vec![
+            (ProviderId::Yadio, yadio),
+            (ProviderId::Nostr, nostr),
+        ]);
+
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("USD"),
+            "USD is covered by Yadio, Nostr's USD must be dropped to avoid double-counting"
+        );
+        assert_eq!(
+            nostr_out.get("ARS"),
+            Some(&Quote::PerBtc(105_000_000.0)),
+            "ARS has no other source, Nostr must still fill the gap"
+        );
+
+        let yadio_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Yadio)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert_eq!(
+            yadio_out.get("USD"),
+            Some(&Quote::PerBtc(50_000.0)),
+            "non-Nostr providers are untouched"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_is_a_noop_without_a_nostr_provider() {
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+
+        let out = restrict_nostr_to_fallback(vec![(ProviderId::Yadio, yadio.clone())]);
+        assert_eq!(out, vec![(ProviderId::Yadio, yadio)]);
+    }
+
+    #[test]
+    fn republishable_rates_drops_nostr_only_sourced_currencies() {
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+            },
+        );
+        aggregates.insert(
+            "ARS".to_string(),
+            AggregateResult {
+                value: 105_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Nostr],
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert_eq!(out.get("USD"), Some(&50_000.0));
+        assert!(
+            !out.contains_key("ARS"),
+            "Nostr-only-sourced ARS must not be republished with a fresh timestamp"
+        );
+    }
+
+    #[test]
+    fn republishable_rates_keeps_a_currency_nostr_only_partly_helped_with() {
+        // Nostr alongside another contributor (e.g. it filled in after a
+        // fallback scenario in a prior tick, or n>=2 combine) is not
+        // "Nostr-only" — still safe to republish since it wasn't the sole
+        // source.
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "EUR".to_string(),
+            AggregateResult {
+                value: 45_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Nostr, ProviderId::Yadio],
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert_eq!(out.get("EUR"), Some(&45_000.0));
     }
 
     #[tokio::test]

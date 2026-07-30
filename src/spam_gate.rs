@@ -216,20 +216,23 @@ mod tests {
 
     #[test]
     fn install_global_then_second_install_is_rejected() {
-        // The OnceLock is process-wide, so this single test owns both the
-        // first (successful) install and the AlreadyInstalled rejection.
-        let first = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
-        assert!(first.is_ok(), "first install must succeed");
+        // The OnceLock is process-wide and shared with every other test in
+        // this binary (e.g. app.rs's accept_event tests also install a
+        // gate), so another test may have already won the race to install
+        // before this one runs. Only "some install eventually succeeds, and
+        // every attempt after that is rejected" is deterministic here — not
+        // which attempt is "first".
+        let _ = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
         assert!(
             SpamGate::global().is_some(),
-            "global() must expose the installed gate"
+            "global() must expose an installed gate"
         );
 
         let second = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
         assert_eq!(
             second,
             Err(InstallError::AlreadyInstalled),
-            "a second install must be refused, not panic"
+            "an install attempted after one already succeeded must be refused, not panic"
         );
     }
 

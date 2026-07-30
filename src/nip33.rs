@@ -1362,6 +1362,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_event_does_not_duplicate_a_caller_supplied_expiration_tag() {
+        // Order events (kind 38383) always get an auto expiration tag from
+        // config when one isn't already present. Pre-supplying a real NIP-40
+        // `TagKind::Expiration` tag must suppress the auto-add, exercising
+        // the `||` in create_event's has_expiration_tag check on its
+        // `TagKind::Expiration` arm rather than only the `Custom("expiration")` arm.
+        init_test_settings();
+        let keys = Keys::generate();
+        let extra_tags = Tags::from_list(vec![Tag::expiration(Timestamp::from(123_456_u64))]);
+
+        let order = super::new_order_event(&keys, "", "order-id".to_string(), extra_tags)
+            .expect("order event");
+
+        let expiration_tags = order
+            .tags
+            .iter()
+            .filter(|t| matches!(t.kind(), TagKind::Expiration))
+            .count();
+        assert_eq!(
+            expiration_tags, 1,
+            "caller-supplied expiration tag must not be duplicated"
+        );
+    }
+
     // ── create_rating_tag ────────────────────────────────────────────────
 
     #[test]

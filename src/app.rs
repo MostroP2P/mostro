@@ -1036,6 +1036,71 @@ mod tests {
 
             assert!(result.is_none());
         }
+
+        /// Ensures a spam gate is installed for this binary run without
+        /// clobbering one another test already installed — `SPAM_GATE` is a
+        /// process-wide `OnceLock`, so at most one instance ever wins, and
+        /// every test only relies on `is_known` being false for its own
+        /// freshly-generated (never-registered) pubkey.
+        fn ensure_spam_gate_installed() {
+            let _ = crate::spam_gate::SpamGate::new(crate::spam_gate::REPLAY_WINDOW_SECS)
+                .install_global();
+        }
+
+        #[tokio::test]
+        async fn unknown_first_contact_sender_clearing_the_pow_bar_is_accepted() {
+            ensure_spam_gate_installed();
+            let ctx = create_test_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event =
+                wrap_test_order(&identity_keys, &trade_keys, receiver_keys.public_key()).await;
+
+            // is_v2 = true routes through the spam gate; a never-seen sender
+            // pubkey is always unknown, and pow_first_contact = 0 is
+            // trivially cleared, so the first-contact lane must let it
+            // through.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                0,
+                NostrKind::GiftWrap,
+                true,
+            )
+            .await;
+
+            assert!(result.is_some());
+        }
+
+        #[tokio::test]
+        async fn unknown_first_contact_sender_below_the_pow_bar_is_dropped() {
+            ensure_spam_gate_installed();
+            let ctx = create_test_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event =
+                wrap_test_order(&identity_keys, &trade_keys, receiver_keys.public_key()).await;
+
+            // pow_first_contact = u8::MAX demands more leading-zero bits than
+            // any real event id will ever have, so this deterministically
+            // fails the first-contact PoW toll.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                u8::MAX,
+                NostrKind::GiftWrap,
+                true,
+            )
+            .await;
+
+            assert!(result.is_none());
+        }
     }
 
     mod handle_message_action_tests {

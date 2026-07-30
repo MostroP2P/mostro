@@ -130,7 +130,11 @@ impl NostrProvider {
     /// check even though the relay-side `authors` filter should already
     /// guarantee the pubkey (spec §10.3 / `NOSTR_EXCHANGE_RATES.md`
     /// "clients MUST verify pubkey"), plus a freshness gate so relays that
-    /// ignore NIP-40 expiration cannot serve zombie rates. Pure and
+    /// ignore NIP-40 expiration cannot serve zombie rates. The event's own
+    /// NIP-40 `expiration` tag, if any, is also honored directly via
+    /// `Event::is_expired_at` — the `max_age` gate alone only bounds
+    /// staleness by this node's clock, so a trusted node advertising a
+    /// shorter self-declared expiry is still respected. Pure and
     /// unit-testable without a relay.
     pub(crate) fn select_freshest<'a>(
         events: &'a [Event],
@@ -146,6 +150,7 @@ impl NostrProvider {
             // otherwise saturate the age check to 0 and win `max_by_key` outright.
             .filter(|e| e.created_at <= now)
             .filter(|e| now.as_secs().saturating_sub(e.created_at.as_secs()) <= max_age_secs)
+            .filter(|e| !e.is_expired_at(&now))
             .max_by_key(|e| e.created_at)
     }
 }
@@ -212,6 +217,25 @@ mod tests {
     fn signed_event(keys: &Keys, content: &str, created_at: u64) -> Event {
         EventBuilder::new(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND), content)
             .tags(vec![Tag::identifier("mostro-rates")])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("event must sign")
+    }
+
+    /// Like `signed_event`, but carrying a NIP-40 `expiration` tag — for
+    /// exercising `select_freshest`'s `is_expired_at` gate independently of
+    /// the `max_age` gate.
+    fn signed_event_expiring_at(
+        keys: &Keys,
+        content: &str,
+        created_at: u64,
+        expiration: u64,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND), content)
+            .tags(vec![
+                Tag::identifier("mostro-rates"),
+                Tag::expiration(Timestamp::from(expiration)),
+            ])
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(keys)
             .expect("event must sign")
@@ -320,6 +344,38 @@ mod tests {
             NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
                 .unwrap();
         assert_eq!(picked.id, current.id);
+    }
+
+    #[test]
+    fn select_freshest_rejects_an_expired_event_even_if_it_is_the_newest() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        // Newer by created_at, but self-declared expired via NIP-40 — a
+        // relay that ignores expiration and still serves it must not let it
+        // win over an older, still-valid event.
+        let expired = signed_event_expiring_at(&keys, SAMPLE_CONTENT, NOW - 100, NOW - 50);
+        let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
+        let events = vec![expired, valid.clone()];
+
+        let picked =
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .unwrap();
+        assert_eq!(picked.id, valid.id);
+    }
+
+    #[test]
+    fn select_freshest_returns_none_when_every_trusted_event_is_expired() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+
+        let expired = signed_event_expiring_at(&keys, SAMPLE_CONTENT, NOW - 100, NOW - 50);
+        let events = vec![expired];
+
+        assert!(
+            NostrProvider::select_freshest(&events, &trusted, Timestamp::from(NOW), MAX_AGE)
+                .is_none()
+        );
     }
 
     fn sample_cfg(trusted_hex: String) -> ProviderConfig {

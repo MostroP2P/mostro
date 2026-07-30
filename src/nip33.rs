@@ -505,7 +505,10 @@ fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
         Transport::Nip44Direct => mostro_settings
             .pow
             .max(mostro_settings.effective_pow_first_contact()),
-        _ => mostro_settings.pow,
+        // Matched explicitly rather than with a catch-all: a future transport
+        // variant must fail the build here instead of silently advertising the
+        // base `pow` for a gate whose behaviour nobody has considered yet.
+        Transport::GiftWrap => mostro_settings.pow,
     }
 }
 
@@ -910,17 +913,25 @@ mod tests {
 
         let tags = info_to_tags(&ln_status);
 
+        // Asserted against literals, not against a second call to the helper:
+        // deriving `expected` from the code under test would pass under any
+        // wrong implementation. `test_settings()` is the shipped default —
+        // `pow = 0`, `pow_first_contact` unset, gift-wrap transport — so both
+        // tags must read "0". The per-transport resolution matrix is pinned
+        // separately in `advertised_first_contact_pow_is_transport_dependent`.
         let settings = test_settings();
         assert_eq!(
+            settings.mostro.pow, 0,
+            "default settings assumed by this test"
+        );
+        assert_eq!(
             get_tag_value(&tags, "pow").as_deref(),
-            Some(settings.mostro.pow.to_string().as_str()),
+            Some("0"),
             "info_to_tags must advertise the base PoW difficulty"
         );
-
-        let expected = super::advertised_first_contact_pow(&settings.mostro).to_string();
         assert_eq!(
             get_tag_value(&tags, "pow_first_contact").as_deref(),
-            Some(expected.as_str()),
+            Some("0"),
             "info_to_tags must advertise the first-contact PoW difficulty"
         );
     }

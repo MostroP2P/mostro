@@ -293,6 +293,24 @@ async fn handle_message_action(
     }
 }
 
+/// True when a rumor's `created_at` falls outside the 10s replay window.
+/// Pulled out of `accept_event` so the boundary can be hit directly instead
+/// of only through a live wrapped event.
+fn is_stale(created_at: Timestamp, since_time: u64) -> bool {
+    created_at.as_secs() < since_time
+}
+
+/// True when the inner rumor is missing a required signature. Full-privacy
+/// clients reuse the trade key as identity and send unsigned rumors; any
+/// other identity/sender split must carry a valid inner signature.
+fn missing_inner_signature(
+    identity: PublicKey,
+    sender: PublicKey,
+    signature: Option<Signature>,
+) -> bool {
+    identity != sender && signature.is_none()
+}
+
 /// Decode and fully validate one relay event into a dispatchable
 /// `(action, message, unwrapped)` triple, or `None` if it must be skipped
 /// (failed PoW, wrong kind, spam-gate drop, decrypt failure, stale, missing
@@ -376,7 +394,7 @@ async fn accept_event(
         .checked_sub_signed(chrono::Duration::seconds(10))
         .unwrap()
         .timestamp() as u64;
-    if unwrapped.created_at.as_secs() < since_time {
+    if is_stale(unwrapped.created_at, since_time) {
         return None;
     }
     let message = unwrapped.message.clone();
@@ -385,7 +403,7 @@ async fn accept_event(
     // unsigned rumors. Any other shape must carry a valid inner
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
-    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+    if missing_inner_signature(unwrapped.identity, unwrapped.sender, unwrapped.signature) {
         tracing::warn!(
             "Missing inner signature: identity {} differs from trade key {}",
             unwrapped.identity,
@@ -609,6 +627,46 @@ mod tests {
             identity: identity.public_key(),
             created_at: Timestamp::now(),
         }
+    }
+
+    #[test]
+    fn is_stale_rejects_events_older_than_the_cutoff() {
+        assert!(is_stale(Timestamp::from(99), 100));
+    }
+
+    #[test]
+    fn is_stale_accepts_events_exactly_at_the_cutoff() {
+        assert!(!is_stale(Timestamp::from(100), 100));
+    }
+
+    #[test]
+    fn is_stale_accepts_events_newer_than_the_cutoff() {
+        assert!(!is_stale(Timestamp::from(101), 100));
+    }
+
+    #[test]
+    fn missing_inner_signature_true_when_identity_and_sender_differ_unsigned() {
+        let identity = create_test_keys().public_key();
+        let sender = create_test_keys().public_key();
+        assert!(missing_inner_signature(identity, sender, None));
+    }
+
+    #[test]
+    fn missing_inner_signature_false_when_identity_equals_sender_unsigned() {
+        let same = create_test_keys().public_key();
+        assert!(!missing_inner_signature(same, same, None));
+    }
+
+    #[test]
+    fn missing_inner_signature_false_when_signed_even_if_identity_differs() {
+        let identity = create_test_keys().public_key();
+        let sender_keys = create_test_keys();
+        let sig = sender_keys.sign_schnorr([7u8; 32]);
+        assert!(!missing_inner_signature(
+            identity,
+            sender_keys.public_key(),
+            Some(sig)
+        ));
     }
 
     #[test]
@@ -864,6 +922,119 @@ mod tests {
             let result = check_trade_index(&ctx, &event, &message).await;
             // Result could be Ok or Err depending on database state
             assert!(result.is_ok() || result.is_err());
+        }
+    }
+
+    mod accept_event_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use mostro_core::prelude::*;
+        use sqlx::SqlitePool;
+        use std::sync::Arc;
+
+        async fn create_test_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        #[allow(deprecated)] // Transport::GiftWrap: still the tested default; see #786.
+        async fn wrap_test_order(
+            identity_keys: &Keys,
+            trade_keys: &Keys,
+            receiver: PublicKey,
+        ) -> Event {
+            // RestoreSession is the one action whose payload is required to
+            // be None (mostro-core's `verify()`), which keeps this helper
+            // free of a hand-built `Payload::Order`.
+            wrap_message_with(
+                Transport::GiftWrap,
+                &create_test_message(Action::RestoreSession, None),
+                identity_keys,
+                trade_keys,
+                receiver,
+                WrapOptions::default(),
+            )
+            .await
+            .expect("gift wrap succeeds")
+        }
+
+        #[tokio::test]
+        async fn accepts_a_validly_wrapped_event_and_returns_the_action() {
+            let ctx = create_test_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event =
+                wrap_test_order(&identity_keys, &trade_keys, receiver_keys.public_key()).await;
+
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                0,
+                NostrKind::GiftWrap,
+                false,
+            )
+            .await;
+
+            let (action, _message, unwrapped) = result.expect("valid event should be accepted");
+            assert_eq!(action, Action::RestoreSession);
+            assert_eq!(unwrapped.sender, trade_keys.public_key());
+            assert_eq!(unwrapped.identity, identity_keys.public_key());
+        }
+
+        #[tokio::test]
+        async fn rejects_an_event_of_the_wrong_kind() {
+            let ctx = create_test_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event =
+                wrap_test_order(&identity_keys, &trade_keys, receiver_keys.public_key()).await;
+
+            // The event is a real, validly-signed GiftWrap; accepted_kind is
+            // deliberately mismatched to exercise the kind-gate on its own.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                0,
+                NostrKind::TextNote,
+                false,
+            )
+            .await;
+
+            assert!(result.is_none());
+        }
+
+        #[tokio::test]
+        async fn rejects_an_event_not_addressed_to_the_receiver() {
+            let ctx = create_test_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let intended_receiver = create_test_keys();
+            let eavesdropper = create_test_keys();
+            let event =
+                wrap_test_order(&identity_keys, &trade_keys, intended_receiver.public_key()).await;
+
+            // unwrap_incoming can't decrypt a rumor sealed for someone else.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &eavesdropper,
+                0,
+                0,
+                NostrKind::GiftWrap,
+                false,
+            )
+            .await;
+
+            assert!(result.is_none());
         }
     }
 

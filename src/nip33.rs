@@ -567,13 +567,18 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
             TagKind::Custom(Cow::Borrowed("pow")),
             vec![mostro_settings.pow.to_string()],
         ),
-        // Companion of `pow` for the Phase 2 anti-spam gate: the difficulty a
-        // *first-contact* event must clear (sender not in the active-trade
-        // cache). Advertised as an already-resolved absolute difficulty so a
-        // client can grind the right amount of work for a brand-new order or
-        // take without replicating the fallback rules. Under-powered events are
-        // dropped before decryption with no reply, so discovery has to come
-        // from here. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
+        // Companion of `pow` for the Phase 2 anti-spam gate: the difficulty an
+        // event from a sender that is *not* in the active-trade cache must
+        // clear. Advertised as an already-resolved absolute difficulty so a
+        // client can grind the right amount of work without replicating the
+        // fallback rules. Under-powered events are dropped before decryption
+        // with no reply, so discovery has to come from here.
+        //
+        // This is a per-*event* requirement, not a one-off toll on the first
+        // one: the cache is rebuilt periodically, so a trade key stays
+        // unrecognized for up to one `active_pubkeys_refresh_interval` after
+        // its first accepted event and its follow-ups must carry the same
+        // work. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
             TagKind::Custom(Cow::Borrowed("pow_first_contact")),
             vec![advertised_first_contact_pow(mostro_settings).to_string()],
@@ -913,26 +918,35 @@ mod tests {
 
         let tags = info_to_tags(&ln_status);
 
-        // Asserted against literals, not against a second call to the helper:
-        // deriving `expected` from the code under test would pass under any
-        // wrong implementation. `test_settings()` is the shipped default —
-        // `pow = 0`, `pow_first_contact` unset, gift-wrap transport — so both
-        // tags must read "0". The per-transport resolution matrix is pinned
-        // separately in `advertised_first_contact_pow_is_transport_dependent`.
-        let settings = test_settings();
-        assert_eq!(
-            settings.mostro.pow, 0,
-            "default settings assumed by this test"
-        );
+        // Expectations come from the settings actually installed in
+        // `MOSTRO_CONFIG`, never from this module's `test_settings()` copy:
+        // the OnceLock is process-wide and first-set-wins, so whichever test
+        // module runs first in the binary decides what `info_to_tags` reads.
+        // Pinning literals here would make this test depend on that ordering.
+        // Both values compared below are plain config data, not something the
+        // code under test derives — the resolution rules, including what the
+        // shipped defaults advertise, are pinned against literals in
+        // `advertised_first_contact_pow_is_transport_dependent`.
+        let live = &MOSTRO_CONFIG
+            .get()
+            .expect("init_test_settings installs a config")
+            .mostro;
         assert_eq!(
             get_tag_value(&tags, "pow").as_deref(),
-            Some("0"),
+            Some(live.pow.to_string().as_str()),
             "info_to_tags must advertise the base PoW difficulty"
         );
-        assert_eq!(
-            get_tag_value(&tags, "pow_first_contact").as_deref(),
-            Some("0"),
-            "info_to_tags must advertise the first-contact PoW difficulty"
+        let first_contact: u8 = get_tag_value(&tags, "pow_first_contact")
+            .expect("info_to_tags must advertise the first-contact PoW difficulty")
+            .parse()
+            .expect("the pow_first_contact tag must carry a NIP-13 difficulty");
+        // The one relation that must hold for *any* configuration: the base
+        // check runs first, so advertising below `pow` would tell a client to
+        // mine less work than the node accepts and have its event dropped.
+        assert!(
+            first_contact >= live.pow,
+            "advertised first-contact difficulty {first_contact} is below the enforced base pow {}",
+            live.pow
         );
     }
 
@@ -984,6 +998,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(super::advertised_first_contact_pow(&v1), 4);
+
+        // The shipped defaults (`pow = 0`, `pow_first_contact` unset) must
+        // advertise "0" — identical in meaning to the pre-tag behaviour, so a
+        // node that changes nothing keeps demanding nothing. Pinned here, on
+        // an explicit value, rather than in the `info_to_tags` test, whose
+        // config depends on which module wins the OnceLock race.
+        assert_eq!(
+            super::advertised_first_contact_pow(&MostroSettings::default()),
+            0
+        );
     }
 
     /// Look up a single-value tag in a Tags collection, returning its

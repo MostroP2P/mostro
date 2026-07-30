@@ -68,5 +68,5 @@ docker-build-startos:
 
 mutation-test:
 	@set -o pipefail; \
-	CARGO_MUTANTS_JOBS=2 cargo mutants $(ARGS)
+	CARGO_MUTANTS_JOBS=2 MOSTRO_TEST_LN_PORT=18080 cargo mutants $(ARGS)
 

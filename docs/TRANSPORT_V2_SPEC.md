@@ -224,6 +224,15 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   re-sent identical event id before decryption. The existing 10-second
   freshness window (post-decrypt, on the inner `created_at`) still applies as
   the precise stale-event check.
+- **Discoverability** (`src/nip33.rs`): the kind-38385 info event carries a
+  `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
+  reply — it never reaches a handler — so the info event is the only way a
+  client can learn what a first event costs. The published value is the
+  *enforced* difficulty (`advertised_first_contact_pow`): on `nip44`
+  `max(pow, effective_pow_first_contact())` — a max because the two checks run
+  in sequence, so a `pow_first_contact` below `pow` still enforces `pow` — and
+  on `gift-wrap` just `pow`, since the gate never runs there and advertising the
+  stiffer number would make clients grind work nobody checks.
 
 New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
 and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,

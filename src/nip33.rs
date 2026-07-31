@@ -940,13 +940,20 @@ mod tests {
             .expect("info_to_tags must advertise the first-contact PoW difficulty")
             .parse()
             .expect("the pow_first_contact tag must carry a NIP-13 difficulty");
-        // The one relation that must hold for *any* configuration: the base
-        // check runs first, so advertising below `pow` would tell a client to
-        // mine less work than the node accepts and have its event dropped.
-        assert!(
-            first_contact >= live.pow,
-            "advertised first-contact difficulty {first_contact} is below the enforced base pow {}",
-            live.pow
+        // Compared against the resolver rather than against a lower bound like
+        // `>= live.pow`: this assertion is about *wiring* — that the resolved
+        // difficulty is what reaches the `pow_first_contact` tag, and not, say,
+        // the base `pow`, which a bound would happily accept. What the resolver
+        // must itself return per transport, shipped defaults included, is
+        // pinned against literals in
+        // `advertised_first_contact_pow_is_transport_dependent`.
+        let expected = super::advertised_first_contact_pow(live);
+        assert_eq!(
+            first_contact, expected,
+            "info_to_tags advertised first-contact difficulty {first_contact}, \
+             but the gate enforces {expected} under the installed settings \
+             (pow = {}, pow_first_contact = {:?})",
+            live.pow, live.pow_first_contact
         );
     }
 

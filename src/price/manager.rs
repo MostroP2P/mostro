@@ -588,13 +588,20 @@ impl PriceManager {
 /// documented purpose (spec §11.7: operators whose direct APIs are
 /// blocked) — while a fully-covered currency's value stays whatever the
 /// direct sources agree on.
+///
+/// Coverage is matched case-insensitively because that is what decides a
+/// collision downstream: `aggregate_tick` upper-cases every code before
+/// grouping, so `usd` from a direct source and `USD` from Nostr land in the
+/// same bucket. Not every adapter normalises on the way out (Yadio forwards
+/// the API's codes verbatim), so comparing raw keys here would let exactly
+/// the double-count this function exists to prevent slip through.
 fn restrict_nostr_to_fallback(
     results: Vec<(ProviderId, ProviderQuotes)>,
 ) -> Vec<(ProviderId, ProviderQuotes)> {
     let mut covered_elsewhere: HashSet<String> = HashSet::new();
     for (id, quotes) in &results {
         if *id != ProviderId::Nostr {
-            covered_elsewhere.extend(quotes.keys().cloned());
+            covered_elsewhere.extend(quotes.keys().map(|c| c.to_uppercase()));
         }
     }
     results
@@ -605,7 +612,7 @@ fn restrict_nostr_to_fallback(
             }
             let fallback_only: ProviderQuotes = quotes
                 .into_iter()
-                .filter(|(currency, _)| !covered_elsewhere.contains(currency))
+                .filter(|(currency, _)| !covered_elsewhere.contains(&currency.to_uppercase()))
                 .collect();
             (id, fallback_only)
         })
@@ -1132,6 +1139,40 @@ mod tests {
             yadio_out.get("USD"),
             Some(&Quote::PerBtc(50_000.0)),
             "non-Nostr providers are untouched"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_matches_coverage_case_insensitively() {
+        // Yadio forwards the API's codes verbatim, so a lowercase code is
+        // reachable in production. `aggregate_tick` upper-cases before
+        // grouping, so `usd` and `USD` are the same currency by the time it
+        // matters — coverage has to be matched the same way.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("usd".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_500.0));
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let out = restrict_nostr_to_fallback(vec![
+            (ProviderId::Yadio, yadio),
+            (ProviderId::Nostr, nostr),
+        ]);
+
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("USD"),
+            "Yadio's lowercase `usd` covers Nostr's `USD` — both fold to the \
+             same aggregate, so Nostr's quote must be dropped"
+        );
+        assert_eq!(
+            nostr_out.get("ARS"),
+            Some(&Quote::PerBtc(105_000_000.0)),
+            "ARS is still uncovered, Nostr must fill the gap"
         );
     }
 

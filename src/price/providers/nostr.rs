@@ -273,7 +273,7 @@ mod tests {
     }
 
     /// Like `signed_event`, but carrying a NIP-40 `expiration` tag — for
-    /// exercising `select_freshest`'s `is_expired_at` gate independently of
+    /// exercising `rank_candidates`'s `is_expired_at` gate independently of
     /// the `max_age` gate.
     fn signed_event_expiring_at(
         keys: &Keys,
@@ -291,7 +291,7 @@ mod tests {
             .expect("event must sign")
     }
 
-    /// Relative clock for `select_freshest` unit tests — events use small
+    /// Relative clock for `rank_candidates` unit tests — events use small
     /// synthetic `created_at` values, so tests pass an explicit `now`
     /// instead of wall-clock time.
     const NOW: u64 = 10_000;
@@ -312,13 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_returns_none_for_empty_events() {
+    fn rank_candidates_returns_none_for_empty_events() {
         let trusted = vec![Keys::generate().public_key()];
         assert!(freshest(&[], &trusted, Timestamp::from(NOW), MAX_AGE).is_none());
     }
 
     #[test]
-    fn select_freshest_ignores_untrusted_authors() {
+    fn rank_candidates_ignores_untrusted_authors() {
         let trusted_keys = Keys::generate();
         let untrusted_keys = Keys::generate();
         let trusted = vec![trusted_keys.public_key()];
@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_picks_the_newest_trusted_event() {
+    fn rank_candidates_picks_the_newest_trusted_event() {
         let older_keys = Keys::generate();
         let newer_keys = Keys::generate();
         let trusted = vec![older_keys.public_key(), newer_keys.public_key()];
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_discards_events_older_than_max_age() {
+    fn rank_candidates_discards_events_older_than_max_age() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_returns_none_when_all_trusted_are_stale() {
+    fn rank_candidates_returns_none_when_all_trusted_are_stale() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_keeps_event_exactly_at_max_age_boundary() {
+    fn rank_candidates_keeps_event_exactly_at_max_age_boundary() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_rejects_future_dated_events() {
+    fn rank_candidates_rejects_future_dated_events() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_rejects_an_expired_event_even_if_it_is_the_newest() {
+    fn rank_candidates_rejects_an_expired_event_even_if_it_is_the_newest() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 
@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn select_freshest_returns_none_when_every_trusted_event_is_expired() {
+    fn rank_candidates_returns_none_when_every_trusted_event_is_expired() {
         let keys = Keys::generate();
         let trusted = vec![keys.public_key()];
 

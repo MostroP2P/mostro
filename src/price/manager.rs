@@ -323,8 +323,7 @@ impl PriceManager {
         report.contributors = contributors;
 
         if self.settings.publish_to_nostr {
-            self.publish_rates_to_nostr(&aggregates, &report.contributors)
-                .await;
+            self.publish_rates_to_nostr(&aggregates).await;
         }
 
         report
@@ -499,11 +498,7 @@ impl PriceManager {
     /// **contributing** provider ids (spec §9 Phase 1: still effectively
     /// one source, but the multi-source shape is in place). Publishing is
     /// best-effort and never fails the tick.
-    async fn publish_rates_to_nostr(
-        &self,
-        aggregates: &HashMap<String, AggregateResult>,
-        successes: &[ProviderId],
-    ) {
+    async fn publish_rates_to_nostr(&self, aggregates: &HashMap<String, AggregateResult>) {
         // Build the `{"BTC": {ccy: value}}` body the legacy format used.
         let rates = republishable_rates(aggregates);
         if rates.is_empty() {
@@ -513,6 +508,9 @@ impl PriceManager {
             );
             return;
         }
+        // Derived before `rates` is moved into the body it describes.
+        let source_tag = sources_to_tag(&republished_contributors(aggregates, &rates));
+
         let mut wrapper: HashMap<String, HashMap<String, f64>> = HashMap::new();
         wrapper.insert("BTC".to_string(), rates);
 
@@ -536,7 +534,6 @@ impl PriceManager {
         // Match legacy bitcoin_price.rs: 2× the interval, capped at 1h.
         let expiration_seconds = std::cmp::min(self.settings.update_interval_seconds * 2, 3600);
         let expiration = timestamp + expiration_seconds as i64;
-        let source_tag = sources_to_tag(successes);
         let tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom("published_at".into()),
@@ -633,6 +630,26 @@ fn republishable_rates(aggregates: &HashMap<String, AggregateResult>) -> HashMap
         .iter()
         .filter(|(_, a)| a.contributors != [ProviderId::Nostr])
         .map(|(c, a)| (c.clone(), a.value))
+        .collect()
+}
+
+/// Providers that actually contributed to the republished payload.
+///
+/// The tick-wide contributor list covers every aggregate, but
+/// `republishable_rates` can drop currencies — so a provider whose every
+/// contribution was filtered out would still be named in the `source` tag
+/// of a body carrying none of its data. Deriving the tag from the
+/// surviving currencies keeps the tag honest about what actually ships.
+fn republished_contributors(
+    aggregates: &HashMap<String, AggregateResult>,
+    rates: &HashMap<String, f64>,
+) -> Vec<ProviderId> {
+    aggregates
+        .iter()
+        .filter(|(currency, _)| rates.contains_key(*currency))
+        .flat_map(|(_, a)| a.contributors.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -1210,6 +1227,47 @@ mod tests {
         assert!(
             !out.contains_key("ARS"),
             "Nostr-only-sourced ARS must not be republished with a fresh timestamp"
+        );
+    }
+
+    #[test]
+    fn republished_contributors_omits_a_provider_whose_currencies_were_all_dropped() {
+        // Nostr's only contribution is the ARS aggregate, which
+        // `republishable_rates` drops as Nostr-only — so the published body
+        // carries nothing from Nostr and the `source` tag must not claim it.
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+            },
+        );
+        aggregates.insert(
+            "ARS".to_string(),
+            AggregateResult {
+                value: 105_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Nostr],
+            },
+        );
+
+        let rates = republishable_rates(&aggregates);
+        let contributors = republished_contributors(&aggregates, &rates);
+
+        assert_eq!(
+            contributors,
+            vec![ProviderId::Yadio, ProviderId::CoinGecko]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "only the providers behind the surviving USD rate belong in the tag"
+        );
+        assert!(
+            !sources_to_tag(&contributors).contains("nostr"),
+            "the `source` tag must not name a provider absent from the body"
         );
     }
 
@@ -1851,9 +1909,7 @@ mod coverage_tests {
                 contributors: vec![ProviderId::Yadio],
             },
         );
-        manager
-            .publish_rates_to_nostr(&aggregates, &[ProviderId::Yadio])
-            .await;
+        manager.publish_rates_to_nostr(&aggregates).await;
     }
 
     #[tokio::test]

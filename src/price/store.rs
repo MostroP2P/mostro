@@ -131,6 +131,7 @@ mod tests {
                         // exercise TTL/last-known-good semantics. Empty
                         // is fine since the store never reads this field.
                         contributors: Vec::new(),
+                        nostr_anchor_dependent: false,
                     },
                 )
             })

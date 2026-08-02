@@ -34,10 +34,12 @@ use mostro_core::error::{MostroError, ServiceError};
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use super::aggregate::{aggregate_tick, AggregateResult};
+use super::aggregate::{aggregate_tick, combine, AggregateResult};
 use super::config::{PriceSettings, ProviderConfig};
 use super::fiat::is_known_fiat;
-use super::provider::{PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes};
+use super::provider::{
+    PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes, Quote,
+};
 use super::providers::blockchain::BlockchainProvider;
 use super::providers::coingecko::CoinGeckoProvider;
 use super::providers::currency_api::CurrencyApiProvider;
@@ -295,7 +297,8 @@ impl PriceManager {
         // direct sources would double-count correlated information and skew
         // the result. Keep it strictly fallback — only for currencies no
         // other provider covered this tick.
-        let filtered_with_ids = restrict_nostr_to_fallback(filtered_with_ids);
+        let filtered_with_ids =
+            restrict_nostr_to_fallback(filtered_with_ids, self.settings.outlier_threshold_pct);
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
@@ -573,7 +576,8 @@ impl PriceManager {
 }
 
 /// Drop the `Nostr` provider's quotes for any currency another provider
-/// already covered this tick, leaving every other provider untouched.
+/// can actually produce a value for this tick, leaving every other
+/// provider untouched.
 ///
 /// A trusted-node `nostr` quote is a relayed *aggregate*, not an
 /// independent local observation — the remote node already ran its own
@@ -581,26 +585,26 @@ impl PriceManager {
 /// node's `aggregate_tick` alongside those same kinds of direct sources
 /// would let one upstream signal count twice (once locally, once via the
 /// remote's combine) and skew the median/mean. Restricting it to
-/// currencies nobody else reported keeps it strictly a gap-filler — its
-/// documented purpose (spec §11.7: operators whose direct APIs are
-/// blocked) — while a fully-covered currency's value stays whatever the
-/// direct sources agree on.
+/// currencies nobody else can resolve keeps it strictly a gap-filler —
+/// its documented purpose (spec §11.7) — while a fully-covered currency's
+/// value stays whatever the direct sources agree on.
 ///
-/// Coverage is matched case-insensitively because that is what decides a
-/// collision downstream: `aggregate_tick` upper-cases every code before
-/// grouping, so `usd` from a direct source and `USD` from Nostr land in the
-/// same bucket. Not every adapter normalises on the way out (Yadio forwards
-/// the API's codes verbatim), so comparing raw keys here would let exactly
-/// the double-count this function exists to prevent slip through.
+/// Coverage is decided **after** fiat-cross resolution, not from raw quote
+/// keys. El Toque reports CUP/MLC only as `PerBase { base: USD }`; a key
+/// presence check would treat that as covering CUP even when the USD
+/// anchor is missing, drop Nostr's usable `PerBtc` CUP, then lose CUP
+/// entirely when the cross fails to resolve (ermeme, PR #841). Anchors
+/// are built from *all* direct `PerBtc` quotes (including Nostr) so a
+/// local El Toque cross that needs Nostr's USD still counts as covering
+/// CUP — Nostr's direct CUP is then correctly suppressed as redundant.
+///
+/// Currency codes are folded to uppercase because `aggregate_tick` does
+/// the same before grouping; Yadio forwards API codes verbatim.
 fn restrict_nostr_to_fallback(
     results: Vec<(ProviderId, ProviderQuotes)>,
+    outlier_pct: f64,
 ) -> Vec<(ProviderId, ProviderQuotes)> {
-    let mut covered_elsewhere: HashSet<String> = HashSet::new();
-    for (id, quotes) in &results {
-        if *id != ProviderId::Nostr {
-            covered_elsewhere.extend(quotes.keys().map(|c| c.to_uppercase()));
-        }
-    }
+    let covered_elsewhere = currencies_covered_by_non_nostr(&results, outlier_pct);
     results
         .into_iter()
         .map(|(id, quotes)| {
@@ -616,19 +620,73 @@ fn restrict_nostr_to_fallback(
         .collect()
 }
 
+/// Currencies a non-Nostr provider can actually yield this tick: either a
+/// usable direct `PerBtc`, or a `PerBase` that resolves against the
+/// tick's anchors (anchors include Nostr `PerBtc` so local crosses can
+/// still cover a currency when only the relayed USD is available).
+fn currencies_covered_by_non_nostr(
+    results: &[(ProviderId, ProviderQuotes)],
+    outlier_pct: f64,
+) -> HashSet<String> {
+    let mut direct: HashMap<String, Vec<f64>> = HashMap::new();
+    for (_id, quotes) in results {
+        for (currency, quote) in quotes {
+            if let Quote::PerBtc(v) = quote {
+                if v.is_finite() && *v > 0.0 {
+                    direct.entry(currency.to_uppercase()).or_default().push(*v);
+                }
+            }
+        }
+    }
+    let mut anchors: HashMap<String, f64> = HashMap::new();
+    for (currency, values) in &direct {
+        if let Some(v) = combine(values, outlier_pct) {
+            anchors.insert(currency.clone(), v);
+        }
+    }
+
+    let mut covered: HashSet<String> = HashSet::new();
+    for (id, quotes) in results {
+        if *id == ProviderId::Nostr {
+            continue;
+        }
+        for (currency, quote) in quotes {
+            let code = currency.to_uppercase();
+            match quote {
+                Quote::PerBtc(v) if v.is_finite() && *v > 0.0 => {
+                    covered.insert(code);
+                }
+                Quote::PerBase { base, value } => {
+                    if let Some(anchor) = anchors.get(&base.to_uppercase()) {
+                        let candidate = value * anchor;
+                        if candidate.is_finite() && candidate > 0.0 {
+                            covered.insert(code);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    covered
+}
+
 /// Currencies fit to republish to Nostr this tick: everything **except**
-/// those whose only surviving contributor is `Nostr` itself.
+/// those that still depend on a Nostr-sourced rate.
 ///
-/// Republishing a Nostr-only-sourced value with this node's own fresh
-/// `created_at`/`expiration` would erase how old the underlying quote
-/// actually is — a self-trust or A↔B trust cycle could keep a long-dead
-/// upstream quote looking perpetually fresh, one relay hop at a time
-/// (re-review, PR #841). A currency this node independently corroborated
-/// (any non-Nostr contributor) is unaffected and republishes as before.
+/// Two cases must not be re-stamped with a fresh `created_at`/`expiration`
+/// (re-review, PR #841):
+/// - sole surviving contributor is `Nostr` itself;
+/// - a fiat-cross resolved against a Nostr-touched USD (or other) anchor
+///   (`nostr_anchor_dependent`) — e.g. El Toque CUP × Nostr USD would
+///   otherwise publish as `source=eltoque` while embedding a relayed rate.
+///
+/// A currency this node independently corroborated with a non-Nostr
+/// absolute path (and no Nostr-anchor cross) republishes as before.
 fn republishable_rates(aggregates: &HashMap<String, AggregateResult>) -> HashMap<String, f64> {
     aggregates
         .iter()
-        .filter(|(_, a)| a.contributors != [ProviderId::Nostr])
+        .filter(|(_, a)| a.contributors != [ProviderId::Nostr] && !a.nostr_anchor_dependent)
         .map(|(c, a)| (c.clone(), a.value))
         .collect()
 }
@@ -1127,10 +1185,10 @@ mod tests {
         nostr.insert("USD".into(), Quote::PerBtc(50_500.0)); // same currency, different value
         nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0)); // nobody else has this
 
-        let out = restrict_nostr_to_fallback(vec![
-            (ProviderId::Yadio, yadio),
-            (ProviderId::Nostr, nostr),
-        ]);
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::Yadio, yadio), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
 
         let nostr_out = out
             .iter()
@@ -1171,10 +1229,10 @@ mod tests {
         nostr.insert("USD".into(), Quote::PerBtc(50_500.0));
         nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
 
-        let out = restrict_nostr_to_fallback(vec![
-            (ProviderId::Yadio, yadio),
-            (ProviderId::Nostr, nostr),
-        ]);
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::Yadio, yadio), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
 
         let nostr_out = out
             .iter()
@@ -1198,8 +1256,78 @@ mod tests {
         let mut yadio = ProviderQuotes::new();
         yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
 
-        let out = restrict_nostr_to_fallback(vec![(ProviderId::Yadio, yadio.clone())]);
+        let out = restrict_nostr_to_fallback(vec![(ProviderId::Yadio, yadio.clone())], 5.0);
         assert_eq!(out, vec![(ProviderId::Yadio, yadio)]);
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_keeps_nostr_when_per_base_cannot_resolve() {
+        // El Toque "has" CUP as a key, but without a USD anchor the cross
+        // cannot resolve — treating the raw key as coverage would drop
+        // Nostr's usable PerBtc CUP and leave the tick with no CUP at all
+        // (ermeme, PR #841).
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 300.0,
+            },
+        );
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::ElToque, eltoque), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert_eq!(
+            nostr_out.get("CUP"),
+            Some(&Quote::PerBtc(30_000_000.0)),
+            "unresolvable El Toque PerBase must not suppress Nostr's PerBtc CUP"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_drops_nostr_when_per_base_resolves_via_nostr_usd() {
+        // Nostr supplies USD; El Toque's CUP/USD then resolves. CUP is
+        // covered by the local cross, so Nostr's direct CUP must not also
+        // vote (would double-count correlated remote aggregate data).
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_000.0));
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::ElToque, eltoque), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("CUP"),
+            "El Toque CUP that resolves against Nostr USD covers the currency"
+        );
+        assert_eq!(
+            nostr_out.get("USD"),
+            Some(&Quote::PerBtc(50_000.0)),
+            "Nostr USD is still needed as the anchor"
+        );
     }
 
     #[test]
@@ -1211,6 +1339,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 2,
                 contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+                nostr_anchor_dependent: false,
             },
         );
         aggregates.insert(
@@ -1219,6 +1348,7 @@ mod tests {
                 value: 105_000_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Nostr],
+                nostr_anchor_dependent: false,
             },
         );
 
@@ -1242,6 +1372,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 2,
                 contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+                nostr_anchor_dependent: false,
             },
         );
         aggregates.insert(
@@ -1250,6 +1381,7 @@ mod tests {
                 value: 105_000_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Nostr],
+                nostr_anchor_dependent: false,
             },
         );
 
@@ -1284,10 +1416,44 @@ mod tests {
                 value: 45_000.0,
                 sources: 2,
                 contributors: vec![ProviderId::Nostr, ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
 
         let out = republishable_rates(&aggregates);
+        assert_eq!(out.get("EUR"), Some(&45_000.0));
+    }
+
+    #[test]
+    fn republishable_rates_drops_nostr_anchor_dependent_cross() {
+        // El Toque CUP resolved via Nostr USD: contributors name only
+        // eltoque, but the absolute value embeds a relayed rate — must not
+        // be re-stamped as a fresh local observation (ermeme, PR #841).
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "CUP".to_string(),
+            AggregateResult {
+                value: 20_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::ElToque],
+                nostr_anchor_dependent: true,
+            },
+        );
+        aggregates.insert(
+            "EUR".to_string(),
+            AggregateResult {
+                value: 45_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert!(
+            !out.contains_key("CUP"),
+            "Nostr-anchor-dependent CUP must not be republished"
+        );
         assert_eq!(out.get("EUR"), Some(&45_000.0));
     }
 
@@ -1593,6 +1759,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         // 1_000_000s ago: well past any plausible TTL.
@@ -1620,6 +1787,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         let fresh_now = Utc::now().timestamp();
@@ -1655,6 +1823,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         let now = Utc::now().timestamp();
@@ -1702,6 +1871,7 @@ mod tests {
                     value: v,
                     sources: 1,
                     contributors: vec![ProviderId::Yadio],
+                    nostr_anchor_dependent: false,
                 },
             );
             agg
@@ -1907,6 +2077,7 @@ mod coverage_tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         manager.publish_rates_to_nostr(&aggregates).await;

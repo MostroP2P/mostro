@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
 use tracing::debug;
@@ -24,6 +25,16 @@ use tracing::debug;
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::price::config::ProviderConfig;
 use crate::price::provider::{PriceProvider, ProviderError, ProviderId, ProviderQuotes, Quote};
+
+/// Hard cap on events retained from one relay query before local ranking.
+///
+/// `nostr-relay-pool`'s `fetch_events` uses `Events::force_insert`, which
+/// grows without bound when a noncompliant relay ignores the subscription
+/// filter (`verify_subscriptions` defaults to false). Streaming with an
+/// early envelope/author check and this ceiling bounds memory/work within
+/// `query_timeout` (ermeme, PR #841). Well above any realistic number of
+/// trusted-node candidates for one tick.
+const MAX_FETCHED_RATE_EVENTS: usize = 64;
 
 /// Same wrapper the daemon publishes: `{"BTC": {ccy: price}}`.
 #[derive(Debug, Deserialize)]
@@ -203,6 +214,38 @@ impl NostrProvider {
                 .to_string(),
         ))
     }
+
+    /// Whether a relay-delivered event is worth buffering for ranking.
+    /// Applied while streaming so irrelevant junk never accumulates toward
+    /// [`MAX_FETCHED_RATE_EVENTS`].
+    pub(crate) fn is_plausible_candidate(event: &Event, trusted: &[PublicKey]) -> bool {
+        trusted.contains(&event.pubkey)
+            && event.kind == Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND)
+            && event.tags.identifier() == Some("mostro-rates")
+    }
+
+    /// Keep at most `limit` plausible candidates from `incoming`, dropping
+    /// everything else before it is stored. Pure helper so the adversarial
+    /// bound is unit-testable without a relay; production `fetch` applies
+    /// the same filter/cap while streaming.
+    #[cfg(test)]
+    pub(crate) fn collect_bounded_candidates(
+        incoming: impl IntoIterator<Item = Event>,
+        trusted: &[PublicKey],
+        limit: usize,
+    ) -> Vec<Event> {
+        let mut out = Vec::with_capacity(limit.min(16));
+        for event in incoming {
+            if !Self::is_plausible_candidate(&event, trusted) {
+                continue;
+            }
+            out.push(event);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -215,12 +258,31 @@ impl PriceProvider for NostrProvider {
         let client = crate::util::get_nostr_client()
             .map_err(|e| ProviderError::Http(format!("nostr: {e}")))?;
 
-        let events = client
-            .fetch_events(self.build_filter(), self.query_timeout)
+        // Stream rather than `fetch_events`: the pool's collector
+        // `force_insert`s every delivered event (ignoring Filter::limit),
+        // so a noncompliant relay can OOM the process within query_timeout.
+        // Early-filter + hard cap while receiving (ermeme, PR #841).
+        let filter = self.build_filter().limit(MAX_FETCHED_RATE_EVENTS);
+        let mut stream = client
+            .stream_events(filter, self.query_timeout)
             .await
-            .map_err(|e| ProviderError::Http(format!("nostr: relay query failed: {e}")))?
-            .into_iter()
-            .collect::<Vec<Event>>();
+            .map_err(|e| ProviderError::Http(format!("nostr: relay query failed: {e}")))?;
+
+        let mut events = Vec::new();
+        let mut inspected = 0usize;
+        while let Some(event) = stream.next().await {
+            inspected += 1;
+            if Self::is_plausible_candidate(&event, &self.trusted_nodes) {
+                events.push(event);
+                if events.len() >= MAX_FETCHED_RATE_EVENTS {
+                    break;
+                }
+            }
+            // Bound work even when the relay floods irrelevant frames.
+            if inspected >= MAX_FETCHED_RATE_EVENTS.saturating_mul(4) {
+                break;
+            }
+        }
 
         let candidates =
             Self::rank_candidates(&events, &self.trusted_nodes, Timestamp::now(), self.max_age);
@@ -511,6 +573,37 @@ mod tests {
         let candidates = vec![&malformed, &empty];
 
         assert!(NostrProvider::pick_first_usable(&candidates).is_err());
+    }
+
+    #[test]
+    fn collect_bounded_candidates_drops_junk_and_caps_trusted_envelope() {
+        let trusted_keys = Keys::generate();
+        let junk_keys = Keys::generate();
+        let trusted = vec![trusted_keys.public_key()];
+
+        // Flood of wrong-author / wrong-kind frames mixed with more
+        // trusted mostro-rates events than the cap — only `limit`
+        // plausible ones may be retained (ermeme adversarial bound).
+        let mut incoming = Vec::new();
+        for i in 0..20 {
+            incoming.push(signed_event(&junk_keys, SAMPLE_CONTENT, NOW - i));
+            incoming.push(signed_event_with_envelope(
+                &trusted_keys,
+                SAMPLE_CONTENT,
+                NOW - i,
+                1,
+                "mostro-rates",
+            ));
+        }
+        for i in 0..10 {
+            incoming.push(signed_event(&trusted_keys, SAMPLE_CONTENT, NOW - 100 - i));
+        }
+
+        let kept = NostrProvider::collect_bounded_candidates(incoming, &trusted, 3);
+        assert_eq!(kept.len(), 3);
+        assert!(kept
+            .iter()
+            .all(|e| NostrProvider::is_plausible_candidate(e, &trusted)));
     }
 
     fn sample_cfg(trusted_hex: String) -> ProviderConfig {

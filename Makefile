@@ -66,7 +66,12 @@ docker-build-startos:
 	cd docker && \
 	docker compose build mostro-startos
 
+# Single worker on purpose: every worker runs the full suite in its own
+# temp dir but shares the host's TCP ports, so parallel workers collide on
+# the LNURL test's listener. That collision fails the test, and a test
+# failing for its own reasons counts as a killed mutant — silently
+# inflating the score this target exists to measure.
 mutation-test:
 	@set -o pipefail; \
-	CARGO_MUTANTS_JOBS=2 MOSTRO_TEST_LN_PORT=18080 cargo mutants $(ARGS)
+	CARGO_MUTANTS_JOBS=1 MOSTRO_TEST_LN_PORT=$${MOSTRO_TEST_LN_PORT:-18080} cargo mutants $(ARGS)
 

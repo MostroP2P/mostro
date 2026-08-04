@@ -115,11 +115,17 @@ impl NostrProvider {
     /// [`PriceProvider::fetch`] so its shape is unit-testable without a
     /// relay (spec §10.5) — a wrong `kind`/`identifier` here would
     /// otherwise only surface via the `#[ignore]`d live-relay test.
+    ///
+    /// Includes [`Filter::limit`] at [`MAX_FETCHED_RATE_EVENTS`]: with
+    /// `verify_subscriptions` enabled on the process-wide client
+    /// ([`crate::util::mostro_nostr_client_options`]), the relay driver
+    /// enforces that ceiling *before* events enter the pool's dedup set.
     pub(crate) fn build_filter(&self) -> Filter {
         Filter::new()
             .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
             .authors(self.trusted_nodes.clone())
             .identifier("mostro-rates")
+            .limit(MAX_FETCHED_RATE_EVENTS)
     }
 
     /// Parse a rate event's `content` into [`ProviderQuotes`]. Split out so
@@ -258,29 +264,28 @@ impl PriceProvider for NostrProvider {
         let client = crate::util::get_nostr_client()
             .map_err(|e| ProviderError::Http(format!("nostr: {e}")))?;
 
-        // Stream rather than `fetch_events`: the pool's collector
-        // `force_insert`s every delivered event (ignoring Filter::limit),
-        // so a noncompliant relay can OOM the process within query_timeout.
-        // Early-filter + hard cap while receiving (ermeme, PR #841).
-        let filter = self.build_filter().limit(MAX_FETCHED_RATE_EVENTS);
+        // Stream rather than `fetch_events`. The process-wide client enables
+        // `verify_subscriptions` (see `mostro_nostr_client_options`) so the
+        // relay driver drops non-matching frames *before* the pool's
+        // unbounded EventId dedup set; `build_filter`'s `limit` is enforced
+        // there too. We still early-filter and cap retained candidates here
+        // as defense in depth (ermeme, PR #841).
+        //
+        // Do **not** break on a count of inspected frames: the pool merges
+        // relays into one stream, so one noisy peer could fill a global
+        // first-N cutoff before an honest relay's trusted event arrives.
         let mut stream = client
-            .stream_events(filter, self.query_timeout)
+            .stream_events(self.build_filter(), self.query_timeout)
             .await
             .map_err(|e| ProviderError::Http(format!("nostr: relay query failed: {e}")))?;
 
         let mut events = Vec::new();
-        let mut inspected = 0usize;
         while let Some(event) = stream.next().await {
-            inspected += 1;
             if Self::is_plausible_candidate(&event, &self.trusted_nodes) {
                 events.push(event);
                 if events.len() >= MAX_FETCHED_RATE_EVENTS {
                     break;
                 }
-            }
-            // Bound work even when the relay floods irrelevant frames.
-            if inspected >= MAX_FETCHED_RATE_EVENTS.saturating_mul(4) {
-                break;
             }
         }
 
@@ -657,8 +662,15 @@ mod tests {
         let expected = Filter::new()
             .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
             .authors([node_a, node_b])
-            .identifier("mostro-rates");
+            .identifier("mostro-rates")
+            .limit(MAX_FETCHED_RATE_EVENTS);
         assert_eq!(provider.build_filter(), expected);
+        assert_eq!(
+            provider.build_filter().limit,
+            Some(MAX_FETCHED_RATE_EVENTS),
+            "filter limit is the production stream bound enforced by \
+             verify_subscriptions in the relay driver"
+        );
     }
 
     #[test]

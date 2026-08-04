@@ -2,7 +2,7 @@
 //! function is a deterministic transform over in-memory inputs, which is
 //! what makes the numeric heart of the feature exhaustively testable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::provider::{ProviderId, ProviderQuotes, Quote};
 
@@ -164,7 +164,11 @@ pub fn aggregate_tick(
         }
     }
     let mut resolved: HashMap<String, Vec<(ProviderId, f64)>> = HashMap::new();
-    let mut resolved_nostr_anchor: HashMap<String, bool> = HashMap::new();
+    // Providers whose *resolved* candidate for a currency came from a
+    // Nostr-touched anchor. Taint is applied only if that provider later
+    // survives the target currency's outlier filter (step 3) — a discarded
+    // wild cross must not mark an otherwise-local aggregate dependent.
+    let mut nostr_anchored_resolvers: HashMap<String, HashSet<ProviderId>> = HashMap::new();
     for (id, currency, base, value) in &per_base {
         if let Some(anchor) = anchors.get(base) {
             let candidate = value * anchor;
@@ -174,7 +178,10 @@ pub fn aggregate_tick(
                     .or_default()
                     .push((*id, candidate));
                 if *anchor_uses_nostr.get(base).unwrap_or(&false) {
-                    resolved_nostr_anchor.insert(currency.clone(), true);
+                    nostr_anchored_resolvers
+                        .entry(currency.clone())
+                        .or_default()
+                        .insert(*id);
                 }
             }
         }
@@ -201,13 +208,16 @@ pub fn aggregate_tick(
                 .filter(|x| x.is_finite() && **x > 0.0)
                 .count()
                 .min(u8::MAX as usize) as u8;
+            let nostr_anchor_dependent = nostr_anchored_resolvers
+                .get(currency)
+                .is_some_and(|tainted| contributors.iter().any(|c| tainted.contains(c)));
             out.insert(
                 currency.clone(),
                 AggregateResult {
                     value,
                     sources,
                     contributors,
-                    nostr_anchor_dependent: *resolved_nostr_anchor.get(currency).unwrap_or(&false),
+                    nostr_anchor_dependent,
                 },
             );
         }
@@ -440,6 +450,48 @@ mod tests {
         assert!(
             !out["USD"].nostr_anchor_dependent,
             "direct Nostr USD is Nostr-only via contributors, not via anchor taint"
+        );
+    }
+
+    #[test]
+    fn aggregate_tick_nostr_anchor_taint_clears_when_cross_is_outlier() {
+        // Local direct quotes agree near 100; a Nostr-anchored El Toque
+        // cross at 10000 is discarded by the 5% outlier band. The final
+        // value is fully local — it must NOT stay nostr_anchor_dependent
+        // (ermeme follow-up on a8a6aef2).
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("CUP".into(), Quote::PerBtc(100.0));
+        let mut coingecko = ProviderQuotes::new();
+        coingecko.insert("CUP".into(), Quote::PerBtc(101.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 0.2, // 0.2 * 50_000 = 10_000 — wildly above local CUP
+            },
+        );
+
+        let out = aggregate_tick(
+            &[
+                (ProviderId::Nostr, nostr),
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+                (ProviderId::ElToque, eltoque),
+            ],
+            PCT,
+        );
+
+        approx(out["CUP"].value, 100.5);
+        assert_eq!(
+            out["CUP"].contributors,
+            vec![ProviderId::Yadio, ProviderId::CoinGecko]
+        );
+        assert!(
+            !out["CUP"].nostr_anchor_dependent,
+            "outlier-discarded Nostr-anchored cross must not taint a local aggregate"
         );
     }
 

@@ -937,14 +937,15 @@ pub async fn update_order_event(
 pub async fn connect_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
 
-    let mut limits = RelayLimits::default();
-    // Some specific events can have a bigger size than regular events
-    // So we increase the limits for those events
-    limits.messages.max_size = Some(6_000);
-    limits.events.max_size = Some(6_500);
-    let opts = ClientOptions::new().relay_limits(limits);
-
-    // Create new client
+    // Create new client. `verify_subscriptions(true)` rejects events that
+    // do not match the REQ filter *inside the relay driver*, before they
+    // can enter `RelayPool::stream_events_targeted`'s unbounded
+    // `HashSet<EventId>` dedup set. Without this, dropping the consumer
+    // after an application-level cap does not stop the spawned pool task
+    // from buffering every unique EventId until query timeout (ermeme,
+    // PR #841). Relays are operator-configured trust boundaries; filter
+    // enforcement is the correct bound for that surface.
+    let opts = mostro_nostr_client_options();
     let client = ClientBuilder::default().opts(opts).build();
 
     // Add relays
@@ -959,6 +960,20 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     client.connect().await;
 
     Ok(client)
+}
+
+/// Process-wide Nostr [`ClientOptions`]: size limits plus subscription
+/// filter verification. Split out so the verify-subscriptions bound is
+/// unit-testable without standing up relays.
+pub(crate) fn mostro_nostr_client_options() -> ClientOptions {
+    let mut limits = RelayLimits::default();
+    // Some specific events can have a bigger size than regular events
+    // So we increase the limits for those events
+    limits.messages.max_size = Some(6_000);
+    limits.events.max_size = Some(6_500);
+    ClientOptions::new()
+        .relay_limits(limits)
+        .verify_subscriptions(true)
 }
 
 pub async fn show_hold_invoice(
@@ -2443,6 +2458,20 @@ mod tests {
             !client.relays().await.is_empty(),
             "configured relays must be registered"
         );
+    }
+
+    #[test]
+    fn mostro_nostr_client_options_builds_client() {
+        // Production stream bound for pooled queries: `connect_nostr` uses
+        // `mostro_nostr_client_options()` which enables `verify_subscriptions`
+        // so the relay driver drops non-matching events before they hit the
+        // pool's unbounded EventId dedup set (ermeme, PR #841). Options
+        // fields are not publicly readable; pin that the helper still
+        // constructs a Client (SDK copies the flag into RelayOptions in
+        // Client::compose_relay_opts).
+        let _client = ClientBuilder::default()
+            .opts(mostro_nostr_client_options())
+            .build();
     }
 
     #[tokio::test]

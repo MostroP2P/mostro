@@ -4,14 +4,20 @@
 //! same kind-30078 NIP-33 rate event Mostro nodes already publish
 //! (`nip33::new_exchange_rates_event`, `docs/NOSTR_EXCHANGE_RATES.md`) — for
 //! operators in regions where price APIs are DNS/IP blocked but Nostr relays
-//! are reachable (issue #697). It queries the process-wide Nostr client
-//! (already connected to the `[nostr]` relays) for the latest such event
-//! from each configured `trusted_nodes` pubkey and takes the **freshest**
-//! one as this tick's source — no cross-node statistical combine; a stale or
-//! unreachable trusted node is simply outrun by a fresher one. Events whose
+//! are reachable (issue #697). It queries a **dedicated** price Nostr client
+//! ([`crate::util::get_price_nostr_client`], same `[nostr]` relays, with
+//! `verify_subscriptions`) for the latest such event from each configured
+//! `trusted_nodes` pubkey and takes the **freshest** one as this tick's
+//! source — no cross-node statistical combine; a stale or unreachable
+//! trusted node is simply outrun by a fresher one. Events whose
 //! `created_at` is older than `[price].max_price_staleness_seconds` are
 //! discarded so a relay that still serves an expired kind-30078 cannot keep
 //! refreshing the local cache clock with zombie rates.
+//!
+//! Subscription verification is **not** enabled on the process-wide daemon
+//! client used for the inbox / publishing: that client's `.limit(0)`
+//! subscription must keep delivering live trade messages after EOSE
+//! (hermeme, PR #841).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -117,8 +123,8 @@ impl NostrProvider {
     /// otherwise only surface via the `#[ignore]`d live-relay test.
     ///
     /// Includes [`Filter::limit`] at [`MAX_FETCHED_RATE_EVENTS`]: with
-    /// `verify_subscriptions` enabled on the process-wide client
-    /// ([`crate::util::mostro_nostr_client_options`]), the relay driver
+    /// `verify_subscriptions` enabled on the **price** Nostr client
+    /// ([`crate::util::price_nostr_client_options`]), the relay driver
     /// enforces that ceiling *before* events enter the pool's dedup set.
     pub(crate) fn build_filter(&self) -> Filter {
         Filter::new()
@@ -151,11 +157,10 @@ impl NostrProvider {
     ///   (spec §10.3 / `NOSTR_EXCHANGE_RATES.md` "clients MUST verify
     ///   pubkey");
     /// - the exact expected envelope (`kind` 30078, `d` = `mostro-rates`) —
-    ///   `build_filter`'s relay-side query asks for this, but
-    ///   `nostr-relay-pool`'s `verify_subscriptions` defaults to `false` (not
-    ///   enabled by `connect_nostr`), so a noncompliant relay could still
-    ///   hand back a validly-signed event from a trusted pubkey of a
-    ///   different kind/`d` (CodeRabbit / re-review, PR #841);
+    ///   `build_filter`'s relay-side query asks for this, and the price
+    ///   client's `verify_subscriptions` enforces it in the relay driver;
+    ///   this client-side check remains as defense in depth against a
+    ///   misconfigured or noncompliant peer (CodeRabbit / re-review, PR #841);
     /// - not future-dated (a forged or clock-skewed `created_at` must not
     ///   look artificially fresh);
     /// - `created_at` within `max_age` of `now`, so a relay that ignores
@@ -261,12 +266,13 @@ impl PriceProvider for NostrProvider {
     }
 
     async fn fetch(&self, _http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError> {
-        let client = crate::util::get_nostr_client()
+        let client = crate::util::get_price_nostr_client()
+            .await
             .map_err(|e| ProviderError::Http(format!("nostr: {e}")))?;
 
-        // Stream rather than `fetch_events`. The process-wide client enables
-        // `verify_subscriptions` (see `mostro_nostr_client_options`) so the
-        // relay driver drops non-matching frames *before* the pool's
+        // Stream rather than `fetch_events`. The dedicated price client
+        // enables `verify_subscriptions` (see `price_nostr_client_options`)
+        // so the relay driver drops non-matching frames *before* the pool's
         // unbounded EventId dedup set; `build_filter`'s `limit` is enforced
         // there too. We still early-filter and cap retained candidates here
         // as defense in depth (ermeme, PR #841).
@@ -669,7 +675,7 @@ mod tests {
             provider.build_filter().limit,
             Some(MAX_FETCHED_RATE_EVENTS),
             "filter limit is the production stream bound enforced by \
-             verify_subscriptions in the relay driver"
+             verify_subscriptions on the price Nostr client"
         );
     }
 
@@ -699,21 +705,23 @@ mod tests {
     /// example `trusted_nodes` pubkeys the issue names. Inherently flaky
     /// against third-party infra outside this repo's control, so it's
     /// `#[ignore]`d (never runs in CI) — run explicitly, alone, so no other
-    /// test races it to set the process-wide `NOSTR_CLIENT`:
+    /// test races it to set the process-wide `PRICE_NOSTR_CLIENT`:
     ///
     /// `cargo test price::providers::nostr::tests::live_relay_fetch_returns_real_rates -- --ignored --exact`
     #[tokio::test]
     #[ignore = "hits a real Nostr relay; run explicitly for manual verification"]
     async fn live_relay_fetch_returns_real_rates() {
-        let client = Client::default();
+        let client = ClientBuilder::default()
+            .opts(crate::util::price_nostr_client_options())
+            .build();
         client
             .add_relay("wss://relay.mostro.network")
             .await
             .expect("add_relay");
         client.connect().await;
-        crate::NOSTR_CLIENT
+        crate::config::PRICE_NOSTR_CLIENT
             .set(client)
-            .expect("NOSTR_CLIENT must be unset — run this test alone (see doc comment)");
+            .expect("PRICE_NOSTR_CLIENT must be unset — run this test alone (see doc comment)");
 
         // Both pubkeys issue #697 names as example trusted_nodes.
         let cfg = ProviderConfig {

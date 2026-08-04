@@ -2574,7 +2574,10 @@ mod tests {
         let price_client = ClientBuilder::default()
             .opts(price_nostr_client_options())
             .build();
-        price_client.add_relay(url.clone()).await.expect("add_relay");
+        price_client
+            .add_relay(url.clone())
+            .await
+            .expect("add_relay");
         price_client.connect().await;
 
         let filter = Filter::new().kind(nostr_sdk::Kind::Metadata).limit(3);
@@ -2618,13 +2621,8 @@ mod tests {
         // the live event.
         let mut notifications = daemon.notifications();
 
-        let filter = Filter::new()
-            .kind(nostr_sdk::Kind::TextNote)
-            .limit(0);
-        daemon
-            .subscribe(filter, None)
-            .await
-            .expect("subscribe");
+        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(0);
+        daemon.subscribe(filter, None).await.expect("subscribe");
 
         // Empty relay ⇒ EOSE quickly; then publish a matching live event.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2634,7 +2632,10 @@ mod tests {
             .sign_with_keys(&keys)
             .expect("sign");
         let live_id = live.id;
-        publisher.send_event(&live).await.expect("publish live event");
+        publisher
+            .send_event(&live)
+            .await
+            .expect("publish live event");
 
         let got = tokio::time::timeout(Duration::from_secs(8), async {
             while let Ok(notification) = notifications.recv().await {

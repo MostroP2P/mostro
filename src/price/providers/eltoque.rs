@@ -223,6 +223,7 @@ mod tests {
             token: token.map(String::from),
             only: Some(vec!["CUP".into(), "MLC".into()]),
             except: None,
+            trusted_nodes: vec![],
         }
     }
 

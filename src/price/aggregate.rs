@@ -2,7 +2,7 @@
 //! function is a deterministic transform over in-memory inputs, which is
 //! what makes the numeric heart of the feature exhaustively testable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::provider::{ProviderId, ProviderQuotes, Quote};
 
@@ -14,11 +14,20 @@ use super::provider::{ProviderId, ProviderQuotes, Quote};
 /// value actually **survived** [`combine`]'s outlier filter — what the
 /// Nostr `source` tag really means. The two can differ: with three
 /// providers and one outlier the count is 3 but contributors is 2.
+///
+/// `nostr_anchor_dependent` is true when a fiat-cross (`PerBase`) path for
+/// this currency resolved against an anchor that itself included `Nostr`
+/// among its surviving direct contributors. The absolute per-BTC figure
+/// then embeds a relayed rate even if `contributors` only names the
+/// cross provider (e.g. El Toque × Nostr USD → CUP tagged `eltoque`).
+/// [`crate::price::manager`] uses this so republication cannot re-stamp
+/// that hybrid as a fresh local observation (PR #841 re-review).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateResult {
     pub value: f64,
     pub sources: u8,
     pub contributors: Vec<ProviderId>,
+    pub nostr_anchor_dependent: bool,
 }
 
 /// Combine a currency's candidate per-BTC prices into one figure (spec §6.2).
@@ -111,8 +120,9 @@ pub fn resolve_per_base(
 ///    their provider id**.
 /// 2. Per-currency **anchors** are the [`combine`]d direct quotes; fiat-cross
 ///    (`PerBase`) quotes are resolved against those anchors and attributed
-///    to the fiat-cross provider (the anchor's own contributors are an
-///    intermediate, not a contributor to the resolved currency).
+///    to the fiat-cross provider (the anchor's own contributors stay out of
+///    `contributors` — they are an intermediate of the cross math — but a
+///    Nostr-touched anchor sets `nostr_anchor_dependent` on the result).
 /// 3. Each currency's final value is the [`combine`] of its direct **and**
 ///    resolved candidates. `contributors` lists the providers whose value
 ///    survived the outlier filter ([`kept_contributors`]) — what the Nostr
@@ -138,20 +148,27 @@ pub fn aggregate_tick(
         }
     }
 
-    // Step 2: anchors = aggregated direct quotes (values only), then
-    // resolve cross quotes — attributing each resolved candidate to the
-    // fiat-cross provider that emitted it. Anchor contributors are *not*
-    // propagated into resolved-currency contributors: they are an
-    // intermediate of the cross math, not an upstream of the cross
-    // currency.
+    // Step 2: anchors = aggregated direct quotes, then resolve cross quotes.
+    // Track whether each anchor's surviving contributors include Nostr so a
+    // later PerBase resolution can mark the cross currency as
+    // `nostr_anchor_dependent` without putting Nostr into `contributors`
+    // (which would change the published `source` tag's meaning).
     let mut anchors: HashMap<String, f64> = HashMap::new();
+    let mut anchor_uses_nostr: HashMap<String, bool> = HashMap::new();
     for (currency, pairs) in &direct {
         let values: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
         if let Some(v) = combine(&values, outlier_pct) {
             anchors.insert(currency.clone(), v);
+            let kept = kept_contributors(pairs, outlier_pct);
+            anchor_uses_nostr.insert(currency.clone(), kept.contains(&ProviderId::Nostr));
         }
     }
     let mut resolved: HashMap<String, Vec<(ProviderId, f64)>> = HashMap::new();
+    // Providers whose *resolved* candidate for a currency came from a
+    // Nostr-touched anchor. Taint is applied only if that provider later
+    // survives the target currency's outlier filter (step 3) — a discarded
+    // wild cross must not mark an otherwise-local aggregate dependent.
+    let mut nostr_anchored_resolvers: HashMap<String, HashSet<ProviderId>> = HashMap::new();
     for (id, currency, base, value) in &per_base {
         if let Some(anchor) = anchors.get(base) {
             let candidate = value * anchor;
@@ -160,6 +177,12 @@ pub fn aggregate_tick(
                     .entry(currency.clone())
                     .or_default()
                     .push((*id, candidate));
+                if *anchor_uses_nostr.get(base).unwrap_or(&false) {
+                    nostr_anchored_resolvers
+                        .entry(currency.clone())
+                        .or_default()
+                        .insert(*id);
+                }
             }
         }
     }
@@ -185,12 +208,16 @@ pub fn aggregate_tick(
                 .filter(|x| x.is_finite() && **x > 0.0)
                 .count()
                 .min(u8::MAX as usize) as u8;
+            let nostr_anchor_dependent = nostr_anchored_resolvers
+                .get(currency)
+                .is_some_and(|tainted| contributors.iter().any(|c| tainted.contains(c)));
             out.insert(
                 currency.clone(),
                 AggregateResult {
                     value,
                     sources,
                     contributors,
+                    nostr_anchor_dependent,
                 },
             );
         }
@@ -385,6 +412,86 @@ mod tests {
         assert_eq!(
             out["CUP"].contributors,
             vec![ProviderId::Yadio, ProviderId::ElToque]
+        );
+        assert!(
+            !out["CUP"].nostr_anchor_dependent,
+            "Yadio/CoinGecko USD anchor is local — CUP cross is not Nostr-tainted"
+        );
+    }
+
+    #[test]
+    fn aggregate_tick_marks_cross_resolved_via_nostr_usd_as_anchor_dependent() {
+        // Nostr is the only USD source; El Toque CUP/USD resolves against it.
+        // contributors stay [ElToque] (anchor providers are intermediates),
+        // but nostr_anchor_dependent must be set so republication cannot
+        // re-stamp the hybrid as a fresh local observation.
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+
+        let out = aggregate_tick(
+            &[(ProviderId::Nostr, nostr), (ProviderId::ElToque, eltoque)],
+            PCT,
+        );
+
+        approx(out["CUP"].value, 20_000_000.0);
+        assert_eq!(out["CUP"].contributors, vec![ProviderId::ElToque]);
+        assert!(
+            out["CUP"].nostr_anchor_dependent,
+            "CUP absolute value embeds Nostr USD and must be flagged"
+        );
+        assert!(
+            !out["USD"].nostr_anchor_dependent,
+            "direct Nostr USD is Nostr-only via contributors, not via anchor taint"
+        );
+    }
+
+    #[test]
+    fn aggregate_tick_nostr_anchor_taint_clears_when_cross_is_outlier() {
+        // Local direct quotes agree near 100; a Nostr-anchored El Toque
+        // cross at 10000 is discarded by the 5% outlier band. The final
+        // value is fully local — it must NOT stay nostr_anchor_dependent
+        // (ermeme follow-up on a8a6aef2).
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("CUP".into(), Quote::PerBtc(100.0));
+        let mut coingecko = ProviderQuotes::new();
+        coingecko.insert("CUP".into(), Quote::PerBtc(101.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 0.2, // 0.2 * 50_000 = 10_000 — wildly above local CUP
+            },
+        );
+
+        let out = aggregate_tick(
+            &[
+                (ProviderId::Nostr, nostr),
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+                (ProviderId::ElToque, eltoque),
+            ],
+            PCT,
+        );
+
+        approx(out["CUP"].value, 100.5);
+        assert_eq!(
+            out["CUP"].contributors,
+            vec![ProviderId::Yadio, ProviderId::CoinGecko]
+        );
+        assert!(
+            !out["CUP"].nostr_anchor_dependent,
+            "outlier-discarded Nostr-anchored cross must not taint a local aggregate"
         );
     }
 

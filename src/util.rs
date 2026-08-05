@@ -11,7 +11,6 @@ use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
 use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
-use crate::NOSTR_CLIENT;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
@@ -943,14 +942,13 @@ pub async fn update_order_event(
 pub async fn connect_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
 
-    let mut limits = RelayLimits::default();
-    // Some specific events can have a bigger size than regular events
-    // So we increase the limits for those events
-    limits.messages.max_size = Some(6_000);
-    limits.events.max_size = Some(6_500);
-    let opts = ClientOptions::new().relay_limits(limits);
-
-    // Create new client
+    // Daemon inbox client: shared size limits, but **no**
+    // `verify_subscriptions`. The long-lived `.limit(0)` subscription in
+    // `main.rs` must not count pre-EOSE frames against a zero limit — that
+    // would drop matching trade messages before dispatch (hermeme, PR #841).
+    // Price queries use [`connect_price_nostr`] / [`PRICE_NOSTR_CLIENT`] with
+    // verification enabled instead.
+    let opts = mostro_nostr_client_options();
     let client = ClientBuilder::default().opts(opts).build();
 
     // Add relays
@@ -965,6 +963,78 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     client.connect().await;
 
     Ok(client)
+}
+
+/// Build the dedicated price-provider Nostr client (same relays as the
+/// daemon client, with [`price_nostr_client_options`]).
+pub async fn connect_price_nostr() -> Result<Client, MostroError> {
+    let nostr_settings = Settings::get_nostr();
+    let client = ClientBuilder::default()
+        .opts(price_nostr_client_options())
+        .build();
+
+    for relay in nostr_settings.relays.iter() {
+        client
+            .add_relay(relay)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    }
+
+    client.connect().await;
+    Ok(client)
+}
+
+/// Observable policy for Mostro Nostr clients. [`ClientOptions`] fields are
+/// not publicly readable, so production paths go through this struct and
+/// tests assert on it directly (hermeme, PR #841).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MostroNostrClientPolicy {
+    /// When true, the relay driver rejects non-matching / over-limit events
+    /// before they enter the pool's EventId dedup set.
+    pub verify_subscriptions: bool,
+}
+
+/// Daemon / inbox client: do **not** verify subscriptions (see [`connect_nostr`]).
+pub(crate) fn daemon_nostr_client_policy() -> MostroNostrClientPolicy {
+    MostroNostrClientPolicy {
+        verify_subscriptions: false,
+    }
+}
+
+/// Price kind-30078 queries: verify subscriptions so a noncompliant relay
+/// cannot flood `stream_events`'s pool-side dedup set (ermeme, PR #841).
+pub(crate) fn price_nostr_client_policy() -> MostroNostrClientPolicy {
+    MostroNostrClientPolicy {
+        verify_subscriptions: true,
+    }
+}
+
+fn mostro_nostr_relay_limits() -> RelayLimits {
+    let mut limits = RelayLimits::default();
+    // Some specific events can have a bigger size than regular events
+    // So we increase the limits for those events
+    limits.messages.max_size = Some(6_000);
+    limits.events.max_size = Some(6_500);
+    limits
+}
+
+fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientOptions {
+    let mut opts = ClientOptions::new().relay_limits(mostro_nostr_relay_limits());
+    if policy.verify_subscriptions {
+        opts = opts.verify_subscriptions(true);
+    }
+    opts
+}
+
+/// Process-wide daemon Nostr [`ClientOptions`] (inbox / publishing).
+pub(crate) fn mostro_nostr_client_options() -> ClientOptions {
+    client_options_from_policy(daemon_nostr_client_policy())
+}
+
+/// Price-provider Nostr [`ClientOptions`]: size limits plus subscription
+/// filter verification, scoped away from the daemon inbox client.
+pub(crate) fn price_nostr_client_options() -> ClientOptions {
+    client_options_from_policy(price_nostr_client_policy())
 }
 
 pub async fn show_hold_invoice(
@@ -1327,6 +1397,26 @@ pub fn get_nostr_client() -> Result<&'static Client, MostroError> {
             "Client not initialized!".to_string(),
         )))
     }
+}
+
+/// Lazy getter for the price-provider Nostr client ([`PRICE_NOSTR_CLIENT`]).
+///
+/// Initialized on first price fetch so operators who disable the Nostr
+/// provider never open a second relay pool. Uses [`connect_price_nostr`] —
+/// `verify_subscriptions(true)` only on this client.
+pub async fn get_price_nostr_client() -> Result<&'static Client, MostroError> {
+    if let Some(client) = PRICE_NOSTR_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let client = connect_price_nostr().await?;
+    // Another task may have won the race; drop our duplicate and use theirs.
+    let _ = PRICE_NOSTR_CLIENT.set(client);
+    PRICE_NOSTR_CLIENT.get().ok_or_else(|| {
+        MostroInternalErr(ServiceError::NostrError(
+            "Price Nostr client not initialized!".to_string(),
+        ))
+    })
 }
 
 /// Getter function with error management for nostr relays
@@ -2448,6 +2538,172 @@ mod tests {
         assert!(
             !client.relays().await.is_empty(),
             "configured relays must be registered"
+        );
+    }
+
+    #[test]
+    fn nostr_client_policies_scope_verify_to_price_only() {
+        // Daemon inbox must not enable verify_subscriptions (main.rs limit(0)).
+        assert!(
+            !daemon_nostr_client_policy().verify_subscriptions,
+            "daemon client must leave verify_subscriptions off"
+        );
+        assert!(
+            price_nostr_client_policy().verify_subscriptions,
+            "price client must enable verify_subscriptions"
+        );
+        // Helpers remain constructible (SDK copies the flag into RelayOptions).
+        let _daemon = ClientBuilder::default()
+            .opts(mostro_nostr_client_options())
+            .build();
+        let _price = ClientBuilder::default()
+            .opts(price_nostr_client_options())
+            .build();
+    }
+
+    #[tokio::test]
+    async fn price_client_rejects_mismatched_events_before_pool() {
+        use futures::StreamExt;
+        use nostr_relay_builder::builder::RelayTestOptions;
+        use nostr_relay_builder::MockRelay;
+        use std::time::Duration;
+
+        // Noncompliant relay floods random events that do not match the REQ.
+        let mock = MockRelay::run_with_opts(RelayTestOptions {
+            unresponsive_connection: None,
+            send_random_events: true,
+        })
+        .await
+        .expect("mock relay");
+        let url = mock.url().await;
+
+        let price_client = ClientBuilder::default()
+            .opts(price_nostr_client_options())
+            .build();
+        price_client
+            .add_relay(url.clone())
+            .await
+            .expect("add_relay");
+        price_client.connect().await;
+
+        let filter = Filter::new().kind(nostr_sdk::Kind::Metadata).limit(3);
+        let mut stream = price_client
+            .stream_events(filter, Duration::from_secs(3))
+            .await
+            .expect("stream");
+        let mut received = 0usize;
+        while stream.next().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(
+            received, 0,
+            "price verify_subscriptions must drop mismatched frames before delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_client_limit_zero_still_delivers_live_after_eose() {
+        use nostr_relay_builder::MockRelay;
+        use std::time::Duration;
+
+        // Clean mock (no random flood): mirrors main.rs `.limit(0)` inbox —
+        // history is skipped, but live matching events after EOSE must arrive.
+        // Daemon options intentionally omit verify_subscriptions so pre-EOSE
+        // frames are not counted against limit 0 (hermeme, PR #841).
+        let mock = MockRelay::run().await.expect("mock relay");
+        let url = mock.url().await;
+
+        let daemon = ClientBuilder::default()
+            .opts(mostro_nostr_client_options())
+            .build();
+        daemon.add_relay(url.clone()).await.expect("add_relay");
+        daemon.connect().await;
+
+        let publisher = ClientBuilder::default().build();
+        publisher.add_relay(url).await.expect("add_relay");
+        publisher.connect().await;
+
+        // Take the notification channel before subscribe so we cannot miss
+        // the live event.
+        let mut notifications = daemon.notifications();
+
+        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(0);
+        daemon.subscribe(filter, None).await.expect("subscribe");
+
+        // Empty relay ⇒ EOSE quickly; then publish a matching live event.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let keys = Keys::generate();
+        let live = EventBuilder::text_note("live-after-eose")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let live_id = live.id;
+        publisher
+            .send_event(&live)
+            .await
+            .expect("publish live event");
+
+        let got = tokio::time::timeout(Duration::from_secs(8), async {
+            while let Ok(notification) = notifications.recv().await {
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if event.id == live_id {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for live event after EOSE");
+        assert!(
+            got,
+            "daemon limit(0) subscription must deliver live post-EOSE events"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_client_enforces_filter_limit_before_pool() {
+        use futures::StreamExt;
+        use nostr_relay_builder::MockRelay;
+        use std::time::Duration;
+
+        let mock = MockRelay::run().await.expect("mock relay");
+        let url = mock.url().await;
+
+        // Seed more matching events than the REQ limit.
+        let seeder = ClientBuilder::default().build();
+        seeder.add_relay(url.clone()).await.expect("add_relay");
+        seeder.connect().await;
+        let keys = Keys::generate();
+        for i in 0..10 {
+            let event = EventBuilder::text_note(format!("seed-{i}"))
+                .sign_with_keys(&keys)
+                .expect("sign");
+            seeder.send_event(&event).await.expect("seed");
+        }
+
+        let price_client = ClientBuilder::default()
+            .opts(price_nostr_client_options())
+            .build();
+        price_client.add_relay(url).await.expect("add_relay");
+        price_client.connect().await;
+
+        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(3);
+        let mut stream = price_client
+            .stream_events(filter, Duration::from_secs(5))
+            .await
+            .expect("stream");
+        let mut received = 0usize;
+        while stream.next().await.is_some() {
+            received += 1;
+        }
+        assert!(
+            received <= 3,
+            "price verify_subscriptions must enforce REQ limit before pool forwarding; got {received}"
+        );
+        assert!(
+            received > 0,
+            "matching events under the limit must still be delivered"
         );
     }
 

@@ -146,6 +146,7 @@ mod tests {
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         };
         assert_eq!(BlockchainProvider::new(&cfg).url, "https://blockchain.info");
     }

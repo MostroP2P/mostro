@@ -2042,6 +2042,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_held_invoices_includes_waiting_buyer_invoice_after_payment() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // The state hold_invoice_paid leaves behind on its no-buyer-invoice
+        // branch: still waiting-buyer-invoice, but the invoice was already
+        // observed. It must keep being resubscribed so later settle/cancel
+        // events are seen; hold_invoice_paid itself no-ops on the replay.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at, hash)
+            VALUES (?1, 'buy', 'ev1', 'waiting-buyer-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("bb".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "post-payment rows stay subscribed");
+    }
+
+    #[tokio::test]
     async fn test_find_held_invoices_ignores_orders_without_hash() {
         let pool = setup_orders_db().await.unwrap();
 

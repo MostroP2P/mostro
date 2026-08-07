@@ -15,6 +15,40 @@ pub async fn hold_invoice_paid(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Decide whether this event may advance the order before touching anything
+    // else, so a replay costs one status read and cannot surface a spurious
+    // error from a degraded row.
+    //
+    // Two conditions, and both are load-bearing:
+    //
+    // - Status must still be pre-payment. Otherwise a late `Accepted` — the row
+    //   was canceled while the hold invoice lived on in LND — would drag a dead
+    //   order back into a live trade.
+    // - `invoice_held_at` must still be unset. This is the idempotency marker:
+    //   it is written at the end of this function and read nowhere else, and
+    //   `WaitingBuyerInvoice` is both an entry *and* an exit state of the flow
+    //   below. Without it, every restart resubscribes such a row, LND replays
+    //   the held invoice's `Accepted`, and the buyer gets another `AddInvoice`
+    //   while the maker gets another reputation notification.
+    let current_status = order.get_order_status().map_err(MostroInternalErr)?;
+    let is_pre_payment = matches!(
+        current_status,
+        Status::WaitingPayment | Status::WaitingBuyerInvoice
+    );
+    if !is_pre_payment || order.invoice_held_at != 0 {
+        // Loud on purpose: the HTLC is real and locked, but this order is past
+        // the point where we can credit it, so an operator has to look.
+        tracing::warn!(
+            order_id = %order.id,
+            status = %current_status,
+            invoice_held_at = order.invoice_held_at,
+            "Ignoring hold-invoice payment for an order already past the \
+             pre-payment window; the invoice with hash {hash} may still be \
+             locked in LND"
+        );
+        return Ok(());
+    }
+
     let buyer_pubkey = order
         .get_buyer_pubkey()
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
@@ -26,27 +60,6 @@ pub async fn hold_invoice_paid(
         "Order Id: {} - Seller paid invoice with hash: {hash}",
         order.id
     );
-
-    // Only an order still waiting on the seller's payment may be advanced by
-    // this event. Without the check, a redelivered or late `Accepted` — after a
-    // restart reattaches the subscription, or after the row was canceled while
-    // the hold invoice lived on in LND — would flip a settled or canceled order
-    // back into a live trade.
-    let current_status = order.get_order_status().map_err(MostroInternalErr)?;
-    if !matches!(
-        current_status,
-        Status::WaitingPayment | Status::WaitingBuyerInvoice
-    ) {
-        // Loud on purpose: the HTLC is real and locked, but this order is past
-        // the point where we can credit it, so an operator has to look.
-        tracing::warn!(
-            order_id = %order.id,
-            status = %current_status,
-            "Ignoring hold-invoice payment for an order outside the pre-payment \
-             window; the invoice with hash {hash} may still be locked in LND"
-        );
-        return Ok(());
-    }
 
     // Check if the order kind is valid
     let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
@@ -309,6 +322,46 @@ mod tests {
         assert_eq!(
             updated.invoice_held_at, 0,
             "no side effects on an order outside the pre-payment window"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_is_a_noop_on_redelivery() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "ee".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        // This is the else-branch's *own* output state: WaitingBuyerInvoice with
+        // the hold invoice already observed. Such a row is resubscribed on every
+        // restart, and LND replays the current Accepted state on resubscribe, so
+        // the flow must not run a second time — it would re-send AddInvoice to
+        // the buyer and re-notify the maker on each restart.
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "a replayed Accepted is a no-op, not a failure: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(
+            updated.invoice_held_at, 1_700_000_000,
+            "a replayed Accepted must not re-run the flow"
         );
     }
 

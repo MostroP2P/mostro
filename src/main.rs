@@ -221,24 +221,33 @@ async fn main() -> Result<()> {
         panic!("No connection to LND node - shutting down Mostro!");
     };
 
-    if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
-        for invoice in held_invoices.iter() {
-            if let Some(hash) = &invoice.hash {
-                // `orders.hash` is hex text; LND's SubscribeSingleInvoiceRequest
-                // wants the 32 raw bytes. Passing the 64 ASCII characters makes
-                // every resubscribe fail, which is silent here because the error
-                // is only logged — and a missed subscription looks exactly like
-                // a seller who never paid.
-                let r_hash = match crate::lightning::decode_hash32("order hash", hash) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::error!("Order {} has an undecodable hash: {e}", invoice.id);
-                        continue;
+    // A failure here means no in-flight hold invoice is resubscribed for the
+    // whole run, which is indistinguishable from "there were none" unless it is
+    // said out loud — the same silent-failure shape this path already had.
+    match find_held_invoices(get_db_pool().as_ref()).await {
+        Err(e) => tracing::error!(
+            "Could not load held invoices to resubscribe; in-flight trades will \
+             not be observed until the next restart: {e}"
+        ),
+        Ok(held_invoices) => {
+            for invoice in held_invoices.iter() {
+                if let Some(hash) = &invoice.hash {
+                    // `orders.hash` is hex text; LND's SubscribeSingleInvoiceRequest
+                    // wants the 32 raw bytes. Passing the 64 ASCII characters makes
+                    // every resubscribe fail, which is silent here because the error
+                    // is only logged — and a missed subscription looks exactly like
+                    // a seller who never paid.
+                    let r_hash = match crate::lightning::decode_hash32("order hash", hash) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::error!("Order {} has an undecodable hash: {e}", invoice.id);
+                            continue;
+                        }
+                    };
+                    tracing::info!("Resubscribing order id - {}", invoice.id);
+                    if let Err(e) = invoice_subscribe(r_hash, None).await {
+                        tracing::error!("Ln node error {e}")
                     }
-                };
-                tracing::info!("Resubscribing order id - {}", invoice.id);
-                if let Err(e) = invoice_subscribe(r_hash, None).await {
-                    tracing::error!("Ln node error {e}")
                 }
             }
         }

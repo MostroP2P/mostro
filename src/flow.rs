@@ -306,7 +306,10 @@ mod tests {
 
         let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
         assert_eq!(updated.status, Status::Active.to_string());
-        assert_eq!(updated.invoice_held_at, 0, "invoice_held_at must stay untouched");
+        assert_eq!(
+            updated.invoice_held_at, 0,
+            "invoice_held_at must stay untouched"
+        );
     }
 
     #[tokio::test]

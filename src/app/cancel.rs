@@ -614,8 +614,11 @@ async fn cancel_active_order<L: CancelLightning + Send>(
     }
 
     // If there is already an initiator recorded, this call becomes the confirmation (step 2).
-    match order.cancel_initiator_pubkey {
-        Some(_) => {
+    match order.cancel_initiator_pubkey.as_deref() {
+        Some(initiator) => {
+            if initiator != counterparty_pubkey {
+                return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+            }
             cancel_cooperative_execution_step_2(
                 ctx,
                 event,
@@ -1480,6 +1483,42 @@ mod tests {
         assert!(queued_actions_for(taker)
             .await
             .contains(&Action::CooperativeCancelAccepted));
+    }
+
+    #[tokio::test]
+    async fn cancel_active_order_rejects_preexisting_stranger_initiator() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let stranger = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Active.to_string();
+        order.cancel_initiator_pubkey = Some(stranger.to_string());
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // A real counterparty tries to confirm a cancel that was initiated by a stranger.
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Active.to_string()
+        );
     }
 
     #[tokio::test]

@@ -598,6 +598,12 @@ async fn cancel_active_order<L: CancelLightning + Send>(
     let seller_pubkey = order.get_seller_pubkey().map_err(MostroInternalErr)?;
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
+    // Only the trade counterparties may drive this flow; without this check a
+    // third party falls into the `else` branch below and is treated as the seller.
+    if event.sender != buyer_pubkey && event.sender != seller_pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
     let counterparty_pubkey: String;
     if buyer_pubkey == event.sender {
         order.buyer_cooperativecancel = true;
@@ -1295,6 +1301,75 @@ mod tests {
         assert!(queued_actions_for(maker)
             .await
             .contains(&Action::CooperativeCancelInitiatedByPeer));
+    }
+
+    #[tokio::test]
+    async fn cancel_active_order_rejects_stranger_initiate() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Active.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // Neither buyer nor seller: must not be recorded as initiator.
+        let stranger = Keys::generate().public_key();
+        let event = create_unwrapped_message_with_pubkey(stranger);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert!(after.cancel_initiator_pubkey.is_none());
+        assert!(!after.buyer_cooperativecancel);
+        assert!(!after.seller_cooperativecancel);
+    }
+
+    #[tokio::test]
+    async fn cancel_active_order_rejects_stranger_confirm() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::Active.to_string();
+        // The buyer already initiated; escrow is still locked.
+        order.cancel_initiator_pubkey = Some(taker.to_string());
+        order.buyer_cooperativecancel = true;
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // Neither buyer nor seller: must not be able to confirm the cancel.
+        let stranger = Keys::generate().public_key();
+        let event = create_unwrapped_message_with_pubkey(stranger);
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Active.to_string());
+        assert_eq!(after.cancel_initiator_pubkey, Some(taker.to_string()));
     }
 
     #[tokio::test]

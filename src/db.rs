@@ -919,12 +919,26 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Orders whose Lightning hold invoice still needs an LND subscription after
+/// a daemon restart.
+///
+/// Includes:
+/// - `waiting-payment` — seller has not paid yet; `Accepted` advances the trade
+/// - `waiting-buyer-invoice` / `active` — hold already accepted; keep watching
+///   `Settled` / `Canceled`
+///
+/// Selection is by a non-empty `hash`, not `invoice_held_at`: that timestamp is
+/// only written in `hold_invoice_paid` *after* `Accepted`, so filtering on it
+/// would permanently skip the `WaitingPayment` phase where resubscription
+/// matters most.
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE invoice_held_at !=0 AND  status == 'active'
+          WHERE hash IS NOT NULL
+            AND hash != ''
+            AND status IN ('waiting-payment', 'waiting-buyer-invoice', 'active')
         "#,
     )
     .fetch_all(pool)
@@ -1948,17 +1962,18 @@ mod tests {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
 
-        // Insert order with invoice_held_at != 0 and status = 'active'
+        // Insert order with a payment hash and status = 'active'
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                     amount, fiat_code, fiat_amount, created_at, expires_at,
                     failed_payment, payment_attempts, dev_fee, dev_fee_paid,
-                    invoice_held_at)
+                    invoice_held_at, hash)
             VALUES (?1, 'buy', 'ev1', 'active', 0, 'lightning',
                     100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, 0, 0, 1700001000)"#,
+                    0, 0, 0, 0, 1700001000, ?2)"#,
         )
         .bind(id)
+        .bind("aa".repeat(32))
         .execute(&pool)
         .await
         .unwrap();
@@ -1972,18 +1987,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_held_invoices_ignores_non_active() {
+    async fn test_find_held_invoices_returns_waiting_payment_with_hash() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        // WaitingPayment: hold invoice created, seller not yet paid.
+        // `invoice_held_at` is still 0 — that field is only set on Accepted.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at, hash)
+            VALUES (?1, 'buy', 'ev1', 'waiting-payment', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 0, ?2)"#,
+        )
+        .bind(id)
+        .bind("bb".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "WaitingPayment orders with a hash must be resubscribed on restart"
+        );
+        assert_eq!(result[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_returns_waiting_buyer_invoice_with_hash() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at, hash)
+            VALUES (?1, 'sell', 'ev1', 'waiting-buyer-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000, ?2)"#,
+        )
+        .bind(id)
+        .bind("cc".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "WaitingBuyerInvoice orders with a hash must be resubscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_waiting_payment_without_hash() {
         let pool = setup_orders_db().await.unwrap();
 
-        // Insert order with invoice_held_at != 0 but wrong status
+        // Pre-hold WaitingBuyerInvoice / empty-hash waiting states have
+        // nothing for LND to subscribe to.
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                     amount, fiat_code, fiat_amount, created_at, expires_at,
                     failed_payment, payment_attempts, dev_fee, dev_fee_paid,
                     invoice_held_at)
-            VALUES (?1, 'buy', 'ev1', 'pending', 0, 'lightning',
+            VALUES (?1, 'sell', 'ev1', 'waiting-buyer-invoice', 0, 'lightning',
                     100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, 0, 0, 1700001000)"#,
+                    0, 0, 0, 0, 0)"#,
         )
         .bind(uuid::Uuid::new_v4())
         .execute(&pool)
@@ -1991,14 +2066,44 @@ mod tests {
         .unwrap();
 
         let result = super::find_held_invoices(&pool).await.unwrap();
-        assert!(result.is_empty(), "Should not find non-active orders");
+        assert!(
+            result.is_empty(),
+            "Orders without a payment hash must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_non_active() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Insert order with a hash but a terminal / unrelated status
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at, hash)
+            VALUES (?1, 'buy', 'ev1', 'pending', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("dd".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not find orders outside waiting/active hold-invoice statuses"
+        );
     }
 
     #[tokio::test]
     async fn test_find_held_invoices_ignores_zero_held_at() {
         let pool = setup_orders_db().await.unwrap();
 
-        // Insert active order but invoice_held_at = 0
+        // Active without a hash: nothing to resubscribe (e.g. Cashu trades).
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                     amount, fiat_code, fiat_amount, created_at, expires_at,
@@ -2014,7 +2119,10 @@ mod tests {
         .unwrap();
 
         let result = super::find_held_invoices(&pool).await.unwrap();
-        assert!(result.is_empty(), "Should not find orders with held_at = 0");
+        assert!(
+            result.is_empty(),
+            "Should not find active orders without a payment hash"
+        );
     }
 
     // -- Tests for find_failed_payment --

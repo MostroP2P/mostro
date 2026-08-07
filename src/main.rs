@@ -26,6 +26,7 @@ use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use crate::rpc::RpcServer;
+use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::prelude::*;
 use scheduler::start_scheduler;
 use std::env;
@@ -224,9 +225,24 @@ async fn main() -> Result<()> {
     if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
-                tracing::info!("Resubscribing order id - {}", invoice.id);
-                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None).await {
-                    tracing::error!("Ln node error {e}")
+                // `orders.hash` is lowercase hex from `util::bytes_to_string`.
+                // LND's `SubscribeSingleInvoiceRequest.r_hash` wants the raw
+                // 32 bytes — mirror `bond::resubscribe_active_bonds`. Passing
+                // `hash.as_bytes()` would hand LND 64 ASCII hex digits and
+                // every restart resubscribe would fail instantly.
+                match Vec::<u8>::from_hex(hash) {
+                    Ok(bytes) => {
+                        tracing::info!("Resubscribing order id - {}", invoice.id);
+                        if let Err(e) = invoice_subscribe(bytes, None).await {
+                            tracing::error!("Ln node error {e}")
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Order {} has malformed payment hash, skipping resubscribe: {e}",
+                            invoice.id
+                        )
+                    }
                 }
             }
         }
@@ -364,7 +380,28 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 mod tests {
     use mostro_core::message::Message;
+    use nostr_sdk::nostr::hashes::hex::FromHex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn restart_resubscribe_hex_decodes_payment_hash() {
+        // Regression for the ASCII-hex-as-r_hash bug: `orders.hash` is a
+        // 64-char lowercase hex string from `util::bytes_to_string`, and
+        // LND expects the raw 32-byte payment hash.
+        let raw_hash: [u8; 32] = [0xab; 32];
+        let hex_string = crate::util::bytes_to_string(&raw_hash);
+        assert_eq!(hex_string.len(), 64);
+
+        // The broken form previously used in `main`:
+        let ascii_bytes = hex_string.as_bytes().to_vec();
+        assert_eq!(ascii_bytes.len(), 64);
+        assert_ne!(ascii_bytes, raw_hash.to_vec());
+
+        // The fixed form (same as `bond::resubscribe_active_bonds`):
+        let decoded = Vec::<u8>::from_hex(&hex_string).unwrap();
+        assert_eq!(decoded.len(), 32);
+        assert_eq!(decoded, raw_hash.to_vec());
+    }
 
     #[test]
     fn test_message_deserialize_serialize() {

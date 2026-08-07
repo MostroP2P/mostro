@@ -15,6 +15,19 @@ pub async fn hold_invoice_paid(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // `Accepted` only advances a trade still waiting for the seller's hold
+    // payment. After a restart LND may redeliver the current invoice state;
+    // without this guard a redelivered `Accepted` on an already-advanced
+    // order would regress status / re-enqueue party messages.
+    let current_status = order.get_order_status().map_err(MostroInternalErr)?;
+    if current_status != Status::WaitingPayment {
+        info!(
+            "Order Id: {} - Ignoring hold-invoice Accepted in status {current_status} (hash {hash})",
+            order.id
+        );
+        return Ok(());
+    }
+
     let buyer_pubkey = order
         .get_buyer_pubkey()
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
@@ -235,19 +248,30 @@ mod tests {
         let hash = "bb".repeat(32);
         let buyer = create_test_keys().public_key().to_string();
         let seller = create_test_keys().public_key().to_string();
-        let master_buyer = create_test_keys().public_key().to_string();
-        // Status WaitingBuyerInvoice keeps notify_taker_reputation on its
-        // allowed-status path (sell order → PayInvoice to seller).
-        insert_order_with_hash(
-            &pool,
-            &hash,
-            Status::WaitingBuyerInvoice,
-            None,
-            Some(buyer),
-            Some(seller),
-            Some(master_buyer),
-        )
-        .await;
+        let master_seller = create_test_keys().public_key().to_string();
+        // Buy order still WaitingPayment: seller just paid the hold invoice
+        // and the maker (buyer) has not supplied a settlement invoice yet.
+        // `notify_taker_reputation` accepts WaitingPayment on buy orders.
+        let order = Order {
+            id: uuid::Uuid::new_v4(),
+            kind: OrderKind::Buy.to_string(),
+            status: Status::WaitingPayment.to_string(),
+            creator_pubkey: buyer.clone(),
+            payment_method: "SEPA".to_string(),
+            amount: 1_000,
+            fee: 10,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            hash: Some(hash.clone()),
+            buyer_invoice: None,
+            buyer_pubkey: Some(buyer),
+            seller_pubkey: Some(seller),
+            master_seller_pubkey: Some(master_seller),
+            created_at: Timestamp::now().as_secs() as i64,
+            expires_at: Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        order.create(&pool).await.unwrap();
 
         let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
         assert!(result.is_ok(), "add-invoice path must succeed: {result:?}");
@@ -255,6 +279,34 @@ mod tests {
         let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
         assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
         assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_ignores_accepted_when_not_waiting_payment() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "ee".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        // Already Active: a redelivered Accepted after restart must not
+        // regress the order or re-enqueue party messages.
+        insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Active,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, Some(1), &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "stale Accepted must be a no-op: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert_eq!(updated.invoice_held_at, 0, "invoice_held_at must stay untouched");
     }
 
     #[tokio::test]

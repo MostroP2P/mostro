@@ -85,6 +85,12 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Guard: the same party cannot both initiate and confirm the cooperative cancel.
+    //
+    // Unreachable from `cancel_active_order`, the only caller: it already rejects
+    // senders outside {buyer, seller} and then requires the recorded initiator to
+    // equal `counterparty_pubkey` — the party the sender is not — so a sender that
+    // is also the initiator never reaches this point. That check is where the
+    // authorization actually lives; this one is a backstop for any future caller.
     if let Some(initiator) = &order.cancel_initiator_pubkey {
         if *initiator == event.sender.to_string() {
             // We create a Message

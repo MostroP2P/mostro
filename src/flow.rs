@@ -5,6 +5,21 @@ use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use tracing::info;
 
+/// Advance an order whose seller has just paid the hold invoice.
+///
+/// Called from the LND invoice subscriber on `InvoiceState::Accepted`, which
+/// means it can fire more than once for the same invoice: LND replays the
+/// current state whenever a subscription is (re)attached, and every restart
+/// reattaches one for each row `crate::db::find_held_invoices` returns.
+///
+/// It therefore only acts on an order that is still in `WaitingPayment` or
+/// `WaitingBuyerInvoice` *and* still has `invoice_held_at == 0`. Anything else
+/// — a replay, or a late event for an order canceled while its hold invoice
+/// lived on in LND — is a no-op that returns `Ok` after a warning, never an
+/// error, since there is nothing for the caller to retry.
+///
+/// Not atomic: the check and the write are separate statements, so a cancel
+/// running concurrently on the main loop can still interleave. See #855.
 pub async fn hold_invoice_paid(
     hash: &str,
     request_id: Option<u64>,

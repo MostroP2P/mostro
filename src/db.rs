@@ -919,12 +919,25 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Orders whose hold invoice still needs an LND subscription attached.
+///
+/// Two disjoint cases, and the second is the one that matters after a restart:
+///
+/// - `active` with `invoice_held_at != 0` — the seller already paid, so the
+///   subscription is there to observe settle/cancel.
+/// - `waiting-payment` / `waiting-buyer-invoice` with a hash — the invoice
+///   exists but nobody has paid it yet. `invoice_held_at` is still 0 here
+///   (only [`crate::flow::hold_invoice_paid`] ever writes it), which is why
+///   that column cannot gate this branch: these rows would never match.
+///   Missing this window is what makes a seller who paid during a restart
+///   look like a seller who never paid.
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE invoice_held_at !=0 AND  status == 'active'
+          WHERE (invoice_held_at != 0 AND status == 'active')
+             OR (status IN ('waiting-payment', 'waiting-buyer-invoice') AND hash IS NOT NULL)
         "#,
     )
     .fetch_all(pool)
@@ -1992,6 +2005,64 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "Should not find non-active orders");
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_includes_orders_awaiting_seller_payment() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // The hold invoice exists (hash set) but the seller has not paid it yet,
+        // so invoice_held_at is still 0 — it is only written by hold_invoice_paid.
+        // This is precisely the window a restart must not drop: the Accepted
+        // event has not arrived, so the subscription is what is load-bearing.
+        for status in ["waiting-payment", "waiting-buyer-invoice"] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 0, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("aa".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "both pre-payment statuses must be resubscribed on restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_orders_without_hash() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Nothing to subscribe to without an r_hash, so such a row must not be
+        // returned — the caller would have no bytes to hand LND.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'buy', 'ev1', 'waiting-payment', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 0)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(result.is_empty(), "rows without a hash must be skipped");
     }
 
     #[tokio::test]

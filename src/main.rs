@@ -224,8 +224,20 @@ async fn main() -> Result<()> {
     if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
         for invoice in held_invoices.iter() {
             if let Some(hash) = &invoice.hash {
+                // `orders.hash` is hex text; LND's SubscribeSingleInvoiceRequest
+                // wants the 32 raw bytes. Passing the 64 ASCII characters makes
+                // every resubscribe fail, which is silent here because the error
+                // is only logged — and a missed subscription looks exactly like
+                // a seller who never paid.
+                let r_hash = match crate::lightning::decode_hash32("order hash", hash) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!("Order {} has an undecodable hash: {e}", invoice.id);
+                        continue;
+                    }
+                };
                 tracing::info!("Resubscribing order id - {}", invoice.id);
-                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None).await {
+                if let Err(e) = invoice_subscribe(r_hash, None).await {
                     tracing::error!("Ln node error {e}")
                 }
             }

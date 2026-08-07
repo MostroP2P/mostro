@@ -27,6 +27,27 @@ pub async fn hold_invoice_paid(
         order.id
     );
 
+    // Only an order still waiting on the seller's payment may be advanced by
+    // this event. Without the check, a redelivered or late `Accepted` — after a
+    // restart reattaches the subscription, or after the row was canceled while
+    // the hold invoice lived on in LND — would flip a settled or canceled order
+    // back into a live trade.
+    let current_status = order.get_order_status().map_err(MostroInternalErr)?;
+    if !matches!(
+        current_status,
+        Status::WaitingPayment | Status::WaitingBuyerInvoice
+    ) {
+        // Loud on purpose: the HTLC is real and locked, but this order is past
+        // the point where we can credit it, so an operator has to look.
+        tracing::warn!(
+            order_id = %order.id,
+            status = %current_status,
+            "Ignoring hold-invoice payment for an order outside the pre-payment \
+             window; the invoice with hash {hash} may still be locked in LND"
+        );
+        return Ok(());
+    }
+
     // Check if the order kind is valid
     let order_kind = order.get_order_kind().map_err(MostroInternalErr)?;
 
@@ -255,6 +276,40 @@ mod tests {
         let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
         assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
         assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_does_not_revive_a_settled_order() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "cc".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        // A redelivered or late Accepted event for an order that has already
+        // left the pre-payment window must not drag it back into a live trade.
+        insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Canceled,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "a stale Accepted is a no-op, not a failure: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Canceled.to_string());
+        assert_eq!(
+            updated.invoice_held_at, 0,
+            "no side effects on an order outside the pre-payment window"
+        );
     }
 
     #[tokio::test]

@@ -72,7 +72,7 @@ const HASH_LEN: usize = 32;
 /// `field` names the column for the log line. The value itself is never
 /// included in the error: the preimage is the secret that claims the
 /// HTLC, and errors end up in logs.
-fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
+pub(crate) fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
     let bytes = Vec::<u8>::from_hex(value).map_err(|e| {
         MostroInternalErr(ServiceError::HoldInvoiceError(format!(
             "invalid {field}: not valid hex ({e})"

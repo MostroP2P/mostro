@@ -224,6 +224,38 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   re-sent identical event id before decryption. The existing 10-second
   freshness window (post-decrypt, on the inner `created_at`) still applies as
   the precise stale-event check.
+- **Discoverability** (`src/nip33.rs`): the kind-38385 info event carries a
+  `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
+  reply — it never reaches a handler — so the info event is the only way a
+  client can learn what the first-contact lane costs. The published value is
+  the *enforced* difficulty (`advertised_first_contact_pow`): on `nip44`
+  `max(pow, effective_pow_first_contact())` — a max because the two checks run
+  in sequence, so a `pow_first_contact` below `pow` still enforces `pow` — and
+  on `gift-wrap` just `pow`, since the gate never runs there and advertising the
+  stiffer number would make clients grind work nobody checks.
+- **Recognition is eventually consistent — the lane is not "the first event
+  only".** Accepting a create or take does *not* insert that trade key into the
+  cache synchronously; `job_refresh_active_pubkeys` is the only writer after
+  startup and rebuilds the whole set on its interval. A trade key whose event
+  was just accepted therefore keeps being classified as first contact until the
+  next rebuild lands — up to one full `active_pubkeys_refresh_interval`
+  (default 60 s), and longer if a reload fails and the previous snapshot is
+  retained. A client that mined `pow_first_contact` once and then dropped back
+  to `pow` for an immediate follow-up (the `take-sell` right after a
+  `new-order`, or the invoice message that follows a take) would have that
+  follow-up silently discarded.
+
+  The client-side rule is therefore: **mine `pow_first_contact` for every event
+  sent from a trade key, not just for its first one.** Recognition is not
+  observable from the client side — the daemon publishes no per-key signal and
+  does not advertise the refresh interval — so there is no bound a client can
+  safely wait out; it must keep using the higher difficulty for the lifetime of
+  the trade key. On nodes where `pow_first_contact` resolves to `pow` (the
+  default) the rule costs nothing; on nodes that set it higher it is the
+  difference between working and failing silently. Making recognition
+  synchronous at accept time, so the rule can be relaxed to a bounded window,
+  is follow-up work — the advertised value is correct either way, because it
+  always reports the difficulty the gate enforces on an unrecognized sender.
 
 New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
 and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,

@@ -1337,6 +1337,7 @@ mod tests {
         assert!(after.cancel_initiator_pubkey.is_none());
         assert!(!after.buyer_cooperativecancel);
         assert!(!after.seller_cooperativecancel);
+        assert!(after.status == Status::Active.to_string());
     }
 
     #[tokio::test]
@@ -1373,6 +1374,7 @@ mod tests {
         let after = order_by_id(ctx.pool(), order.id).await;
         assert_eq!(after.status, Status::Active.to_string());
         assert_eq!(after.cancel_initiator_pubkey, Some(taker.to_string()));
+        assert!(after.status == Status::Active.to_string());
     }
 
     #[tokio::test]
@@ -1519,6 +1521,10 @@ mod tests {
             order_by_id(ctx.pool(), order.id).await.status,
             Status::Active.to_string()
         );
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.cancel_initiator_pubkey, Some(stranger.to_string()));
+        assert!(!after.buyer_cooperativecancel);
+        assert!(!after.seller_cooperativecancel);
     }
 
     #[tokio::test]

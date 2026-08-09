@@ -16,7 +16,30 @@ use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Run [`check_failure_retries`] and surface bookkeeping failures instead of
+/// silently dropping them. On success, preserves the existing retry-count log.
+async fn check_failure_retries_or_log(
+    ctx: &AppContext,
+    order: &Order,
+    request_id: Option<u64>,
+) {
+    match check_failure_retries(ctx, order, request_id).await {
+        Ok(failed_payment) => {
+            info!(
+                "Order id {} has {} failed payments retries",
+                failed_payment.id, failed_payment.payment_attempts
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Order id {}: check_failure_retries failed: {:?}",
+                order.id, e
+            );
+        }
+    }
+}
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -506,18 +529,13 @@ pub async fn do_payment(
             Ok(pr) if !pr.is_empty() => pr,
             outcome => {
                 match outcome {
-                    Err(e) => info!(
+                    Err(e) => warn!(
                         "Order id {}: could not resolve payout address: {:?}",
                         order.id, e
                     ),
-                    _ => info!("Order id {}: payout address returned no invoice", order.id),
+                    _ => warn!("Order id {}: payout address returned no invoice", order.id),
                 }
-                if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
-                    info!(
-                        "Order id {} has {} failed payments retries",
-                        failed_payment.id, failed_payment.payment_attempts
-                    );
-                }
+                check_failure_retries_or_log(ctx, &order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
         }
@@ -529,13 +547,8 @@ pub async fn do_payment(
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(paymement_result) = payment_task.await {
-        info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
-            info!(
-                "Order id {} has {} failed payments retries",
-                failed_payment.id, failed_payment.payment_attempts
-            );
-        }
+        warn!("Error during ln payment : {}", paymement_result);
+        check_failure_retries_or_log(ctx, &order, request_id).await;
     }
 
     // Get Mostro keys from context
@@ -569,20 +582,13 @@ pub async fn do_payment(
                             .await;
                         }
                         PaymentStatus::Failed => {
-                            info!(
+                            warn!(
                                 "Order Id {}: Invoice with hash: {} has failed!",
                                 order.id, msg.payment.payment_hash
                             );
 
                             // Mark payment as failed
-                            if let Ok(failed_payment) =
-                                check_failure_retries(&ctx, &order, request_id).await
-                            {
-                                info!(
-                                    "Order id {} has {} failed payments retries",
-                                    failed_payment.id, failed_payment.payment_attempts
-                                );
-                            }
+                            check_failure_retries_or_log(&ctx, &order, request_id).await;
                         }
                         _ => {}
                     }

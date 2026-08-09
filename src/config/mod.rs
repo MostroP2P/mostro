@@ -44,6 +44,17 @@ pub static PRICE_NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
 
+/// Install the canonical test keys into [`NOSTR_KEYS`] so code paths that
+/// call `get_keys()` work in unit tests. Idempotent: whichever test module
+/// wins the race installs the same key.
+#[cfg(test)]
+pub fn init_test_nostr_keys() {
+    let _ = NOSTR_KEYS.set(
+        Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd")
+            .expect("valid canonical test nsec"),
+    );
+}
+
 /// Global message queues for Mostro
 /// This struct holds three queues:
 /// - `queue_order_msg`: Holds messages related to orders.

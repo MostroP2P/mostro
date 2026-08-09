@@ -2030,6 +2030,7 @@ mod tests {
     /// `anti_abuse_bond` block stays `None`, matching every other test
     /// init in the binary (the OnceCell is first-set-wins).
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         use crate::config::MOSTRO_CONFIG;
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
@@ -2037,8 +2038,9 @@ mod tests {
                 // Valid canonical test nsec: whichever module wins the
                 // MOSTRO_CONFIG race must install a parseable key, or tests
                 // that reach get_keys() flake on init ordering.
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),

@@ -727,6 +727,7 @@ mod tests {
     /// rest of the test infrastructure.
     /// Uses `let _ =` to silently ignore if the OnceLock is already set by another test.
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(test_settings());
     }
 

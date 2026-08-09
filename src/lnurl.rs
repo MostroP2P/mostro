@@ -25,7 +25,7 @@ static ALLOW_PRIVATE_LNURL_HOSTS: AtomicBool = AtomicBool::new(false);
 /// Serializes tests that mutate [`ALLOW_PRIVATE_LNURL_HOSTS`] so parallel
 /// tokio tests cannot flip the flag under each other.
 #[cfg(test)]
-static LNURL_HOST_POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LNURL_HOST_POLICY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Test-only escape hatch so local mock LNURL servers on loopback / RFC1918
 /// addresses keep working. Link-local (e.g. cloud metadata `169.254.0.0/16`)
@@ -60,10 +60,13 @@ impl AllowPrivateLnurlHostsGuard {
     }
 
     /// Hold the policy-test lock so concurrent tests cannot flip the flag.
-    pub fn lock_policy() -> std::sync::MutexGuard<'static, ()> {
-        LNURL_HOST_POLICY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    pub async fn lock_policy() -> tokio::sync::MutexGuard<'static, ()> {
+        LNURL_HOST_POLICY_TEST_LOCK.lock().await
+    }
+
+    /// Sync variant for non-async unit tests.
+    pub fn lock_policy_sync() -> tokio::sync::MutexGuard<'static, ()> {
+        LNURL_HOST_POLICY_TEST_LOCK.blocking_lock()
     }
 }
 
@@ -390,7 +393,7 @@ mod tests {
 
     #[test]
     fn ip_is_forbidden_rejects_loopback_private_and_link_local() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy_sync();
         let _guard = AllowPrivateLnurlHostsGuard {
             previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
         };
@@ -408,7 +411,7 @@ mod tests {
 
     #[test]
     fn ip_is_forbidden_test_guard_allows_loopback_but_not_link_local() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy_sync();
         let _guard = AllowPrivateLnurlHostsGuard::enable();
         assert!(!ip_is_forbidden(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(!ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
@@ -420,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn assert_url_host_safe_rejects_loopback_literal() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _guard = AllowPrivateLnurlHostsGuard {
             previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
         };
@@ -581,7 +584,7 @@ mod tests {
     /// the internal target must never be contacted.
     #[tokio::test]
     async fn resolv_ln_address_refuses_link_local_callback() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _guard = AllowPrivateLnurlHostsGuard::enable();
 
         let hits = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -650,7 +653,7 @@ mod tests {
     /// refused before the first GET.
     #[tokio::test]
     async fn resolv_ln_address_refuses_initial_loopback_lnurl() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _policy = AllowPrivateLnurlHostsGuard {
             previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
         };
@@ -702,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolv_ln_address_returns_err_on_lnurl_error_status() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _guard = AllowPrivateLnurlHostsGuard::enable();
 
         let app = Router::new().route(
@@ -740,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolv_ln_address_returns_err_on_non_payrequest_tag() {
-        let _lock = AllowPrivateLnurlHostsGuard::lock_policy();
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _guard = AllowPrivateLnurlHostsGuard::enable();
 
         let app = Router::new().route(

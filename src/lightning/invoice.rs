@@ -424,7 +424,7 @@ mod tests {
         // Local mock LNURL servers bind loopback; production host policy
         // would refuse them without this test-only escape hatch. Hold the
         // shared policy lock so parallel lnurl tests cannot flip the flag.
-        let _policy_lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy();
+        let _policy_lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy().await;
         let _allow_private = crate::lnurl::AllowPrivateLnurlHostsGuard::enable();
 
         // Start test server

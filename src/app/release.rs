@@ -496,9 +496,31 @@ pub async fn do_payment(
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount, None)
-            .await
-            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
+        // Resolving a lightning address is a network round-trip to a host the
+        // buyer chose. When it yields no invoice — forbidden host (SSRF
+        // policy), unreachable, or LNURL-level ERROR — that is a payment
+        // failure and must go through the same bookkeeping as a failed
+        // `send_payment`. Returning early would leave `failed_payment =
+        // false` and hide the order from the retry job.
+        match resolv_ln_address(&addr.to_string(), amount, None).await {
+            Ok(pr) if !pr.is_empty() => pr,
+            outcome => {
+                match outcome {
+                    Err(e) => info!(
+                        "Order id {}: could not resolve payout address: {:?}",
+                        order.id, e
+                    ),
+                    _ => info!("Order id {}: payout address returned no invoice", order.id),
+                }
+                if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
+                    info!(
+                        "Order id {} has {} failed payments retries",
+                        failed_payment.id, failed_payment.payment_attempts
+                    );
+                }
+                return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+            }
+        }
     } else {
         payment_request
     };

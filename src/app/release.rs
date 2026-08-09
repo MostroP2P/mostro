@@ -20,11 +20,7 @@ use tracing::{info, warn};
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
-async fn check_failure_retries_or_log(
-    ctx: &AppContext,
-    order: &Order,
-    request_id: Option<u64>,
-) {
+async fn check_failure_retries_or_log(ctx: &AppContext, order: &Order, request_id: Option<u64>) {
     match check_failure_retries(ctx, order, request_id).await {
         Ok(failed_payment) => {
             info!(

@@ -14,7 +14,7 @@ Report suspected vulnerabilities privately by email to:
 
 **security@mostro.network**
 
-Do not open a public GitHub issue, pull request, or discussion for a security report, and do not post details in the public Telegram groups. Public disclosure before a fix is available exposes every operator and their users.
+Do not open a public GitHub issue, pull request, or discussion for a security report, and do not post details in the public Telegram groups. Premature public disclosure exposes every operator and their users; see [Coordinated Disclosure](#coordinated-disclosure) below for the timeline we ask you to follow.
 
 Include as much of the following as you can:
 

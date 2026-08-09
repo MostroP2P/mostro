@@ -77,20 +77,38 @@ impl Drop for AllowPrivateLnurlHostsGuard {
     }
 }
 
+/// True for IPv4 CGNAT / carrier-grade NAT (`100.64.0.0/10`, RFC 6598).
+/// Manual check: `Ipv4Addr::is_shared` is still unstable on stable Rust.
+fn ipv4_is_cgnat(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn ipv4_is_always_forbidden(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_link_local()
+        || v4.is_documentation()
+        || ipv4_is_cgnat(v4)
+}
+
+/// RFC 6052 well-known NAT64 prefix `64:ff9b::/96`.
+fn ipv6_is_nat64_well_known(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
+}
+
 /// True for destinations the daemon must never fetch for LNURL (SSRF policy).
 ///
-/// Always rejects link-local, unspecified, multicast, broadcast, and
+/// Always rejects link-local, CGNAT (RFC 6598 `100.64.0.0/10`), NAT64 well-known
+/// prefix (RFC 6052 `64:ff9b::/96`), unspecified, multicast, broadcast, and
 /// documentation ranges. Loopback and RFC1918 private are rejected unless
 /// the test-only allow flag is set (local mock servers).
 fn ip_is_forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            if v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_link_local()
-                || v4.is_documentation()
-            {
+            if ipv4_is_always_forbidden(v4) {
                 return true;
             }
             if private_hosts_allowed() {
@@ -102,15 +120,10 @@ fn ip_is_forbidden(ip: IpAddr) -> bool {
             if v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
+                || ipv6_is_nat64_well_known(v6)
                 || v6
                     .to_ipv4_mapped()
-                    .map(|v4| {
-                        v4.is_unspecified()
-                            || v4.is_broadcast()
-                            || v4.is_multicast()
-                            || v4.is_link_local()
-                            || v4.is_documentation()
-                    })
+                    .map(ipv4_is_always_forbidden)
                     .unwrap_or(false)
             {
                 return true;
@@ -403,6 +416,13 @@ mod tests {
         assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(
             169, 254, 169, 254
         ))));
+        // CGNAT / shared address space (RFC 6598).
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+        // NAT64 well-known prefix embedding 8.8.8.8 (RFC 6052).
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(
+            0x64, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
+        ))));
         assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(!ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
@@ -418,6 +438,11 @@ mod tests {
         // Cloud-metadata style link-local stays forbidden even for local mocks.
         assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(
             169, 254, 169, 254
+        ))));
+        // CGNAT and NAT64 stay forbidden under the test guard too.
+        assert!(ip_is_forbidden(IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))));
+        assert!(ip_is_forbidden(IpAddr::V6(Ipv6Addr::new(
+            0x64, 0xff9b, 0, 0, 0, 0, 0xc0a8, 0x0001
         ))));
     }
 

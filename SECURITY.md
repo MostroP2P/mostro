@@ -1,6 +1,6 @@
 # Security Policy
 
-Mostro is a non-custodial Lightning Network peer-to-peer exchange. Although the daemon never takes ownership of user funds, it coordinates hold invoices, escrow settlement, disputes and reputation, so defects in those paths can put real money and user privacy at risk. Security reports are treated as a priority.
+Mostro is a Lightning Network peer-to-peer exchange built on Nostr. The daemon coordinates hold invoices, escrow settlement, disputes and reputation, so defects in those paths can put real money and user privacy at risk. Security reports are treated as a priority.
 
 ## Supported Versions
 

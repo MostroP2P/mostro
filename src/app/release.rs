@@ -2,6 +2,7 @@ use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
+use crate::lightning::invoice::decode_invoice;
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -522,7 +523,17 @@ pub async fn do_payment(
         // `send_payment`. Returning early would leave `failed_payment =
         // false` and hide the order from the retry job.
         match resolv_ln_address(&addr.to_string(), amount, None).await {
-            Ok(pr) if !pr.is_empty() => pr,
+            Ok(pr) if !pr.is_empty() => match decode_invoice(&pr) {
+                Ok(_) => pr,
+                Err(e) => {
+                    warn!(
+                        "Order id {}: payout address returned malformed invoice: {:?}",
+                        order.id, e
+                    );
+                    check_failure_retries_or_log(ctx, &order, request_id).await;
+                    return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+                }
+            },
             outcome => {
                 match outcome {
                     Err(e) => warn!(

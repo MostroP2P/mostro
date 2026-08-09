@@ -3336,6 +3336,7 @@ mod migration_and_query_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(test_settings());
     }
 

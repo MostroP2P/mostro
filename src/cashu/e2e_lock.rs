@@ -335,7 +335,7 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
         mint_url: mint_url.clone(),
         escrow_locktime_days: days as u32,
     });
-    crate::config::settings::init_mostro_settings(settings);
+    let _ = crate::config::settings::init_mostro_settings(settings);
 
     let keys = EscrowKeys::generate();
     let keys_path = keys.persist();

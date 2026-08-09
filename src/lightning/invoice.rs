@@ -214,8 +214,9 @@ mod tests {
         // The template ships a placeholder nsec; install a parseable one so
         // whichever module wins the MOSTRO_CONFIG race leaves get_keys()
         // usable for every other test.
-        test_settings.nostr.nsec_privkey =
-            "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd".to_string();
+        test_settings.nostr.nsec_privkey = secrecy::SecretString::from(
+            "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+        );
         MOSTRO_CONFIG.get_or_init(|| test_settings);
     }
 

@@ -892,6 +892,7 @@ mod tests {
     use uuid::Uuid;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(test_settings());
     }
 

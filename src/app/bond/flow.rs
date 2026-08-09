@@ -285,7 +285,7 @@ pub async fn request_taker_bond(
     };
     if claimed {
         let my_keys = get_keys()?;
-        match crate::util::update_order_event(&my_keys, Status::WaitingTakerBond, order).await {
+        match crate::util::update_order_event(my_keys, Status::WaitingTakerBond, order).await {
             Ok(updated) => {
                 if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
                     .bind(&updated.event_id)
@@ -931,7 +931,7 @@ async fn on_bond_invoice_accepted(
     let order = promote_taker_context_to_order(pool, order, &current).await?;
 
     let my_keys = get_keys()?;
-    resume_take_after_bond(pool, order, &my_keys, request_id).await
+    resume_take_after_bond(pool, order, my_keys, request_id).await
 }
 
 /// Subscriber callback path for a **maker** bond reaching `Accepted`.
@@ -1015,7 +1015,7 @@ async fn on_maker_bond_accepted(
     }
 
     let my_keys = get_keys()?;
-    crate::util::resume_publish_after_maker_bond(pool, &my_keys, order, request_id).await
+    crate::util::resume_publish_after_maker_bond(pool, my_keys, order, request_id).await
 }
 
 /// Message the taker of a losing concurrent bond that their take was
@@ -1227,7 +1227,7 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
         None => return Ok(()),
     };
     let my_keys = get_keys()?;
-    match crate::util::update_order_event(&my_keys, Status::Pending, &fresh).await {
+    match crate::util::update_order_event(my_keys, Status::Pending, &fresh).await {
         Ok(updated) => {
             if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
                 .bind(&updated.event_id)
@@ -2030,6 +2030,7 @@ mod tests {
     /// `anti_abuse_bond` block stays `None`, matching every other test
     /// init in the binary (the OnceCell is first-set-wins).
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         use crate::config::MOSTRO_CONFIG;
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
@@ -2037,8 +2038,9 @@ mod tests {
                 // Valid canonical test nsec: whichever module wins the
                 // MOSTRO_CONFIG race must install a parseable key, or tests
                 // that reach get_keys() flake on init ordering.
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),

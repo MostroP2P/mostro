@@ -3041,8 +3041,9 @@ mod tests {
                 // Valid canonical test nsec: whichever module wins the
                 // MOSTRO_CONFIG race must install a parseable key, or tests
                 // that reach get_keys() flake on init ordering.
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),

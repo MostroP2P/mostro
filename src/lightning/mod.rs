@@ -464,12 +464,14 @@ mod tests {
     use mostro_core::prelude::*;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         // Defaults set `max_routing_fee = 0.002`.
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
             nostr: crate::config::NostrSettings {
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),
@@ -616,6 +618,7 @@ mod offline_connector_tests {
     use fedimint_tonic_lnd::lnrpc::GetInfoResponse;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
     }
 

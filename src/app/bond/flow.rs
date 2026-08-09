@@ -2024,4 +2024,1147 @@ mod tests {
             );
         }
     }
+
+    /// Initialize the process-wide settings so paths that reach
+    /// `Settings::get_ln()` / `Settings::get_nostr()` don't panic. The
+    /// `anti_abuse_bond` block stays `None`, matching every other test
+    /// init in the binary (the OnceCell is first-set-wins).
+    fn init_test_settings() {
+        use crate::config::MOSTRO_CONFIG;
+        let _ = MOSTRO_CONFIG.set(Settings {
+            database: Default::default(),
+            nostr: crate::config::NostrSettings {
+                // Valid canonical test nsec: whichever module wins the
+                // MOSTRO_CONFIG race must install a parseable key, or tests
+                // that reach get_keys() flake on init ordering.
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
+            mostro: Default::default(),
+            lightning: Default::default(),
+            rpc: Default::default(),
+            expiration: Some(Default::default()),
+            anti_abuse_bond: None,
+            cashu: None,
+            price: None,
+        });
+    }
+
+    async fn load_order(pool: &Pool<Sqlite>, id: Uuid) -> Order {
+        Order::by_id(pool, id).await.unwrap().unwrap()
+    }
+
+    /// Count queued messages for `order_id` with `action` in the global
+    /// message queue. Each test uses a fresh order id, so the count is
+    /// deterministic under parallel tests.
+    async fn count_msgs(order_id: Uuid, action: Action) -> usize {
+        use crate::config::MESSAGE_QUEUES;
+        MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| {
+                let k = m.get_inner_message_kind();
+                k.id == Some(order_id) && k.action == action
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn request_taker_bond_errors_when_bond_config_missing() {
+        // The take handlers only call this when `taker_bond_required()`
+        // is true, but a raced config reload can leave the block absent:
+        // the function must fail loudly, not panic.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let order = load_order(&pool, order_id).await;
+
+        let ctx = TakerContext {
+            identity: "i".repeat(64),
+            trade_index: 1,
+            buyer_invoice: None,
+            fiat_amount: 10,
+            amount: 1_000,
+            fee: 1,
+            dev_fee: 0,
+        };
+        let taker = Keys::generate().public_key();
+        let result = request_taker_bond(&pool, &order, taker, None, ctx).await;
+        assert!(result.is_err(), "missing anti_abuse_bond block must error");
+        // And no bond row was persisted.
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_maker_bond_errors_when_bond_config_missing() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let order = load_order(&pool, order_id).await;
+
+        let maker = Keys::generate().public_key();
+        let result = request_maker_bond(&pool, &order, maker, 100_000, None, Some(1)).await;
+        assert!(result.is_err(), "missing anti_abuse_bond block must error");
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_bond_with_unparseable_state_errors() {
+        // A malformed `state` column must short-circuit with an error
+        // instead of transitioning the row.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.state = "definitely-not-a-state".to_string();
+        let err = release_bond(&pool, &bond).await.unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_bond_with_hash_stays_active_when_lnd_unreachable() {
+        // Safety contract: a transient LND failure (unreachable node in
+        // this harness) must leave the bond in its active state and
+        // propagate the error — never mark Released while the HTLC may
+        // still be encumbered.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let bond = create_bond(&pool, make_bond(order_id, BondState::Requested))
+            .await
+            .unwrap();
+
+        let result = release_bond(&pool, &bond).await;
+        assert!(result.is_err(), "transient LND failure must propagate");
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state,
+            BondState::Requested.to_string(),
+            "bond must stay active for a later retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_bonds_for_order_swallows_per_bond_failures() {
+        // The order-level helper warns and continues on individual bond
+        // failures; the call itself succeeds.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        create_bond(&pool, make_bond(order_id, BondState::Requested))
+            .await
+            .unwrap();
+
+        release_bonds_for_order(&pool, order_id).await.unwrap();
+
+        // The bond is still active (LND unreachable → left for retry).
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_bonds_for_order_or_warn_never_propagates() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        create_bond(&pool, make_bond(order_id, BondState::Requested))
+            .await
+            .unwrap();
+
+        // Must not panic or propagate despite the unreachable LND.
+        release_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+    }
+
+    #[tokio::test]
+    async fn release_taker_bonds_retains_locked_maker_bond() {
+        // Waiting-timeout republish path: the maker's Locked bond stays
+        // put; only the taker side is released.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = BondState::Locked.to_string();
+        maker.hash = Some("d".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        // Hashless taker bond → release succeeds without LND.
+        let mut taker = make_bond(order_id, BondState::Requested);
+        taker.pubkey = "t".repeat(64);
+        taker.hash = None;
+        create_bond(&pool, taker).await.unwrap();
+
+        release_taker_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1, "only the maker bond may remain");
+        assert_eq!(active[0].role, BondRole::Maker.to_string());
+        assert_eq!(active[0].state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn bond_invoice_subscribe_errors_when_lnd_unreachable() {
+        init_test_settings();
+        let result = bond_invoice_subscribe(vec![0u8; 32], None).await;
+        assert!(result.is_err(), "no LND in the unit-test harness");
+    }
+
+    #[tokio::test]
+    async fn resubscribe_active_bonds_survives_bad_hash_and_no_lnd() {
+        // One malformed hash (hex decode fails → warn) and one valid
+        // hash (subscribe fails on unreachable LND → warn). The restart
+        // hook must swallow both and return Ok.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut malformed = make_bond(order_id, BondState::Requested);
+        malformed.pubkey = "a".repeat(64);
+        malformed.hash = Some("zz-not-hex".to_string());
+        create_bond(&pool, malformed).await.unwrap();
+
+        let mut valid = make_bond(order_id, BondState::Locked);
+        valid.pubkey = "b".repeat(64);
+        valid.hash = Some("ab".repeat(32));
+        create_bond(&pool, valid).await.unwrap();
+
+        let arc_pool = Arc::new(pool);
+        resubscribe_active_bonds(&arc_pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_ignores_unknown_hash() {
+        let pool = setup_pool().await;
+        on_bond_invoice_accepted(&"9".repeat(64), &pool, None)
+            .await
+            .expect("unknown hash is a warn-and-return");
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_race_loser_is_notified_and_left_for_retry() {
+        // Bond B fires `Accepted` after bond A already locked. B loses
+        // the CAS, is not Locked on re-read, and gets the loser
+        // treatment: release attempt (fails here: unreachable LND, so
+        // the row stays Requested for a later retry) + `Canceled`
+        // notification to its taker.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut a = make_bond(order_id, BondState::Locked);
+        a.pubkey = "a".repeat(64);
+        a.hash = Some("a".repeat(64));
+        create_bond(&pool, a).await.unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.pubkey = Keys::generate().public_key().to_string();
+        b.hash = Some("b".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        let before = count_msgs(order_id, Action::Canceled).await;
+        on_bond_invoice_accepted(&"b".repeat(64), &pool, None)
+            .await
+            .expect("loser path returns Ok");
+        let after = count_msgs(order_id, Action::Canceled).await;
+        assert_eq!(after - before, 1, "loser taker must be messaged Canceled");
+
+        let b_after = find_bond_by_hash(&pool, &"b".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b_after.state,
+            BondState::Requested.to_string(),
+            "release failed transiently (no LND) → left active for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_terminal_loser_skips_release() {
+        // A loser whose row is already terminal (Released) must not be
+        // re-released; it is only notified.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut a = make_bond(order_id, BondState::Locked);
+        a.pubkey = "a".repeat(64);
+        a.hash = Some("a".repeat(64));
+        create_bond(&pool, a).await.unwrap();
+
+        let mut b = make_bond(order_id, BondState::Released);
+        b.pubkey = Keys::generate().public_key().to_string();
+        b.hash = Some("b".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        let before = count_msgs(order_id, Action::Canceled).await;
+        on_bond_invoice_accepted(&"b".repeat(64), &pool, None)
+            .await
+            .expect("terminal loser path returns Ok");
+        let after = count_msgs(order_id, Action::Canceled).await;
+        assert_eq!(after - before, 1);
+
+        let b_after = find_bond_by_hash(&pool, &"b".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b_after.state, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_winner_tears_down_requested_siblings() {
+        // The winner's CAS lands; every other still-Requested bond on
+        // the order is released (hashless here, so no LND involved) and
+        // its taker messaged Canceled. The resume then fails in this
+        // harness (no LND/keys), but the winner's Locked state and the
+        // promoted taker context must already be durable.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let winner_pk = Keys::generate().public_key().to_string();
+        let mut w = make_bond(order_id, BondState::Requested);
+        w.pubkey = winner_pk.clone();
+        w.hash = Some("a".repeat(64));
+        w.taker_identity = Some("i".repeat(64));
+        w.taker_trade_index = Some(7);
+        w.taker_fiat_amount = Some(42);
+        w.taker_amount = Some(2_000);
+        w.taker_fee = Some(3);
+        w.taker_dev_fee = Some(1);
+        create_bond(&pool, w).await.unwrap();
+
+        let mut s = make_bond(order_id, BondState::Requested);
+        s.pubkey = Keys::generate().public_key().to_string();
+        s.hash = None; // hashless → release succeeds without LND
+        create_bond(&pool, s).await.unwrap();
+
+        let before = count_msgs(order_id, Action::Canceled).await;
+        let result = on_bond_invoice_accepted(&"a".repeat(64), &pool, None).await;
+        assert!(
+            result.is_err(),
+            "resume must fail in the unit harness (no LND / nostr keys)"
+        );
+        let after = count_msgs(order_id, Action::Canceled).await;
+        assert_eq!(after - before, 1, "losing sibling must be notified");
+
+        // Winner locked; sibling released.
+        let w_after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(w_after.state, BondState::Locked.to_string());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, w_after.id);
+
+        // Taker context was promoted onto the order (buy order → seller
+        // side) before the resume attempt.
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.seller_pubkey.as_deref(), Some(winner_pk.as_str()));
+        assert_eq!(
+            order.master_seller_pubkey.as_deref(),
+            Some(&*"i".repeat(64))
+        );
+        assert_eq!(order.trade_index_seller, Some(7));
+        assert_eq!(order.fiat_amount, 42);
+        assert_eq!(order.amount, 2_000);
+        assert_eq!(order.fee, 3);
+        assert_eq!(order.dev_fee, 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_skips_resume_when_order_moved_on() {
+        // Winner locks, but the order already advanced past the
+        // pre-trade states (e.g. maker cancel) → no resume, Ok.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut w = make_bond(order_id, BondState::Requested);
+        w.pubkey = "w".repeat(64);
+        w.hash = Some("a".repeat(64));
+        create_bond(&pool, w).await.unwrap();
+
+        on_bond_invoice_accepted(&"a".repeat(64), &pool, None)
+            .await
+            .expect("moved-on order must skip resume with Ok");
+
+        let w_after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(w_after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_errors_on_missing_order_row() {
+        // Bond exists but its order row vanished — an invariant
+        // violation surfaced as an error, not a panic.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut w = make_bond(order_id, BondState::Requested);
+        w.hash = Some("a".repeat(64));
+        create_bond(&pool, w).await.unwrap();
+
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM orders WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = on_bond_invoice_accepted(&"a".repeat(64), &pool, None).await;
+        assert!(result.is_err(), "missing order row must error");
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_skips_bond_with_unparseable_state() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.state = "garbage-state".to_string();
+        b.hash = Some("a".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_accepted(&"a".repeat(64), &pool, None)
+            .await
+            .expect("unparseable state is warn-and-return");
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_locks_and_skips_publish_when_not_waiting() {
+        // A maker bond firing Accepted while the order is NOT parked at
+        // WaitingMakerBond (already published) locks the row and skips
+        // the publish idempotently.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // status 'pending'
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_accepted(&"e".repeat(64), &pool, None)
+            .await
+            .expect("published order → skip publish, Ok");
+
+        let after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_skips_when_bond_no_longer_locked() {
+        // Duplicate firing after the bond was already released (order
+        // expired): re-read sees a terminal state and skips.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = BondState::Released.to_string();
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_accepted(&"e".repeat(64), &pool, None)
+            .await
+            .expect("released maker bond → skip, Ok");
+
+        let after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_skips_unparseable_state() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = "garbage-state".to_string();
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_accepted(&"e".repeat(64), &pool, None)
+            .await
+            .expect("unparseable maker state is warn-and-return");
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_attempts_resume_when_order_waiting_maker_bond() {
+        // Order parked at WaitingMakerBond: the callback locks the bond
+        // and attempts the deferred publication. In this harness the
+        // publication path cannot complete meaningfully; the load-bearing
+        // assertion is the durable Requested → Locked transition.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingMakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        // Result depends on which settings init won the process-wide
+        // race (keys may or may not parse); the durable state must not.
+        let _ = on_bond_invoice_accepted(&"e".repeat(64), &pool, None).await;
+
+        let after = find_bond_by_hash(&pool, &"e".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn canceled_callback_ignores_unknown_hash() {
+        let pool = setup_pool().await;
+        on_bond_invoice_canceled(&"9".repeat(64), &pool)
+            .await
+            .expect("unknown hash is a no-op");
+    }
+
+    #[tokio::test]
+    async fn canceled_callback_noop_for_terminal_bond() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut b = make_bond(order_id, BondState::Slashed);
+        b.hash = Some("a".repeat(64));
+        let created = create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("terminal bond is a no-op");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Slashed.to_string());
+        assert_eq!(after.released_at, created.released_at);
+    }
+
+    #[tokio::test]
+    async fn canceled_callback_releases_last_bond_and_drops_to_pending() {
+        // The last active taker bond is canceled by LND: the row flips
+        // to Released and the order drops WaitingTakerBond → Pending.
+        // The NIP-33 republish is best-effort and must not affect the
+        // durable transitions in this harness.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.hash = Some("a".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("cancel path returns Ok");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert!(after.released_at.is_some());
+
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    #[tokio::test]
+    async fn promote_taker_context_buy_order_fills_seller_side() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // kind 'buy'
+        let order = load_order(&pool, order_id).await;
+
+        let mut bond = make_bond(order_id, BondState::Locked);
+        bond.pubkey = "s".repeat(64);
+        bond.taker_identity = Some("i".repeat(64));
+        bond.taker_trade_index = Some(3);
+        bond.taker_fiat_amount = Some(55);
+        bond.taker_amount = Some(4_000);
+        bond.taker_fee = Some(9);
+        bond.taker_dev_fee = Some(2);
+
+        let updated = promote_taker_context_to_order(&pool, order, &bond)
+            .await
+            .unwrap();
+        assert_eq!(updated.seller_pubkey.as_deref(), Some(&*"s".repeat(64)));
+        assert_eq!(
+            updated.master_seller_pubkey.as_deref(),
+            Some(&*"i".repeat(64))
+        );
+        assert_eq!(updated.trade_index_seller, Some(3));
+        assert_eq!(updated.fiat_amount, 55);
+        assert_eq!(updated.amount, 4_000);
+        assert_eq!(updated.fee, 9);
+        assert_eq!(updated.dev_fee, 2);
+        // Buyer side untouched on a buy order.
+        assert!(updated.buyer_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_taker_context_sell_order_fills_buyer_side_and_invoice() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET kind = 'sell' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order = load_order(&pool, order_id).await;
+
+        let mut bond = make_bond(order_id, BondState::Locked);
+        bond.pubkey = "b".repeat(64);
+        bond.taker_identity = Some("i".repeat(64));
+        bond.taker_trade_index = Some(4);
+        bond.taker_invoice = Some("lnbc1pTEST".to_string());
+
+        let updated = promote_taker_context_to_order(&pool, order, &bond)
+            .await
+            .unwrap();
+        assert_eq!(updated.buyer_pubkey.as_deref(), Some(&*"b".repeat(64)));
+        assert_eq!(
+            updated.master_buyer_pubkey.as_deref(),
+            Some(&*"i".repeat(64))
+        );
+        assert_eq!(updated.trade_index_buyer, Some(4));
+        assert_eq!(updated.buyer_invoice.as_deref(), Some("lnbc1pTEST"));
+        assert!(updated.seller_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_take_errors_on_bad_kind_and_missing_pubkeys() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let my_keys = Keys::generate();
+
+        // Unparseable order kind.
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut order = load_order(&pool, order_id).await;
+        order.kind = "bogus".to_string();
+        assert!(resume_take_after_bond(&pool, order, &my_keys, None)
+            .await
+            .is_err());
+
+        // Buy order without buyer pubkey.
+        let order = load_order(&pool, order_id).await;
+        assert!(order.buyer_pubkey.is_none());
+        assert!(resume_take_after_bond(&pool, order, &my_keys, None)
+            .await
+            .is_err());
+
+        // Buy order with buyer but no seller.
+        let mut order = load_order(&pool, order_id).await;
+        order.buyer_pubkey = Some(Keys::generate().public_key().to_string());
+        assert!(resume_take_after_bond(&pool, order, &my_keys, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_take_buy_order_fails_at_hold_invoice_without_lnd() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut order = load_order(&pool, order_id).await;
+        order.buyer_pubkey = Some(Keys::generate().public_key().to_string());
+        order.seller_pubkey = Some(Keys::generate().public_key().to_string());
+
+        let result = resume_take_after_bond(&pool, order, &Keys::generate(), None).await;
+        assert!(result.is_err(), "show_hold_invoice requires LND");
+    }
+
+    #[tokio::test]
+    async fn resume_take_sell_order_with_invoice_fails_without_lnd() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET kind = 'sell' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut order = load_order(&pool, order_id).await;
+        order.buyer_pubkey = Some(Keys::generate().public_key().to_string());
+        order.seller_pubkey = Some(Keys::generate().public_key().to_string());
+        order.buyer_invoice = Some("lnbc1pWHATEVER".to_string());
+
+        let result = resume_take_after_bond(&pool, order, &Keys::generate(), None).await;
+        assert!(result.is_err(), "show_hold_invoice requires LND");
+    }
+
+    #[tokio::test]
+    async fn resume_take_sell_order_without_invoice_asks_buyer_for_one() {
+        // Sell take without a buyer invoice: the resume flips the order
+        // to WaitingBuyerInvoice, messages the buyer, and persists — no
+        // LND involved on this leg, so it completes end-to-end.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET kind = 'sell' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut order = load_order(&pool, order_id).await;
+        let buyer = Keys::generate().public_key();
+        order.buyer_pubkey = Some(buyer.to_string());
+        order.seller_pubkey = Some(Keys::generate().public_key().to_string());
+
+        let before = count_msgs(order_id, Action::AddInvoice).await;
+        resume_take_after_bond(&pool, order, &Keys::generate(), None)
+            .await
+            .expect("waiting-buyer-invoice leg has no LND dependency");
+        let after = count_msgs(order_id, Action::AddInvoice).await;
+        assert_eq!(after - before, 1, "buyer must be asked for an invoice");
+
+        let persisted = load_order(&pool, order_id).await;
+        assert_eq!(persisted.status, Status::WaitingBuyerInvoice.to_string());
+    }
+
+    #[tokio::test]
+    async fn release_bonds_for_order_or_warn_swallows_db_error() {
+        // Force `release_bonds_for_order` itself to error (not just an
+        // individual bond release) by dropping the `bonds` table out
+        // from under `find_active_bonds_for_order`. The `_or_warn`
+        // wrapper must log and swallow it, never propagate or panic.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        release_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+    }
+
+    #[tokio::test]
+    async fn release_taker_bonds_for_order_or_warn_swallows_db_error() {
+        // Same DB-error swallow contract for the retain-makers variant
+        // used by the waiting-timeout republish path.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        release_taker_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_noop_when_bond_vanishes_after_lock_cas() {
+        // Deterministic stand-in for the bond row disappearing between
+        // the Requested→Locked CAS and the immediately following
+        // re-read: a trigger deletes the row the instant it locks. The
+        // re-read then sees `None` and the callback must no-op rather
+        // than error.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        sqlx::query(
+            "CREATE TRIGGER vanish_after_lock AFTER UPDATE OF state ON bonds \
+             WHEN NEW.state = 'locked' \
+             BEGIN DELETE FROM bonds WHERE id = NEW.id; END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.hash = Some("a".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_accepted(&"a".repeat(64), &pool, None)
+            .await
+            .expect("bond vanishing after the lock CAS must no-op, not error");
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_warns_when_enumerating_losers_fails() {
+        // After winning the lock, the callback enumerates every other
+        // still-`Requested` bond on the order via
+        // `find_active_bonds_for_order` (a `SELECT *` multi-row fetch).
+        // Plant a sibling row whose `amount_sats` can't decode as `i64`
+        // (SQLite stores the literal as TEXT under INTEGER affinity
+        // since it isn't numeric) — `find_active_bonds_for_order` fails
+        // to decode it and errors, while `find_bond_by_hash` (single row
+        // keyed by a *different* hash) never touches it. This exercises
+        // the warn-and-continue-with-empty-vec branch without dropping
+        // the whole table (which would also break the winner's own
+        // lookups).
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut w = make_bond(order_id, BondState::Requested);
+        w.hash = Some("a".repeat(64));
+        create_bond(&pool, w).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO bonds (id, order_id, pubkey, role, amount_sats, state, created_at) \
+             VALUES (?, ?, ?, 'taker', 'not-a-number', 'requested', ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(order_id)
+        .bind("z".repeat(64))
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The winner's own Locked transition and the resume attempt
+        // proceed regardless of the loser-enumeration failure; resume
+        // then fails in this harness (no LND/keys), so the overall call
+        // still errors — the load-bearing assertion is that the winner
+        // is durably Locked despite the enumeration error.
+        let _ = on_bond_invoice_accepted(&"a".repeat(64), &pool, None).await;
+
+        let w_after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(w_after.state, BondState::Locked.to_string());
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_winner_warns_when_sibling_release_fails() {
+        // Unlike the hashless-sibling happy path exercised elsewhere, a
+        // losing sibling WITH a hash forces `release_bond` to hit LND
+        // (unreachable in this harness) and fail transiently. The
+        // tear-down loop must still notify the loser and keep going
+        // (warn, not propagate) instead of aborting the whole teardown.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut w = make_bond(order_id, BondState::Requested);
+        w.hash = Some("a".repeat(64));
+        create_bond(&pool, w).await.unwrap();
+
+        let mut s = make_bond(order_id, BondState::Requested);
+        s.pubkey = Keys::generate().public_key().to_string();
+        s.hash = Some("b".repeat(64));
+        create_bond(&pool, s).await.unwrap();
+
+        let before = count_msgs(order_id, Action::Canceled).await;
+        let _ = on_bond_invoice_accepted(&"a".repeat(64), &pool, None).await;
+        let after = count_msgs(order_id, Action::Canceled).await;
+        assert_eq!(
+            after - before,
+            1,
+            "sibling must still be notified despite the release failure"
+        );
+
+        let s_after = find_bond_by_hash(&pool, &"b".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s_after.state,
+            BondState::Requested.to_string(),
+            "release failed transiently (no LND) → sibling stays active for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_callback_skips_resume_when_bond_flips_away_from_locked_via_trigger() {
+        // Deterministic stand-in for the exceedingly narrow race where
+        // the winning CAS's own re-read observes a state that already
+        // moved past `Locked` (e.g. a same-tick release elsewhere). A
+        // trigger flips the row to `released` the instant it locks, so
+        // `result.rows_affected() == 1` (this statement won the CAS) but
+        // the re-read sees `current_state != Locked` — the tear-down
+        // loop still runs (no other siblings here), then the callback
+        // must bail out before attempting the resume.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        sqlx::query(
+            "CREATE TRIGGER flip_after_lock AFTER UPDATE OF state ON bonds \
+             WHEN NEW.state = 'locked' \
+             BEGIN UPDATE bonds SET state = 'released' WHERE id = NEW.id AND state = 'locked'; END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.hash = Some("a".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_accepted(&"a".repeat(64), &pool, None)
+            .await
+            .expect("post-lock state flip must bail out before resume, not error");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state,
+            BondState::Released.to_string(),
+            "trigger-induced flip must be the durable end state"
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_noop_when_bond_vanishes_after_lock_cas() {
+        // Maker-bond counterpart of the taker-side vanish-after-lock
+        // test: the row disappears between the plain `Requested→Locked`
+        // CAS and the immediately following re-read.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        sqlx::query(
+            "CREATE TRIGGER vanish_maker_after_lock AFTER UPDATE OF state ON bonds \
+             WHEN NEW.state = 'locked' \
+             BEGIN DELETE FROM bonds WHERE id = NEW.id; END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_accepted(&"e".repeat(64), &pool, None)
+            .await
+            .expect("maker bond vanishing after the lock CAS must no-op, not error");
+    }
+
+    #[tokio::test]
+    async fn maker_accepted_errors_on_missing_order_row() {
+        // Maker-bond counterpart of
+        // `accepted_callback_errors_on_missing_order_row`: the bond row
+        // is durably Locked but its order vanished — an invariant
+        // violation that must surface as an error, not a panic.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("e".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM orders WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = on_bond_invoice_accepted(&"e".repeat(64), &pool, None).await;
+        assert!(result.is_err(), "missing order row must error (maker path)");
+    }
+
+    #[tokio::test]
+    async fn canceled_callback_swallows_maybe_drop_db_error() {
+        // Force `maybe_drop_waiting_taker_bond`'s status-flip UPDATE to
+        // fail by dropping the `orders` table out from under it (the
+        // bond row itself lives in `bonds`, untouched, so the release
+        // half of `on_bond_invoice_canceled` still completes). The
+        // failure must be warn-logged, not propagated: the bond release
+        // is the load-bearing invariant of this callback.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut b = make_bond(order_id, BondState::Requested);
+        b.hash = Some("a".repeat(64));
+        create_bond(&pool, b).await.unwrap();
+
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("db error dropping status back to Pending must not propagate");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state,
+            BondState::Released.to_string(),
+            "bond release itself must remain durable despite the downstream DB error"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_noop_when_order_vanishes_after_transition() {
+        // Deterministic stand-in for the order row disappearing between
+        // the CAS that drops it to `Pending` and the subsequent re-read
+        // used to build the NIP-33 republish: a trigger deletes the row
+        // the instant it flips to `pending`.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER vanish_after_pending AFTER UPDATE OF status ON orders \
+             WHEN NEW.status = 'pending' \
+             BEGIN DELETE FROM orders WHERE id = NEW.id; END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("missing order after the drop-to-Pending CAS must no-op, not error");
+    }
+
+    #[tokio::test]
+    async fn maybe_drop_waiting_taker_bond_republishes_and_persists_event_id() {
+        // Full success path: the CAS wins, the fresh order carries a
+        // resolvable identity (`master_buyer_pubkey == buyer_pubkey`, so
+        // the reputation lookup's "no such user" fallback short-circuits
+        // to a default rating instead of erroring), and `NOSTR_CLIENT`
+        // being uninitialized in this harness is handled gracefully by
+        // `update_order_event` (it skips the send, doesn't error) — so
+        // the whole republish completes and the new `event_id` is
+        // persisted back onto the order row.
+        init_test_settings();
+        let pool = setup_pool().await;
+        // `get_ratings_for_pending_order` (reached via `update_order_event`
+        // for a `Pending` republish) reads the *global* DB pool, not the
+        // pool passed to this function. Best-effort install ours (a
+        // sibling test file may have already won this OnceCell with an
+        // unrelated pool — that's fine, `is_user_present` just needs to
+        // fail-not-found there too, which it will for our random pubkey).
+        let _ = crate::config::DB_POOL.set(Arc::new(pool.clone()));
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // kind 'buy'
+        let same_pubkey = Keys::generate().public_key().to_string();
+        sqlx::query(
+            "UPDATE orders SET status = ?, buyer_pubkey = ?, master_buyer_pubkey = ? WHERE id = ?",
+        )
+        .bind(Status::WaitingTakerBond.to_string())
+        .bind(&same_pubkey)
+        .bind(&same_pubkey)
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        maybe_drop_waiting_taker_bond(&pool, order_id)
+            .await
+            .expect("republish path must not propagate");
+
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::Pending.to_string());
+        assert!(
+            !order.event_id.is_empty(),
+            "event_id must be persisted after a successful republish"
+        );
+    }
 }

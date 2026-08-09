@@ -225,6 +225,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_last_trade_index_zero_index_is_rejected() {
+        // Arrange: user exists but with the invalid sentinel index 0.
+        let pool = setup_test_db().await;
+        let sender_keys = create_test_keys();
+        insert_test_user(&pool, &sender_keys.public_key().to_string(), 0).await;
+
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let event = create_test_unwrapped_message(&sender_keys);
+        let kind = MessageKind::new(None, Some(1), None, Action::LastTradeIndex, None);
+
+        // Act
+        let result = last_trade_index(&ctx, Message::Restore(kind), &event, &sender_keys).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroError::MostroCantDo(CantDoReason::InvalidTradeIndex))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_last_trade_index_success_path_sends_dm() {
+        // Arrange: user exists with a valid index; the DM send is best-effort
+        // (errors are logged, not propagated), so the handler must return Ok.
+        let pool = setup_test_db().await;
+        let sender_keys = create_test_keys();
+        insert_test_user(&pool, &sender_keys.public_key().to_string(), 42).await;
+
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let event = create_test_unwrapped_message(&sender_keys);
+        let kind = MessageKind::new(None, Some(7), None, Action::LastTradeIndex, None);
+
+        // Act
+        let result = last_trade_index(&ctx, Message::Restore(kind), &event, &sender_keys).await;
+
+        // Assert
+        assert!(
+            result.is_ok(),
+            "success path must swallow DM transport errors: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_last_trade_index_correct_value() {
         // Setup: Create database with multiple users with different trade indexes
         let pool = setup_test_db().await;

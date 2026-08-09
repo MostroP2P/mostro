@@ -258,6 +258,322 @@ pub async fn admin_settle_action(
 }
 
 #[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::lightning::LndConnector;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    async fn setup_pool() -> Arc<SqlitePool> {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn build_ctx(pool: Arc<SqlitePool>) -> AppContext {
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build()
+    }
+
+    /// Real `LndConnector` against a dead endpoint: `connect` is lazy so it
+    /// always builds, but every RPC fails fast. Handlers take `&mut
+    /// LndConnector` by value, so tests must supply one even for paths that
+    /// return before any LND call.
+    async fn dead_lnd() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-test-lnd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("tls.cert");
+        let mac = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").unwrap();
+        std::fs::write(&mac, [1u8, 2u8]).unwrap();
+        let client = fedimint_tonic_lnd::connect(
+            "https://127.0.0.1:1".to_string(),
+            cert.to_str().unwrap().to_string(),
+            mac.to_str().unwrap().to_string(),
+        )
+        .await
+        .expect("lazy connect never dials");
+        LndConnector { client }
+    }
+
+    /// `event.identity` is the seal signer the admin-gating checks against;
+    /// `sender` is the trade key.
+    fn admin_event(identity: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::new_order(None, Some(1), None, Action::AdminSettle, None),
+            signature: None,
+            sender: Keys::generate().public_key(),
+            identity,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn dispute_order(seller: PublicKey, buyer: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::Dispute.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: seller.to_string(),
+            seller_pubkey: Some(seller.to_string()),
+            buyer_pubkey: Some(buyer.to_string()),
+            amount: 21_000,
+            fee: 210,
+            ..Default::default()
+        }
+    }
+
+    async fn assign_solver(pool: &SqlitePool, order_id: uuid::Uuid, solver: &PublicKey) {
+        // `Dispute::new` always starts in `Initiated`; the admin-takeover
+        // detection queries for `in-progress`, so set it explicitly.
+        let mut dispute = Dispute::new(order_id, Status::Dispute.to_string());
+        dispute.status = DisputeStatus::InProgress.to_string();
+        dispute.solver_pubkey = Some(solver.to_string());
+        dispute.create(pool).await.unwrap();
+    }
+
+    fn settle_msg(order_id: uuid::Uuid) -> Message {
+        Message::new_order(Some(order_id), Some(1), None, Action::AdminSettle, None)
+    }
+
+    async fn queued_actions_for(destination: PublicKey) -> Vec<Action> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == destination)
+            .map(|(m, _)| m.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fails_when_order_missing() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool);
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(uuid::Uuid::new_v4()),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MostroCantDo(CantDoReason::NotFound))));
+    }
+
+    #[tokio::test]
+    async fn rejects_caller_not_assigned_and_no_admin_takeover() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+
+        // No dispute row → not assigned and not taken by admin.
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(Keys::generate().public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourDispute))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reports_admin_takeover_when_dispute_in_progress_with_admin() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        // Dispute is in-progress and taken over by the admin (mostro) key.
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        // Caller is some unrelated solver key, not assigned.
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(Keys::generate().public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::DisputeTakenByAdmin))
+        ));
+    }
+
+    /// Caller is the assigned solver but is neither the admin key nor a
+    /// read-write solver user row → `ensure_dispute_finalize_permission`
+    /// rejects with `NotAuthorized`.
+    #[tokio::test]
+    async fn rejects_assigned_solver_without_write_permission() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let solver = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        assign_solver(ctx.pool(), order.id, &solver.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(solver.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+    }
+
+    /// A cooperatively-cancelled order short-circuits: the admin (whose
+    /// identity == the mostro key, so the finalize-permission admin
+    /// shortcut applies) is acknowledged and the handler returns `Ok`
+    /// before any settle.
+    #[tokio::test]
+    async fn cooperatively_cancelled_order_acknowledges_admin() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.status = Status::CooperativelyCanceled.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        // Admin identity is the assigned solver → finalize permission via
+        // the caller==admin shortcut.
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "coop-cancel must ack and return Ok: {result:?}"
+        );
+        assert!(queued_actions_for(admin.public_key())
+            .await
+            .contains(&Action::CooperativeCancelAccepted));
+    }
+
+    /// An order that is neither cooperatively-cancelled nor in dispute is
+    /// rejected by the status guard.
+    #[tokio::test]
+    async fn rejects_order_not_in_dispute() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidOrderStatus))
+        ));
+    }
+
+    /// A genuine dispute settle reaches `settle_seller_hold_invoice`, which
+    /// short-circuits on the missing preimage before any LND call and is
+    /// mapped to `LnNodeError`. The LND settle + `do_payment` tail beyond
+    /// this seam requires a live node and is covered by integration tests.
+    #[tokio::test]
+    async fn dispute_order_reaches_settle_seam() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.preimage = None; // settle short-circuits with InvalidInvoice
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::LnNodeError(_)))
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use mostro_core::error::CantDoReason;
 

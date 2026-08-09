@@ -33,6 +33,14 @@ pub use types::{
 pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
 pub static NOSTR_KEYS: OnceLock<Keys> = OnceLock::new();
 pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
+/// Dedicated Nostr client for the price provider's kind-30078 queries.
+///
+/// Kept separate from [`NOSTR_CLIENT`] so `verify_subscriptions(true)` (and
+/// the REQ `limit` it enforces) applies only to price fetches — not to the
+/// daemon's long-lived `.limit(0)` inbox subscription in `main.rs`, where
+/// pre-EOSE filter verification would reject matching trade messages
+/// (hermeme, PR #841).
+pub static PRICE_NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
 

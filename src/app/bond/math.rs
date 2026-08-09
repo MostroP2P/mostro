@@ -145,6 +145,16 @@ mod tests {
     }
 
     #[test]
+    fn pct_component_that_rounds_to_zero_falls_back_to_base() {
+        // 0.4 * 1 = 0.4 → round → 0.0 hits the `pct_rounded <= 0.0`
+        // saturation arm; the result is then `max(base)`.
+        let cfg = cfg_with(0.4, 0);
+        assert_eq!(compute_bond_amount(1, &cfg), 0);
+        let cfg = cfg_with(0.4, 7);
+        assert_eq!(compute_bond_amount(1, &cfg), 7);
+    }
+
+    #[test]
     fn saturates_on_absurd_percentage() {
         let cfg = cfg_with(1e18, 0);
         // No overflow; clamps to i64::MAX. Not a realistic config but

@@ -1,0 +1,132 @@
+# Line-coverage report: publishes the browsable `cargo llvm-cov` HTML to
+# GitHub Pages and uploads lcov to Codecov for the badge / trend.
+#
+# NOTE: intentionally NOT run on push or per-PR. `cargo llvm-cov` rebuilds the
+# whole tree with instrumentation and then runs the full suite (~1000 tests),
+# so wiring it to every push burns CI minutes to regenerate a report nobody
+# reads between merges. Same reasoning as `mutation.yml`: a weekly audit plus
+# on-demand runs. Trigger it by hand from the Actions tab after a merge that
+# you expect to move coverage.
+#
+# PUBLISHING PATH: branch-based (`gh-pages`), deliberately matching
+# `mutation.yml`. GitHub Pages has a single Source setting per repo, so a
+# repo cannot serve both a branch and an `actions/deploy-pages` artifact.
+# Using `deploy-pages` here would make the coverage artifact the *entire*
+# site and silently stop serving `/mutation-testing/`. Each report owns a
+# subdirectory instead: `/coverage/` and `/mutation-testing/`.
+name: Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sundays at 05:00 UTC — two hours after the mutation audit so the
+    # two long jobs don't contend for runners.
+    - cron: '0 5 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `contents: write` is required to push the rendered report to `gh-pages`.
+permissions:
+  contents: write
+
+# Never let two runs push `gh-pages` at once; the later one wins.
+concurrency:
+  group: coverage-pages
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Generate and publish report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Nothing after this step needs the checkout token; the publish step
+          # gets its own. Keeps the credential out of the later cargo/llvm-cov
+          # steps and out of any artifact they produce.
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-cov needs the profdata/profraw tooling shipped here.
+          components: llvm-tools-preview
+
+      - name: Install protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with: { cache-on-failure: true }
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Run the instrumented suite once, then render every report from the
+      # same profile data. Rendering separately would re-run all ~1000 tests.
+      #
+      # Default features only, matching `cargo test` in ci.yml. `--all-features`
+      # would pull in `startos`, a packaging feature with no test surface, and
+      # the published percentage would stop matching what contributors get from
+      # `cargo llvm-cov --summary-only` locally.
+      - name: Run instrumented tests
+        run: cargo llvm-cov --no-report
+
+      # `--output-dir DIR` writes into `DIR/html`, not `DIR`. Passing
+      # `target/llvm-cov/html` here would nest it one level deeper and the
+      # published directory would have no index.html at its root — a 404.
+      - name: Render HTML report
+        run: cargo llvm-cov report --html --output-dir target/llvm-cov
+
+      # Published next to the HTML so editors and external tools can consume
+      # the raw data without re-running the suite.
+      - name: Render lcov report
+        run: cargo llvm-cov report --lcov --output-path target/llvm-cov/html/lcov.info
+
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+      # Self-hosted badge data, so the README number comes from this repo's
+      # own Pages site instead of a third-party service that would make
+      # readers sign up to see it. shields.io renders it via its `endpoint`
+      # type; the repo already depends on shields for the license, Rust and
+      # version badges, so this adds no new dependency.
+      #
+      # The percentage is read from the machine-readable summary rather than
+      # scraped from the human table: `--json` with `--summary-only` is the
+      # supported combination and its shape is stable
+      # (`.data[0].totals.lines.percent`).
+      - name: Generate badge data
+        run: |
+          set -euo pipefail
+          # Force the C locale: printf's decimal separator follows LC_NUMERIC,
+          # so on a localised machine "%.1f" yields "92,8" and shields.io then
+          # renders a comma in the badge.
+          export LC_ALL=C
+          cargo llvm-cov report --json --summary-only --output-path summary.json
+          pct=$(jq -r '.data[0].totals.lines.percent' summary.json)
+          printf -v rounded '%.1f' "$pct"
+          # Thresholds mirror the usual shields palette so the colour keeps
+          # meaning something if coverage regresses.
+          if   (( $(echo "$pct >= 90" | bc -l) )); then colour=brightgreen
+          elif (( $(echo "$pct >= 75" | bc -l) )); then colour=green
+          elif (( $(echo "$pct >= 60" | bc -l) )); then colour=yellow
+          elif (( $(echo "$pct >= 40" | bc -l) )); then colour=orange
+          else                                          colour=red
+          fi
+          jq -n --arg m "${rounded}%" --arg c "$colour" \
+            '{schemaVersion: 1, label: "coverage", message: $m, color: $c}' \
+            > target/llvm-cov/html/badge.json
+          echo "coverage: ${rounded}% ($colour)"
+
+      # Same action and same branch as `mutation.yml`, into a sibling
+      # subdirectory. `keep_files` is left at its default: with
+      # `destination_dir` set, only `coverage/` is replaced, so
+      # `mutation-testing/` on the same branch is untouched.
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/llvm-cov/html
+          destination_dir: coverage

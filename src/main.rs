@@ -17,7 +17,7 @@ pub mod spam_gate;
 pub mod util;
 
 use crate::app::context::AppContext;
-use crate::app::run;
+use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
@@ -151,6 +151,69 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Cashu escrow mode (docs/cashu/, CF-5): run the daemon with NO Lightning
+    // node. Skip `LndConnector::new()` and the LN status probe entirely,
+    // connect the configured mint instead (fail fast if unreachable, mirroring
+    // the LND-refusal behaviour), attach the client to the context, and hand
+    // off to the Cashu event loop. Every trade action is still rejected with
+    // `CantDo(InvalidAction)` until the feature tracks land. The default
+    // Lightning path below is left byte-for-byte unchanged.
+    if Settings::is_cashu_enabled() {
+        // `mint_url` non-emptiness + scheme were validated at config load
+        // (CF-1); this expect is unreachable for a validated config.
+        let mint_url = Settings::get_cashu()
+            .map(|c| c.mint_url.clone())
+            .expect("cashu enabled but [cashu] settings missing after validation");
+        tracing::info!(
+            "Starting in Cashu escrow mode — connecting mint {mint_url} (LND not initialised)"
+        );
+        let cashu_client = match cashu::CashuClient::connect(&mint_url).await {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                tracing::error!(
+                    "No connection to Cashu mint {mint_url} - shutting down Mostro! ({e})"
+                );
+                exit(1);
+            }
+        };
+
+        // The admin gRPC server takes a Lightning client that Cashu mode never
+        // initialises, so it is not started here. Warn (rather than silently
+        // skip) when an operator has RPC enabled, so the missing API is not a
+        // surprise. Starting the LN-independent RPC subset in Cashu mode is a
+        // follow-up (see PR #828 review).
+        if RpcServer::is_enabled() {
+            tracing::warn!(
+                "[rpc].enabled = true but the admin gRPC server is NOT started in Cashu mode: \
+                 it requires a Lightning client Cashu mode does not initialise. Disable [rpc], \
+                 or run in Lightning mode, if you need the RPC API."
+            );
+        }
+
+        // Warm the anti-spam gate exactly as the Lightning path does.
+        install_spam_gate().await;
+
+        let settings = Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .expect("MOSTRO_CONFIG not initialized")
+                .clone(),
+        );
+        let ctx = AppContext::new(
+            get_db_pool(),
+            client.clone(),
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            mostro_keys.clone(),
+        )
+        .with_cashu_client(cashu_client);
+
+        start_scheduler(ctx.clone()).await;
+
+        // Run the Mostro Cashu event loop and be happy!!
+        return run_cashu(ctx).await;
+    }
+
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;
     let ln_status = LnStatus::from_get_info_response(ln_status);
@@ -193,27 +256,9 @@ async fn main() -> Result<()> {
     }
 
     // Install the protocol-v2 anti-spam gate and warm its active-trade-pubkey
-    // cache before the event loop starts, so the very first kind-14 events are
-    // already pre-filtered against known keys (spec §6 Phase 2). The cache is
-    // kept fresh afterwards by `job_refresh_active_pubkeys`. Inert on the v1
-    // (gift-wrap) transport, which never consults the gate.
-    {
-        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
-        let gate = SpamGate::new(REPLAY_WINDOW_SECS);
-        match db::find_active_trade_pubkeys(get_db_pool().as_ref()).await {
-            Ok(keys) => {
-                tracing::info!(
-                    "SpamGate: warming active-trade-pubkey cache ({} keys)",
-                    keys.len()
-                );
-                gate.set_known(keys);
-            }
-            Err(e) => tracing::warn!("SpamGate: initial cache warm failed: {e}"),
-        }
-        if gate.install_global().is_err() {
-            tracing::warn!("SpamGate already installed");
-        }
-    }
+    // cache before the event loop starts (mode-agnostic — both `run` and
+    // `run_cashu` consult it for kind-14 events).
+    install_spam_gate().await;
 
     // Build AppContext explicitly with all dependencies
     let settings = Arc::new(
@@ -235,6 +280,32 @@ async fn main() -> Result<()> {
 
     // Run the Mostro and be happy!!
     run(ctx, &mut ln_client).await
+}
+
+/// Install the protocol-v2 anti-spam gate and warm its active-trade-pubkey
+/// cache before the event loop starts, so the very first kind-14 events are
+/// already pre-filtered against known keys (spec §6 Phase 2). The cache is
+/// kept fresh afterwards by `job_refresh_active_pubkeys`. Inert on the v1
+/// (gift-wrap) transport, which never consults the gate.
+///
+/// Shared by both boot paths (Lightning `run` and Cashu `run_cashu`, CF-5) so
+/// the warm-up logic exists in exactly one place.
+async fn install_spam_gate() {
+    use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+    let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+    match db::find_active_trade_pubkeys(get_db_pool().as_ref()).await {
+        Ok(keys) => {
+            tracing::info!(
+                "SpamGate: warming active-trade-pubkey cache ({} keys)",
+                keys.len()
+            );
+            gate.set_known(keys);
+        }
+        Err(e) => tracing::warn!("SpamGate: initial cache warm failed: {e}"),
+    }
+    if gate.install_global().is_err() {
+        tracing::warn!("SpamGate already installed");
+    }
 }
 
 /// Build the multi-source [`crate::price::PriceManager`] from settings and

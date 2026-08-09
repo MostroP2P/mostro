@@ -263,3 +263,380 @@ pub async fn admin_cancel_action(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::lightning::LndConnector;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    async fn setup_pool() -> Arc<SqlitePool> {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn build_ctx(pool: Arc<SqlitePool>) -> AppContext {
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .build()
+    }
+
+    /// Real `LndConnector` against a dead endpoint: `connect` is lazy so it
+    /// always builds; every RPC fails fast. Required because the handler
+    /// takes `&mut LndConnector` even on paths that return before any LND
+    /// call.
+    async fn dead_lnd() -> LndConnector {
+        let dir = std::env::temp_dir().join(format!("mostro-test-lnd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("tls.cert");
+        let mac = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").unwrap();
+        std::fs::write(&mac, [1u8, 2u8]).unwrap();
+        let client = fedimint_tonic_lnd::connect(
+            "https://127.0.0.1:1".to_string(),
+            cert.to_str().unwrap().to_string(),
+            mac.to_str().unwrap().to_string(),
+        )
+        .await
+        .expect("lazy connect never dials");
+        LndConnector { client }
+    }
+
+    fn admin_event(identity: PublicKey) -> UnwrappedMessage {
+        UnwrappedMessage {
+            message: Message::new_order(None, Some(1), None, Action::AdminCancel, None),
+            signature: None,
+            sender: Keys::generate().public_key(),
+            identity,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn dispute_order(seller: PublicKey, buyer: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::Dispute.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: seller.to_string(),
+            seller_pubkey: Some(seller.to_string()),
+            buyer_pubkey: Some(buyer.to_string()),
+            amount: 21_000,
+            fee: 210,
+            ..Default::default()
+        }
+    }
+
+    async fn assign_solver(pool: &SqlitePool, order_id: uuid::Uuid, solver: &PublicKey) {
+        let mut dispute = Dispute::new(order_id, Status::Dispute.to_string());
+        dispute.status = DisputeStatus::InProgress.to_string();
+        dispute.solver_pubkey = Some(solver.to_string());
+        dispute.create(pool).await.unwrap();
+    }
+
+    fn cancel_msg(order_id: uuid::Uuid) -> Message {
+        Message::new_order(Some(order_id), Some(1), None, Action::AdminCancel, None)
+    }
+
+    async fn queued_actions_for(destination: PublicKey) -> Vec<Action> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == destination)
+            .map(|(m, _)| m.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fails_when_order_missing() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool);
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(uuid::Uuid::new_v4()),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MostroCantDo(CantDoReason::NotFound))));
+    }
+
+    #[tokio::test]
+    async fn rejects_caller_not_assigned_and_no_admin_takeover() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(Keys::generate().public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourDispute))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reports_admin_takeover_when_dispute_in_progress_with_admin() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(Keys::generate().public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::DisputeTakenByAdmin))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_assigned_solver_without_write_permission() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let solver = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        assign_solver(ctx.pool(), order.id, &solver.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(solver.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cooperatively_cancelled_order_acknowledges_admin() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.status = Status::CooperativelyCanceled.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "coop-cancel must ack and return Ok: {result:?}"
+        );
+        assert!(queued_actions_for(admin.public_key())
+            .await
+            .contains(&Action::CooperativeCancelAccepted));
+    }
+
+    #[tokio::test]
+    async fn rejects_order_not_in_dispute() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+    }
+
+    /// A dispute order with no `hash` skips the LND cancel and, when
+    /// neither `seller_dispute` nor `buyer_dispute` is set, fails the
+    /// dispute-initiator resolution with `DisputeEventError`.
+    #[tokio::test]
+    async fn dispute_without_initiator_flag_errors() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        // hash is None, seller_dispute/buyer_dispute both false.
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DisputeEventError))
+        ));
+    }
+
+    /// A dispute order carrying a hold-invoice `hash` returns funds to the
+    /// seller via `cancel_hold_invoice`, which fails against the dead LND
+    /// endpoint and surfaces as `LnNodeError`.
+    #[tokio::test]
+    async fn dispute_with_hash_reaches_ln_cancel_seam() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        // Valid 32-byte hex hash so `cancel_hold_invoice` reaches the RPC
+        // (it panics on non-hex input) and then fails on the dead node.
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::LnNodeError(_)))
+        ));
+    }
+
+    /// Full no-LND cancel path: a seller-initiated dispute with no hold
+    /// invoice hash. The dispute row is moved to `SellerRefunded` and the
+    /// order to `CanceledByAdmin` before the DM fan-out. Those DB writes are
+    /// deterministic; the terminal `send_dm` depends on the process-global
+    /// Nostr client, so the top-level result is not asserted.
+    #[tokio::test]
+    async fn seller_dispute_without_hash_refunds_and_cancels() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+        let dispute_id = find_dispute_by_order_id(ctx.pool(), order.id)
+            .await
+            .unwrap()
+            .id;
+
+        let _ = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        let stored_order = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored_order.status, Status::CanceledByAdmin.to_string());
+        let stored_dispute = Dispute::by_id(ctx.pool(), dispute_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_dispute.status,
+            DisputeStatus::SellerRefunded.to_string()
+        );
+    }
+}

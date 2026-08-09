@@ -209,8 +209,13 @@ mod tests {
         let config_tpl = include_bytes!("../../settings.tpl.toml");
         let config_tpl =
             std::str::from_utf8(config_tpl).expect("Invalid UTF-8 in template config file");
-        let test_settings: Settings =
+        let mut test_settings: Settings =
             toml::from_str(config_tpl).expect("Failed to parse template config file");
+        // The template ships a placeholder nsec; install a parseable one so
+        // whichever module wins the MOSTRO_CONFIG race leaves get_keys()
+        // usable for every other test.
+        test_settings.nostr.nsec_privkey =
+            "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd".to_string();
         MOSTRO_CONFIG.get_or_init(|| test_settings);
     }
 
@@ -258,6 +263,116 @@ mod tests {
         let lnurl = lnurl_obj.encode();
 
         (lnurl, handle)
+    }
+
+    /// Build a freshly-signed BOLT11 invoice locally (no network, no LND).
+    /// `amount_msat = None` produces a no-amount invoice.
+    fn build_test_invoice(amount_msat: Option<u64>, expiry_secs: u64) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        use std::time::Duration;
+
+        let secp = Secp256k1::new();
+        let private_key = SecretKey::from_slice(&[0x42; 32]).expect("valid secret key");
+        let payment_hash = sha256::Hash::hash(&[0u8; 32]);
+
+        let builder = InvoiceBuilder::new(Currency::Bitcoin)
+            .description("mostro coverage test invoice".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([42u8; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .expiry_time(Duration::from_secs(expiry_secs));
+        let builder = match amount_msat {
+            Some(msat) => builder.amount_milli_satoshis(msat),
+            None => builder,
+        };
+        builder
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &private_key))
+            .expect("valid signed invoice")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_fresh_invoice_with_matching_amount_is_valid() {
+        init_settings_test();
+        // 1000 sats invoice; caller expects amount 1100 with 100 sats fee →
+        // expected_sats_amount = 1000 = invoice amount → valid.
+        let payment_request = build_test_invoice(Some(1_000_000), 86_400);
+        let result = is_valid_invoice(payment_request, Some(1_100), Some(100)).await;
+        assert!(
+            result.is_ok(),
+            "fresh matching invoice must pass: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fresh_invoice_without_amount_check_is_valid() {
+        init_settings_test();
+        // No expected amount: only min-amount and expiry windows apply.
+        let payment_request = build_test_invoice(Some(1_000_000), 86_400);
+        let result = is_valid_invoice(payment_request, None, None).await;
+        assert!(result.is_ok(), "fresh invoice must pass: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_fresh_invoice_amount_mismatch_is_rejected() {
+        init_settings_test();
+        // Invoice carries 1000 sats but the caller expects 5000 - 0 fee.
+        let payment_request = build_test_invoice(Some(1_000_000), 86_400);
+        let result = is_valid_invoice(payment_request, Some(5_000), None).await;
+        assert_eq!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "amount mismatch on a non-expired invoice must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fee_larger_than_amount_overflows_and_is_rejected() {
+        init_settings_test();
+        // fee > amount → checked_sub underflows → invalid.
+        let payment_request = build_test_invoice(Some(1_000_000), 86_400);
+        let result = is_valid_invoice(payment_request, Some(100), Some(200)).await;
+        assert_eq!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "fee larger than expected amount must be rejected (subtraction underflow)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invoice_expiring_before_expiration_window_is_rejected() {
+        init_settings_test();
+        // Non-expired invoice whose remaining lifetime (60s) is shorter than
+        // the configured expiration window. The assertion adapts to whichever
+        // global settings won the process-wide OnceLock race.
+        let window = Settings::get_ln().invoice_expiration_window;
+        let payment_request = build_test_invoice(Some(1_000_000), 60);
+        let result = is_valid_invoice(payment_request, None, None).await;
+        if window as u64 > 60 {
+            assert_eq!(
+                result,
+                Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+                "invoice expiring inside the window must be rejected"
+            );
+        } else {
+            assert!(result.is_ok(), "window {window} accepts short invoices");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_amount_fresh_invoice_skips_amount_and_min_checks() {
+        init_settings_test();
+        // A fresh no-amount invoice: amount_sat == 0 skips both the equality
+        // check (explicitly allowed) and the min-payment floor.
+        let payment_request = build_test_invoice(None, 86_400);
+        let result = is_valid_invoice(payment_request, Some(1_000), None).await;
+        assert!(
+            result.is_ok(),
+            "zero-amount invoice must pass amount checks: {result:?}"
+        );
     }
 
     #[tokio::test]

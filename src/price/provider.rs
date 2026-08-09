@@ -39,6 +39,7 @@ pub enum ProviderId {
     CurrencyApi,
     Blockchain,
     ElToque,
+    Nostr,
 }
 
 impl fmt::Display for ProviderId {
@@ -49,6 +50,7 @@ impl fmt::Display for ProviderId {
             ProviderId::CurrencyApi => "currency_api",
             ProviderId::Blockchain => "blockchain",
             ProviderId::ElToque => "eltoque",
+            ProviderId::Nostr => "nostr",
         };
         f.write_str(s)
     }
@@ -64,6 +66,7 @@ impl FromStr for ProviderId {
             "currency_api" => Ok(ProviderId::CurrencyApi),
             "blockchain" => Ok(ProviderId::Blockchain),
             "eltoque" => Ok(ProviderId::ElToque),
+            "nostr" => Ok(ProviderId::Nostr),
             other => Err(format!("unknown price provider id: {other}")),
         }
     }
@@ -205,6 +208,7 @@ mod tests {
             ProviderId::CurrencyApi,
             ProviderId::Blockchain,
             ProviderId::ElToque,
+            ProviderId::Nostr,
         ] {
             let s = id.to_string();
             assert_eq!(ProviderId::from_str(&s).unwrap(), id, "roundtrip {s}");

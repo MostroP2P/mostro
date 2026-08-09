@@ -47,7 +47,10 @@ pub struct ProviderConfig {
     /// Whether this provider participates in aggregation.
     #[serde(default)]
     pub enabled: bool,
-    /// Primary base URL.
+    /// Primary base URL. Not needed by a provider sourcing quotes over Nostr
+    /// instead of HTTP (see `trusted_nodes`) — defaults to empty so those
+    /// providers can omit it.
+    #[serde(default)]
     pub url: String,
     /// Ordered mirrors tried when `url` fails this tick (spec §7).
     #[serde(default)]
@@ -65,6 +68,10 @@ pub struct ProviderConfig {
     /// Exclude these currencies from this provider (spec §6.6).
     #[serde(default)]
     pub except: Option<Vec<String>>,
+    /// Trusted node pubkeys (hex) to source quotes from over Nostr, instead
+    /// of an HTTP `url` (the `nostr` provider; see §11.7).
+    #[serde(default)]
+    pub trusted_nodes: Vec<String>,
 }
 
 impl ProviderConfig {
@@ -78,11 +85,25 @@ impl ProviderConfig {
                  (see docs/PRICE_PROVIDERS.md §7)"
             ));
         }
+        // `trusted_nodes` only excuses a missing `url` for the `nostr`
+        // provider — it's the only adapter that reads it (§11.7). Any other
+        // id is still HTTP-only, so exempting it here would let a typo'd or
+        // copy-pasted `trusted_nodes` mask a missing `url` past startup and
+        // into a confusing per-tick HTTP failure instead.
         if self.enabled && self.url.trim().is_empty() {
-            return Err(format!(
-                "price provider '{id}': enabled provider must have a non-empty `url` \
-                 (see docs/PRICE_PROVIDERS.md §7)"
-            ));
+            if id == "nostr" {
+                if self.trusted_nodes.is_empty() {
+                    return Err(format!(
+                        "price provider '{id}': enabled provider must have a non-empty \
+                         `trusted_nodes` (see docs/PRICE_PROVIDERS.md §11.7)"
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "price provider '{id}': enabled provider must have a non-empty `url` \
+                     (see docs/PRICE_PROVIDERS.md §7)"
+                ));
+            }
         }
         Ok(())
     }
@@ -217,13 +238,21 @@ enabled = false
 url = "https://tasas.eltoque.com"
 token = "secret"
 only = ["CUP", "MLC"]
+
+[price.providers.nostr]
+enabled = false
+trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390"]
 "#;
         let parsed: Stub = toml::from_str(toml_str).unwrap();
         let p = parsed.price;
         // Overridden value + defaulted siblings.
         assert_eq!(p.update_interval_seconds, 60);
         assert_eq!(p.max_price_staleness_seconds, 1800);
-        assert_eq!(p.providers.len(), 3);
+        assert_eq!(p.providers.len(), 4);
+
+        let nostr = &p.providers["nostr"];
+        assert!(nostr.url.is_empty());
+        assert_eq!(nostr.trusted_nodes.len(), 1);
 
         let ca = &p.providers["currency_api"];
         assert!(ca.enabled);
@@ -251,6 +280,7 @@ only = ["CUP", "MLC"]
             token: None,
             only: Some(vec!["CUP".into()]),
             except: Some(vec!["MLC".into()]),
+            trusted_nodes: vec![],
         };
         assert!(cfg.validate("eltoque").is_err());
     }
@@ -298,6 +328,7 @@ only = ["CUP", "MLC"]
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         };
         assert!(blank.validate("yadio").is_err());
         // A disabled provider with a blank url is allowed (inert).
@@ -306,6 +337,55 @@ only = ["CUP", "MLC"]
             ..blank.clone()
         };
         disabled.validate("yadio").unwrap();
+    }
+
+    #[test]
+    fn enabled_provider_with_trusted_nodes_needs_no_url() {
+        let cfg = ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+            trusted_nodes: vec!["a".repeat(64)],
+        };
+        cfg.validate("nostr").unwrap();
+    }
+
+    #[test]
+    fn trusted_nodes_does_not_excuse_a_missing_url_on_a_non_nostr_provider() {
+        // Regression: `trusted_nodes` only means anything to the `nostr`
+        // adapter. A copy-paste onto e.g. `yadio` must not silently pass
+        // validation and defer the failure to a confusing per-tick HTTP
+        // error against an empty URL.
+        let cfg = ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+            trusted_nodes: vec!["a".repeat(64)],
+        };
+        assert!(cfg.validate("yadio").is_err());
+    }
+
+    #[test]
+    fn enabled_provider_without_url_or_trusted_nodes_is_rejected() {
+        let cfg = ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: None,
+            except: None,
+            trusted_nodes: vec![],
+        };
+        assert!(cfg.validate("nostr").is_err());
     }
 
     #[test]
@@ -318,6 +398,7 @@ only = ["CUP", "MLC"]
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         };
         assert!(cfg.allows_currency("USD"));
         assert!(cfg.allows_currency("CUP"));

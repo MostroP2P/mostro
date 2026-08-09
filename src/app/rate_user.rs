@@ -234,7 +234,14 @@ mod tests {
     fn init_test_settings() {
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
-            nostr: Default::default(),
+            nostr: crate::config::NostrSettings {
+                // Valid canonical test nsec: whichever module wins the
+                // MOSTRO_CONFIG race must install a parseable key, or tests
+                // that reach get_keys() flake on init ordering.
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string(),
+                relays: vec![],
+            },
             mostro: Default::default(),
             lightning: Default::default(),
             rpc: Default::default(),
@@ -692,5 +699,250 @@ mod tests {
         let created_at = (now - 86_400 - 43_200) as i64;
         let days = calculate_days_since_creation(created_at);
         assert_eq!(days, 1);
+    }
+
+    #[test]
+    fn test_prepare_variables_missing_seller_pubkey_errors() {
+        let buyer_keys = create_test_keys();
+        let mut order = create_test_order(
+            Status::Success,
+            create_test_keys().public_key(),
+            buyer_keys.public_key(),
+        );
+        order.seller_pubkey = None;
+        let result = prepare_variables_for_vote(&buyer_keys.public_key().to_string(), &order);
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[test]
+    fn test_prepare_variables_missing_buyer_pubkey_errors() {
+        let seller_keys = create_test_keys();
+        let mut order = create_test_order(
+            Status::Success,
+            seller_keys.public_key(),
+            create_test_keys().public_key(),
+        );
+        order.buyer_pubkey = None;
+        let result = prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order);
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+    }
+
+    #[test]
+    fn test_prepare_variables_unknown_sender_sets_no_flags() {
+        // A sender that is neither buyer nor seller falls through both
+        // arms: no rating flag set and an empty counterpart pubkey.
+        let order = create_test_order(
+            Status::Success,
+            create_test_keys().public_key(),
+            create_test_keys().public_key(),
+        );
+        let stranger = create_test_keys().public_key().to_string();
+        let (counterpart, buyer_rating, seller_rating) =
+            prepare_variables_for_vote(&stranger, &order).unwrap();
+        assert!(counterpart.is_empty());
+        assert!(!buyer_rating);
+        assert!(!seller_rating);
+    }
+
+    #[tokio::test]
+    async fn test_buyer_rating_full_privacy_seller_is_silent_noop() {
+        // Buyer rates, but the seller has no distinct identity key
+        // (full privacy): there is no user row to credit, so the action
+        // returns Ok without touching anything.
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+
+        // No master_seller_pubkey → seller reads as full-privacy.
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_buyer_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_seller_rating_full_privacy_buyer_is_silent_noop() {
+        // Mirror case: seller rates a full-privacy buyer → Ok, no-op.
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(seller_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_buyer_rating_with_absent_seller_user_row_errors() {
+        // Seller identity key set, but no matching row in `users`:
+        // `is_user_present` fails and must surface as DbAccessError.
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(create_test_keys().public_key().to_string());
+        order.master_buyer_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_seller_rating_with_absent_buyer_user_row_errors() {
+        // Mirror case for the seller-rating arm of the privacy lookup.
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(create_test_keys().public_key().to_string());
+        order.master_buyer_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(seller_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_db_failure_surfaces_error() {
+        // Force the `users` UPDATE to fail via a RAISE trigger so the
+        // `update_user_rating` error branch is exercised without
+        // touching production code.
+        use crate::db::add_new_user;
+
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+        let seller_id = create_test_keys().public_key().to_string();
+
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER fail_users_update BEFORE UPDATE ON users \
+             BEGIN SELECT RAISE(ABORT, 'forced users failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_event_db_failure_surfaces_error() {
+        // The user rating write succeeds, but the follow-up order-flag
+        // update (`update_user_rating_event`) fails via a RAISE trigger
+        // on `orders` — the error must map to DbAccessError.
+        use crate::db::add_new_user;
+
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let seller_pk = create_test_keys().public_key();
+        let buyer_pk = create_test_keys().public_key();
+        let seller_id = create_test_keys().public_key().to_string();
+
+        let seller_user = User {
+            pubkey: seller_id.clone(),
+            ..Default::default()
+        };
+        add_new_user(&pool, seller_user).await.unwrap();
+
+        let mut order = create_test_order(Status::Success, seller_pk, buyer_pk);
+        order.master_seller_pubkey = Some(seller_id.clone());
+        order.master_buyer_pubkey = Some(create_test_keys().public_key().to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER fail_orders_update BEFORE UPDATE ON orders \
+             BEGIN SELECT RAISE(ABORT, 'forced orders failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(buyer_pk);
+        let msg = create_rate_user_message(order.id, 5);
+        let result = update_user_reputation_action(&ctx, msg, &event, &keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
     }
 }

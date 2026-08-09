@@ -4102,4 +4102,761 @@ mod tests {
                 .unwrap();
         assert!(second.is_empty(), "retry must not re-notify the maker");
     }
+
+    // ── Coverage: pure-helper / classifier branches ─────────────────────────
+
+    #[tokio::test]
+    async fn is_unique_violation_false_for_non_unique_db_error() {
+        // The message-based fallback branch only runs when `code()` is not
+        // "2067" — a genuine unique-constraint violation on SQLite always
+        // carries that code, so the fallback is only reachable from some
+        // *other* kind of database error. Drive it with a plain SQL error
+        // (unknown column) and confirm it classifies as "not a unique
+        // violation" rather than panicking or misclassifying.
+        let pool = setup_pool().await;
+        let err = sqlx::query("SELECT this_column_does_not_exist FROM bonds")
+            .execute(&pool)
+            .await
+            .expect_err("querying a missing column must fail");
+        assert!(
+            !is_unique_violation(&err),
+            "a non-constraint DB error must not be classified as a unique violation"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_slash_target_ignores_range_root_bond_when_not_locked() {
+        // The range-root fallback (used for a maker slash landing on a
+        // descendant slice) must only resolve a maker bond that is still
+        // `Locked`. A root maker bond that already moved on (e.g. a prior
+        // close released it) must not be picked up as a slash target.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        insert_bond_with_role(
+            &pool,
+            root.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Released,
+        )
+        .await;
+
+        let mut slice = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 70);
+        slice.range_parent_id = Some(root.id);
+        insert_range_order_row(&pool, &slice).await;
+
+        let bonds = find_active_bonds_for_order(&pool, slice.id).await.unwrap();
+        let target = resolve_slash_target(&pool, &slice, &bonds, Side::Seller, true)
+            .await
+            .unwrap();
+        assert!(
+            target.is_none(),
+            "a non-Locked root maker bond must not resolve as a slash target"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_dispatch_on_non_waiting_status_releases_defensively() {
+        // The scheduler only calls the timeout dispatch for waiting-state
+        // orders, but the dispatch itself must never assume that — any
+        // other status (here: `Dispute`, `fixture_order`'s default) falls
+        // back to releasing every active bond, never slashing.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "a non-waiting status must never slash");
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_slash_armed_but_no_bond_posted_releases_without_slash() {
+        // The gate is armed (enabled, slash_on_waiting_timeout, apply_to
+        // covers the responsible taker), but the taker never posted a bond
+        // at all (e.g. the feature was enabled after the bond stage ran).
+        // No Locked row resolves, so the dispatch must release defensively
+        // and report no slash, instead of erroring.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let mut ln = StubSettle::new();
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "an armed gate with no bond to slash must not report a slash"
+        );
+        assert!(ln.calls().is_empty());
+    }
+
+    // ── Coverage: `notify_bond_slashed` error branches ──────────────────────
+
+    #[tokio::test]
+    async fn notify_bond_slashed_skips_when_pubkey_unparseable() {
+        use crate::config::MESSAGE_QUEUES;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        let mut bond =
+            Bond::new_requested(order.id, taker_pk().to_string(), BondRole::Taker, 10_000);
+        bond.pubkey = "not-a-valid-pubkey".to_string();
+
+        notify_bond_slashed(&order, &bond).await;
+
+        let has_notice = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .any(|(m, _)| {
+                let k = m.get_inner_message_kind();
+                k.id == Some(order.id) && k.action == Action::BondSlashed
+            });
+        assert!(
+            !has_notice,
+            "an unparseable bonded pubkey must skip the BondSlashed notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_bond_slashed_skips_when_order_kind_unparseable() {
+        use crate::config::MESSAGE_QUEUES;
+        let mut order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        order.kind = "not-a-real-kind".to_string();
+        let bond = Bond::new_requested(order.id, taker_pk().to_string(), BondRole::Taker, 10_000);
+
+        notify_bond_slashed(&order, &bond).await;
+
+        let has_notice = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .any(|(m, _)| {
+                let k = m.get_inner_message_kind();
+                k.id == Some(order.id) && k.action == Action::BondSlashed
+            });
+        assert!(
+            !has_notice,
+            "an unparseable order kind must skip the BondSlashed notice"
+        );
+    }
+
+    // ── Coverage: `slash_one` edge branches ─────────────────────────────────
+
+    #[tokio::test]
+    async fn slash_one_with_no_preimage_leaves_bond_locked_for_review() {
+        // A `Locked` bond with no preimage is a corrupt/incomplete row
+        // (should never happen in production, but must be handled): the
+        // HTLC can never be settled, so the bond must stay Locked for an
+        // operator to investigate, and `settle_hold_invoice` must never be
+        // called with a bogus preimage.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let mut bond =
+            Bond::new_requested(order.id, taker_pk().to_string(), BondRole::Taker, 10_000);
+        bond.state = BondState::Locked.to_string();
+        // preimage stays None (the `new_requested` default).
+        bond.clone().create(&pool).await.unwrap();
+        let mut ln = StubSettle::new();
+
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+
+        assert!(
+            ln.calls().is_empty(),
+            "no preimage means settle_hold_invoice must never be invoked"
+        );
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Locked.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_one_cas_noop_when_bond_already_transitioned_concurrently() {
+        // Simulate a concurrent transition: the row moved to PendingPayout
+        // (e.g. a duplicate admin call already slashed it) between the
+        // active-bonds fetch and this call's CAS. The CAS must match zero
+        // rows and log a no-op instead of clobbering the row.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::PendingPayout.to_string())
+            .bind(bond.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut ln = StubSettle::new();
+
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "settle is still attempted before the CAS no-op is discovered"
+        );
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT state, slashed_reason FROM bonds WHERE id = ?")
+                .bind(bond.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, BondState::PendingPayout.to_string());
+        assert!(
+            row.1.is_none(),
+            "a CAS no-op must not stamp slashed_reason for this call"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_one_cas_db_error_is_logged_not_propagated() {
+        // A DB-level failure on the CAS itself (after the HTLC is already
+        // settled) must be logged, not panic or propagate — `slash_one` is
+        // best-effort by design.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut ln = StubSettle::new();
+
+        // Must not panic despite the CAS query itself failing.
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+
+        assert_eq!(
+            ln.calls(),
+            vec![stub_preimage()],
+            "settle is attempted before the failed CAS is discovered"
+        );
+    }
+
+    // ── Coverage: `record_maker_slice_slash` edge branches ──────────────────
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_buy_order_uses_buyer_pubkey() {
+        // Every other `record_maker_slice_slash` test uses a sell-order
+        // range (maker = seller). A buy-order range's maker is the buyer,
+        // so the child row's pubkey must come from `buyer_pubkey`.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Buy, taker_pk(), maker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let inserted = record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+        assert!(inserted);
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            children[0].pubkey,
+            maker_pk(),
+            "a buy-order slice's maker-side pubkey is the buyer's"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_skips_when_slice_missing_maker_pubkey() {
+        // A slice row with no maker-side pubkey (corrupt/incomplete row)
+        // must be skipped rather than inserting a child with a missing
+        // recipient.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.seller_pubkey = None;
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        let inserted = record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        assert!(!inserted);
+        assert!(find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_skips_when_root_missing_max_amount() {
+        // A range root with no positive `max_amount` (corrupt/non-range
+        // root passed by mistake) must be skipped, never divide-by-zero or
+        // insert a bogus share.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        for bad_max in [None, Some(0)] {
+            let mut bad_root = root.clone();
+            bad_root.max_amount = bad_max;
+            let inserted = record_maker_slice_slash(
+                &pool,
+                &root,
+                &bad_root,
+                &parent,
+                BondSlashReason::LostDispute,
+                0.5,
+            )
+            .await
+            .unwrap();
+            assert!(!inserted, "max_amount={bad_max:?} must be rejected");
+        }
+        assert!(find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_skips_when_bond_already_fully_slashed() {
+        // Once the parent's cumulative slashed share already equals the
+        // bond amount, any further slice slash computes a non-positive
+        // remaining share and must be dropped instead of over-allocating.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        sqlx::query("UPDATE bonds SET slashed_share_sats = ? WHERE id = ?")
+            .bind(1000_i64)
+            .bind(parent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+
+        let inserted = record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !inserted,
+            "no remaining bond to slash means the slice is dropped"
+        );
+        assert!(find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_maker_slice_slash_propagates_non_unique_db_error() {
+        // A genuine DB error on the child INSERT (not a unique-constraint
+        // violation) must propagate as an `Err`, not be swallowed like the
+        // idempotent-duplicate case.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    // ── Coverage: `resolve_range_maker_bond_at_close` edge branches ─────────
+
+    #[tokio::test]
+    async fn range_close_noop_when_no_maker_bond_exists() {
+        // No maker bond posted at all for this order → immediate no-op,
+        // never touching LND.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let mut ln = StubSettle::new();
+
+        resolve_range_maker_bond_at_close(&pool, &mut ln, &order)
+            .await
+            .unwrap();
+
+        assert!(ln.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_close_releases_non_range_maker_bond() {
+        // A non-range order's maker bond (`max_amount = None`) has no slice
+        // children by construction — the close path must fall through to a
+        // plain release, exactly like the Phase 5 non-range happy path.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let parent = insert_parent_maker_bond(&pool, order.id, maker_pk(), 1000).await;
+        let mut ln = StubSettle::new();
+
+        resolve_range_maker_bond_at_close(&pool, &mut ln, &order)
+            .await
+            .unwrap();
+
+        assert!(
+            ln.calls().is_empty(),
+            "release (hash=None) must never touch settle_hold_invoice"
+        );
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn range_close_skips_settle_when_parent_preimage_missing() {
+        // A parent bond with a slashed slice but a missing preimage
+        // (corrupt/incomplete row) must be left Locked for operator review
+        // rather than attempting to settle.
+        let pool = setup_pool().await;
+        let root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE bonds SET preimage = NULL WHERE id = ?")
+            .bind(parent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut ln = StubSettle::new();
+        resolve_range_maker_bond_at_close(&pool, &mut ln, &root)
+            .await
+            .unwrap();
+
+        assert!(
+            ln.calls().is_empty(),
+            "no preimage means settle must never be attempted"
+        );
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.state,
+            BondState::Locked.to_string(),
+            "left Locked for operator review"
+        );
+    }
+
+    /// `SettleLightning` mock whose `settle_hold_invoice` has a side effect:
+    /// it flips the target bond straight to `Slashed` via a direct DB write,
+    /// simulating a *concurrent* close winning the `Locked -> Slashed` CAS
+    /// race between this call's settle and its own CAS attempt. Used to
+    /// deterministically drive `resolve_range_maker_bond_at_close`'s
+    /// lost-the-race branch without real concurrency.
+    struct RaceWinningSettle {
+        pool: Pool<Sqlite>,
+        bond_id: Uuid,
+    }
+
+    impl SettleLightning for RaceWinningSettle {
+        fn settle_hold_invoice<'a>(
+            &'a mut self,
+            _preimage: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            Box::pin(async move {
+                sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+                    .bind(BondState::Slashed.to_string())
+                    .bind(self.bond_id)
+                    .execute(&self.pool)
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn range_close_loses_cas_race_and_skips_refund_row() {
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        let mut racer = RaceWinningSettle {
+            pool: pool.clone(),
+            bond_id: parent.id,
+        };
+        resolve_range_maker_bond_at_close(&pool, &mut racer, &root)
+            .await
+            .unwrap();
+
+        // The CAS lost the race (the mock already moved the parent to
+        // Slashed as a side effect of "settling") — no refund row may be
+        // written, and the parent stays whatever the winner left it as.
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Slashed.to_string());
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert!(
+            children.iter().all(|c| c.child_order_id.is_some()),
+            "a lost CAS race must skip the maker-refund row insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_close_full_slash_creates_no_refund_row() {
+        // When the slashed total exactly equals the bond amount there is
+        // nothing left to refund — the maker-refund row insert must be
+        // skipped entirely (not inserted with amount 0).
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 100, 10, 100);
+        root.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+        let mut ln = StubSettle::new();
+        resolve_range_maker_bond_at_close(&pool, &mut ln, &root)
+            .await
+            .unwrap();
+
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(p.state, BondState::Slashed.to_string());
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "only the slice child; no maker-refund row when fully slashed"
+        );
+        assert!(children[0].child_order_id.is_some());
+    }
+
+    // ── Coverage: `resolve_range_maker_bond_at_close_or_warn` ───────────────
+
+    #[tokio::test]
+    async fn resolve_at_close_or_warn_noop_when_no_locked_maker_bond() {
+        // The cheap pre-check must return without ever attempting to open
+        // LND when there is no Locked maker bond to resolve — this must
+        // hold even though `MOSTRO_CONFIG` is never initialized in this
+        // test binary (an LND attempt would panic on `Settings::get_ln`).
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+
+        resolve_range_maker_bond_at_close_or_warn(&pool, &order, "unit_test").await;
+    }
+
+    #[tokio::test]
+    async fn resolve_at_close_or_warn_logs_when_maker_bond_lookup_errors() {
+        // A DB failure on the maker-bond lookup itself must be logged and
+        // must return before ever reaching the LND connect step.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        resolve_range_maker_bond_at_close_or_warn(&pool, &order, "unit_test").await;
+    }
+
+    // ── Coverage: reconciliation sweep DB-error branches ────────────────────
+
+    #[tokio::test]
+    async fn collect_stranded_logs_and_skips_when_order_lookup_errors() {
+        // A DB error on the range-root order lookup (not just a missing
+        // row) must be logged and skipped, never propagated — one corrupt
+        // root must not starve the whole sweep tick.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &root).await;
+        insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stranded = collect_stranded_range_maker_roots(&pool).await.unwrap();
+        assert!(
+            stranded.is_empty(),
+            "an Order::by_id failure must be logged and skipped, not propagated"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_returns_zero_when_scan_query_fails() {
+        // A DB failure on the very scan for stranded bonds (not a per-root
+        // failure) must be logged and yield zero resolved, never panic or
+        // propagate.
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stub = StubSettle::new();
+
+        let resolved = reconcile_stranded_range_maker_bonds_with(&pool, &mut stub.clone()).await;
+
+        assert_eq!(resolved, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_logs_and_continues_when_a_root_close_errors() {
+        // A per-root close failure must be logged and the sweep must move
+        // on (report it as not-resolved) rather than propagate — the next
+        // tick (or the CLTV safety net) retries.
+        let pool = setup_pool().await;
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::CooperativelyCanceled.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        record_maker_slice_slash(
+            &pool,
+            &root,
+            &root,
+            &parent,
+            BondSlashReason::LostDispute,
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        // Force the close's refund-row insert to fail once it reaches the
+        // transaction (mirrors `range_close_crash_after_settle_is_resumed`).
+        sqlx::query(
+            "CREATE TRIGGER bond_refund_fail_sweep BEFORE INSERT ON bonds \
+             WHEN NEW.parent_bond_id IS NOT NULL AND NEW.child_order_id IS NULL \
+             BEGIN SELECT RAISE(ABORT, 'injected refund insert failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stub = StubSettle::new();
+        let resolved = reconcile_stranded_range_maker_bonds_with(&pool, &mut stub.clone()).await;
+
+        assert_eq!(
+            resolved, 0,
+            "the erroring root must be logged and skipped, not counted as resolved"
+        );
+        let p = find_bond_by_id(&pool, parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.state,
+            BondState::Locked.to_string(),
+            "a failed close leaves the parent Locked for a future retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_stranded_range_maker_bonds_returns_early_when_nothing_stranded() {
+        // The public entry point's cheap pre-check must return before ever
+        // attempting to open LND when there is nothing stranded — this
+        // must hold even though `MOSTRO_CONFIG` is never initialized in
+        // this test binary.
+        let pool = setup_pool().await;
+        reconcile_stranded_range_maker_bonds(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_stranded_range_maker_bonds_returns_early_when_scan_fails() {
+        // A scan failure must short-circuit before the LND connect step
+        // too, for the same MOSTRO_CONFIG-safety reason.
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reconcile_stranded_range_maker_bonds(&pool).await;
+    }
 }

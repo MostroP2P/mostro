@@ -215,6 +215,69 @@ mod tests {
     }
 
     #[test]
+    fn install_global_then_second_install_is_rejected() {
+        // The OnceLock is process-wide, so this single test owns both the
+        // first (successful) install and the AlreadyInstalled rejection.
+        let first = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
+        assert!(first.is_ok(), "first install must succeed");
+        assert!(
+            SpamGate::global().is_some(),
+            "global() must expose the installed gate"
+        );
+
+        let second = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
+        assert_eq!(
+            second,
+            Err(InstallError::AlreadyInstalled),
+            "a second install must be refused, not panic"
+        );
+    }
+
+    #[test]
+    fn poisoned_known_lock_degrades_to_first_contact_lane() {
+        let gate = std::sync::Arc::new(SpamGate::new(REPLAY_WINDOW_SECS));
+        gate.set_known(["known".to_string()]);
+        assert!(gate.is_known("known"));
+
+        // Poison the known-keys RwLock by panicking while holding the writer.
+        let poisoner = std::sync::Arc::clone(&gate);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.known.write().unwrap();
+            panic!("poison known lock");
+        })
+        .join();
+
+        // Degradation contract: reads fall back to "unknown" (safe direction),
+        // counts to 0, and refresh is skipped without crashing.
+        assert!(!gate.is_known("known"), "poisoned read degrades to false");
+        assert_eq!(gate.known_count(), 0, "poisoned count degrades to 0");
+        gate.set_known(["other".to_string()]); // must log-and-skip, not panic
+        assert!(!gate.is_known("other"));
+    }
+
+    #[test]
+    fn poisoned_replay_lock_never_drops_messages() {
+        let gate = std::sync::Arc::new(SpamGate::new(REPLAY_WINDOW_SECS));
+        let id = an_event_id("poisoned-replay");
+        assert!(!gate.is_replay(id, 1_000));
+
+        // Poison the replay Mutex by panicking while holding the guard.
+        let poisoner = std::sync::Arc::clone(&gate);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.replay.lock().unwrap();
+            panic!("poison replay lock");
+        })
+        .join();
+
+        // Even a genuine duplicate must NOT be dropped once dedup state is
+        // lost — fail-open is the documented safe direction.
+        assert!(
+            !gate.is_replay(id, 1_001),
+            "poisoned replay guard must degrade to 'not a replay'"
+        );
+    }
+
+    #[test]
     fn prune_keeps_map_bounded_to_window() {
         let mut guard = ReplayGuard::new(60);
         for i in 0..100 {

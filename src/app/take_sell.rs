@@ -457,4 +457,269 @@ mod tests {
             assert!(expected_fee < amount); // Fee should be less than amount
         }
     }
+
+    /// Full-handler tests that drive `take_sell_action` against a migrated
+    /// in-memory database. Unlike the structural tests above (which run on
+    /// an un-migrated pool and bail at `get_order`), these seed real order
+    /// rows and assert the branch outcomes.
+    mod handler_flow_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use mostro_core::db::Crud;
+        use nostr_sdk::prelude::PublicKey;
+        use std::sync::Arc;
+
+        async fn setup_pool() -> Arc<SqlitePool> {
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            pool
+        }
+
+        fn build_ctx(pool: Arc<SqlitePool>) -> AppContext {
+            let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        /// For a sell order the taker is the buyer. `sender` is the taker
+        /// trade key; `identity == sender` so a `None` trade_index → 0.
+        fn taker_event(taker: PublicKey) -> UnwrappedMessage {
+            UnwrappedMessage {
+                message: Message::new_order(
+                    Some(uuid::Uuid::new_v4()),
+                    Some(1),
+                    None,
+                    Action::TakeSell,
+                    None,
+                ),
+                signature: None,
+                sender: taker,
+                identity: taker,
+                created_at: Timestamp::now(),
+            }
+        }
+
+        /// A pending sell order: the maker is the seller (creator ==
+        /// seller_pubkey), no taker yet.
+        fn pending_sell_order(maker_seller: PublicKey) -> Order {
+            Order {
+                id: uuid::Uuid::new_v4(),
+                status: Status::Pending.to_string(),
+                kind: OrderKind::Sell.to_string(),
+                fiat_code: "USD".to_string(),
+                fiat_amount: 100,
+                creator_pubkey: maker_seller.to_string(),
+                seller_pubkey: Some(maker_seller.to_string()),
+                master_seller_pubkey: Some(maker_seller.to_string()),
+                amount: 21_000,
+                fee: 210,
+                ..Default::default()
+            }
+        }
+
+        fn take_sell_msg(order_id: uuid::Uuid, trade_index: Option<i64>) -> Message {
+            Message::new_order(Some(order_id), Some(1), trade_index, Action::TakeSell, None)
+        }
+
+        #[tokio::test]
+        async fn fails_when_order_missing() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool);
+            let taker = Keys::generate().public_key();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(uuid::Uuid::new_v4(), Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(result, Err(MostroCantDo(CantDoReason::NotFound))));
+        }
+
+        #[tokio::test]
+        async fn rejects_taker_with_pending_order() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+            // The taker already has a waiting-buyer-invoice order as buyer.
+            let mut pending = pending_sell_order(Keys::generate().public_key());
+            pending.status = Status::WaitingBuyerInvoice.to_string();
+            pending.master_buyer_pubkey = Some(taker.to_string());
+            pending.create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::PendingOrderExists))
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejects_non_sell_order() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let mut order = pending_sell_order(maker);
+            order.kind = OrderKind::Buy.to_string();
+            let order = order.create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::InvalidOrderKind))
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejects_non_pending_status() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let mut order = pending_sell_order(maker);
+            order.status = Status::Active.to_string();
+            let order = order.create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::InvalidOrderStatus))
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejects_maker_taking_own_order() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+
+            let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(maker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::InvalidPubkey))
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejects_range_order_without_amount() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let mut order = pending_sell_order(maker);
+            order.min_amount = Some(10);
+            order.max_amount = Some(1000);
+            let order = order.create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::OutOfRangeSatsAmount))
+            ));
+        }
+
+        #[tokio::test]
+        async fn requires_trade_index_when_identity_differs() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+            let mut event = taker_event(taker);
+            event.identity = Keys::generate().public_key();
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, None),
+                &event,
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::InvalidPayload))
+            ));
+        }
+
+        /// Non-bond happy path with no buyer payout invoice supplied: the
+        /// take succeeds and the order is moved to `WaitingBuyerInvoice` via
+        /// `update_order_status` (no LND involved). This covers the
+        /// `payment_request.is_none()` branch and `update_order_status`.
+        #[tokio::test]
+        async fn no_invoice_transitions_to_waiting_buyer_invoice() {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let maker = Keys::generate().public_key();
+            let taker = Keys::generate().public_key();
+
+            let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+            let result = take_sell_action(
+                &ctx,
+                take_sell_msg(order.id, Some(1)),
+                &taker_event(taker),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(result.is_ok(), "no-invoice take must succeed: {result:?}");
+            let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+            assert_eq!(stored.status, Status::WaitingBuyerInvoice.to_string());
+            assert_eq!(stored.buyer_pubkey, Some(taker.to_string()));
+        }
+    }
 }

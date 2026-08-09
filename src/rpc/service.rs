@@ -501,6 +501,211 @@ mod tests {
         assert_eq!(error_resp.error_message.unwrap(), "Order not found");
     }
 
+    use crate::app::context::test_utils::test_settings;
+    use crate::config::MOSTRO_CONFIG;
+    use crate::rpc::admin::{GetVersionRequest, ValidateDbPasswordRequest};
+    use nostr_sdk::Keys;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tonic::transport::server::TcpConnectInfo;
+    use tonic::Request;
+
+    fn init_test_settings() {
+        let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// `fedimint_tonic_lnd::connect` is lazy (no network until the first
+    /// RPC), so an offline connector against a dead localhost port lets us
+    /// construct the full service without a live LND node.
+    async fn offline_service() -> AdminServiceImpl {
+        init_test_settings();
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-offline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("tls.cert");
+        let macaroon = dir.join("admin.macaroon");
+        std::fs::write(&cert, b"").expect("write cert");
+        std::fs::write(&macaroon, b"").expect("write macaroon");
+        let client = fedimint_tonic_lnd::connect("https://127.0.0.1:1".to_string(), cert, macaroon)
+            .await
+            .expect("lazy connect must not touch the network");
+        let ln_client = Arc::new(tokio::sync::Mutex::new(LndConnector { client }));
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        AdminServiceImpl::new(Keys::generate(), Arc::new(pool), ln_client)
+    }
+
+    fn request_with_addr<T>(inner: T, last_octet: u8) -> Request<T> {
+        let mut request = Request::new(inner);
+        request.extensions_mut().insert(TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet)),
+                50051,
+            )),
+        });
+        request
+    }
+
+    #[tokio::test]
+    async fn cancel_order_with_invalid_uuid_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .cancel_order(Request::new(CancelOrderRequest {
+                order_id: "not-a-uuid".to_string(),
+                request_id: Some("7".to_string()),
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        let inner = response.into_inner();
+        assert!(!inner.success);
+        assert!(inner.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_order_with_unknown_order_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .cancel_order(Request::new(CancelOrderRequest {
+                order_id: uuid::Uuid::new_v4().to_string(),
+                request_id: None,
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        // Either the Nostr client is uninitialized or the order lookup
+        // fails — both must surface as an unsuccessful response.
+        assert!(!response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn settle_order_with_invalid_uuid_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .settle_order(Request::new(SettleOrderRequest {
+                order_id: "definitely not a uuid".to_string(),
+                request_id: None,
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        assert!(!response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn settle_order_with_unknown_order_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .settle_order(Request::new(SettleOrderRequest {
+                order_id: uuid::Uuid::new_v4().to_string(),
+                request_id: Some("9".to_string()),
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        assert!(!response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn take_dispute_with_invalid_uuid_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .take_dispute(Request::new(TakeDisputeRequest {
+                dispute_id: "nope".to_string(),
+                request_id: None,
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        assert!(!response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn take_dispute_with_unknown_dispute_reports_failure() {
+        let service = offline_service().await;
+        let response = service
+            .take_dispute(Request::new(TakeDisputeRequest {
+                dispute_id: uuid::Uuid::new_v4().to_string(),
+                request_id: Some("11".to_string()),
+            }))
+            .await
+            .expect("RPC surface always answers with a response");
+        assert!(!response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn add_solver_answers_without_transport_error() {
+        let service = offline_service().await;
+        // Depending on global Nostr-client state the action may succeed or
+        // fail; the RPC surface must answer with a response either way.
+        let response = service
+            .add_solver(Request::new(AddSolverRequest {
+                solver_pubkey: Keys::generate().public_key().to_hex(),
+                request_id: Some("13".to_string()),
+            }))
+            .await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_version_returns_crate_version() {
+        let service = offline_service().await;
+        let response = service
+            .get_version(Request::new(GetVersionRequest {}))
+            .await
+            .expect("get_version never fails");
+        assert_eq!(response.into_inner().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn validate_db_password_requires_remote_addr() {
+        let service = offline_service().await;
+        let status = service
+            .validate_db_password(Request::new(ValidateDbPasswordRequest {
+                password: "secret".to_string(),
+            }))
+            .await
+            .expect_err("no remote_addr must be an internal error");
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn validate_db_password_succeeds_with_remote_addr() {
+        let service = offline_service().await;
+        let response = service
+            .validate_db_password(request_with_addr(
+                ValidateDbPasswordRequest {
+                    password: "anything".to_string(),
+                },
+                21,
+            ))
+            .await
+            .expect("backward-compat endpoint always succeeds");
+        assert!(response.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn validate_db_password_is_rate_limited_after_failures() {
+        let service = offline_service().await;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 22)), 50051);
+        // Pause the tokio clock only for the failure loop so the
+        // exponential-backoff sleeps auto-advance instead of stalling the
+        // suite ~15s; the std-`Instant` lockout stays active in real time.
+        tokio::time::pause();
+        // Drive the limiter into lockout directly (5 failures).
+        for _ in 0..5 {
+            service.password_rate_limiter.record_failure(&addr).await;
+        }
+        tokio::time::resume();
+        let status = service
+            .validate_db_password(request_with_addr(
+                ValidateDbPasswordRequest {
+                    password: "anything".to_string(),
+                },
+                22,
+            ))
+            .await
+            .expect_err("locked-out client must be refused");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
     #[test]
     fn test_optional_fields() {
         // Test that optional fields work correctly

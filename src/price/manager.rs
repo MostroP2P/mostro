@@ -34,14 +34,17 @@ use mostro_core::error::{MostroError, ServiceError};
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use super::aggregate::{aggregate_tick, AggregateResult};
+use super::aggregate::{aggregate_tick, combine, AggregateResult};
 use super::config::{PriceSettings, ProviderConfig};
 use super::fiat::is_known_fiat;
-use super::provider::{PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes};
+use super::provider::{
+    PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes, Quote,
+};
 use super::providers::blockchain::BlockchainProvider;
 use super::providers::coingecko::CoinGeckoProvider;
 use super::providers::currency_api::CurrencyApiProvider;
 use super::providers::eltoque::ElToqueProvider;
+use super::providers::nostr::NostrProvider;
 use super::providers::yadio::YadioProvider;
 use super::store::{PriceError, PriceStore};
 
@@ -107,7 +110,12 @@ impl PriceManager {
             }
             match id_str.parse::<ProviderId>() {
                 Ok(id) => {
-                    let provider = build_provider(id, cfg)?;
+                    let provider = build_provider(
+                        id,
+                        cfg,
+                        settings.provider_timeout_seconds,
+                        settings.max_price_staleness_seconds,
+                    )?;
                     providers.push(EnabledProvider {
                         id,
                         provider,
@@ -282,6 +290,15 @@ impl PriceManager {
                 (id, self.scope_quotes(id, fiat_only))
             })
             .collect();
+        // Nostr is a relay of another node's *already-aggregated* rate, not
+        // an independent peer observation (re-review, PR #841): that node's
+        // own direct sources already fed into the value it published, so
+        // blending it into the median/mean here alongside this node's own
+        // direct sources would double-count correlated information and skew
+        // the result. Keep it strictly fallback — only for currencies no
+        // other provider covered this tick.
+        let filtered_with_ids =
+            restrict_nostr_to_fallback(filtered_with_ids, self.settings.outlier_threshold_pct);
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
@@ -309,8 +326,7 @@ impl PriceManager {
         report.contributors = contributors;
 
         if self.settings.publish_to_nostr {
-            self.publish_rates_to_nostr(&aggregates, &report.contributors)
-                .await;
+            self.publish_rates_to_nostr(&aggregates).await;
         }
 
         report
@@ -485,16 +501,19 @@ impl PriceManager {
     /// **contributing** provider ids (spec §9 Phase 1: still effectively
     /// one source, but the multi-source shape is in place). Publishing is
     /// best-effort and never fails the tick.
-    async fn publish_rates_to_nostr(
-        &self,
-        aggregates: &HashMap<String, AggregateResult>,
-        successes: &[ProviderId],
-    ) {
+    async fn publish_rates_to_nostr(&self, aggregates: &HashMap<String, AggregateResult>) {
         // Build the `{"BTC": {ccy: value}}` body the legacy format used.
-        let rates: HashMap<String, f64> = aggregates
-            .iter()
-            .map(|(c, a)| (c.clone(), a.value))
-            .collect();
+        let rates = republishable_rates(aggregates);
+        if rates.is_empty() {
+            debug!(
+                "price: nothing to republish to Nostr this tick \
+                 (every fresh currency was Nostr-only sourced)"
+            );
+            return;
+        }
+        // Derived before `rates` is moved into the body it describes.
+        let source_tag = sources_to_tag(&republished_contributors(aggregates, &rates));
+
         let mut wrapper: HashMap<String, HashMap<String, f64>> = HashMap::new();
         wrapper.insert("BTC".to_string(), rates);
 
@@ -518,7 +537,6 @@ impl PriceManager {
         // Match legacy bitcoin_price.rs: 2× the interval, capped at 1h.
         let expiration_seconds = std::cmp::min(self.settings.update_interval_seconds * 2, 3600);
         let expiration = timestamp + expiration_seconds as i64;
-        let source_tag = sources_to_tag(successes);
         let tags = Tags::from_list(vec![
             Tag::custom(
                 TagKind::Custom("published_at".into()),
@@ -548,13 +566,149 @@ impl PriceManager {
         match tokio::time::timeout(timeout_duration, client.send_event(&event)).await {
             Ok(Ok(output)) => info!(
                 "price: published exchange rates to Nostr ({} currencies). Output: {:?}",
-                aggregates.len(),
+                wrapper["BTC"].len(),
                 output
             ),
             Ok(Err(e)) => error!("price: send_event to relays failed: {e}"),
             Err(_) => error!("price: timeout publishing exchange rates to Nostr (30s exceeded)"),
         }
     }
+}
+
+/// Drop the `Nostr` provider's quotes for any currency another provider
+/// can actually produce a value for this tick, leaving every other
+/// provider untouched.
+///
+/// A trusted-node `nostr` quote is a relayed *aggregate*, not an
+/// independent local observation — the remote node already ran its own
+/// direct sources through `combine` to produce it. Feeding it into this
+/// node's `aggregate_tick` alongside those same kinds of direct sources
+/// would let one upstream signal count twice (once locally, once via the
+/// remote's combine) and skew the median/mean. Restricting it to
+/// currencies nobody else can resolve keeps it strictly a gap-filler —
+/// its documented purpose (spec §11.7) — while a fully-covered currency's
+/// value stays whatever the direct sources agree on.
+///
+/// Coverage is decided **after** fiat-cross resolution, not from raw quote
+/// keys. El Toque reports CUP/MLC only as `PerBase { base: USD }`; a key
+/// presence check would treat that as covering CUP even when the USD
+/// anchor is missing, drop Nostr's usable `PerBtc` CUP, then lose CUP
+/// entirely when the cross fails to resolve (ermeme, PR #841). Anchors
+/// are built from *all* direct `PerBtc` quotes (including Nostr) so a
+/// local El Toque cross that needs Nostr's USD still counts as covering
+/// CUP — Nostr's direct CUP is then correctly suppressed as redundant.
+///
+/// Currency codes are folded to uppercase because `aggregate_tick` does
+/// the same before grouping; Yadio forwards API codes verbatim.
+fn restrict_nostr_to_fallback(
+    results: Vec<(ProviderId, ProviderQuotes)>,
+    outlier_pct: f64,
+) -> Vec<(ProviderId, ProviderQuotes)> {
+    let covered_elsewhere = currencies_covered_by_non_nostr(&results, outlier_pct);
+    results
+        .into_iter()
+        .map(|(id, quotes)| {
+            if id != ProviderId::Nostr {
+                return (id, quotes);
+            }
+            let fallback_only: ProviderQuotes = quotes
+                .into_iter()
+                .filter(|(currency, _)| !covered_elsewhere.contains(&currency.to_uppercase()))
+                .collect();
+            (id, fallback_only)
+        })
+        .collect()
+}
+
+/// Currencies a non-Nostr provider can actually yield this tick: either a
+/// usable direct `PerBtc`, or a `PerBase` that resolves against the
+/// tick's anchors (anchors include Nostr `PerBtc` so local crosses can
+/// still cover a currency when only the relayed USD is available).
+fn currencies_covered_by_non_nostr(
+    results: &[(ProviderId, ProviderQuotes)],
+    outlier_pct: f64,
+) -> HashSet<String> {
+    let mut direct: HashMap<String, Vec<f64>> = HashMap::new();
+    for (_id, quotes) in results {
+        for (currency, quote) in quotes {
+            if let Quote::PerBtc(v) = quote {
+                if v.is_finite() && *v > 0.0 {
+                    direct.entry(currency.to_uppercase()).or_default().push(*v);
+                }
+            }
+        }
+    }
+    let mut anchors: HashMap<String, f64> = HashMap::new();
+    for (currency, values) in &direct {
+        if let Some(v) = combine(values, outlier_pct) {
+            anchors.insert(currency.clone(), v);
+        }
+    }
+
+    let mut covered: HashSet<String> = HashSet::new();
+    for (id, quotes) in results {
+        if *id == ProviderId::Nostr {
+            continue;
+        }
+        for (currency, quote) in quotes {
+            let code = currency.to_uppercase();
+            match quote {
+                Quote::PerBtc(v) if v.is_finite() && *v > 0.0 => {
+                    covered.insert(code);
+                }
+                Quote::PerBase { base, value } => {
+                    if let Some(anchor) = anchors.get(&base.to_uppercase()) {
+                        let candidate = value * anchor;
+                        if candidate.is_finite() && candidate > 0.0 {
+                            covered.insert(code);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    covered
+}
+
+/// Currencies fit to republish to Nostr this tick: everything **except**
+/// those that still depend on a Nostr-sourced rate.
+///
+/// Two cases must not be re-stamped with a fresh `created_at`/`expiration`
+/// (re-review, PR #841):
+/// - sole surviving contributor is `Nostr` itself;
+/// - a fiat-cross resolved against a Nostr-touched USD (or other) anchor
+///   (`nostr_anchor_dependent`) — e.g. El Toque CUP × Nostr USD would
+///   otherwise publish as `source=eltoque` while embedding a relayed rate.
+///
+/// A currency this node independently corroborated with a non-Nostr
+/// absolute path (and no Nostr-anchor cross) republishes as before.
+fn republishable_rates(aggregates: &HashMap<String, AggregateResult>) -> HashMap<String, f64> {
+    aggregates
+        .iter()
+        .filter(|(_, a)| a.contributors != [ProviderId::Nostr] && !a.nostr_anchor_dependent)
+        .map(|(c, a)| (c.clone(), a.value))
+        .collect()
+}
+
+/// Providers that actually contributed to the republished payload.
+///
+/// The tick-wide contributor list covers every aggregate, but
+/// `republishable_rates` can drop currencies — so a provider whose every
+/// contribution was filtered out would still be named in the `source` tag
+/// of a body carrying none of its data. Deriving the tag from the
+/// surviving currencies keeps the tag honest about what actually ships.
+fn republished_contributors(
+    aggregates: &HashMap<String, AggregateResult>,
+    rates: &HashMap<String, f64>,
+) -> Vec<ProviderId> {
+    aggregates
+        .iter()
+        .filter(|(currency, _)| rates.contains_key(*currency))
+        .flat_map(|(_, a)| a.contributors.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Joined list of contributing provider ids for the Nostr `source` tag.
@@ -569,7 +723,12 @@ fn sources_to_tag(ids: &[ProviderId]) -> String {
 /// Single designated extension point (spec §5.4 Step 3). Adding a new
 /// provider adds exactly one match arm here — the aggregation core, the
 /// store, the scheduler, and every order handler stay untouched.
-fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceProvider>, String> {
+fn build_provider(
+    id: ProviderId,
+    cfg: &ProviderConfig,
+    provider_timeout_seconds: u64,
+    max_price_staleness_seconds: i64,
+) -> Result<Box<dyn PriceProvider>, String> {
     match id {
         ProviderId::Yadio => Ok(Box::new(YadioProvider::new(cfg))),
         ProviderId::CoinGecko => Ok(Box::new(CoinGeckoProvider::new(cfg))),
@@ -579,6 +738,16 @@ fn build_provider(id: ProviderId, cfg: &ProviderConfig) -> Result<Box<dyn PriceP
         // required Bearer token is missing, so an enabled-but-unconfigured
         // provider fails fast at startup (spec §7).
         ProviderId::ElToque => Ok(Box::new(ElToqueProvider::new(cfg)?)),
+        // Nostr trusted-node relay mode (§11.7). `new` returns `Err` when
+        // `trusted_nodes` is empty or contains an unparsable hex pubkey.
+        // `provider_timeout_seconds` sizes its one-shot relay query;
+        // `max_price_staleness_seconds` is the freshness gate on event
+        // `created_at` so zombie relay data cannot refresh the store clock.
+        ProviderId::Nostr => Ok(Box::new(NostrProvider::new(
+            cfg,
+            provider_timeout_seconds,
+            max_price_staleness_seconds,
+        )?)),
     }
 }
 
@@ -640,6 +809,7 @@ pub fn synthesise_legacy_price_settings(
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         },
     );
     PriceSettings {
@@ -712,6 +882,7 @@ mod tests {
                     token: None,
                     only: None,
                     except: None,
+                    trusted_nodes: vec![],
                 },
             );
             providers.push(EnabledProvider {
@@ -854,6 +1025,7 @@ mod tests {
             token: token.map(String::from),
             only: Some(vec!["CUP".into(), "MLC".into()]),
             except: None,
+            trusted_nodes: vec![],
         }
     }
 
@@ -882,6 +1054,52 @@ mod tests {
     }
 
     #[test]
+    fn from_settings_builds_nostr_with_trusted_nodes() {
+        // §11.7: Nostr trusted-node relay mode builds into the registry like
+        // any other provider once it has at least one valid pubkey.
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Nostr.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec![
+                    "82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390".into(),
+                ],
+            },
+        );
+        let m = PriceManager::from_settings(settings).expect("nostr builds with trusted_nodes");
+        assert_eq!(m.providers.len(), 1);
+        assert_eq!(m.providers[0].id, ProviderId::Nostr);
+    }
+
+    #[test]
+    fn from_settings_rejects_nostr_with_invalid_pubkey() {
+        // §11.7 fail-fast: an enabled Nostr provider with an unparsable
+        // trusted-node pubkey must not silently produce no quotes.
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Nostr.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec!["not-a-pubkey".into()],
+            },
+        );
+        assert!(PriceManager::from_settings(settings).is_err());
+    }
+
+    #[test]
     fn from_settings_builds_all_phase2_providers() {
         // Spec §9 Phase 2: the three keyless backups join Yadio in the
         // registry — the §7 example config must now build cleanly.
@@ -902,6 +1120,7 @@ mod tests {
                     token: None,
                     only: None,
                     except: None,
+                    trusted_nodes: vec![],
                 },
             );
         }
@@ -925,6 +1144,7 @@ mod tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
         let m = PriceManager::from_settings(settings).expect("unknown id is non-fatal");
@@ -944,6 +1164,7 @@ mod tests {
                 token: None,
                 only: None,
                 except: None,
+                trusted_nodes: vec![],
             },
         );
         let m = PriceManager::from_settings(settings).unwrap();
@@ -954,6 +1175,286 @@ mod tests {
     fn sources_to_tag_is_deterministic() {
         let tag = sources_to_tag(&[ProviderId::CoinGecko, ProviderId::Yadio]);
         assert_eq!(tag, "coingecko,yadio");
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_drops_currencies_another_provider_covers() {
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_500.0)); // same currency, different value
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0)); // nobody else has this
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::Yadio, yadio), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("USD"),
+            "USD is covered by Yadio, Nostr's USD must be dropped to avoid double-counting"
+        );
+        assert_eq!(
+            nostr_out.get("ARS"),
+            Some(&Quote::PerBtc(105_000_000.0)),
+            "ARS has no other source, Nostr must still fill the gap"
+        );
+
+        let yadio_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Yadio)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert_eq!(
+            yadio_out.get("USD"),
+            Some(&Quote::PerBtc(50_000.0)),
+            "non-Nostr providers are untouched"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_matches_coverage_case_insensitively() {
+        // Yadio forwards the API's codes verbatim, so a lowercase code is
+        // reachable in production. `aggregate_tick` upper-cases before
+        // grouping, so `usd` and `USD` are the same currency by the time it
+        // matters — coverage has to be matched the same way.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("usd".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_500.0));
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::Yadio, yadio), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("USD"),
+            "Yadio's lowercase `usd` covers Nostr's `USD` — both fold to the \
+             same aggregate, so Nostr's quote must be dropped"
+        );
+        assert_eq!(
+            nostr_out.get("ARS"),
+            Some(&Quote::PerBtc(105_000_000.0)),
+            "ARS is still uncovered, Nostr must fill the gap"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_is_a_noop_without_a_nostr_provider() {
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+
+        let out = restrict_nostr_to_fallback(vec![(ProviderId::Yadio, yadio.clone())], 5.0);
+        assert_eq!(out, vec![(ProviderId::Yadio, yadio)]);
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_keeps_nostr_when_per_base_cannot_resolve() {
+        // El Toque "has" CUP as a key, but without a USD anchor the cross
+        // cannot resolve — treating the raw key as coverage would drop
+        // Nostr's usable PerBtc CUP and leave the tick with no CUP at all
+        // (ermeme, PR #841).
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 300.0,
+            },
+        );
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::ElToque, eltoque), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert_eq!(
+            nostr_out.get("CUP"),
+            Some(&Quote::PerBtc(30_000_000.0)),
+            "unresolvable El Toque PerBase must not suppress Nostr's PerBtc CUP"
+        );
+    }
+
+    #[test]
+    fn restrict_nostr_to_fallback_drops_nostr_when_per_base_resolves_via_nostr_usd() {
+        // Nostr supplies USD; El Toque's CUP/USD then resolves. CUP is
+        // covered by the local cross, so Nostr's direct CUP must not also
+        // vote (would double-count correlated remote aggregate data).
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(50_000.0));
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+
+        let out = restrict_nostr_to_fallback(
+            vec![(ProviderId::ElToque, eltoque), (ProviderId::Nostr, nostr)],
+            5.0,
+        );
+        let nostr_out = out
+            .iter()
+            .find(|(id, _)| *id == ProviderId::Nostr)
+            .map(|(_, q)| q)
+            .unwrap();
+        assert!(
+            !nostr_out.contains_key("CUP"),
+            "El Toque CUP that resolves against Nostr USD covers the currency"
+        );
+        assert_eq!(
+            nostr_out.get("USD"),
+            Some(&Quote::PerBtc(50_000.0)),
+            "Nostr USD is still needed as the anchor"
+        );
+    }
+
+    #[test]
+    fn republishable_rates_drops_nostr_only_sourced_currencies() {
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+                nostr_anchor_dependent: false,
+            },
+        );
+        aggregates.insert(
+            "ARS".to_string(),
+            AggregateResult {
+                value: 105_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Nostr],
+                nostr_anchor_dependent: false,
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert_eq!(out.get("USD"), Some(&50_000.0));
+        assert!(
+            !out.contains_key("ARS"),
+            "Nostr-only-sourced ARS must not be republished with a fresh timestamp"
+        );
+    }
+
+    #[test]
+    fn republished_contributors_omits_a_provider_whose_currencies_were_all_dropped() {
+        // Nostr's only contribution is the ARS aggregate, which
+        // `republishable_rates` drops as Nostr-only — so the published body
+        // carries nothing from Nostr and the `source` tag must not claim it.
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Yadio, ProviderId::CoinGecko],
+                nostr_anchor_dependent: false,
+            },
+        );
+        aggregates.insert(
+            "ARS".to_string(),
+            AggregateResult {
+                value: 105_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Nostr],
+                nostr_anchor_dependent: false,
+            },
+        );
+
+        let rates = republishable_rates(&aggregates);
+        let contributors = republished_contributors(&aggregates, &rates);
+
+        assert_eq!(
+            contributors,
+            vec![ProviderId::Yadio, ProviderId::CoinGecko]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "only the providers behind the surviving USD rate belong in the tag"
+        );
+        assert!(
+            !sources_to_tag(&contributors).contains("nostr"),
+            "the `source` tag must not name a provider absent from the body"
+        );
+    }
+
+    #[test]
+    fn republishable_rates_keeps_a_currency_nostr_only_partly_helped_with() {
+        // Nostr alongside another contributor (e.g. it filled in after a
+        // fallback scenario in a prior tick, or n>=2 combine) is not
+        // "Nostr-only" — still safe to republish since it wasn't the sole
+        // source.
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "EUR".to_string(),
+            AggregateResult {
+                value: 45_000.0,
+                sources: 2,
+                contributors: vec![ProviderId::Nostr, ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert_eq!(out.get("EUR"), Some(&45_000.0));
+    }
+
+    #[test]
+    fn republishable_rates_drops_nostr_anchor_dependent_cross() {
+        // El Toque CUP resolved via Nostr USD: contributors name only
+        // eltoque, but the absolute value embeds a relayed rate — must not
+        // be re-stamped as a fresh local observation (ermeme, PR #841).
+        let mut aggregates = HashMap::new();
+        aggregates.insert(
+            "CUP".to_string(),
+            AggregateResult {
+                value: 20_000_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::ElToque],
+                nostr_anchor_dependent: true,
+            },
+        );
+        aggregates.insert(
+            "EUR".to_string(),
+            AggregateResult {
+                value: 45_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        );
+
+        let out = republishable_rates(&aggregates);
+        assert!(
+            !out.contains_key("CUP"),
+            "Nostr-anchor-dependent CUP must not be republished"
+        );
+        assert_eq!(out.get("EUR"), Some(&45_000.0));
     }
 
     #[tokio::test]
@@ -1258,6 +1759,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         // 1_000_000s ago: well past any plausible TTL.
@@ -1285,6 +1787,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         let fresh_now = Utc::now().timestamp();
@@ -1320,6 +1823,7 @@ mod tests {
                 value: 50_000.0,
                 sources: 1,
                 contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
             },
         );
         let now = Utc::now().timestamp();
@@ -1367,6 +1871,7 @@ mod tests {
                     value: v,
                     sources: 1,
                     contributors: vec![ProviderId::Yadio],
+                    nostr_anchor_dependent: false,
                 },
             );
             agg
@@ -1389,5 +1894,243 @@ mod tests {
             manager.get_price("EUR"),
             Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
         ));
+    }
+}
+
+// Coverage-focused additions: global install, timeout arm, scoping edge
+// cases, warn-flag plumbing, and the Nostr publish path.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::price::provider::{ProviderQuotes, Quote};
+    use async_trait::async_trait;
+
+    /// A provider whose fetch never resolves — drives `update_all`'s
+    /// timeout arm under a paused tokio clock.
+    struct HangingProvider;
+
+    #[async_trait]
+    impl PriceProvider for HangingProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::Yadio
+        }
+        async fn fetch(&self, _http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    fn bare_manager(settings: PriceSettings, providers: Vec<EnabledProvider>) -> PriceManager {
+        PriceManager {
+            providers,
+            store: Arc::new(PriceStore::new()),
+            settings,
+            http: reqwest::Client::new(),
+            warned_stale: RwLock::new(HashSet::new()),
+            warned_refused: RwLock::new(HashSet::new()),
+            warned_single_source: RwLock::new(HashSet::new()),
+        }
+    }
+
+    fn quotes(pairs: &[(&str, f64)]) -> ProviderQuotes {
+        pairs
+            .iter()
+            .map(|(c, v)| (c.to_string(), Quote::PerBtc(*v)))
+            .collect()
+    }
+
+    #[test]
+    fn install_error_display_and_traits() {
+        let err = InstallError::AlreadyInstalled;
+        assert_eq!(err.to_string(), "PriceManager already installed");
+        // It is a std::error::Error.
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn settings_accessor_returns_active_settings() {
+        let settings = PriceSettings {
+            update_interval_seconds: 123,
+            ..PriceSettings::default()
+        };
+        let manager = bare_manager(settings, Vec::new());
+        assert_eq!(manager.settings().update_interval_seconds, 123);
+    }
+
+    /// The one deliberate global installation in the whole test binary: an
+    /// empty-provider manager with a sub-minimum interval, so the scheduler
+    /// smoke test exercises its interval clamp without any provider HTTP.
+    /// Every other test drives managers through `&self`, never the global.
+    #[tokio::test]
+    async fn install_global_accepts_once_then_refuses() {
+        let manager = PriceManager::from_settings(PriceSettings {
+            update_interval_seconds: 30,
+            providers: HashMap::new(),
+            ..PriceSettings::default()
+        })
+        .expect("empty provider set builds");
+        // First install wins (or another test's identical install did).
+        let _ = manager.install_global();
+        assert!(PriceManager::global().is_some());
+
+        let second = PriceManager::from_settings(PriceSettings {
+            update_interval_seconds: 30,
+            providers: HashMap::new(),
+            ..PriceSettings::default()
+        })
+        .expect("empty provider set builds");
+        assert_eq!(second.install_global(), Err(InstallError::AlreadyInstalled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_all_times_out_hung_provider_and_records_failure() {
+        let mut settings = PriceSettings {
+            publish_to_nostr: false,
+            provider_timeout_seconds: 1,
+            ..PriceSettings::default()
+        };
+        settings.providers.insert(
+            ProviderId::Yadio.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: "http://test".into(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec![],
+            },
+        );
+        let manager = bare_manager(
+            settings,
+            vec![EnabledProvider {
+                id: ProviderId::Yadio,
+                provider: Box::new(HangingProvider),
+                health: Mutex::new(ProviderHealth::new()),
+            }],
+        );
+
+        let report = manager.update_all().await;
+        assert!(report.successes.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].1, "timeout");
+    }
+
+    #[test]
+    fn poll_budget_defaults_to_single_attempt_for_unknown_provider() {
+        // No config entry for the id: one attempt plus one second of slack.
+        let manager = bare_manager(
+            PriceSettings {
+                provider_timeout_seconds: 4,
+                ..PriceSettings::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            manager.poll_budget(ProviderId::CoinGecko),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn scope_quotes_passes_through_without_config_entry() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        let q = quotes(&[("USD", 50_000.0)]);
+        let scoped = manager.scope_quotes(ProviderId::Blockchain, q.clone());
+        assert_eq!(scoped.len(), q.len());
+    }
+
+    #[test]
+    fn observe_freshness_ignores_unknown_currency() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        // No store entry: must be a silent no-op.
+        manager.observe_freshness("ZZZ", "ZZZ", Utc::now().timestamp());
+    }
+
+    #[test]
+    fn mark_warned_treats_poisoned_lock_as_already_warned() {
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        // Poison the warned_stale lock by panicking while holding it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.warned_stale.write().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(
+            !manager.mark_warned(&manager.warned_stale, "USD"),
+            "poisoned lock must read as already-warned (stay quiet)"
+        );
+        // clear_warned on the poisoned lock is a silent no-op.
+        manager.clear_warned(&manager.warned_stale, "USD");
+    }
+
+    #[tokio::test]
+    async fn publish_rates_to_nostr_is_best_effort_without_relays() {
+        // Publishing must never fail the tick: with keys derivable from the
+        // global test settings and no reachable Nostr client/relays, every
+        // failure is swallowed and logged.
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let manager = bare_manager(PriceSettings::default(), Vec::new());
+        let mut aggregates: HashMap<String, AggregateResult> = HashMap::new();
+        aggregates.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        );
+        manager.publish_rates_to_nostr(&aggregates).await;
+    }
+
+    #[tokio::test]
+    async fn update_all_with_publish_flag_runs_publish_path() {
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let mut settings = PriceSettings {
+            publish_to_nostr: true,
+            provider_timeout_seconds: 5,
+            ..PriceSettings::default()
+        };
+        settings.providers.insert(
+            ProviderId::Yadio.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: "http://test".into(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec![],
+            },
+        );
+
+        struct OneShot;
+        #[async_trait]
+        impl PriceProvider for OneShot {
+            fn id(&self) -> ProviderId {
+                ProviderId::Yadio
+            }
+            async fn fetch(
+                &self,
+                _http: &reqwest::Client,
+            ) -> Result<ProviderQuotes, ProviderError> {
+                Ok([("USD".to_string(), Quote::PerBtc(50_000.0))]
+                    .into_iter()
+                    .collect())
+            }
+        }
+
+        let manager = bare_manager(
+            settings,
+            vec![EnabledProvider {
+                id: ProviderId::Yadio,
+                provider: Box::new(OneShot),
+                health: Mutex::new(ProviderHealth::new()),
+            }],
+        );
+        let report = manager.update_all().await;
+        assert_eq!(report.fresh_currencies, 1);
+        assert_eq!(report.contributors, vec![ProviderId::Yadio]);
     }
 }

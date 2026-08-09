@@ -31,6 +31,7 @@
 - Run `cargo test` locally after schema or query changes.
 
 ## Commit & Pull Request Guidelines
+- **Write in English.** Commit messages, PR titles and bodies, issue and review comments, documentation, and code comments are all English, regardless of the language a contributor or maintainer is speaking in elsewhere. Mostro has contributors who do not read Spanish, and a repository that mixes languages is one they cannot review.
 - Base work on `main`; keep topics scoped.
 - Commit subject: imperative, ≤50 chars; sign with `git commit -S`.
 - Squash fixups before review.

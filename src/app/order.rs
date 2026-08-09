@@ -391,6 +391,227 @@ mod tests {
         let _ = order_action(&ctx, msg3, &event2, &keys).await;
     }
 
+    mod calculate_and_check_quote_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use crate::bitcoin_price::BitcoinPriceManager;
+        use std::sync::Arc;
+
+        async fn create_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        fn order_with(amount: i64, fiat_code: &str) -> SmallOrder {
+            SmallOrder {
+                amount,
+                fiat_code: fiat_code.to_string(),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn fixed_amount_inside_limits_is_accepted() {
+            let ctx = create_ctx().await;
+            let order = order_with(50_000, "USD");
+            assert!(calculate_and_check_quote(&ctx, &order, &100).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn fixed_amount_below_min_is_out_of_range() {
+            let ctx = create_ctx().await;
+            // min_payment_amount is 100 sats in test settings.
+            let order = order_with(10, "USD");
+            let err = calculate_and_check_quote(&ctx, &order, &100)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MostroCantDo(CantDoReason::OutOfRangeSatsAmount)
+            ));
+        }
+
+        #[tokio::test]
+        async fn negative_amount_is_invalid() {
+            let ctx = create_ctx().await;
+            let order = order_with(-5, "USD");
+            let err = calculate_and_check_quote(&ctx, &order, &100)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MostroCantDo(CantDoReason::InvalidAmount)));
+        }
+
+        #[tokio::test]
+        async fn market_priced_order_uses_cached_price() {
+            let ctx = create_ctx().await;
+            // Unique currency code avoids clobbering the shared override map.
+            BitcoinPriceManager::set_price_for_test("QUOTE1", 50_000.0);
+            let order = order_with(0, "QUOTE1");
+            // 100 / 50_000 * 1e8 = 200_000 sats → inside [100, 1_000_000].
+            assert!(calculate_and_check_quote(&ctx, &order, &100).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn market_priced_order_without_price_data_fails() {
+            let ctx = create_ctx().await;
+            // No override and no global PriceManager → NoAPIResponse.
+            let order = order_with(0, "QUOTE2");
+            let err = calculate_and_check_quote(&ctx, &order, &100)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MostroInternalErr(ServiceError::NoAPIResponse)
+            ));
+        }
+
+        #[tokio::test]
+        async fn market_priced_order_above_max_is_out_of_range() {
+            let ctx = create_ctx().await;
+            BitcoinPriceManager::set_price_for_test("QUOTE3", 1.0);
+            // 100 / 1.0 * 1e8 = 10_000_000_000 sats → above max_order_amount.
+            let order = order_with(0, "QUOTE3");
+            let err = calculate_and_check_quote(&ctx, &order, &100)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MostroCantDo(CantDoReason::OutOfRangeSatsAmount)
+            ));
+        }
+    }
+
+    mod order_action_flow_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use std::sync::Arc;
+
+        async fn create_migrated_ctx() -> AppContext {
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build()
+        }
+
+        fn init_globals() {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+        }
+
+        fn order_message(fiat_code: &str, trade_index: Option<i64>) -> Message {
+            let order = SmallOrder {
+                kind: Some(mostro_core::order::Kind::Sell),
+                amount: 1_000,
+                fiat_code: fiat_code.to_string(),
+                fiat_amount: 100,
+                payment_method: "SEPA".to_string(),
+                ..Default::default()
+            };
+            Message::new_order(
+                None,
+                Some(1),
+                trade_index,
+                Action::NewOrder,
+                Some(Payload::Order(order)),
+            )
+        }
+
+        #[tokio::test]
+        async fn unsupported_fiat_currency_is_rejected() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            let keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            let msg = order_message("XXX", Some(1));
+            let err = order_action(&ctx, msg, &event, &keys).await.unwrap_err();
+            assert!(
+                matches!(err, MostroCantDo(_)),
+                "unsupported currency must be a CantDo: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_trade_index_with_distinct_identity_is_invalid_payload() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            let keys = create_test_keys();
+            // identity != sender and no trade_index → InvalidPayload.
+            let event = create_test_unwrapped_message();
+
+            let msg = order_message("USD", None);
+            let err = order_action(&ctx, msg, &event, &keys).await.unwrap_err();
+            assert!(matches!(
+                err,
+                MostroInternalErr(ServiceError::InvalidPayload)
+            ));
+        }
+
+        #[tokio::test]
+        async fn valid_order_reaches_publication_and_persists_row() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            let keys = create_test_keys();
+            // Full-privacy shape: identity == sender → trade_index defaults to 0.
+            let mut event = create_test_unwrapped_message();
+            event.identity = event.sender;
+
+            let msg = order_message("USD", None);
+            let result = order_action(&ctx, msg, &event, &keys).await;
+            // The offline Nostr client cannot broadcast, so the pipeline ends
+            // with a NostrError — but only AFTER the order row was persisted.
+            assert!(
+                matches!(result, Err(MostroInternalErr(ServiceError::NostrError(_)))),
+                "expected broadcast failure at the very end: {result:?}"
+            );
+
+            let row: (String, String) =
+                sqlx::query_as("SELECT status, event_id FROM orders LIMIT 1")
+                    .fetch_one(ctx.pool())
+                    .await
+                    .expect("order row must be persisted");
+            assert_eq!(row.0, "pending");
+            assert!(!row.1.is_empty(), "event_id must be recorded");
+        }
+
+        #[tokio::test]
+        async fn valid_order_with_trade_index_updates_user_index() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            let keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            // A registered identity (check_trade_index would have created it
+            // on first contact) keeps the tags path on the known-user branch.
+            crate::db::add_new_user(
+                ctx.pool(),
+                mostro_core::user::User {
+                    pubkey: event.identity.to_string(),
+                    last_trade_index: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert identity user");
+
+            let msg = order_message("USD", Some(7));
+            let result = order_action(&ctx, msg, &event, &keys).await;
+            assert!(
+                matches!(result, Err(MostroInternalErr(ServiceError::NostrError(_)))),
+                "expected broadcast failure at the very end: {result:?}"
+            );
+        }
+    }
+
     mod quote_calculation_tests {
 
         #[test]

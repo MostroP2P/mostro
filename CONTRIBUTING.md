@@ -21,6 +21,8 @@ All Mostro contributors submit changes via pull requests. The workflow is as fol
 
 Pull requests should be focused on a single change. Do not mix, for example, refactorings with a bug fix or implementation of a new feature. This practice makes it easier for fellow contributors to review each pull request.
 
+Contributions are written in **English** — commit messages, pull request titles and bodies, issue and review comments, documentation, and code comments. Discussion in other languages is welcome on Telegram, but anything that lands in the repository should be readable by every contributor.
+
 ### Protocol / Tag Changes
 
 Changes that affect Nostr event tags (e.g. `y` tags, `z` tags) or event kinds are **protocol changes** and deserve extra care:

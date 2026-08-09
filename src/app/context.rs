@@ -6,6 +6,7 @@
 //!
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
+use crate::cashu::CashuClient;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
 use nostr_sdk::{Client, Keys, PublicKey};
@@ -38,10 +39,18 @@ pub struct AppContext {
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
     keys: Keys,
+    /// Connected Cashu mint client (docs/cashu/, CF-5). `Some` only in Cashu
+    /// mode, where `main.rs` connects the configured mint at boot and attaches
+    /// it here; `None` in the default Lightning mode. Track A's lock handler
+    /// reads it through [`AppContext::cashu_client`].
+    cashu_client: Option<Arc<CashuClient>>,
 }
 
 impl AppContext {
     /// Create a new application context.
+    ///
+    /// The Cashu client defaults to `None` (Lightning mode). Cashu-mode boot
+    /// attaches a connected client with [`AppContext::with_cashu_client`].
     pub fn new(
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Client,
@@ -55,7 +64,16 @@ impl AppContext {
             settings,
             order_msg_queue,
             keys,
+            cashu_client: None,
         }
+    }
+
+    /// Attach a connected Cashu mint client (Cashu mode, CF-5). Returns a new
+    /// context; the Lightning path never calls this, so `cashu_client()` stays
+    /// `None` there.
+    pub fn with_cashu_client(mut self, cashu_client: Arc<CashuClient>) -> Self {
+        self.cashu_client = Some(cashu_client);
+        self
     }
 
     /// Database connection pool.
@@ -89,6 +107,15 @@ impl AppContext {
     /// Use this instead of `get_keys()` to avoid re-parsing on every call.
     pub fn keys(&self) -> &Keys {
         &self.keys
+    }
+
+    /// The connected Cashu mint client, if this node runs in Cashu mode.
+    ///
+    /// `Some` only when `[cashu] enabled = true` and the mint connected at
+    /// boot (CF-5); `None` in Lightning mode. Track A's `add_cashu_escrow`
+    /// handler uses it to validate the seller's escrow token against the mint.
+    pub fn cashu_client(&self) -> Option<&Arc<CashuClient>> {
+        self.cashu_client.as_ref()
     }
 }
 
@@ -303,6 +330,63 @@ mod tests {
 
         let queue = mock_order_queue.expect("mock queue should be present");
         assert!(Arc::ptr_eq(&queue.queue(), ctx.order_msg_queue()));
+    }
+
+    #[tokio::test]
+    async fn context_accessors_expose_injected_dependencies() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+        let keys = nostr_sdk::Keys::generate();
+        let client = nostr_sdk::Client::default();
+
+        let ctx = TestContextBuilder::new()
+            .with_pool(pool.clone())
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(keys.clone())
+            .build();
+
+        // pool() and pool_arc() must expose the same injected pool.
+        assert!(Arc::ptr_eq(&ctx.pool_arc(), &pool));
+        assert!(std::ptr::eq(ctx.pool(), pool.as_ref()));
+
+        // keys() must return the injected keys instead of parsing settings.
+        assert_eq!(ctx.keys().public_key(), keys.public_key());
+
+        // nostr_client() returns the injected client (no relays configured).
+        assert!(ctx.nostr_client().relays().await.is_empty());
+
+        // settings() exposes the injected settings.
+        assert_eq!(ctx.settings().database.url, "sqlite::memory:");
+    }
+
+    #[tokio::test]
+    async fn default_builders_and_mock_queue_helpers_work() {
+        let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+
+        // Default impls delegate to new().
+        let mock: super::test_utils::MockOrderMsgQueue = Default::default();
+        let builder: super::test_utils::TestContextBuilder = Default::default();
+
+        let ctx = builder
+            .with_pool(pool)
+            .with_settings(test_settings())
+            .with_mock_order_msg_queue(mock.clone())
+            .build();
+
+        // Fresh queue starts empty.
+        assert!(mock.is_empty().await);
+        assert_eq!(mock.len().await, 0);
+
+        // Push through the context handle, observe through the mock handle.
+        let msg = mostro_core::prelude::Message::new_restore(None);
+        let key = nostr_sdk::Keys::generate().public_key();
+        ctx.order_msg_queue().write().await.push((msg, key));
+        assert_eq!(mock.len().await, 1);
+        assert!(!mock.is_empty().await);
+
+        // clear() drains it again.
+        mock.clear().await;
+        assert!(mock.is_empty().await);
     }
 
     #[tokio::test]

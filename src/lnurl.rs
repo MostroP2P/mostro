@@ -351,7 +351,9 @@ pub async fn resolv_ln_address(
 ) -> Result<String, MostroError> {
     let url = extract_lnurl(address).await?;
     let url = Url::parse(&url).map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
-    let amount_msat = amount * 1000;
+    let amount_msat = amount
+        .checked_mul(1000)
+        .ok_or(MostroInternalErr(ServiceError::WrongAmountError))?;
 
     let res = lnurl_get(url).await?;
     if !res.status().is_success() {

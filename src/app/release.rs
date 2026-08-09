@@ -553,9 +553,12 @@ pub async fn do_payment(
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
-    if let Err(paymement_result) = payment_task.await {
-        warn!("Error during ln payment : {}", paymement_result);
+    if let Err(payment_result) = payment_task.await {
+        warn!("Error during ln payment : {}", payment_result);
         check_failure_retries_or_log(ctx, &order, request_id).await;
+        // Do not spawn the status watcher or report Ok: nothing was submitted
+        // to LND (or the attempt aborted before a usable status stream).
+        return Err(payment_result);
     }
 
     // Get Mostro keys from context

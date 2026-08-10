@@ -145,6 +145,7 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         hold_invoice_expiration_window: 300,
         payment_attempts: 3,
         payment_retries_interval: 60,
+        max_final_cltv_expiry_delta: 432,
     })
 }
 

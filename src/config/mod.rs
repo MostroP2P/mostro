@@ -202,6 +202,12 @@ mod tests {
         );
         assert_eq!(lightning_settings.lightning.payment_attempts, 3);
         assert_eq!(lightning_settings.lightning.payment_retries_interval, 60);
+        // Absent from this TOML: an existing operator config keeps working and
+        // picks up the bound from the serde default.
+        assert_eq!(
+            lightning_settings.lightning.max_final_cltv_expiry_delta,
+            432
+        );
     }
 
     #[test]

@@ -55,7 +55,9 @@ pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroErro
 /// # Notes
 ///
 /// This function performs a network request to validate the address, so it may
-/// fail due to network issues even if the address format is correct.
+/// fail due to network issues even if the address format is correct. The fetch
+/// goes through [`crate::lnurl::ln_exists`] / LNURL host policy (no private or
+/// link-local destinations in production, DNS pin, short timeouts).
 async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroError> {
     if ln_exists(payment_request).await.is_err() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
@@ -178,6 +180,8 @@ async fn validate_bolt11_invoice(
 ///
 /// This function is typically used to validate buyer invoices in trading contexts
 /// where the exact payment format may vary depending on user preference.
+/// Lightning Address / LNURL existence checks use the shared LNURL host policy
+/// in `src/lnurl.rs` (SSRF bounds, DNS pin, timeouts).
 pub async fn is_valid_invoice(
     payment_request: String,
     amount: Option<u64>,

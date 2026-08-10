@@ -1,3 +1,18 @@
+//! LNURL-pay and Lightning Address resolution for Mostro.
+//!
+//! Every outbound LNURL HTTP fetch goes through [`lnurl_get`], which:
+//! - allows only `http`/`https` (and rejects userinfo)
+//! - resolves DNS under a short timeout and rejects forbidden destinations
+//!   (loopback/private unless the test-only allow flag is set, plus link-local,
+//!   CGNAT `100.64.0.0/10`, NAT64 `64:ff9b::/96`, multicast, etc.)
+//! - pins the request to a checked [`SocketAddr`] (no DNS rebinding) and
+//!   disables redirects
+//! - bounds connect and request duration so a hanging host cannot stall the
+//!   serial message loop for long
+//!
+//! Callers (`ln_exists`, `resolv_ln_address`) map LNURL-level `ERROR` / missing
+//! `payRequest` / empty `pr` to `Err` rather than soft empty success.
+
 use lnurl::lnurl::LnUrl;
 use mostro_core::prelude::*;
 use reqwest::redirect::Policy;
@@ -148,9 +163,9 @@ fn ip_is_forbidden(ip: IpAddr) -> bool {
 
 /// Resolve `url`'s host and reject non-public destinations before any GET.
 ///
-/// Returns one checked [`SocketAddr`] suitable for reqwest's `.resolve` pin
-/// so the subsequent request cannot be steered to a different IP via DNS
-/// rebinding.
+/// DNS lookup is bounded by [`LNURL_DNS_TIMEOUT`]. Returns one checked
+/// [`SocketAddr`] suitable for reqwest's `.resolve` pin so the subsequent
+/// request cannot be steered to a different IP via DNS rebinding.
 async fn assert_url_host_safe(url: &Url) -> Result<SocketAddr, MostroError> {
     if !crate::util::is_http_or_https(url) {
         return Err(MostroInternalErr(ServiceError::LnAddressParseError));
@@ -197,6 +212,10 @@ async fn assert_url_host_safe(url: &Url) -> Result<SocketAddr, MostroError> {
 }
 
 /// GET an LNURL URL after host policy checks, with DNS pin and no redirects.
+///
+/// Applies [`LNURL_CONNECT_TIMEOUT`] and [`LNURL_REQUEST_TIMEOUT`]. Callers
+/// must only pass URLs produced by [`extract_lnurl`] or [`build_callback_url`]
+/// (scheme already constrained to http/https).
 async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
     let pinned = assert_url_host_safe(&url).await?;
     let host = url
@@ -220,21 +239,18 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
-/// Extracts the LNURL from a given address.
-/// The address can be in the form of a Lightning Address (user@domain.com format)
-/// or a LNURL (lnurl1... format).
-/// If the address is a Lightning Address, it is resolved to the corresponding LNURL.
-/// If the address is already a LNURL, it is returned as is.
-/// # Arguments
-/// * `address` - The address to extract the LNURL from
-/// # Returns
-/// * `Ok(String)` - The extracted LNURL
-/// * `Err(MostroError)` - If the address is invalid or cannot be resolved
+/// Parse a Lightning Address or bech32 LNURL into an http(s) [`Url`].
 ///
-/// Validates the scheme is `http`/`https` before returning: a bech32-decoded
-/// LNURL is attacker-controlled input, and every caller of this function
-/// (`ln_exists`, `resolv_ln_address`) does a GET against the result after
-/// host/IP policy checks in [`lnurl_get`].
+/// - Lightning Address (`user@domain`) → well-known LNURL-pay endpoint URL
+/// - Bech32 LNURL (`lnurl1…`) → decoded callback/pay URL
+///
+/// Returns a parsed [`Url`] (not a raw string) so callers can pass it straight
+/// to [`lnurl_get`] without a second parse. Scheme must be `http`/`https`;
+/// host/IP safety is enforced later by [`lnurl_get`].
+///
+/// # Errors
+///
+/// * `LnAddressParseError` — malformed address, bad bech32, or non-http(s) scheme
 async fn extract_lnurl(address: &str) -> Result<Url, MostroError> {
     let url = if address.to_lowercase().starts_with("lnurl") {
         let lnurl = LnUrl::decode(address.to_string())
@@ -261,6 +277,11 @@ async fn extract_lnurl(address: &str) -> Result<Url, MostroError> {
     Ok(parsed)
 }
 
+/// Probe whether a Lightning Address or LNURL-pay endpoint advertises
+/// `tag: payRequest`.
+///
+/// Uses [`lnurl_get`] (host policy, DNS pin, timeouts, no redirects). Does not
+/// request an invoice — only the LNURL-pay metadata document.
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let url = extract_lnurl(address).await?;
     let res = lnurl_get(url).await?;
@@ -340,9 +361,15 @@ fn build_callback_url(
 /// it (`commentAllowed > 0`); otherwise it's silently dropped, matching the
 /// pre-LUD-12 behavior.
 ///
+/// Both the initial LNURL-pay document and the callback fetch go through
+/// [`lnurl_get`] (SSRF host policy, DNS pin, timeouts, no redirects). The
+/// callback URL is rebuilt with [`build_callback_url`] so `amount`/`comment`
+/// are proper query params.
+///
 /// Permanent LNURL-level failures (`status: ERROR`, missing `payRequest`,
 /// amount out of range, empty `pr`) return `Err` so callers do not treat
-/// them as soft empty invoices.
+/// them as soft empty invoices. Callers that pay the returned `pr` (e.g.
+/// `do_payment`) should still decode it as BOLT11 before submitting to LND.
 pub async fn resolv_ln_address(
     address: &str,
     amount: u64,

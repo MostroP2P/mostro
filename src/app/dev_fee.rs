@@ -890,11 +890,13 @@ fn dev_fee_comment(order_id: &uuid::Uuid, node: &PublicKey) -> String {
 
 /// Resolve a dev fee LNURL invoice for the given order.
 ///
-/// Contacts the dev fee lightning address, obtains a fresh invoice,
-/// decodes it, and returns the payment request and payment hash.
+/// Contacts the dev fee lightning address via [`resolv_ln_address`] (shared
+/// LNURL host policy, DNS pin, and per-request timeouts in `src/lnurl.rs`),
+/// obtains a fresh invoice, decodes it, and returns the payment request and
+/// payment hash.
 ///
 /// # Timeouts
-/// - LNURL resolution: 15 seconds
+/// - Outer LNURL resolution budget: 15 seconds (inner GETs are shorter)
 pub async fn resolve_dev_fee_invoice(
     order: &Order,
     keys: &Keys,

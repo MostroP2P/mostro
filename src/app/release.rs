@@ -498,6 +498,15 @@ async fn handle_child_order(
     Ok(())
 }
 
+/// Pay the buyer invoice for a settled-hold-invoice order.
+///
+/// Lightning Addresses are resolved via [`resolv_ln_address`] under the LNURL
+/// host policy. A non-empty `pr` must decode as BOLT11 before LND submission;
+/// resolve/decode failures and `send_payment` RPC errors go through
+/// [`check_failure_retries_or_log`] and return `Err` (no empty status-watcher
+/// spawn). Streamed `PaymentStatus::Failed` updates also bump retry
+/// bookkeeping. Callers such as `release_action` typically ignore the error
+/// after hold settlement — retries are driven by the failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
     mut order: Order,

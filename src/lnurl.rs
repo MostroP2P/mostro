@@ -235,7 +235,7 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
 /// LNURL is attacker-controlled input, and every caller of this function
 /// (`ln_exists`, `resolv_ln_address`) does a GET against the result after
 /// host/IP policy checks in [`lnurl_get`].
-async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
+async fn extract_lnurl(address: &str) -> Result<Url, MostroError> {
     let url = if address.to_lowercase().starts_with("lnurl") {
         let lnurl = LnUrl::decode(address.to_string())
             .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
@@ -258,7 +258,7 @@ async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
     if !crate::util::is_http_or_https(&parsed) {
         return Err(MostroInternalErr(ServiceError::LnAddressParseError));
     }
-    Ok(url)
+    Ok(parsed)
 }
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
@@ -481,7 +481,7 @@ mod tests {
         assert!(encoded.to_lowercase().starts_with("lnurl1"));
 
         let extracted = extract_lnurl(&encoded).await.expect("valid LNURL decodes");
-        assert_eq!(extracted, url);
+        assert_eq!(extracted.to_string(), url);
     }
 
     #[tokio::test]
@@ -503,7 +503,10 @@ mod tests {
         let extracted = extract_lnurl("alice@127.0.0.1")
             .await
             .expect("lightning address parses");
-        assert_eq!(extracted, "http://127.0.0.1:8080/.well-known/lnurlp/alice");
+        assert_eq!(
+            extracted.to_string(),
+            "http://127.0.0.1:8080/.well-known/lnurlp/alice"
+        );
     }
 
     #[tokio::test]

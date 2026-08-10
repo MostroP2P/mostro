@@ -36,6 +36,18 @@ fn node_currency() -> Option<Currency> {
         .and_then(|network| currency_for_network(network))
 }
 
+/// Whether a node on `expected_currency` is able to pay `invoice`. `None` means
+/// the node's chain is unknown, in which case the check is skipped.
+fn invoice_currency_is_payable(
+    invoice: &Bolt11Invoice,
+    expected_currency: Option<Currency>,
+) -> bool {
+    match expected_currency {
+        Some(expected_currency) => invoice.currency() == expected_currency,
+        None => true,
+    }
+}
+
 /// Decodes a BOLT11 Lightning invoice from its string representation.
 ///
 /// This function parses a Lightning Network payment request string and returns
@@ -139,10 +151,8 @@ async fn validate_bolt11_invoice(
     // Reject invoices issued for another chain. LND cannot pay them, and
     // without this check the failure only surfaces at payout time — after the
     // seller's hold invoice has already been settled.
-    if let Some(expected_currency) = node_currency() {
-        if invoice.currency() != expected_currency {
-            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-        }
+    if !invoice_currency_is_payable(&invoice, node_currency()) {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
 
     // Bound the payee-chosen final CLTV delta: a large value lets the payee
@@ -316,7 +326,7 @@ mod tests {
     /// currency it resolves to. `LN_STATUS` is a process-wide `OnceLock` that
     /// other tests also seed, so the installed value may not be ours — read
     /// back whatever won.
-    fn init_ln_status_test() -> Currency {
+    fn init_ln_status_test() -> Option<Currency> {
         let _ = LN_STATUS.set(crate::lightning::LnStatus {
             version: "test".to_string(),
             node_pubkey: "00".repeat(32),
@@ -326,7 +336,17 @@ mod tests {
             networks: vec!["mainnet".to_string()],
             uris: vec![],
         });
-        node_currency().expect("test LN status must map to a known currency")
+        // Setting first means the global is initialised from here on, so every
+        // later read in this process returns the same value. It may still be
+        // `None`: other modules install stubs with no networks, in which case
+        // the network check is inactive for the whole run.
+        node_currency()
+    }
+
+    /// A currency that passes the network check whatever `LN_STATUS` ended up
+    /// holding.
+    fn payable_currency() -> Currency {
+        init_ln_status_test().unwrap_or(Currency::Bitcoin)
     }
 
     /// A currency the node cannot pay, whichever chain it runs on.
@@ -343,7 +363,7 @@ mod tests {
         build_test_invoice_with(
             amount_msat,
             expiry_secs,
-            init_ln_status_test(),
+            payable_currency(),
             DEFAULT_TEST_CLTV_DELTA,
         )
     }
@@ -399,10 +419,42 @@ mod tests {
         assert_eq!(currency_for_network("testnet4"), None);
     }
 
+    /// The chain comparison itself, independent of the shared `LN_STATUS`.
+    #[test]
+    fn invoice_currency_is_payable_only_on_the_node_chain() {
+        let invoice = decode_invoice(&build_test_invoice_with(
+            Some(1_000_000),
+            86_400,
+            Currency::Bitcoin,
+            144,
+        ))
+        .expect("must decode");
+
+        assert!(invoice_currency_is_payable(
+            &invoice,
+            Some(Currency::Bitcoin)
+        ));
+        assert!(!invoice_currency_is_payable(
+            &invoice,
+            Some(Currency::BitcoinTestnet)
+        ));
+        assert!(!invoice_currency_is_payable(
+            &invoice,
+            Some(Currency::Regtest)
+        ));
+        // Unknown chain: skipped rather than rejected.
+        assert!(invoice_currency_is_payable(&invoice, None));
+    }
+
     #[tokio::test]
     async fn test_invoice_for_another_chain_is_rejected() {
         init_settings_test();
-        let node_currency = init_ln_status_test();
+        // With no mapped chain installed the check is inactive by design and
+        // there is nothing to assert end to end; the comparison itself is
+        // covered by `invoice_currency_is_payable_only_on_the_node_chain`.
+        let Some(node_currency) = init_ln_status_test() else {
+            return;
+        };
         let payment_request = build_test_invoice_with(
             Some(1_000_000),
             86_400,
@@ -420,8 +472,8 @@ mod tests {
     #[tokio::test]
     async fn test_invoice_for_the_node_chain_is_accepted() {
         init_settings_test();
-        let node_currency = init_ln_status_test();
-        let payment_request = build_test_invoice_with(Some(1_000_000), 86_400, node_currency, 144);
+        let payment_request =
+            build_test_invoice_with(Some(1_000_000), 86_400, payable_currency(), 144);
         let result = is_valid_invoice(payment_request, Some(1_000), None).await;
         assert!(
             result.is_ok(),
@@ -432,12 +484,11 @@ mod tests {
     #[tokio::test]
     async fn test_excessive_final_cltv_delta_is_rejected() {
         init_settings_test();
-        let node_currency = init_ln_status_test();
         // Read the effective bound so the test holds whichever settings won
         // the process-wide OnceLock race.
         let max_delta = Settings::get_ln().max_final_cltv_expiry_delta as u64;
         let payment_request =
-            build_test_invoice_with(Some(1_000_000), 86_400, node_currency, max_delta + 1);
+            build_test_invoice_with(Some(1_000_000), 86_400, payable_currency(), max_delta + 1);
         let result = is_valid_invoice(payment_request, Some(1_000), None).await;
         assert_eq!(
             result,
@@ -449,10 +500,9 @@ mod tests {
     #[tokio::test]
     async fn test_final_cltv_delta_at_the_bound_is_accepted() {
         init_settings_test();
-        let node_currency = init_ln_status_test();
         let max_delta = Settings::get_ln().max_final_cltv_expiry_delta as u64;
         let payment_request =
-            build_test_invoice_with(Some(1_000_000), 86_400, node_currency, max_delta);
+            build_test_invoice_with(Some(1_000_000), 86_400, payable_currency(), max_delta);
         let result = is_valid_invoice(payment_request, Some(1_000), None).await;
         assert!(
             result.is_ok(),

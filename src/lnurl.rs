@@ -263,7 +263,6 @@ async fn extract_lnurl(address: &str) -> Result<String, MostroError> {
 
 pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let url = extract_lnurl(address).await?;
-    let url = Url::parse(&url).map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
     let res = lnurl_get(url).await?;
     let status = res.status();
     if status.is_success() {
@@ -350,7 +349,6 @@ pub async fn resolv_ln_address(
     comment: Option<&str>,
 ) -> Result<String, MostroError> {
     let url = extract_lnurl(address).await?;
-    let url = Url::parse(&url).map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
     let amount_msat = amount
         .checked_mul(1000)
         .ok_or(MostroInternalErr(ServiceError::WrongAmountError))?;

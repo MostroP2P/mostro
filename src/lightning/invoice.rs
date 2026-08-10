@@ -48,6 +48,31 @@ fn invoice_currency_is_payable(
     }
 }
 
+/// Checks the properties that must hold for any invoice this node is about to
+/// pay, whatever its origin: it has to be on the node's own chain, and its
+/// final CLTV delta has to stay within the configured bound.
+///
+/// Kept apart from [`validate_bolt11_invoice`] because the amount and expiry
+/// rules there do not apply to invoices minted by an LNURL server: those are
+/// resolved at payment time and are routinely short-lived, so the
+/// `invoice_expiration_window` rule would reject legitimate payouts.
+pub fn validate_payout_invoice(invoice: &Bolt11Invoice) -> Result<(), MostroError> {
+    // LND cannot pay another chain's invoice. Rejecting here keeps the failure
+    // at validation time instead of mid-payout.
+    if !invoice_currency_is_payable(invoice, node_currency()) {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+    }
+
+    // Bound the payee-chosen final CLTV delta: a large value lets the payee
+    // hold the outgoing HTLC, and the routing liquidity behind it, for weeks.
+    if invoice.min_final_cltv_expiry_delta() > Settings::get_ln().max_final_cltv_expiry_delta as u64
+    {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+    }
+
+    Ok(())
+}
+
 /// Decodes a BOLT11 Lightning invoice from its string representation.
 ///
 /// This function parses a Lightning Network payment request string and returns
@@ -148,18 +173,9 @@ async fn validate_bolt11_invoice(
     let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
     let fee = fee.unwrap_or(0);
 
-    // Reject invoices issued for another chain. LND cannot pay them, and
-    // without this check the failure only surfaces at payout time — after the
-    // seller's hold invoice has already been settled.
-    if !invoice_currency_is_payable(&invoice, node_currency()) {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-    }
-
-    // Bound the payee-chosen final CLTV delta: a large value lets the payee
-    // hold the outgoing HTLC, and the routing liquidity behind it, for weeks.
-    if invoice.min_final_cltv_expiry_delta() > ln_settings.max_final_cltv_expiry_delta as u64 {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-    }
+    // Chain and final-CLTV rules, shared with the invoices an LNURL server
+    // hands us at payment time.
+    validate_payout_invoice(&invoice)?;
 
     // Validate amount if provided
     if let Some(amt) = amount {
@@ -417,6 +433,61 @@ mod tests {
         assert_eq!(currency_for_network("simnet"), Some(Currency::Simnet));
         // An unmapped name skips the check instead of blocking trading.
         assert_eq!(currency_for_network("testnet4"), None);
+    }
+
+    /// The reason `validate_payout_invoice` exists apart from
+    /// `validate_bolt11_invoice`: LNURL servers mint short-lived invoices, and
+    /// folding the expiry-window rule into the payout path would reject them.
+    #[tokio::test]
+    async fn validate_payout_invoice_ignores_the_expiry_window() {
+        init_settings_test();
+        let window = Settings::get_ln().invoice_expiration_window as u64;
+        let short_lived = build_test_invoice_with(Some(1_000_000), 60, payable_currency(), 144);
+
+        assert!(
+            validate_payout_invoice(&decode_invoice(&short_lived).expect("must decode")).is_ok(),
+            "a short-lived LNURL invoice must pass the payout checks"
+        );
+
+        if window > 60 {
+            assert_eq!(
+                is_valid_invoice(short_lived, None, None).await,
+                Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+                "the same invoice is rejected by the buyer-supplied path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_payout_invoice_rejects_excessive_final_cltv_delta() {
+        init_settings_test();
+        let max_delta = Settings::get_ln().max_final_cltv_expiry_delta as u64;
+        let invoice =
+            build_test_invoice_with(Some(1_000_000), 86_400, payable_currency(), max_delta + 1);
+        assert_eq!(
+            validate_payout_invoice(&decode_invoice(&invoice).expect("must decode")),
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_payout_invoice_rejects_another_chain() {
+        init_settings_test();
+        // Inactive without a mapped chain; see
+        // `invoice_currency_is_payable_only_on_the_node_chain`.
+        let Some(node_currency) = init_ln_status_test() else {
+            return;
+        };
+        let invoice = build_test_invoice_with(
+            Some(1_000_000),
+            86_400,
+            foreign_currency(node_currency),
+            144,
+        );
+        assert_eq!(
+            validate_payout_invoice(&decode_invoice(&invoice).expect("must decode")),
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+        );
     }
 
     /// The chain comparison itself, independent of the shared `LN_STATUS`.

@@ -2,6 +2,7 @@ use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
+use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -496,9 +497,14 @@ pub async fn do_payment(
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
     let payment_request = if let Ok(addr) = ln_addr {
-        resolv_ln_address(&addr.to_string(), amount, None)
+        let resolved = resolv_ln_address(&addr.to_string(), amount, None)
             .await
-            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?
+            .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
+        // The LNURL server picked this invoice, not the buyer, so it never went
+        // through `validate_invoice`. Apply the chain and final-CLTV rules
+        // before handing it to LND.
+        validate_payout_invoice(&decode_invoice(&resolved)?)?;
+        resolved
     } else {
         payment_request
     };

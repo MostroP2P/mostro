@@ -18,7 +18,26 @@ use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use tokio::sync::mpsc::channel;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Run [`check_failure_retries`] and surface bookkeeping failures instead of
+/// silently dropping them. On success, preserves the existing retry-count log.
+async fn check_failure_retries_or_log(ctx: &AppContext, order: &Order, request_id: Option<u64>) {
+    match check_failure_retries(ctx, order, request_id).await {
+        Ok(failed_payment) => {
+            info!(
+                "Order id {} has {} failed payments retries",
+                failed_payment.id, failed_payment.payment_attempts
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Order id {}: check_failure_retries failed: {:?}",
+                order.id, e
+            );
+        }
+    }
+}
 
 /// Check if order has failed payment retries
 pub async fn check_failure_retries(
@@ -480,6 +499,17 @@ async fn handle_child_order(
     Ok(())
 }
 
+/// Pay the buyer invoice for a settled-hold-invoice order.
+///
+/// Lightning Addresses **and** bech32 LNURLs are resolved via
+/// [`resolv_ln_address`] under the LNURL host policy. A non-empty `pr` must
+/// decode as BOLT11 and pass [`validate_payout_invoice`] (chain match, final
+/// CLTV bound, not already expired) before LND submission; resolve, decode and
+/// validation failures plus `send_payment` RPC errors go through
+/// [`check_failure_retries_or_log`] and return `Err` (no empty status-watcher
+/// spawn). Streamed `PaymentStatus::Failed` updates also bump retry
+/// bookkeeping. Callers such as `release_action` typically ignore the error
+/// after hold settlement — retries are driven by the failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
     mut order: Order,
@@ -508,30 +538,61 @@ pub async fn do_payment(
     };
 
     let payment_request = match payout_destination {
-        Some(destination) => {
-            let resolved = resolv_ln_address(&destination, amount, None)
-                .await
-                .map_err(|_| MostroInternalErr(ServiceError::LnAddressParseError))?;
-            // The LNURL server picked this invoice, not the buyer, so it never
-            // went through `validate_invoice`. Apply the payout rules before
-            // handing it to LND.
-            validate_payout_invoice(&decode_invoice(&resolved)?)?;
-            resolved
-        }
+        // Resolving a payout destination is a network round-trip to a host the
+        // buyer chose. When it yields no usable invoice — forbidden host (SSRF
+        // policy), unreachable, LNURL-level ERROR, malformed or unpayable `pr`
+        // — that is a payment failure and must go through the same bookkeeping
+        // as a failed `send_payment`. Returning early would leave
+        // `failed_payment = false` and hide the order from the retry job.
+        Some(destination) => match resolv_ln_address(&destination, amount, None).await {
+            Ok(pr) if !pr.is_empty() => match decode_invoice(&pr) {
+                // The LNURL server picked this invoice, not the buyer, so it
+                // never went through `validate_invoice`. Apply the payout rules
+                // before handing it to LND.
+                Ok(invoice) => match validate_payout_invoice(&invoice) {
+                    Ok(()) => pr,
+                    Err(e) => {
+                        warn!(
+                            "Order id {}: payout address returned unpayable invoice: {:?}",
+                            order.id, e
+                        );
+                        check_failure_retries_or_log(ctx, &order, request_id).await;
+                        return Err(e);
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Order id {}: payout address returned malformed invoice: {:?}",
+                        order.id, e
+                    );
+                    check_failure_retries_or_log(ctx, &order, request_id).await;
+                    return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+                }
+            },
+            outcome => {
+                match outcome {
+                    Err(e) => warn!(
+                        "Order id {}: could not resolve payout address: {:?}",
+                        order.id, e
+                    ),
+                    _ => warn!("Order id {}: payout address returned no invoice", order.id),
+                }
+                check_failure_retries_or_log(ctx, &order, request_id).await;
+                return Err(MostroInternalErr(ServiceError::LnAddressParseError));
+            }
+        },
         None => payment_request,
     };
     let mut ln_client_payment = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
-    if let Err(paymement_result) = payment_task.await {
-        info!("Error during ln payment : {}", paymement_result);
-        if let Ok(failed_payment) = check_failure_retries(ctx, &order, request_id).await {
-            info!(
-                "Order id {} has {} failed payments retries",
-                failed_payment.id, failed_payment.payment_attempts
-            );
-        }
+    if let Err(payment_result) = payment_task.await {
+        warn!("Error during ln payment : {}", payment_result);
+        check_failure_retries_or_log(ctx, &order, request_id).await;
+        // Do not spawn the status watcher or report Ok: nothing was submitted
+        // to LND (or the attempt aborted before a usable status stream).
+        return Err(payment_result);
     }
 
     // Get Mostro keys from context
@@ -565,20 +626,13 @@ pub async fn do_payment(
                             .await;
                         }
                         PaymentStatus::Failed => {
-                            info!(
+                            warn!(
                                 "Order Id {}: Invoice with hash: {} has failed!",
                                 order.id, msg.payment.payment_hash
                             );
 
                             // Mark payment as failed
-                            if let Ok(failed_payment) =
-                                check_failure_retries(&ctx, &order, request_id).await
-                            {
-                                info!(
-                                    "Order id {} has {} failed payments retries",
-                                    failed_payment.id, failed_payment.payment_attempts
-                                );
-                            }
+                            check_failure_retries_or_log(&ctx, &order, request_id).await;
                         }
                         _ => {}
                     }
@@ -1747,6 +1801,11 @@ mod tests {
     #[tokio::test]
     async fn do_payment_resolves_and_validates_an_encoded_lnurl() {
         init_global_config();
+        // The mock LNURL server binds on loopback, which the LNURL host policy
+        // forbids in production. Take the policy lock before flipping the flag
+        // so a concurrent test cannot observe private hosts as allowed.
+        let _policy_lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _allow_private = crate::lnurl::AllowPrivateLnurlHostsGuard::enable();
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let seller = Keys::generate().public_key();

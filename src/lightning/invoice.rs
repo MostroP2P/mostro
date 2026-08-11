@@ -49,8 +49,9 @@ fn invoice_currency_is_payable(
 }
 
 /// Checks the properties that must hold for any invoice this node is about to
-/// pay, whatever its origin: it has to be on the node's own chain, and its
-/// final CLTV delta has to stay within the configured bound.
+/// pay, whatever its origin: it has to be on the node's own chain, its final
+/// CLTV delta has to stay within the configured bound, and it must not have
+/// expired already.
 ///
 /// Kept apart from [`validate_bolt11_invoice`] because the amount and expiry
 /// rules there do not apply to invoices minted by an LNURL server: those are
@@ -67,6 +68,13 @@ pub fn validate_payout_invoice(invoice: &Bolt11Invoice) -> Result<(), MostroErro
     // hold the outgoing HTLC, and the routing liquidity behind it, for weeks.
     if invoice.min_final_cltv_expiry_delta() > Settings::get_ln().max_final_cltv_expiry_delta as u64
     {
+        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+    }
+
+    // An already-expired invoice cannot be paid. This is not the
+    // `invoice_expiration_window` rule, which demands remaining lifetime an
+    // LNURL-minted invoice has no reason to satisfy.
+    if invoice.is_expired() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
 
@@ -191,11 +199,6 @@ async fn validate_bolt11_invoice(
 
     // Check minimum payment amount
     if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
-        return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
-    }
-
-    // Check if invoice is expired
-    if invoice.is_expired() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
 
@@ -387,6 +390,32 @@ mod tests {
     /// Typical wallet value, well under any sane `max_final_cltv_expiry_delta`.
     const DEFAULT_TEST_CLTV_DELTA: u64 = 144;
 
+    /// An invoice on the node's own chain whose lifetime already elapsed:
+    /// issued an hour ago with a one-minute expiry.
+    fn build_expired_test_invoice() -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{InvoiceBuilder, PaymentSecret};
+        use std::time::{Duration, SystemTime};
+
+        let secp = Secp256k1::new();
+        let private_key = SecretKey::from_slice(&[0x42; 32]).expect("valid secret key");
+        let payment_hash = sha256::Hash::hash(&[0u8; 32]);
+        let issued_at = SystemTime::now() - Duration::from_secs(3_600);
+
+        InvoiceBuilder::new(payable_currency())
+            .description("mostro coverage test invoice".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([42u8; 32]))
+            .timestamp(issued_at)
+            .min_final_cltv_expiry_delta(DEFAULT_TEST_CLTV_DELTA)
+            .expiry_time(Duration::from_secs(60))
+            .amount_milli_satoshis(1_000_000)
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &private_key))
+            .expect("valid signed invoice")
+            .to_string()
+    }
+
     /// `build_test_invoice` with the two fields the network and final-CLTV
     /// checks read.
     fn build_test_invoice_with(
@@ -456,6 +485,33 @@ mod tests {
                 "the same invoice is rejected by the buyer-supplied path"
             );
         }
+    }
+
+    /// Already expired is rejected; merely short-lived is not. The two are
+    /// separate rules and only the first belongs in the payout path.
+    #[tokio::test]
+    async fn validate_payout_invoice_rejects_only_expired_invoices() {
+        init_settings_test();
+
+        let expired = decode_invoice(&build_expired_test_invoice()).expect("must decode");
+        assert!(expired.is_expired(), "fixture must be expired");
+        assert_eq!(
+            validate_payout_invoice(&expired),
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "an expired invoice can never be paid"
+        );
+
+        // 60s of remaining lifetime is below `invoice_expiration_window` but
+        // perfectly payable, so the payout path must accept it.
+        let short_lived = decode_invoice(&build_test_invoice_with(
+            Some(1_000_000),
+            60,
+            payable_currency(),
+            144,
+        ))
+        .expect("must decode");
+        assert!(!short_lived.is_expired());
+        assert!(validate_payout_invoice(&short_lived).is_ok());
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@
 
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;
-use crate::lightning::invoice::decode_invoice;
+use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{bytes_to_string, publish_dev_fee_audit_event};
@@ -947,6 +947,9 @@ pub async fn resolve_dev_fee_invoice(
     }
 
     let invoice = decode_invoice(&payment_request)?;
+    // Resolved by an LNURL server rather than validated on the way in, so apply
+    // the chain and final-CLTV rules here too.
+    validate_payout_invoice(&invoice)?;
     let payment_hash_hex = bytes_to_string(invoice.payment_hash().as_ref());
 
     info!(

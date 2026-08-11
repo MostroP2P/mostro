@@ -384,7 +384,7 @@ pub struct DatabaseSettings {
     pub url: String,
 }
 /// Lightning configuration settings
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LightningSettings {
     /// LND certificate file path
     pub lnd_cert_file: String,
@@ -402,6 +402,35 @@ pub struct LightningSettings {
     pub payment_attempts: u32,
     /// Payment retries interval in seconds
     pub payment_retries_interval: u32,
+    /// Upper bound, in blocks, on the `min_final_cltv_expiry_delta` of a
+    /// user-supplied payout invoice
+    #[serde(default = "default_max_final_cltv_expiry_delta")]
+    pub max_final_cltv_expiry_delta: u32,
+}
+
+/// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
+/// the usual range) and low enough that a payee holding the outgoing HTLC
+/// cannot pin routing liquidity for weeks.
+fn default_max_final_cltv_expiry_delta() -> u32 {
+    432
+}
+
+// Hand-written so `max_final_cltv_expiry_delta` defaults to the real bound
+// instead of `0`, which would reject every invoice.
+impl Default for LightningSettings {
+    fn default() -> Self {
+        Self {
+            lnd_cert_file: String::new(),
+            lnd_macaroon_file: String::new(),
+            lnd_grpc_host: String::new(),
+            invoice_expiration_window: 0,
+            hold_invoice_cltv_delta: 0,
+            hold_invoice_expiration_window: 0,
+            payment_attempts: 0,
+            payment_retries_interval: 0,
+            max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
+        }
+    }
 }
 /// Nostr configuration settings
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]

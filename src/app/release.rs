@@ -2,7 +2,7 @@ use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
-use crate::lightning::invoice::decode_invoice;
+use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
@@ -10,6 +10,7 @@ use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, upda
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
+use lnurl::lnurl::LnUrl;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -500,9 +501,11 @@ async fn handle_child_order(
 
 /// Pay the buyer invoice for a settled-hold-invoice order.
 ///
-/// Lightning Addresses are resolved via [`resolv_ln_address`] under the LNURL
-/// host policy. A non-empty `pr` must decode as BOLT11 before LND submission;
-/// resolve/decode failures and `send_payment` RPC errors go through
+/// Lightning Addresses **and** bech32 LNURLs are resolved via
+/// [`resolv_ln_address`] under the LNURL host policy. A non-empty `pr` must
+/// decode as BOLT11 and pass [`validate_payout_invoice`] (chain match, final
+/// CLTV bound, not already expired) before LND submission; resolve, decode and
+/// validation failures plus `send_payment` RPC errors go through
 /// [`check_failure_retries_or_log`] and return `Err` (no empty status-watcher
 /// spawn). Streamed `PaymentStatus::Failed` updates also bump retry
 /// bookkeeping. Callers such as `release_action` typically ignore the error
@@ -524,16 +527,39 @@ pub async fn do_payment(
     if amount == 0 {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
-    let payment_request = if let Ok(addr) = ln_addr {
-        // Resolving a lightning address is a network round-trip to a host the
-        // buyer chose. When it yields no invoice — forbidden host (SSRF
-        // policy), unreachable, or LNURL-level ERROR — that is a payment
-        // failure and must go through the same bookkeeping as a failed
-        // `send_payment`. Returning early would leave `failed_payment =
-        // false` and hide the order from the retry job.
-        match resolv_ln_address(&addr.to_string(), amount, None).await {
+    // `is_valid_invoice` accepts a Lightning Address *and* an encoded LNURL, so
+    // both have to be resolved to a BOLT11 invoice here. An unresolved LNURL
+    // reaches `send_payment`, fails to decode and burns the retry budget
+    // instead of ever paying the buyer.
+    let payout_destination = match &ln_addr {
+        Ok(addr) => Some(addr.to_string()),
+        Err(_) if LnUrl::from_str(&payment_request).is_ok() => Some(payment_request.clone()),
+        Err(_) => None,
+    };
+
+    let payment_request = match payout_destination {
+        // Resolving a payout destination is a network round-trip to a host the
+        // buyer chose. When it yields no usable invoice — forbidden host (SSRF
+        // policy), unreachable, LNURL-level ERROR, malformed or unpayable `pr`
+        // — that is a payment failure and must go through the same bookkeeping
+        // as a failed `send_payment`. Returning early would leave
+        // `failed_payment = false` and hide the order from the retry job.
+        Some(destination) => match resolv_ln_address(&destination, amount, None).await {
             Ok(pr) if !pr.is_empty() => match decode_invoice(&pr) {
-                Ok(_) => pr,
+                // The LNURL server picked this invoice, not the buyer, so it
+                // never went through `validate_invoice`. Apply the payout rules
+                // before handing it to LND.
+                Ok(invoice) => match validate_payout_invoice(&invoice) {
+                    Ok(()) => pr,
+                    Err(e) => {
+                        warn!(
+                            "Order id {}: payout address returned unpayable invoice: {:?}",
+                            order.id, e
+                        );
+                        check_failure_retries_or_log(ctx, &order, request_id).await;
+                        return Err(e);
+                    }
+                },
                 Err(e) => {
                     warn!(
                         "Order id {}: payout address returned malformed invoice: {:?}",
@@ -554,9 +580,8 @@ pub async fn do_payment(
                 check_failure_retries_or_log(ctx, &order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
-        }
-    } else {
-        payment_request
+        },
+        None => payment_request,
     };
     let mut ln_client_payment = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
@@ -1718,6 +1743,89 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    /// An expired regtest invoice: rejected by `validate_payout_invoice` on
+    /// every chain, either for the currency or for having expired, so the
+    /// assertion below does not depend on what `LN_STATUS` holds.
+    const EXPIRED_INVOICE: &str = "lnbcrt500u1p3lzwdzpp5t9kgwgwd07y2lrwdscdnkqu4scrcgpm5pt9uwx0rxn5rxawlxlvqdqqcqzpgxqyz5vqsp5a6k7syfxeg8jy63rteywwjla5rrg2pvhedx8ajr2ltm4seydhsqq9qyyssq0n2uwlumsx4d0mtjm8tp7jw3y4da6p6z9gyyjac0d9xugf72lhh4snxpugek6n83geafue9ndgrhuhzk98xcecu2t3z56ut35mkammsqscqp0n";
+
+    /// Stand-in LNURL-pay server: the well-known endpoint points at its own
+    /// callback, which hands back `EXPIRED_INVOICE`.
+    async fn start_lnurl_test_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let callback = format!("http://127.0.0.1:{port}/callback");
+
+        let app = Router::new()
+            .route(
+                "/.well-known/lnurlp/payout",
+                get(move || {
+                    let callback = callback.clone();
+                    async move {
+                        Json(json!({
+                            "tag": "payRequest",
+                            "callback": callback,
+                            "minSendable": 1,
+                            "maxSendable": 100_000_000_000u64,
+                            "metadata": "[[\"text/plain\",\"payout\"]]"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/callback",
+                get(|| async { Json(json!({ "pr": EXPIRED_INVOICE })) }),
+            );
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let lnurl = LnUrl {
+            url: format!("http://127.0.0.1:{port}/.well-known/lnurlp/payout"),
+        }
+        .encode();
+
+        (lnurl, handle)
+    }
+
+    /// An encoded LNURL is a payout destination `is_valid_invoice` accepts, so
+    /// `do_payment` has to resolve it and validate the invoice it gets back.
+    /// Reaching `InvoiceInvalidError` proves both happened: unresolved, the
+    /// LNURL string would have travelled on to the LND connector instead.
+    #[tokio::test]
+    async fn do_payment_resolves_and_validates_an_encoded_lnurl() {
+        init_global_config();
+        // The mock LNURL server binds on loopback, which the LNURL host policy
+        // forbids in production. Take the policy lock before flipping the flag
+        // so a concurrent test cannot observe private hosts as allowed.
+        let _policy_lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _allow_private = crate::lnurl::AllowPrivateLnurlHostsGuard::enable();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let (lnurl, server) = start_lnurl_test_server().await;
+
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_invoice = Some(lnurl);
+
+        let result = do_payment(&ctx, order, None).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
+            ),
+            "the resolved invoice must be rejected before LND is contacted: {result:?}"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

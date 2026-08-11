@@ -55,7 +55,9 @@ pub fn decode_invoice(payment_request: &str) -> Result<Bolt11Invoice, MostroErro
 /// # Notes
 ///
 /// This function performs a network request to validate the address, so it may
-/// fail due to network issues even if the address format is correct.
+/// fail due to network issues even if the address format is correct. The fetch
+/// goes through [`crate::lnurl::ln_exists`] / LNURL host policy (no private or
+/// link-local destinations in production, DNS pin, short timeouts).
 async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroError> {
     if ln_exists(payment_request).await.is_err() {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
@@ -178,6 +180,8 @@ async fn validate_bolt11_invoice(
 ///
 /// This function is typically used to validate buyer invoices in trading contexts
 /// where the exact payment format may vary depending on user preference.
+/// Lightning Address / LNURL existence checks use the shared LNURL host policy
+/// in `src/lnurl.rs` (SSRF bounds, DNS pin, timeouts).
 pub async fn is_valid_invoice(
     payment_request: String,
     amount: Option<u64>,
@@ -253,9 +257,10 @@ mod tests {
             server.await.unwrap();
         });
 
-        // Build the LNURL for this port and encode it
+        // Build the LNURL for this port and encode it (use 127.0.0.1 so the
+        // pinned address matches the IPv4-only listener).
         let url = format!(
-            "http://localhost:{}/.well-known/lnurlp/MostroP2Ptestlnurl",
+            "http://127.0.0.1:{}/.well-known/lnurlp/MostroP2Ptestlnurl",
             port
         );
 
@@ -421,13 +426,21 @@ mod tests {
     #[tokio::test]
     async fn test_lnurl_validation_with_test_server() {
         init_settings_test();
+        // Local mock LNURL servers bind loopback; production host policy
+        // would refuse them without this test-only escape hatch. Hold the
+        // shared policy lock so parallel lnurl tests cannot flip the flag.
+        let _policy_lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _allow_private = crate::lnurl::AllowPrivateLnurlHostsGuard::enable();
 
         // Start test server
         let (lnurl, server_handle) = start_test_server().await;
 
         // Test basic LNURL validation
         let result = is_valid_invoice(lnurl.clone(), None, None).await;
-        assert!(result.is_ok(), "Basic LNURL validation should succeed");
+        assert!(
+            result.is_ok(),
+            "Basic LNURL validation should succeed: {result:?}"
+        );
 
         // Test LNURL validation with amount
         let result = is_valid_invoice(lnurl.clone(), Some(5000), None).await;
@@ -436,17 +449,16 @@ mod tests {
             "LNURL validation with valid amount should succeed"
         );
 
-        // Lightning address validation
-        // Test with a valid Lightning address that matches our test server
-        let valid_address = "MostroP2P@localhost".to_string();
+        // Lightning address validation (cfg(test) rewrites to 127.0.0.1:8080)
+        let valid_address = "MostroP2P@127.0.0.1".to_string();
         let result = is_valid_invoice(valid_address, None, None).await;
         assert!(
             result.is_ok(),
-            "Valid Lightning address should pass validation"
+            "Valid Lightning address should pass validation: {result:?}"
         );
 
         // Test with an invalid Lightning address
-        let invalid_address = "nonexistent@localhost".to_string();
+        let invalid_address = "nonexistent@127.0.0.1".to_string();
         let result = is_valid_invoice(invalid_address, None, None).await;
         assert!(
             result.is_err(),

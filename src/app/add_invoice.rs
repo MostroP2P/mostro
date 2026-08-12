@@ -8,6 +8,14 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 
+/// Persist a replacement buyer invoice on a `SettledHoldInvoice` order and reset
+/// `payment_attempts`.
+///
+/// Uses a status-guarded targeted `UPDATE` (`WHERE status = settled-hold-invoice`)
+/// so a stale full-row write cannot resurrect payment state after
+/// `payment_success` has already moved the order to `Success`. When the CAS
+/// misses, returns `CantDo(NotAllowedByStatus)` and does not enqueue
+/// `InvoiceUpdated`.
 pub async fn pay_new_invoice(
     order: &mut Order,
     pool: &Pool<Sqlite>,
@@ -308,7 +316,13 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "stale write must be rejected");
+        assert!(
+            matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+            ),
+            "stale write must be rejected as NotAllowedByStatus: {result:?}"
+        );
         let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(stored.status, Status::Active.to_string());
         assert_eq!(stored.payment_attempts, 7, "newer state must remain intact");

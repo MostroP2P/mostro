@@ -9,6 +9,7 @@ Quick links to architecture and feature guides.
 - Orders & Actions: ORDERS_AND_ACTIONS.md
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - Anti-Abuse Bond: ANTI_ABUSE_BOND.md (opt-in maker/taker Lightning bond; off by default)
+- Payment Circuit Breaker: PAYMENT_CIRCUIT_BREAKER.md (halts outgoing payments when outflow outruns inflow; off by default)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 

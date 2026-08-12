@@ -12,6 +12,8 @@ Core interactions with LND via `fedimint_tonic_lnd`.
 - Subscribe: `subscribe_invoice(r_hash, sender)` streams `InvoiceState` updates.
 - Settle: `settle_hold_invoice(preimage)`.
 - Cancel: `cancel_hold_invoice(hash)`.
+- Expiry: `lookup_invoice_htlc_expiry(hash)` → block height at which the escrow
+  expires (see [Escrow Deadline](#escrow-deadline)).
 
 ## Outgoing Payments
 - `send_payment(invoice, amount, sender)`
@@ -200,6 +202,109 @@ Retrieves LND node information including:
 **Entry**: `src/lightning/mod.rs:260`
 
 **Usage**: Called during startup to populate `config::LN_STATUS` (src/main.rs:86)
+
+## Escrow Deadline
+
+Source: `src/app/escrow_deadline.rs`, swept by `src/scheduler.rs`
+(`fn job_enforce_escrow_deadline`).
+
+A trade is escrowed in a hold invoice, and that escrow has a hard lifetime.
+The invoice is created with `hold_invoice_cltv_delta` (144 blocks by default),
+and LND force-cancels an accepted hold HTLC a few blocks before its expiry
+height — `invoices.holdexpirydelta`, 24 by default — so the channel is never
+forced to close over a held payment. The refund goes to the seller regardless
+of what the trade was doing. On the defaults that leaves roughly 20 hours of
+escrow from the moment the seller pays.
+
+Nothing in the order state machine used to know about that horizon, so a trade
+could outlive its escrow: the order stayed `active` or `fiat-sent`, kept
+advertising itself as live, and the seller's release later failed at settle —
+after the buyer had already sent fiat.
+
+### Windows
+
+**Settings** (`src/config/types.rs`, `LightningSettings`), both measured in
+blocks remaining until the escrow HTLC's expiry height:
+
+```rust
+pub struct LightningSettings {
+    // ... other fields ...
+    pub escrow_expiry_warning_blocks: u32, // escalate here (default: 72, ~12 h)
+    pub escrow_expiry_safety_blocks: u32,  // last call (default: 36, ~6 h)
+}
+```
+
+`fn validate_escrow_expiry_settings` enforces
+`hold_invoice_cltv_delta > escrow_expiry_warning_blocks >
+escrow_expiry_safety_blocks > invoices.holdexpirydelta` at startup and refuses
+to boot otherwise: these bound when the daemon destroys a live escrow, so a
+configuration that puts them outside the escrow's lifetime is loud rather than
+silently clamped.
+
+### What the sweep does
+
+Every minute the job asks LND for the current block height, lists the orders
+that still hold escrow (`fn find_orders_with_live_escrow`) and asks LND for
+each escrow's real expiry height. The invoice's `cltv_expiry` is only a
+minimum the payer had to honour — wallets routinely add their own buffer — so
+the horizon cannot be derived from the order row. `fn escrow_deadline_action`
+turns the distance into a decision:
+
+| Order status | At the warning window | At the safety window |
+| --- | --- | --- |
+| `active` | nothing | cancel the hold invoice, close the order, notify both parties, release bonds |
+| `fiat-sent` | open the dispute (`initiator: mostro`) | keep retrying the dispute; never cancel |
+| `dispute` | alert the operator | alert again, urgently; leave the escrow alone |
+
+The asymmetry is deliberate. An `active` order has no fiat leg at risk, so
+ending it costs no one anything the CLTV would not have taken anyway. Once the
+buyer has declared the fiat sent, cancelling would hand the seller both the
+fiat and the sats, so mostro never does it — it hands the trade to a solver
+while the escrow still exists, which is the only action left that can pay the
+buyer. And a solver working a dispute can settle up to the last block, so
+taking the escrow away early would remove the very outcome they might be about
+to choose.
+
+Every failure path is "skip and retry next tick": an unreachable node or an
+unreadable invoice must never end a trade, and there is a whole warning window
+worth of ticks before anything is actually due.
+
+### Backstop
+
+`crate::flow::hold_invoice_canceled` closes an order whose escrow was canceled
+without mostro asking — LND winning the race, an operator cancelling by hand,
+or the daemon having been down through the horizon. It publishes the
+cancelation, claims the order with a conditional update
+(`fn claim_escrow_order_canceled`), notifies both parties and unwinds the
+dispute and bonds. Both paths use the same claim, so exactly one of them owns
+the transition and the other is a no-op.
+
+### Reading what happened in the logs
+
+Sweep lines are prefixed `escrow_deadline:`. The ones that matter:
+
+- `Trade reached its escrow deadline` — an `active` order was cancelled and
+  the seller refunded. Expected; no action needed.
+- `Opened a dispute on a fiat-sent order whose escrow is about to expire` —
+  a solver has until the expiry height to settle or cancel.
+- `Disputed order is running out of escrow` — the loud one. If no solver acts
+  before that height, LND refunds the seller and the buyer's only recourse is
+  out of band.
+- `Escrow with hash ... was canceled while the trade was still live` — the
+  backstop fired, meaning the escrow went away before the sweep could act.
+  Worth investigating: a lagging node, a long outage, or a manual cancel.
+
+### Tuning
+
+Raise `hold_invoice_cltv_delta` if your traders use slow fiat rails: the whole
+trade, disputes included, has to fit inside it. Keep in mind that the payer's
+route must accommodate the delta, so very large values make the hold invoice
+harder to pay.
+
+If you raise LND's own `invoices.holdexpirydelta` past
+`escrow_expiry_safety_blocks`, raise the safety window with it — startup
+validation compares against LND's default (24), which it cannot read over
+gRPC, so that combination is the one misconfiguration it cannot catch for you.
 
 ## Anti-Abuse Bond Operations
 

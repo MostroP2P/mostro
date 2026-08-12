@@ -8,7 +8,10 @@ use nostr_sdk::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
-use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
+use super::constants::{
+    DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS, DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS, ENV_FILENAME,
+    NSEC_ENV_VAR,
+};
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -146,6 +149,8 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         payment_attempts: 3,
         payment_retries_interval: 60,
         max_final_cltv_expiry_delta: 432,
+        escrow_expiry_safety_blocks: DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS,
+        escrow_expiry_warning_blocks: DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS,
     })
 }
 

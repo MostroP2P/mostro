@@ -2,8 +2,11 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::constants::{
+    ENV_FILENAME, LND_DEFAULT_HOLD_EXPIRY_DELTA, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
+};
 use crate::config::secret::read_nsec_env_var;
+use crate::config::types::LightningSettings;
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
@@ -65,6 +68,8 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
         ))));
     }
 
+    validate_escrow_expiry_settings(&settings.lightning)?;
+
     validate_cashu_settings(
         settings.cashu.as_ref(),
         settings
@@ -72,6 +77,58 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             .as_ref()
             .is_some_and(|bond| bond.enabled),
     )?;
+
+    Ok(())
+}
+
+/// Validate the escrow-deadline windows against the CLTV the escrow is
+/// created with. Standalone so it is unit-testable without a full `Settings`.
+///
+/// A trade's escrow is a hold HTLC that LND force-cancels a few blocks before
+/// its expiry height, refunding the seller. `escrow_expiry_warning_blocks` and
+/// `escrow_expiry_safety_blocks` are where mostrod steps in ahead of that, so
+/// they only mean anything while they sit *inside* the escrow's lifetime:
+///
+/// - `safety > LND_DEFAULT_HOLD_EXPIRY_DELTA`, or LND takes the escrow away
+///   before the daemon ever reaches its own deadline.
+/// - `warning > safety`, or the escalation lands at or after the deadline it
+///   is supposed to precede.
+/// - `hold_invoice_cltv_delta > warning`, or every trade is already past the
+///   escalation threshold the moment the seller pays — which would escalate
+///   and then cancel healthy trades on the first scheduler tick.
+///
+/// All three are startup-fatal rather than clamped: these bound when the
+/// daemon destroys a live escrow, and silently repairing that is how an
+/// operator ends up with a deadline they never agreed to.
+fn validate_escrow_expiry_settings(lightning: &LightningSettings) -> Result<(), MostroError> {
+    let safety = lightning.escrow_expiry_safety_blocks;
+    let warning = lightning.escrow_expiry_warning_blocks;
+    let cltv_delta = lightning.hold_invoice_cltv_delta;
+
+    if safety <= LND_DEFAULT_HOLD_EXPIRY_DELTA {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "lightning.escrow_expiry_safety_blocks ({safety}) must exceed LND's \
+             invoices.holdexpirydelta ({LND_DEFAULT_HOLD_EXPIRY_DELTA} by default): \
+             below it, LND cancels the escrow before mostrod can close the trade"
+        ))));
+    }
+
+    if warning <= safety {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "lightning.escrow_expiry_warning_blocks ({warning}) must exceed \
+             lightning.escrow_expiry_safety_blocks ({safety}): the warning has to \
+             come before the deadline it warns about"
+        ))));
+    }
+
+    if cltv_delta <= warning {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "lightning.hold_invoice_cltv_delta ({cltv_delta}) must exceed \
+             lightning.escrow_expiry_warning_blocks ({warning}): otherwise every \
+             trade starts already past its escrow deadline. Raise the CLTV delta \
+             or lower the escrow expiry windows"
+        ))));
+    }
 
     Ok(())
 }
@@ -444,7 +501,14 @@ mod startup_validation_tests {
     fn base_settings() -> Settings {
         Settings {
             database: DatabaseSettings::default(),
-            lightning: LightningSettings::default(),
+            // `LightningSettings::default()` leaves `hold_invoice_cltv_delta`
+            // at 0 — a placeholder no real config carries, since TOML must
+            // supply it. Use the shipped value so the escrow-window checks
+            // see a configuration an operator could actually be running.
+            lightning: LightningSettings {
+                hold_invoice_cltv_delta: 144,
+                ..Default::default()
+            },
             nostr: NostrSettings::default(),
             mostro: MostroSettings::default(),
             rpc: RpcSettings::default(),
@@ -489,6 +553,87 @@ mod startup_validation_tests {
             escrow_locktime_days: 15,
         });
         assert!(validate_mostro_settings(&settings).is_err());
+    }
+}
+
+#[cfg(test)]
+mod escrow_expiry_validation_tests {
+    use super::*;
+    use crate::config::constants::{
+        DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS, DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS,
+    };
+
+    fn lightning(cltv_delta: u32, safety: u32, warning: u32) -> LightningSettings {
+        LightningSettings {
+            hold_invoice_cltv_delta: cltv_delta,
+            escrow_expiry_safety_blocks: safety,
+            escrow_expiry_warning_blocks: warning,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_are_a_valid_configuration() {
+        // 144 / 72 / 36: what settings.tpl.toml ships and what an untouched
+        // upgrade inherits. If this ever fails, every node fails to boot.
+        let ln = lightning(
+            144,
+            DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS,
+            DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS,
+        );
+        assert!(validate_escrow_expiry_settings(&ln).is_ok());
+    }
+
+    #[test]
+    fn rejects_safety_window_inside_lnd_hold_expiry_delta() {
+        // At or below LND's own delta the daemon never gets to act: LND has
+        // already canceled the escrow by the time mostrod's deadline hits.
+        let ln = lightning(144, LND_DEFAULT_HOLD_EXPIRY_DELTA, 72);
+        let err = validate_escrow_expiry_settings(&ln).expect_err("must reject");
+        assert!(err.to_string().contains("holdexpirydelta"));
+
+        let ln = lightning(144, LND_DEFAULT_HOLD_EXPIRY_DELTA - 1, 72);
+        assert!(validate_escrow_expiry_settings(&ln).is_err());
+    }
+
+    #[test]
+    fn rejects_warning_not_before_the_deadline() {
+        // Equal windows mean the escalation and the cancel land on the same
+        // tick, so the escalation buys nobody any time.
+        let ln = lightning(144, 36, 36);
+        let err = validate_escrow_expiry_settings(&ln).expect_err("must reject");
+        assert!(err.to_string().contains("escrow_expiry_warning_blocks"));
+
+        let ln = lightning(144, 72, 36);
+        assert!(validate_escrow_expiry_settings(&ln).is_err());
+    }
+
+    #[test]
+    fn rejects_cltv_delta_that_starts_past_the_warning() {
+        // A 72-block escrow with a 72-block warning window: every trade is
+        // born already due for escalation, and the first tick would cancel
+        // perfectly healthy trades.
+        let ln = lightning(72, 36, 72);
+        let err = validate_escrow_expiry_settings(&ln).expect_err("must reject");
+        assert!(err.to_string().contains("hold_invoice_cltv_delta"));
+
+        let ln = lightning(48, 36, 72);
+        assert!(validate_escrow_expiry_settings(&ln).is_err());
+    }
+
+    #[test]
+    fn unconfigured_cltv_delta_is_rejected() {
+        // `LightningSettings::default()` carries no CLTV delta; a config that
+        // somehow reached startup that way has no escrow window at all.
+        assert!(validate_escrow_expiry_settings(&LightningSettings::default()).is_err());
+    }
+
+    #[test]
+    fn accepts_a_longer_escrow_with_wider_windows() {
+        // Operators trading on slow fiat rails raise the CLTV delta; the
+        // windows scale with it as long as the ordering holds.
+        let ln = lightning(432, 72, 144);
+        assert!(validate_escrow_expiry_settings(&ln).is_ok());
     }
 }
 

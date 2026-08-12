@@ -23,6 +23,24 @@ pub const DM_EVENT_KIND: u16 = 14;
 /// This allows the same Mostro instance to publish updated rates that replace previous events
 pub const NOSTR_EXCHANGE_RATES_EVENT_KIND: u16 = 30078;
 
+/// LND's own default for `invoices.holdexpirydelta`: how many blocks before
+/// an accepted hold HTLC's expiry height LND force-cancels the invoice to
+/// avoid a channel force-close, refunding the payer.
+///
+/// mostrod cannot read this value over gRPC, so it is the reference point the
+/// escrow-deadline windows below are validated against: the daemon has to act
+/// on a trade *before* LND takes the escrow away from it.
+pub const LND_DEFAULT_HOLD_EXPIRY_DELTA: u32 = 24;
+
+/// Default `lightning.escrow_expiry_safety_blocks` (~6 h): how close to the
+/// escrow HTLC's expiry height a trade may get before mostrod ends it itself.
+pub const DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS: u32 = 36;
+
+/// Default `lightning.escrow_expiry_warning_blocks` (~12 h): how close a trade
+/// may get before mostrod escalates it — for a `fiat-sent` order that means
+/// opening the dispute so a solver can still act while the escrow exists.
+pub const DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS: u32 = 72;
+
 /// Filename of the environment file auto-loaded from the settings directory at
 /// startup. Shared between the wizard (writes it) and the loader (reads it).
 pub const ENV_FILENAME: &str = ".env";

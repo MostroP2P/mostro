@@ -1,6 +1,9 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
-use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DM_EVENT_KIND};
+use crate::config::constants::{
+    DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS, DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS,
+    DEV_FEE_AUDIT_EVENT_KIND, DM_EVENT_KIND,
+};
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -406,6 +409,14 @@ pub struct LightningSettings {
     /// user-supplied payout invoice
     #[serde(default = "default_max_final_cltv_expiry_delta")]
     pub max_final_cltv_expiry_delta: u32,
+    /// How close, in blocks, a trade may get to its escrow HTLC's expiry
+    /// height before mostrod ends the trade itself
+    #[serde(default = "default_escrow_expiry_safety_blocks")]
+    pub escrow_expiry_safety_blocks: u32,
+    /// How close, in blocks, a trade may get to that same expiry height
+    /// before mostrod escalates it (dispute / operator alert)
+    #[serde(default = "default_escrow_expiry_warning_blocks")]
+    pub escrow_expiry_warning_blocks: u32,
 }
 
 /// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
@@ -415,8 +426,20 @@ fn default_max_final_cltv_expiry_delta() -> u32 {
     432
 }
 
+/// Absent from an existing `settings.toml`, the escrow deadline must still
+/// exist: a node that upgrades without touching its config cannot be left
+/// running trades whose escrow can evaporate unobserved.
+fn default_escrow_expiry_safety_blocks() -> u32 {
+    DEFAULT_ESCROW_EXPIRY_SAFETY_BLOCKS
+}
+
+fn default_escrow_expiry_warning_blocks() -> u32 {
+    DEFAULT_ESCROW_EXPIRY_WARNING_BLOCKS
+}
+
 // Hand-written so `max_final_cltv_expiry_delta` defaults to the real bound
-// instead of `0`, which would reject every invoice.
+// instead of `0`, which would reject every invoice. The escrow windows are
+// real defaults for the same reason: a `0` there would read as "no deadline".
 impl Default for LightningSettings {
     fn default() -> Self {
         Self {
@@ -429,6 +452,8 @@ impl Default for LightningSettings {
             payment_attempts: 0,
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
+            escrow_expiry_safety_blocks: default_escrow_expiry_safety_blocks(),
+            escrow_expiry_warning_blocks: default_escrow_expiry_warning_blocks(),
         }
     }
 }

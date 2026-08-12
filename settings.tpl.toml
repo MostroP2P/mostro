@@ -20,6 +20,12 @@ payment_retries_interval = 60
 # Maximum min_final_cltv_expiry_delta (in blocks) accepted on a payout invoice
 # supplied by a user. Bounds how long a payee can hold the outgoing HTLC.
 max_final_cltv_expiry_delta = 432
+# Escrow deadline, in blocks left before the hold HTLC expires: mostrod
+# escalates a trade at the warning window and ends it at the safety window,
+# ahead of LND's own force-cancel. Startup requires
+# hold_invoice_cltv_delta > escrow_expiry_warning_blocks > escrow_expiry_safety_blocks > 24
+escrow_expiry_warning_blocks = 72
+escrow_expiry_safety_blocks = 36
 
 [nostr]
 nsec_privkey = 'nsec1...'

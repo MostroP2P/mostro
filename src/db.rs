@@ -956,6 +956,27 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// Every order whose escrow HTLC is still locked, for the deadline sweep.
+///
+/// The same three statuses [`find_held_invoices`] resubscribes, narrowed to
+/// rows the sweep can actually act on: an order with no `hash` has no invoice
+/// to look up in LND, and `invoice_held_at == 0` means the seller never paid,
+/// so there is no escrow whose expiry could be approaching.
+pub async fn find_orders_with_live_escrow(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE status IN ('active', 'fiat-sent', 'dispute')
+            AND hash IS NOT NULL
+            AND invoice_held_at != 0
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Claim the cancelation of an order that still has a live escrow, reporting
 /// whether this caller is the one that got it.
 ///
@@ -2257,6 +2278,65 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "Should not find orders with held_at = 0");
+    }
+
+    // -- Tests for find_orders_with_live_escrow --
+
+    #[tokio::test]
+    async fn find_orders_with_live_escrow_returns_only_actionable_rows() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Eligible: a paid escrow in each of the three live statuses.
+        for status in ["active", "fiat-sent", "dispute"] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'sell', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 1700001000, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("aa".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Not eligible: no hash (nothing to look up in LND), never paid
+        // (no escrow), and a status whose escrow is already resolved.
+        let ineligible: [(&str, Option<String>, i64); 3] = [
+            ("active", None, 1700001000),
+            ("active", Some("bb".repeat(32)), 0),
+            ("settled-hold-invoice", Some("cc".repeat(32)), 1700001000),
+        ];
+        for (status, hash, held_at) in ineligible {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'sell', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, ?3, ?4)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(held_at)
+            .bind(hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_orders_with_live_escrow(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "only paid, still-live escrows are sweepable"
+        );
     }
 
     // -- Tests for claim_escrow_order_canceled --

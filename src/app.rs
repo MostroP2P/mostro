@@ -15,6 +15,7 @@ pub mod bond; // Anti-abuse bond data + helpers (issue #711)
 pub mod cancel; // User order cancellation
 pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling
+pub mod escrow_deadline; // Escrow CLTV deadline policy
 pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
 pub mod order; // Order creation and management

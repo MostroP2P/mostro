@@ -29,6 +29,21 @@ async fn publish_dispute_event(
         false => "seller",
     };
 
+    publish_dispute_event_with_initiator(ctx, dispute, my_keys, initiator).await
+}
+
+/// Same event, for a dispute no trader opened.
+///
+/// `initiator` is a free string because mostro can open a dispute itself when
+/// a trade is about to lose its escrow (`mostro`), and claiming the buyer or
+/// the seller filed it would be wrong in the event, in the order's dispute
+/// flags, and in the solver's view of who is asking for what.
+async fn publish_dispute_event_with_initiator(
+    ctx: &AppContext,
+    dispute: &Dispute,
+    my_keys: &Keys,
+    initiator: &str,
+) -> Result<(), MostroError> {
     // Create tags for the dispute event
     let tags = Tags::from_list(vec![
         // Status tag - indicates the current state of the dispute
@@ -233,6 +248,91 @@ pub async fn dispute_action(
     publish_dispute_event(ctx, &dispute, my_keys, is_buyer_dispute)
         .await
         .map_err(|_| MostroInternalErr(ServiceError::DisputeEventError))?;
+
+    Ok(())
+}
+
+/// Open a dispute on a `fiat-sent` order whose escrow is about to expire.
+///
+/// The buyer says the fiat is gone and the seller has not released; in a few
+/// hours LND will refund the escrow and neither of them will be able to do
+/// anything about it. Handing the trade to a solver while the escrow still
+/// exists is the only move left that can pay the buyer, so mostro makes it
+/// instead of waiting for someone to notice the clock.
+///
+/// Unlike [`dispute_action`] there is no initiator: both of the order's
+/// dispute flags stay false and the event is published with `initiator` set to
+/// `mostro`, because recording the buyer or the seller as the filer would
+/// misrepresent the dispute to the solver — and to the reputation and
+/// restore-session views that read those flags.
+///
+/// Errors instead of unwinding on failure: the order stays in `fiat-sent` and
+/// the sweep retries on its next tick, which is what we want while the escrow
+/// is still there.
+pub async fn open_deadline_dispute(ctx: &AppContext, order: &Order) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+    if find_dispute_by_order_id(pool, order.id).await.is_ok() {
+        return Err(MostroInternalErr(ServiceError::DisputeAlreadyExists));
+    }
+
+    let (buyer_pubkey, seller_pubkey) = match (order.get_buyer_pubkey(), order.get_seller_pubkey())
+    {
+        (Ok(buyer), Ok(seller)) => (buyer, seller),
+        _ => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+    };
+
+    let dispute = Dispute::new(order.id, order.status.clone());
+
+    // Publish and persist the order first: a dispute row pointing at an order
+    // that is still `fiat-sent` would be picked up by the sweep again on the
+    // next tick and rejected as a duplicate, stranding it.
+    let order_updated = crate::util::update_order_event(ctx.keys(), Status::Dispute, order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let dispute = dispute
+        .create(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    tracing::warn!(
+        order_id = %order.id,
+        dispute_id = %dispute.id,
+        "Opened a dispute on a fiat-sent order whose escrow is about to expire"
+    );
+
+    // `DisputeInitiatedByPeer` for both: from either trader's side this is a
+    // dispute they did not file, and the payload carries the id their client
+    // needs to follow it.
+    for pubkey in [buyer_pubkey, seller_pubkey] {
+        enqueue_order_msg(
+            None,
+            Some(order.id),
+            Action::DisputeInitiatedByPeer,
+            Some(Payload::Dispute(dispute.id, None)),
+            pubkey,
+            None,
+        )
+        .await;
+    }
+
+    // Best-effort, like every other dispute publish: the dispute is already
+    // open in the DB and both traders have been told, so a relay that refuses
+    // the event must not report the dispute as un-opened — that would put the
+    // sweep back on a path it has already taken.
+    if let Err(e) = publish_dispute_event_with_initiator(ctx, &dispute, ctx.keys(), "mostro").await
+    {
+        tracing::error!(
+            order_id = %order.id,
+            dispute_id = %dispute.id,
+            "Opened the escrow-deadline dispute but could not publish its event ({e}); \
+             solvers will not see it until it is republished"
+        );
+    }
 
     Ok(())
 }
@@ -758,5 +858,80 @@ mod tests {
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
         assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+    }
+
+    #[tokio::test]
+    async fn open_deadline_dispute_hands_a_fiat_sent_order_to_a_solver() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::FiatSent)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        open_deadline_dispute(&ctx, &order)
+            .await
+            .expect("a fiat-sent order must be disputable before its escrow expires");
+
+        let updated = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            Status::Dispute.to_string(),
+            "the order has to move so a solver can act on it"
+        );
+        assert!(
+            !updated.buyer_dispute && !updated.seller_dispute,
+            "neither trader filed this dispute; recording one of them as the \
+             initiator would misrepresent it to the solver"
+        );
+        assert!(find_dispute_by_order_id(&pool, order.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_deadline_dispute_refuses_to_duplicate_an_existing_one() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::FiatSent)
+            .create(&pool)
+            .await
+            .unwrap();
+        Dispute::new(order.id, order.status.clone())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // A trader who disputed first already has a solver on it; the sweep
+        // must not file a second dispute for the same order.
+        assert!(matches!(
+            open_deadline_dispute(&ctx, &order).await,
+            Err(MostroInternalErr(ServiceError::DisputeAlreadyExists))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_deadline_dispute_needs_both_trade_pubkeys() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(None, Some(seller), Status::FiatSent)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // Nobody to notify means nobody would learn the dispute exists, so
+        // the order stays as it was for an operator to look at.
+        assert!(matches!(
+            open_deadline_dispute(&ctx, &order).await,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+        let unchanged = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, Status::FiatSent.to_string());
     }
 }

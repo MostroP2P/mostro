@@ -1,6 +1,9 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
+use crate::app::escrow_deadline::{
+    apply_escrow_deadline_action, escrow_deadline_action, EscrowDeadlineAction,
+};
 use crate::app::release::do_payment;
 use crate::config;
 use crate::db::*;
@@ -38,6 +41,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // `false`, so every job below still starts exactly as before).
     if !Settings::is_cashu_enabled() {
         job_cancel_orders(ctx.clone()).await;
+        job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
@@ -594,6 +598,116 @@ async fn job_cancel_orders(ctx: AppContext) {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
+}
+
+/// Keep every live trade inside its escrow's lifetime.
+///
+/// The escrow is a hold HTLC that LND force-cancels near its CLTV expiry
+/// height, refunding the seller whatever the trade is doing. No other job
+/// covers `active`, `fiat-sent` or `dispute`, so without this sweep a trade
+/// simply outlives its escrow: the order keeps reading as live, the buyer can
+/// still send fiat, and the seller's release then fails at settle.
+///
+/// Each tick asks LND where the chain is, then asks it for the real expiry
+/// height of every live escrow — the invoice's `cltv_expiry` is only a
+/// minimum the payer had to honour, so the horizon cannot be derived from the
+/// order row. [`escrow_deadline_action`] turns the distance into a decision.
+///
+/// Failures are always "skip and retry next tick": one unreachable node or one
+/// unreadable invoice must not end trades, and there is a whole warning window
+/// worth of ticks before anything is actually due.
+async fn job_enforce_escrow_deadline(ctx: AppContext) {
+    let mut ln_client = match LndConnector::new().await {
+        Ok(client) => client,
+        Err(e) => return error!("escrow_deadline: failed to create LND client: {e}"),
+    };
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        // Which disputed orders have already been shouted about, per band, so
+        // an operator gets two lines per order instead of one per minute. Kept
+        // in memory on purpose: a restart repeating an alert is the harmless
+        // direction, and the set only ever holds orders that reached their
+        // escrow deadline while disputed.
+        let mut alerted: HashSet<(uuid::Uuid, bool)> = HashSet::new();
+
+        loop {
+            match ln_client.get_node_info().await {
+                Ok(info) => {
+                    let current_height = i64::from(info.block_height);
+                    match crate::db::find_orders_with_live_escrow(pool).await {
+                        Ok(orders) => {
+                            for order in orders.iter() {
+                                sweep_one_escrow(
+                                    &ctx,
+                                    &mut ln_client,
+                                    order,
+                                    current_height,
+                                    &mut alerted,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => warn!("escrow_deadline: could not list live escrows: {e}"),
+                    }
+                }
+                Err(e) => warn!("escrow_deadline: no block height from LND ({e}); skipping tick"),
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Resolve one order's distance to its escrow horizon and act on it.
+async fn sweep_one_escrow(
+    ctx: &AppContext,
+    ln_client: &mut LndConnector,
+    order: &Order,
+    current_height: i64,
+    alerted: &mut HashSet<(uuid::Uuid, bool)>,
+) {
+    let Some(hash) = order.hash.as_ref() else {
+        return;
+    };
+
+    let Ok(status) = order.get_order_status() else {
+        warn!(
+            "escrow_deadline: order {} has an unreadable status",
+            order.id
+        );
+        return;
+    };
+
+    let expiry_height = match ln_client.lookup_invoice_htlc_expiry(hash).await {
+        // No accepted HTLC left: the escrow was settled or canceled while the
+        // order row still says otherwise. Whichever it was, the invoice
+        // subscriber owns that transition, not this sweep.
+        Ok(None) => return,
+        Ok(Some(height)) => i64::from(height),
+        Err(e) => {
+            warn!(
+                "escrow_deadline: could not read the escrow horizon for order {} ({e}); \
+                 retrying next tick",
+                order.id
+            );
+            return;
+        }
+    };
+
+    let remaining_blocks = expiry_height - current_height;
+    let action = escrow_deadline_action(status, remaining_blocks, &ctx.settings().lightning);
+
+    // Alerts are the only repeatable action: cancelling or disputing takes the
+    // order out of the sweep on the same tick, while a disputed order stays in
+    // it until the horizon and would otherwise shout once a minute.
+    if let EscrowDeadlineAction::AlertSolvers { urgent } = action {
+        if !alerted.insert((order.id, urgent)) {
+            return;
+        }
+    }
+
+    apply_escrow_deadline_action(ctx, ln_client, order, action, remaining_blocks).await;
 }
 
 async fn job_expire_pending_older_orders(ctx: AppContext) {

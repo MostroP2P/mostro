@@ -273,7 +273,7 @@ pub async fn hold_invoice_canceled(hash: &str, ctx: &AppContext) -> Result<(), M
 /// whose escrow is gone: the buyer must not send fiat, and the seller must
 /// not expect a release. Missing pubkeys are logged rather than propagated —
 /// the cancelation is already durable and cannot be undone by a failed DM.
-async fn notify_escrow_canceled(order: &Order) {
+pub(crate) async fn notify_escrow_canceled(order: &Order) {
     let (buyer_pubkey, seller_pubkey) = match (order.get_buyer_pubkey(), order.get_seller_pubkey())
     {
         (Ok(buyer), Ok(seller)) => (buyer, seller),

@@ -855,23 +855,20 @@ pub async fn update_user_rating_event(
         order.seller_sent_rate = seller_sent_rate;
     }
 
-    let result = sqlx::query(
-        "UPDATE orders SET buyer_sent_rate = ?, seller_sent_rate = ? WHERE id = ?",
-    )
-    .bind(order.buyer_sent_rate)
-    .bind(order.seller_sent_rate)
-    .bind(order.id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE orders SET buyer_sent_rate = ?, seller_sent_rate = ? WHERE id = ?")
+            .bind(order.buyer_sent_rate)
+            .bind(order.seller_sent_rate)
+            .bind(order.id)
+            .execute(pool)
+            .await?;
 
     if result.rows_affected() == 0 {
         tracing::warn!(
             "Ignoring stale rating update for order {}: row no longer exists or changed concurrently",
             order.id
         );
-        return Err(Box::new(MostroCantDo(
-            CantDoReason::NotAllowedByStatus,
-        )));
+        return Err(Box::new(MostroCantDo(CantDoReason::NotAllowedByStatus)));
     }
 
     // Add event message to global list

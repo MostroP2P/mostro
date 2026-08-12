@@ -301,13 +301,11 @@ mod tests {
         stale_order.buyer_invoice = Some("lnbc-stale".to_string());
         stale_order.payment_attempts = 0;
 
-        let result = pay_new_invoice(&mut stale_order, &pool, &Message::new_order(
-            Some(order.id),
-            Some(1),
-            None,
-            Action::AddInvoice,
-            None,
-        ))
+        let result = pay_new_invoice(
+            &mut stale_order,
+            &pool,
+            &Message::new_order(Some(order.id), Some(1), None, Action::AddInvoice, None),
+        )
         .await;
 
         assert!(result.is_err(), "stale write must be rejected");
@@ -315,7 +313,9 @@ mod tests {
         assert_eq!(stored.status, Status::Active.to_string());
         assert_eq!(stored.payment_attempts, 7, "newer state must remain intact");
         assert_eq!(stored.buyer_invoice.as_deref(), Some("lnbc-old"));
-        assert!(!queued_actions_for(buyer).await.contains(&Action::InvoiceUpdated));
+        assert!(!queued_actions_for(buyer)
+            .await
+            .contains(&Action::InvoiceUpdated));
     }
 
     /// A `SettledHoldInvoice` order routes through `pay_new_invoice`: the

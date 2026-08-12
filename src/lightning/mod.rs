@@ -8,7 +8,10 @@ use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
+use fedimint_tonic_lnd::lnrpc::{
+    invoice::InvoiceState, GetInfoRequest, GetInfoResponse, InvoiceHtlc, InvoiceHtlcState, Payment,
+    PaymentHash,
+};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
 use mostro_core::prelude::*;
@@ -58,6 +61,26 @@ pub fn routing_fee_cap_sats(amount: i64) -> i64 {
 /// Length in bytes of a Lightning payment preimage and of the payment
 /// hash derived from it (both are SHA-256 sized).
 const HASH_LEN: usize = 32;
+
+/// Block height at which the first of an invoice's accepted HTLCs expires.
+///
+/// The escrow's lifetime is bounded by whichever accepted HTLC expires
+/// soonest — LND cancels the whole invoice as that one approaches its
+/// expiry — so a multi-part payment is only as long-lived as its earliest
+/// part. HTLCs already settled or canceled are not holding anything and are
+/// skipped, which is also why an invoice with no accepted HTLC yields
+/// `None`: there is no escrow to put a deadline on.
+///
+/// `expiry_height` is an `int32` on the wire; a negative value cannot
+/// describe a block height, so such an HTLC is ignored rather than wrapped
+/// into a huge `u32`.
+fn earliest_accepted_htlc_expiry(htlcs: &[InvoiceHtlc]) -> Option<u32> {
+    htlcs
+        .iter()
+        .filter(|htlc| htlc.state == InvoiceHtlcState::Accepted as i32)
+        .filter_map(|htlc| u32::try_from(htlc.expiry_height).ok())
+        .min()
+}
 
 /// Decode a hex-encoded 32-byte preimage or payment hash — as stored in
 /// the `orders` / `bonds` tables — into the raw bytes LND expects.
@@ -222,6 +245,56 @@ impl LndConnector {
                 ))))
             }
         }
+    }
+
+    /// Block height at which the escrow behind `hash` expires, as LND sees it.
+    ///
+    /// The invoice's `cltv_expiry` is only a *minimum* the payer must honour,
+    /// and the accepted HTLC's real expiry height is set by the payer (many
+    /// wallets add their own buffer). Asking LND is therefore the only way to
+    /// know the actual horizon, and it is immune to the block-interval drift
+    /// that any wall-clock estimate from `invoice_held_at` would inherit.
+    ///
+    /// Returns:
+    /// - `Ok(Some(height))` — the escrow is locked until `height`; LND
+    ///   force-cancels the invoice a few blocks earlier
+    ///   (`invoices.holdexpirydelta`, 24 by default) to avoid a force-close.
+    /// - `Ok(None)` — LND has no record of the hash, or the invoice holds no
+    ///   accepted HTLC (never paid, or already settled/canceled). Either way
+    ///   there is no live escrow to put a deadline on.
+    /// - `Err(_)` — undecodable hash, or a transport/gRPC failure that leaves
+    ///   the horizon unknown. Callers must not read this as "no deadline".
+    pub async fn lookup_invoice_htlc_expiry(
+        &mut self,
+        hash: &str,
+    ) -> Result<Option<u32>, MostroError> {
+        let r_hash = decode_hash32("payment hash", hash)?;
+
+        let invoice = match self
+            .client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(invoice) => invoice.into_inner(),
+            Err(status) => {
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
+                    return Ok(None);
+                }
+                // Same stable `code=<Code>` prefix the cancel path uses, so a
+                // caller can tell a benign outcome from a transport failure.
+                return Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))));
+            }
+        };
+
+        Ok(earliest_accepted_htlc_expiry(&invoice.htlcs))
     }
 
     pub async fn send_payment(
@@ -696,6 +769,78 @@ mod offline_connector_tests {
         init_test_settings();
         let mut ln = offline_connector().await;
         assert!(ln.get_node_info().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_invoice_htlc_expiry_rejects_malformed_hash() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        // Decoding runs before any RPC, so a bad row fails here rather than
+        // spending a round trip on a hash LND could never match.
+        assert!(ln.lookup_invoice_htlc_expiry("not-hex").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_invoice_htlc_expiry_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        let err = ln
+            .lookup_invoice_htlc_expiry(&"cc".repeat(32))
+            .await
+            .expect_err("a dead port must error, not report 'no deadline'");
+        assert!(
+            err.to_string().contains("code="),
+            "error must carry the code= prefix, got: {err}"
+        );
+    }
+
+    fn htlc(state: InvoiceHtlcState, expiry_height: i32) -> InvoiceHtlc {
+        InvoiceHtlc {
+            state: state as i32,
+            expiry_height,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn earliest_accepted_htlc_expiry_takes_the_soonest_accepted_one() {
+        // A multi-part payment lives only as long as its earliest part.
+        let htlcs = [
+            htlc(InvoiceHtlcState::Accepted, 900_100),
+            htlc(InvoiceHtlcState::Accepted, 900_050),
+            htlc(InvoiceHtlcState::Accepted, 900_200),
+        ];
+        assert_eq!(earliest_accepted_htlc_expiry(&htlcs), Some(900_050));
+    }
+
+    #[test]
+    fn earliest_accepted_htlc_expiry_ignores_resolved_htlcs() {
+        // Settled and canceled HTLCs hold nothing; a sooner expiry on one of
+        // them must not shorten the deadline of the escrow that is still live.
+        let htlcs = [
+            htlc(InvoiceHtlcState::Canceled, 800_000),
+            htlc(InvoiceHtlcState::Settled, 810_000),
+            htlc(InvoiceHtlcState::Accepted, 900_000),
+        ];
+        assert_eq!(earliest_accepted_htlc_expiry(&htlcs), Some(900_000));
+    }
+
+    #[test]
+    fn earliest_accepted_htlc_expiry_is_none_without_a_live_htlc() {
+        assert_eq!(earliest_accepted_htlc_expiry(&[]), None);
+        let resolved = [htlc(InvoiceHtlcState::Canceled, 900_000)];
+        assert_eq!(earliest_accepted_htlc_expiry(&resolved), None);
+    }
+
+    #[test]
+    fn earliest_accepted_htlc_expiry_skips_negative_heights() {
+        // `expiry_height` is an int32 on the wire: a negative value is not a
+        // block height and must not wrap into a far-future u32.
+        let htlcs = [
+            htlc(InvoiceHtlcState::Accepted, -1),
+            htlc(InvoiceHtlcState::Accepted, 900_000),
+        ];
+        assert_eq!(earliest_accepted_htlc_expiry(&htlcs), Some(900_000));
     }
 
     #[tokio::test]

@@ -33,66 +33,22 @@ gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.18.1
-
-### 🚀 Features
-
-
-* feat(nip33): advertise pow_first_contact in the info event by [@grunch](https://github.com/grunch) in [#847](https://github.com/MostroP2P/mostro/pull/847)
-* feat: add Nostr trusted-node price provider (#697) by [@ToRyVand](https://github.com/ToRyVand) in [#841](https://github.com/MostroP2P/mostro/pull/841)
-* feat(cashu): add_cashu_escrow_action lock handler — Track A TA-1 by [@grunch](https://github.com/grunch) in [#829](https://github.com/MostroP2P/mostro/pull/829)
-* feat: cashu boot + run_cashu + dispatch seam — Cashu foundation CF-5 by [@grunch](https://github.com/grunch) in [#828](https://github.com/MostroP2P/mostro/pull/828)
-* feat: cashu escrow DB helpers — Cashu foundation CF-4 by [@grunch](https://github.com/grunch) in [#797](https://github.com/MostroP2P/mostro/pull/797)
-* feat: CashuClient mint library (cdk 0.17.2) — Cashu foundation CF-2 by [@grunch](https://github.com/grunch) in [#798](https://github.com/MostroP2P/mostro/pull/798)
-* feat: cashu config + escrow mode — Cashu foundation CF-1 by [@grunch](https://github.com/grunch) in [#796](https://github.com/MostroP2P/mostro/pull/796)
-
-### 🐛 Bug Fixes
-
-
-* fix: resubscribe hold invoices correctly across a restart by [@grunch](https://github.com/grunch) in [#853](https://github.com/MostroP2P/mostro/pull/853)
-* fix(deps): bump nostr to 0.44.6 for GHSA-hrqp-8w79-gwgw (NIP-44 DoS) by [@grunch](https://github.com/grunch) in [#846](https://github.com/MostroP2P/mostro/pull/846)
-* fix(restore-session): scrub Nostr keys from log lines by [@ToRyVand](https://github.com/ToRyVand) in [#835](https://github.com/MostroP2P/mostro/pull/835)
-* fix(lightning): don't panic the daemon on malformed preimage/hash (#804) by [@grunch](https://github.com/grunch) in [#821](https://github.com/MostroP2P/mostro/pull/821)
+## What's Changed in 0.18.2
 
 ### 💼 Other
 
 
-* Validate payout invoice network and bound final CLTV delta by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#861](https://github.com/MostroP2P/mostro/pull/861)
-* Harden LNURL fetches against SSRF and hangs by [@arkanoider](https://github.com/arkanoider) in [#858](https://github.com/MostroP2P/mostro/pull/858)
-* Harden nsec storage with SecretString and one-time key init by [@arkanoider](https://github.com/arkanoider) in [#772](https://github.com/MostroP2P/mostro/pull/772)
-* Reject non-counterparty senders in cooperative cancel by [@arkanoider](https://github.com/arkanoider) in [#851](https://github.com/MostroP2P/mostro/pull/851)
-* Add LUD-12 comment to dev fee LNURL-pay calls by [@ToRyVand](https://github.com/ToRyVand) in [#820](https://github.com/MostroP2P/mostro/pull/820)
-
-### 🚜 Refactor
-
-
-* refactor: EscrowBackend seam — Cashu foundation CF-0 by [@grunch](https://github.com/grunch) in [#795](https://github.com/MostroP2P/mostro/pull/795)
-
-### 📚 Documentation
-
-
-* docs: add security policy by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#850](https://github.com/MostroP2P/mostro/pull/850)
-* docs: state the English-language convention explicitly by [@grunch](https://github.com/grunch) in [#822](https://github.com/MostroP2P/mostro/pull/822)
-
-### 🧪 Testing
-
-
-* test: raise line coverage 67%→93% + deep review findings by [@grunch](https://github.com/grunch) in [#803](https://github.com/MostroP2P/mostro/pull/803)
+* Fix stale buyer invoice overwrite by [@arkanoider](https://github.com/arkanoider) in [#865](https://github.com/MostroP2P/mostro/pull/865)
 
 ### ⚙️ Miscellaneous Tasks
 
 
-* ci: cashu test-mint harness — Cashu foundation CF-3 by [@grunch](https://github.com/grunch) in [#799](https://github.com/MostroP2P/mostro/pull/799)
-* ci: serve the coverage badge from our own Pages, drop Codecov by [@grunch](https://github.com/grunch) in [#824](https://github.com/MostroP2P/mostro/pull/824)
-* ci: publish the llvm-cov HTML report to Pages and Codecov by [@grunch](https://github.com/grunch) in [#823](https://github.com/MostroP2P/mostro/pull/823)
-* chore: add andreadiazcorreia to release verification instructions by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#802](https://github.com/MostroP2P/mostro/pull/802)
+* chore: migrate nostr-sdk to 0.45.1 by [@grunch](https://github.com/grunch) in [#867](https://github.com/MostroP2P/mostro/pull/867)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#853](https://github.com/MostroP2P/mostro/pull/853)
-* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#861](https://github.com/MostroP2P/mostro/pull/861)
-* [@arkanoider](https://github.com/arkanoider) made their contribution in [#858](https://github.com/MostroP2P/mostro/pull/858)
-* [@ToRyVand](https://github.com/ToRyVand) made their contribution in [#841](https://github.com/MostroP2P/mostro/pull/841)
+* [@grunch](https://github.com/grunch) made their contribution in [#867](https://github.com/MostroP2P/mostro/pull/867)
+* [@arkanoider](https://github.com/arkanoider) made their contribution in [#865](https://github.com/MostroP2P/mostro/pull/865)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.0...0.18.1
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.1...0.18.2
 
 <!-- generated by git-cliff -->

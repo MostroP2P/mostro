@@ -418,6 +418,12 @@ async fn cancel_pending_order_from_maker(
             )
             .await?;
             if !won {
+                crate::util::republish_winning_state_after_cas_miss(
+                    pool,
+                    my_keys,
+                    order_updated.id,
+                )
+                .await;
                 return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
             }
         }

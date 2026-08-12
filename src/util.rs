@@ -895,6 +895,38 @@ async fn get_ratings_for_pending_order(
     }
 }
 
+/// Best-effort repair of the relay view after a pre-trade CAS miss. The
+/// caller published its transition via `update_order_event` *before*
+/// learning it lost the race, so the newest replaceable event on relays
+/// contradicts the database (e.g. relays advertise `waiting-payment` for
+/// an order that is actually `canceled`). Republish the state that
+/// actually won so the orderbook converges. Never fails the caller: the
+/// database is already correct — this is only the advertised view.
+pub async fn republish_winning_state_after_cas_miss(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    order_id: Uuid,
+) {
+    let current = match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("cas miss repair: could not reload order {order_id}: {e}");
+            return;
+        }
+    };
+    match current.get_order_status() {
+        Ok(status) => {
+            if let Err(e) = update_order_event(my_keys, status, &current).await {
+                tracing::warn!(
+                    "cas miss repair: could not republish order {order_id} as {status}: {e}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("cas miss repair: order {order_id} has bad status: {e}"),
+    }
+}
+
 pub async fn update_order_event(
     keys: &Keys,
     status: Status,
@@ -1081,8 +1113,9 @@ pub async fn show_hold_invoice(
     // window while the hold invoice was being created at LND (e.g. a maker
     // cancel committed), persisting this snapshot would resurrect the row
     // and strand the invoice. On a miss, cancel the orphaned invoice and
-    // bail instead.
-    let won = db::cas_complete_pretrade_take(&pool, &order_updated).await?;
+    // bail instead. `waiting-buyer-invoice` stays an allowed source: the
+    // `add_invoice` caller legitimately arrives from it.
+    let won = db::cas_complete_pretrade_take(&pool, &order_updated, true).await?;
     if !won {
         if let Err(e) = ln_client.cancel_hold_invoice(&bytes_to_string(&hash)).await {
             tracing::warn!(
@@ -1090,6 +1123,7 @@ pub async fn show_hold_invoice(
                 order.id
             );
         }
+        republish_winning_state_after_cas_miss(&pool, my_keys, order.id).await;
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 

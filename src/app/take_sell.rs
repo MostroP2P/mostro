@@ -27,9 +27,18 @@ async fn update_order_status(
                     // Compare-and-swap the whole take-context transition:
                     // bail if the order left the pre-trade window (e.g. a
                     // maker cancel committed) instead of resurrecting it
-                    // with a stale full-row write.
-                    let won = crate::db::cas_complete_pretrade_take(pool, &order_updated).await?;
+                    // with a stale full-row write. `waiting-buyer-invoice`
+                    // is not a legitimate source here: only `add_invoice`
+                    // may drive a row out of that state.
+                    let won =
+                        crate::db::cas_complete_pretrade_take(pool, &order_updated, false).await?;
                     if !won {
+                        crate::util::republish_winning_state_after_cas_miss(
+                            pool,
+                            my_keys,
+                            order_updated.id,
+                        )
+                        .await;
                         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
                     }
                     Ok(())

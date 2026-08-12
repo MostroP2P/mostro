@@ -10,7 +10,6 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use mostro_core::db::Crud;
-use std::borrow::Cow;
 use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
@@ -32,25 +31,16 @@ async fn publish_dispute_event(
     // Create tags for the dispute event
     let tags = Tags::from_list(vec![
         // Status tag - indicates the current state of the dispute
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("s")),
-            vec![dispute.status.to_string()],
-        ),
+        Tag::custom("s", vec![dispute.status.to_string()]),
         // Who is the dispute creator
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("initiator")),
-            vec![initiator.to_string()],
-        ),
+        Tag::custom("initiator", vec![initiator.to_string()]),
         // Application identifier tag
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
         ),
         // Event type tag
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["dispute".to_string()],
-        ),
+        Tag::custom("z", vec!["dispute".to_string()]),
     ]);
 
     // Create a new NIP-33 replaceable event (kind 38386 for disputes)
@@ -295,22 +285,13 @@ pub async fn close_dispute_after_user_resolution(
 
             // Publish updated dispute event to Nostr so admin clients see it as resolved
             let tags = Tags::from_list(vec![
+                Tag::custom("s", vec![new_status.to_string()]),
+                Tag::custom("initiator", vec![dispute_initiator.to_string()]),
                 Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("s")),
-                    vec![new_status.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("initiator")),
-                    vec![dispute_initiator.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("y")),
+                    "y",
                     create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
                 ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("z")),
-                    vec!["dispute".to_string()],
-                ),
+                Tag::custom("z", vec!["dispute".to_string()]),
             ]);
 
             match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
@@ -338,7 +319,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::config::MESSAGE_QUEUES;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

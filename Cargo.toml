@@ -45,7 +45,9 @@ mutants = "0.0.3" # For #[mutants::skip] annotations
 chrono = "0.4.35"
 easy-hasher = "2.2.1"
 lightning-invoice = { version = "0.33.1", features = ["std"] }
-nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
+nostr = { version = "0.45.1" }
+nostr-sdk = { version = "0.45.1" }
+rand = "0.8"
 serde = { version = "1.0.210" }
 toml = "0.9.5"
 serde_json = "1.0.128"
@@ -69,7 +71,7 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.14.1", features = ["sqlx"] }
+mostro-core = { version = "0.14.3", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"
@@ -86,6 +88,7 @@ tonic = "0.14.2"
 prost = "0.14.1"
 tonic-prost = "0.14.1"
 cdk = { version = "0.17.2", default-features = false, features = ["wallet"] }
+secp256k1 = { version = "0.30", features = ["serde"] }
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = "1.8"
 
@@ -94,7 +97,7 @@ tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }
 axum = "0.8.4"
 tower-http = { version = "0.6.6", features = ["cors"] }
 bech32 = "0.11.0"
-nostr-relay-builder = "0.44.1"
+nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.1"

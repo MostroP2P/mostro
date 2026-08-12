@@ -10,7 +10,7 @@ use crate::rpc::admin::{
 };
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::nip59::UnwrappedMessage;
-use nostr_sdk::Keys;
+use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,7 +49,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_cancel::admin_cancel_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::Timestamp;
+        use nostr_sdk::prelude::Timestamp;
         use uuid::Uuid;
 
         // Create a mock message for the admin cancel action
@@ -111,7 +111,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_settle::admin_settle_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::Timestamp;
+        use nostr_sdk::prelude::Timestamp;
         use uuid::Uuid;
 
         let msg = Message::new_order(
@@ -166,7 +166,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_add_solver::admin_add_solver_action;
         use mostro_core::message::{Action, Message, Payload};
-        use nostr_sdk::Timestamp;
+        use nostr_sdk::prelude::Timestamp;
 
         let msg = Message::new_dispute(
             None,
@@ -219,7 +219,7 @@ impl AdminServiceImpl {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::app::admin_take_dispute::admin_take_dispute_action;
         use mostro_core::message::{Action, Message};
-        use nostr_sdk::Timestamp;
+        use nostr_sdk::prelude::Timestamp;
         use uuid::Uuid;
 
         let msg = Message::new_dispute(
@@ -504,7 +504,7 @@ mod tests {
     use crate::app::context::test_utils::test_settings;
     use crate::config::MOSTRO_CONFIG;
     use crate::rpc::admin::{GetVersionRequest, ValidateDbPasswordRequest};
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tonic::transport::server::TcpConnectInfo;

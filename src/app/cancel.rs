@@ -702,7 +702,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use mostro_core::db::Crud;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

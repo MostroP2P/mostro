@@ -1,7 +1,6 @@
 use crate::app::context::AppContext;
 use crate::util::{enqueue_order_msg, get_user_orders_by_id};
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::*;
 
 // Handle orders action
 pub async fn orders_action(
@@ -62,7 +61,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use mostro_core::db::Crud;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, PublicKey, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use uuid::Uuid;

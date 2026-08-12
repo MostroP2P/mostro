@@ -5,10 +5,9 @@ use crate::lightning::LnStatus;
 use crate::util::{get_expiration_timestamp_for_kind, get_keys};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
-use nostr::event::builder::Error;
+use nostr::error::Error;
 use nostr_sdk::prelude::*;
 use serde_json::json;
-use std::borrow::Cow;
 use std::vec;
 
 /// Internal helper function to create a NIP-33 replaceable event with a specific kind
@@ -23,10 +22,10 @@ fn create_event(
     tags.push(Tag::identifier(identifier));
 
     // Add NIP-40 expiration tag if configured and not already provided.
-    let has_expiration_tag = tags.iter().chain(extra_tags.iter()).any(|t| {
-        matches!(t.kind(), TagKind::Expiration)
-            || (matches!(t.kind(), TagKind::Custom(ref c) if c == "expiration"))
-    });
+    let has_expiration_tag = tags
+        .iter()
+        .chain(extra_tags.iter())
+        .any(|t| t.kind() == "expiration");
     if !has_expiration_tag {
         if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(kind) {
             tags.push(Tag::expiration(Timestamp::from(
@@ -38,9 +37,9 @@ fn create_event(
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 
-    EventBuilder::new(nostr::Kind::Custom(kind), content)
+    EventBuilder::new(nostr::event::Kind::Custom(kind), content)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
 }
 
 /// Creates a new order event (kind 38383)
@@ -164,8 +163,8 @@ pub fn new_dispute_event(
 /// wrapper.insert("BTC".to_string(), bitcoin_prices.clone());
 /// let content = serde_json::to_string(&wrapper)?;
 /// let tags = Tags::from_list(vec![
-///     Tag::custom(TagKind::Custom("published_at".into()), vec![timestamp.to_string()]),
-///     Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+///     Tag::custom("published_at", vec![timestamp.to_string()]),
+///     Tag::custom("source", vec!["yadio".to_string()]),
 ///     Tag::expiration(Timestamp::from(expiration)),
 /// ]);
 /// let event = new_exchange_rates_event(&keys, &content, tags)?;
@@ -407,72 +406,39 @@ pub fn order_to_tags(
             .map(|s| s.to_string())
             .collect();
         let mut tags: Vec<Tag> = vec![
+            Tag::custom("k", vec![order.kind.to_string()]),
+            Tag::custom("f", vec![order.fiat_code.to_string()]),
+            Tag::custom("s", vec![status.to_string()]),
+            Tag::custom("amt", vec![order.amount.to_string()]),
+            Tag::custom("fa", create_fiat_amt_array(order)),
+            Tag::custom("pm", payment_method),
+            Tag::custom("premium", vec![order.premium.to_string()]),
+            Tag::custom("network", vec![ln_network]),
+            Tag::custom("layer", vec!["lightning".to_string()]),
+            Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("k")),
-                vec![order.kind.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("f")),
-                vec![order.fiat_code.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("s")),
-                vec![status.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("amt")),
-                vec![order.amount.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("fa")),
-                create_fiat_amt_array(order),
-            ),
-            Tag::custom(TagKind::Custom(Cow::Borrowed("pm")), payment_method),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("premium")),
-                vec![order.premium.to_string()],
-            ),
-            Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("layer")),
-                vec!["lightning".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("expires_at")),
-                vec![order.expires_at.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("expiration")),
+                "expiration",
                 vec![get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
                     .expect("expiration is always defined for order events")
                     .to_string()],
             ),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(Settings::get_mostro().name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["order".to_string()],
-            ),
+            Tag::custom("z", vec!["order".to_string()]),
         ];
 
         // Add reputation data if available
         if reputation_data.is_some() {
             tags.insert(
                 RATING_TAG_INDEX,
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("rating")),
-                    vec![create_rating_tag(reputation_data)],
-                ),
+                Tag::custom("rating", vec![create_rating_tag(reputation_data)]),
             );
         }
         // Add source tag if available
         if let Some(source) = mostro_link {
-            tags.insert(
-                SOURCE_TAG_INDEX,
-                Tag::custom(TagKind::Custom(Cow::Borrowed("source")), vec![source]),
-            );
+            tags.insert(SOURCE_TAG_INDEX, Tag::custom("source", vec![source]));
         }
         Ok(Some(Tags::from_list(tags)))
     } else {
@@ -528,45 +494,36 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 
     let mut tags_vec: Vec<Tag> = vec![
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_version")),
+            "mostro_version",
             vec![env!("CARGO_PKG_VERSION").to_string()],
         ),
+        Tag::custom("mostro_commit_hash", vec![env!("GIT_HASH").to_string()]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_commit_hash")),
-            vec![env!("GIT_HASH").to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("max_order_amount")),
+            "max_order_amount",
             vec![mostro_settings.max_order_amount.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("min_order_amount")),
+            "min_order_amount",
             vec![mostro_settings.min_payment_amount.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration_hours")),
+            "expiration_hours",
             vec![mostro_settings.expiration_hours.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration_seconds")),
+            "expiration_seconds",
             vec![mostro_settings.expiration_seconds.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fiat_currencies_accepted")),
+            "fiat_currencies_accepted",
             vec![mostro_settings.fiat_currencies_accepted.join(",")],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("max_orders_per_response")),
+            "max_orders_per_response",
             vec![mostro_settings.max_orders_per_response.to_string()],
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fee")),
-            vec![mostro_settings.fee.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pow")),
-            vec![mostro_settings.pow.to_string()],
-        ),
+        Tag::custom("fee", vec![mostro_settings.fee.to_string()]),
+        Tag::custom("pow", vec![mostro_settings.pow.to_string()]),
         // Companion of `pow` for the Phase 2 anti-spam gate: the difficulty an
         // event from a sender that is *not* in the active-trade cache must
         // clear. Advertised as an already-resolved absolute difficulty so a
@@ -580,65 +537,38 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         // its first accepted event and its follow-ups must carry the same
         // work. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pow_first_contact")),
+            "pow_first_contact",
             vec![advertised_first_contact_pow(mostro_settings).to_string()],
         ),
         // Capability advertisement: which Mostro protocol version this node
         // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
         // `transport` setting so clients pick the right wire format before
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("protocol_version")),
-            vec![protocol_version.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hold_invoice_expiration_window")),
+            "hold_invoice_expiration_window",
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hold_invoice_cltv_delta")),
+            "hold_invoice_cltv_delta",
             vec![ln_settings.hold_invoice_cltv_delta.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("invoice_expiration_window")),
+            "invoice_expiration_window",
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),
+        Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
+        Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
+        Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
+        Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
+        Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
+        Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
+        Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_version")),
-            vec![ln_status.version.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_node_pubkey")),
-            vec![ln_status.node_pubkey.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_commit_hash")),
-            vec![ln_status.commit_hash.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_node_alias")),
-            vec![ln_status.node_alias.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_chains")),
-            vec![ln_status.chains.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_networks")),
-            vec![ln_status.networks.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_uris")),
-            vec![ln_status.uris.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["info".to_string()],
-        ),
+        Tag::custom("z", vec!["info".to_string()]),
     ];
 
     tags_vec.extend(bond_policy_tags(bond_settings));
@@ -664,10 +594,7 @@ fn bond_policy_tags(
 ) -> Vec<Tag> {
     let mut tags = Vec::with_capacity(7);
     let bond_enabled = bond_settings.is_some_and(|b| b.enabled);
-    tags.push(Tag::custom(
-        TagKind::Custom(Cow::Borrowed("bond_enabled")),
-        vec![bond_enabled.to_string()],
-    ));
+    tags.push(Tag::custom("bond_enabled", vec![bond_enabled.to_string()]));
     if let Some(bond) = bond_settings {
         if bond.enabled {
             let apply_to_str = match bond.apply_to {
@@ -676,27 +603,24 @@ fn bond_policy_tags(
                 BondApplyTo::Both => "both",
             };
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_amount_pct")),
+                "bond_amount_pct",
                 vec![bond.amount_pct.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_base_amount_sats")),
+                "bond_base_amount_sats",
                 vec![bond.base_amount_sats.to_string()],
             ));
+            tags.push(Tag::custom("bond_apply_to", vec![apply_to_str.to_string()]));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_apply_to")),
-                vec![apply_to_str.to_string()],
-            ));
-            tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_slash_on_waiting_timeout")),
+                "bond_slash_on_waiting_timeout",
                 vec![bond.slash_on_waiting_timeout.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_slash_node_share_pct")),
+                "bond_slash_node_share_pct",
                 vec![bond.slash_node_share_pct.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_payout_claim_window_days")),
+                "bond_payout_claim_window_days",
                 vec![bond.payout_claim_window_days.to_string()],
             ));
         }
@@ -714,7 +638,6 @@ mod tests {
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
     use nostr_sdk::prelude::*;
-    use std::borrow::Cow;
 
     // ── Shared test helpers ──────────────────────────────────────────────────────
 
@@ -1139,22 +1062,13 @@ mod tests {
         init_test_settings();
 
         let tags = Tags::from_list(vec![
+            Tag::custom("s", vec!["initiated-by-buyer".to_string()]),
+            Tag::custom("initiator", vec!["buyer".to_string()]),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("s")),
-                vec!["initiated-by-buyer".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("initiator")),
-                vec!["buyer".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(test_settings().mostro.name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["dispute".to_string()],
-            ),
+            Tag::custom("z", vec!["dispute".to_string()]),
         ]);
 
         let y_values = get_y_tag_values(&tags)
@@ -1182,33 +1096,18 @@ mod tests {
 
         let tags = Tags::from_list(vec![
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("order-id")),
+                "order-id",
                 vec!["00000000-0000-0000-0000-000000000000".to_string()],
             ),
+            Tag::custom("amount", vec!["300".to_string()]),
+            Tag::custom("hash", vec!["deadbeef".to_string()]),
+            Tag::custom("destination", vec!["dev@lightning.address".to_string()]),
+            Tag::custom("network", vec!["mainnet".to_string()]),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("amount")),
-                vec!["300".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("hash")),
-                vec!["deadbeef".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("destination")),
-                vec!["dev@lightning.address".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("network")),
-                vec!["mainnet".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(test_settings().mostro.name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["dev-fee-payment".to_string()],
-            ),
+            Tag::custom("z", vec!["dev-fee-payment".to_string()]),
         ]);
 
         let y_values = get_y_tag_values(&tags)
@@ -1245,10 +1144,7 @@ mod tests {
             super::new_info_event(&keys, "", "mostro-pk".to_string(), tags.clone()).expect("info");
         assert_eq!(info.kind.as_u16(), NOSTR_INFO_EVENT_KIND);
         assert!(
-            !info
-                .tags
-                .iter()
-                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            !info.tags.iter().any(|t| t.kind() == "expiration"),
             "info events must not carry an expiration tag"
         );
 
@@ -1271,10 +1167,7 @@ mod tests {
 
         // Order events DO get an expiration tag from configuration.
         assert!(
-            order
-                .tags
-                .iter()
-                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            order.tags.iter().any(|t| t.kind() == "expiration"),
             "order events must carry an expiration tag"
         );
     }

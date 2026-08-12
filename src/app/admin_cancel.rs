@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::str::FromStr;
 
 use crate::app::bond::{self, BondSlashReason};
@@ -142,23 +141,14 @@ pub async fn admin_cancel_action(
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // We create a tag to show status of the dispute
         let tags: Tags = Tags::from_list(vec![
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("s")),
-                vec![DisputeStatus::SellerRefunded.to_string()],
-            ),
+            Tag::custom("s", vec![DisputeStatus::SellerRefunded.to_string()]),
             // Who is the dispute creator
+            Tag::custom("initiator", vec![dispute_initiator]),
             Tag::custom(
-                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-                vec![dispute_initiator],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["dispute".to_string()],
-            ),
+            Tag::custom("z", vec!["dispute".to_string()]),
         ]);
         // nip33 kind with dispute id as identifier (kind 38386 for disputes)
         let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)

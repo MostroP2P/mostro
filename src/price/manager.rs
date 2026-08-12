@@ -538,11 +538,8 @@ impl PriceManager {
         let expiration_seconds = std::cmp::min(self.settings.update_interval_seconds * 2, 3600);
         let expiration = timestamp + expiration_seconds as i64;
         let tags = Tags::from_list(vec![
-            Tag::custom(
-                TagKind::Custom("published_at".into()),
-                vec![timestamp.to_string()],
-            ),
-            Tag::custom(TagKind::Custom("source".into()), vec![source_tag]),
+            Tag::custom("published_at", vec![timestamp.to_string()]),
+            Tag::custom("source", vec![source_tag]),
             Tag::expiration(Timestamp::from(expiration as u64)),
         ]);
 

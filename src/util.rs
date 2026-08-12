@@ -1089,10 +1089,21 @@ pub async fn show_hold_invoice(
     let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    order_updated
-        .update(&pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // Compare-and-swap the escrow storage: if the order left the pre-trade
+    // window while the hold invoice was being created at LND (e.g. a maker
+    // cancel committed), persisting this snapshot would resurrect the row
+    // and strand the invoice. On a miss, cancel the orphaned invoice and
+    // bail instead.
+    let won = db::cas_complete_pretrade_take(&pool, &order_updated).await?;
+    if !won {
+        if let Err(e) = ln_client.cancel_hold_invoice(&bytes_to_string(&hash)).await {
+            tracing::warn!(
+                "Order id {}: best-effort cancel of orphaned hold invoice failed: {e}",
+                order.id
+            );
+        }
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);

@@ -6,7 +6,6 @@ use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
     get_order, set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
 };
-use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
@@ -25,7 +24,14 @@ async fn update_order_status(
             // Update order status
             match update_order_event(my_keys, Status::WaitingBuyerInvoice, order).await {
                 Ok(order_updated) => {
-                    let _ = order_updated.update(pool).await;
+                    // Compare-and-swap the whole take-context transition:
+                    // bail if the order left the pre-trade window (e.g. a
+                    // maker cancel committed) instead of resurrecting it
+                    // with a stale full-row write.
+                    let won = crate::db::cas_complete_pretrade_take(pool, &order_updated).await?;
+                    if !won {
+                        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+                    }
                     Ok(())
                 }
                 Err(_) => Err(MostroInternalErr(ServiceError::UpdateOrderStatusError)),

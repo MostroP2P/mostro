@@ -402,13 +402,24 @@ async fn cancel_pending_order_from_maker(
     order
         .sent_from_maker(event.sender)
         .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
-    // Publish a replaceable nostr event with updated status and persist it.
+    // Publish a replaceable nostr event with updated status and persist it
+    // with a compare-and-swap: a taker's take (or bond promotion) can commit
+    // while the cancel event is being published, and a stale full-row write
+    // would clobber the promoted taker context and escrow material — or
+    // resurrect the row the take just moved on from. Losing the CAS means
+    // the take won, so the cancel is too late.
     match update_order_event(my_keys, Status::Canceled, order).await {
         Ok(order_updated) => {
-            order_updated
-                .update(pool)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            let won = crate::db::cas_pretrade_order_status(
+                pool,
+                order_updated.id,
+                Status::Canceled,
+                &order_updated.event_id,
+            )
+            .await?;
+            if !won {
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
         }
         Err(e) => {
             return Err(MostroInternalErr(ServiceError::DbAccessError(
@@ -817,6 +828,95 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::IsNotYourOrder))
         ));
+    }
+
+    /// Regression test for the stale full-row write clobber: the maker's
+    /// cancel holds a pre-promotion snapshot (no taker context) while the
+    /// bond subscriber's promotion has already landed on the row. The
+    /// cancel must move `status`/`event_id` only — never NULL the promoted
+    /// columns.
+    #[tokio::test]
+    async fn pending_maker_cancel_preserves_concurrently_promoted_taker_context() {
+        set_global_config();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        // The maker's stale snapshot: read before the taker's bond locked.
+        let mut snapshot = create_pending_order(maker, taker);
+        snapshot.buyer_pubkey = None;
+        snapshot.master_buyer_pubkey = None;
+        let snapshot = snapshot.create(&pool).await.unwrap();
+
+        // Externally apply what the bond subscriber's promotion writes
+        // (status still pre-trade: the escrow is not stored yet).
+        sqlx::query(
+            "UPDATE orders SET status = 'waiting-taker-bond', buyer_pubkey = ?1, \
+             master_buyer_pubkey = ?2 WHERE id = ?3",
+        )
+        .bind(taker.to_string())
+        .bind(taker.to_string())
+        .bind(snapshot.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut stale = snapshot.clone();
+        cancel_pending_order_from_maker(&pool, &event, &mut stale, &Keys::generate(), None)
+            .await
+            .unwrap();
+
+        let after = Order::by_id(&pool, snapshot.id).await.unwrap().unwrap();
+        assert_eq!(after.status, Status::Canceled.to_string());
+        assert_eq!(
+            after.buyer_pubkey.as_deref(),
+            Some(taker.to_string().as_str()),
+            "the promoted taker context must survive the maker's cancel"
+        );
+        assert_eq!(
+            after.master_buyer_pubkey.as_deref(),
+            Some(taker.to_string().as_str())
+        );
+    }
+
+    /// The mirror image: once the take committed past the pre-trade window
+    /// (escrow stored, `waiting-payment`), the maker's pending-cancel must
+    /// lose instead of reverting the row.
+    #[tokio::test]
+    async fn pending_maker_cancel_loses_once_the_take_committed() {
+        set_global_config();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+        let snapshot = create_pending_order(maker, taker)
+            .create(&pool)
+            .await
+            .unwrap();
+        // The take committed: escrow stored, status moved on.
+        sqlx::query("UPDATE orders SET status = 'waiting-payment', hash = ?1 WHERE id = ?2")
+            .bind("ab".repeat(32))
+            .bind(snapshot.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut stale = snapshot.clone();
+        let result =
+            cancel_pending_order_from_maker(&pool, &event, &mut stale, &Keys::generate(), None)
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        let after = Order::by_id(&pool, snapshot.id).await.unwrap().unwrap();
+        assert_eq!(after.status, Status::WaitingPayment.to_string());
+        assert_eq!(after.hash.as_deref(), Some("ab".repeat(32).as_str()));
     }
 
     /// Phase 1 fix: a taker who took a `Pending` order but hasn't paid

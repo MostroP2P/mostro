@@ -1336,8 +1336,11 @@ pub async fn settle_seller_hold_invoice(
 }
 
 /// Nominal seconds per block for CLTV-horizon math (10 min). Bitcoin's
-/// long-run average; the configured safety margin absorbs short-run
-/// variance, so the daemon always acts *before* LND's auto-cancel.
+/// long-run average. Time-based deadlines derived from it are only an
+/// approximation of the real, block-height-measured CLTV horizon — the
+/// escrow-deadline guardian consults the chain height and the accepted
+/// HTLC's actual expiry height when LND can answer, and falls back to
+/// this nominal clock only when it cannot.
 const SECS_PER_BLOCK: i64 = 600;
 
 /// Seconds between the escrow payment and the moment the deadline
@@ -1358,23 +1361,12 @@ pub fn escrow_guard_window_secs(cltv_delta_blocks: u32, margin_blocks: u32) -> i
     i64::from(cltv_delta_blocks - effective_margin) * SECS_PER_BLOCK
 }
 
-/// Unix timestamp at which the order's trade escrow is gone for sure:
-/// LND auto-cancels an accepted hold invoice `invoices.holdexpirydelta`
-/// blocks before the HTLC expires, and a compliant sender sets that
-/// expiry at least `hold_invoice_cltv_delta` blocks after the HTLC
-/// locked in (`invoice_held_at`). A larger sender-chosen delta only
-/// moves this later, so the value is a safe lower bound. `None` when
-/// `invoice_held_at` is 0 (escrow never observed — nothing to protect).
-pub fn escrow_hard_deadline_unix(invoice_held_at: i64, cltv_delta_blocks: u32) -> Option<i64> {
-    if invoice_held_at == 0 {
-        return None;
-    }
-    Some(invoice_held_at + i64::from(cltv_delta_blocks) * SECS_PER_BLOCK)
-}
-
 /// Unix timestamp from which the escrow-deadline guardian acts on an
-/// order: the hard deadline minus the safety margin. `None` when
-/// `invoice_held_at` is 0.
+/// order when no chain view is available: the nominal CLTV horizon minus
+/// the safety margin, measured in 10-minute blocks from the moment the
+/// escrow was observed (`invoice_held_at`). Only a fallback — the real
+/// deadline is the accepted HTLC's expiry height vs the chain tip.
+/// `None` when `invoice_held_at` is 0 (escrow never observed).
 pub fn escrow_action_deadline_unix(
     invoice_held_at: i64,
     cltv_delta_blocks: u32,
@@ -2908,8 +2900,6 @@ mod tests {
         // never firing on brand-new escrows.
         assert_eq!(escrow_guard_window_secs(144, 144), 43_200);
         assert_eq!(escrow_guard_window_secs(144, 1_000), 43_200);
-        assert_eq!(escrow_hard_deadline_unix(0, 144), None);
-        assert_eq!(escrow_hard_deadline_unix(1_000, 144), Some(1_000 + 86_400));
         assert_eq!(escrow_action_deadline_unix(0, 144, 24), None);
         assert_eq!(
             escrow_action_deadline_unix(1_000, 144, 24),

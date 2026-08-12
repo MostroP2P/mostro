@@ -197,9 +197,12 @@ pub async fn hold_invoice_settlement(hash: &str, pool: &SqlitePool) -> Result<()
 /// guardian job could not act — e.g. the daemon was down past the
 /// horizon and this is the restart replay). To avoid misreading an
 /// in-flight *intentional* cancel as an evaporation, the alarm only
-/// fires once the order is past the guardian's action deadline
+/// fires once the order is past the guardian's nominal action deadline
 /// ([`crate::util::escrow_action_deadline_unix`]); before that, an
-/// escrow-backed cancel is treated as intentional and only logged.
+/// escrow-backed cancel is treated as intentional and only logged. This
+/// gate is a wall-clock approximation of the block-height horizon (no
+/// LND handle here to consult the chain); the guardian job is the
+/// height-accurate layer and normally acts first.
 ///
 /// Past the deadline:
 ///

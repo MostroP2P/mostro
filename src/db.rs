@@ -2157,6 +2157,8 @@ mod tests {
         // Due: escrow-backed states observed paid before the cutoff.
         insert_order(&pool, "active", cutoff - 1, true).await;
         insert_order(&pool, "fiat-sent", cutoff - 1, true).await;
+        // Due: exactly at the cutoff — the bound is inclusive.
+        insert_order(&pool, "active", cutoff, true).await;
         // Not due: inside the window still.
         insert_order(&pool, "active", cutoff + 1, true).await;
         // Excluded: a dispute already has a solver in the loop.
@@ -2172,7 +2174,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.len(),
-            2,
+            3,
             "only due active/fiat-sent orders with a hash qualify: {result:?}"
         );
         assert!(result

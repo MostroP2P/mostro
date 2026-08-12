@@ -22,11 +22,12 @@ payment_retries_interval = 60
 max_final_cltv_expiry_delta = 432
 # Safety margin (in blocks) before the hold invoice's CLTV horizon. LND
 # auto-cancels an accepted hold invoice `invoices.holdexpirydelta` blocks
-# (default 12) before its HTLC expires, refunding the seller; at
-# hold_invoice_cltv_delta - escrow_deadline_margin_blocks blocks after the
-# escrow was paid, mostrod cancels the trade (Active) or opens a dispute
-# (FiatSent) while the escrow still exists. Must comfortably exceed your
-# node's holdexpirydelta.
+# (default 12) before its HTLC expires, refunding the seller; once the
+# chain tip is within escrow_deadline_margin_blocks of the accepted
+# HTLC's expiry height (nominal 10-minute-block clock as fallback when
+# LND cannot answer), mostrod cancels the trade (Active) or opens a
+# dispute (FiatSent) while the escrow still exists. Must comfortably
+# exceed your node's holdexpirydelta.
 escrow_deadline_margin_blocks = 24
 
 [nostr]

@@ -317,10 +317,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(
-                result,
-                Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
-            ),
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
             "stale write must be rejected as NotAllowedByStatus: {result:?}"
         );
         let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();

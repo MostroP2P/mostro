@@ -1266,15 +1266,63 @@ async fn has_pending_order_with_status(
     Ok(exists)
 }
 
-pub async fn update_user_rating(
-    pool: &SqlitePool,
+/// Claim the buyer or seller rating slot on an order (CAS).
+///
+/// Updates **only** the applicable unset flag and leaves the other untouched.
+/// Buyer claims require `status = success`; seller claims allow `success` or
+/// `settled-hold-invoice`.
+///
+/// Returns `Ok(true)` when this caller won the claim, or `Ok(false)` when the
+/// flag was already set or the order left the eligible status window.
+pub async fn claim_order_rating_flag(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    order_id: Uuid,
+    buyer_side: bool,
+) -> Result<bool, MostroError> {
+    let result = if buyer_side {
+        sqlx::query(
+            "UPDATE orders SET buyer_sent_rate = 1 \
+             WHERE id = ? AND buyer_sent_rate = 0 AND status = ?",
+        )
+        .bind(order_id)
+        .bind(Status::Success.to_string())
+        .execute(&mut **tx)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE orders SET seller_sent_rate = 1 \
+             WHERE id = ? AND seller_sent_rate = 0 AND status IN (?, ?)",
+        )
+        .bind(order_id)
+        .bind(Status::Success.to_string())
+        .bind(Status::SettledHoldInvoice.to_string())
+        .execute(&mut **tx)
+        .await
+    }
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// Persist a user's aggregate rating columns.
+///
+/// `executor` may be a pool or an open transaction — callers that claim an
+/// order rating flag in the same transaction should pass `&mut *tx` so the
+/// flag claim and this write commit or roll back together.
+///
+/// Returns `Ok(true)` when a matching `users` row was updated.
+pub async fn update_user_rating<'e, E>(
+    executor: E,
     public_key: String,
     last_rating: i64,
     min_rating: i64,
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
-) -> Result<bool, MostroError> {
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
@@ -1309,7 +1357,7 @@ pub async fn update_user_rating(
     .bind(total_reviews)
     .bind(total_rating)
     .bind(public_key)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -3312,6 +3360,47 @@ mod tests {
             other_idx.0, 77,
             "other user's last_trade_index must not change"
         );
+    }
+
+    #[tokio::test]
+    async fn claim_order_rating_flag_sets_only_the_claimed_side() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                amount, fiat_code, fiat_amount, created_at, expires_at,
+                failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                buyer_sent_rate, seller_sent_rate)
+            VALUES (?1, 'sell', 'ev', 'success', 0, 'lightning',
+                    1000, 'USD', 10, 1, 2,
+                    0, 0, 0, 0,
+                    0, 1)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let won = super::claim_order_rating_flag(&mut tx, id, true)
+            .await
+            .unwrap();
+        assert!(won, "buyer claim must succeed while flag is unset");
+        // Second claim in the same tx must lose — flag already set.
+        let lost = super::claim_order_rating_flag(&mut tx, id, true)
+            .await
+            .unwrap();
+        assert!(!lost, "duplicate buyer claim must lose the CAS");
+        tx.commit().await.unwrap();
+
+        let row: (bool, bool) =
+            sqlx::query_as("SELECT buyer_sent_rate, seller_sent_rate FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0, "buyer_sent_rate must be claimed");
+        assert!(row.1, "seller_sent_rate must be preserved");
     }
 
     #[tokio::test]

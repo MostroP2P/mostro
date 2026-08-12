@@ -13,12 +13,25 @@ pub async fn pay_new_invoice(
     pool: &Pool<Sqlite>,
     msg: &Message,
 ) -> Result<(), MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET buyer_invoice = ?, payment_attempts = 0 WHERE id = ? AND status = ?",
+    )
+    .bind(&order.buyer_invoice)
+    .bind(order.id)
+    .bind(Status::SettledHoldInvoice.to_string())
+    .execute(pool)
+    .await
+    .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "Ignoring stale buyer invoice update for order {}: row no longer in settled-hold-invoice",
+            order.id
+        );
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
     order.payment_attempts = 0;
-    order
-        .clone()
-        .update(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     enqueue_order_msg(
         msg.get_inner_message_kind().request_id,
         Some(order.id),
@@ -266,6 +279,43 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
         ));
+    }
+
+    /// A stale `SettledHoldInvoice` write must be rejected when the order has
+    /// already moved on to a new status. This is the race behind the double-pay
+    /// issue: a late full-row write must not overwrite newer state.
+    #[tokio::test]
+    async fn pay_new_invoice_rejects_stale_settled_hold_invoice_update() {
+        let pool = setup_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = waiting_invoice_sell_order(seller, buyer);
+        order.status = Status::Active.to_string();
+        order.payment_attempts = 7;
+        order.buyer_invoice = Some("lnbc-old".to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let mut stale_order = order.clone();
+        stale_order.status = Status::SettledHoldInvoice.to_string();
+        stale_order.buyer_invoice = Some("lnbc-stale".to_string());
+        stale_order.payment_attempts = 0;
+
+        let result = pay_new_invoice(&mut stale_order, &pool, &Message::new_order(
+            Some(order.id),
+            Some(1),
+            None,
+            Action::AddInvoice,
+            None,
+        ))
+        .await;
+
+        assert!(result.is_err(), "stale write must be rejected");
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Active.to_string());
+        assert_eq!(stored.payment_attempts, 7, "newer state must remain intact");
+        assert_eq!(stored.buyer_invoice.as_deref(), Some("lnbc-old"));
+        assert!(!queued_actions_for(buyer).await.contains(&Action::InvoiceUpdated));
     }
 
     /// A `SettledHoldInvoice` order routes through `pay_new_invoice`: the

@@ -831,32 +831,20 @@ pub fn get_keys() -> Result<&'static Keys, MostroError> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Build and enqueue a replaceable rating event for `user` (NIP-33 kind 38384).
+///
+/// Callers must have already claimed the order's rating flag and persisted the
+/// aggregate user rating inside a committed transaction — this helper only
+/// publishes the Nostr side-effect after that durable claim. It does not write
+/// `buyer_sent_rate` / `seller_sent_rate`.
 pub async fn update_user_rating_event(
     user: &str,
-    buyer_sent_rate: bool,
-    seller_sent_rate: bool,
     tags: Tags,
-    msg: &Message,
     keys: &Keys,
-    pool: &SqlitePool,
-) -> Result<()> {
-    // Get order from msg
-    let mut order = get_order(msg, pool).await?;
-
-    // nip33 kind with user as identifier (kind 38384 for ratings)
-    let event = new_rating_event(keys, "", user.to_string(), tags)?;
+) -> Result<(), MostroError> {
+    let event = new_rating_event(keys, "", user.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Sending replaceable event: {event:#?}");
-    // We update the order vote status
-    if buyer_sent_rate {
-        order.buyer_sent_rate = buyer_sent_rate;
-    }
-    if seller_sent_rate {
-        order.seller_sent_rate = seller_sent_rate;
-    }
-    order.update(pool).await?;
-
-    // Add event message to global list
     MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
     Ok(())
 }

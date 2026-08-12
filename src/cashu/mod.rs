@@ -995,7 +995,7 @@ mod tests {
     fn odd_y_nostr_key_signs_for_derived_cashu_pubkey() {
         use cdk::nuts::nut00::Witness;
         use cdk::nuts::nut11::P2PKWitness;
-        use nostr_sdk::Keys;
+        use nostr_sdk::prelude::Keys;
 
         // Find a Nostr key whose secp256k1 point has odd-Y parity (`0x03`).
         let (keys, nut_sk) = loop {

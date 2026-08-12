@@ -72,7 +72,7 @@ use mostro_core::error::MostroError::MostroInternalErr;
 use mostro_core::error::ServiceError;
 use mostro_core::order::Order;
 use nostr_sdk::prelude::ToBech32;
-use nostr_sdk::{Keys, PublicKey};
+use nostr_sdk::prelude::{Keys, PublicKey};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
@@ -783,7 +783,7 @@ async fn check_dev_fee_payment_status(
         }
     };
 
-    use nostr_sdk::nostr::hashes::hex::FromHex;
+    use bitcoin::hashes::hex::FromHex;
     let payment_hash_bytes: Vec<u8> = match FromHex::from_hex(&payment_hash_str) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1529,7 +1529,7 @@ mod tests {
         verify_confirmed_orders,
     };
     use crate::lightning::LndConnector;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
 
     /// Real `LndConnector` against a dead endpoint: `connect` is lazy,
     /// so it always builds; every RPC fails in ~1ms with a transport

@@ -180,15 +180,11 @@ pub async fn update_user_reputation_action(
         user_to_vote.min_rating as u8,
         user_to_vote.max_rating as u8,
     )
-    .to_tags()
-    .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
+    .to_tags();
 
     let days = calculate_days_since_creation(user_to_vote.created_at);
     let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("days")),
-        vec![days.to_string()],
-    ));
+    tags.push(Tag::custom("days", vec![days.to_string()]));
     let reputation_event = Tags::from_list(tags);
 
     if buyer_rating || seller_rating {
@@ -227,7 +223,7 @@ mod tests {
     use mostro_core::db::Crud;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use uuid::Uuid;
 

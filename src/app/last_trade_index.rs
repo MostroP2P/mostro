@@ -100,7 +100,7 @@ pub async fn last_trade_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
 

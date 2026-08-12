@@ -264,23 +264,14 @@ pub async fn admin_take_dispute_action(
 
     // We create a tag to show status of the dispute
     let tags: Tags = Tags::from_list(vec![
-        Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("s")),
-            vec![Status::InProgress.to_string()],
-        ),
+        Tag::custom("s", vec![Status::InProgress.to_string()]),
         // Who is the dispute creator
+        Tag::custom("initiator", vec![dispute_initiator]),
         Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-            vec![dispute_initiator],
-        ),
-        Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
         ),
-        Tag::custom(
-            TagKind::Custom(std::borrow::Cow::Borrowed("z")),
-            vec!["dispute".to_string()],
-        ),
+        Tag::custom("z", vec!["dispute".to_string()]),
     ]);
     // nip33 kind with dispute id as identifier (kind 38386 for disputes)
     let event = new_dispute_event(mostro_keys, "", dispute.id.to_string(), tags)

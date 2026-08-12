@@ -5,7 +5,7 @@ use crate::config::constants::NSEC_ENV_VAR;
 use crate::config::types::NostrSettings;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
-use nostr_sdk::Keys;
+use nostr_sdk::prelude::Keys;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serializer;
 use zeroize::Zeroize;

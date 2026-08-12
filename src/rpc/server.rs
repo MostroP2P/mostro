@@ -3,7 +3,7 @@
 use crate::config::settings::Settings;
 use crate::lightning::LndConnector;
 use crate::rpc::service::AdminServiceImpl;
-use nostr_sdk::Keys;
+use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -104,7 +104,7 @@ mod tests {
 
     use crate::app::context::test_utils::test_settings;
     use crate::config::MOSTRO_CONFIG;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use std::sync::Arc;
 
     fn init_test_settings() {

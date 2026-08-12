@@ -1,4 +1,5 @@
 use crate::util::{enqueue_order_msg, notify_taker_reputation};
+use crate::Result;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -197,7 +198,7 @@ pub async fn hold_invoice_canceled(hash: &str, pool: &SqlitePool) -> Result<()> 
 mod tests {
     use super::*;
     use mostro_core::order::{Kind as OrderKind, Status};
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {

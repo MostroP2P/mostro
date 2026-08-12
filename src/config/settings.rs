@@ -8,7 +8,7 @@ use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use mostro_core::transport::Transport;
-use nostr_sdk::Keys;
+use nostr_sdk::prelude::Keys;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

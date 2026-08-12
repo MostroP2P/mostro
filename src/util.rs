@@ -1175,7 +1175,14 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                     }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool).await {
+                    let keys = match get_keys() {
+                        Ok(k) => k,
+                        Err(e) => {
+                            info!("Failed to get keys: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool, keys).await {
                         info!("Invoice flow error {e}");
                     }
                 } else {
@@ -1326,6 +1333,57 @@ pub async fn settle_seller_hold_invoice(
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
     Ok(())
+}
+
+/// Nominal seconds per block for CLTV-horizon math (10 min). Bitcoin's
+/// long-run average; the configured safety margin absorbs short-run
+/// variance, so the daemon always acts *before* LND's auto-cancel.
+const SECS_PER_BLOCK: i64 = 600;
+
+/// Seconds between the escrow payment and the moment the deadline
+/// guardian acts: `(cltv_delta - margin)` blocks. A misconfigured margin
+/// `>= cltv_delta` would make the guardian fire on brand-new escrows, so
+/// it is clamped to half the window (loudly) instead of being honored.
+pub fn escrow_guard_window_secs(cltv_delta_blocks: u32, margin_blocks: u32) -> i64 {
+    let effective_margin = if margin_blocks >= cltv_delta_blocks {
+        tracing::error!(
+            "escrow_deadline_margin_blocks ({margin_blocks}) must be below \
+             hold_invoice_cltv_delta ({cltv_delta_blocks}); clamping to half \
+             the window"
+        );
+        cltv_delta_blocks / 2
+    } else {
+        margin_blocks
+    };
+    i64::from(cltv_delta_blocks - effective_margin) * SECS_PER_BLOCK
+}
+
+/// Unix timestamp at which the order's trade escrow is gone for sure:
+/// LND auto-cancels an accepted hold invoice `invoices.holdexpirydelta`
+/// blocks before the HTLC expires, and a compliant sender sets that
+/// expiry at least `hold_invoice_cltv_delta` blocks after the HTLC
+/// locked in (`invoice_held_at`). A larger sender-chosen delta only
+/// moves this later, so the value is a safe lower bound. `None` when
+/// `invoice_held_at` is 0 (escrow never observed — nothing to protect).
+pub fn escrow_hard_deadline_unix(invoice_held_at: i64, cltv_delta_blocks: u32) -> Option<i64> {
+    if invoice_held_at == 0 {
+        return None;
+    }
+    Some(invoice_held_at + i64::from(cltv_delta_blocks) * SECS_PER_BLOCK)
+}
+
+/// Unix timestamp from which the escrow-deadline guardian acts on an
+/// order: the hard deadline minus the safety margin. `None` when
+/// `invoice_held_at` is 0.
+pub fn escrow_action_deadline_unix(
+    invoice_held_at: i64,
+    cltv_delta_blocks: u32,
+    margin_blocks: u32,
+) -> Option<i64> {
+    if invoice_held_at == 0 {
+        return None;
+    }
+    Some(invoice_held_at + escrow_guard_window_secs(cltv_delta_blocks, margin_blocks))
 }
 
 pub fn bytes_to_string(bytes: &[u8]) -> String {
@@ -2840,6 +2898,23 @@ mod tests {
             identity: trade.public_key(),
             created_at: Timestamp::now(),
         }
+    }
+
+    #[test]
+    fn escrow_deadline_math_matches_the_cltv_horizon() {
+        // 10-minute blocks: (144 - 24) * 600.
+        assert_eq!(escrow_guard_window_secs(144, 24), 72_000);
+        // A margin at/above the window clamps to half — never negative,
+        // never firing on brand-new escrows.
+        assert_eq!(escrow_guard_window_secs(144, 144), 43_200);
+        assert_eq!(escrow_guard_window_secs(144, 1_000), 43_200);
+        assert_eq!(escrow_hard_deadline_unix(0, 144), None);
+        assert_eq!(escrow_hard_deadline_unix(1_000, 144), Some(1_000 + 86_400));
+        assert_eq!(escrow_action_deadline_unix(0, 144, 24), None);
+        assert_eq!(
+            escrow_action_deadline_unix(1_000, 144, 24),
+            Some(1_000 + 72_000)
+        );
     }
 
     #[tokio::test]

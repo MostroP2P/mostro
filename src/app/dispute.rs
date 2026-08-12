@@ -17,7 +17,7 @@ use uuid::Uuid;
 ///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details,
 /// including status, initiator (`buyer` or `seller`), and application metadata.
-async fn publish_dispute_event(
+pub(crate) async fn publish_dispute_event(
     ctx: &AppContext,
     dispute: &Dispute,
     my_keys: &Keys,

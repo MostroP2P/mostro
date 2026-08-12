@@ -947,6 +947,40 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// Orders whose trade escrow is a paid hold invoice approaching the point
+/// where the daemon must act before LND does: LND auto-cancels an accepted
+/// hold invoice `invoices.holdexpirydelta` blocks before the HTLC's CLTV
+/// expiry, silently refunding the seller while the order still looks live.
+///
+/// `held_before` is a unix cutoff on `invoice_held_at` (written by
+/// [`crate::flow::hold_invoice_paid`] when the escrow was observed paid):
+/// rows at or before it are due. Only `active` / `fiat-sent` qualify —
+/// `dispute` already has a human solver in the loop (the reactive
+/// `hold_invoice_canceled` path raises the alarm there), and every other
+/// state has no live escrow to protect. `hash IS NOT NULL` because the
+/// guardian needs the payment hash to cancel the invoice proactively.
+pub async fn find_escrow_deadline_orders(
+    pool: &SqlitePool,
+    held_before: i64,
+) -> Result<Vec<Order>, MostroError> {
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE status IN ('active', 'fiat-sent')
+            AND invoice_held_at != 0
+            AND invoice_held_at <= ?1
+            AND hash IS NOT NULL
+        "#,
+    )
+    .bind(held_before)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -2090,6 +2124,60 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "rows without a hash must be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_find_escrow_deadline_orders_selects_only_due_escrows() {
+        async fn insert_order(pool: &SqlitePool, status: &str, held_at: i64, with_hash: bool) {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'sell', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, ?3, ?4)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(held_at)
+            .bind(if with_hash {
+                Some("aa".repeat(32))
+            } else {
+                None
+            })
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let pool = setup_orders_db().await.unwrap();
+        let cutoff = 1_700_100_000i64;
+
+        // Due: escrow-backed states observed paid before the cutoff.
+        insert_order(&pool, "active", cutoff - 1, true).await;
+        insert_order(&pool, "fiat-sent", cutoff - 1, true).await;
+        // Not due: inside the window still.
+        insert_order(&pool, "active", cutoff + 1, true).await;
+        // Excluded: a dispute already has a solver in the loop.
+        insert_order(&pool, "dispute", cutoff - 1, true).await;
+        // Excluded: no live escrow behind these.
+        insert_order(&pool, "waiting-payment", cutoff - 1, true).await;
+        insert_order(&pool, "active", 0, true).await;
+        // Excluded: nothing to cancel without the payment hash.
+        insert_order(&pool, "active", cutoff - 1, false).await;
+
+        let result = super::find_escrow_deadline_orders(&pool, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "only due active/fiat-sent orders with a hash qualify: {result:?}"
+        );
+        assert!(result
+            .iter()
+            .all(|o| o.invoice_held_at <= cutoff && o.invoice_held_at != 0));
     }
 
     #[tokio::test]

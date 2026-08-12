@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "mostro"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "async-trait",
  "axum",

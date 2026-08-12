@@ -4,12 +4,14 @@ In order to verify the release, you'll need to have gpg or gpg2 installed on you
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/arkanoider.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/catrya.asc | gpg --import
+curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/andreadiazcorreia.asc | gpg --import
 ```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya and manifest.txt are in the current directory) with:
+Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya, manifest.txt.sig.andreadiazcorreia and manifest.txt are in the current directory) with:
 ```bash
 gpg --verify manifest.txt.sig.negrunch manifest.txt
 gpg --verify manifest.txt.sig.arkanoider manifest.txt
 gpg --verify manifest.txt.sig.catrya manifest.txt
+gpg --verify manifest.txt.sig.andreadiazcorreia manifest.txt
 
 gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 1E41631D137BA2ADE55344F73852B843679AD6F0
@@ -23,54 +25,74 @@ gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 9A718444050F091D3D24CF6CE15E232F243D73E6
 gpg: Good signature from "Catrya (github) <140891948+Catrya@users.noreply.github.com>" [ultimate]
 
+gpg: Signature made fri 10 oct 2025 11:28:03 -03
+gpg:                using EDDSA key 57376B6467F41F565ADDC65B1ED8B40E3A46E21D
+gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [ultimate]
+
 ```
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.18.0
+## What's Changed in 0.18.1
 
 ### 🚀 Features
 
 
-* feat(price): Phase 4 — unify live quote path on cache + enforce staleness by [@grunch](https://github.com/grunch) in [#783](https://github.com/MostroP2P/mostro/pull/783)
-* feat(transport): make inner protocol version follow active transport by [@grunch](https://github.com/grunch) in [#785](https://github.com/MostroP2P/mostro/pull/785)
-* feat(price): Phase 3 — El Toque fiat-cross provider (CUP/MLC) by [@grunch](https://github.com/grunch) in [#778](https://github.com/MostroP2P/mostro/pull/778)
-* feat(transport): log active transport at mostrod startup by [@grunch](https://github.com/grunch) in [#781](https://github.com/MostroP2P/mostro/pull/781)
-* feat(transport): Phase 2 — anti-spam gates for protocol v2 by [@grunch](https://github.com/grunch) in [#780](https://github.com/MostroP2P/mostro/pull/780)
-* feat(bond): notify slashed party on dispute slash (#768) by [@Catrya](https://github.com/Catrya) in [#779](https://github.com/MostroP2P/mostro/pull/779)
-* feat(transport): Phase 1 — wire protocol v2 (NIP-44 direct) into mostrod by [@grunch](https://github.com/grunch) in [#776](https://github.com/MostroP2P/mostro/pull/776)
+* feat(nip33): advertise pow_first_contact in the info event by [@grunch](https://github.com/grunch) in [#847](https://github.com/MostroP2P/mostro/pull/847)
+* feat: add Nostr trusted-node price provider (#697) by [@ToRyVand](https://github.com/ToRyVand) in [#841](https://github.com/MostroP2P/mostro/pull/841)
+* feat(cashu): add_cashu_escrow_action lock handler — Track A TA-1 by [@grunch](https://github.com/grunch) in [#829](https://github.com/MostroP2P/mostro/pull/829)
+* feat: cashu boot + run_cashu + dispatch seam — Cashu foundation CF-5 by [@grunch](https://github.com/grunch) in [#828](https://github.com/MostroP2P/mostro/pull/828)
+* feat: cashu escrow DB helpers — Cashu foundation CF-4 by [@grunch](https://github.com/grunch) in [#797](https://github.com/MostroP2P/mostro/pull/797)
+* feat: CashuClient mint library (cdk 0.17.2) — Cashu foundation CF-2 by [@grunch](https://github.com/grunch) in [#798](https://github.com/MostroP2P/mostro/pull/798)
+* feat: cashu config + escrow mode — Cashu foundation CF-1 by [@grunch](https://github.com/grunch) in [#796](https://github.com/MostroP2P/mostro/pull/796)
 
 ### 🐛 Bug Fixes
 
 
-* fix: surface InvalidOrderId to clients as CantDo(NotFound) by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#752](https://github.com/MostroP2P/mostro/pull/752)
-* fix(nip33): rename info tag protocol_versions -> protocol_version by [@grunch](https://github.com/grunch) in [#782](https://github.com/MostroP2P/mostro/pull/782)
+* fix: resubscribe hold invoices correctly across a restart by [@grunch](https://github.com/grunch) in [#853](https://github.com/MostroP2P/mostro/pull/853)
+* fix(deps): bump nostr to 0.44.6 for GHSA-hrqp-8w79-gwgw (NIP-44 DoS) by [@grunch](https://github.com/grunch) in [#846](https://github.com/MostroP2P/mostro/pull/846)
+* fix(restore-session): scrub Nostr keys from log lines by [@ToRyVand](https://github.com/ToRyVand) in [#835](https://github.com/MostroP2P/mostro/pull/835)
+* fix(lightning): don't panic the daemon on malformed preimage/hash (#804) by [@grunch](https://github.com/grunch) in [#821](https://github.com/MostroP2P/mostro/pull/821)
+
+### 💼 Other
+
+
+* Validate payout invoice network and bound final CLTV delta by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#861](https://github.com/MostroP2P/mostro/pull/861)
+* Harden LNURL fetches against SSRF and hangs by [@arkanoider](https://github.com/arkanoider) in [#858](https://github.com/MostroP2P/mostro/pull/858)
+* Harden nsec storage with SecretString and one-time key init by [@arkanoider](https://github.com/arkanoider) in [#772](https://github.com/MostroP2P/mostro/pull/772)
+* Reject non-counterparty senders in cooperative cancel by [@arkanoider](https://github.com/arkanoider) in [#851](https://github.com/MostroP2P/mostro/pull/851)
+* Add LUD-12 comment to dev fee LNURL-pay calls by [@ToRyVand](https://github.com/ToRyVand) in [#820](https://github.com/MostroP2P/mostro/pull/820)
+
+### 🚜 Refactor
+
+
+* refactor: EscrowBackend seam — Cashu foundation CF-0 by [@grunch](https://github.com/grunch) in [#795](https://github.com/MostroP2P/mostro/pull/795)
 
 ### 📚 Documentation
 
 
-* docs: harden cashu spec after review (fee crash-safety, reuse guard, action ownership) by [@grunch](https://github.com/grunch) in [#794](https://github.com/MostroP2P/mostro/pull/794)
-* docs(cashu): phased implementation spec series for Cashu escrow by [@grunch](https://github.com/grunch) in [#788](https://github.com/MostroP2P/mostro/pull/788)
+* docs: add security policy by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#850](https://github.com/MostroP2P/mostro/pull/850)
+* docs: state the English-language convention explicitly by [@grunch](https://github.com/grunch) in [#822](https://github.com/MostroP2P/mostro/pull/822)
 
 ### 🧪 Testing
 
 
-* test: add smoke tests for runtime UPDATE helpers by [@grunch](https://github.com/grunch) in [#793](https://github.com/MostroP2P/mostro/pull/793)
+* test: raise line coverage 67%→93% + deep review findings by [@grunch](https://github.com/grunch) in [#803](https://github.com/MostroP2P/mostro/pull/803)
 
 ### ⚙️ Miscellaneous Tasks
 
 
-* chore: standardize v0.19.0 deprecation notices for the v1 transport by [@grunch](https://github.com/grunch) in [#800](https://github.com/MostroP2P/mostro/pull/800)
-* chore: upgrade sqlx to 0.9 and drop sqlx-crud by [@arkanoider](https://github.com/arkanoider) in [#791](https://github.com/MostroP2P/mostro/pull/791)
-* chore: drop sqlx-crud; use mostro_core::db::Crud by [@arkanoider](https://github.com/arkanoider) in [#789](https://github.com/MostroP2P/mostro/pull/789)
-* ci(mutation): run as scheduled audit + opt-in instead of on every push to main by [@grunch](https://github.com/grunch) in [#787](https://github.com/MostroP2P/mostro/pull/787)
+* ci: cashu test-mint harness — Cashu foundation CF-3 by [@grunch](https://github.com/grunch) in [#799](https://github.com/MostroP2P/mostro/pull/799)
+* ci: serve the coverage badge from our own Pages, drop Codecov by [@grunch](https://github.com/grunch) in [#824](https://github.com/MostroP2P/mostro/pull/824)
+* ci: publish the llvm-cov HTML report to Pages and Codecov by [@grunch](https://github.com/grunch) in [#823](https://github.com/MostroP2P/mostro/pull/823)
+* chore: add andreadiazcorreia to release verification instructions by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#802](https://github.com/MostroP2P/mostro/pull/802)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#800](https://github.com/MostroP2P/mostro/pull/800)
-* [@arkanoider](https://github.com/arkanoider) made their contribution in [#791](https://github.com/MostroP2P/mostro/pull/791)
-* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#752](https://github.com/MostroP2P/mostro/pull/752)
-* [@Catrya](https://github.com/Catrya) made their contribution in [#779](https://github.com/MostroP2P/mostro/pull/779)
+* [@grunch](https://github.com/grunch) made their contribution in [#853](https://github.com/MostroP2P/mostro/pull/853)
+* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#861](https://github.com/MostroP2P/mostro/pull/861)
+* [@arkanoider](https://github.com/arkanoider) made their contribution in [#858](https://github.com/MostroP2P/mostro/pull/858)
+* [@ToRyVand](https://github.com/ToRyVand) made their contribution in [#841](https://github.com/MostroP2P/mostro/pull/841)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.17.5...0.18.0
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.0...0.18.1
 
 <!-- generated by git-cliff -->

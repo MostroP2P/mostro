@@ -956,6 +956,44 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// Claim the cancelation of an order that still has a live escrow, reporting
+/// whether this caller is the one that got it.
+///
+/// Two independent paths react to an escrow that has run out of time — the
+/// scheduler cancelling ahead of the CLTV horizon, and the invoice subscriber
+/// reacting to LND having cancelled first — and a release or admin action can
+/// always land between another path's read and its write. This single
+/// statement is what decides who owns the transition: `Ok(true)` means the
+/// caller wrote the status and owns the follow-up (notifications, dispute
+/// close, bond release), `Ok(false)` means the order had already left its
+/// escrow states and the caller must not touch it further.
+///
+/// Only the three statuses that can carry a live escrow are eligible, so this
+/// can never drag a settled, expired or already-canceled order back into a
+/// cancelation.
+pub async fn claim_escrow_order_canceled(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    event_id: &str,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        r#"
+          UPDATE orders
+          SET status = ?1, event_id = ?2
+          WHERE id = ?3
+            AND status IN ('active', 'fiat-sent', 'dispute')
+        "#,
+    )
+    .bind(Status::Canceled.to_string())
+    .bind(event_id)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -2219,6 +2257,113 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "Should not find orders with held_at = 0");
+    }
+
+    // -- Tests for claim_escrow_order_canceled --
+
+    async fn insert_order_with_status(pool: &SqlitePool, status: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at)
+            VALUES (?1, 'sell', 'ev-before', ?2, 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000)"#,
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn read_order(pool: &SqlitePool, id: uuid::Uuid) -> (String, String) {
+        sqlx::query_as("SELECT status, event_id FROM orders WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn claim_escrow_order_canceled_wins_from_every_escrow_status() {
+        let pool = setup_orders_db().await.unwrap();
+
+        for status in ["active", "fiat-sent", "dispute"] {
+            let id = insert_order_with_status(&pool, status).await;
+            assert!(
+                super::claim_escrow_order_canceled(&pool, id, "ev-after")
+                    .await
+                    .unwrap(),
+                "{status} carries a live escrow, so the claim must win"
+            );
+            let (status, event_id) = read_order(&pool, id).await;
+            assert_eq!(status, "canceled");
+            assert_eq!(event_id, "ev-after", "the published event must be recorded");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_escrow_order_canceled_is_lost_by_the_second_caller() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = insert_order_with_status(&pool, "fiat-sent").await;
+
+        assert!(super::claim_escrow_order_canceled(&pool, id, "ev-first")
+            .await
+            .unwrap());
+        assert!(
+            !super::claim_escrow_order_canceled(&pool, id, "ev-second")
+                .await
+                .unwrap(),
+            "only one caller may own the cancelation and its side effects"
+        );
+
+        let (_, event_id) = read_order(&pool, id).await;
+        assert_eq!(
+            event_id, "ev-first",
+            "the loser must not overwrite the winner's row"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_escrow_order_canceled_never_reopens_a_resolved_order() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // A settled or already-terminal order has no escrow to lose; a late
+        // cancel event must not drag any of them into a cancelation.
+        for status in [
+            "pending",
+            "waiting-payment",
+            "settled-hold-invoice",
+            "success",
+            "canceled-by-admin",
+            "cooperatively-canceled",
+        ] {
+            let id = insert_order_with_status(&pool, status).await;
+            assert!(
+                !super::claim_escrow_order_canceled(&pool, id, "ev-after")
+                    .await
+                    .unwrap(),
+                "{status} must not be claimable"
+            );
+            let (unchanged, event_id) = read_order(&pool, id).await;
+            assert_eq!(unchanged, status);
+            assert_eq!(event_id, "ev-before");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_escrow_order_canceled_reports_a_miss_for_unknown_orders() {
+        let pool = setup_orders_db().await.unwrap();
+        assert!(
+            !super::claim_escrow_order_canceled(&pool, uuid::Uuid::new_v4(), "ev")
+                .await
+                .unwrap(),
+            "no row means nothing was claimed"
+        );
     }
 
     // -- Tests for find_failed_payment --

@@ -68,6 +68,42 @@ impl AppContext {
         }
     }
 
+    /// Assemble a context from the process globals.
+    ///
+    /// For code that runs outside the event loop and has no context handed to
+    /// it: the LND invoice subscriber is spawned both from boot and from
+    /// `show_hold_invoice`, and neither carries one down to the callback. The
+    /// globals read here are the same ones `main` builds its own context from,
+    /// so this is that context assembled where it is needed rather than
+    /// threaded through every intermediate call site.
+    ///
+    /// Handlers must keep taking `&AppContext` as a parameter — that is what
+    /// lets tests inject a `TestContextBuilder` context instead of this one.
+    ///
+    /// Fails only before `main` has initialised the Nostr client or settings.
+    pub fn from_globals() -> Result<Self, mostro_core::error::MostroError> {
+        let settings = Arc::new(
+            crate::config::MOSTRO_CONFIG
+                .get()
+                .ok_or_else(|| {
+                    mostro_core::error::MostroError::MostroInternalErr(
+                        mostro_core::error::ServiceError::IOError(
+                            "Settings not initialized".to_string(),
+                        ),
+                    )
+                })?
+                .clone(),
+        );
+
+        Ok(Self::new(
+            crate::config::get_db_pool(),
+            crate::util::get_nostr_client()?.clone(),
+            settings,
+            crate::config::MESSAGE_QUEUES.queue_order_msg.clone(),
+            crate::util::get_keys()?.clone(),
+        ))
+    }
+
     /// Attach a connected Cashu mint client (Cashu mode, CF-5). Returns a new
     /// context; the Lightning path never calls this, so `cashu_client()` stays
     /// `None` there.

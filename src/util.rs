@@ -1137,6 +1137,13 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
     // Arc clone db pool to safe use across threads
     let pool = get_db_pool();
 
+    // Built once, before the loop: `hold_invoice_canceled` has to publish, DM
+    // both parties and close a dispute, and neither of this function's two
+    // callers (boot resubscribe and `show_hold_invoice`) carries a context
+    // down here. Failing now is better than discovering it on the one event
+    // that matters.
+    let ctx = crate::app::context::AppContext::from_globals()?;
+
     let subs = {
         async move {
             // Receiving msgs from the invoice subscription.
@@ -1163,7 +1170,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                     }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool).await {
+                    if let Err(e) = flow::hold_invoice_canceled(&hash, &ctx).await {
                         info!("Invoice flow error {e}");
                     }
                 } else {

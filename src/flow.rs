@@ -1,3 +1,6 @@
+use crate::app::bond;
+use crate::app::context::AppContext;
+use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::util::{enqueue_order_msg, notify_taker_reputation};
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -184,21 +187,119 @@ pub async fn hold_invoice_settlement(hash: &str, pool: &SqlitePool) -> Result<()
     Ok(())
 }
 
-pub async fn hold_invoice_canceled(hash: &str, pool: &SqlitePool) -> Result<()> {
-    let order = crate::db::find_order_by_hash(pool, hash).await?;
-    info!(
-        "Order Id: {} - Invoice with hash: {} was canceled!",
-        order.id, hash
+/// Resolve an order whose hold invoice was canceled in LND.
+///
+/// Called from the invoice subscriber on `InvoiceState::Canceled`, which
+/// covers two situations that look identical on the wire:
+///
+/// - A cancel mostro asked for — a waiting order that timed out, a
+///   cooperative cancel, an admin cancel. Whoever asked already moved the
+///   order to its terminal status, so this event is just LND confirming the
+///   refund and there is nothing left to do.
+/// - A cancel nobody asked for. LND force-cancels an accepted hold HTLC as it
+///   approaches the CLTV expiry height, refunding the seller, so that the
+///   channel is never forced to close over a held payment. The trade is
+///   unaffected by that decision: an order left in `active`, `fiat-sent` or
+///   `dispute` keeps advertising itself as live while its escrow is already
+///   back in the seller's channel — which is how a buyer ends up sending
+///   fiat for sats nobody can release anymore.
+///
+/// The second case is what this function exists for: publish the cancelation,
+/// claim the order with a conditional update, then notify both parties and
+/// unwind the trade. The claim is what keeps this safe next to the
+/// scheduler's own deadline cancel and any release or admin action racing on
+/// the same row — exactly one path transitions the order, the rest no-op.
+pub async fn hold_invoice_canceled(hash: &str, ctx: &AppContext) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+    let order = crate::db::find_order_by_hash(pool, hash)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    if !matches!(status, Status::Active | Status::FiatSent | Status::Dispute) {
+        info!(
+            "Order Id: {} - Invoice with hash: {} was canceled!",
+            order.id, hash
+        );
+        return Ok(());
+    }
+
+    // Loud on purpose: a trade just lost its escrow without anyone deciding
+    // it should. Either the trade outlived the CLTV horizon, or the invoice
+    // was canceled out of band — both are things an operator wants to see.
+    tracing::error!(
+        order_id = %order.id,
+        status = %status,
+        "Escrow with hash {hash} was canceled while the trade was still live; \
+         the sats are back with the seller, closing the order"
     );
+
+    let order_updated = crate::util::update_order_event(ctx.keys(), Status::Canceled, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
+    // Publishing before the claim mirrors `release_action`, and is safe here
+    // for a narrower reason: the only other writer that can win this race is
+    // the scheduler's deadline cancel, which publishes the very same
+    // `Canceled` status. A settled invoice never emits a cancel, so a release
+    // cannot be overwritten by the event above.
+    if !crate::db::claim_escrow_order_canceled(pool, order.id, &order_updated.event_id).await? {
+        tracing::info!(
+            order_id = %order.id,
+            "Order left its escrow status concurrently; leaving it to whoever resolved it"
+        );
+        return Ok(());
+    }
+
+    notify_escrow_canceled(&order).await;
+
+    // Best-effort unwind from here on: the order is already canceled in the
+    // DB, so a failure below must not resurrect it.
+    close_dispute_after_user_resolution(
+        ctx,
+        &order_updated,
+        DisputeStatus::SellerRefunded,
+        ctx.keys(),
+        "escrow cancel",
+    )
+    .await;
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "escrow_canceled").await;
+    bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "escrow_canceled").await;
+
     Ok(())
+}
+
+/// Tell both sides the trade is over, so neither keeps acting on an order
+/// whose escrow is gone: the buyer must not send fiat, and the seller must
+/// not expect a release. Missing pubkeys are logged rather than propagated —
+/// the cancelation is already durable and cannot be undone by a failed DM.
+async fn notify_escrow_canceled(order: &Order) {
+    let (buyer_pubkey, seller_pubkey) = match (order.get_buyer_pubkey(), order.get_seller_pubkey())
+    {
+        (Ok(buyer), Ok(seller)) => (buyer, seller),
+        _ => {
+            tracing::warn!(
+                order_id = %order.id,
+                "Canceled an order with an unreadable trade pubkey; \
+                 both parties are left unnotified"
+            );
+            return;
+        }
+    };
+
+    for pubkey in [buyer_pubkey, seller_pubkey] {
+        enqueue_order_msg(None, Some(order.id), Action::Canceled, None, pubkey, None).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use mostro_core::order::{Kind as OrderKind, Status};
     use nostr_sdk::{Keys, Timestamp};
     use sqlx::SqlitePool;
+    use std::sync::Arc;
 
     async fn create_test_pool() -> SqlitePool {
         SqlitePool::connect(":memory:").await.unwrap()
@@ -395,14 +496,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hold_invoice_settlement_and_cancel_resolve_existing_order() {
+    async fn hold_invoice_settlement_resolves_existing_order() {
         init_global_settings();
         let pool = create_migrated_pool().await;
         let hash = "dd".repeat(32);
         insert_order_with_hash(&pool, &hash, Status::Active, None, None, None, None).await;
 
         assert!(hold_invoice_settlement(&hash, &pool).await.is_ok());
-        assert!(hold_invoice_canceled(&hash, &pool).await.is_ok());
+    }
+
+    fn ctx_for(pool: &SqlitePool) -> AppContext {
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build()
+    }
+
+    async fn order_with_parties(pool: &SqlitePool, hash: &str, status: Status) {
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        insert_order_with_hash(pool, hash, status, None, Some(buyer), Some(seller), None).await;
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_closes_a_live_trade() {
+        init_global_settings();
+        // The escrow is gone in all three: an order left in any of them keeps
+        // advertising a trade that nothing backs, which is what lets a buyer
+        // send fiat for sats already returned to the seller.
+        for status in [Status::Active, Status::FiatSent, Status::Dispute] {
+            let pool = create_migrated_pool().await;
+            let hash = "aa".repeat(32);
+            order_with_parties(&pool, &hash, status).await;
+
+            hold_invoice_canceled(&hash, &ctx_for(&pool))
+                .await
+                .unwrap_or_else(|e| panic!("{status} must be closed, not error: {e:?}"));
+
+            let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+            assert_eq!(
+                updated.status,
+                Status::Canceled.to_string(),
+                "an order in {status} must not survive its escrow"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_leaves_expected_cancels_alone() {
+        init_global_settings();
+        // Cancels mostro asked for, and orders whose escrow already resolved.
+        // Whoever asked has set the final status; re-deriving one here would
+        // overwrite it — a canceled-by-admin order must not read as a plain
+        // cancel, and a settled one must never go back to canceled at all.
+        for status in [
+            Status::WaitingPayment,
+            Status::WaitingBuyerInvoice,
+            Status::Canceled,
+            Status::CanceledByAdmin,
+            Status::CooperativelyCanceled,
+            Status::SettledHoldInvoice,
+            Status::Success,
+        ] {
+            let pool = create_migrated_pool().await;
+            let hash = "bb".repeat(32);
+            order_with_parties(&pool, &hash, status).await;
+
+            hold_invoice_canceled(&hash, &ctx_for(&pool))
+                .await
+                .expect("an expected cancel is a no-op, not a failure");
+
+            let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+            assert_eq!(
+                updated.status,
+                status.to_string(),
+                "{status} must be left exactly as it was"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_is_a_noop_on_redelivery() {
+        init_global_settings();
+        // LND replays invoice state on every resubscribe, so the same cancel
+        // arrives again after each restart. The second delivery must not
+        // re-notify or re-unwind a trade that is already closed.
+        let pool = create_migrated_pool().await;
+        let hash = "cc".repeat(32);
+        order_with_parties(&pool, &hash, Status::FiatSent).await;
+        let ctx = ctx_for(&pool);
+
+        hold_invoice_canceled(&hash, &ctx).await.unwrap();
+        let first = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+
+        hold_invoice_canceled(&hash, &ctx)
+            .await
+            .expect("a replayed cancel is a no-op, not a failure");
+        let second = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+
+        assert_eq!(second.status, Status::Canceled.to_string());
+        assert_eq!(
+            second.event_id, first.event_id,
+            "a replayed cancel must not republish the order"
+        );
     }
 
     #[tokio::test]
@@ -434,14 +630,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hold_invoice_canceled_structure() {
-        let pool = create_test_pool().await;
+    async fn hold_invoice_canceled_errors_on_unknown_hash() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let ctx = ctx_for(&pool);
+        // No order carries this hash: there is nothing to close, and the
+        // subscriber logs the error rather than acting on a guess.
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        // This test would require setting up database with order data
-        let result = hold_invoice_canceled(hash, &pool).await;
-        // Should fail without proper database setup
-        assert!(result.is_ok() || result.is_err());
+        assert!(hold_invoice_canceled(hash, &ctx).await.is_err());
     }
 
     mod hold_invoice_flow_tests {

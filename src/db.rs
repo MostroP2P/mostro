@@ -1103,20 +1103,30 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
 ///
 /// Two disjoint cases, and the second is the one that matters after a restart:
 ///
-/// - `active` with `invoice_held_at != 0` — the seller already paid, so the
-///   subscription is there to observe settle/cancel.
+/// - a post-payment status with `invoice_held_at != 0` — the seller already
+///   paid, so the subscription is there to observe settle/cancel. All three
+///   such statuses belong here, not just `active`: an order reaches
+///   `fiat-sent` and `dispute` with the escrow HTLC still locked, so a
+///   restart in either one used to stop observing that invoice for the rest
+///   of the run (#856). That is the window in which LND force-cancels an
+///   accepted hold HTLC at the CLTV horizon, and
+///   [`crate::flow::hold_invoice_canceled`] cannot react to a cancel it
+///   never observes.
 /// - `waiting-payment` / `waiting-buyer-invoice` with a hash — the invoice
 ///   exists but nobody has paid it yet. `invoice_held_at` is still 0 here
 ///   (only [`crate::flow::hold_invoice_paid`] ever writes it), which is why
 ///   that column cannot gate this branch: these rows would never match.
 ///   Missing this window is what makes a seller who paid during a restart
 ///   look like a seller who never paid.
+///
+/// Terminal and post-escrow statuses are deliberately absent: once the hold
+/// is settled or canceled there is nothing left to observe.
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE (invoice_held_at != 0 AND status == 'active')
+          WHERE (invoice_held_at != 0 AND status IN ('active', 'fiat-sent', 'dispute'))
              OR (status IN ('waiting-payment', 'waiting-buyer-invoice') AND hash IS NOT NULL)
         "#,
     )
@@ -2302,26 +2312,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_held_invoices_ignores_non_active() {
+    async fn test_find_held_invoices_returns_every_escrow_status() {
         let pool = setup_orders_db().await.unwrap();
 
-        // Insert order with invoice_held_at != 0 but wrong status
-        sqlx::query(
-            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
-                    amount, fiat_code, fiat_amount, created_at, expires_at,
-                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
-                    invoice_held_at)
-            VALUES (?1, 'buy', 'ev1', 'pending', 0, 'lightning',
-                    100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, 0, 0, 1700001000)"#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .unwrap();
+        // The three statuses an order can sit in while its escrow HTLC is
+        // still locked. `fiat-sent` and `dispute` were missing before #856,
+        // so a restart during either one left the hold invoice unobserved
+        // for the rest of the run.
+        for status in ["active", "fiat-sent", "dispute"] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 1700001000, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("cc".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         let result = super::find_held_invoices(&pool).await.unwrap();
-        assert!(result.is_empty(), "Should not find non-active orders");
+        assert_eq!(
+            result.len(),
+            3,
+            "every status that can still hold escrow must be resubscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_statuses_without_live_escrow() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // `pending` never had an escrow; the rest already resolved theirs.
+        // A stale `invoice_held_at` on such a row must not resubscribe it —
+        // there is no HTLC left to observe.
+        for status in [
+            "pending",
+            "settled-hold-invoice",
+            "success",
+            "canceled",
+            "cooperatively-canceled",
+        ] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 1700001000, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("dd".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "only statuses with a live escrow are resubscribed"
+        );
     }
 
     #[tokio::test]

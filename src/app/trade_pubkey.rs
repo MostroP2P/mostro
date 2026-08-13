@@ -5,6 +5,15 @@ use mostro_core::db::Crud;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 
+/// Rotate the maker's per-trade pubkey for a pre-trade order.
+///
+/// Only the order maker may rotate: maker ownership is determined by the
+/// order kind — the seller is the maker of a [`OrderKind::Sell`] order and
+/// the buyer is the maker of a [`OrderKind::Buy`] order. The caller's
+/// `event.identity` must match the maker-side master key; on success the
+/// maker-side trade pubkey and `creator_pubkey` (which tracks the maker's
+/// current trade key) are set to `event.sender`. Anything else is rejected
+/// with [`ServiceError::InvalidPubkey`] and the order is left untouched.
 pub async fn trade_pubkey_action(
     ctx: &AppContext,
     msg: Message,

@@ -268,14 +268,31 @@ pub async fn release_action(
     // settle-at-close, or the Phase 5 release for a non-range maker bond).
     match get_child_order(ctx, order.clone(), my_keys).await {
         Ok((Some(child_order), Some(event))) => {
-            let client = ctx.nostr_client();
-            if client.send_event(&event).await.is_err() {
-                tracing::warn!("Failed sending child order event for order id: {}; queued for republish by the orderbook reconciler", child_order.id);
-                mark_orderbook_publish_failed(child_order.id);
+            let child_order_id = child_order.id;
+            // The hold invoice is already settled at this point, so a child
+            // failure must never abort the release: skip the remainder,
+            // resolve the maker bond and continue to the buyer payout. The
+            // child order is persisted before its event is published so a
+            // persistence failure never leaves a ghost order on the book.
+            match handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id).await
+            {
+                Ok(()) => {
+                    let client = ctx.nostr_client();
+                    if client.send_event(&event).await.is_err() {
+                        tracing::warn!("Failed sending child order event for order id: {}; queued for republish by the orderbook reconciler", child_order_id);
+                        mark_orderbook_publish_failed(child_order_id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        order_id = %order.id,
+                        error = %e,
+                        "handle_child_order failed (e.g. Release without NextTrade); skipping remainder, resolving maker bond and continuing with buyer payout"
+                    );
+                    bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action")
+                        .await;
+                }
             }
-            handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         }
         Ok(_) => {
             bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "release_action").await;
@@ -476,30 +493,32 @@ async fn handle_child_order(
     // Prepare new pending child order
     let new_order = child_order.as_new_order();
 
-    if let (Some(destination_pubkey), new_trade_index) = (notification_pubkey, new_trade_index) {
-        // If we have next trade pubkey and index we can set them in child order
-        enqueue_order_msg(
-            request_id,
-            new_order.id,
-            Action::NewOrder,
-            Some(Payload::Order(new_order)),
-            PublicKey::from_str(&destination_pubkey).map_err(|_| {
-                MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string()))
-            })?,
-            new_trade_index,
-        )
-        .await;
-    } else {
+    // Validate the notification data before touching the database
+    let Some(destination_pubkey) = notification_pubkey else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(
             "Next trade index or pubkey is missing - user cannot be notified".to_string(),
         )));
-    }
+    };
+    let destination_pubkey = PublicKey::from_str(&destination_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string())))?;
 
-    // Create the child order in database
+    // Create the child order in database before queueing its notification,
+    // so the queue never delivers a NewOrder message for a row that does
+    // not exist (e.g. on a transient insert failure).
     child_order
         .create(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    enqueue_order_msg(
+        request_id,
+        new_order.id,
+        Action::NewOrder,
+        Some(Payload::Order(new_order)),
+        destination_pubkey,
+        new_trade_index,
+    )
+    .await;
 
     Ok(())
 }
@@ -1321,6 +1340,46 @@ mod tests {
             .await
             .unwrap();
         assert!(children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_action_pays_buyer_when_release_omits_next_trade_on_sell_range() {
+        // Arrange: sell range with a valid remainder, so get_child_order
+        // returns Ok(Some, Some), but the Release carries no NextTrade —
+        // handle_child_order fails after the hold invoice was settled.
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.max_amount = Some(100);
+        order.min_amount = Some(10);
+        order.fiat_amount = 40;
+        let order = order.create(&pool).await.unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let msg = release_message(order.id, None);
+        let my_keys = Keys::generate();
+        let mut escrow = StubEscrow;
+
+        // Act
+        let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
+
+        // Assert: release completes instead of aborting, the remainder is
+        // skipped (no child row) and the buyer-payout flow still runs.
+        assert!(result.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        let children = sqlx::query("SELECT id FROM orders WHERE range_parent_id = ?")
+            .bind(order.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(children.is_empty());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::Released));
+        assert!(actions.contains(&Action::HoldInvoicePaymentSettled));
+        assert!(actions.contains(&Action::Rate));
     }
 
     // ---------------------------------------------------------------

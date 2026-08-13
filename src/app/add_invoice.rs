@@ -1,7 +1,7 @@
 use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_order, notify_taker_reputation, show_hold_invoice, update_order_event,
-    validate_invoice,
+    validate_invoice, HoldInvoiceOrigin,
 };
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -139,6 +139,9 @@ pub async fn add_invoice_action(
         &seller_pubkey,
         order,
         msg.get_inner_message_kind().request_id,
+        // The buyer just supplied their payout invoice, so this order
+        // legitimately sits at `waiting-buyer-invoice`.
+        HoldInvoiceOrigin::BuyerInvoice,
     )
     .await
     {

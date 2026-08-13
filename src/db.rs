@@ -805,6 +805,158 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Statuses from which a take (or a maker cancel) may still start: the
+/// order has no live trade escrow yet. Used as the `WHERE` guard for the
+/// pre-trade compare-and-swap writes below, so a writer working from a
+/// stale snapshot loses cleanly instead of clobbering whoever committed
+/// first.
+const PRETRADE_STATUSES: &str = "'pending','waiting-taker-bond'";
+
+/// Compare-and-swap a pre-trade status transition (`status` + `event_id`
+/// only). Returns `false` when the order has already left the pre-trade
+/// window — e.g. a take committed `waiting-payment` while a maker cancel
+/// was publishing — letting the caller bail instead of resurrecting or
+/// clobbering the row with a stale full-row write.
+pub async fn cas_pretrade_order_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    new_status: Status,
+    event_id: &str,
+) -> Result<bool, MostroError> {
+    let query = format!(
+        "UPDATE orders SET status = ?1, event_id = ?2 \
+         WHERE id = ?3 AND status IN ({PRETRADE_STATUSES})"
+    );
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(new_status.to_string())
+        .bind(event_id)
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Compare-and-swap the winning taker's bond context onto the order row
+/// (see `promote_taker_context_to_order`). Writes only the promoted
+/// columns — never `status` — and only while the order is still
+/// pre-trade, so a maker cancel that already committed is not undone.
+/// `order` must be the merged in-memory row (taker fields applied).
+/// Returns `false` when the CAS missed.
+pub async fn cas_promote_taker_context(
+    pool: &SqlitePool,
+    order: &Order,
+) -> Result<bool, MostroError> {
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let taker_columns = match kind {
+        OrderKind::Buy => "seller_pubkey = ?2, master_seller_pubkey = ?3, trade_index_seller = ?4",
+        OrderKind::Sell => {
+            "buyer_pubkey = ?2, master_buyer_pubkey = ?3, trade_index_buyer = ?4, \
+             buyer_invoice = ?5"
+        }
+    };
+    let query = format!(
+        "UPDATE orders SET {taker_columns}, fiat_amount = ?6, amount = ?7, fee = ?8, \
+         dev_fee = ?9, created_at = ?10 \
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
+    );
+    // The unused ?5 slot for buy orders binds a throwaway `None`.
+    let buyer_invoice: Option<&str> = match kind {
+        OrderKind::Sell => order.buyer_invoice.as_deref(),
+        OrderKind::Buy => None,
+    };
+    let (trade_pubkey, identity, trade_index) = match kind {
+        OrderKind::Buy => (
+            &order.seller_pubkey,
+            &order.master_seller_pubkey,
+            order.trade_index_seller,
+        ),
+        OrderKind::Sell => (
+            &order.buyer_pubkey,
+            &order.master_buyer_pubkey,
+            order.trade_index_buyer,
+        ),
+    };
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(order.id)
+        .bind(trade_pubkey.as_deref())
+        .bind(identity.as_deref())
+        .bind(trade_index)
+        .bind(buyer_invoice)
+        .bind(order.fiat_amount)
+        .bind(order.amount)
+        .bind(order.fee)
+        .bind(order.dev_fee)
+        .bind(order.created_at)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Compare-and-swap the full take-context transition: everything the take
+/// handlers mutate on their in-memory row before persisting — taker
+/// context, computed amounts, trade escrow material (when the hold
+/// invoice was created) and the status/event pair — in one guarded write.
+///
+/// The `WHERE` guard always covers the pre-trade statuses
+/// (`pending` / `waiting-taker-bond`). `allow_waiting_buyer_invoice`
+/// adds that status for the one caller that legitimately arrives from
+/// it: `show_hold_invoice` when driven by `add_invoice`. Take paths
+/// (`take_sell`, `take_buy`, the bond resume) must pass `false`, so a
+/// stale take can never overwrite an already-committed one even if a
+/// future change lets two take handlers overlap.
+///
+/// Returns `false` when the order moved on meanwhile (e.g. a maker
+/// cancel committed while the hold invoice was being created at LND) —
+/// the caller must then cancel any orphaned invoice instead of
+/// resurrecting the row.
+pub async fn cas_complete_pretrade_take(
+    pool: &SqlitePool,
+    order: &Order,
+    allow_waiting_buyer_invoice: bool,
+) -> Result<bool, MostroError> {
+    let extra_status = if allow_waiting_buyer_invoice {
+        ", 'waiting-buyer-invoice'"
+    } else {
+        ""
+    };
+    let query = format!(
+        "UPDATE orders SET status = ?2, event_id = ?3, \
+         buyer_pubkey = ?4, seller_pubkey = ?5, \
+         master_buyer_pubkey = ?6, master_seller_pubkey = ?7, \
+         trade_index_buyer = ?8, trade_index_seller = ?9, \
+         fiat_amount = ?10, amount = ?11, fee = ?12, dev_fee = ?13, created_at = ?14, \
+         buyer_invoice = ?15, preimage = ?16, hash = ?17 \
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES}{extra_status})"
+    );
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(order.id)
+        .bind(order.status.clone())
+        .bind(order.event_id.clone())
+        .bind(order.buyer_pubkey.as_deref())
+        .bind(order.seller_pubkey.as_deref())
+        .bind(order.master_buyer_pubkey.as_deref())
+        .bind(order.master_seller_pubkey.as_deref())
+        .bind(order.trade_index_buyer)
+        .bind(order.trade_index_seller)
+        .bind(order.fiat_amount)
+        .bind(order.amount)
+        .bind(order.fee)
+        .bind(order.dev_fee)
+        .bind(order.created_at)
+        .bind(order.buyer_invoice.as_deref())
+        .bind(order.preimage.as_deref())
+        .bind(order.hash.as_deref())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Atomically persist a validated Cashu escrow and advance the order status
 /// (Cashu foundation CF-4, `docs/cashu/01-fundamentals.md` §6).
 ///
@@ -2138,6 +2290,155 @@ mod tests {
 
         let result = super::find_held_invoices(&pool).await.unwrap();
         assert!(result.is_empty(), "rows without a hash must be skipped");
+    }
+
+    // ── pre-trade compare-and-swap writes ────────────────────────────────
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// A `pending` sell order carrying escrow material, so a targeted write
+    /// that touches columns it shouldn't is visible in the assertions.
+    async fn insert_pretrade_order(pool: &SqlitePool, status: &str) -> super::Order {
+        use mostro_core::db::Crud;
+        let order = super::Order {
+            id: uuid::Uuid::new_v4(),
+            kind: "sell".to_string(),
+            status: status.to_string(),
+            creator_pubkey: "aa".repeat(32),
+            seller_pubkey: Some("aa".repeat(32)),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            amount: 100_000,
+            fiat_amount: 100,
+            hash: Some("cc".repeat(32)),
+            preimage: Some("dd".repeat(32)),
+            ..Default::default()
+        };
+        order.create(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn cas_pretrade_order_status_flips_only_status_and_event_id() {
+        let pool = migrated_pool().await;
+        let order = insert_pretrade_order(&pool, "pending").await;
+
+        let won =
+            super::cas_pretrade_order_status(&pool, order.id, super::Status::Canceled, "ev-new")
+                .await
+                .unwrap();
+        assert!(won, "pending orders accept the transition");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "canceled");
+        assert_eq!(after.event_id, "ev-new");
+        // The targeted write must not clobber unrelated columns.
+        assert_eq!(after.hash, Some("cc".repeat(32)));
+        assert_eq!(after.preimage, Some("dd".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn cas_pretrade_order_status_loses_once_the_take_committed() {
+        let pool = migrated_pool().await;
+        let order = insert_pretrade_order(&pool, "waiting-payment").await;
+
+        let won =
+            super::cas_pretrade_order_status(&pool, order.id, super::Status::Canceled, "ev-new")
+                .await
+                .unwrap();
+        assert!(!won, "waiting-payment is past the pre-trade window");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-payment");
+        assert_ne!(after.event_id, "ev-new");
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_covers_every_legitimate_caller_state() {
+        let pool = migrated_pool().await;
+        // `waiting-buyer-invoice` is legitimate only for the `add_invoice`
+        // → `show_hold_invoice` caller, which passes `true`.
+        for (from, allow_wbi) in [
+            ("pending", false),
+            ("waiting-taker-bond", false),
+            ("waiting-buyer-invoice", true),
+        ] {
+            let mut order = insert_pretrade_order(&pool, from).await;
+            // What the take handlers mutate in memory before persisting:
+            // the transition, the taker context, and the computed amounts.
+            order.status = super::Status::WaitingPayment.to_string();
+            order.event_id = "ev-escrow".to_string();
+            order.buyer_pubkey = Some("bb".repeat(32));
+            order.master_buyer_pubkey = Some("bb".repeat(32));
+            order.trade_index_buyer = Some(3);
+            order.amount = 200_000;
+            order.dev_fee = 5;
+            // The helper writes `hash`/`preimage` from the caller's
+            // snapshot: use values that differ from the inserted row's, so
+            // the assertions prove whose values landed.
+            order.hash = Some("ee".repeat(32));
+            order.preimage = Some("ff".repeat(32));
+
+            let won = super::cas_complete_pretrade_take(&pool, &order, allow_wbi)
+                .await
+                .unwrap();
+            assert!(won, "{from} must accept the take transition");
+
+            use mostro_core::db::Crud;
+            let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(after.status, "waiting-payment");
+            assert_eq!(after.event_id, "ev-escrow");
+            assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.master_buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.trade_index_buyer, Some(3));
+            assert_eq!(after.amount, 200_000);
+            assert_eq!(after.dev_fee, 5);
+            assert_eq!(after.hash, Some("ee".repeat(32)));
+            assert_eq!(after.preimage, Some("ff".repeat(32)));
+        }
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_rejects_waiting_buyer_invoice_for_take_callers() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "waiting-buyer-invoice").await;
+        order.status = super::Status::WaitingPayment.to_string();
+        order.buyer_pubkey = Some("bb".repeat(32));
+
+        // A take path must never overwrite a row that is already waiting
+        // for the first buyer's invoice.
+        let won = super::cas_complete_pretrade_take(&pool, &order, false)
+            .await
+            .unwrap();
+        assert!(!won);
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-buyer-invoice");
+        assert_ne!(after.buyer_pubkey, Some("bb".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_loses_on_a_canceled_order() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "canceled").await;
+        order.status = super::Status::WaitingPayment.to_string();
+        order.event_id = "ev-escrow".to_string();
+
+        let won = super::cas_complete_pretrade_take(&pool, &order, true)
+            .await
+            .unwrap();
+        assert!(!won, "a committed cancel must win over the escrow storage");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "canceled");
+        assert_ne!(after.event_id, "ev-escrow");
     }
 
     #[tokio::test]

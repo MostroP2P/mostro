@@ -3,7 +3,7 @@ use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, show_hold_invoice,
+    get_order, show_hold_invoice, HoldInvoiceOrigin,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -196,6 +196,7 @@ pub async fn take_buy_action(
         &seller_pubkey,
         order,
         request_id,
+        HoldInvoiceOrigin::Take,
     )
     .await
     {

@@ -10,7 +10,10 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
-use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
+use crate::nip33::{
+    create_platform_tag_values, new_order_event, new_order_event_with_created_at, new_rating_event,
+    order_to_tags,
+};
 use crate::Result;
 
 use chrono::Duration;
@@ -880,10 +883,74 @@ async fn get_ratings_for_pending_order(
     }
 }
 
+/// Best-effort repair of the relay view after a pre-trade CAS miss. The
+/// caller published its transition via `update_order_event` *before*
+/// learning it lost the race, so the newest replaceable event on relays
+/// contradicts the database (e.g. relays advertise `waiting-payment` for
+/// an order that is actually `canceled`). Republish the state that
+/// actually won so the orderbook converges. Never fails the caller: the
+/// database is already correct — this is only the advertised view.
+pub async fn republish_winning_state_after_cas_miss(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    order_id: Uuid,
+) {
+    let current = match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("cas miss repair: could not reload order {order_id}: {e}");
+            return;
+        }
+    };
+    match current.get_order_status() {
+        Ok(status) => {
+            // The stale event was published moments ago, usually within the
+            // same Unix second. NIP-01 breaks same-timestamp ties by lowest
+            // event id, so stamp the repair strictly after `now` to guarantee
+            // it replaces the stale event on relays.
+            let repair_created_at = repair_timestamp(Timestamp::now());
+            if let Err(e) = update_order_event_with_created_at(
+                my_keys,
+                status,
+                &current,
+                Some(repair_created_at),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "cas miss repair: could not republish order {order_id} as {status}: {e}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("cas miss repair: order {order_id} has bad status: {e}"),
+    }
+}
+
+/// Timestamp for a CAS-miss repair event: strictly after `now`, so the repair
+/// wins NIP-01 replaceable-event ordering even against a stale event
+/// published in the same Unix second (same-second ties fall back to lowest
+/// event id, which the repair could lose).
+fn repair_timestamp(now: Timestamp) -> Timestamp {
+    Timestamp::from(now.as_secs() + 1)
+}
+
 pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
+) -> Result<Order, MostroError> {
+    update_order_event_with_created_at(keys, status, order, None).await
+}
+
+/// Same as [`update_order_event`], but allows overriding the published
+/// event's `created_at` (used by the CAS-miss repair path, which must stamp
+/// its event strictly after the stale one to win NIP-01 ordering).
+pub async fn update_order_event_with_created_at(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    created_at: Option<Timestamp>,
 ) -> Result<Order, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
@@ -896,8 +963,13 @@ pub async fn update_order_event(
     let mostro_pubkey = keys.public_key().to_hex();
     if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
         // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
-        let event = new_order_event(keys, "", order.id.to_string(), tags)
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        let event = match created_at {
+            Some(created_at) => {
+                new_order_event_with_created_at(keys, "", order.id.to_string(), tags, created_at)
+            }
+            None => new_order_event(keys, "", order.id.to_string(), tags),
+        }
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         info!("Sending replaceable event: {event:#?}");
 
@@ -1015,6 +1087,25 @@ pub(crate) fn price_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(price_nostr_client_policy())
 }
 
+/// Which caller drove `show_hold_invoice`, and therefore which order
+/// statuses its compare-and-swap may still overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldInvoiceOrigin {
+    /// A take handler: `take_sell`, `take_buy`, or the post-bond resume.
+    /// Only the pre-trade statuses may be swapped out, so a take that raced
+    /// in behind an already-committed one loses instead of clobbering it.
+    Take,
+    /// `add_invoice`: the buyer supplied their payout invoice, so the row
+    /// legitimately sits at `waiting-buyer-invoice`.
+    BuyerInvoice,
+}
+
+impl HoldInvoiceOrigin {
+    fn allows_waiting_buyer_invoice(self) -> bool {
+        matches!(self, Self::BuyerInvoice)
+    }
+}
+
 pub async fn show_hold_invoice(
     my_keys: &Keys,
     payment_request: Option<String>,
@@ -1022,6 +1113,7 @@ pub async fn show_hold_invoice(
     seller_pubkey: &PublicKey,
     mut order: Order,
     request_id: Option<u64>,
+    origin: HoldInvoiceOrigin,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Seller pays only the order amount and their Mostro fee
@@ -1059,10 +1151,29 @@ pub async fn show_hold_invoice(
     let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    order_updated
-        .update(&pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // Compare-and-swap the escrow storage: if the order left the pre-trade
+    // window while the hold invoice was being created at LND (e.g. a maker
+    // cancel committed), persisting this snapshot would resurrect the row
+    // and strand the invoice. On a miss, cancel the orphaned invoice and
+    // bail instead. Only the `add_invoice` origin may also swap out
+    // `waiting-buyer-invoice`; a take arriving from there raced in behind
+    // a committed take and must lose rather than clobber it.
+    let won = db::cas_complete_pretrade_take(
+        &pool,
+        &order_updated,
+        origin.allows_waiting_buyer_invoice(),
+    )
+    .await?;
+    if !won {
+        if let Err(e) = ln_client.cancel_hold_invoice(&bytes_to_string(&hash)).await {
+            tracing::warn!(
+                "Order id {}: best-effort cancel of orphaned hold invoice failed: {e}",
+                order.id
+            );
+        }
+        republish_winning_state_after_cas_miss(&pool, my_keys, order.id).await;
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
@@ -1619,6 +1730,18 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    /// Regression: the CAS-miss repair timestamp must be strictly newer than
+    /// `now`, otherwise a repair published in the same Unix second as the
+    /// stale event ties on `created_at` and NIP-01's lowest-id tie-breaker
+    /// can keep the stale state on relays.
+    #[test]
+    fn repair_timestamp_is_strictly_after_now() {
+        let now = Timestamp::from(1_700_000_000);
+        let repair = repair_timestamp(now);
+        assert!(repair > now);
+        assert_eq!(repair.as_secs(), now.as_secs() + 1);
     }
 
     #[test]
@@ -2706,6 +2829,64 @@ mod tests {
             .is_err());
     }
 
+    /// Regression: `show_hold_invoice` used to hardcode
+    /// `allow_waiting_buyer_invoice = true` for every caller, so a take that
+    /// raced in behind an already-committed no-invoice take (row at
+    /// `waiting-buyer-invoice`, first taker recorded) still won the CAS and
+    /// clobbered that taker. Only the `add_invoice` caller may treat
+    /// `waiting-buyer-invoice` as a legitimate source.
+    #[test]
+    fn only_the_buyer_invoice_caller_may_swap_out_waiting_buyer_invoice() {
+        assert!(
+            !HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+            "take paths must lose against an already-committed take"
+        );
+        assert!(
+            HoldInvoiceOrigin::BuyerInvoice.allows_waiting_buyer_invoice(),
+            "add_invoice legitimately arrives from waiting-buyer-invoice"
+        );
+    }
+
+    /// The take-path scope must actually be refused by the CAS it feeds, so
+    /// the mapping above is wired to real database behaviour rather than
+    /// just asserting an enum against itself.
+    #[tokio::test]
+    async fn take_origin_cas_scope_cannot_clobber_a_committed_take() {
+        use mostro_core::db::Crud;
+
+        let pool = SqlitePoolOptions::new().connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // First taker already committed: row waits for their invoice.
+        let mut committed = base_order(OrderKind::Sell, Status::WaitingBuyerInvoice);
+        committed.id = Uuid::new_v4();
+        committed.buyer_pubkey = Some("aa".repeat(32));
+        let stored = committed.create(&pool).await.unwrap();
+
+        // Second taker, racing in from a stale `pending` read, reaches
+        // show_hold_invoice and tries to store its own escrow.
+        let mut racer = stored.clone();
+        racer.status = Status::WaitingPayment.to_string();
+        racer.buyer_pubkey = Some("bb".repeat(32));
+
+        let won = db::cas_complete_pretrade_take(
+            &pool,
+            &racer,
+            HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!won, "the racing take must lose");
+        let after = Order::by_id(&pool, stored.id).await.unwrap().unwrap();
+        assert_eq!(after.status, Status::WaitingBuyerInvoice.to_string());
+        assert_eq!(
+            after.buyer_pubkey,
+            Some("aa".repeat(32)),
+            "the first taker must survive"
+        );
+    }
+
     // ───────────────────────── LND-dependent early failures ─────────────────────────
 
     #[tokio::test]
@@ -2716,7 +2897,16 @@ mod tests {
         let seller = Keys::generate().public_key();
         let order = base_order(OrderKind::Sell, Status::WaitingPayment);
 
-        let res = show_hold_invoice(&keys, None, &buyer, &seller, order, None).await;
+        let res = show_hold_invoice(
+            &keys,
+            None,
+            &buyer,
+            &seller,
+            order,
+            None,
+            HoldInvoiceOrigin::Take,
+        )
+        .await;
         assert!(res.is_err(), "no LND reachable in unit tests");
     }
 

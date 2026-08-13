@@ -10,13 +10,16 @@ use nostr_sdk::prelude::*;
 use serde_json::json;
 use std::vec;
 
-/// Internal helper function to create a NIP-33 replaceable event with a specific kind
+/// Internal helper function to create a NIP-33 replaceable event with a specific kind.
+/// `created_at` overrides the event timestamp when provided; `None` uses the
+/// current time.
 fn create_event(
     keys: &Keys,
     content: &str,
     identifier: String,
     extra_tags: Tags,
     kind: u16,
+    created_at: Option<Timestamp>,
 ) -> Result<Event, Error> {
     let mut tags: Vec<Tag> = Vec::with_capacity(2 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
@@ -37,9 +40,11 @@ fn create_event(
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 
-    EventBuilder::new(nostr::event::Kind::Custom(kind), content)
-        .tags(tags)
-        .finalize(keys)
+    let mut builder = EventBuilder::new(nostr::event::Kind::Custom(kind), content).tags(tags);
+    if let Some(created_at) = created_at {
+        builder = builder.custom_created_at(created_at);
+    }
+    builder.finalize(keys)
 }
 
 /// Creates a new order event (kind 38383)
@@ -65,6 +70,29 @@ pub fn new_order_event(
         identifier,
         extra_tags,
         NOSTR_ORDER_EVENT_KIND,
+        None,
+    )
+}
+
+/// Creates a new order event (kind 38383) with an explicit `created_at`.
+///
+/// NIP-01 replaceable-event ordering breaks same-second ties by lowest event
+/// id, so a repair event that must supersede an earlier event published in
+/// the same Unix second needs a strictly newer timestamp.
+pub fn new_order_event_with_created_at(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+    created_at: Timestamp,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_ORDER_EVENT_KIND,
+        Some(created_at),
     )
 }
 
@@ -91,6 +119,7 @@ pub fn new_rating_event(
         identifier,
         extra_tags,
         NOSTR_RATING_EVENT_KIND,
+        None,
     )
 }
 
@@ -111,7 +140,14 @@ pub fn new_info_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
-    create_event(keys, content, identifier, extra_tags, NOSTR_INFO_EVENT_KIND)
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_INFO_EVENT_KIND,
+        None,
+    )
 }
 
 /// Creates a new dispute event (kind 38386)
@@ -137,6 +173,7 @@ pub fn new_dispute_event(
         identifier,
         extra_tags,
         NOSTR_DISPUTE_EVENT_KIND,
+        None,
     )
 }
 
@@ -180,6 +217,7 @@ pub fn new_exchange_rates_event(
         "mostro-rates".to_string(), // NIP-33 d tag identifier
         extra_tags,
         NOSTR_EXCHANGE_RATES_EVENT_KIND,
+        None,
     )
 }
 
@@ -1124,6 +1162,57 @@ mod tests {
 
     // ── Event constructors (kinds 38383/38384/38385/38386/30078) ─────────
 
+    /// Regression: after a same-second CAS miss the repair event must win
+    /// NIP-01 replaceable-event ordering. Same-timestamp ties fall back to
+    /// lowest event id — which the repair could lose — so the repair is
+    /// stamped strictly after the stale event and must win on `created_at`
+    /// alone, regardless of how the ids compare.
+    #[test]
+    fn same_second_cas_miss_repair_event_wins_nip01_ordering() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let tags = Tags::from_list(vec![]);
+
+        // The stale event the losing caller already published.
+        let stale = super::new_order_event(&keys, "", "order-id".to_string(), tags.clone())
+            .expect("stale event");
+
+        // The repair runs milliseconds later — same Unix second. It is
+        // stamped one second after the stale event (see
+        // `util::repair_timestamp`).
+        let repair = super::new_order_event_with_created_at(
+            &keys,
+            "",
+            "order-id".to_string(),
+            tags,
+            Timestamp::from(stale.created_at.as_secs() + 1),
+        )
+        .expect("repair event");
+
+        assert!(
+            repair.created_at > stale.created_at,
+            "repair must out-order the stale event on created_at alone"
+        );
+        // NIP-01: for replaceable events the higher created_at wins; the id
+        // tie-breaker only applies on equal timestamps, which the strictly
+        // newer stamp rules out.
+        let nip01_winner = if repair.created_at != stale.created_at {
+            if repair.created_at > stale.created_at {
+                &repair
+            } else {
+                &stale
+            }
+        } else if repair.id < stale.id {
+            &repair
+        } else {
+            &stale
+        };
+        assert_eq!(
+            nip01_winner.id, repair.id,
+            "repair event must replace the stale one"
+        );
+    }
+
     #[test]
     fn event_constructors_emit_expected_kinds_and_identifier() {
         init_test_settings();
@@ -1151,6 +1240,17 @@ mod tests {
         let dispute = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags.clone())
             .expect("dispute event");
         assert_eq!(dispute.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
+
+        let stamped = super::new_order_event_with_created_at(
+            &keys,
+            "",
+            "order-id".to_string(),
+            tags.clone(),
+            Timestamp::from(1_700_000_000),
+        )
+        .expect("order event with explicit created_at");
+        assert_eq!(stamped.kind.as_u16(), NOSTR_ORDER_EVENT_KIND);
+        assert_eq!(stamped.created_at.as_secs(), 1_700_000_000);
 
         let rates =
             super::new_exchange_rates_event(&keys, "{}", tags.clone()).expect("rates event");

@@ -1087,6 +1087,25 @@ pub(crate) fn price_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(price_nostr_client_policy())
 }
 
+/// Which caller drove `show_hold_invoice`, and therefore which order
+/// statuses its compare-and-swap may still overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldInvoiceOrigin {
+    /// A take handler: `take_sell`, `take_buy`, or the post-bond resume.
+    /// Only the pre-trade statuses may be swapped out, so a take that raced
+    /// in behind an already-committed one loses instead of clobbering it.
+    Take,
+    /// `add_invoice`: the buyer supplied their payout invoice, so the row
+    /// legitimately sits at `waiting-buyer-invoice`.
+    BuyerInvoice,
+}
+
+impl HoldInvoiceOrigin {
+    fn allows_waiting_buyer_invoice(self) -> bool {
+        matches!(self, Self::BuyerInvoice)
+    }
+}
+
 pub async fn show_hold_invoice(
     my_keys: &Keys,
     payment_request: Option<String>,
@@ -1094,6 +1113,7 @@ pub async fn show_hold_invoice(
     seller_pubkey: &PublicKey,
     mut order: Order,
     request_id: Option<u64>,
+    origin: HoldInvoiceOrigin,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Seller pays only the order amount and their Mostro fee
@@ -1135,9 +1155,15 @@ pub async fn show_hold_invoice(
     // window while the hold invoice was being created at LND (e.g. a maker
     // cancel committed), persisting this snapshot would resurrect the row
     // and strand the invoice. On a miss, cancel the orphaned invoice and
-    // bail instead. `waiting-buyer-invoice` stays an allowed source: the
-    // `add_invoice` caller legitimately arrives from it.
-    let won = db::cas_complete_pretrade_take(&pool, &order_updated, true).await?;
+    // bail instead. Only the `add_invoice` origin may also swap out
+    // `waiting-buyer-invoice`; a take arriving from there raced in behind
+    // a committed take and must lose rather than clobber it.
+    let won = db::cas_complete_pretrade_take(
+        &pool,
+        &order_updated,
+        origin.allows_waiting_buyer_invoice(),
+    )
+    .await?;
     if !won {
         if let Err(e) = ln_client.cancel_hold_invoice(&bytes_to_string(&hash)).await {
             tracing::warn!(
@@ -2803,6 +2829,64 @@ mod tests {
             .is_err());
     }
 
+    /// Regression: `show_hold_invoice` used to hardcode
+    /// `allow_waiting_buyer_invoice = true` for every caller, so a take that
+    /// raced in behind an already-committed no-invoice take (row at
+    /// `waiting-buyer-invoice`, first taker recorded) still won the CAS and
+    /// clobbered that taker. Only the `add_invoice` caller may treat
+    /// `waiting-buyer-invoice` as a legitimate source.
+    #[test]
+    fn only_the_buyer_invoice_caller_may_swap_out_waiting_buyer_invoice() {
+        assert!(
+            !HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+            "take paths must lose against an already-committed take"
+        );
+        assert!(
+            HoldInvoiceOrigin::BuyerInvoice.allows_waiting_buyer_invoice(),
+            "add_invoice legitimately arrives from waiting-buyer-invoice"
+        );
+    }
+
+    /// The take-path scope must actually be refused by the CAS it feeds, so
+    /// the mapping above is wired to real database behaviour rather than
+    /// just asserting an enum against itself.
+    #[tokio::test]
+    async fn take_origin_cas_scope_cannot_clobber_a_committed_take() {
+        use mostro_core::db::Crud;
+
+        let pool = SqlitePoolOptions::new().connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // First taker already committed: row waits for their invoice.
+        let mut committed = base_order(OrderKind::Sell, Status::WaitingBuyerInvoice);
+        committed.id = Uuid::new_v4();
+        committed.buyer_pubkey = Some("aa".repeat(32));
+        let stored = committed.create(&pool).await.unwrap();
+
+        // Second taker, racing in from a stale `pending` read, reaches
+        // show_hold_invoice and tries to store its own escrow.
+        let mut racer = stored.clone();
+        racer.status = Status::WaitingPayment.to_string();
+        racer.buyer_pubkey = Some("bb".repeat(32));
+
+        let won = db::cas_complete_pretrade_take(
+            &pool,
+            &racer,
+            HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!won, "the racing take must lose");
+        let after = Order::by_id(&pool, stored.id).await.unwrap().unwrap();
+        assert_eq!(after.status, Status::WaitingBuyerInvoice.to_string());
+        assert_eq!(
+            after.buyer_pubkey,
+            Some("aa".repeat(32)),
+            "the first taker must survive"
+        );
+    }
+
     // ───────────────────────── LND-dependent early failures ─────────────────────────
 
     #[tokio::test]
@@ -2813,7 +2897,16 @@ mod tests {
         let seller = Keys::generate().public_key();
         let order = base_order(OrderKind::Sell, Status::WaitingPayment);
 
-        let res = show_hold_invoice(&keys, None, &buyer, &seller, order, None).await;
+        let res = show_hold_invoice(
+            &keys,
+            None,
+            &buyer,
+            &seller,
+            order,
+            None,
+            HoldInvoiceOrigin::Take,
+        )
+        .await;
         assert!(res.is_err(), "no LND reachable in unit tests");
     }
 

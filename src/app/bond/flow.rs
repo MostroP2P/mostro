@@ -57,6 +57,7 @@ use crate::config::settings::Settings;
 use crate::lightning::{InvoiceMessage, LndConnector};
 use crate::util::{
     bytes_to_string, enqueue_order_msg, get_keys, set_waiting_invoice_status, show_hold_invoice,
+    HoldInvoiceOrigin,
 };
 
 use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
@@ -1313,6 +1314,7 @@ async fn resume_take_after_bond(
                 &seller_pubkey,
                 order,
                 request_id,
+                HoldInvoiceOrigin::Take,
             )
             .await
         }
@@ -1329,6 +1331,7 @@ async fn resume_take_after_bond(
                     &seller_pubkey,
                     order,
                     request_id,
+                    HoldInvoiceOrigin::Take,
                 )
                 .await
             } else {

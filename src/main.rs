@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod escrow;
 pub mod flow;
+pub mod inbox;
 pub mod lightning;
 pub mod lnurl;
 pub mod messages;
@@ -28,6 +29,7 @@ use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
+use crate::inbox::InboxSubscription;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use crate::rpc::RpcServer;
@@ -104,10 +106,7 @@ async fn main() -> Result<()> {
              support protocol v2. See https://github.com/MostroP2P/mostro/issues/786"
         );
     }
-    let subscription = Filter::new()
-        .pubkey(mostro_keys.public_key())
-        .kind(transport.event_kind())
-        .limit(0);
+    let inbox = InboxSubscription::new(mostro_keys.public_key(), transport.event_kind());
 
     let client = match get_nostr_client() {
         Ok(client) => client,
@@ -119,7 +118,7 @@ async fn main() -> Result<()> {
     };
 
     // Client subscription
-    client.subscribe(subscription).await?;
+    inbox.subscribe(client).await?;
 
     // Publish NIP-01 kind 0 metadata event
     let mostro_settings = Settings::get_mostro();

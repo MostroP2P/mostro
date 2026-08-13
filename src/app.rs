@@ -50,6 +50,7 @@ use crate::app::trade_pubkey::trade_pubkey_action;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
+use crate::inbox::{InboxKeeper, InboxSubscription};
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
 use crate::Result;
@@ -457,35 +458,44 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    // Same id and filter `main.rs` subscribed with — the inbox identity is
+    // derived, not passed around (see `crate::inbox`).
+    let mut keeper = InboxKeeper::new(InboxSubscription::new(my_keys.public_key(), accepted_kind));
 
     loop {
         let mut notifications = client.notifications();
 
         while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    is_v2,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result = handle_message_action(
-                    &action,
-                    message.clone(),
-                    &unwrapped,
-                    my_keys,
-                    ln_client,
-                    &ctx,
-                )
-                .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    let Some((action, message, unwrapped)) = accept_event(
+                        &ctx,
+                        &event,
+                        my_keys,
+                        pow,
+                        pow_first_contact,
+                        accepted_kind,
+                        is_v2,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let result = handle_message_action(
+                        &action,
+                        message.clone(),
+                        &unwrapped,
+                        my_keys,
+                        ln_client,
+                        &ctx,
+                    )
+                    .await;
+                    finalize_dispatch(result, message, unwrapped, &action).await;
+                }
+                ClientNotification::Message { relay_url, message } => {
+                    keeper.on_relay_message(client, &relay_url, &message).await;
+                }
+                ClientNotification::Shutdown => return Ok(()),
             }
         }
     }
@@ -508,28 +518,35 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let mut keeper = InboxKeeper::new(InboxSubscription::new(my_keys.public_key(), accepted_kind));
 
     loop {
         let mut notifications = client.notifications();
 
         while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    is_v2,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result =
-                    dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    let Some((action, message, unwrapped)) = accept_event(
+                        &ctx,
+                        &event,
+                        my_keys,
+                        pow,
+                        pow_first_contact,
+                        accepted_kind,
+                        is_v2,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let result =
+                        dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
+                    finalize_dispatch(result, message, unwrapped, &action).await;
+                }
+                ClientNotification::Message { relay_url, message } => {
+                    keeper.on_relay_message(client, &relay_url, &message).await;
+                }
+                ClientNotification::Shutdown => return Ok(()),
             }
         }
     }

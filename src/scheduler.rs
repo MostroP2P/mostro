@@ -543,7 +543,7 @@ async fn job_cancel_orders(ctx: AppContext) {
             // under-credit an order that waited through the whole outage or
             // hand the same credit to one taken long after it ended.
             let health = crate::inbox::InboxHealth::global();
-            let max_grace = health.map(|h| h.max_blind_seconds()).unwrap_or(0);
+            let max_grace = health.as_ref().map(|h| h.max_blind_seconds()).unwrap_or(0);
             if max_grace > 0 {
                 info!(
                     "scheduler_timeout: up to {max_grace}s of inbox downtime is credited against order deadlines"
@@ -569,7 +569,7 @@ async fn job_cancel_orders(ctx: AppContext) {
                     // Give this order back the downtime it actually waited
                     // through. Orders taken after the outage are owed nothing
                     // and fall through unchanged.
-                    if let Some(health) = health {
+                    if let Some(health) = health.as_ref() {
                         let owed = health.blind_seconds_since(order.taken_at);
                         let waited =
                             nostr_sdk::prelude::Timestamp::now().as_secs() as i64 - order.taken_at;

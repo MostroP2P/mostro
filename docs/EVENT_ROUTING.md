@@ -19,9 +19,9 @@ Two mechanisms keep the subscription alive:
 - `InboxKeeper::on_relay_message` reacts to a `CLOSED` naming the inbox by re-sending the REQ to that relay, paced by a per-relay backoff (immediate first retry, doubling to a five-minute ceiling, cleared when the relay answers with `EOSE`).
 - `check_inbox_health`, run every 30 seconds by `job_inbox_watchdog`, audits each connected read relay and re-subscribes any that is no longer serving the inbox. This covers the losses that produce no frame the loop can see: a notification channel that dropped messages under lag, a REQ that failed to go out, a relay added after startup.
 
-Health is judged by the presence of the subscription, never by traffic volume: an instance with no trades in flight is legitimately silent.
+Health is judged by the subscription, never by traffic volume: an instance with no trades in flight is legitimately silent.
 
-A relay re-subscribed during an audit is not counted as listening until the following round. Sending a REQ says nothing about whether the relay will honour it, and counting the attempt would report a healthy inbox indefinitely against a relay that closes it on principle.
+A relay counts as serving the inbox only once **it** has said so, by answering the REQ with an `EOSE` that the event loop recorded in `InboxHealth`. The SDK's own subscription map is not evidence — it records what Mostro sent, so a relay that holds the connection open and quietly drops the REQ still appears subscribed there, and the daemon would resume order timeouts while deaf. The same rule means a relay re-subscribed during an audit does not count until it answers, which costs one interval before recovery is declared and errs toward keeping the timeout clock frozen slightly longer than strictly needed.
 
 ### NIP-42
 The daemon and price clients are built with a `SignerAuthenticator` over the node's keys (`src/util.rs:connect_nostr`). Without it a relay that gates reads behind authentication answers the REQ with `CLOSED "auth-required: …"`, which the SDK treats as permanent. The AUTH event is bound to the relay's challenge and URL, so it cannot be replayed elsewhere.

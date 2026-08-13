@@ -45,8 +45,8 @@
 //! are not, and records the verdict in [`InboxHealth`] so the rest of the
 //! daemon can tell whether Mostro is currently able to hear anything at all.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
@@ -166,13 +166,22 @@ pub struct InboxKeeper {
     /// Only holds relays that are currently failing; a relay that accepts the
     /// REQ is dropped from the map, so the steady state is empty.
     backoff: HashMap<RelayUrl, RelayBackoff>,
+    /// Where relay acknowledgements are recorded. The event loop is the only
+    /// place an `EOSE` can be observed, but the watchdog is what acts on it,
+    /// so the fact has to be shared rather than kept here.
+    health: Option<Arc<InboxHealth>>,
 }
 
 impl InboxKeeper {
     pub fn new(subscription: InboxSubscription) -> Self {
+        Self::with_health(subscription, InboxHealth::global())
+    }
+
+    pub fn with_health(subscription: InboxSubscription, health: Option<Arc<InboxHealth>>) -> Self {
         Self {
             subscription,
             backoff: HashMap::new(),
+            health,
         }
     }
 
@@ -200,8 +209,13 @@ impl InboxKeeper {
             RelayMessage::EndOfStoredEvents(subscription_id)
                 if subscription_id.as_ref() == self.subscription.id() =>
             {
-                // The relay answered the REQ, so whatever made it fail before
-                // is over and the next failure deserves a prompt retry again.
+                // The relay answered the REQ: it is really serving the inbox,
+                // which is what the watchdog needs to know, and whatever made
+                // it fail before is over, so the next failure deserves a prompt
+                // retry again.
+                if let Some(health) = &self.health {
+                    health.note_relay_acknowledged(relay_url);
+                }
                 if self.backoff.remove(relay_url).is_some() {
                     info!("Inbox subscription re-established on relay {relay_url}");
                 }
@@ -297,7 +311,7 @@ pub enum InboxStatus {
 /// Process-wide inbox health. `None` until [`InboxHealth::install_global`]
 /// runs at startup; consumers treat an absent health record as "listening", so
 /// unit tests that never install it behave as before.
-static INBOX_HEALTH: OnceLock<InboxHealth> = OnceLock::new();
+static INBOX_HEALTH: OnceLock<Arc<InboxHealth>> = OnceLock::new();
 
 /// Why [`InboxHealth::install_global`] refused. Mirrors `spam_gate::InstallError`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +360,13 @@ struct HealthState {
     installed_at: i64,
     /// Every outage this process has seen, oldest first, pruned by age.
     windows: Vec<BlindWindow>,
+    /// Relays that have answered the inbox REQ since it was last sent to them.
+    ///
+    /// A relay is only credited with serving the inbox once it says so. The
+    /// SDK's own subscription map cannot stand in for this: it records what
+    /// *we* sent, so a relay that holds the connection open and quietly
+    /// ignores the REQ still looks subscribed there.
+    acknowledged: HashSet<RelayUrl>,
 }
 
 impl HealthState {
@@ -383,6 +404,7 @@ impl InboxHealth {
                 verdict: None,
                 installed_at,
                 windows: Vec::new(),
+                acknowledged: HashSet::new(),
             }),
         }
     }
@@ -390,13 +412,13 @@ impl InboxHealth {
     /// Install as the process-wide health record.
     pub fn install_global(self) -> Result<(), InstallError> {
         INBOX_HEALTH
-            .set(self)
+            .set(Arc::new(self))
             .map_err(|_| InstallError::AlreadyInstalled)
     }
 
     /// The process-wide health record, if one was installed.
-    pub fn global() -> Option<&'static InboxHealth> {
-        INBOX_HEALTH.get()
+    pub fn global() -> Option<Arc<InboxHealth>> {
+        INBOX_HEALTH.get().cloned()
     }
 
     /// Record the current observation, returning the resulting status.
@@ -499,6 +521,35 @@ impl InboxHealth {
             .max(0)
     }
 
+    /// Record that `relay` answered the inbox REQ (an `EOSE` for our
+    /// subscription), which is the only evidence that it is really serving it.
+    pub fn note_relay_acknowledged(&self, relay: &RelayUrl) {
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .acknowledged
+            .insert(relay.clone());
+    }
+
+    /// Forget `relay`'s acknowledgement, because the REQ has just been sent
+    /// again and has yet to be answered.
+    pub fn note_relay_resubscribed(&self, relay: &RelayUrl) {
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .acknowledged
+            .remove(relay);
+    }
+
+    /// Whether `relay` has answered the inbox REQ since it was last sent.
+    pub fn has_acknowledged(&self, relay: &RelayUrl) -> bool {
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .acknowledged
+            .contains(relay)
+    }
+
     /// How long the current outage has been running, or zero if listening.
     pub fn blind_for_secs(&self) -> i64 {
         let now = now_secs();
@@ -516,25 +567,34 @@ fn now_secs() -> i64 {
     Timestamp::now().as_secs() as i64
 }
 
-/// Check every read relay, re-subscribing any that lost the inbox, and record
-/// the verdict in the process-wide [`InboxHealth`].
+/// Check every read relay, re-subscribing any that is not serving the inbox,
+/// and record the verdict in the process-wide [`InboxHealth`].
 ///
 /// The health question is asked of the *subscription*, not of traffic: a node
 /// with no trades in flight is legitimately silent, so treating quiet as
 /// failure would raise false alarms on an idle instance and, worse, would stop
 /// the timeout machinery for no reason.
 ///
-/// A relay re-subscribed during this very audit does **not** count as
-/// listening. Sending a REQ is not the same as having it honoured — a relay
-/// that closes the inbox on principle would accept the REQ and close it again
-/// moments later, and counting the attempt would report a healthy inbox
-/// forever while nothing was ever delivered. Only a subscription that was
-/// already in place when the audit ran proves the relay kept it. Recovery is
-/// therefore confirmed on the following round, which costs one extra interval
-/// before the inbox is declared healthy again and keeps the error on the safe
-/// side: the timeout clock stays frozen a little longer than strictly needed,
-/// rather than resuming while the node is still deaf.
+/// A relay counts as serving the inbox only when **it** has said so, by
+/// answering the REQ with an `EOSE` the event loop recorded. The SDK's own
+/// subscription map is not evidence: it records what Mostro sent, so a relay
+/// that keeps the connection open and quietly drops the REQ still appears
+/// subscribed there — and the daemon would resume timeouts while deaf. It also
+/// means a relay re-subscribed during this audit does not count until it
+/// answers, which costs one interval before recovery is declared and keeps the
+/// error on the safe side: the timeout clock stays frozen slightly longer than
+/// strictly needed rather than restarting too early.
 pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscription) -> InboxStatus {
+    check_inbox_health_with(client, subscription, InboxHealth::global()).await
+}
+
+/// [`check_inbox_health`] against an explicit health record, so tests do not
+/// have to install the process-wide one.
+async fn check_inbox_health_with(
+    client: &Client,
+    subscription: &InboxSubscription,
+    health: Option<Arc<InboxHealth>>,
+) -> InboxStatus {
     let relays = client
         .relays()
         .with_capabilities(RelayCapabilities::READ)
@@ -547,14 +607,26 @@ pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscriptio
         if !relay.status().is_connected() {
             continue;
         }
-        if relay.subscription(subscription.id()).await.is_some() {
+        let registered = relay.subscription(subscription.id()).await.is_some();
+        // Without a health record there is nowhere to have stored an
+        // acknowledgement, so fall back to registration alone.
+        let acknowledged = health
+            .as_ref()
+            .map(|h| h.has_acknowledged(url))
+            .unwrap_or(true);
+
+        if registered && acknowledged {
             listening += 1;
         } else {
-            // Connected but not subscribed: a CLOSED the event loop never saw
-            // (the notification channel drops frames when it lags), a REQ that
-            // failed to go out, or a relay re-added after startup.
+            // Not serving it: a CLOSED the event loop never saw (the
+            // notification channel drops frames when it lags), a REQ that
+            // failed to go out, a relay re-added after startup — or one that
+            // took the REQ and never answered it.
             warn!("Relay {url} is connected but not serving the Mostro inbox; re-subscribing");
             resubscribe_relay(relay, subscription).await;
+            if let Some(health) = &health {
+                health.note_relay_resubscribed(url);
+            }
             retried += 1;
         }
     }
@@ -565,7 +637,7 @@ pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscriptio
         InboxStatus::Blind
     };
 
-    if let Some(health) = InboxHealth::global() {
+    if let Some(health) = &health {
         let was_blind = health.is_blind();
         health.observe(status, now_secs());
 
@@ -1181,11 +1253,13 @@ mod tests {
             .expect("drop the subscription");
         assert!(!client.subscriptions().await.contains_key(subscription.id()));
 
+        let health = Arc::new(InboxHealth::at(T0));
+
         // The audit re-subscribes, but does not yet claim to be listening: a
         // REQ that just went out proves nothing about whether the relay will
         // honour it.
         assert_eq!(
-            check_inbox_health(&client, &subscription).await,
+            check_inbox_health_with(&client, &subscription, Some(health.clone())).await,
             InboxStatus::Blind,
             "a relay re-subscribed during this audit must not count as listening yet"
         );
@@ -1194,14 +1268,88 @@ mod tests {
             "the inbox subscription must be back after the audit"
         );
 
-        // The relay kept it, so the next round confirms the recovery.
+        // The relay answers the new REQ; in the daemon this is the event loop
+        // seeing the EOSE and recording it.
+        health.note_relay_acknowledged(&url);
+
         assert_eq!(
-            check_inbox_health(&client, &subscription).await,
+            check_inbox_health_with(&client, &subscription, Some(health)).await,
             InboxStatus::Listening,
-            "a subscription that survived to the next audit means the ear is open"
+            "a relay that answered the REQ is serving the inbox"
         );
 
         relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn watchdog_does_not_trust_a_relay_that_never_answered() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        // A relay can hold the connection open and quietly drop the REQ. The
+        // SDK still lists the subscription, because that map records what
+        // Mostro sent, not what the relay agreed to serve. Treating it as
+        // proof would resume order timeouts against a deaf node.
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+        subscription.subscribe(&client).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let health = Arc::new(InboxHealth::at(T0));
+
+        assert!(
+            client.subscriptions().await.contains_key(subscription.id()),
+            "precondition: the SDK has the subscription registered"
+        );
+        assert_eq!(
+            check_inbox_health_with(&client, &subscription, Some(health.clone())).await,
+            InboxStatus::Blind,
+            "local registration alone must not count as the relay serving the inbox"
+        );
+
+        // Once it does answer, the same registration is finally evidence.
+        health.note_relay_acknowledged(&url);
+        assert_eq!(
+            check_inbox_health_with(&client, &subscription, Some(health)).await,
+            InboxStatus::Listening
+        );
+
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn keeper_records_the_acknowledgement_the_watchdog_reads() {
+        // The EOSE is only observable from the event loop, while the watchdog
+        // is what acts on it — this is the handoff between the two.
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        let health = Arc::new(InboxHealth::at(T0));
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        let url = relay_url("ws://relay.example");
+
+        assert!(!health.has_acknowledged(&url));
+
+        let eose =
+            RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(subscription.id().clone()));
+        keeper.on_relay_message(&client, &url, &eose).await;
+
+        assert!(
+            health.has_acknowledged(&url),
+            "an EOSE for the inbox must be recorded as the relay serving it"
+        );
+
+        // A frame for someone else's subscription proves nothing about ours.
+        let other_url = relay_url("ws://other.example");
+        let other = RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(SubscriptionId::new(
+            "not-the-inbox",
+        )));
+        keeper.on_relay_message(&client, &other_url, &other).await;
+        assert!(!health.has_acknowledged(&other_url));
     }
 
     #[tokio::test]

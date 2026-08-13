@@ -398,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn eose_for_the_inbox_clears_the_backoff() {
-        let client = crate::util::mostro_nostr_client_options().build();
+        let client = crate::util::mostro_nostr_client_options(None).build();
         let mut keeper = keeper();
         let relay = relay_url("ws://relay.example");
         let now = Instant::now();
@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn frames_for_other_subscriptions_are_ignored() {
-        let client = crate::util::mostro_nostr_client_options().build();
+        let client = crate::util::mostro_nostr_client_options(None).build();
         let mut keeper = keeper();
         let relay = relay_url("ws://relay.example");
 
@@ -496,7 +496,7 @@ mod tests {
         let mostro = Keys::generate();
         let subscription = InboxSubscription::new(mostro.public_key(), Kind::GiftWrap);
 
-        let client = crate::util::mostro_nostr_client_options().build();
+        let client = crate::util::mostro_nostr_client_options(None).build();
         client.add_relay(url.clone()).await.expect("add_relay");
         client.connect().await;
 
@@ -560,7 +560,7 @@ mod tests {
         let url = relay.url().await;
 
         let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
-        let client = crate::util::mostro_nostr_client_options().build();
+        let client = crate::util::mostro_nostr_client_options(None).build();
         client.add_relay(url.clone()).await.expect("add_relay");
         client.connect().await;
         subscription.subscribe(&client).await.expect("subscribe");

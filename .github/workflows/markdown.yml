@@ -1,0 +1,24 @@
+name: Markdown
+
+on:
+  push:
+    paths:
+      - "**/*.md"
+      - ".markdownlint-cli2.jsonc"
+      - ".github/workflows/markdown.yml"
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".markdownlint-cli2.jsonc"
+      - ".github/workflows/markdown.yml"
+
+jobs:
+  markdownlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to the version the review tooling reports, so a finding raised in
+      # review reproduces locally with the same command and the same result.
+      # Globs and ignores come from .markdownlint-cli2.jsonc.
+      - name: markdownlint-cli2
+        run: npx --yes markdownlint-cli2@0.23.2

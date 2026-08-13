@@ -168,14 +168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 When RPC is enabled, you'll see log messages like:
 
-```
+```text
 INFO mostro::rpc::server: Starting RPC server on 127.0.0.1:50051
 INFO mostro::rpc::server: RPC server started successfully
 ```
 
 Admin operations will be logged:
 
-```
+```text
 INFO mostro::rpc::service: Received cancel order request for order: 550e8400-e29b-41d4-a716-446655440000
 ```
 

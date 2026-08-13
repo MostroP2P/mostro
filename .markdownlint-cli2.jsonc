@@ -1,0 +1,21 @@
+{
+  // Markdown lint configuration for the repository's documentation.
+  //
+  // The ruleset is deliberately narrow: it starts from `default: false` and
+  // enables only what AGENTS.md § Documentation Guidelines actually mandates,
+  // so the job fails on policy violations and stays silent about style the
+  // repository has never agreed on.
+  //
+  // Turning on markdownlint's full default set today would report ~1560
+  // findings across 38 files (768 of them MD013 line-length alone), which is a
+  // reformatting project, not a lint gate. Rules can be promoted here one at a
+  // time as the tree is cleaned up — each promotion should land together with
+  // the fixes that make it green.
+  "config": {
+    "default": false,
+    // AGENTS.md: "Add a language specifier to every fenced code block."
+    "MD040": true
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["target/**", "node_modules/**", ".git/**"]
+}

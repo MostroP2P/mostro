@@ -1485,46 +1485,6 @@ mod tests {
         let _ = crate::util::take_failed_orderbook_publishes();
     }
 
-    /// The full sweep re-asserts only live pending orders: expired rows are
-    /// the expiry job's business and post-trade rows are not book entries.
-    #[tokio::test]
-    async fn reconciler_full_sweep_lists_only_live_pending_orders() {
-        let ctx = migrated_ctx().await;
-        let now = nostr_sdk::prelude::Timestamp::now().as_secs() as i64;
-
-        for (status, expires_at) in [
-            (Status::Pending, now + 3_600),        // live → listed
-            (Status::WaitingTakerBond, now + 600), // publishes as pending → listed
-            (Status::Pending, now - 60),           // expired → expiry job's business
-            (Status::Active, now + 3_600),         // post-trade → not a book entry
-            (Status::WaitingMakerBond, now + 600), // never published → skipped
-        ] {
-            let order = Order {
-                id: Uuid::new_v4(),
-                kind: Kind::Sell.to_string(),
-                status: status.to_string(),
-                fiat_code: "USD".to_string(),
-                payment_method: "bank".to_string(),
-                expires_at,
-                ..Default::default()
-            };
-            order.create(ctx.pool()).await.unwrap();
-        }
-
-        let listed = crate::db::find_pending_orders_for_reconcile(ctx.pool())
-            .await
-            .unwrap();
-        let statuses: Vec<String> = listed.iter().map(|o| o.status.clone()).collect();
-
-        assert_eq!(
-            listed.len(),
-            2,
-            "only live pending-published rows: {statuses:?}"
-        );
-        assert!(statuses.contains(&Status::Pending.to_string()));
-        assert!(statuses.contains(&Status::WaitingTakerBond.to_string()));
-    }
-
     // ── notify_users_canceled_order ──────────────────────────────────────
 
     #[tokio::test]

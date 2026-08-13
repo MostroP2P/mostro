@@ -1122,13 +1122,13 @@ pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64)> {
         .collect()
 }
 
-/// `true` when the order's take window has closed (`expires_at` in the
-/// past) but the expiry job has not canceled it yet. The scheduler tick
-/// runs every ~60 s, so a `pending` row can outlive its `expires_at` by up
-/// to a minute; take paths must reject in that window instead of relying
-/// on the tick.
+/// `true` when the order's take window has closed (`expires_at` reached,
+/// inclusive: the expiry second itself is already closed) but the expiry
+/// job has not canceled it yet. The scheduler tick runs every ~60 s, so a
+/// `pending` row can outlive its `expires_at` by up to a minute; take
+/// paths must reject in that window instead of relying on the tick.
 pub(crate) fn is_order_take_window_closed(order: &Order, now: i64) -> bool {
-    order.expires_at > 0 && order.expires_at < now
+    order.expires_at > 0 && order.expires_at <= now
 }
 
 /// Serializes tests that touch the process-global failed-publish queue
@@ -2260,6 +2260,12 @@ mod tests {
         let mut order = base_order(OrderKind::Sell, Status::Pending);
         let now = order.expires_at + 10;
         assert!(is_order_take_window_closed(&order, now));
+
+        // Equality boundary: the expiry second itself is already closed.
+        // Both take paths (`take_buy`, `take_sell`) gate through this
+        // function with `Timestamp::now()`, so a take landing exactly at
+        // `expires_at` must be rejected.
+        assert!(is_order_take_window_closed(&order, order.expires_at));
 
         // Still-open window: not closed.
         assert!(!is_order_take_window_closed(&order, order.expires_at - 10));

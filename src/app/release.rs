@@ -493,30 +493,32 @@ async fn handle_child_order(
     // Prepare new pending child order
     let new_order = child_order.as_new_order();
 
-    if let (Some(destination_pubkey), new_trade_index) = (notification_pubkey, new_trade_index) {
-        // If we have next trade pubkey and index we can set them in child order
-        enqueue_order_msg(
-            request_id,
-            new_order.id,
-            Action::NewOrder,
-            Some(Payload::Order(new_order)),
-            PublicKey::from_str(&destination_pubkey).map_err(|_| {
-                MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string()))
-            })?,
-            new_trade_index,
-        )
-        .await;
-    } else {
+    // Validate the notification data before touching the database
+    let Some(destination_pubkey) = notification_pubkey else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(
             "Next trade index or pubkey is missing - user cannot be notified".to_string(),
         )));
-    }
+    };
+    let destination_pubkey = PublicKey::from_str(&destination_pubkey)
+        .map_err(|_| MostroInternalErr(ServiceError::NostrError("Invalid pubkey".to_string())))?;
 
-    // Create the child order in database
+    // Create the child order in database before queueing its notification,
+    // so the queue never delivers a NewOrder message for a row that does
+    // not exist (e.g. on a transient insert failure).
     child_order
         .create(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    enqueue_order_msg(
+        request_id,
+        new_order.id,
+        Action::NewOrder,
+        Some(Payload::Order(new_order)),
+        destination_pubkey,
+        new_trade_index,
+    )
+    .await;
 
     Ok(())
 }

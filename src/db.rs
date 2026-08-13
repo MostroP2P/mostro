@@ -1081,8 +1081,9 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
 ///   `fiat-sent` and `dispute` with the escrow HTLC still locked, so a
 ///   restart in either one used to stop observing that invoice for the rest
 ///   of the run (#856). That is the window in which LND force-cancels an
-///   accepted hold HTLC at the CLTV horizon, and the cancel has to be seen
-///   for [`crate::flow::hold_invoice_canceled`] to close the trade.
+///   accepted hold HTLC at the CLTV horizon, and
+///   [`crate::flow::hold_invoice_canceled`] cannot react to a cancel it
+///   never observes.
 /// - `waiting-payment` / `waiting-buyer-invoice` with a hash — the invoice
 ///   exists but nobody has paid it yet. `invoice_held_at` is still 0 here
 ///   (only [`crate::flow::hold_invoice_paid`] ever writes it), which is why

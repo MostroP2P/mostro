@@ -14,8 +14,8 @@ use chrono::{TimeDelta, Utc};
 use config::*;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
-use nostr_sdk::EventBuilder;
-use nostr_sdk::{Kind as NostrKind, Tag};
+use nostr_sdk::prelude::EventBuilder;
+use nostr_sdk::prelude::{FinalizeEvent, Kind as NostrKind, Nip65Tag, Tag};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -162,13 +162,19 @@ async fn job_relay_list(ctx: AppContext) {
                 let mut relay_tags: Vec<Tag> = vec![];
 
                 for (_, r) in relays.iter() {
-                    if r.is_connected() {
-                        relay_tags.push(Tag::relay_metadata(r.url().clone(), None))
+                    if r.status().is_connected() {
+                        relay_tags.push(
+                            Nip65Tag::RelayMetadata {
+                                relay_url: r.url().clone(),
+                                metadata: None,
+                            }
+                            .into(),
+                        )
                     }
                 }
                 if let Ok(relay_ev) = EventBuilder::new(NostrKind::RelayList, "")
                     .tags(relay_tags)
-                    .sign_with_keys(&mostro_keys)
+                    .finalize(&mostro_keys)
                 {
                     let _ = client.send_event(&relay_ev).await;
                 }
@@ -907,7 +913,7 @@ mod tests {
     }
 
     fn hex_key() -> String {
-        nostr_sdk::Keys::generate().public_key().to_hex()
+        nostr_sdk::prelude::Keys::generate().public_key().to_hex()
     }
 
     fn order_for_cancel(kind: Kind, with_pubkeys: bool) -> Order {
@@ -1055,9 +1061,9 @@ mod tests {
         let ctx = migrated_ctx().await;
         // Seed a signed dummy event; the job publishes (best-effort, no
         // relays) and clears the queue.
-        let keys = nostr_sdk::Keys::generate();
-        let event = nostr_sdk::EventBuilder::text_note("rate")
-            .sign_with_keys(&keys)
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let event = nostr_sdk::prelude::EventBuilder::new(nostr::event::Kind::TextNote, "rate")
+            .finalize(&keys)
             .unwrap();
         MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
 

@@ -7,6 +7,7 @@ use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event, order_to_tags};
 use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
+use crate::Result;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -840,7 +841,7 @@ mod tests {
     use crate::app::context::AppContext;
     use crate::config::{MESSAGE_QUEUES, MOSTRO_CONFIG};
     use async_trait::async_trait;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

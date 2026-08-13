@@ -257,7 +257,7 @@ mod tests {
     use super::*;
 
     use mostro_core::order::{Kind as OrderKind, Status};
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {

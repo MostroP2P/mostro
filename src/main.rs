@@ -16,6 +16,11 @@ pub mod scheduler;
 pub mod spam_gate;
 pub mod util;
 
+/// Convenience alias mirroring the one `nostr` (pre-0.45) used to re-export
+/// via `nostr_sdk::prelude::*`; nostr 0.45 dropped it, so it's recreated here
+/// for the crate root and pulled into other modules via `use crate::Result;`.
+pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
+
 use crate::app::context::AppContext;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
@@ -112,12 +117,12 @@ async fn main() -> Result<()> {
     };
 
     // Client subscription
-    client.subscribe(subscription, None).await?;
+    client.subscribe(subscription).await?;
 
     // Publish NIP-01 kind 0 metadata event
     let mostro_settings = Settings::get_mostro();
     let mut has_metadata = false;
-    let mut metadata = nostr_sdk::Metadata::new();
+    let mut metadata = Metadata::new();
 
     if let Some(ref name) = mostro_settings.name {
         metadata = metadata.name(name);
@@ -128,7 +133,7 @@ async fn main() -> Result<()> {
         has_metadata = true;
     }
     if let Some(ref picture) = mostro_settings.picture {
-        if let Ok(url) = nostr_sdk::Url::parse(picture) {
+        if let Ok(url) = Url::parse(picture) {
             metadata = metadata.picture(url);
             has_metadata = true;
         } else {
@@ -136,7 +141,7 @@ async fn main() -> Result<()> {
         }
     }
     if let Some(ref website) = mostro_settings.website {
-        if let Ok(url) = nostr_sdk::Url::parse(website) {
+        if let Ok(url) = Url::parse(website) {
             metadata = metadata.website(url);
             has_metadata = true;
         } else {
@@ -145,7 +150,7 @@ async fn main() -> Result<()> {
     }
 
     if has_metadata {
-        if let Ok(metadata_ev) = EventBuilder::metadata(&metadata).sign_with_keys(mostro_keys) {
+        if let Ok(metadata_ev) = metadata.finalize(mostro_keys) {
             let _ = client.send_event(&metadata_ev).await;
             tracing::info!("Published NIP-01 kind 0 metadata event");
         }

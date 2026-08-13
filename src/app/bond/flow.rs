@@ -41,12 +41,12 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bitcoin::hashes::hex::FromHex;
 use chrono::Utc;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use mostro_core::prelude::*;
-use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::mpsc::channel;

@@ -2,8 +2,7 @@ use crate::app::context::AppContext;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::*;
-use nostr_sdk::Keys;
+use nostr_sdk::prelude::Keys;
 
 async fn calculate_and_check_quote(
     ctx: &AppContext,
@@ -169,7 +168,7 @@ mod tests {
     use super::*;
     use mostro_core::message::MessageKind;
 
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {
@@ -504,7 +503,7 @@ mod tests {
         fn init_globals() {
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
-            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
         }
 
         fn order_message(fiat_code: &str, trade_index: Option<i64>) -> Message {

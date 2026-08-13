@@ -2576,7 +2576,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_order_by_date_includes_waiting_taker_bond() {
         let pool = setup_orders_db().await.unwrap();
-        let now = nostr_sdk::Timestamp::now().as_secs() as i64;
+        let now = nostr_sdk::prelude::Timestamp::now().as_secs() as i64;
         let past = now - 3600;
         let future = now + 3600;
 

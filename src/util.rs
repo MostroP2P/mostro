@@ -14,6 +14,7 @@ use crate::nip33::{
     create_platform_tag_values, new_order_event, new_order_event_with_created_at, new_rating_event,
     order_to_tags,
 };
+use crate::Result;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
@@ -745,7 +746,6 @@ pub async fn publish_dev_fee_audit_event(
     order: &Order,
     payment_hash: &str,
 ) -> Result<(), MostroError> {
-    use std::borrow::Cow;
     let ln_network = match LN_STATUS.get() {
         Some(status) => status.networks.join(","),
         None => "unknown".to_string(),
@@ -758,31 +758,16 @@ pub async fn publish_dev_fee_audit_event(
 
     // Create tags for queryability
     let mut tag_list = vec![
+        Tag::custom("order-id", vec![order.id.to_string()]),
+        Tag::custom("amount", vec![order.dev_fee.to_string()]),
+        Tag::custom("hash", vec![payment_hash.to_string()]),
+        Tag::custom("destination", vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()]),
+        Tag::custom("network", vec![ln_network]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("order-id")),
-            vec![order.id.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("amount")),
-            vec![order.dev_fee.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hash")),
-            vec![payment_hash.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("destination")),
-            vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()],
-        ),
-        Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(Settings::get_mostro().name.as_deref()),
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["dev-fee-payment".to_string()],
-        ),
+        Tag::custom("z", vec!["dev-fee-payment".to_string()]),
     ];
 
     // Add expiration tag if configured
@@ -796,9 +781,9 @@ pub async fn publish_dev_fee_audit_event(
     let tags = Tags::from_list(tag_list);
 
     // Create and sign event
-    let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
+    let event = EventBuilder::new(nostr::event::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Publish event to relays
@@ -1016,8 +1001,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     // would drop matching trade messages before dispatch (hermeme, PR #841).
     // Price queries use [`connect_price_nostr`] / [`PRICE_NOSTR_CLIENT`] with
     // verification enabled instead.
-    let opts = mostro_nostr_client_options();
-    let client = ClientBuilder::default().opts(opts).build();
+    let client = mostro_nostr_client_options().build();
 
     // Add relays
     for relay in nostr_settings.relays.iter() {
@@ -1037,9 +1021,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
 /// daemon client, with [`price_nostr_client_options`]).
 pub async fn connect_price_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
-    let client = ClientBuilder::default()
-        .opts(price_nostr_client_options())
-        .build();
+    let client = price_nostr_client_options().build();
 
     for relay in nostr_settings.relays.iter() {
         client
@@ -1052,9 +1034,9 @@ pub async fn connect_price_nostr() -> Result<Client, MostroError> {
     Ok(client)
 }
 
-/// Observable policy for Mostro Nostr clients. [`ClientOptions`] fields are
-/// not publicly readable, so production paths go through this struct and
-/// tests assert on it directly (hermeme, PR #841).
+/// Observable policy for Mostro Nostr clients. [`ClientBuilder`] is
+/// constructed fresh by [`client_options_from_policy`], so production paths
+/// go through this struct and tests assert on it directly (hermeme, PR #841).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MostroNostrClientPolicy {
     /// When true, the relay driver rejects non-matching / over-limit events
@@ -1086,22 +1068,22 @@ fn mostro_nostr_relay_limits() -> RelayLimits {
     limits
 }
 
-fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientOptions {
-    let mut opts = ClientOptions::new().relay_limits(mostro_nostr_relay_limits());
+fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientBuilder {
+    let mut builder = ClientBuilder::new().relay_limits(mostro_nostr_relay_limits());
     if policy.verify_subscriptions {
-        opts = opts.verify_subscriptions(true);
+        builder = builder.verify_subscriptions(true);
     }
-    opts
+    builder
 }
 
-/// Process-wide daemon Nostr [`ClientOptions`] (inbox / publishing).
-pub(crate) fn mostro_nostr_client_options() -> ClientOptions {
+/// Process-wide daemon Nostr [`ClientBuilder`] (inbox / publishing).
+pub(crate) fn mostro_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(daemon_nostr_client_policy())
 }
 
-/// Price-provider Nostr [`ClientOptions`]: size limits plus subscription
+/// Price-provider Nostr [`ClientBuilder`]: size limits plus subscription
 /// filter verification, scoped away from the daemon inbox client.
-pub(crate) fn price_nostr_client_options() -> ClientOptions {
+pub(crate) fn price_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(price_nostr_client_policy())
 }
 
@@ -2646,23 +2628,18 @@ mod tests {
             "price client must enable verify_subscriptions"
         );
         // Helpers remain constructible (SDK copies the flag into RelayOptions).
-        let _daemon = ClientBuilder::default()
-            .opts(mostro_nostr_client_options())
-            .build();
-        let _price = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let _daemon = mostro_nostr_client_options().build();
+        let _price = price_nostr_client_options().build();
     }
 
     #[tokio::test]
     async fn price_client_rejects_mismatched_events_before_pool() {
         use futures::StreamExt;
-        use nostr_relay_builder::builder::RelayTestOptions;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::{LocalRelayTestOptions, MockRelay};
         use std::time::Duration;
 
         // Noncompliant relay floods random events that do not match the REQ.
-        let mock = MockRelay::run_with_opts(RelayTestOptions {
+        let mock = MockRelay::run_with_opts(LocalRelayTestOptions {
             unresponsive_connection: None,
             send_random_events: true,
         })
@@ -2670,18 +2647,17 @@ mod tests {
         .expect("mock relay");
         let url = mock.url().await;
 
-        let price_client = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let price_client = price_nostr_client_options().build();
         price_client
             .add_relay(url.clone())
             .await
             .expect("add_relay");
         price_client.connect().await;
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::Metadata).limit(3);
+        let filter = Filter::new().kind(nostr::event::Kind::Metadata).limit(3);
         let mut stream = price_client
-            .stream_events(filter, Duration::from_secs(3))
+            .stream_events(filter)
+            .timeout(Duration::from_secs(3))
             .await
             .expect("stream");
         let mut received = 0usize;
@@ -2696,7 +2672,8 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_client_limit_zero_still_delivers_live_after_eose() {
-        use nostr_relay_builder::MockRelay;
+        use futures::StreamExt;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Clean mock (no random flood): mirrors main.rs `.limit(0)` inbox —
@@ -2706,9 +2683,7 @@ mod tests {
         let mock = MockRelay::run().await.expect("mock relay");
         let url = mock.url().await;
 
-        let daemon = ClientBuilder::default()
-            .opts(mostro_nostr_client_options())
-            .build();
+        let daemon = mostro_nostr_client_options().build();
         daemon.add_relay(url.clone()).await.expect("add_relay");
         daemon.connect().await;
 
@@ -2720,15 +2695,15 @@ mod tests {
         // the live event.
         let mut notifications = daemon.notifications();
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(0);
-        daemon.subscribe(filter, None).await.expect("subscribe");
+        let filter = Filter::new().kind(nostr::event::Kind::TextNote).limit(0);
+        daemon.subscribe(filter).await.expect("subscribe");
 
         // Empty relay ⇒ EOSE quickly; then publish a matching live event.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let keys = Keys::generate();
-        let live = EventBuilder::text_note("live-after-eose")
-            .sign_with_keys(&keys)
+        let live = EventBuilder::new(nostr::event::Kind::TextNote, "live-after-eose")
+            .finalize(&keys)
             .expect("sign");
         let live_id = live.id;
         publisher
@@ -2737,8 +2712,8 @@ mod tests {
             .expect("publish live event");
 
         let got = tokio::time::timeout(Duration::from_secs(8), async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
+            while let Some(notification) = notifications.next().await {
+                if let ClientNotification::Event { event, .. } = notification {
                     if event.id == live_id {
                         return true;
                     }
@@ -2757,7 +2732,7 @@ mod tests {
     #[tokio::test]
     async fn price_client_enforces_filter_limit_before_pool() {
         use futures::StreamExt;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         let mock = MockRelay::run().await.expect("mock relay");
@@ -2769,21 +2744,20 @@ mod tests {
         seeder.connect().await;
         let keys = Keys::generate();
         for i in 0..10 {
-            let event = EventBuilder::text_note(format!("seed-{i}"))
-                .sign_with_keys(&keys)
+            let event = EventBuilder::new(nostr::event::Kind::TextNote, format!("seed-{i}"))
+                .finalize(&keys)
                 .expect("sign");
             seeder.send_event(&event).await.expect("seed");
         }
 
-        let price_client = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let price_client = price_nostr_client_options().build();
         price_client.add_relay(url).await.expect("add_relay");
         price_client.connect().await;
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(3);
+        let filter = Filter::new().kind(nostr::event::Kind::TextNote).limit(3);
         let mut stream = price_client
-            .stream_events(filter, Duration::from_secs(5))
+            .stream_events(filter)
+            .timeout(Duration::from_secs(5))
             .await
             .expect("stream");
         let mut received = 0usize;

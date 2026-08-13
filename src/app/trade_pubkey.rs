@@ -3,7 +3,6 @@ use crate::util::{enqueue_order_msg, get_order};
 
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::*;
 
 pub async fn trade_pubkey_action(
     ctx: &AppContext,
@@ -76,7 +75,7 @@ pub async fn trade_pubkey_action(
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, PublicKey, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use uuid::Uuid;

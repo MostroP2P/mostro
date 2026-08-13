@@ -92,6 +92,15 @@ pub struct Bond {
     /// then; the counterparty share is always derived as
     /// `amount_sats - node_share_sats` so they cannot drift.
     pub node_share_sats: Option<i64>,
+    /// Trade pubkey of the winning counterparty the slashed share is owed to
+    /// (hex, 64 chars). Captured by the slash CAS at the moment the bond
+    /// enters `PendingPayout`, while the order still carries both trade
+    /// pubkeys — before the scheduler's `edit_pubkeys_order` can NULL the
+    /// slashed side. The payout resolver reads this in preference to
+    /// re-deriving the recipient from the (possibly mutated) order row.
+    /// `None` on rows slashed before this column existed, and on paths that
+    /// leave the resolution to the order-derived fallback.
+    pub payout_recipient_pubkey: Option<String>,
     /// Number of `send_payment` retries against an invoice the counterparty
     /// has already submitted. Bumped only on Phase 3 step 6 (send_payment
     /// failure); `payout_max_retries` is checked against this counter
@@ -169,6 +178,7 @@ impl Bond {
             payout_routing_fee_sats: None,
             payout_payment_hash: None,
             node_share_sats: None,
+            payout_recipient_pubkey: None,
             payout_attempts: 0,
             invoice_request_attempts: 0,
             last_invoice_request_at: None,

@@ -1018,7 +1018,7 @@ async fn on_send_payment_failure(
 ///   one responsible for the elapsed waiting state, and the recipient
 ///   is the other side. The §9.2 table is encoded by *who got
 ///   slashed*, not consulted here.
-fn resolve_recipient(
+pub(crate) fn resolve_recipient(
     order: &Order,
     bond: &Bond,
     _reason: BondSlashReason,
@@ -1626,6 +1626,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260813120000_bond_payout_recipient.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient migration");
         // cashu escrow columns (mostro-core 0.12.1) — `Order::by_id` SELECTs
         // them. Apply each ALTER separately for the same reason as dev_fee.
         for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")

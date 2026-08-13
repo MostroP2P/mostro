@@ -410,6 +410,11 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
+/// How long to wait before re-attaching to the notification stream after it
+/// ended without a shutdown. Long enough that a persistent failure cannot burn
+/// a core, short enough that a transient one costs no meaningful deaf time.
+const NOTIFICATION_STREAM_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Shared post-dispatch error handling (identical in both loops). A handler
 /// `Err` is downcast to a `MostroError` and turned into the right reply
 /// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
@@ -509,6 +514,18 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                 ClientNotification::Shutdown => return Ok(()),
             }
         }
+
+        // The stream ended without a `Shutdown` frame. That frame can be
+        // missed — the SDK's notification channel silently drops messages when
+        // the consumer falls behind — and after a shutdown `notifications()`
+        // hands back an empty stream, so re-taking it unconditionally spins
+        // this loop at full tilt. Leave when the client is done, and pace the
+        // retry otherwise.
+        if client.is_shutdown() {
+            return Ok(());
+        }
+        tracing::warn!("Nostr notification stream ended without a shutdown; re-attaching");
+        tokio::time::sleep(NOTIFICATION_STREAM_RETRY).await;
     }
 }
 
@@ -568,6 +585,18 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                 ClientNotification::Shutdown => return Ok(()),
             }
         }
+
+        // The stream ended without a `Shutdown` frame. That frame can be
+        // missed — the SDK's notification channel silently drops messages when
+        // the consumer falls behind — and after a shutdown `notifications()`
+        // hands back an empty stream, so re-taking it unconditionally spins
+        // this loop at full tilt. Leave when the client is done, and pace the
+        // retry otherwise.
+        if client.is_shutdown() {
+            return Ok(());
+        }
+        tracing::warn!("Nostr notification stream ended without a shutdown; re-attaching");
+        tokio::time::sleep(NOTIFICATION_STREAM_RETRY).await;
     }
 }
 

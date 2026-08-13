@@ -243,7 +243,7 @@ impl InboxKeeper {
             }
         };
 
-        resubscribe_relay(&relay, &self.subscription).await;
+        resubscribe_relay(&relay, &self.subscription, self.health.as_deref()).await;
     }
 
     /// Whether a re-subscribe to `relay` may go out at `now`, arming the next
@@ -277,7 +277,21 @@ impl InboxKeeper {
 /// Shared by the event-loop keeper (reacting to a `CLOSED`) and the watchdog
 /// (finding an ear that went missing without one), so both recover a relay the
 /// same way.
-async fn resubscribe_relay(relay: &Relay, subscription: &InboxSubscription) {
+///
+/// Invalidating the relay's acknowledgement is part of the operation, not
+/// something callers remember to do: from the moment a fresh REQ goes out, an
+/// earlier `EOSE` says nothing about whether the relay is serving *this* one.
+/// A relay that answers, then closes the subscription, then quietly ignores
+/// the replacement would otherwise keep its stale credit and read as healthy.
+async fn resubscribe_relay(
+    relay: &Relay,
+    subscription: &InboxSubscription,
+    health: Option<&InboxHealth>,
+) {
+    if let Some(health) = health {
+        health.note_relay_resubscribed(relay.url());
+    }
+
     // A `CLOSED` does not always remove the subscription: rate-limited and
     // auth-required closures only *mark* it, and a marked subscription is
     // re-REQ'd no earlier than the next reconnect — which may never come on a
@@ -642,10 +656,7 @@ async fn check_inbox_health_with(
             // failed to go out, a relay re-added after startup — or one that
             // took the REQ and never answered it.
             warn!("Relay {url} is connected but not serving the Mostro inbox; re-subscribing");
-            resubscribe_relay(relay, subscription).await;
-            if let Some(health) = &health {
-                health.note_relay_resubscribed(url);
-            }
+            resubscribe_relay(relay, subscription, health.as_deref()).await;
             retried += 1;
         }
     }
@@ -1324,6 +1335,45 @@ mod tests {
             check_inbox_health_with(&client, &subscription, Some(health)).await,
             InboxStatus::Listening,
             "a relay that answered the REQ is serving the inbox"
+        );
+
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_closed_frame_invalidates_the_relays_earlier_acknowledgement() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        // A relay can answer the REQ, later close the subscription, and then
+        // ignore the replacement. Its old EOSE must not carry over: the
+        // watchdog would see the re-registered subscription plus stale credit
+        // and resume order timeouts while the node is deaf.
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+
+        let health = Arc::new(InboxHealth::at(T0));
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+
+        // The relay answered an earlier REQ.
+        health.note_relay_acknowledged(&url);
+        assert!(health.has_acknowledged(&url));
+
+        // Now it closes the subscription; the keeper re-sends the REQ.
+        let closed = RelayMessage::Closed {
+            subscription_id: std::borrow::Cow::Owned(subscription.id().clone()),
+            message: std::borrow::Cow::Borrowed("error: go away"),
+        };
+        keeper.on_relay_message(&client, &url, &closed).await;
+
+        assert!(
+            !health.has_acknowledged(&url),
+            "an EOSE from before the CLOSED must not vouch for the replacement REQ"
         );
 
         relay.shutdown();

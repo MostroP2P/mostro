@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::fs::{set_permissions, Permissions};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 // Constants for status filtering used across restore session functions
@@ -675,10 +676,21 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
-pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+/// Orders whose waiting deadline has passed and are therefore candidates for
+/// the timeout job.
+///
+/// `grace` widens the deadline by time the daemon owes users — currently the
+/// span its Nostr inbox spent unable to receive anything (see
+/// [`crate::inbox::InboxHealth::timeout_debt`]). A user who answered on time
+/// into a deaf node must not read as late, so the eligibility window is pushed
+/// back by exactly as long as the node could not listen.
+pub async fn find_order_by_seconds(
+    pool: &SqlitePool,
+    grace: Duration,
+) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
-    let expire_time = Timestamp::now() - exp_seconds;
+    let expire_time = Timestamp::now() - exp_seconds - grace.as_secs();
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -5123,7 +5135,7 @@ mod migration_and_query_tests {
         )
         .await;
 
-        let stale = find_order_by_seconds(&pool).await.unwrap();
+        let stale = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].id, stale_id);
     }
@@ -5167,10 +5179,58 @@ mod migration_and_query_tests {
 
         let after = Order::by_id(&pool, id).await.unwrap().unwrap();
         assert!(after.taken_at > 0, "take must persist taken_at");
-        let stale = find_order_by_seconds(&pool).await.unwrap();
+        let stale = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
         assert!(
             stale.is_empty(),
             "a just-taken order must not be timeout-cancel eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_order_by_seconds_grace_spares_orders_the_daemon_could_not_hear() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+
+        let exp_seconds = Settings::get_mostro().expiration_seconds as i64;
+        // Taken one minute past the deadline: late by wall time, and the
+        // caller is about to say the node was deaf for longer than that.
+        let taken_at = Timestamp::now().as_secs() as i64 - exp_seconds - 60;
+        let order_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            order_id,
+            "sell",
+            "waiting-buyer-invoice",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            taken_at,
+        )
+        .await;
+
+        // No grace: the order is treated as late, which is what would cancel
+        // the escrow and slash the bond.
+        let without_grace = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
+        assert_eq!(without_grace.len(), 1);
+        assert_eq!(without_grace[0].id, order_id);
+
+        // Owed more downtime than the order is late by: not late at all.
+        let with_grace = find_order_by_seconds(&pool, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert!(
+            with_grace.is_empty(),
+            "an order cannot be late for a window the daemon spent unable to listen"
+        );
+
+        // Once the debt wears below the overshoot, the order is late again.
+        let partly_repaid = find_order_by_seconds(&pool, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            partly_repaid.len(),
+            1,
+            "grace only postpones the deadline, it does not remove it"
         );
     }
 

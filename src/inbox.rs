@@ -310,8 +310,12 @@ pub enum InstallError {
 struct HealthState {
     /// When the current outage began, if the inbox is deaf right now.
     blind_since: Option<Instant>,
-    /// The most recent finished outage: when it ended, and how long it lasted.
-    last_outage: Option<(Instant, Duration)>,
+    /// Debt owed by finished outages, exact as of `owed_as_of`. It wears off
+    /// as time passes with the inbox listening, and is frozen while it is
+    /// blind — repaying it requires time the user could actually talk in.
+    owed: Duration,
+    /// When `owed` was last exact. `None` before the first outage.
+    owed_as_of: Option<Instant>,
 }
 
 /// Tracks whether the daemon's ear is open, and for how long it was not.
@@ -347,11 +351,20 @@ impl InboxHealth {
     fn observe(&self, status: InboxStatus, now: Instant) -> InboxStatus {
         let mut state = self.state.lock().expect("inbox health mutex poisoned");
         match (status, state.blind_since) {
-            (InboxStatus::Blind, None) => state.blind_since = Some(now),
+            (InboxStatus::Blind, None) => {
+                // Freeze whatever an earlier outage still owes: from here on,
+                // no time passes that a user could have used to answer, so
+                // none of that debt gets repaid.
+                state.owed = settled_debt(&state, now);
+                state.owed_as_of = Some(now);
+                state.blind_since = Some(now);
+            }
             (InboxStatus::Listening, Some(since)) => {
-                let outage = now.saturating_duration_since(since);
+                // The frozen debt plus this outage; two outages in quick
+                // succession add up rather than cancelling each other out.
+                state.owed += now.saturating_duration_since(since);
+                state.owed_as_of = Some(now);
                 state.blind_since = None;
-                state.last_outage = Some((now, outage));
             }
             _ => {}
         }
@@ -365,6 +378,46 @@ impl InboxHealth {
             .expect("inbox health mutex poisoned")
             .blind_since
             .is_some()
+    }
+
+    /// How much time the order-timeout clock currently owes users.
+    ///
+    /// Deadlines are measured against wall time, but a user cannot answer a
+    /// node that cannot hear — and because a message sent into a dead inbox is
+    /// lost rather than queued (the ten-second replay window, see the module
+    /// docs), they have to send it again once the ear is back. So the time the
+    /// inbox spent down is given back: the debt equals the outage when it ends
+    /// and decays to zero over an equal span, which is the same as saying the
+    /// timeout clock stood still while Mostro was deaf.
+    ///
+    /// Compensation is granted to every waiting order rather than only to
+    /// those in flight during the outage — an order taken *during* the blind
+    /// window gets slightly more grace than it strictly lost. That error is
+    /// deliberate: it delays a cancellation, where the opposite would slash an
+    /// honest user's bond for the node's own failure.
+    pub fn timeout_debt(&self) -> Duration {
+        self.timeout_debt_at(Instant::now())
+    }
+
+    fn timeout_debt_at(&self, now: Instant) -> Duration {
+        let state = self.state.lock().expect("inbox health mutex poisoned");
+        match state.blind_since {
+            // Still deaf: the debt frozen at the start of this outage, plus
+            // every second it has run for.
+            Some(since) => state.owed + now.saturating_duration_since(since),
+            None => settled_debt(&state, now),
+        }
+    }
+}
+
+/// The debt still outstanding at `now` while the inbox is listening: it starts
+/// at the recorded amount and wears off second for second.
+fn settled_debt(state: &HealthState, now: Instant) -> Duration {
+    match state.owed_as_of {
+        Some(as_of) => state
+            .owed
+            .saturating_sub(now.saturating_duration_since(as_of)),
+        None => Duration::ZERO,
     }
 }
 
@@ -778,12 +831,74 @@ mod tests {
         health.observe(InboxStatus::Listening, start + Duration::from_secs(90));
         assert!(!health.is_blind());
 
-        let state = health.state.lock().expect("lock");
-        let (_, outage) = state.last_outage.expect("outage recorded");
         assert_eq!(
-            outage,
+            health.timeout_debt_at(start + Duration::from_secs(90)),
             Duration::from_secs(90),
             "the recorded outage must span the whole blind window"
+        );
+    }
+
+    #[test]
+    fn a_node_that_was_never_blind_owes_nothing() {
+        let health = InboxHealth::new();
+        assert_eq!(health.timeout_debt_at(Instant::now()), Duration::ZERO);
+    }
+
+    #[test]
+    fn debt_grows_while_blind_and_wears_off_after_recovery() {
+        let health = InboxHealth::new();
+        let start = Instant::now();
+
+        health.observe(InboxStatus::Blind, start);
+
+        // While deaf, the clock is stopped: the debt is the whole outage so far.
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
+
+        health.observe(InboxStatus::Listening, start + Duration::from_secs(300));
+
+        // On recovery, users are owed the full outage...
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+        // ...which then decays second for second, so a five-minute outage
+        // gives back five minutes and no more.
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(400)),
+            Duration::from_secs(200)
+        );
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(600)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(10_000)),
+            Duration::ZERO,
+            "the debt must not linger once repaid"
+        );
+    }
+
+    #[test]
+    fn consecutive_outages_accumulate_their_debt() {
+        let health = InboxHealth::new();
+        let start = Instant::now();
+
+        // A 100s outage, recovered at t=100 — debt 100s.
+        health.observe(InboxStatus::Blind, start);
+        health.observe(InboxStatus::Listening, start + Duration::from_secs(100));
+
+        // A second outage begins at t=140, when 60s of the first is still owed,
+        // and lasts 50s.
+        health.observe(InboxStatus::Blind, start + Duration::from_secs(140));
+        health.observe(InboxStatus::Listening, start + Duration::from_secs(190));
+
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(190)),
+            Duration::from_secs(110),
+            "the second outage must not wipe out what the first still owed"
         );
     }
 
@@ -796,8 +911,9 @@ mod tests {
         health.observe(InboxStatus::Listening, now + Duration::from_secs(30));
 
         assert!(!health.is_blind());
-        assert!(
-            health.state.lock().expect("lock").last_outage.is_none(),
+        assert_eq!(
+            health.timeout_debt_at(now + Duration::from_secs(30)),
+            Duration::ZERO,
             "a node that was never blind has no outage to compensate for"
         );
     }

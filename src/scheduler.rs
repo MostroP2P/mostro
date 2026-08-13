@@ -512,7 +512,36 @@ async fn job_cancel_orders(ctx: AppContext) {
         loop {
             info!("Check for order to republish for late actions of users");
 
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
+            // A timeout means "the user did not answer in time", and that
+            // conclusion is only sound while Mostro can hear. With the inbox
+            // down, an answer that was sent is simply never delivered — and
+            // the ten-second replay window means it is lost, not queued — so
+            // acting on the deadline would cancel escrows and slash bonds over
+            // the node's own deafness. Skip the whole tick: cancel, refund,
+            // republish and slash all rest on the same unsound premise.
+            if let Some(health) = crate::inbox::InboxHealth::global() {
+                if health.is_blind() {
+                    warn!(
+                        "scheduler_timeout: inbox is blind, holding order timeouts until it recovers"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
+
+            // Time the inbox spent deaf is given back to users before an order
+            // counts as late (see `InboxHealth::timeout_debt`).
+            let grace = crate::inbox::InboxHealth::global()
+                .map(|health| health.timeout_debt())
+                .unwrap_or_default();
+            if !grace.is_zero() {
+                info!(
+                    "scheduler_timeout: extending order deadlines by {}s to make up for inbox downtime",
+                    grace.as_secs()
+                );
+            }
+
+            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool, grace).await {
                 for order in older_orders_list.into_iter() {
                     // The tick-start snapshot may be stale by the time this
                     // iteration is reached — re-read and re-confirm before

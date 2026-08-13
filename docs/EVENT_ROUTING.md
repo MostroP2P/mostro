@@ -35,6 +35,8 @@ Once the inbox recovers, each order is credited the downtime **it** waited throu
 
 The credit has to be per order rather than one global allowance: a single figure either under-credits an order that waited through the whole outage or hands the same credit to one taken long afterwards.
 
+Deferring cannot be unconditional, though. The same pass that slashes a bond is the one that releases it and the one that cancels the seller's hold invoice, so waiting forever on a permanently broken inbox would leave escrows encumbered until CLTV expiry and honest takers' bonds locked indefinitely. After three hours without a confirmed inbox, timed-out orders are unwound anyway — but blamelessly: bonds are released rather than settled (`bond::release_on_timeout_without_slashing`), and the downtime credit is skipped, since by then every waiting order would be owed more than its deadline and nothing would ever be unwound.
+
 ## Dispatch
 - Router: `src/app.rs:handle_message_action`
 - Maps `Action` → module function under `src/app/*`.

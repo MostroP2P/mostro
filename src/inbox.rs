@@ -560,6 +560,25 @@ impl InboxHealth {
             .map(|w| (now - w.start).max(0))
             .unwrap_or(0)
     }
+
+    /// How long it has been since an audit confirmed Mostro can hear.
+    ///
+    /// Zero while listening. Otherwise it counts from the start of the current
+    /// outage, or — if no audit has ever run — from startup, so a watchdog
+    /// that never reported cannot leave a caller waiting forever on a verdict
+    /// that is not coming.
+    pub fn unconfirmed_for_secs(&self) -> i64 {
+        let now = now_secs();
+        let state = self.state.lock().expect("inbox health mutex poisoned");
+        if state.verdict == Some(InboxStatus::Listening) && state.blind_now().is_none() {
+            return 0;
+        }
+        let since = state
+            .blind_now()
+            .map(|w| w.start)
+            .unwrap_or(state.installed_at);
+        (now - since).max(0)
+    }
 }
 
 /// Wall-clock seconds, the base an order's `taken_at` is recorded in.
@@ -1209,6 +1228,35 @@ mod tests {
 
         assert_eq!(health.blind_seconds_between(T0, much_later), 0);
         assert!(health.state.lock().expect("lock").windows.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_time_counts_from_the_outage_or_from_startup() {
+        // What bounds how long the timeout job may defer. It has to answer
+        // even when no audit ever ran, or a watchdog that died would park the
+        // job on a verdict that is never coming.
+        let never_audited = InboxHealth::at(now_secs() - 120);
+        assert!(
+            never_audited.unconfirmed_for_secs() >= 120,
+            "with no verdict at all, the clock runs from startup"
+        );
+
+        let healthy = InboxHealth::at(now_secs());
+        healthy.observe(InboxStatus::Listening, now_secs());
+        assert_eq!(
+            healthy.unconfirmed_for_secs(),
+            0,
+            "a confirmed inbox owes no waiting"
+        );
+
+        let blind = InboxHealth::at(now_secs() - 600);
+        blind.observe(InboxStatus::Listening, now_secs() - 600);
+        blind.observe(InboxStatus::Blind, now_secs() - 300);
+        assert!(
+            (300..=310).contains(&blind.unconfirmed_for_secs()),
+            "while blind it runs from the start of the outage, got {}",
+            blind.unconfirmed_for_secs()
+        );
     }
 
     #[test]

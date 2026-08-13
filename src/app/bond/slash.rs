@@ -2346,6 +2346,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_slash_payout_survives_scheduler_pubkey_wipe() {
+        // Regression for the timeout-slash forfeit bug. `job_cancel_orders`
+        // runs the slash and then calls `edit_pubkeys_order`, which NULLs the
+        // slashed taker's trade pubkey on the order to reset/republish it.
+        // Composing both here proves the payout recipient is still resolvable
+        // afterwards: the winning maker was captured on the bond at slash
+        // time, so it no longer depends on the now-wiped order row.
+        use crate::app::bond::payout::resolve_payout_recipient;
+        use crate::db::edit_pubkeys_order;
+
+        let pool = setup_pool().await;
+        // Sell order, WaitingBuyerInvoice: maker = seller, taker = buyer. The
+        // buyer abandons → the taker bond is slashed and the seller (maker)
+        // is the wronged party owed the counterparty share.
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        // Step 1 — the real timeout slash. Besides settling the HTLC and
+        // moving the bond to PendingPayout, its CAS captures the recipient.
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let slashed = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap()
+            .expect("taker bond is slashed on timeout");
+        assert_eq!(slashed.id, bond.id);
+
+        // Step 2 — the scheduler's republish step wipes the taker pubkey.
+        edit_pubkeys_order(&pool, &order)
+            .await
+            .expect("edit_pubkeys_order");
+
+        // The order row can no longer be matched by `bond.pubkey`...
+        let wiped = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order row present");
+        assert!(
+            wiped.buyer_pubkey.is_none(),
+            "the scheduler wipe NULLs the taker (buyer) pubkey"
+        );
+
+        // ...but the slash CAS captured the winner on the bond row.
+        let slashed_row = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")
+            .bind(slashed.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            slashed_row.payout_recipient_pubkey.as_deref(),
+            Some(maker_pk()),
+            "the slash CAS recorded the winning counterparty before the wipe"
+        );
+
+        // So the payout still resolves to the maker instead of falling
+        // through to `None` (which would forfeit the share to the node).
+        let recipient = resolve_payout_recipient(&wiped, &slashed_row, BondSlashReason::Timeout)
+            .unwrap()
+            .expect("recipient must still resolve after the pubkey wipe");
+        assert_eq!(
+            recipient.to_string(),
+            maker_pk(),
+            "the wronged maker is paid, not forfeited to the node"
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_republish_retains_maker_bond_sell_order() {
         // Regression (PR #767 review): sell order, WaitingBuyerInvoice. The
         // buyer (taker) times out, so the order is **republished** to the

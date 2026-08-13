@@ -1043,17 +1043,31 @@ pub(crate) fn resolve_recipient(
 ///   NULL) → the recipient is the **maker themselves** (`bond.pubkey`), not
 ///   a trade counterparty. This is the unslashed remainder being returned
 ///   after a partial range slash.
+/// - **Recipient captured at slash time** (`payout_recipient_pubkey` set) →
+///   trust it directly. The timeout-slash path NULLs one of the order's
+///   trade pubkeys via `edit_pubkeys_order` immediately after the slash, so
+///   re-deriving the winner from the order row here would fall through to
+///   `None` and strand the payout (the funds would forfeit to the node
+///   instead of compensating the wronged party). The slash CAS records the
+///   winner while the order is still intact precisely so this lookup no
+///   longer depends on the mutable order row.
 /// - **Everything else** — a normal slash row, or a Phase 6 *slice-slash*
 ///   child (whose `order_id` is the slice order and whose `pubkey` is the
-///   maker's slice-side key) — resolves via [`resolve_recipient`] to the
-///   non-`bond.pubkey` side of the order, i.e. the winning counterparty.
-fn resolve_payout_recipient(
+///   maker's slice-side key), recorded before the column existed — falls
+///   back to [`resolve_recipient`], resolving the non-`bond.pubkey` side of
+///   the order.
+pub(crate) fn resolve_payout_recipient(
     order: &Order,
     bond: &Bond,
     reason: BondSlashReason,
 ) -> Result<Option<PublicKey>, MostroError> {
     if bond.parent_bond_id.is_some() && bond.child_order_id.is_none() {
         let pk = PublicKey::from_str(&bond.pubkey)
+            .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+        return Ok(Some(pk));
+    }
+    if let Some(recipient) = bond.payout_recipient_pubkey.as_deref() {
+        let pk = PublicKey::from_str(recipient)
             .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
         return Ok(Some(pk));
     }
@@ -1773,6 +1787,66 @@ mod tests {
             r.unwrap().to_string(),
             taker_pk(),
             "a slice slash pays the non-maker winner"
+        );
+    }
+
+    #[test]
+    fn resolve_payout_recipient_prefers_captured_pubkey_over_wiped_order() {
+        // The timeout-slash path NULLs the taker's trade pubkey on the order
+        // (via `edit_pubkeys_order`) right after the slash. With the winner
+        // captured on the bond at slash time, the resolver must still return
+        // it even though the order can no longer be matched by `bond.pubkey`.
+        let wiped_order = Order {
+            kind: Kind::Sell.to_string(),
+            seller_pubkey: Some(maker_pk().to_string()),
+            buyer_pubkey: None,
+            ..Order::default()
+        };
+        let mut bond =
+            pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, 0, None, None);
+        bond.slashed_reason = Some(BondSlashReason::Timeout.to_string());
+        bond.payout_recipient_pubkey = Some(maker_pk().to_string());
+
+        let r = resolve_payout_recipient(&wiped_order, &bond, BondSlashReason::Timeout).unwrap();
+        assert_eq!(
+            r.unwrap().to_string(),
+            maker_pk(),
+            "the captured recipient survives the order-pubkey wipe"
+        );
+    }
+
+    #[test]
+    fn resolve_payout_recipient_falls_back_when_no_captured_pubkey() {
+        // A row slashed before the column existed carries no captured
+        // recipient (`None`). The resolver must fall back to the order-derived
+        // lookup, preserving the pre-fix behaviour: an intact order still
+        // resolves, and a wiped one still yields `None`.
+        let intact_order = Order {
+            kind: Kind::Sell.to_string(),
+            seller_pubkey: Some(maker_pk().to_string()),
+            buyer_pubkey: Some(taker_pk().to_string()),
+            ..Order::default()
+        };
+        let bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, 0, None, None);
+        assert!(bond.payout_recipient_pubkey.is_none());
+
+        let resolved =
+            resolve_payout_recipient(&intact_order, &bond, BondSlashReason::LostDispute).unwrap();
+        assert_eq!(
+            resolved.unwrap().to_string(),
+            maker_pk(),
+            "fallback still resolves the winner off an intact order"
+        );
+
+        let wiped_order = Order {
+            buyer_pubkey: None,
+            ..intact_order
+        };
+        let none =
+            resolve_payout_recipient(&wiped_order, &bond, BondSlashReason::LostDispute).unwrap();
+        assert!(
+            none.is_none(),
+            "with no captured recipient a wiped order is unrecoverable (the bug this fix targets)"
         );
     }
 

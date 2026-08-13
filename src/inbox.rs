@@ -36,8 +36,17 @@
 //! re-issues the REQ to the relay that sent it — under per-relay backoff, so a
 //! relay that refuses the inbox on principle is retried at a decreasing rate
 //! instead of being hammered.
+//!
+//! Not every way of losing the ear announces itself with a frame, though: the
+//! notification channel silently drops messages when the consumer falls
+//! behind, a REQ can fail to go out, a relay can be added after startup.
+//! [`check_inbox_health`] is the backstop — it asks each connected relay
+//! whether it is still serving the subscription, re-subscribes the ones that
+//! are not, and records the verdict in [`InboxHealth`] so the rest of the
+//! daemon can tell whether Mostro is currently able to hear anything at all.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
@@ -220,21 +229,7 @@ impl InboxKeeper {
             }
         };
 
-        // A `CLOSED` does not always remove the subscription: rate-limited and
-        // auth-required closures only *mark* it, and a marked subscription is
-        // re-REQ'd no earlier than the next reconnect — which may never come on
-        // a healthy connection. Dropping the registration first makes the REQ
-        // below unconditional, instead of being refused as a duplicate id.
-        let _ = relay.unsubscribe(self.subscription.id()).await;
-
-        match relay
-            .subscribe(self.subscription.filter().clone())
-            .with_id(self.subscription.id().clone())
-            .await
-        {
-            Ok(_) => info!("Re-sent the inbox subscription to relay {relay_url}"),
-            Err(e) => warn!("Failed to re-subscribe the inbox on relay {relay_url}: {e}"),
-        }
+        resubscribe_relay(&relay, &self.subscription).await;
     }
 
     /// Whether a re-subscribe to `relay` may go out at `now`, arming the next
@@ -261,6 +256,192 @@ impl InboxKeeper {
             }
         }
     }
+}
+
+/// Re-send the inbox REQ to one relay.
+///
+/// Shared by the event-loop keeper (reacting to a `CLOSED`) and the watchdog
+/// (finding an ear that went missing without one), so both recover a relay the
+/// same way.
+async fn resubscribe_relay(relay: &Relay, subscription: &InboxSubscription) {
+    // A `CLOSED` does not always remove the subscription: rate-limited and
+    // auth-required closures only *mark* it, and a marked subscription is
+    // re-REQ'd no earlier than the next reconnect — which may never come on a
+    // healthy connection. Dropping the registration first makes the REQ below
+    // unconditional, instead of being refused as a duplicate id.
+    let _ = relay.unsubscribe(subscription.id()).await;
+
+    match relay
+        .subscribe(subscription.filter().clone())
+        .with_id(subscription.id().clone())
+        .await
+    {
+        Ok(_) => info!("Re-sent the inbox subscription to relay {}", relay.url()),
+        Err(e) => warn!(
+            "Failed to re-subscribe the inbox on relay {}: {e}",
+            relay.url()
+        ),
+    }
+}
+
+/// Whether the daemon can currently hear anything at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxStatus {
+    /// At least one connected relay is serving the inbox subscription.
+    Listening,
+    /// No connected relay is serving it: every message sent to Mostro right
+    /// now is being lost.
+    Blind,
+}
+
+/// Process-wide inbox health. `None` until [`InboxHealth::install_global`]
+/// runs at startup; consumers treat an absent health record as "listening", so
+/// unit tests that never install it behave as before.
+static INBOX_HEALTH: OnceLock<InboxHealth> = OnceLock::new();
+
+/// Why [`InboxHealth::install_global`] refused. Mirrors `spam_gate::InstallError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// A health record is already installed.
+    AlreadyInstalled,
+}
+
+#[derive(Debug, Default)]
+struct HealthState {
+    /// When the current outage began, if the inbox is deaf right now.
+    blind_since: Option<Instant>,
+    /// The most recent finished outage: when it ended, and how long it lasted.
+    last_outage: Option<(Instant, Duration)>,
+}
+
+/// Tracks whether the daemon's ear is open, and for how long it was not.
+///
+/// The scheduler's timeout machinery reads this: an order is only "late" if
+/// Mostro was in a position to hear from the user, and the ten-second replay
+/// window means a message sent into a dead inbox is gone rather than delayed
+/// (see the module docs). Punishing a user for a silence the node itself
+/// caused would be unfair, so the timeout clock stops while the inbox is down.
+#[derive(Debug, Default)]
+pub struct InboxHealth {
+    state: Mutex<HealthState>,
+}
+
+impl InboxHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install as the process-wide health record.
+    pub fn install_global(self) -> Result<(), InstallError> {
+        INBOX_HEALTH
+            .set(self)
+            .map_err(|_| InstallError::AlreadyInstalled)
+    }
+
+    /// The process-wide health record, if one was installed.
+    pub fn global() -> Option<&'static InboxHealth> {
+        INBOX_HEALTH.get()
+    }
+
+    /// Record the current observation, returning the resulting status.
+    fn observe(&self, status: InboxStatus, now: Instant) -> InboxStatus {
+        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        match (status, state.blind_since) {
+            (InboxStatus::Blind, None) => state.blind_since = Some(now),
+            (InboxStatus::Listening, Some(since)) => {
+                let outage = now.saturating_duration_since(since);
+                state.blind_since = None;
+                state.last_outage = Some((now, outage));
+            }
+            _ => {}
+        }
+        status
+    }
+
+    /// Whether the inbox is deaf right now.
+    pub fn is_blind(&self) -> bool {
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .blind_since
+            .is_some()
+    }
+}
+
+/// Check every read relay, re-subscribing any that lost the inbox, and record
+/// the verdict in the process-wide [`InboxHealth`].
+///
+/// The health question is asked of the *subscription*, not of traffic: a node
+/// with no trades in flight is legitimately silent, so treating quiet as
+/// failure would raise false alarms on an idle instance and, worse, would stop
+/// the timeout machinery for no reason.
+///
+/// A relay re-subscribed during this very audit does **not** count as
+/// listening. Sending a REQ is not the same as having it honoured — a relay
+/// that closes the inbox on principle would accept the REQ and close it again
+/// moments later, and counting the attempt would report a healthy inbox
+/// forever while nothing was ever delivered. Only a subscription that was
+/// already in place when the audit ran proves the relay kept it. Recovery is
+/// therefore confirmed on the following round, which costs one extra interval
+/// before the inbox is declared healthy again and keeps the error on the safe
+/// side: the timeout clock stays frozen a little longer than strictly needed,
+/// rather than resuming while the node is still deaf.
+pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscription) -> InboxStatus {
+    let relays = client
+        .relays()
+        .with_capabilities(RelayCapabilities::READ)
+        .await;
+
+    let mut listening = 0usize;
+    let mut retried = 0usize;
+
+    for (url, relay) in relays.iter() {
+        if !relay.status().is_connected() {
+            continue;
+        }
+        if relay.subscription(subscription.id()).await.is_some() {
+            listening += 1;
+        } else {
+            // Connected but not subscribed: a CLOSED the event loop never saw
+            // (the notification channel drops frames when it lags), a REQ that
+            // failed to go out, or a relay re-added after startup.
+            warn!("Relay {url} is connected but not serving the Mostro inbox; re-subscribing");
+            resubscribe_relay(relay, subscription).await;
+            retried += 1;
+        }
+    }
+
+    let status = if listening > 0 {
+        InboxStatus::Listening
+    } else {
+        InboxStatus::Blind
+    };
+
+    if let Some(health) = InboxHealth::global() {
+        let was_blind = health.is_blind();
+        health.observe(status, Instant::now());
+
+        match (was_blind, status) {
+            (false, InboxStatus::Blind) => error!(
+                "Mostro inbox is BLIND: no connected relay is serving subscription '{}'. \
+                 Trade messages sent now are lost, and order timeouts are on hold until it \
+                 recovers",
+                subscription.id()
+            ),
+            (true, InboxStatus::Listening) => info!(
+                "Mostro inbox recovered: subscription '{}' is live on {listening} relay(s)",
+                subscription.id()
+            ),
+            (true, InboxStatus::Blind) => {
+                warn!("Mostro inbox still blind ({retried} relay(s) retried this round)")
+            }
+            (false, InboxStatus::Listening) => {
+                debug!("Inbox healthy on {listening} relay(s)");
+            }
+        }
+    }
+
+    status
 }
 
 #[cfg(test)]
@@ -575,5 +756,195 @@ mod tests {
         );
 
         relay.shutdown();
+    }
+
+    // ──────────────────────────────── watchdog ────────────────────────────────
+
+    #[test]
+    fn health_records_an_outage_from_first_blindness_to_recovery() {
+        let health = InboxHealth::new();
+        let start = Instant::now();
+
+        assert!(!health.is_blind(), "a fresh record starts out listening");
+
+        health.observe(InboxStatus::Blind, start);
+        assert!(health.is_blind());
+
+        // Staying blind must not restart the clock — the outage began at the
+        // first observation, and that is what the timeout discount is owed on.
+        health.observe(InboxStatus::Blind, start + Duration::from_secs(30));
+        assert!(health.is_blind());
+
+        health.observe(InboxStatus::Listening, start + Duration::from_secs(90));
+        assert!(!health.is_blind());
+
+        let state = health.state.lock().expect("lock");
+        let (_, outage) = state.last_outage.expect("outage recorded");
+        assert_eq!(
+            outage,
+            Duration::from_secs(90),
+            "the recorded outage must span the whole blind window"
+        );
+    }
+
+    #[test]
+    fn health_ignores_repeated_healthy_observations() {
+        let health = InboxHealth::new();
+        let now = Instant::now();
+
+        health.observe(InboxStatus::Listening, now);
+        health.observe(InboxStatus::Listening, now + Duration::from_secs(30));
+
+        assert!(!health.is_blind());
+        assert!(
+            health.state.lock().expect("lock").last_outage.is_none(),
+            "a node that was never blind has no outage to compensate for"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_resubscribes_a_relay_that_lost_the_inbox() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        // Accepts every REQ: the point here is the *missing* subscription, not
+        // a refusing relay.
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+        subscription.subscribe(&client).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Simulate the ear vanishing without a CLOSED the loop could see —
+        // a frame dropped by a lagging notification channel looks like this.
+        client
+            .unsubscribe(subscription.id())
+            .await
+            .expect("drop the subscription");
+        assert!(!client.subscriptions().await.contains_key(subscription.id()));
+
+        // The audit re-subscribes, but does not yet claim to be listening: a
+        // REQ that just went out proves nothing about whether the relay will
+        // honour it.
+        assert_eq!(
+            check_inbox_health(&client, &subscription).await,
+            InboxStatus::Blind,
+            "a relay re-subscribed during this audit must not count as listening yet"
+        );
+        assert!(
+            client.subscriptions().await.contains_key(subscription.id()),
+            "the inbox subscription must be back after the audit"
+        );
+
+        // The relay kept it, so the next round confirms the recovery.
+        assert_eq!(
+            check_inbox_health(&client, &subscription).await,
+            InboxStatus::Listening,
+            "a subscription that survived to the next audit means the ear is open"
+        );
+
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn watchdog_stays_blind_against_a_relay_that_keeps_closing() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        /// Refuses every REQ, always.
+        #[derive(Debug)]
+        struct RejectAllQueries;
+
+        impl nostr_sdk::local_relay::QueryPolicy for RejectAllQueries {
+            fn admit_query<'a>(
+                &'a self,
+                _query: &'a mut Filter,
+                _addr: &'a std::net::SocketAddr,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = nostr_sdk::local_relay::QueryPolicyResult>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    nostr_sdk::local_relay::QueryPolicyResult::reject(
+                        MachineReadablePrefix::Blocked,
+                        "no subscriptions here",
+                    )
+                })
+            }
+        }
+
+        let relay = LocalRelay::builder().query_policy(RejectAllQueries).build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+        subscription.subscribe(&client).await.expect("subscribe");
+
+        // However many rounds it runs, a relay that keeps closing the inbox
+        // never makes the node look healthy — this is what keeps the timeout
+        // machinery paused while trade messages are being lost.
+        for round in 0..3 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                check_inbox_health(&client, &subscription).await,
+                InboxStatus::Blind,
+                "round {round}: a relay that refuses every REQ must never read as listening"
+            );
+        }
+
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn watchdog_reports_blind_when_no_relay_serves_the_inbox() {
+        // A client with no relays at all is the limit case of every relay
+        // being down: nothing can deliver a trade message.
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+
+        assert_eq!(
+            check_inbox_health(&client, &subscription).await,
+            InboxStatus::Blind
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_ignores_a_disconnected_relay() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        let live = LocalRelay::builder().build();
+        live.run().await.expect("run local relay");
+        let live_url = live.url().await;
+
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(live_url.clone()).await.expect("add_relay");
+        // Never connects: a relay that is down must not be re-subscribed on
+        // every tick, nor drag the verdict to blind while another one serves.
+        client
+            .add_relay("ws://127.0.0.1:1")
+            .await
+            .expect("add_relay");
+        client.connect().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        subscription.subscribe(&client).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            check_inbox_health(&client, &subscription).await,
+            InboxStatus::Listening,
+            "one healthy relay is enough to keep hearing"
+        );
+
+        live.shutdown();
     }
 }

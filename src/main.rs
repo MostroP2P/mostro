@@ -29,7 +29,7 @@ use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
-use crate::inbox::InboxSubscription;
+use crate::inbox::{InboxHealth, InboxSubscription};
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use crate::rpc::RpcServer;
@@ -107,6 +107,12 @@ async fn main() -> Result<()> {
         );
     }
     let inbox = InboxSubscription::new(mostro_keys.public_key(), transport.event_kind());
+
+    // Install the inbox health record before the subscription goes out, so the
+    // watchdog and the scheduler read the same one from their own tasks.
+    if InboxHealth::new().install_global().is_err() {
+        tracing::warn!("Inbox health record already installed");
+    }
 
     let client = match get_nostr_client() {
         Ok(client) => client,

@@ -54,8 +54,39 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
     job_refresh_active_pubkeys(ctx.clone()).await;
+    job_inbox_watchdog(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// How often the inbox watchdog audits the subscription across relays.
+///
+/// Short enough that a lost ear is measured in seconds rather than the 60s
+/// timeout tick, long enough that it is not a source of traffic on its own.
+/// Hardcoded like the other maintenance intervals in this module.
+const INBOX_WATCHDOG_INTERVAL: u64 = 30;
+
+/// Audit the daemon's Nostr inbox and re-subscribe any relay that stopped
+/// serving it (see `crate::inbox`).
+///
+/// The event loop already reacts to a `CLOSED` frame, but only to frames it
+/// actually receives — the SDK's notification channel drops them when the
+/// consumer lags, and some ways of losing a subscription produce no frame at
+/// all. This job is the backstop, and the only thing that notices when *every*
+/// relay has gone quiet.
+async fn job_inbox_watchdog(ctx: AppContext) {
+    #[allow(deprecated)]
+    let event_kind = ctx.settings().mostro.transport.event_kind();
+    let subscription = crate::inbox::InboxSubscription::new(ctx.keys().public_key(), event_kind);
+
+    tokio::spawn(async move {
+        loop {
+            // Sleep first: at startup `main` has just subscribed, and a REQ
+            // still in flight would look exactly like a missing one.
+            tokio::time::sleep(tokio::time::Duration::from_secs(INBOX_WATCHDOG_INTERVAL)).await;
+            crate::inbox::check_inbox_health(ctx.nostr_client(), &subscription).await;
+        }
+    });
 }
 
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey

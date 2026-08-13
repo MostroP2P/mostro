@@ -519,10 +519,15 @@ async fn job_cancel_orders(ctx: AppContext) {
             // acting on the deadline would cancel escrows and slash bonds over
             // the node's own deafness. Skip the whole tick: cancel, refund,
             // republish and slash all rest on the same unsound premise.
+            //
+            // The test is "an audit confirmed we can hear", not "no audit has
+            // reported deafness". This job's first tick runs immediately while
+            // the watchdog's comes later, so an unaudited record would let a
+            // node that never obtained a working inbox act on that window.
             if let Some(health) = crate::inbox::InboxHealth::global() {
-                if health.is_blind() {
+                if !health.is_confirmed_listening() {
                     warn!(
-                        "scheduler_timeout: inbox is blind, holding order timeouts until it recovers"
+                        "scheduler_timeout: inbox not confirmed listening, holding order timeouts"
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                     continue;

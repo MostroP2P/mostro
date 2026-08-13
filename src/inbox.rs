@@ -306,8 +306,15 @@ pub enum InstallError {
     AlreadyInstalled,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HealthState {
+    /// The last verdict an audit reached. `None` until the first one runs:
+    /// startup is not evidence that the inbox works, and must not be read as
+    /// such (see [`InboxHealth::is_confirmed_listening`]).
+    verdict: Option<InboxStatus>,
+    /// When the record was installed, which is the earliest moment an outage
+    /// discovered by the first audit could have begun.
+    installed_at: Instant,
     /// When the current outage began, if the inbox is deaf right now.
     blind_since: Option<Instant>,
     /// Debt owed by finished outages, exact as of `owed_as_of`. It wears off
@@ -325,14 +332,32 @@ struct HealthState {
 /// window means a message sent into a dead inbox is gone rather than delayed
 /// (see the module docs). Punishing a user for a silence the node itself
 /// caused would be unfair, so the timeout clock stops while the inbox is down.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InboxHealth {
     state: Mutex<HealthState>,
 }
 
+impl Default for InboxHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InboxHealth {
     pub fn new() -> Self {
-        Self::default()
+        Self::at(Instant::now())
+    }
+
+    fn at(installed_at: Instant) -> Self {
+        Self {
+            state: Mutex::new(HealthState {
+                verdict: None,
+                installed_at,
+                blind_since: None,
+                owed: Duration::ZERO,
+                owed_as_of: None,
+            }),
+        }
     }
 
     /// Install as the process-wide health record.
@@ -350,6 +375,9 @@ impl InboxHealth {
     /// Record the current observation, returning the resulting status.
     fn observe(&self, status: InboxStatus, now: Instant) -> InboxStatus {
         let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        let first_verdict = state.verdict.is_none();
+        state.verdict = Some(status);
+
         match (status, state.blind_since) {
             (InboxStatus::Blind, None) => {
                 // Freeze whatever an earlier outage still owes: from here on,
@@ -357,7 +385,14 @@ impl InboxHealth {
                 // none of that debt gets repaid.
                 state.owed = settled_debt(&state, now);
                 state.owed_as_of = Some(now);
-                state.blind_since = Some(now);
+                // A first audit that finds the inbox deaf has found an outage
+                // that was already running: the node has not heard anything
+                // since it came up, so that is when the outage began.
+                state.blind_since = Some(if first_verdict {
+                    state.installed_at
+                } else {
+                    now
+                });
             }
             (InboxStatus::Listening, Some(since)) => {
                 // The frozen debt plus this outage; two outages in quick
@@ -372,12 +407,32 @@ impl InboxHealth {
     }
 
     /// Whether the inbox is deaf right now.
+    ///
+    /// A record that has never been audited is not blind — but neither is it
+    /// known to be listening, which is the question a caller about to act on a
+    /// user's silence should be asking. See [`Self::is_confirmed_listening`].
     pub fn is_blind(&self) -> bool {
         self.state
             .lock()
             .expect("inbox health mutex poisoned")
             .blind_since
             .is_some()
+    }
+
+    /// Whether an audit has actually confirmed that Mostro can hear.
+    ///
+    /// This is the predicate for anything that punishes a user for not
+    /// answering. It is deliberately false before the first audit: the daemon
+    /// subscribes at startup and the watchdog's first pass comes later, so
+    /// between the two there is a window in which a node that never obtained a
+    /// working inbox would otherwise look healthy and start cancelling orders
+    /// and slashing bonds over messages it was never in a position to receive.
+    pub fn is_confirmed_listening(&self) -> bool {
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .verdict
+            == Some(InboxStatus::Listening)
     }
 
     /// How much time the order-timeout clock currently owes users.
@@ -815,8 +870,8 @@ mod tests {
 
     #[test]
     fn health_records_an_outage_from_first_blindness_to_recovery() {
-        let health = InboxHealth::new();
         let start = Instant::now();
+        let health = InboxHealth::at(start);
 
         assert!(!health.is_blind(), "a fresh record starts out listening");
 
@@ -839,6 +894,44 @@ mod tests {
     }
 
     #[test]
+    fn health_is_not_listening_until_an_audit_says_so() {
+        let health = InboxHealth::new();
+
+        // Startup is not evidence. Between `main` subscribing and the
+        // watchdog's first pass, a node whose inbox never worked would
+        // otherwise process timeouts as if it had been listening all along.
+        assert!(
+            !health.is_confirmed_listening(),
+            "an unaudited record must not authorise acting on a user's silence"
+        );
+        assert!(
+            !health.is_blind(),
+            "nor should it claim an outage it has not observed"
+        );
+
+        health.observe(InboxStatus::Listening, Instant::now());
+        assert!(health.is_confirmed_listening());
+    }
+
+    #[test]
+    fn a_blind_first_audit_dates_the_outage_from_startup() {
+        let start = Instant::now();
+        let health = InboxHealth::at(start);
+
+        // The watchdog's first pass comes some time after boot. Finding the
+        // inbox deaf then means it was deaf for that whole stretch, not just
+        // from the moment somebody looked.
+        health.observe(InboxStatus::Blind, start + Duration::from_secs(30));
+        health.observe(InboxStatus::Listening, start + Duration::from_secs(90));
+
+        assert_eq!(
+            health.timeout_debt_at(start + Duration::from_secs(90)),
+            Duration::from_secs(90),
+            "the outage must be dated from startup, not from the first audit"
+        );
+    }
+
+    #[test]
     fn a_node_that_was_never_blind_owes_nothing() {
         let health = InboxHealth::new();
         assert_eq!(health.timeout_debt_at(Instant::now()), Duration::ZERO);
@@ -846,8 +939,8 @@ mod tests {
 
     #[test]
     fn debt_grows_while_blind_and_wears_off_after_recovery() {
-        let health = InboxHealth::new();
         let start = Instant::now();
+        let health = InboxHealth::at(start);
 
         health.observe(InboxStatus::Blind, start);
 
@@ -883,8 +976,8 @@ mod tests {
 
     #[test]
     fn consecutive_outages_accumulate_their_debt() {
-        let health = InboxHealth::new();
         let start = Instant::now();
+        let health = InboxHealth::at(start);
 
         // A 100s outage, recovered at t=100 — debt 100s.
         health.observe(InboxStatus::Blind, start);

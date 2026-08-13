@@ -32,6 +32,27 @@ pub trait EscrowBackend: Send {
 
     /// Cancel a held invoice by payment hash (hex).
     async fn cancel_hold_invoice(&mut self, hash: &str) -> Result<(), MostroError>;
+
+    /// Current chain tip height as seen by the node backing the escrow,
+    /// for CLTV-deadline math. Backends without a chain view return an
+    /// error; callers must fall back to time-based approximations.
+    async fn chain_height(&mut self) -> Result<u32, MostroError> {
+        Err(MostroInternalErr(ServiceError::LnNodeError(
+            "chain height not available for this escrow backend".to_string(),
+        )))
+    }
+
+    /// Earliest CLTV expiry height among the ACCEPTED HTLCs backing the
+    /// hold invoice `hash` (hex). `Ok(None)` means no accepted HTLC backs
+    /// the invoice anymore (canceled, settled, or never held).
+    async fn hold_invoice_expiry_height(
+        &mut self,
+        _hash: &str,
+    ) -> Result<Option<u32>, MostroError> {
+        Err(MostroInternalErr(ServiceError::LnNodeError(
+            "HTLC expiry height not available for this escrow backend".to_string(),
+        )))
+    }
 }
 
 #[async_trait]
@@ -60,6 +81,14 @@ impl EscrowBackend for LndConnector {
         LndConnector::cancel_hold_invoice(self, hash)
             .await
             .map(|_| ())
+    }
+
+    async fn chain_height(&mut self) -> Result<u32, MostroError> {
+        LndConnector::get_chain_height(self).await
+    }
+
+    async fn hold_invoice_expiry_height(&mut self, hash: &str) -> Result<Option<u32>, MostroError> {
+        LndConnector::get_hold_invoice_expiry_height(self, hash).await
     }
 }
 

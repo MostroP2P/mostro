@@ -429,7 +429,7 @@ pub async fn request_maker_bond(
 /// from the structured gRPC error so the caller can decide whether the
 /// HTLC is verifiably no longer encumbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelOutcome {
+pub(crate) enum CancelOutcome {
     /// The cancel landed at LND (or didn't need to: the invoice was
     /// already canceled / never existed). The HTLC, if there ever was
     /// one, is no longer encumbered. Safe to mark `Released`.
@@ -451,7 +451,7 @@ enum CancelOutcome {
 /// Anything we can't classify confidently maps to `Transient`: the
 /// safer side is to delay cleanup until the next exit path or CLTV
 /// expiry, never to falsely report a release on an HTLC LND still has.
-fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
+pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
     let s = err.to_string().to_lowercase();
 
     // gRPC codes that mean the cancel was idempotent / target wasn't there.

@@ -406,6 +406,12 @@ pub struct LightningSettings {
     /// user-supplied payout invoice
     #[serde(default = "default_max_final_cltv_expiry_delta")]
     pub max_final_cltv_expiry_delta: u32,
+    /// Safety margin, in blocks, before the hold invoice's CLTV horizon at
+    /// which the daemon cancels/escalates trades whose escrow is about to
+    /// be auto-refunded by LND. Must exceed the node's
+    /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
+    #[serde(default = "default_escrow_deadline_margin_blocks")]
+    pub escrow_deadline_margin_blocks: u32,
 }
 
 /// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
@@ -413,6 +419,13 @@ pub struct LightningSettings {
 /// cannot pin routing liquidity for weeks.
 fn default_max_final_cltv_expiry_delta() -> u32 {
     432
+}
+
+/// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
+/// `holdexpirydelta` (12) plus slack for block-time variance and the
+/// guardian job's tick.
+fn default_escrow_deadline_margin_blocks() -> u32 {
+    24
 }
 
 // Hand-written so `max_final_cltv_expiry_delta` defaults to the real bound
@@ -429,6 +442,7 @@ impl Default for LightningSettings {
             payment_attempts: 0,
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
+            escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
         }
     }
 }

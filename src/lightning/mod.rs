@@ -9,7 +9,9 @@ use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
+use fedimint_tonic_lnd::lnrpc::{
+    invoice::InvoiceState, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment, PaymentHash,
+};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
 use mostro_core::prelude::*;
@@ -222,6 +224,39 @@ impl LndConnector {
                 ))))
             }
         }
+    }
+
+    /// Current chain tip height as seen by LND, for CLTV-deadline math.
+    pub async fn get_chain_height(&mut self) -> Result<u32, MostroError> {
+        self.get_node_info().await.map(|info| info.block_height)
+    }
+
+    /// Earliest CLTV expiry height among the ACCEPTED HTLCs backing the
+    /// hold invoice `hash` (hex). `None` when no accepted HTLC backs it
+    /// anymore — the invoice was canceled, settled, or never held.
+    pub async fn get_hold_invoice_expiry_height(
+        &mut self,
+        hash: &str,
+    ) -> Result<Option<u32>, MostroError> {
+        let r_hash = decode_hash32("payment hash", hash)?;
+
+        let invoice = self
+            .client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .into_inner();
+
+        Ok(invoice
+            .htlcs
+            .iter()
+            .filter(|htlc| htlc.state == InvoiceHtlcState::Accepted as i32)
+            .map(|htlc| htlc.expiry_height.max(0) as u32)
+            .min())
     }
 
     pub async fn send_payment(

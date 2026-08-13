@@ -4,6 +4,7 @@ use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::do_payment;
 use crate::config;
 use crate::db::*;
+use crate::escrow::EscrowBackend;
 use crate::lightning::LndConnector;
 use crate::price::PriceManager;
 use crate::util;
@@ -38,6 +39,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // `false`, so every job below still starts exactly as before).
     if !Settings::is_cashu_enabled() {
         job_cancel_orders(ctx.clone()).await;
+        job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
@@ -277,7 +279,7 @@ async fn job_update_rate_events(ctx: AppContext) {
     });
 }
 
-async fn notify_users_canceled_order(
+pub(crate) async fn notify_users_canceled_order(
     updated_order: &Order,
     old_order: &Order,
     maker_action: Option<Action>,
@@ -600,6 +602,322 @@ async fn job_cancel_orders(ctx: AppContext) {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
+}
+
+/// Guardian for the trade escrow's CLTV lifetime.
+///
+/// A trade's escrow is a hold invoice whose HTLC LND auto-cancels
+/// `invoices.holdexpirydelta` blocks (default 12) before its CLTV expiry,
+/// refunding the seller — while the order still reads `active` /
+/// `fiat-sent` and the buyer may still send (or already sent) the fiat
+/// leg. No other job covers those states, so without this pass the escrow
+/// silently evaporates ~`hold_invoice_cltv_delta - 12` blocks after the
+/// seller paid (~22 h on defaults) and the trade can no longer settle:
+/// the buyer loses the fiat and the seller keeps both the fiat and the
+/// refunded sats.
+///
+/// Each tick, orders whose accepted HTLC is within
+/// `escrow_deadline_margin_blocks` of its CLTV expiry height — measured
+/// against the actual chain tip, with the nominal 10-minute clock
+/// ([`util::escrow_action_deadline_unix`]) only as a fallback when LND
+/// cannot answer — are resolved while the escrow still exists:
+///
+/// - `active` — nobody claims the fiat moved: cancel the hold invoice
+///   proactively (a clean, observed refund instead of LND's silent one),
+///   move the order to `canceled`, notify both parties.
+/// - `fiat-sent` — the buyer says the fiat moved: open a dispute so a
+///   solver can settle or cancel *while the escrow is still settleable*.
+///   The hold invoice is deliberately NOT canceled here.
+async fn job_enforce_escrow_deadline(ctx: AppContext) {
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client");
+    };
+
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = enforce_escrow_deadline_pass(&ctx, &mut ln_client).await {
+                error!("escrow deadline pass failed: {e}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
+/// One guardian tick, split out for testing. See
+/// [`job_enforce_escrow_deadline`] for the semantics.
+async fn enforce_escrow_deadline_pass(
+    ctx: &AppContext,
+    escrow: &mut dyn EscrowBackend,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+    let keys = ctx.keys().clone();
+    let now = Utc::now().timestamp();
+    let ln_settings = &ctx.settings().lightning;
+    let cltv = ln_settings.hold_invoice_cltv_delta;
+    let margin = ln_settings.escrow_deadline_margin_blocks;
+
+    // Candidate prefilter only — real due-ness is decided from chain
+    // height below. CLTV expiry is measured in blocks, not seconds, so a
+    // stretch of fast blocks shortens the wall-clock window; half the
+    // nominal window keeps escrows in view even at twice the 10-minute
+    // average block rate.
+    let cutoff = now - util::escrow_guard_window_secs(cltv, margin) / 2;
+    let due_orders = find_escrow_deadline_orders(pool, cutoff).await?;
+
+    // One probe per tick; per-order lookups below reuse it.
+    let chain_height = match escrow.chain_height().await {
+        Ok(height) => Some(height),
+        Err(e) => {
+            warn!("escrow_deadline: chain height unavailable ({e}); falling back to nominal block time");
+            None
+        }
+    };
+
+    for order in due_orders {
+        let status = match order.get_order_status() {
+            Ok(status) => status,
+            Err(e) => {
+                warn!(
+                    "escrow_deadline: unparseable status on order {} ({e}); skipping",
+                    order.id
+                );
+                continue;
+            }
+        };
+        let hash = match order.hash.as_ref() {
+            Some(hash) => hash.clone(),
+            None => continue, // query guarantees one; defensive
+        };
+
+        // Real deadline: the accepted HTLC's expiry height vs the chain
+        // tip. `due` = the guardian must act now; `escrow_gone` = the
+        // HTLC verifiably no longer backs the trade (past its expiry, or
+        // no accepted HTLC at LND at all).
+        let heights = match chain_height {
+            Some(chain) => match escrow.hold_invoice_expiry_height(&hash).await {
+                Ok(Some(expiry)) => Some((chain.saturating_add(margin) >= expiry, chain >= expiry)),
+                Ok(None) => Some((true, true)),
+                Err(e) => {
+                    warn!(
+                        "escrow_deadline: HTLC expiry lookup failed for order {} ({e}); falling back to nominal block time",
+                        order.id
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let (due, escrow_gone) = heights.unwrap_or_else(|| {
+            // Nominal-time fallback (10-minute blocks): good enough to
+            // decide to act, but never proof the escrow is gone — that
+            // requires chain evidence.
+            (
+                util::escrow_action_deadline_unix(order.invoice_held_at, cltv, margin)
+                    .map(|deadline| now >= deadline)
+                    .unwrap_or(false),
+                false,
+            )
+        });
+        if !due {
+            continue;
+        }
+
+        match status {
+            Status::Active => {
+                // Cancel proactively so the seller's refund is clean and
+                // observed rather than LND's silent auto-cancel. On
+                // failure, stay eligible and retry next tick — unless the
+                // HTLC is verifiably past its CLTV lifetime on-chain, in
+                // which case LND has auto-refunded no matter what this
+                // RPC reports and the state must be fixed regardless.
+                if let Err(e) = escrow.cancel_hold_invoice(&hash).await {
+                    match bond::flow::classify_cancel_error(&e) {
+                        bond::flow::CancelOutcome::AlreadyDone => {
+                            info!(
+                                "escrow_deadline: order {} hold invoice already canceled at LND; fixing state",
+                                order.id
+                            );
+                        }
+                        bond::flow::CancelOutcome::Transient if !escrow_gone => {
+                            warn!(
+                                "escrow_deadline: cancel_hold_invoice failed for order {} ({e}); retrying next tick",
+                                order.id
+                            );
+                            continue;
+                        }
+                        bond::flow::CancelOutcome::Transient => {
+                            warn!(
+                                "escrow_deadline: cancel_hold_invoice failed for order {} ({e}) but the HTLC is past its CLTV expiry height; the escrow is auto-refunded — fixing state",
+                                order.id
+                            );
+                        }
+                    }
+                }
+
+                let updated = match update_order_event(&keys, Status::Canceled, &order).await {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        warn!(
+                            "escrow_deadline: could not publish cancel for order {} ({e}); retrying next tick",
+                            order.id
+                        );
+                        continue;
+                    }
+                };
+                let updated = match updated.update(pool).await {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        // Next tick retries: the order is still eligible, and
+                        // the repeated cancel reports already-done, so the
+                        // pass proceeds straight back here.
+                        warn!(
+                            "escrow_deadline: persist failed for order {} ({e}); retrying next tick",
+                            order.id
+                        );
+                        continue;
+                    }
+                };
+                info!(
+                    "escrow_deadline: order {} canceled — trade escrow reached its CLTV lifetime",
+                    order.id
+                );
+                notify_users_canceled_order(&updated, &order, Some(Action::Canceled)).await;
+                // Idempotent close of any range maker bond, mirroring the
+                // waiting-state timeout path.
+                bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "escrow_deadline")
+                    .await;
+            }
+            Status::FiatSent => {
+                // The fiat leg may already be with the seller — only a
+                // human can resolve this, and only while the escrow still
+                // exists. Open (or reopen) the dispute now; do NOT cancel
+                // the hold invoice, it is the solver's only leverage.
+                //
+                // There is at most one dispute row per order, and resolved
+                // disputes keep theirs (`settled` / `seller-refunded` /
+                // `released`), so an existence check is not enough: a row
+                // left over from a dispute the users resolved themselves
+                // earlier in the trade must be reopened, not mistaken for
+                // a solver already working.
+                let dispute = match find_dispute_by_order_id(pool, order.id).await {
+                    Ok(dispute)
+                        if matches!(
+                            dispute.status.parse(),
+                            Ok(DisputeStatus::Initiated | DisputeStatus::InProgress)
+                        ) =>
+                    {
+                        // The query only returns `fiat-sent` orders, so a
+                        // live dispute row here means a previous pass (or
+                        // a user-filed dispute) died between writing the
+                        // row and flipping the order. Resume with the
+                        // existing row and finish the transition below —
+                        // skipping would strand the order in `fiat-sent`
+                        // with nobody notified.
+                        dispute
+                    }
+                    Ok(mut dispute) => {
+                        dispute.status = DisputeStatus::Initiated.to_string();
+                        dispute.solver_pubkey = None;
+                        dispute.taken_at = 0;
+                        dispute.order_previous_status = order.status.clone();
+                        match dispute.update(pool).await {
+                            Ok(dispute) => dispute,
+                            Err(e) => {
+                                warn!(
+                                    "escrow_deadline: could not reopen dispute for order {} ({e}); retrying next tick",
+                                    order.id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // The buyer's claim is the one at stake, so the
+                        // dispute is filed as buyer-initiated. Row first,
+                        // then the status flip: a dispute row pointing at a
+                        // `fiat-sent` order is recoverable (the next tick
+                        // sees it and stops), a `dispute` order with no row
+                        // would be invisible.
+                        match Dispute::new(order.id, order.status.clone())
+                            .create(pool)
+                            .await
+                        {
+                            Ok(dispute) => dispute,
+                            Err(e) => {
+                                warn!(
+                                    "escrow_deadline: could not create dispute for order {} ({e}); retrying next tick",
+                                    order.id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let mut disputed = order.clone();
+                if disputed.buyer_dispute {
+                    // The buyer flag is already set by the earlier dispute
+                    // this row was reopened from; just move the status back.
+                    disputed.status = Status::Dispute.to_string();
+                } else if let Err(e) = disputed.setup_dispute(true) {
+                    warn!(
+                        "escrow_deadline: could not move order {} to dispute ({e:?}); retrying next tick",
+                        order.id
+                    );
+                    continue;
+                }
+                if let Err(e) = disputed.update(pool).await {
+                    warn!(
+                        "escrow_deadline: could not persist dispute status for order {} ({e}); retrying next tick",
+                        order.id
+                    );
+                    continue;
+                }
+                info!(
+                    "escrow_deadline: order {} moved to dispute — fiat claimed sent and the escrow is near its CLTV horizon",
+                    order.id
+                );
+                // A missing party key must not mute the other party's
+                // notification, mirroring `flow::hold_invoice_canceled`.
+                for (party, action) in [
+                    (order.get_buyer_pubkey(), Action::DisputeInitiatedByYou),
+                    (order.get_seller_pubkey(), Action::DisputeInitiatedByPeer),
+                ] {
+                    match party {
+                        Ok(party) => {
+                            enqueue_order_msg(
+                                None,
+                                Some(order.id),
+                                action,
+                                Some(Payload::Dispute(dispute.id, None)),
+                                party,
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(e) => warn!(
+                            "escrow_deadline: could not resolve a party key for order {} ({e}); that party is not notified",
+                            order.id
+                        ),
+                    }
+                }
+                // Best-effort: the dispute row is durable either way, and
+                // solvers can also enumerate disputes from the admin RPC.
+                if let Err(e) =
+                    crate::app::dispute::publish_dispute_event(ctx, &dispute, &keys, true).await
+                {
+                    warn!(
+                        "escrow_deadline: could not publish the dispute event for order {} ({e})",
+                        order.id
+                    );
+                }
+            }
+            _ => {} // the query only returns active / fiat-sent
+        }
+    }
+
+    Ok(())
 }
 
 async fn job_expire_pending_older_orders(ctx: AppContext) {
@@ -988,6 +1306,417 @@ mod tests {
         let order = order_for_cancel(Kind::Sell, false);
         notify_users_canceled_order(&order, &order, None).await;
         assert!(queued_actions_for(order.id).await.is_empty());
+    }
+
+    // ── enforce_escrow_deadline_pass ─────────────────────────────────────
+
+    struct StubEscrow {
+        cancel_error: Option<&'static str>,
+        canceled: std::sync::Mutex<Vec<String>>,
+        /// `(chain tip, HTLC expiry lookup result)`. `None` = no chain
+        /// view (both probes error), driving the nominal-time fallback.
+        heights: Option<(u32, Option<u32>)>,
+    }
+
+    impl StubEscrow {
+        fn ok() -> Self {
+            Self {
+                cancel_error: None,
+                canceled: std::sync::Mutex::new(Vec::new()),
+                heights: None,
+            }
+        }
+
+        fn failing(msg: &'static str) -> Self {
+            Self {
+                cancel_error: Some(msg),
+                canceled: std::sync::Mutex::new(Vec::new()),
+                heights: None,
+            }
+        }
+
+        fn with_heights(mut self, chain: u32, expiry: Option<u32>) -> Self {
+            self.heights = Some((chain, expiry));
+            self
+        }
+
+        fn canceled(&self) -> Vec<String> {
+            self.canceled.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EscrowBackend for StubEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            unreachable!("the guardian never creates invoices")
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            unreachable!("the guardian never settles")
+        }
+
+        async fn cancel_hold_invoice(&mut self, hash: &str) -> Result<(), MostroError> {
+            self.canceled.lock().unwrap().push(hash.to_string());
+            match self.cancel_error {
+                Some(msg) => Err(MostroInternalErr(ServiceError::LnNodeError(
+                    msg.to_string(),
+                ))),
+                None => Ok(()),
+            }
+        }
+
+        async fn chain_height(&mut self) -> Result<u32, MostroError> {
+            self.heights.map(|(chain, _)| chain).ok_or_else(|| {
+                MostroInternalErr(ServiceError::LnNodeError("no chain view".to_string()))
+            })
+        }
+
+        async fn hold_invoice_expiry_height(
+            &mut self,
+            _hash: &str,
+        ) -> Result<Option<u32>, MostroError> {
+            self.heights.map(|(_, expiry)| expiry).ok_or_else(|| {
+                MostroInternalErr(ServiceError::LnNodeError("no chain view".to_string()))
+            })
+        }
+    }
+
+    async fn escrow_guardian_ctx(cltv: u32, margin: u32) -> AppContext {
+        init_test_settings();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let mut settings = test_settings();
+        settings.lightning.hold_invoice_cltv_delta = cltv;
+        settings.lightning.escrow_deadline_margin_blocks = margin;
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(settings)
+            .build()
+    }
+
+    fn escrow_backed_order(status: Status, held_at: i64) -> Order {
+        Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: status.to_string(),
+            buyer_pubkey: Some(hex_key()),
+            seller_pubkey: Some(hex_key()),
+            creator_pubkey: hex_key(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            hash: Some("ab".repeat(32)),
+            preimage: Some("cd".repeat(32)),
+            invoice_held_at: held_at,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_cancels_due_active_order_and_refunds_seller() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // Guard window is (144 - 24) * 600 = 72_000s; this escrow was
+        // observed 80_000s ago, so it is due.
+        let order = escrow_backed_order(Status::Active, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Canceled.to_string());
+        assert_eq!(
+            escrow.canceled(),
+            vec![order.hash.clone().unwrap()],
+            "the hold invoice must be canceled proactively, before LND does it"
+        );
+        let actions = queued_actions_for(order.id).await;
+        assert_eq!(actions.len(), 2, "both parties must be told: {actions:?}");
+        assert!(actions.iter().all(|a| *a == Action::Canceled));
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_retries_when_cancel_fails_before_the_horizon() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // Due (past the 72_000s action window) but the 86_400s hard horizon
+        // has not passed: a transient LND failure must leave the order
+        // eligible for the next tick instead of stranding it.
+        let order = escrow_backed_order(Status::Active, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::failing("transport: connection refused");
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert!(queued_actions_for(order.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_fixes_state_when_lnd_already_canceled() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::Active, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::failing("invoice already canceled");
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            Status::Canceled.to_string(),
+            "the HTLC is verifiably gone — the order must not keep looking live"
+        );
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_opens_dispute_on_fiat_sent_without_touching_escrow() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::FiatSent, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Dispute.to_string());
+        assert!(
+            find_dispute_by_order_id(ctx.pool(), order.id).await.is_ok(),
+            "a solver must be able to pick up the dispute"
+        );
+        assert!(
+            escrow.canceled().is_empty(),
+            "the escrow is the solver's only leverage — never canceled here"
+        );
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::DisputeInitiatedByYou));
+        assert!(actions.contains(&Action::DisputeInitiatedByPeer));
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_resumes_a_half_completed_dispute_transition() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::FiatSent, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        // An `initiated` dispute row on a still-`fiat-sent` order can only
+        // mean a previous pass (or a user dispute) died between the two
+        // writes: the pass must finish the transition, not skip it.
+        let prior = Dispute::new(order.id, order.status.clone())
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Dispute.to_string());
+        let dispute = find_dispute_by_order_id(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(dispute.id, prior.id, "the existing row is reused");
+        assert_eq!(dispute.status, DisputeStatus::Initiated.to_string());
+        assert!(escrow.canceled().is_empty());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::DisputeInitiatedByYou));
+        assert!(actions.contains(&Action::DisputeInitiatedByPeer));
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_reopens_a_dispute_the_users_resolved_themselves() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::FiatSent, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        // A dispute the users resolved cooperatively earlier in the trade:
+        // its row lingers with a terminal status and must not masquerade
+        // as a solver already working on the escrow deadline.
+        let mut prior = Dispute::new(order.id, order.status.clone());
+        prior.status = DisputeStatus::Settled.to_string();
+        prior.solver_pubkey = Some(hex_key());
+        prior.taken_at = now - 90_000;
+        let prior = prior.create(ctx.pool()).await.unwrap();
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Dispute.to_string());
+        let dispute = find_dispute_by_order_id(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(dispute.id, prior.id, "one dispute row per order, reopened");
+        assert_eq!(dispute.status, DisputeStatus::Initiated.to_string());
+        assert_eq!(dispute.solver_pubkey, None);
+        assert_eq!(dispute.taken_at, 0);
+        assert!(escrow.canceled().is_empty());
+        let actions = queued_actions_for(order.id).await;
+        assert!(actions.contains(&Action::DisputeInitiatedByYou));
+        assert!(actions.contains(&Action::DisputeInitiatedByPeer));
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_acts_on_chain_height_when_blocks_run_fast() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // Only 40_000s elapsed — inside the nominal 72_000s window — but
+        // the chain says the HTLC is within the 24-block margin of its
+        // expiry: blocks came in fast, and the guardian must act now.
+        let order = escrow_backed_order(Status::Active, now - 40_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok().with_heights(900_000, Some(900_010));
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Canceled.to_string());
+        assert_eq!(escrow.canceled(), vec![order.hash.clone().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_trusts_a_live_htlc_over_the_nominal_clock() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // The nominal clock says long overdue, but the chain shows the
+        // HTLC still 100 blocks from expiry (slow blocks, or a payer that
+        // chose a larger final CLTV delta): nothing to do yet.
+        let order = escrow_backed_order(Status::Active, now - 200_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok().with_heights(900_000, Some(900_100));
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert!(escrow.canceled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_retries_transient_cancel_while_the_htlc_is_alive() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // Past the nominal hard horizon (86_400s), but the chain shows the
+        // accepted HTLC still alive (10 blocks left): a transient cancel
+        // failure must NOT be taken as proof of an auto-refund — the order
+        // stays eligible and is retried.
+        let order = escrow_backed_order(Status::Active, now - 90_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::failing("transport: connection refused")
+            .with_heights(900_000, Some(900_010));
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert!(queued_actions_for(order.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_fixes_state_when_no_htlc_backs_the_invoice() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // LND reports no accepted HTLC behind the invoice: the escrow is
+        // verifiably gone, so even a transient cancel error must not keep
+        // the order looking live.
+        let order = escrow_backed_order(Status::Active, now - 40_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow =
+            StubEscrow::failing("transport: connection refused").with_heights(900_000, None);
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Canceled.to_string());
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_never_assumes_refund_without_chain_evidence() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // No chain view at all and a transient cancel failure, way past
+        // the nominal hard horizon: the old timestamp-based inference
+        // would have marked the order canceled; now only chain evidence
+        // (or an already-canceled report) may fix state.
+        let order = escrow_backed_order(Status::Active, now - 90_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::failing("transport: connection refused");
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_ignores_orders_inside_the_window() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        // Only 1_000s into the 72_000s guard window: not due.
+        let order = escrow_backed_order(Status::Active, now - 1_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        let updated = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+        assert!(escrow.canceled().is_empty());
     }
 
     // ── job smoke tests ──────────────────────────────────────────────────

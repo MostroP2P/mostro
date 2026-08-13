@@ -110,6 +110,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300)
 - `payment_attempts` (u32): Max payment retry attempts (default: 3)
 - `payment_retries_interval` (u32): Retry interval in seconds (default: 60)
+- `escrow_deadline_margin_blocks` (u32): Safety margin in blocks before the hold invoice's CLTV horizon; at `hold_invoice_cltv_delta - escrow_deadline_margin_blocks` blocks after the escrow was paid, mostrod cancels the trade (Active) or opens a dispute (FiatSent) before LND auto-refunds the escrow. Must exceed the LND node's `invoices.holdexpirydelta` (LND default: 12) (default: 24)
 
 **Mostro** (`src/config/types.rs:76-108`):
 

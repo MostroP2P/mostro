@@ -938,6 +938,17 @@ async fn record_maker_slice_slash(
         );
         return Ok(false);
     };
+    // The slashed maker share is owed to the slice's *other* side (the
+    // winning taker). Capture it now, while the slice order still carries
+    // both trade pubkeys: on a maker-responsible timeout the scheduler calls
+    // `edit_pubkeys_order` right after this, NULLing the taker key — which is
+    // exactly this child row's recipient. Without the capture the payout
+    // would later fall through to `resolve_recipient` → `None` and forfeit to
+    // the node instead of compensating the taker.
+    let recipient_slice_pubkey = match kind {
+        Kind::Sell => slice.buyer_pubkey.as_deref(),
+        Kind::Buy => slice.seller_pubkey.as_deref(),
+    };
     let Some(max_fiat) = root.max_amount.filter(|m| *m > 0) else {
         warn!(
             bond_id = %parent_bond.id,
@@ -995,8 +1006,9 @@ async fn record_maker_slice_slash(
     let insert = sqlx::query(
         "INSERT INTO bonds \
             (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
-             amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             amount_sats, state, slashed_reason, node_share_sats, \
+             payout_recipient_pubkey, slashed_at, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?) \
            AND EXISTS ( \
@@ -1012,6 +1024,7 @@ async fn record_maker_slice_slash(
     .bind(BondState::PendingPayout.to_string())
     .bind(reason.to_string())
     .bind(node_share)
+    .bind(recipient_slice_pubkey)
     .bind(now)
     .bind(now)
     .bind(parent_bond.id)
@@ -2841,6 +2854,79 @@ mod tests {
             read_bond_state(&pool, taker_bond.id).await,
             BondState::Released.to_string(),
             "taker bond released on the terminal cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_range_maker_slash_payout_survives_scheduler_pubkey_wipe() {
+        // Regression companion to the taker/non-range case, for the Phase 6
+        // slice-slash child. A maker-responsible *range* timeout records the
+        // child via `record_maker_slice_slash`; the scheduler then cancels the
+        // slice and calls `edit_pubkeys_order`, which NULLs the taker — the
+        // child's own payout recipient. The child must still resolve to that
+        // taker because the winner was captured at slash time.
+        use crate::app::bond::payout::resolve_payout_recipient;
+        use crate::db::edit_pubkeys_order;
+
+        let pool = setup_pool().await;
+        // Sell range, WaitingPayment → the seller (maker) is responsible; the
+        // wronged party owed the slice share is the buyer (taker).
+        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        root.status = Status::WaitingPayment.to_string();
+        insert_range_order_row(&pool, &root).await;
+        let _parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
+        let _taker_bond = insert_bond(&pool, root.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        // Step 1 — the real range-maker timeout slash records the child row,
+        // capturing the winning taker.
+        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
+        let child = slash_or_release_on_timeout(&pool, &mut ln, &root, Some(&cfg))
+            .await
+            .unwrap()
+            .expect("range maker timeout records the slice-slash child");
+        let child_row = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")
+            .bind(child.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            child_row.payout_recipient_pubkey.as_deref(),
+            Some(taker_pk()),
+            "the slice slash captured the winning taker before the wipe"
+        );
+
+        // Step 2 — the scheduler's cancel step wipes the taker (buyer) pubkey.
+        edit_pubkeys_order(&pool, &root)
+            .await
+            .expect("edit_pubkeys_order");
+        let wiped = Order::by_id(&pool, root.id)
+            .await
+            .unwrap()
+            .expect("order row present");
+        assert!(
+            wiped.buyer_pubkey.is_none(),
+            "the cancel wipe NULLs the taker (buyer) pubkey"
+        );
+
+        // With the capture, the payout still resolves to the taker...
+        let recipient = resolve_payout_recipient(&wiped, &child_row, BondSlashReason::Timeout)
+            .unwrap()
+            .expect("recipient must still resolve after the pubkey wipe");
+        assert_eq!(
+            recipient.to_string(),
+            taker_pk(),
+            "the wronged taker is paid, not forfeited to the node"
+        );
+
+        // ...whereas a pre-fix child row (no captured recipient) would strand
+        // on the wiped order — the gap this commit closes.
+        let mut legacy = child_row.clone();
+        legacy.payout_recipient_pubkey = None;
+        let none = resolve_payout_recipient(&wiped, &legacy, BondSlashReason::Timeout).unwrap();
+        assert!(
+            none.is_none(),
+            "without the capture the wiped slice order is unrecoverable"
         );
     }
 

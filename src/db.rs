@@ -675,6 +675,32 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// All orders currently advertised (or advertisable) as `pending` on the
+/// book. Includes `waiting-taker-bond`, which publishes as `pending` on the
+/// wire (Phase 1.5), and excludes `waiting-maker-bond`, which was never
+/// published. Used by the orderbook reconciler to re-assert the book on
+/// relays; only orders whose take window is still open are returned — an
+/// expired row is the expiry job's business, not the reconciler's.
+pub async fn find_pending_orders_for_reconcile(
+    pool: &SqlitePool,
+) -> Result<Vec<Order>, MostroError> {
+    let now = Timestamp::now();
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE expires_at >= ?1
+            AND status IN ('pending', 'waiting-taker-bond')
+        "#,
+    )
+    .bind(now.as_secs() as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;

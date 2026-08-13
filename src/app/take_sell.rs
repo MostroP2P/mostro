@@ -4,8 +4,8 @@ use crate::app::context::AppContext;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, set_waiting_invoice_status, show_hold_invoice, update_order_event, validate_invoice,
-    HoldInvoiceOrigin,
+    get_order, is_order_take_window_closed, set_waiting_invoice_status, show_hold_invoice,
+    update_order_event, validate_invoice, HoldInvoiceOrigin,
 };
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -80,6 +80,13 @@ pub async fn take_sell_action(
     if order.check_status(Status::Pending).is_err()
         && order.check_status(Status::WaitingTakerBond).is_err()
     {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+    }
+
+    // Reject takes on an order whose take window already closed: a
+    // `pending` row can outlive its `expires_at` by up to one scheduler
+    // tick (~60 s) before the expiry job cancels it.
+    if is_order_take_window_closed(&order, Timestamp::now().as_secs() as i64) {
         return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 

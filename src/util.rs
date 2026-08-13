@@ -11,8 +11,7 @@ use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
 use crate::nip33::{
-    create_platform_tag_values, new_order_event, new_order_event_with_created_at, new_rating_event,
-    order_to_tags,
+    create_platform_tag_values, new_order_event_with_created_at, new_rating_event, order_to_tags,
 };
 use crate::Result;
 
@@ -460,7 +459,11 @@ async fn finalize_order_publication(
     let event = if let Some(tags) =
         get_tags_for_new_order(&order, pool, &identity_pubkey, &trade_pubkey, keys).await?
     {
-        new_order_event(keys, "", order_id.to_string(), tags)
+        // Register the initial `pending` publish in the monotonic registry
+        // so a same-second follow-up transition (instant take, maker
+        // cancel) is stamped strictly after it and wins NIP-01 ordering.
+        let created_at = monotonic_order_event_timestamp(order_id, Timestamp::now());
+        new_order_event_with_created_at(keys, "", order_id.to_string(), tags, created_at)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
@@ -496,7 +499,13 @@ async fn finalize_order_publication(
         .send_event(&event)
         .await
         .map(|_s| ())
-        .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
+        .map_err(|err| {
+            // The row is already `Pending` in the DB; queue it so the
+            // orderbook reconciler retries the publish instead of leaving
+            // an order that exists in the DB but never reached relays.
+            mark_orderbook_publish_failed(order_id);
+            MostroInternalErr(ServiceError::NostrError(err.to_string()))
+        })
 }
 
 /// Finish publishing an order whose maker bond has just locked.
@@ -935,6 +944,104 @@ fn repair_timestamp(now: Timestamp) -> Timestamp {
     Timestamp::from(now.as_secs() + 1)
 }
 
+/// Last `created_at` published per order d-tag, so consecutive kind-38383
+/// revisions of the same order never tie on the same Unix second. NIP-01
+/// breaks same-timestamp ties on replaceable events by *lowest* event id —
+/// a coin flip that can leave a dead `pending` revision as the winning
+/// state on relays (e.g. create + instant take, create + maker cancel).
+///
+/// Process-local by design: this daemon's key is the only legitimate
+/// publisher of its orders' events, so a per-process registry is enough to
+/// order its own revisions. Across a restart the map starts empty, but two
+/// publishes for the same order on both sides of a restart cannot land in
+/// the same second in practice.
+static LAST_PUBLISHED_ORDER_TS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Registry entries older than this are pruned once the map grows past
+/// [`ORDER_TS_PRUNE_THRESHOLD`]; ties only matter within the same second,
+/// so anything published days ago can never tie with a new revision.
+const ORDER_TS_MAX_AGE_SECS: u64 = 48 * 3600;
+const ORDER_TS_PRUNE_THRESHOLD: usize = 16_384;
+
+/// Next `created_at` for a kind-38383 revision of `order_id`: the candidate
+/// timestamp, bumped to strictly after the last published revision when both
+/// land in the same second (`max(candidate, last + 1)`). Records the result.
+pub(crate) fn monotonic_order_event_timestamp(order_id: Uuid, candidate: Timestamp) -> Timestamp {
+    let mut registry = LAST_PUBLISHED_ORDER_TS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let candidate = candidate.as_secs();
+    let effective = match registry.get(&order_id) {
+        Some(&last) => candidate.max(last + 1),
+        None => candidate,
+    };
+    if registry.len() >= ORDER_TS_PRUNE_THRESHOLD {
+        registry.retain(|_, &mut ts| ts + ORDER_TS_MAX_AGE_SECS > effective);
+    }
+    registry.insert(order_id, effective);
+    Timestamp::from(effective)
+}
+
+/// Orders whose latest kind-38383 publish failed (relay send error or no
+/// Nostr client), so the DB state and the advertised orderbook diverged.
+/// The scheduler's orderbook reconciler drains this set and republishes the
+/// current DB state until the wire converges.
+static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<Uuid>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Queue `order_id` for republish by the orderbook reconciler.
+pub(crate) fn mark_orderbook_publish_failed(order_id: Uuid) {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(order_id);
+}
+
+/// Drop `order_id` from the republish queue after a successful publish.
+pub(crate) fn clear_orderbook_publish_failure(order_id: Uuid) {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&order_id);
+}
+
+/// Take the current set of orders awaiting republish, leaving the queue
+/// empty. Failed retries re-queue themselves via `update_order_event`.
+pub(crate) fn take_failed_orderbook_publishes() -> Vec<Uuid> {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect()
+}
+
+/// `true` when the order's take window has closed (`expires_at` in the
+/// past) but the expiry job has not canceled it yet. The scheduler tick
+/// runs every ~60 s, so a `pending` row can outlive its `expires_at` by up
+/// to a minute; take paths must reject in that window instead of relying
+/// on the tick.
+pub(crate) fn is_order_take_window_closed(order: &Order, now: i64) -> bool {
+    order.expires_at > 0 && order.expires_at < now
+}
+
+/// Serializes tests that touch the process-global failed-publish queue
+/// (util + scheduler test modules share one test binary), so one test's
+/// drain cannot race another's enqueue-then-assert sequence.
+#[cfg(test)]
+pub(crate) static ORDERBOOK_QUEUE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Test-only visibility into the republish queue.
+#[cfg(test)]
+pub(crate) fn is_orderbook_publish_queued(order_id: Uuid) -> bool {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&order_id)
+}
+
 pub async fn update_order_event(
     keys: &Keys,
     status: Status,
@@ -962,23 +1069,46 @@ pub async fn update_order_event_with_created_at(
     // We transform the order fields to tags to use in the event
     let mostro_pubkey = keys.public_key().to_hex();
     if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
+        // Every revision of an order's kind-38383 event is stamped through
+        // the monotonic registry so two transitions in the same Unix second
+        // (create + instant take, create + maker cancel, …) never tie on
+        // `created_at` — NIP-01 breaks such ties by lowest event id, which
+        // can leave a dead `pending` revision as the winning state.
+        let candidate = created_at.unwrap_or_else(Timestamp::now);
+        let event_created_at = monotonic_order_event_timestamp(order.id, candidate);
         // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
-        let event = match created_at {
-            Some(created_at) => {
-                new_order_event_with_created_at(keys, "", order.id.to_string(), tags, created_at)
-            }
-            None => new_order_event(keys, "", order.id.to_string(), tags),
-        }
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        let event =
+            new_order_event_with_created_at(keys, "", order.id.to_string(), tags, event_created_at)
+                .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         info!("Sending replaceable event: {event:#?}");
 
         // We update the order with the new event_id
         order_updated.event_id = event.id.to_string();
 
-        if let Ok(client) = get_nostr_client() {
-            if client.send_event(&event).await.is_err() {
-                tracing::warn!("order id : {} is expired", order_updated.id)
+        // A failed (or impossible) publish must not stay invisible: the DB
+        // is about to advance while relays keep advertising the previous
+        // state. Queue the order so the scheduler's orderbook reconciler
+        // republishes the current DB state until the wire converges.
+        match get_nostr_client() {
+            Ok(client) => match client.send_event(&event).await {
+                Ok(_) => clear_orderbook_publish_failure(order.id),
+                Err(e) => {
+                    tracing::warn!(
+                        "orderbook publish failed for order {} (status {}): {e}; queued for republish",
+                        order_updated.id,
+                        status
+                    );
+                    mark_orderbook_publish_failed(order.id);
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "orderbook publish skipped for order {} (status {}): no nostr client ({e}); queued for republish",
+                    order_updated.id,
+                    status
+                );
+                mark_orderbook_publish_failed(order.id);
             }
         }
     };
@@ -1794,6 +1924,119 @@ mod tests {
         assert_eq!(repair.as_secs(), now.as_secs() + 1);
     }
 
+    // ───────────────── monotonic per-order created_at registry ─────────────────
+
+    /// Two revisions of the same order in the same Unix second must not tie:
+    /// NIP-01 breaks same-timestamp ties by lowest event id, which can keep a
+    /// dead `pending` revision as the winning state on relays.
+    #[test]
+    fn monotonic_timestamp_bumps_same_second_revisions() {
+        let order_id = Uuid::new_v4();
+        let now = Timestamp::from(1_700_000_000);
+
+        let first = monotonic_order_event_timestamp(order_id, now);
+        let second = monotonic_order_event_timestamp(order_id, now);
+        let third = monotonic_order_event_timestamp(order_id, now);
+
+        assert_eq!(first.as_secs(), 1_700_000_000);
+        assert_eq!(second.as_secs(), 1_700_000_001);
+        assert_eq!(third.as_secs(), 1_700_000_002);
+    }
+
+    /// A later wall-clock candidate wins over `last + 1` — the registry only
+    /// bumps when it must, so timestamps track real time whenever possible.
+    #[test]
+    fn monotonic_timestamp_uses_candidate_when_already_newer() {
+        let order_id = Uuid::new_v4();
+
+        let first = monotonic_order_event_timestamp(order_id, Timestamp::from(1_700_000_000));
+        let later = monotonic_order_event_timestamp(order_id, Timestamp::from(1_700_000_100));
+
+        assert_eq!(first.as_secs(), 1_700_000_000);
+        assert_eq!(later.as_secs(), 1_700_000_100);
+    }
+
+    /// Orders are independent d-tags: one order's revisions must not bump
+    /// another order's timestamps.
+    #[test]
+    fn monotonic_timestamp_is_per_order() {
+        let now = Timestamp::from(1_700_000_000);
+        let order_a = Uuid::new_v4();
+        let order_b = Uuid::new_v4();
+
+        let _ = monotonic_order_event_timestamp(order_a, now);
+        let b = monotonic_order_event_timestamp(order_b, now);
+
+        assert_eq!(
+            b.as_secs(),
+            now.as_secs(),
+            "order_b must not inherit order_a's bump"
+        );
+    }
+
+    /// The CAS-miss repair path still wins ordering when routed through the
+    /// registry: the repair candidate (`now + 1`) can never be flattened back
+    /// onto the stale revision's second.
+    #[test]
+    fn monotonic_timestamp_keeps_repair_strictly_after_stale() {
+        let order_id = Uuid::new_v4();
+        let now = Timestamp::from(1_700_000_000);
+
+        let stale = monotonic_order_event_timestamp(order_id, now);
+        let repair = monotonic_order_event_timestamp(order_id, repair_timestamp(now));
+
+        assert!(repair > stale, "repair must out-order the stale revision");
+    }
+
+    // ───────────────── failed-publish queue (orderbook reconciler) ─────────────────
+
+    /// A publish that cannot reach any relay must leave a trace: the order id
+    /// is queued for the orderbook reconciler instead of silently diverging
+    /// DB state from the advertised book (the finding's swallowed-publish
+    /// defect: pre-fix this was a `warn!` and nothing else).
+    #[tokio::test]
+    async fn update_order_event_queues_republish_when_publish_fails() {
+        init_globals();
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let keys = Keys::generate();
+
+        // A `Canceled` transition emits an event but skips the reputation
+        // lookup, so this test never touches the process-global DB pool.
+        let order = base_order(OrderKind::Sell, Status::Pending);
+
+        // The test-global Nostr client has no relays, so the send fails.
+        let updated = update_order_event(&keys, Status::Canceled, &order)
+            .await
+            .expect("publish failure must not fail the caller");
+
+        assert!(!updated.event_id.is_empty(), "event must still be built");
+        assert!(
+            is_orderbook_publish_queued(order.id),
+            "failed publish must queue the order for the reconciler"
+        );
+
+        // A drained entry stays drained until the next failure.
+        let drained = take_failed_orderbook_publishes();
+        assert!(drained.contains(&order.id));
+        assert!(!is_orderbook_publish_queued(order.id));
+    }
+
+    // ───────────────── take-window gate ─────────────────
+
+    #[test]
+    fn take_window_closed_for_expired_order() {
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        let now = order.expires_at + 10;
+        assert!(is_order_take_window_closed(&order, now));
+
+        // Still-open window: not closed.
+        assert!(!is_order_take_window_closed(&order, order.expires_at - 10));
+
+        // Legacy rows without expires_at are exempt.
+        order.expires_at = 0;
+        assert!(!is_order_take_window_closed(&order, now));
+    }
+
     #[test]
     // DEPRECATED(v0.19.0, #786): delete along with `stamp_protocol_version`.
     #[allow(deprecated)]
@@ -2260,7 +2503,13 @@ mod tests {
     /// migrations against the live pool unconditionally — they are idempotent
     /// (tracked in `_sqlx_migrations`) and guarantee the tables these tests
     /// need exist regardless of who won.
+    /// Serializes global-pool initialization: two tests racing through this
+    /// helper could interleave `set` + migration runs on the winning pool,
+    /// leaving one of them querying tables that are not applied yet.
+    static GLOBAL_POOL_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn ensure_global_db_pool() -> std::sync::Arc<SqlitePool> {
+        let _guard = GLOBAL_POOL_INIT.lock().await;
         if DB_POOL.get().is_none() {
             let pool = migrated_pool().await;
             let _ = DB_POOL.set(std::sync::Arc::new(pool));

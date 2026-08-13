@@ -3,7 +3,7 @@ use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, show_hold_invoice, HoldInvoiceOrigin,
+    get_order, is_order_take_window_closed, show_hold_invoice, HoldInvoiceOrigin,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -41,6 +41,13 @@ pub async fn take_buy_action(
     if order.check_status(Status::Pending).is_err()
         && order.check_status(Status::WaitingTakerBond).is_err()
     {
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
+    }
+
+    // Reject takes on an order whose take window already closed: a
+    // `pending` row can outlive its `expires_at` by up to one scheduler
+    // tick (~60 s) before the expiry job cancels it.
+    if is_order_take_window_closed(&order, Timestamp::now().as_secs() as i64) {
         return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 

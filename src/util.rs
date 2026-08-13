@@ -10,7 +10,10 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
-use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
+use crate::nip33::{
+    create_platform_tag_values, new_order_event, new_order_event_with_created_at, new_rating_event,
+    order_to_tags,
+};
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
@@ -917,7 +920,19 @@ pub async fn republish_winning_state_after_cas_miss(
     };
     match current.get_order_status() {
         Ok(status) => {
-            if let Err(e) = update_order_event(my_keys, status, &current).await {
+            // The stale event was published moments ago, usually within the
+            // same Unix second. NIP-01 breaks same-timestamp ties by lowest
+            // event id, so stamp the repair strictly after `now` to guarantee
+            // it replaces the stale event on relays.
+            let repair_created_at = repair_timestamp(Timestamp::now());
+            if let Err(e) = update_order_event_with_created_at(
+                my_keys,
+                status,
+                &current,
+                Some(repair_created_at),
+            )
+            .await
+            {
                 tracing::warn!(
                     "cas miss repair: could not republish order {order_id} as {status}: {e}"
                 );
@@ -927,10 +942,30 @@ pub async fn republish_winning_state_after_cas_miss(
     }
 }
 
+/// Timestamp for a CAS-miss repair event: strictly after `now`, so the repair
+/// wins NIP-01 replaceable-event ordering even against a stale event
+/// published in the same Unix second (same-second ties fall back to lowest
+/// event id, which the repair could lose).
+fn repair_timestamp(now: Timestamp) -> Timestamp {
+    Timestamp::from(now.as_secs() + 1)
+}
+
 pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
+) -> Result<Order, MostroError> {
+    update_order_event_with_created_at(keys, status, order, None).await
+}
+
+/// Same as [`update_order_event`], but allows overriding the published
+/// event's `created_at` (used by the CAS-miss repair path, which must stamp
+/// its event strictly after the stale one to win NIP-01 ordering).
+pub async fn update_order_event_with_created_at(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    created_at: Option<Timestamp>,
 ) -> Result<Order, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
@@ -943,8 +978,13 @@ pub async fn update_order_event(
     let mostro_pubkey = keys.public_key().to_hex();
     if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
         // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
-        let event = new_order_event(keys, "", order.id.to_string(), tags)
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        let event = match created_at {
+            Some(created_at) => {
+                new_order_event_with_created_at(keys, "", order.id.to_string(), tags, created_at)
+            }
+            None => new_order_event(keys, "", order.id.to_string(), tags),
+        }
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         info!("Sending replaceable event: {event:#?}");
 
@@ -1682,6 +1722,18 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    /// Regression: the CAS-miss repair timestamp must be strictly newer than
+    /// `now`, otherwise a repair published in the same Unix second as the
+    /// stale event ties on `created_at` and NIP-01's lowest-id tie-breaker
+    /// can keep the stale state on relays.
+    #[test]
+    fn repair_timestamp_is_strictly_after_now() {
+        let now = Timestamp::from(1_700_000_000);
+        let repair = repair_timestamp(now);
+        assert!(repair > now);
+        assert_eq!(repair.as_secs(), now.as_secs() + 1);
     }
 
     #[test]

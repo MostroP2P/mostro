@@ -929,22 +929,50 @@ const ORDERBOOK_RECONCILE_INTERVAL_SECS: u64 = 60;
 /// restores from backup, NIP-01 ties lost before the monotonic stamp).
 const ORDERBOOK_FULL_SWEEP_EVERY_TICKS: u64 = 60;
 
+/// A reconciler republish only proceeds when the order has not been
+/// stamped for this long. Handlers publish their kind-38383 revision
+/// *before* persisting the CAS, so a background republish that reads the
+/// DB row inside that window could re-advertise the pre-CAS state with a
+/// newer timestamp and the relay would keep it forever. The window only
+/// needs to outlast a handler's publish→persist gap (relay send timeout +
+/// one DB write); anything recently stamped is retried on a later pass.
+const ORDERBOOK_QUIESCENT_SECS: u64 = 120;
+
 /// One reconciler pass: republish every order whose last kind-38383
 /// publish failed (`util::take_failed_orderbook_publishes`), and — when
 /// `full_sweep` — re-assert every live `pending` order from the DB.
 ///
-/// `update_order_event` re-queues an order on publish failure, so a relay
-/// outage self-heals on a later pass. The returned order (fresh
-/// `event_id`) is deliberately not persisted, matching the CAS-miss
-/// repair path: the DB row's status is the source of truth being
-/// re-advertised, not mutated.
+/// Every publish goes through `update_order_event_if_quiescent`: an order
+/// stamped within the last [`ORDERBOOK_QUIESCENT_SECS`] is skipped (queue
+/// entries are kept for the next pass), so a sweep can never supersede a
+/// transition that published before persisting its CAS. On publish
+/// failure the order re-queues itself, so a relay outage self-heals on a
+/// later pass. The returned order (fresh `event_id`) is deliberately not
+/// persisted, matching the CAS-miss repair path: the DB row's status is
+/// the source of truth being re-advertised, not mutated.
 async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys, full_sweep: bool) {
-    for order_id in util::take_failed_orderbook_publishes() {
+    for (order_id, generation) in util::take_failed_orderbook_publishes() {
         match Order::by_id(pool, order_id).await {
             Ok(Some(order)) => match order.get_order_status() {
                 Ok(status) => {
-                    if let Err(e) = update_order_event(keys, status, &order).await {
-                        warn!("orderbook reconciler: republish of order {order_id} failed: {e}");
+                    match util::update_order_event_if_quiescent(
+                        keys,
+                        status,
+                        &order,
+                        ORDERBOOK_QUIESCENT_SECS,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {}
+                        // Stamped too recently — another publication may be
+                        // in flight; keep the failure queued for later.
+                        Ok(None) => util::mark_orderbook_publish_failed_at(order_id, generation),
+                        Err(e) => {
+                            warn!(
+                                "orderbook reconciler: republish of order {order_id} failed: {e}"
+                            );
+                            util::mark_orderbook_publish_failed_at(order_id, generation);
+                        }
                     }
                 }
                 Err(e) => warn!("orderbook reconciler: order {order_id} has bad status: {e}"),
@@ -954,7 +982,7 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys, full_swe
             Err(e) => {
                 warn!("orderbook reconciler: could not reload order {order_id}: {e}");
                 // Transient DB error: keep it queued for the next pass.
-                util::mark_orderbook_publish_failed(order_id);
+                util::mark_orderbook_publish_failed_at(order_id, generation);
             }
         }
     }
@@ -969,11 +997,23 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys, full_swe
                 for order in orders {
                     match order.get_order_status() {
                         Ok(status) => {
-                            if let Err(e) = update_order_event(keys, status, &order).await {
-                                warn!(
+                            match util::update_order_event_if_quiescent(
+                                keys,
+                                status,
+                                &order,
+                                ORDERBOOK_QUIESCENT_SECS,
+                            )
+                            .await
+                            {
+                                Ok(Some(_)) => {}
+                                // Recently stamped — the normal publish
+                                // path owns convergence for this order; a
+                                // lost event is healed by the next sweep.
+                                Ok(None) => {}
+                                Err(e) => warn!(
                                     "orderbook reconciler: re-assert of order {} failed: {e}",
                                     order.id
-                                );
+                                ),
                             }
                         }
                         Err(e) => warn!(
@@ -1404,6 +1444,42 @@ mod tests {
         assert!(
             crate::util::is_orderbook_publish_queued(order.id),
             "unreachable relays must keep the order queued for the next pass"
+        );
+        // Leave the shared queue clean for other tests.
+        let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
+    /// An order stamped moments ago may belong to a transition that
+    /// published before persisting its CAS: the reconciler must skip it
+    /// this pass (keeping the queue entry) instead of re-advertising the
+    /// possibly-stale DB row with a newer timestamp.
+    #[tokio::test]
+    async fn reconciler_skips_recently_stamped_order_but_keeps_it_queued() {
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Canceled.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        // Simulate an in-flight transition: stamp the order now, then fail
+        // its publish (mark it for the reconciler).
+        let _ = crate::util::stamp_orderbook_event(order.id, nostr_sdk::prelude::Timestamp::now());
+        crate::util::mark_orderbook_publish_failed(order.id);
+
+        reconcile_orderbook_once(ctx.pool(), &keys, false).await;
+
+        assert!(
+            crate::util::is_orderbook_publish_queued(order.id),
+            "a recently stamped order must stay queued, not be republished over a possible in-flight transition"
         );
         // Leave the shared queue clean for other tests.
         let _ = crate::util::take_failed_orderbook_publishes();

@@ -458,12 +458,23 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
-    // Same id and filter `main.rs` subscribed with — the inbox identity is
-    // derived, not passed around (see `crate::inbox`).
-    let mut keeper = InboxKeeper::new(InboxSubscription::new(my_keys.public_key(), accepted_kind));
+    // The inbox identity is derived here rather than passed around (see
+    // `crate::inbox`).
+    let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
+    let mut keeper = InboxKeeper::new(subscription.clone());
+    let mut subscribed = false;
 
     loop {
         let mut notifications = client.notifications();
+
+        // The REQ goes out only once this stream exists. A notification
+        // receiver never sees what was delivered before it was created, so
+        // subscribing any earlier throws away the relay's EOSE — and every
+        // event that lands while the rest of the daemon is still booting.
+        if !subscribed {
+            subscription.subscribe(client).await?;
+            subscribed = true;
+        }
 
         while let Some(notification) = notifications.next().await {
             match notification {
@@ -518,10 +529,18 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
-    let mut keeper = InboxKeeper::new(InboxSubscription::new(my_keys.public_key(), accepted_kind));
+    let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
+    let mut keeper = InboxKeeper::new(subscription.clone());
+    let mut subscribed = false;
 
     loop {
         let mut notifications = client.notifications();
+
+        // Subscribe only once the stream exists — see `run`.
+        if !subscribed {
+            subscription.subscribe(client).await?;
+            subscribed = true;
+        }
 
         while let Some(notification) = notifications.next().await {
             match notification {

@@ -876,6 +876,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_receiver_created_after_the_req_misses_its_eose() {
+        use futures::StreamExt;
+        use nostr_sdk::local_relay::LocalRelay;
+
+        // Why the event loop must subscribe *after* taking its notification
+        // stream: the SDK delivers nothing that predates the receiver, so a
+        // REQ sent earlier loses its EOSE — and any event arriving meanwhile.
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+
+        // Subscribe first, listen second — the order this module avoids.
+        subscription.subscribe(&client).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut late = client.notifications();
+
+        let saw_eose = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(notification) = late.next().await {
+                if let ClientNotification::Message { message, .. } = notification {
+                    if let RelayMessage::EndOfStoredEvents(id) = &*message {
+                        if id.as_ref() == subscription.id() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            !saw_eose,
+            "SDK behaviour changed: a late receiver now sees earlier frames, so the \
+             subscribe-after-stream ordering in `app::run` could be relaxed"
+        );
+
+        relay.shutdown();
+    }
+
+    #[tokio::test]
     async fn without_the_keeper_a_closed_inbox_stays_dead() {
         use nostr_sdk::local_relay::LocalRelay;
 

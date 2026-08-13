@@ -29,7 +29,7 @@ use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
-use crate::inbox::{InboxHealth, InboxSubscription};
+use crate::inbox::InboxHealth;
 use crate::lightning::LnStatus;
 use crate::lightning::LndConnector;
 use crate::rpc::RpcServer;
@@ -106,10 +106,8 @@ async fn main() -> Result<()> {
              support protocol v2. See https://github.com/MostroP2P/mostro/issues/786"
         );
     }
-    let inbox = InboxSubscription::new(mostro_keys.public_key(), transport.event_kind());
-
-    // Install the inbox health record before the subscription goes out, so the
-    // watchdog and the scheduler read the same one from their own tasks.
+    // Install the inbox health record before anything can observe the inbox,
+    // so the watchdog and the scheduler read the same one from their own tasks.
     if InboxHealth::new().install_global().is_err() {
         tracing::warn!("Inbox health record already installed");
     }
@@ -123,8 +121,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Client subscription
-    inbox.subscribe(client).await?;
+    // The inbox REQ is sent by the event loop (`app::run` / `app::run_cashu`),
+    // which subscribes only after its notification stream exists. Sending it
+    // from here would put it ahead of any receiver, and the SDK delivers
+    // nothing that predates one — the relay's EOSE and any trade message
+    // arriving during the rest of this boot would be dropped on the floor.
 
     // Publish NIP-01 kind 0 metadata event
     let mostro_settings = Settings::get_mostro();

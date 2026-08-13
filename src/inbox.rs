@@ -306,6 +306,35 @@ pub enum InstallError {
     AlreadyInstalled,
 }
 
+/// One stretch during which the daemon could not hear.
+///
+/// Timestamps are wall-clock seconds, the same base as an order's `taken_at`,
+/// because that is what these windows are ultimately intersected against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlindWindow {
+    start: i64,
+    /// `None` while the outage is still running.
+    end: Option<i64>,
+}
+
+impl BlindWindow {
+    /// Seconds of this window that fall inside `[from, to]`.
+    fn overlap(&self, from: i64, to: i64, now: i64) -> i64 {
+        let end = self.end.unwrap_or(now);
+        (end.min(to) - self.start.max(from)).max(0)
+    }
+}
+
+/// Windows that ended longer ago than this are dropped: no order the timeout
+/// job can still be looking at was waiting back then, so they can no longer
+/// change any verdict. Generous next to `expiration_seconds` (900s by default)
+/// so the bound is never the reason a user loses compensation.
+const BLIND_WINDOW_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// Hard cap on retained windows, so a relay flapping in a tight loop cannot
+/// grow this unboundedly between prunes.
+const MAX_BLIND_WINDOWS: usize = 512;
+
 #[derive(Debug)]
 struct HealthState {
     /// The last verdict an audit reached. `None` until the first one runs:
@@ -314,18 +343,18 @@ struct HealthState {
     verdict: Option<InboxStatus>,
     /// When the record was installed, which is the earliest moment an outage
     /// discovered by the first audit could have begun.
-    installed_at: Instant,
-    /// When the current outage began, if the inbox is deaf right now.
-    blind_since: Option<Instant>,
-    /// Debt owed by finished outages, exact as of `owed_as_of`. It wears off
-    /// as time passes with the inbox listening, and is frozen while it is
-    /// blind — repaying it requires time the user could actually talk in.
-    owed: Duration,
-    /// When `owed` was last exact. `None` before the first outage.
-    owed_as_of: Option<Instant>,
+    installed_at: i64,
+    /// Every outage this process has seen, oldest first, pruned by age.
+    windows: Vec<BlindWindow>,
 }
 
-/// Tracks whether the daemon's ear is open, and for how long it was not.
+impl HealthState {
+    fn blind_now(&self) -> Option<&BlindWindow> {
+        self.windows.last().filter(|w| w.end.is_none())
+    }
+}
+
+/// Tracks whether the daemon's ear is open, and when it was not.
 ///
 /// The scheduler's timeout machinery reads this: an order is only "late" if
 /// Mostro was in a position to hear from the user, and the ten-second replay
@@ -345,17 +374,15 @@ impl Default for InboxHealth {
 
 impl InboxHealth {
     pub fn new() -> Self {
-        Self::at(Instant::now())
+        Self::at(now_secs())
     }
 
-    fn at(installed_at: Instant) -> Self {
+    fn at(installed_at: i64) -> Self {
         Self {
             state: Mutex::new(HealthState {
                 verdict: None,
                 installed_at,
-                blind_since: None,
-                owed: Duration::ZERO,
-                owed_as_of: None,
+                windows: Vec::new(),
             }),
         }
     }
@@ -373,36 +400,40 @@ impl InboxHealth {
     }
 
     /// Record the current observation, returning the resulting status.
-    fn observe(&self, status: InboxStatus, now: Instant) -> InboxStatus {
+    fn observe(&self, status: InboxStatus, now: i64) -> InboxStatus {
         let mut state = self.state.lock().expect("inbox health mutex poisoned");
         let first_verdict = state.verdict.is_none();
         state.verdict = Some(status);
 
-        match (status, state.blind_since) {
-            (InboxStatus::Blind, None) => {
-                // Freeze whatever an earlier outage still owes: from here on,
-                // no time passes that a user could have used to answer, so
-                // none of that debt gets repaid.
-                state.owed = settled_debt(&state, now);
-                state.owed_as_of = Some(now);
+        match (status, state.blind_now().is_some()) {
+            (InboxStatus::Blind, false) => {
                 // A first audit that finds the inbox deaf has found an outage
                 // that was already running: the node has not heard anything
                 // since it came up, so that is when the outage began.
-                state.blind_since = Some(if first_verdict {
+                let start = if first_verdict {
                     state.installed_at
                 } else {
                     now
-                });
+                };
+                state.windows.push(BlindWindow { start, end: None });
             }
-            (InboxStatus::Listening, Some(since)) => {
-                // The frozen debt plus this outage; two outages in quick
-                // succession add up rather than cancelling each other out.
-                state.owed += now.saturating_duration_since(since);
-                state.owed_as_of = Some(now);
-                state.blind_since = None;
+            (InboxStatus::Listening, true) => {
+                if let Some(open) = state.windows.last_mut() {
+                    open.end = Some(now);
+                }
             }
             _ => {}
         }
+
+        state.windows.retain(|w| match w.end {
+            Some(end) => end > now - BLIND_WINDOW_RETENTION_SECS,
+            None => true,
+        });
+        if state.windows.len() > MAX_BLIND_WINDOWS {
+            let excess = state.windows.len() - MAX_BLIND_WINDOWS;
+            state.windows.drain(..excess);
+        }
+
         status
     }
 
@@ -415,7 +446,7 @@ impl InboxHealth {
         self.state
             .lock()
             .expect("inbox health mutex poisoned")
-            .blind_since
+            .blind_now()
             .is_some()
     }
 
@@ -435,45 +466,54 @@ impl InboxHealth {
             == Some(InboxStatus::Listening)
     }
 
-    /// How much time the order-timeout clock currently owes users.
+    /// Seconds the inbox was deaf between `from` and now.
     ///
-    /// Deadlines are measured against wall time, but a user cannot answer a
-    /// node that cannot hear — and because a message sent into a dead inbox is
-    /// lost rather than queued (the ten-second replay window, see the module
-    /// docs), they have to send it again once the ear is back. So the time the
-    /// inbox spent down is given back: the debt equals the outage when it ends
-    /// and decays to zero over an equal span, which is the same as saying the
-    /// timeout clock stood still while Mostro was deaf.
-    ///
-    /// Compensation is granted to every waiting order rather than only to
-    /// those in flight during the outage — an order taken *during* the blind
-    /// window gets slightly more grace than it strictly lost. That error is
-    /// deliberate: it delays a cancellation, where the opposite would slash an
-    /// honest user's bond for the node's own failure.
-    pub fn timeout_debt(&self) -> Duration {
-        self.timeout_debt_at(Instant::now())
+    /// This is the compensation a single order is owed, and it is computed per
+    /// order on purpose. A deadline is wall-clock, but the user is answering a
+    /// node that has to be listening for the answer to land — and because a
+    /// message sent into a dead inbox is lost rather than queued (the
+    /// ten-second replay window, see the module docs), they must send it again
+    /// once the ear is back. So an order's clock effectively stops for exactly
+    /// the outages that overlap its own waiting period: an order that was
+    /// already waiting through an outage is owed all of it, one taken
+    /// afterwards is owed nothing.
+    pub fn blind_seconds_since(&self, from: i64) -> i64 {
+        self.blind_seconds_between(from, now_secs())
     }
 
-    fn timeout_debt_at(&self, now: Instant) -> Duration {
+    fn blind_seconds_between(&self, from: i64, to: i64) -> i64 {
         let state = self.state.lock().expect("inbox health mutex poisoned");
-        match state.blind_since {
-            // Still deaf: the debt frozen at the start of this outage, plus
-            // every second it has run for.
-            Some(since) => state.owed + now.saturating_duration_since(since),
-            None => settled_debt(&state, now),
-        }
+        state.windows.iter().map(|w| w.overlap(from, to, to)).sum()
+    }
+
+    /// Upper bound on what any order could be owed, for callers that need to
+    /// widen a query before applying the exact per-order figure.
+    pub fn max_blind_seconds(&self) -> i64 {
+        let now = now_secs();
+        let state = self.state.lock().expect("inbox health mutex poisoned");
+        state
+            .windows
+            .iter()
+            .map(|w| w.end.unwrap_or(now) - w.start)
+            .sum::<i64>()
+            .max(0)
+    }
+
+    /// How long the current outage has been running, or zero if listening.
+    pub fn blind_for_secs(&self) -> i64 {
+        let now = now_secs();
+        self.state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .blind_now()
+            .map(|w| (now - w.start).max(0))
+            .unwrap_or(0)
     }
 }
 
-/// The debt still outstanding at `now` while the inbox is listening: it starts
-/// at the recorded amount and wears off second for second.
-fn settled_debt(state: &HealthState, now: Instant) -> Duration {
-    match state.owed_as_of {
-        Some(as_of) => state
-            .owed
-            .saturating_sub(now.saturating_duration_since(as_of)),
-        None => Duration::ZERO,
-    }
+/// Wall-clock seconds, the base an order's `taken_at` is recorded in.
+fn now_secs() -> i64 {
+    Timestamp::now().as_secs() as i64
 }
 
 /// Check every read relay, re-subscribing any that lost the inbox, and record
@@ -527,7 +567,7 @@ pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscriptio
 
     if let Some(health) = InboxHealth::global() {
         let was_blind = health.is_blind();
-        health.observe(status, Instant::now());
+        health.observe(status, now_secs());
 
         match (was_blind, status) {
             (false, InboxStatus::Blind) => error!(
@@ -866,36 +906,39 @@ mod tests {
         relay.shutdown();
     }
 
-    // ──────────────────────────────── watchdog ────────────────────────────────
+    // ───────────────────────────── health record ─────────────────────────────
+
+    /// Health observations are wall-clock based, so tests drive a fixed origin
+    /// rather than the real clock.
+    const T0: i64 = 1_700_000_000;
 
     #[test]
     fn health_records_an_outage_from_first_blindness_to_recovery() {
-        let start = Instant::now();
-        let health = InboxHealth::at(start);
+        let health = InboxHealth::at(T0);
 
         assert!(!health.is_blind(), "a fresh record starts out listening");
 
-        health.observe(InboxStatus::Blind, start);
+        health.observe(InboxStatus::Blind, T0);
         assert!(health.is_blind());
 
         // Staying blind must not restart the clock — the outage began at the
-        // first observation, and that is what the timeout discount is owed on.
-        health.observe(InboxStatus::Blind, start + Duration::from_secs(30));
+        // first observation, and that is what an order is owed.
+        health.observe(InboxStatus::Blind, T0 + 30);
         assert!(health.is_blind());
 
-        health.observe(InboxStatus::Listening, start + Duration::from_secs(90));
+        health.observe(InboxStatus::Listening, T0 + 90);
         assert!(!health.is_blind());
 
         assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(90)),
-            Duration::from_secs(90),
+            health.blind_seconds_between(T0, T0 + 90),
+            90,
             "the recorded outage must span the whole blind window"
         );
     }
 
     #[test]
     fn health_is_not_listening_until_an_audit_says_so() {
-        let health = InboxHealth::new();
+        let health = InboxHealth::at(T0);
 
         // Startup is not evidence. Between `main` subscribing and the
         // watchdog's first pass, a node whose inbox never worked would
@@ -909,107 +952,163 @@ mod tests {
             "nor should it claim an outage it has not observed"
         );
 
-        health.observe(InboxStatus::Listening, Instant::now());
+        health.observe(InboxStatus::Listening, T0);
         assert!(health.is_confirmed_listening());
     }
 
     #[test]
     fn a_blind_first_audit_dates_the_outage_from_startup() {
-        let start = Instant::now();
-        let health = InboxHealth::at(start);
+        let health = InboxHealth::at(T0);
 
         // The watchdog's first pass comes some time after boot. Finding the
         // inbox deaf then means it was deaf for that whole stretch, not just
         // from the moment somebody looked.
-        health.observe(InboxStatus::Blind, start + Duration::from_secs(30));
-        health.observe(InboxStatus::Listening, start + Duration::from_secs(90));
+        health.observe(InboxStatus::Blind, T0 + 30);
+        health.observe(InboxStatus::Listening, T0 + 90);
 
         assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(90)),
-            Duration::from_secs(90),
+            health.blind_seconds_between(T0, T0 + 90),
+            90,
             "the outage must be dated from startup, not from the first audit"
         );
     }
 
     #[test]
     fn a_node_that_was_never_blind_owes_nothing() {
-        let health = InboxHealth::new();
-        assert_eq!(health.timeout_debt_at(Instant::now()), Duration::ZERO);
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Listening, T0);
+
+        assert_eq!(health.blind_seconds_between(T0, T0 + 10_000), 0);
+        assert_eq!(health.max_blind_seconds(), 0);
+    }
+
+    // ──────────────────── what a single order is owed ────────────────────
+
+    #[test]
+    fn an_order_is_owed_only_the_downtime_it_waited_through() {
+        let health = InboxHealth::at(T0);
+        // One outage: [T0+100, T0+400], five minutes.
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Blind, T0 + 100);
+        health.observe(InboxStatus::Listening, T0 + 400);
+
+        let now = T0 + 1_000;
+
+        // Waiting since before it started: owed the whole outage.
+        assert_eq!(health.blind_seconds_between(T0, now), 300);
+        // Taken midway through: owed only the remainder.
+        assert_eq!(health.blind_seconds_between(T0 + 250, now), 150);
+        // Taken after it ended: owed nothing. This is what a single global
+        // allowance got wrong — it credited orders that never lost a second.
+        assert_eq!(health.blind_seconds_between(T0 + 500, now), 0);
     }
 
     #[test]
-    fn debt_grows_while_blind_and_wears_off_after_recovery() {
-        let start = Instant::now();
-        let health = InboxHealth::at(start);
+    fn compensation_does_not_evaporate_as_time_passes() {
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Blind, T0 + 100);
+        health.observe(InboxStatus::Listening, T0 + 400);
 
-        health.observe(InboxStatus::Blind, start);
+        // The debt an order carries is a property of when it waited, not of
+        // how long ago the outage was. A decaying allowance wore off at the
+        // same rate the deadline advanced, so it compensated almost nothing.
+        for probe in [400, 700, 5_000, 50_000] {
+            assert_eq!(
+                health.blind_seconds_between(T0, T0 + probe),
+                300,
+                "an order waiting since T0 is owed the outage regardless of when we ask"
+            );
+        }
+    }
 
-        // While deaf, the clock is stopped: the debt is the whole outage so far.
-        assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(120)),
-            Duration::from_secs(120)
-        );
+    #[test]
+    fn an_order_waiting_through_an_outage_survives_its_nominal_deadline() {
+        // The regression in full: 900s timeout, an order taken at T0, and a
+        // 300s outage right at the start. Under the old decaying allowance
+        // this order was cancelled at ~T0+900, having had only 600s of
+        // listening time.
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Blind, T0);
+        health.observe(InboxStatus::Listening, T0 + 300);
 
-        health.observe(InboxStatus::Listening, start + Duration::from_secs(300));
+        let exp_seconds = 900i64;
+        let late_at = |now: i64| {
+            let owed = health.blind_seconds_between(T0, now);
+            (now - T0) >= exp_seconds + owed
+        };
 
-        // On recovery, users are owed the full outage...
-        assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(300)),
-            Duration::from_secs(300)
-        );
-        // ...which then decays second for second, so a five-minute outage
-        // gives back five minutes and no more.
-        assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(400)),
-            Duration::from_secs(200)
-        );
-        assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(600)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(10_000)),
-            Duration::ZERO,
-            "the debt must not linger once repaid"
+        assert!(!late_at(T0 + 900), "cancelled after only 600s of listening");
+        assert!(!late_at(T0 + 1_199));
+        assert!(
+            late_at(T0 + 1_200),
+            "and it must still expire once it has had its full 900s"
         );
     }
 
     #[test]
     fn consecutive_outages_accumulate_their_debt() {
-        let start = Instant::now();
-        let health = InboxHealth::at(start);
-
-        // A 100s outage, recovered at t=100 — debt 100s.
-        health.observe(InboxStatus::Blind, start);
-        health.observe(InboxStatus::Listening, start + Duration::from_secs(100));
-
-        // A second outage begins at t=140, when 60s of the first is still owed,
-        // and lasts 50s.
-        health.observe(InboxStatus::Blind, start + Duration::from_secs(140));
-        health.observe(InboxStatus::Listening, start + Duration::from_secs(190));
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Blind, T0 + 100);
+        health.observe(InboxStatus::Listening, T0 + 200);
+        health.observe(InboxStatus::Blind, T0 + 240);
+        health.observe(InboxStatus::Listening, T0 + 290);
 
         assert_eq!(
-            health.timeout_debt_at(start + Duration::from_secs(190)),
-            Duration::from_secs(110),
-            "the second outage must not wipe out what the first still owed"
+            health.blind_seconds_between(T0, T0 + 1_000),
+            150,
+            "an order waiting through both outages is owed both"
+        );
+        assert_eq!(
+            health.blind_seconds_between(T0 + 210, T0 + 1_000),
+            50,
+            "one taken between them is owed only the second"
         );
     }
 
     #[test]
-    fn health_ignores_repeated_healthy_observations() {
-        let health = InboxHealth::new();
-        let now = Instant::now();
+    fn an_ongoing_outage_counts_up_to_now() {
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Blind, T0 + 100);
 
-        health.observe(InboxStatus::Listening, now);
-        health.observe(InboxStatus::Listening, now + Duration::from_secs(30));
+        assert_eq!(health.blind_seconds_between(T0, T0 + 400), 300);
+        assert_eq!(health.blind_seconds_between(T0, T0 + 900), 800);
+    }
+
+    #[test]
+    fn stale_windows_are_pruned() {
+        let health = InboxHealth::at(T0);
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Blind, T0 + 100);
+        health.observe(InboxStatus::Listening, T0 + 200);
+
+        // Far past the retention horizon, the old window is dropped rather
+        // than accumulating for the life of the process.
+        let much_later = T0 + BLIND_WINDOW_RETENTION_SECS + 1_000;
+        health.observe(InboxStatus::Listening, much_later);
+
+        assert_eq!(health.blind_seconds_between(T0, much_later), 0);
+        assert!(health.state.lock().expect("lock").windows.is_empty());
+    }
+
+    #[test]
+    fn health_ignores_repeated_healthy_observations() {
+        let health = InboxHealth::at(T0);
+
+        health.observe(InboxStatus::Listening, T0);
+        health.observe(InboxStatus::Listening, T0 + 30);
 
         assert!(!health.is_blind());
         assert_eq!(
-            health.timeout_debt_at(now + Duration::from_secs(30)),
-            Duration::ZERO,
+            health.blind_seconds_between(T0, T0 + 30),
+            0,
             "a node that was never blind has no outage to compensate for"
         );
     }
+
+    // ──────────────────────────────── watchdog ────────────────────────────────
 
     #[tokio::test]
     async fn watchdog_resubscribes_a_relay_that_lost_the_inbox() {

@@ -19,8 +19,9 @@ use nostr_sdk::prelude::EventBuilder;
 use nostr_sdk::prelude::{FinalizeEvent, Kind as NostrKind, Nip65Tag, Tag};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
@@ -534,19 +535,25 @@ async fn job_cancel_orders(ctx: AppContext) {
                 }
             }
 
-            // Time the inbox spent deaf is given back to users before an order
-            // counts as late (see `InboxHealth::timeout_debt`).
-            let grace = crate::inbox::InboxHealth::global()
-                .map(|health| health.timeout_debt())
-                .unwrap_or_default();
-            if !grace.is_zero() {
+            // Compensation for inbox downtime is per order, and applied in two
+            // steps. The query widens its window by the most any order could
+            // be owed, so nothing eligible is missed; the exact figure — the
+            // downtime that overlaps *this* order's own wait — then decides.
+            // A single global allowance cannot do this: it would either
+            // under-credit an order that waited through the whole outage or
+            // hand the same credit to one taken long after it ended.
+            let health = crate::inbox::InboxHealth::global();
+            let max_grace = health.map(|h| h.max_blind_seconds()).unwrap_or(0);
+            if max_grace > 0 {
                 info!(
-                    "scheduler_timeout: extending order deadlines by {}s to make up for inbox downtime",
-                    grace.as_secs()
+                    "scheduler_timeout: up to {max_grace}s of inbox downtime is credited against order deadlines"
                 );
             }
 
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool, grace).await {
+            if let Ok(older_orders_list) =
+                crate::db::find_order_by_seconds(pool, Duration::from_secs(max_grace.max(0) as u64))
+                    .await
+            {
                 for order in older_orders_list.into_iter() {
                     // The tick-start snapshot may be stale by the time this
                     // iteration is reached — re-read and re-confirm before
@@ -558,6 +565,23 @@ async fn job_cancel_orders(ctx: AppContext) {
                     else {
                         continue;
                     };
+
+                    // Give this order back the downtime it actually waited
+                    // through. Orders taken after the outage are owed nothing
+                    // and fall through unchanged.
+                    if let Some(health) = health {
+                        let owed = health.blind_seconds_since(order.taken_at);
+                        let waited =
+                            nostr_sdk::prelude::Timestamp::now().as_secs() as i64 - order.taken_at;
+                        if waited < exp_seconds as i64 + owed {
+                            debug!(
+                                "scheduler_timeout: order {} not late yet; {owed}s of its wait was inbox downtime",
+                                order.id
+                            );
+                            continue;
+                        }
+                    }
+
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
                     if order.status == Status::WaitingBuyerInvoice.to_string()

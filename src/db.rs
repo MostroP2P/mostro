@@ -679,11 +679,13 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
 /// Orders whose waiting deadline has passed and are therefore candidates for
 /// the timeout job.
 ///
-/// `grace` widens the deadline by time the daemon owes users — currently the
-/// span its Nostr inbox spent unable to receive anything (see
-/// [`crate::inbox::InboxHealth::timeout_debt`]). A user who answered on time
-/// into a deaf node must not read as late, so the eligibility window is pushed
-/// back by exactly as long as the node could not listen.
+/// `grace` widens the window by the **most** any order could be owed for time
+/// the daemon spent unable to receive anything (see
+/// [`crate::inbox::InboxHealth::max_blind_seconds`]), so that no order the
+/// caller may still have to spare is filtered out here. It deliberately
+/// over-selects: what a given order is actually owed depends on when it began
+/// waiting, which this query cannot express, so the caller applies the exact
+/// per-order figure to the rows returned.
 pub async fn find_order_by_seconds(
     pool: &SqlitePool,
     grace: Duration,
@@ -5223,12 +5225,14 @@ mod migration_and_query_tests {
             "an order cannot be late for a window the daemon spent unable to listen"
         );
 
-        // Once the debt wears below the overshoot, the order is late again.
-        let partly_repaid = find_order_by_seconds(&pool, Duration::from_secs(30))
+        // A grace smaller than the overshoot still selects it: the query only
+        // has to avoid filtering out rows the caller may spare, and the caller
+        // decides from each order's own downtime.
+        let smaller_grace = find_order_by_seconds(&pool, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(
-            partly_repaid.len(),
+            smaller_grace.len(),
             1,
             "grace only postpones the deadline, it does not remove it"
         );

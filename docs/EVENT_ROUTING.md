@@ -29,7 +29,11 @@ The daemon and price clients are built with a `SignerAuthenticator` over the nod
 ### Messages lost while blind are not recovered
 `accept_event` rejects anything whose `created_at` is older than ten seconds. A message sent while the inbox was down is therefore already too old to be accepted by the time the subscription returns, and re-subscribing with `since` instead of `limit(0)` would not change that. Whoever sent it has to send it again.
 
-Because those messages are lost rather than delayed, order timeouts cannot be trusted while the inbox is down — a user who answered on time would look silent. `job_cancel_orders` therefore skips its tick entirely while `InboxHealth` reports blind (no slash, no refund, no republish), and once the inbox recovers, `find_order_by_seconds` widens the eligibility window by the time the node spent deaf (`InboxHealth::timeout_debt`), decaying second for second until repaid.
+Because those messages are lost rather than delayed, order timeouts cannot be trusted while the inbox is down — a user who answered on time would look silent. `job_cancel_orders` therefore skips its tick entirely unless an audit has confirmed the daemon is listening (`InboxHealth::is_confirmed_listening`): no slash, no refund, no republish. Startup counts as unconfirmed, since the daemon subscribes before the watchdog's first pass.
+
+Once the inbox recovers, each order is credited the downtime **it** waited through. `InboxHealth` keeps the wall-clock windows during which the node was deaf; `blind_seconds_since(taken_at)` intersects them with the order's own wait. An order already waiting when a relay went quiet is owed all of that outage; one taken after it ended is owed nothing. The query widens its window by `max_blind_seconds` so no eligible order is missed, and the exact per-order figure decides.
+
+The credit has to be per order rather than one global allowance: a single figure either under-credits an order that waited through the whole outage or hands the same credit to one taken long afterwards.
 
 ## Dispatch
 - Router: `src/app.rs:handle_message_action`
@@ -96,11 +100,12 @@ sequenceDiagram
   end
 
   loop every 60s
-    Timeouts->>Health: is_blind / timeout_debt
-    alt blind
+    Timeouts->>Health: is_confirmed_listening?
+    alt not confirmed
       Timeouts->>Timeouts: skip the tick
-    else listening
-      Timeouts->>Timeouts: run, deadlines widened by the debt
+    else confirmed
+      Timeouts->>Health: blind_seconds_since(taken_at) per order
+      Timeouts->>Timeouts: run, each order credited its own downtime
     end
   end
 ```

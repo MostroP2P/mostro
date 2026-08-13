@@ -5,8 +5,11 @@ use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
-use crate::nip33::{new_order_event, order_to_tags};
-use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
+use crate::nip33::{new_order_event_with_created_at, order_to_tags};
+use crate::util::{
+    enqueue_order_msg, get_order, mark_orderbook_publish_failed, monotonic_order_event_timestamp,
+    settle_seller_hold_invoice, update_order_event,
+};
 use crate::Result;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
@@ -267,7 +270,8 @@ pub async fn release_action(
         Ok((Some(child_order), Some(event))) => {
             let client = ctx.nostr_client();
             if client.send_event(&event).await.is_err() {
-                tracing::warn!("Failed sending child order event for order id: {}. This may affect order synchronization", child_order.id)
+                tracing::warn!("Failed sending child order event for order id: {}; queued for republish by the orderbook reconciler", child_order.id);
+                mark_orderbook_publish_failed(child_order.id);
             }
             handle_child_order(child_order, &order, next_trade, ctx.pool(), request_id)
                 .await
@@ -793,9 +797,12 @@ async fn create_order_event(
         Err(_) => order_to_tags(new_order, Some((0.0, 0, 0)), Some(&mostro_pubkey))?,
     };
 
-    // Prepare new child order event for sending (kind 38383 for orders)
+    // Prepare new child order event for sending (kind 38383 for orders).
+    // Stamp it through the monotonic registry so a same-second follow-up
+    // revision of the child order cannot tie on `created_at`.
     let event = if let Some(tags) = tags {
-        new_order_event(my_keys, "", new_order.id.to_string(), tags)
+        let created_at = monotonic_order_event_timestamp(new_order.id, Timestamp::now());
+        new_order_event_with_created_at(my_keys, "", new_order.id.to_string(), tags, created_at)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(

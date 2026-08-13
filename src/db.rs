@@ -675,6 +675,34 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// All orders currently advertised (or advertisable) as `pending` on the
+/// book. Includes `waiting-taker-bond`, which publishes as `pending` on the
+/// wire (Phase 1.5), and excludes `waiting-maker-bond`, which was never
+/// published. Used by the orderbook reconciler to re-assert the book on
+/// relays; only orders whose take window is still open are returned — an
+/// expired row is the expiry job's business, not the reconciler's. Legacy
+/// rows with `expires_at = 0` have no take-window TTL (mirroring
+/// `is_order_take_window_closed`) and stay re-assertable.
+pub async fn find_pending_orders_for_reconcile(
+    pool: &SqlitePool,
+) -> Result<Vec<Order>, MostroError> {
+    let now = Timestamp::now();
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE (expires_at >= ?1 OR expires_at = 0)
+            AND status IN ('pending', 'waiting-taker-bond')
+        "#,
+    )
+    .bind(now.as_secs() as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
@@ -1869,6 +1897,61 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Insert a minimal order row with an explicit status and expiry, for
+    /// the reconciler full-sweep query.
+    async fn insert_book_order(pool: &SqlitePool, status: &str, expires_at: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at)
+            VALUES (?1, 'sell', 'event123', ?2, 0, 'bank',
+                    100000, 'USD', 100, 1700000000, ?3)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(status)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The full sweep re-asserts only live pending orders: expired rows are
+    /// the expiry job's business and post-trade rows are not book entries.
+    /// Legacy rows with `expires_at = 0` have no take-window TTL and must
+    /// stay re-assertable (mirroring `is_order_take_window_closed`).
+    #[tokio::test]
+    async fn find_pending_orders_for_reconcile_lists_only_live_pending_orders() {
+        let pool = setup_orders_db().await.unwrap();
+        let now = nostr_sdk::prelude::Timestamp::now().as_secs() as i64;
+
+        for (status, expires_at) in [
+            ("pending", now + 3_600),          // live → listed
+            ("waiting-taker-bond", now + 600), // publishes as pending → listed
+            ("pending", 0),                    // legacy, no TTL → listed
+            ("pending", now - 60),             // expired → expiry job's business
+            ("active", now + 3_600),           // post-trade → not a book entry
+            ("waiting-maker-bond", now + 600), // never published → skipped
+        ] {
+            insert_book_order(&pool, status, expires_at).await;
+        }
+
+        let listed = super::find_pending_orders_for_reconcile(&pool)
+            .await
+            .unwrap();
+        let statuses: Vec<String> = listed.iter().map(|o| o.status.clone()).collect();
+
+        assert_eq!(
+            listed.len(),
+            3,
+            "live pending-published rows plus legacy no-TTL: {statuses:?}"
+        );
+        assert!(statuses.contains(&"waiting-taker-bond".to_string()));
+        assert!(listed
+            .iter()
+            .any(|o| o.status == "pending" && o.expires_at == 0));
     }
 
     async fn setup_disputes_table(pool: &SqlitePool) {

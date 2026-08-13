@@ -412,6 +412,23 @@ fn create_source_tag(
 /// * `mostro_pubkey` - Optional Mostro pubkey override. If None, derived from get_keys().
 ///   Pass Some() in tests to avoid global state dependencies.
 ///
+/// NIP-40 `expiration` for an order's kind-38383 event.
+///
+/// Events published as `pending` self-destruct at the order's real
+/// `expires_at` (the take-window TTL, typically ~24 h): if a terminal
+/// revision is ever lost (dropped publish, relay outage), relays delete the
+/// stale `pending` state at the order's actual deadline instead of
+/// advertising phantom liquidity for the full retention window (default
+/// 30 days). Terminal / in-progress revisions keep the configured retention
+/// so trade history remains queryable.
+fn nip40_expiration_for_order(order: &Order, published_status: Status) -> i64 {
+    if published_status == Status::Pending && order.expires_at > 0 {
+        return order.expires_at;
+    }
+    get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
+        .expect("expiration is always defined for order events")
+}
+
 pub fn order_to_tags(
     order: &Order,
     reputation_data: Option<(f64, i64, i64)>,
@@ -456,9 +473,7 @@ pub fn order_to_tags(
             Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
                 "expiration",
-                vec![get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
-                    .expect("expiration is always defined for order events")
-                    .to_string()],
+                vec![nip40_expiration_for_order(order, status).to_string()],
             ),
             Tag::custom(
                 "y",
@@ -759,6 +774,81 @@ mod tests {
         assert_eq!(
             create_platform_tag_values(Some("   \t  ")),
             vec!["mostro".to_string()]
+        );
+    }
+
+    // ── NIP-40 expiration: ghost-order TTL ───────────────────────────────────
+    // (uses the shared `get_tag_value` helper defined further below)
+
+    /// A `pending` event must self-destruct at the order's real take-window
+    /// TTL (`expires_at`), not the 30-day retention window: if a terminal
+    /// revision is ever lost, relays delete the stale `pending` state at the
+    /// order's actual deadline instead of advertising phantom liquidity for
+    /// a month.
+    #[test]
+    fn pending_event_nip40_expiration_matches_order_expires_at() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.expires_at = 1_900_000_000;
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let expiration = get_tag_value(&tags, "expiration").expect("expiration tag present");
+        assert_eq!(
+            expiration, "1900000000",
+            "pending events must expire at the order's real expires_at"
+        );
+    }
+
+    /// Terminal revisions keep the configured retention window so trade
+    /// history stays queryable — only the `pending` face of the order gets
+    /// the short TTL.
+    #[test]
+    fn canceled_event_nip40_expiration_keeps_configured_retention() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::Canceled.to_string();
+        order.expires_at = 1_900_000_000;
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("canceled order must produce Some(tags)");
+
+        let expiration: i64 = get_tag_value(&tags, "expiration")
+            .expect("expiration tag present")
+            .parse()
+            .expect("expiration must be a unix timestamp");
+        let now = Timestamp::now().as_secs() as i64;
+        assert!(
+            expiration > now,
+            "terminal events keep a future retention-based expiration"
+        );
+        assert_ne!(
+            expiration, order.expires_at,
+            "terminal events do not inherit the take-window TTL"
+        );
+    }
+
+    /// Legacy rows without `expires_at` fall back to the configured
+    /// retention window instead of emitting an instantly-expired event.
+    #[test]
+    fn pending_event_without_expires_at_falls_back_to_retention() {
+        init_test_settings();
+        let order = make_pending_order(); // Default: expires_at = 0
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let expiration: i64 = get_tag_value(&tags, "expiration")
+            .expect("expiration tag present")
+            .parse()
+            .expect("expiration must be a unix timestamp");
+        assert!(
+            expiration > Timestamp::now().as_secs() as i64,
+            "zero expires_at must not produce an already-expired event"
         );
     }
 

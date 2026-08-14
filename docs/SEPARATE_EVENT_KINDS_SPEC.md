@@ -347,11 +347,16 @@ client.send_event(&new_event).await?;
     ["d", "660e8400-e29b-41d4-a716-446655440001"],
     ["s", "pending"],
     ["initiator", "buyer"],
+    ["created_at", "1700000100"],
     ["y", "mostro"],
     ["z", "dispute"]
   ]
 }
 ```
+
+The `created_at` tag is the dispute open time from SQLite (`disputes.created_at`).
+It is independent of the Nostr event's `created_at` field, which remains the
+wall-clock time of the latest NIP-33 publish/replace.
 
 ## Client Query Examples
 

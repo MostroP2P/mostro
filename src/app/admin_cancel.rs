@@ -7,7 +7,7 @@ use crate::db::{
     is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
-use crate::nip33::{create_platform_tag_values, new_dispute_event};
+use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -134,22 +134,19 @@ pub async fn admin_cancel_action(
 
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
+        let opened_at = d.created_at;
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded.to_string();
         d.update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         // We create a tag to show status of the dispute
-        let tags: Tags = Tags::from_list(vec![
-            Tag::custom("s", vec![DisputeStatus::SellerRefunded.to_string()]),
-            // Who is the dispute creator
-            Tag::custom("initiator", vec![dispute_initiator]),
-            Tag::custom(
-                "y",
-                create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
-            ),
-            Tag::custom("z", vec!["dispute".to_string()]),
-        ]);
+        let tags = create_dispute_event_tags(
+            DisputeStatus::SellerRefunded.to_string(),
+            dispute_initiator,
+            opened_at,
+            ctx.settings().mostro.name.as_deref(),
+        );
         // nip33 kind with dispute id as identifier (kind 38386 for disputes)
         let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

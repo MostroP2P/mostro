@@ -90,6 +90,7 @@ tonic-prost = "0.14.1"
 cdk = { version = "0.17.2", default-features = false, features = ["wallet"] }
 secp256k1 = { version = "0.30", features = ["serde"] }
 secrecy = { version = "0.10", features = ["serde"] }
+subtle = "2.6"
 zeroize = "1.8"
 
 [dev-dependencies]

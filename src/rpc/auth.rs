@@ -14,12 +14,16 @@
 
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 use tracing::warn;
 
 const AUTHORIZATION_HEADER: &str = "authorization";
-const BEARER_PREFIX: &str = "Bearer ";
+/// RFC 7235 defines the auth-scheme as case-insensitive, and proxies do
+/// normalize it, so the scheme is matched without regard to case. The
+/// credential that follows is still compared byte for byte.
+const BEARER_SCHEME: &str = "Bearer";
 
 /// Rejects any request that does not carry the configured bearer token.
 #[derive(Clone)]
@@ -41,15 +45,15 @@ impl Interceptor for BearerAuth {
             .metadata()
             .get(AUTHORIZATION_HEADER)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix(BEARER_PREFIX));
+            .and_then(|value| {
+                let (scheme, credential) = value.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case(BEARER_SCHEME)
+                    .then_some(credential)
+            });
 
         match presented {
-            Some(candidate)
-                if constant_time_eq(
-                    candidate.as_bytes(),
-                    self.token.expose_secret().as_bytes(),
-                ) =>
-            {
+            Some(candidate) if credentials_match(candidate, self.token.expose_secret()) => {
                 Ok(request)
             }
             // One message for every failure mode: a caller learns whether the
@@ -65,19 +69,20 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// Compare two byte strings without leaking how far they matched.
+/// Compare the presented credential against the configured one without leaking
+/// how far the two matched.
 ///
-/// Length is not a secret here (the token length is fixed by the operator's
-/// config), but the contents are, so the loop always runs to the end.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (left, right) in a.iter().zip(b.iter()) {
-        difference |= left ^ right;
-    }
-    difference == 0
+/// `subtle` is used rather than a hand-written loop because only its
+/// optimization barrier makes the constant-time property a guarantee the
+/// compiler must honour. `ct_eq` on slices already answers `false` for
+/// mismatched lengths, and the token's length is set by the operator's config
+/// rather than being itself a secret.
+fn credentials_match(presented: &str, configured: &str) -> bool {
+    presented
+        .as_bytes()
+        .ct_eq(configured.as_bytes())
+        .unwrap_u8()
+        == 1
 }
 
 #[cfg(test)]
@@ -104,6 +109,24 @@ mod tests {
     fn accepts_the_configured_token() {
         let result = interceptor().call(request_with_authorization(&format!("Bearer {TOKEN}")));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn accepts_any_casing_of_the_bearer_scheme() {
+        // RFC 7235: the auth-scheme is case-insensitive, and proxies rewrite it.
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let result =
+                interceptor().call(request_with_authorization(&format!("{scheme} {TOKEN}")));
+            assert!(result.is_ok(), "{scheme} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_another_scheme_carrying_the_right_token() {
+        let status = interceptor()
+            .call(request_with_authorization(&format!("Basic {TOKEN}")))
+            .expect_err("only the Bearer scheme is accepted");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
@@ -147,10 +170,13 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_matches_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
+    fn credentials_match_only_on_exact_equality() {
+        assert!(credentials_match("abc", "abc"));
+        assert!(!credentials_match("abc", "abd"));
+        assert!(!credentials_match("abc", "ab"));
+        assert!(!credentials_match("ab", "abc"));
+        // The credential itself stays case-sensitive even though the scheme
+        // is not.
+        assert!(!credentials_match("ABC", "abc"));
     }
 }

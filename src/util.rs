@@ -1424,6 +1424,15 @@ pub async fn show_hold_invoice(
     order.preimage = Some(bytes_to_string(&preimage));
     order.hash = Some(bytes_to_string(&hash));
     order.status = Status::WaitingPayment.to_string();
+    // `taken_at` anchors the waiting-state timeout clock
+    // (`find_order_by_seconds`), and the blame in
+    // `slash_or_release_on_timeout` falls on whoever holds the current
+    // waiting duty. Entering `waiting-payment` starts the *seller's* duty,
+    // so the clock must restart here: keeping the take-time value would let
+    // a buyer who stalled through `waiting-buyer-invoice` eat the seller's
+    // window and get the maker's bond wrongly slashed. The CAS below
+    // persists this same struct, so the fresh anchor rides the same write.
+    order.set_timestamp_now();
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
 

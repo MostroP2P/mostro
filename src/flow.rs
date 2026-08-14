@@ -27,7 +27,7 @@ pub async fn hold_invoice_paid(
     pool: &SqlitePool,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    let order = crate::db::find_order_by_hash(pool, hash)
+    let mut order = crate::db::find_order_by_hash(pool, hash)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -135,6 +135,15 @@ pub async fn hold_invoice_paid(
         order_data.status = Some(status);
         order_data.buyer_trade_pubkey = None;
         order_data.seller_trade_pubkey = None;
+        // Entering `waiting-buyer-invoice` starts the *buyer's* waiting
+        // duty, and `taken_at` anchors the timeout clock that
+        // `find_order_by_seconds` / `slash_or_release_on_timeout` blame by
+        // current duty. Restart it here so a seller who stalled through
+        // `waiting-payment` can't eat the buyer's window and get the
+        // buyer's bond wrongly slashed (buy-order mirror of the
+        // `show_hold_invoice` re-anchor). Persisted by the
+        // `updated_order.update` below.
+        order.set_timestamp_now();
         // We ask to buyer for a new invoice
         enqueue_order_msg(
             request_id,
@@ -411,6 +420,53 @@ mod tests {
         let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
         assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
         assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_reanchors_taken_at_for_buyer_duty() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "dd".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+        // A counterparty that stalled through its own waiting duty: the
+        // take-time anchor is already past any timeout window when the hold
+        // invoice settles. If this stale value survived the transition, the
+        // scheduler would immediately deem the buyer's brand-new duty
+        // expired and slash their bond.
+        let stale_taken_at = Timestamp::now().as_secs() as i64 - 10_000;
+        sqlx::query("UPDATE orders SET taken_at = ?1 WHERE id = ?2")
+            .bind(stale_taken_at)
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "add-invoice path must succeed: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert!(
+            updated.taken_at > stale_taken_at,
+            "entering waiting-buyer-invoice must restart the per-duty timeout clock, got {}",
+            updated.taken_at
+        );
+        assert!(
+            updated.taken_at >= Timestamp::now().as_secs() as i64 - 60,
+            "re-anchored taken_at must be current, got {}",
+            updated.taken_at
+        );
     }
 
     #[tokio::test]

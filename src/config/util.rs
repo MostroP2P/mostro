@@ -138,6 +138,17 @@ fn validate_rpc_settings(
                  high-entropy token, e.g. `openssl rand -base64 32`."
             ))));
         }
+        // The token travels verbatim inside an HTTP/2 `authorization` header.
+        // Anything outside printable ASCII cannot be carried there, so a daemon
+        // that accepted it would boot and then refuse every client — a failure
+        // that looks like a broken build rather than a typo in the token.
+        Some(token) if !token.expose_secret().chars().all(|c| c.is_ascii_graphic()) => {
+            return Err(MostroInternalErr(ServiceError::IOError(format!(
+                "{RPC_TOKEN_ENV_VAR} must contain only printable ASCII characters and no spaces: \
+                 it is sent as an HTTP header, so any other value can never authenticate a \
+                 client. `openssl rand -base64 32` produces a valid token."
+            ))));
+        }
         Some(_) => {}
     }
 
@@ -167,11 +178,29 @@ fn validate_rpc_settings(
         }
         (Some(cert), Some(key)) => {
             for (field, path) in [("tls_cert_path", cert), ("tls_key_path", key)] {
-                fs::metadata(path).map_err(|e| {
+                // Open rather than stat: `fs::metadata` succeeds for a file the
+                // daemon has no permission to read. Opening is still not
+                // enough on its own — on Linux a directory opens fine and only
+                // fails on read — so the file type is checked through the
+                // handle, which is the capability `RpcServer::start` needs.
+                let opened = fs::File::open(path).map_err(|e| {
                     MostroInternalErr(ServiceError::IOError(format!(
                         "[rpc].{field} ({path:?}) is not readable: {e}"
                     )))
                 })?;
+                let is_regular_file = opened
+                    .metadata()
+                    .map(|metadata| metadata.is_file())
+                    .map_err(|e| {
+                        MostroInternalErr(ServiceError::IOError(format!(
+                            "[rpc].{field} ({path:?}) could not be inspected: {e}"
+                        )))
+                    })?;
+                if !is_regular_file {
+                    return Err(MostroInternalErr(ServiceError::IOError(format!(
+                        "[rpc].{field} ({path:?}) is not a regular file"
+                    ))));
+                }
             }
         }
         (None, None) => {
@@ -658,6 +687,37 @@ mod rpc_validation_tests {
     #[test]
     fn enabled_rpc_on_loopback_with_a_token_is_accepted() {
         assert!(validate_rpc_settings(&enabled_rpc(), Some(&valid_token())).is_ok());
+    }
+
+    #[test]
+    fn a_token_that_cannot_travel_in_a_header_is_rejected() {
+        // Long enough to clear the length gate, but unusable as an HTTP header
+        // value: accepting it would boot a daemon that refuses every client.
+        for unusable in ["é".repeat(MIN_RPC_TOKEN_LEN), "a".repeat(31) + " b"] {
+            let token = SecretString::from(unusable.clone());
+            let err = validate_rpc_settings(&enabled_rpc(), Some(&token))
+                .expect_err("a token that cannot be sent must not boot");
+            assert!(
+                err.to_string().contains("printable ASCII"),
+                "{unusable:?} should have been refused as unsendable, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_is_not_accepted_as_tls_material() {
+        // Both `fs::metadata` and `File::open` succeed on a directory, so only
+        // the file-type check rejects this.
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let rpc = RpcSettings {
+            tls_cert_path: Some(dir.to_string_lossy().into_owned()),
+            tls_key_path: Some(temp_pem("dir-case-key")),
+            ..enabled_rpc()
+        };
+        let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+            .expect_err("a directory is not a certificate");
+        assert!(err.to_string().contains("not a regular file"));
     }
 
     #[test]

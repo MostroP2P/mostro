@@ -886,7 +886,7 @@ pub async fn cas_promote_taker_context(
     };
     let query = format!(
         "UPDATE orders SET {taker_columns}, fiat_amount = ?6, amount = ?7, fee = ?8, \
-         dev_fee = ?9, created_at = ?10 \
+         dev_fee = ?9, created_at = ?10, taken_at = ?11 \
          WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
     );
     // The unused ?5 slot for buy orders binds a throwaway `None`.
@@ -917,6 +917,7 @@ pub async fn cas_promote_taker_context(
         .bind(order.fee)
         .bind(order.dev_fee)
         .bind(order.created_at)
+        .bind(order.taken_at)
         .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -926,8 +927,10 @@ pub async fn cas_promote_taker_context(
 
 /// Compare-and-swap the full take-context transition: everything the take
 /// handlers mutate on their in-memory row before persisting — taker
-/// context, computed amounts, trade escrow material (when the hold
-/// invoice was created) and the status/event pair — in one guarded write.
+/// context, computed amounts, the take timestamp (`taken_at`, which the
+/// scheduler's timeout-cancel query keys on), trade escrow material (when
+/// the hold invoice was created) and the status/event pair — in one
+/// guarded write.
 ///
 /// The `WHERE` guard always covers the pre-trade statuses
 /// (`pending` / `waiting-taker-bond`). `allow_waiting_buyer_invoice`
@@ -957,7 +960,7 @@ pub async fn cas_complete_pretrade_take(
          master_buyer_pubkey = ?6, master_seller_pubkey = ?7, \
          trade_index_buyer = ?8, trade_index_seller = ?9, \
          fiat_amount = ?10, amount = ?11, fee = ?12, dev_fee = ?13, created_at = ?14, \
-         buyer_invoice = ?15, preimage = ?16, hash = ?17 \
+         buyer_invoice = ?15, preimage = ?16, hash = ?17, taken_at = ?18 \
          WHERE id = ?1 AND status IN ({PRETRADE_STATUSES}{extra_status})"
     );
     let result = sqlx::query(AssertSqlSafe(query.as_str()))
@@ -978,6 +981,7 @@ pub async fn cas_complete_pretrade_take(
         .bind(order.buyer_invoice.as_deref())
         .bind(order.preimage.as_deref())
         .bind(order.hash.as_deref())
+        .bind(order.taken_at)
         .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -2546,7 +2550,10 @@ mod tests {
         ] {
             let mut order = insert_pretrade_order(&pool, from).await;
             // What the take handlers mutate in memory before persisting:
-            // the transition, the taker context, and the computed amounts.
+            // the transition, the taker context, the computed amounts and
+            // the take timestamp (`set_timestamp_now()` — the scheduler's
+            // timeout-cancel query keys on it, so dropping it from the
+            // write cancels every take on the next tick).
             order.status = super::Status::WaitingPayment.to_string();
             order.event_id = "ev-escrow".to_string();
             order.buyer_pubkey = Some("bb".repeat(32));
@@ -2554,6 +2561,7 @@ mod tests {
             order.trade_index_buyer = Some(3);
             order.amount = 200_000;
             order.dev_fee = 5;
+            order.taken_at = 1_700_000_500;
             // The helper writes `hash`/`preimage` from the caller's
             // snapshot: use values that differ from the inserted row's, so
             // the assertions prove whose values landed.
@@ -2576,7 +2584,44 @@ mod tests {
             assert_eq!(after.dev_fee, 5);
             assert_eq!(after.hash, Some("ee".repeat(32)));
             assert_eq!(after.preimage, Some("ff".repeat(32)));
+            assert_eq!(after.taken_at, 1_700_000_500);
         }
+    }
+
+    #[tokio::test]
+    async fn cas_promote_taker_context_persists_taker_context_and_take_time() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "pending").await;
+        // What promote_taker_context_to_order mutates in memory before
+        // persisting (sell order → taker is the buyer side).
+        order.buyer_pubkey = Some("bb".repeat(32));
+        order.master_buyer_pubkey = Some("99".repeat(32));
+        order.trade_index_buyer = Some(4);
+        order.buyer_invoice = Some("lnbc1-taker".to_string());
+        order.fiat_amount = 250;
+        order.amount = 300_000;
+        order.fee = 900;
+        order.dev_fee = 9;
+        order.taken_at = 1_700_000_500;
+
+        let won = super::cas_promote_taker_context(&pool, &order)
+            .await
+            .unwrap();
+        assert!(won, "pending orders accept the promotion");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.master_buyer_pubkey, Some("99".repeat(32)));
+        assert_eq!(after.trade_index_buyer, Some(4));
+        assert_eq!(after.buyer_invoice, Some("lnbc1-taker".to_string()));
+        assert_eq!(after.fiat_amount, 250);
+        assert_eq!(after.amount, 300_000);
+        assert_eq!(after.fee, 900);
+        assert_eq!(after.dev_fee, 9);
+        assert_eq!(after.taken_at, 1_700_000_500);
+        // The promotion never writes status — the resume owns that flip.
+        assert_eq!(after.status, "pending");
     }
 
     #[tokio::test]
@@ -4555,6 +4600,52 @@ mod migration_and_query_tests {
         let stale = find_order_by_seconds(&pool).await.unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].id, stale_id);
+    }
+
+    /// Regression: the pre-trade take CAS must persist `taken_at`, or a
+    /// freshly taken order looks expired to the scheduler (`taken_at = 0`
+    /// is always older than `now - expiration_seconds`) and gets its hold
+    /// invoice canceled on the very next timeout tick.
+    #[tokio::test]
+    async fn freshly_taken_order_is_not_scheduler_timeout_eligible() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+
+        // A maker's pending order: `taken_at` still at the schema default 0.
+        let id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            id,
+            "sell",
+            "pending",
+            None,
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            0,
+        )
+        .await;
+
+        // The take transition exactly as the handlers drive it: mutate the
+        // in-memory row (including `set_timestamp_now()`) and persist via
+        // the wide CAS.
+        use mostro_core::db::Crud;
+        let mut order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        order.status = Status::WaitingPayment.to_string();
+        order.event_id = "ev-take".to_string();
+        order.buyer_pubkey = Some(HEX_KEY_A.to_string());
+        order.set_timestamp_now();
+        let won = cas_complete_pretrade_take(&pool, &order, false)
+            .await
+            .unwrap();
+        assert!(won, "pending order accepts the take");
+
+        let after = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert!(after.taken_at > 0, "take must persist taken_at");
+        let stale = find_order_by_seconds(&pool).await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "a just-taken order must not be timeout-cancel eligible"
+        );
     }
 
     #[tokio::test]

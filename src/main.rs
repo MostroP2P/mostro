@@ -274,9 +274,18 @@ async fn main() -> Result<()> {
         let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
 
         tokio::spawn(async move {
+            // `[rpc].enabled = true` is an explicit request for the admin API,
+            // and every other misconfiguration in that block is startup-fatal
+            // (see `config::util::validate_rpc_settings`). Surviving a failed
+            // listener would leave the operator believing an interface is up
+            // that nothing is serving — including when TLS material is
+            // unreadable or malformed, which only surfaces here.
             match rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
-                Ok(_) => tracing::info!("RPC server started successfully"),
-                Err(e) => tracing::error!("RPC server failed to start: {}", e),
+                Ok(_) => tracing::warn!("RPC server stopped"),
+                Err(e) => {
+                    tracing::error!("RPC server failed to start: {}", e);
+                    exit(1);
+                }
             }
         });
     }

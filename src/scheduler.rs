@@ -308,8 +308,11 @@ pub(crate) async fn notify_users_canceled_order(
         }
     };
 
+    // Neutral wording on purpose: this helper serves several closure paths
+    // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
+    // specific cause is logged by each caller, not here.
     tracing::info!(
-        "Notifying maker {} that taker {} canceled the order {}",
+        "Notifying maker {} and taker {} that order {} was not completed",
         maker_pubkey.to_string(),
         taker_pubkey.to_string(),
         old_order.id
@@ -445,7 +448,17 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 );
                                 continue;
                             }
-                            info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
+                            // A hash exists in both waiting states, but they
+                            // mean different things: in `waiting-payment` the
+                            // hold invoice was never paid (canceling voids
+                            // it), while in `waiting-buyer-invoice` the
+                            // seller already paid it and gets their funds
+                            // back.
+                            if order.status == Status::WaitingPayment.to_string() {
+                                info!("Order Id {}: Hold invoice canceled - seller did not pay it in time", &order.id);
+                            } else {
+                                info!("Order Id {}: Funds returned to seller - buyer did not send their invoice in time", &order.id);
+                            }
                         };
                         let mut order = order.clone();
                         // dev_fee should be reset unconditionally
@@ -547,9 +560,14 @@ async fn job_cancel_orders(ctx: AppContext) {
                                     )
                                     .await;
                                     info!(
-                                "Republishing order Id {}, not received regular invoice in time",
-                                order.id
-                            );
+                                        "Republishing order Id {}, {}",
+                                        order.id,
+                                        if order_status == Status::WaitingPayment {
+                                            "taker (seller) did not pay the hold invoice in time"
+                                        } else {
+                                            "taker (buyer) did not send their invoice in time"
+                                        }
+                                    );
                                     (
                                         Some(Action::NewOrder),
                                         Status::Pending,
@@ -560,9 +578,14 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 | (Status::WaitingPayment, Kind::Sell) => {
                                     // Update order status
                                     info!(
-                                    "Canceled order Id {}, not received regular invoice in time",
-                                    order.id
-                                );
+                                        "Canceled order Id {}, {}",
+                                        order.id,
+                                        if order_status == Status::WaitingPayment {
+                                            "maker (seller) did not pay the hold invoice in time"
+                                        } else {
+                                            "maker (buyer) did not send their invoice in time"
+                                        }
+                                    );
                                     (
                                         Some(Action::Canceled),
                                         Status::Canceled,

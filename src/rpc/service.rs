@@ -62,11 +62,14 @@ impl AdminServiceImpl {
         );
 
         // Admin RPC flows synthesize the inbound event with the node's own
-        // pubkey in both `identity` and `sender` slots. Authorization is then
-        // enforced downstream: the caller must be the assigned solver
-        // (`is_assigned_solver`), with `ensure_dispute_finalize_permission`
-        // bypassing solver category checks for the daemon key (same as
-        // `admin_take_dispute`). gRPC transport authenticates the operator.
+        // pubkey in both `identity` and `sender` slots, so every downstream
+        // check sees the daemon itself: `ensure_dispute_finalize_permission`
+        // waives the solver-category check for the daemon key (same as
+        // `admin_take_dispute`), and `admin_add_solver_action` accepts it
+        // outright. In other words the handlers below apply *no* caller
+        // authorization of their own — the bearer-token interceptor in
+        // `crate::rpc::auth` is the only thing standing between the network
+        // and these actions.
         let event = UnwrappedMessage {
             message: msg.clone(),
             signature: None,

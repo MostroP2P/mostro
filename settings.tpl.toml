@@ -126,7 +126,13 @@ fee_audit_days = 365
 dm_days = 30
 
 [rpc]
-# Enable RPC server for direct admin communication
+# Enable RPC server for direct admin communication.
+#
+# The admin RPC settles disputes, cancels orders and grants solver rights, and
+# every call runs with the daemon's own privileges. Enabling it REQUIRES the
+# MOSTRO_RPC_TOKEN environment variable (set it in the environment or in
+# <settings_dir>/.env, never here); the daemon refuses to start otherwise.
+# Generate one with: openssl rand -base64 32
 enabled = false
 # RPC server listen address
 listen_address = "127.0.0.1"
@@ -134,6 +140,15 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+# Acknowledge binding to a non-loopback address. The daemon refuses to start on
+# a routable address unless this is true, so the admin API is never published to
+# a LAN by accident.
+# allow_remote = false
+# Serve the admin RPC over TLS. Both paths are required together; without them
+# the bearer token crosses the network in cleartext, so configure them (or a
+# TLS-terminating reverse proxy) whenever allow_remote is true.
+# tls_cert_path = "/etc/mostro/rpc-cert.pem"
+# tls_key_path = "/etc/mostro/rpc-key.pem"
 
 # Multi-source price providers (see docs/PRICE_PROVIDERS.md).
 # Absent section ≡ legacy single-source behaviour synthesised from

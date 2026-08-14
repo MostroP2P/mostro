@@ -4,8 +4,9 @@ Admin capabilities and dispute resolution paths.
 
 ## RPC Server
 - Source: `src/rpc/server.rs`
-- Enable: `settings.toml` → `[rpc] enabled = true`
+- Enable: `settings.toml` → `[rpc] enabled = true`, plus a `MOSTRO_RPC_TOKEN` bearer token in the environment (startup is fatal without it).
 - Binds `listen_address:port`; injects Keys, `Arc<Pool<Sqlite>>`, `Arc<Mutex<LndConnector>>`.
+- Auth: `src/rpc/auth.rs` intercepts every method and rejects any request without the token. This is the *only* caller authorization on the RPC path — the handlers run as the daemon identity, which every downstream check treats as fully privileged.
 - Uses `tonic`; see `docs/RPC.md` and `proto/admin.proto`.
 
 ## Dispute Lifecycle
@@ -41,7 +42,7 @@ sequenceDiagram
 ```
 
 ## Audit and Safety
-- Require admin authentication/authorization at message level.
+- Nostr admin messages are authorized at message level; the gRPC path is authorized at the transport instead (bearer token), because its synthesized events always carry the daemon identity.
 - Enforce solver permission levels in the daemon: `read` solvers can assist but cannot execute `admin-settle` or `admin-cancel`.
 - Record solver, timestamps, and decisions in DB for traceability.
 - Avoid leaking sensitive data in logs; scrub invoices and keys.

@@ -144,10 +144,16 @@ service AdminService {
 ## Authentication
 
 Every method, `GetVersion` included, requires an `authorization: Bearer <token>`
-header carrying the value of `MOSTRO_RPC_TOKEN`. A missing, malformed or
-incorrect token is answered with `UNAUTHENTICATED` before the handler runs, and
-the token is compared in constant time so a caller learns nothing from how long
-the rejection took.
+header carrying the value of `MOSTRO_RPC_TOKEN`. The scheme is matched
+case-insensitively per RFC 7235; the token itself must match exactly. A missing,
+malformed or incorrect token is answered with `UNAUTHENTICATED` before the
+handler runs, and the token comparison itself is constant-time
+(`fn credentials_match` in `src/rpc/auth.rs`), so it does not leak how many
+bytes matched. Total request latency is not claimed to be constant: header
+parsing, logging and transport all contribute to it.
+
+The token must be printable ASCII with no spaces, since it is sent verbatim as
+an HTTP header. The daemon rejects anything else at startup.
 
 ```bash
 grpcurl -plaintext \
@@ -155,6 +161,11 @@ grpcurl -plaintext \
   -d '{"order_id": "550e8400-e29b-41d4-a716-446655440000"}' \
   localhost:50051 mostro.admin.v1.AdminService/CancelOrder
 ```
+
+> **Shared hosts:** the shell expands `$MOSTRO_RPC_TOKEN` into `grpcurl`'s
+> arguments, where any local user can read it with `ps`. On a host with other
+> users, drive the API from the Rust client below instead, which keeps the token
+> in the process environment.
 
 ## Client Implementation Example
 
@@ -202,10 +213,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Treat reaching this port as equivalent to holding the Mostro operator key.
 
 Every RPC is executed under the daemon's own Nostr identity, and the daemon
-identity is fully privileged downstream: `ensure_dispute_finalize_permission`
-waives its solver-category check for that key, and `admin_add_solver_action`
-accepts it outright. The handlers apply no caller authorization of their own, so
-the bearer token is the only thing between the network and a settled dispute.
+identity is fully privileged downstream: `fn ensure_dispute_finalize_permission`
+in `src/db.rs` waives its solver-category check for that key, and
+`fn admin_add_solver_action` in `src/app/admin_add_solver.rs` accepts it
+outright. The handlers apply no caller authorization of their own, so the bearer
+token (`fn call` for `BearerAuth` in `src/rpc/auth.rs`) is the only thing between
+the network and a settled dispute.
 
 - **Never expose this port beyond loopback without TLS.** The daemon refuses to
   start on a non-loopback `listen_address` unless `allow_remote = true`, and

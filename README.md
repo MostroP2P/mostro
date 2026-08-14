@@ -801,6 +801,10 @@ grpcurl -plaintext -H "$AUTH" -d '{"order_id": "abc123"}' localhost:50051 mostro
 grpcurl -plaintext -H "$AUTH" -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
 ```
 
+The shell expands `$AUTH` into `grpcurl`'s arguments, so any local user can read
+the token with `ps`. On a host you do not have to yourself, use the Rust client
+in [docs/RPC.md](docs/RPC.md) instead, which keeps the token in the environment.
+
 ---
 
 ### Querying Audit Events

@@ -69,7 +69,7 @@ How the original issue’s ideas map to the codebase today:
 | Exponential backoff / lockout | Implemented inside **`RateLimiter`**; **not** triggered by **`ValidateDbPassword`** (no **`record_failure`**). |
 | Audit logging | **tracing** in service + limiter. |
 | Localhost-only | Default RPC bind **`127.0.0.1`**, and a non-loopback bind now requires an explicit **`allow_remote = true`** (see `settings.toml` / `docs/RPC.md`). |
-| Strong auth | Implemented in **`src/rpc/auth.rs`**: a **`MOSTRO_RPC_TOKEN`** bearer token, checked in constant time by a tonic interceptor on every method. The interceptor is deliberately **not** rate-limited — the token's entropy, not a counter, is what defeats guessing. |
+| Strong auth | Implemented by **`fn call`** for **`BearerAuth`** in **`src/rpc/auth.rs`**: a **`MOSTRO_RPC_TOKEN`** bearer token, compared in constant time (**`fn credentials_match`**, same file) on every method. The interceptor is deliberately **not** rate-limited — the token's entropy, not a counter, is what defeats guessing. |
 
 ## Testing
 

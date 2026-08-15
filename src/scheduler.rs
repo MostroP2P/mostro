@@ -308,8 +308,11 @@ pub(crate) async fn notify_users_canceled_order(
         }
     };
 
+    // Neutral wording on purpose: this helper serves several closure paths
+    // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
+    // specific cause is logged by each caller, not here.
     tracing::info!(
-        "Notifying maker {} that taker {} canceled the order {}",
+        "Notifying maker {} and taker {} that order {} was not completed",
         maker_pubkey.to_string(),
         taker_pubkey.to_string(),
         old_order.id
@@ -349,6 +352,48 @@ pub(crate) async fn notify_users_canceled_order(
     .await;
 }
 
+/// Re-read a timeout candidate and confirm it is *still* eligible before
+/// the scheduler acts on it.
+///
+/// `job_cancel_orders` selects its candidates once per tick
+/// (`find_order_by_seconds`) and then works through them sequentially with
+/// LND round-trips in between, so by the time an order is reached its
+/// snapshot can be arbitrarily stale. Acting on the snapshot is not
+/// harmless: the tick cancels the escrow hold invoice, assigns bond blame
+/// from the waiting status, and cancels/republishes the order — all of
+/// which would hit the wrong party or the wrong state if the order moved
+/// on in the meantime (a duty handoff re-anchored `taken_at` via
+/// `show_hold_invoice` / `hold_invoice_paid`, the trade activated, or a
+/// cancel landed).
+///
+/// Returns the fresh row only when it still holds a waiting status and its
+/// `taken_at` is still past the expiration window — the same predicate as
+/// `find_order_by_seconds`, evaluated on current data. Anything else
+/// (transitioned, re-anchored, missing, or a read error) returns `None`
+/// and the caller must skip; skipping never loses a genuine timeout
+/// because the next tick re-selects it.
+async fn reconfirm_timeout_eligibility(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    order_id: uuid::Uuid,
+    exp_seconds: u32,
+) -> Option<Order> {
+    let fresh = match Order::by_id(pool, order_id).await {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                "scheduler_timeout: could not re-read order {} to reconfirm eligibility ({e}); skipping so next tick retries",
+                order_id
+            );
+            return None;
+        }
+    };
+    let still_waiting = fresh.status == Status::WaitingBuyerInvoice.to_string()
+        || fresh.status == Status::WaitingPayment.to_string();
+    let still_expired = fresh.taken_at < Utc::now().timestamp() - exp_seconds as i64;
+    (still_waiting && still_expired).then_some(fresh)
+}
+
 async fn job_cancel_orders(ctx: AppContext) {
     info!("Create a pool to connect to db");
 
@@ -369,6 +414,16 @@ async fn job_cancel_orders(ctx: AppContext) {
 
             if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
                 for order in older_orders_list.into_iter() {
+                    // The tick-start snapshot may be stale by the time this
+                    // iteration is reached — re-read and re-confirm before
+                    // acting, so the hold-invoice cancel, the bond blame,
+                    // and the cancel/republish below all run against the
+                    // order's *current* duty rather than the snapshot's.
+                    let Some(order) =
+                        reconfirm_timeout_eligibility(pool, order.id, exp_seconds).await
+                    else {
+                        continue;
+                    };
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
                     if order.status == Status::WaitingBuyerInvoice.to_string()
@@ -393,7 +448,17 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 );
                                 continue;
                             }
-                            info!("Order Id {}: Funds returned to seller - buyer did not sent regular invoice in time", &order.id);
+                            // A hash exists in both waiting states, but they
+                            // mean different things: in `waiting-payment` the
+                            // hold invoice was never paid (canceling voids
+                            // it), while in `waiting-buyer-invoice` the
+                            // seller already paid it and gets their funds
+                            // back.
+                            if order.status == Status::WaitingPayment.to_string() {
+                                info!("Order Id {}: Hold invoice canceled - seller did not pay it in time", &order.id);
+                            } else {
+                                info!("Order Id {}: Funds returned to seller - buyer did not send their invoice in time", &order.id);
+                            }
                         };
                         let mut order = order.clone();
                         // dev_fee should be reset unconditionally
@@ -495,9 +560,14 @@ async fn job_cancel_orders(ctx: AppContext) {
                                     )
                                     .await;
                                     info!(
-                                "Republishing order Id {}, not received regular invoice in time",
-                                order.id
-                            );
+                                        "Republishing order Id {}, {}",
+                                        order.id,
+                                        if order_status == Status::WaitingPayment {
+                                            "taker (seller) did not pay the hold invoice in time"
+                                        } else {
+                                            "taker (buyer) did not send their invoice in time"
+                                        }
+                                    );
                                     (
                                         Some(Action::NewOrder),
                                         Status::Pending,
@@ -508,9 +578,14 @@ async fn job_cancel_orders(ctx: AppContext) {
                                 | (Status::WaitingPayment, Kind::Sell) => {
                                     // Update order status
                                     info!(
-                                    "Canceled order Id {}, not received regular invoice in time",
-                                    order.id
-                                );
+                                        "Canceled order Id {}, {}",
+                                        order.id,
+                                        if order_status == Status::WaitingPayment {
+                                            "maker (seller) did not pay the hold invoice in time"
+                                        } else {
+                                            "maker (buyer) did not send their invoice in time"
+                                        }
+                                    );
                                     (
                                         Some(Action::Canceled),
                                         Status::Canceled,
@@ -1392,6 +1467,104 @@ mod tests {
             .filter(|(msg, _)| msg.get_inner_message_kind().id == Some(order_id))
             .map(|(msg, _)| msg.get_inner_message_kind().action.clone())
             .collect()
+    }
+
+    // ── reconfirm_timeout_eligibility ────────────────────────────────────
+
+    /// A waiting order whose duty clock is genuinely past the window stays
+    /// eligible on the re-read: the guard must not swallow real timeouts.
+    #[tokio::test]
+    async fn reconfirm_timeout_eligibility_keeps_still_stale_waiting_order() {
+        let ctx = migrated_ctx().await;
+        let pool = ctx.pool();
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.taken_at = Utc::now().timestamp() - 10_000;
+        let stored = order.create(pool).await.unwrap();
+
+        let fresh = reconfirm_timeout_eligibility(pool, stored.id, 900).await;
+        assert!(
+            fresh.is_some(),
+            "a genuinely expired waiting order must stay eligible"
+        );
+    }
+
+    /// The wrongful-slash race: the tick snapshot says `waiting-buyer-invoice`
+    /// with an expired clock, but before this order's turn comes up the buyer
+    /// hands off — status flips to `waiting-payment` and the per-duty clock
+    /// re-anchors. Acting on the snapshot would cancel the fresh escrow and
+    /// blame (slash) the seller seconds into their duty.
+    #[tokio::test]
+    async fn reconfirm_timeout_eligibility_skips_after_duty_handoff() {
+        let ctx = migrated_ctx().await;
+        let pool = ctx.pool();
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.taken_at = Utc::now().timestamp() - 10_000;
+        let stored = order.create(pool).await.unwrap();
+
+        sqlx::query("UPDATE orders SET status = ?1, taken_at = ?2 WHERE id = ?3")
+            .bind(Status::WaitingPayment.to_string())
+            .bind(Utc::now().timestamp())
+            .bind(stored.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert!(
+            reconfirm_timeout_eligibility(pool, stored.id, 900)
+                .await
+                .is_none(),
+            "a just-started duty must not inherit the snapshot's expiry"
+        );
+    }
+
+    /// Same status but a re-anchored clock is equally ineligible: the guard
+    /// re-evaluates the `find_order_by_seconds` predicate, not just the state.
+    #[tokio::test]
+    async fn reconfirm_timeout_eligibility_skips_reanchored_clock() {
+        let ctx = migrated_ctx().await;
+        let pool = ctx.pool();
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.taken_at = Utc::now().timestamp() - 10_000;
+        let stored = order.create(pool).await.unwrap();
+
+        sqlx::query("UPDATE orders SET taken_at = ?1 WHERE id = ?2")
+            .bind(Utc::now().timestamp())
+            .bind(stored.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert!(
+            reconfirm_timeout_eligibility(pool, stored.id, 900)
+                .await
+                .is_none(),
+            "a re-anchored clock is no longer expired"
+        );
+    }
+
+    /// Orders that left the waiting window entirely — or vanished — are
+    /// skipped, never acted on from the stale snapshot.
+    #[tokio::test]
+    async fn reconfirm_timeout_eligibility_skips_terminal_and_missing_orders() {
+        let ctx = migrated_ctx().await;
+        let pool = ctx.pool();
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.status = Status::Canceled.to_string();
+        order.taken_at = Utc::now().timestamp() - 10_000;
+        let stored = order.create(pool).await.unwrap();
+
+        assert!(
+            reconfirm_timeout_eligibility(pool, stored.id, 900)
+                .await
+                .is_none(),
+            "a terminal order is not timeout-eligible however stale its clock"
+        );
+        assert!(
+            reconfirm_timeout_eligibility(pool, Uuid::new_v4(), 900)
+                .await
+                .is_none(),
+            "a missing row is skipped"
+        );
     }
 
     // ── orderbook reconciler ─────────────────────────────────────────────

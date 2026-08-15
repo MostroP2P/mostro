@@ -443,7 +443,11 @@ async fn order_has_range_maker_bond(
 /// guarantees the bond was really forfeited and the notice is truthful.
 ///
 /// `order` MUST carry the pre-cancel waiting status and the trade
-/// pubkeys; call this from the persist-success branch that replaces the
+/// pubkeys, and MUST be a *fresh* read whose timeout eligibility was just
+/// re-confirmed (see `scheduler::reconfirm_timeout_eligibility`): blame
+/// is assigned from `order.status`, so a stale snapshot taken before a
+/// duty handoff would slash the wrong party. Call this from the
+/// persist-success branch that replaces the
 /// Phase 1 release call. `bond_cfg` is the node's `[anti_abuse_bond]`
 /// config (the scheduler passes `Settings::get_bond()`); it is taken as a
 /// parameter rather than read from the global so the gate is unit-testable

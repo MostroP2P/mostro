@@ -41,12 +41,12 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bitcoin::hashes::hex::FromHex;
 use chrono::Utc;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
 use mostro_core::prelude::*;
-use nostr_sdk::nostr::hashes::hex::FromHex;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::mpsc::channel;
@@ -57,6 +57,7 @@ use crate::config::settings::Settings;
 use crate::lightning::{InvoiceMessage, LndConnector};
 use crate::util::{
     bytes_to_string, enqueue_order_msg, get_keys, set_waiting_invoice_status, show_hold_invoice,
+    HoldInvoiceOrigin,
 };
 
 use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
@@ -428,7 +429,7 @@ pub async fn request_maker_bond(
 /// from the structured gRPC error so the caller can decide whether the
 /// HTLC is verifiably no longer encumbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelOutcome {
+pub(crate) enum CancelOutcome {
     /// The cancel landed at LND (or didn't need to: the invoice was
     /// already canceled / never existed). The HTLC, if there ever was
     /// one, is no longer encumbered. Safe to mark `Released`.
@@ -450,7 +451,7 @@ enum CancelOutcome {
 /// Anything we can't classify confidently maps to `Transient`: the
 /// safer side is to delay cleanup until the next exit path or CLTV
 /// expiry, never to falsely report a release on an HTLC LND still has.
-fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
+pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
     let s = err.to_string().to_lowercase();
 
     // gRPC codes that mean the cancel was idempotent / target wasn't there.
@@ -917,6 +918,30 @@ async fn on_bond_invoice_accepted(
     if order.status != Status::Pending.to_string()
         && order.status != Status::WaitingTakerBond.to_string()
     {
+        // A canceled order means this taker's bond locked against a trade
+        // that will never start — the maker's cancel beat the promotion,
+        // or the cancel-side release hit a transient LND failure. Release
+        // the bond here (idempotent: the cancel path may already have
+        // done it) and tell the taker, so their sats are not stranded
+        // until the bond invoice's CLTV expiry. Any other non-pre-trade
+        // status is a live trade the bond still backs — leave it alone.
+        if matches!(
+            order.get_order_status(),
+            Ok(Status::Canceled | Status::CooperativelyCanceled | Status::CanceledByAdmin)
+        ) && !current_state.is_terminal()
+        {
+            info!(
+                "Bond {} locked on canceled order {} — releasing and notifying taker",
+                current.id, order.id
+            );
+            if let Err(e) = release_bond(pool, &current).await {
+                warn!(
+                    bond_id = %current.id,
+                    "release_bond on canceled order failed ({}); the next exit path retries", e
+                );
+            }
+            notify_loser(&current).await;
+        }
         info!(
             "Bond {} accepted but order {} is in status {} — skipping resume",
             current.id, order.id, order.status
@@ -1077,10 +1102,15 @@ async fn promote_taker_context_to_order(
         order.dev_fee = v;
     }
     order.set_timestamp_now();
-    order
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+    // Compare-and-swap: write only the promoted columns, and only while the
+    // order is still pre-trade. A maker cancel that committed in the
+    // meantime wins — aborting here leaves the row canceled and drops the
+    // take; the cancel path already released this taker's bond.
+    let won = crate::db::cas_promote_taker_context(pool, &order).await?;
+    if !won {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    Ok(order)
 }
 
 /// Subscriber callback for `InvoiceState::Canceled`: bond never locked
@@ -1284,6 +1314,7 @@ async fn resume_take_after_bond(
                 &seller_pubkey,
                 order,
                 request_id,
+                HoldInvoiceOrigin::Take,
             )
             .await
         }
@@ -1300,6 +1331,7 @@ async fn resume_take_after_bond(
                     &seller_pubkey,
                     order,
                     request_id,
+                    HoldInvoiceOrigin::Take,
                 )
                 .await
             } else {
@@ -1310,10 +1342,25 @@ async fn resume_take_after_bond(
                     crate::util::update_order_event(my_keys, Status::WaitingBuyerInvoice, &order)
                         .await
                         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-                order_updated
-                    .update(pool)
-                    .await
-                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                // Compare-and-swap: bail if the order left the pre-trade
+                // window (e.g. a maker cancel committed) instead of
+                // resurrecting it with a stale full-row write.
+                let won = crate::db::cas_pretrade_order_status(
+                    pool,
+                    order_updated.id,
+                    Status::WaitingBuyerInvoice,
+                    &order_updated.event_id,
+                )
+                .await?;
+                if !won {
+                    crate::util::republish_winning_state_after_cas_miss(
+                        pool,
+                        my_keys,
+                        order_updated.id,
+                    )
+                    .await;
+                    return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+                }
                 Ok(())
             }
         }
@@ -2692,6 +2739,73 @@ mod tests {
         assert_eq!(updated.trade_index_buyer, Some(4));
         assert_eq!(updated.buyer_invoice.as_deref(), Some("lnbc1pTEST"));
         assert!(updated.seller_pubkey.is_none());
+    }
+
+    /// The promotion is a compare-and-swap: when the maker's cancel (or any
+    /// other transition) committed first, the write must miss and the row
+    /// must stay canceled — a full-row write here would resurrect it.
+    #[tokio::test]
+    async fn promote_taker_context_loses_cas_when_order_already_canceled() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order = load_order(&pool, order_id).await;
+
+        let mut bond = make_bond(order_id, BondState::Locked);
+        bond.pubkey = "s".repeat(64);
+
+        let result = promote_taker_context_to_order(&pool, order, &bond).await;
+        assert!(
+            result.is_err(),
+            "a committed cancel must win over the bond promotion"
+        );
+
+        let after = load_order(&pool, order_id).await;
+        assert_eq!(after.status, Status::Canceled.to_string());
+        assert!(
+            after.seller_pubkey.is_none(),
+            "no taker context may be written past the pre-trade window"
+        );
+    }
+
+    /// A taker bond that reaches `Locked` against an already-canceled
+    /// order (maker cancel won the race, or the cancel-side release hit a
+    /// transient LND failure) must be released and its owner notified —
+    /// never left locked until the bond invoice's CLTV expiry. Without
+    /// LND the release attempt itself fails here, but the notification is
+    /// unconditional.
+    #[tokio::test]
+    async fn accepted_bond_on_canceled_order_notifies_and_skips_resume() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = ?")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bond = make_bond(order_id, BondState::Locked);
+        create_bond(&pool, bond).await.unwrap();
+
+        on_bond_invoice_accepted(&"c".repeat(64), &pool, None)
+            .await
+            .expect("cancel-observation path returns Ok");
+
+        assert!(
+            count_msgs(order_id, Action::Canceled).await > 0,
+            "the taker must be told the trade is dead"
+        );
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::Canceled.to_string());
+        assert!(
+            order.buyer_pubkey.is_none() && order.seller_pubkey.is_none(),
+            "no resume may happen on a canceled order"
+        );
     }
 
     #[tokio::test]

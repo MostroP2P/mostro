@@ -5,28 +5,30 @@ use crate::lightning::LnStatus;
 use crate::util::{get_expiration_timestamp_for_kind, get_keys};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
-use nostr::event::builder::Error;
+use nostr::error::Error;
 use nostr_sdk::prelude::*;
 use serde_json::json;
-use std::borrow::Cow;
 use std::vec;
 
-/// Internal helper function to create a NIP-33 replaceable event with a specific kind
+/// Internal helper function to create a NIP-33 replaceable event with a specific kind.
+/// `created_at` overrides the event timestamp when provided; `None` uses the
+/// current time.
 fn create_event(
     keys: &Keys,
     content: &str,
     identifier: String,
     extra_tags: Tags,
     kind: u16,
+    created_at: Option<Timestamp>,
 ) -> Result<Event, Error> {
     let mut tags: Vec<Tag> = Vec::with_capacity(2 + extra_tags.len());
     tags.push(Tag::identifier(identifier));
 
     // Add NIP-40 expiration tag if configured and not already provided.
-    let has_expiration_tag = tags.iter().chain(extra_tags.iter()).any(|t| {
-        matches!(t.kind(), TagKind::Expiration)
-            || (matches!(t.kind(), TagKind::Custom(ref c) if c == "expiration"))
-    });
+    let has_expiration_tag = tags
+        .iter()
+        .chain(extra_tags.iter())
+        .any(|t| t.kind() == "expiration");
     if !has_expiration_tag {
         if let Some(expiration_timestamp) = get_expiration_timestamp_for_kind(kind) {
             tags.push(Tag::expiration(Timestamp::from(
@@ -38,9 +40,11 @@ fn create_event(
     tags.extend(extra_tags);
     let tags = Tags::from_list(tags);
 
-    EventBuilder::new(nostr::Kind::Custom(kind), content)
-        .tags(tags)
-        .sign_with_keys(keys)
+    let mut builder = EventBuilder::new(nostr::event::Kind::Custom(kind), content).tags(tags);
+    if let Some(created_at) = created_at {
+        builder = builder.custom_created_at(created_at);
+    }
+    builder.finalize(keys)
 }
 
 /// Creates a new order event (kind 38383)
@@ -66,6 +70,29 @@ pub fn new_order_event(
         identifier,
         extra_tags,
         NOSTR_ORDER_EVENT_KIND,
+        None,
+    )
+}
+
+/// Creates a new order event (kind 38383) with an explicit `created_at`.
+///
+/// NIP-01 replaceable-event ordering breaks same-second ties by lowest event
+/// id, so a repair event that must supersede an earlier event published in
+/// the same Unix second needs a strictly newer timestamp.
+pub fn new_order_event_with_created_at(
+    keys: &Keys,
+    content: &str,
+    identifier: String,
+    extra_tags: Tags,
+    created_at: Timestamp,
+) -> Result<Event, Error> {
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_ORDER_EVENT_KIND,
+        Some(created_at),
     )
 }
 
@@ -92,6 +119,7 @@ pub fn new_rating_event(
         identifier,
         extra_tags,
         NOSTR_RATING_EVENT_KIND,
+        None,
     )
 }
 
@@ -112,7 +140,14 @@ pub fn new_info_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
-    create_event(keys, content, identifier, extra_tags, NOSTR_INFO_EVENT_KIND)
+    create_event(
+        keys,
+        content,
+        identifier,
+        extra_tags,
+        NOSTR_INFO_EVENT_KIND,
+        None,
+    )
 }
 
 /// Creates a new dispute event (kind 38386)
@@ -138,7 +173,29 @@ pub fn new_dispute_event(
         identifier,
         extra_tags,
         NOSTR_DISPUTE_EVENT_KIND,
+        None,
     )
+}
+
+/// Builds the standard tag set for a kind-38386 dispute event.
+///
+/// `created_at` is the dispute open time from SQLite (`disputes.created_at`),
+/// carried as a business tag so clients can show when the dispute was opened.
+/// It is independent of the Nostr event's `created_at`, which stays as "signed
+/// now" for NIP-33 replaceable-event ordering.
+pub fn create_dispute_event_tags(
+    status: impl Into<String>,
+    initiator: impl Into<String>,
+    created_at: i64,
+    platform_name: Option<&str>,
+) -> Tags {
+    Tags::from_list(vec![
+        Tag::custom("s", vec![status.into()]),
+        Tag::custom("initiator", vec![initiator.into()]),
+        Tag::custom("created_at", vec![created_at.to_string()]),
+        Tag::custom("y", create_platform_tag_values(platform_name)),
+        Tag::custom("z", vec!["dispute".to_string()]),
+    ])
 }
 
 /// Creates a new exchange rates event (kind 30078, NIP-33)
@@ -164,8 +221,8 @@ pub fn new_dispute_event(
 /// wrapper.insert("BTC".to_string(), bitcoin_prices.clone());
 /// let content = serde_json::to_string(&wrapper)?;
 /// let tags = Tags::from_list(vec![
-///     Tag::custom(TagKind::Custom("published_at".into()), vec![timestamp.to_string()]),
-///     Tag::custom(TagKind::Custom("source".into()), vec!["yadio".to_string()]),
+///     Tag::custom("published_at", vec![timestamp.to_string()]),
+///     Tag::custom("source", vec!["yadio".to_string()]),
 ///     Tag::expiration(Timestamp::from(expiration)),
 /// ]);
 /// let event = new_exchange_rates_event(&keys, &content, tags)?;
@@ -181,6 +238,7 @@ pub fn new_exchange_rates_event(
         "mostro-rates".to_string(), // NIP-33 d tag identifier
         extra_tags,
         NOSTR_EXCHANGE_RATES_EVENT_KIND,
+        None,
     )
 }
 
@@ -375,6 +433,23 @@ fn create_source_tag(
 /// * `mostro_pubkey` - Optional Mostro pubkey override. If None, derived from get_keys().
 ///   Pass Some() in tests to avoid global state dependencies.
 ///
+/// NIP-40 `expiration` for an order's kind-38383 event.
+///
+/// Events published as `pending` self-destruct at the order's real
+/// `expires_at` (the take-window TTL, typically ~24 h): if a terminal
+/// revision is ever lost (dropped publish, relay outage), relays delete the
+/// stale `pending` state at the order's actual deadline instead of
+/// advertising phantom liquidity for the full retention window (default
+/// 30 days). Terminal / in-progress revisions keep the configured retention
+/// so trade history remains queryable.
+fn nip40_expiration_for_order(order: &Order, published_status: Status) -> i64 {
+    if published_status == Status::Pending && order.expires_at > 0 {
+        return order.expires_at;
+    }
+    get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
+        .expect("expiration is always defined for order events")
+}
+
 pub fn order_to_tags(
     order: &Order,
     reputation_data: Option<(f64, i64, i64)>,
@@ -407,72 +482,37 @@ pub fn order_to_tags(
             .map(|s| s.to_string())
             .collect();
         let mut tags: Vec<Tag> = vec![
+            Tag::custom("k", vec![order.kind.to_string()]),
+            Tag::custom("f", vec![order.fiat_code.to_string()]),
+            Tag::custom("s", vec![status.to_string()]),
+            Tag::custom("amt", vec![order.amount.to_string()]),
+            Tag::custom("fa", create_fiat_amt_array(order)),
+            Tag::custom("pm", payment_method),
+            Tag::custom("premium", vec![order.premium.to_string()]),
+            Tag::custom("network", vec![ln_network]),
+            Tag::custom("layer", vec!["lightning".to_string()]),
+            Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("k")),
-                vec![order.kind.to_string()],
+                "expiration",
+                vec![nip40_expiration_for_order(order, status).to_string()],
             ),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("f")),
-                vec![order.fiat_code.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("s")),
-                vec![status.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("amt")),
-                vec![order.amount.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("fa")),
-                create_fiat_amt_array(order),
-            ),
-            Tag::custom(TagKind::Custom(Cow::Borrowed("pm")), payment_method),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("premium")),
-                vec![order.premium.to_string()],
-            ),
-            Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("layer")),
-                vec!["lightning".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("expires_at")),
-                vec![order.expires_at.to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("expiration")),
-                vec![get_expiration_timestamp_for_kind(NOSTR_ORDER_EVENT_KIND)
-                    .expect("expiration is always defined for order events")
-                    .to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(Settings::get_mostro().name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["order".to_string()],
-            ),
+            Tag::custom("z", vec!["order".to_string()]),
         ];
 
         // Add reputation data if available
         if reputation_data.is_some() {
             tags.insert(
                 RATING_TAG_INDEX,
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("rating")),
-                    vec![create_rating_tag(reputation_data)],
-                ),
+                Tag::custom("rating", vec![create_rating_tag(reputation_data)]),
             );
         }
         // Add source tag if available
         if let Some(source) = mostro_link {
-            tags.insert(
-                SOURCE_TAG_INDEX,
-                Tag::custom(TagKind::Custom(Cow::Borrowed("source")), vec![source]),
-            );
+            tags.insert(SOURCE_TAG_INDEX, Tag::custom("source", vec![source]));
         }
         Ok(Some(Tags::from_list(tags)))
     } else {
@@ -528,45 +568,36 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
 
     let mut tags_vec: Vec<Tag> = vec![
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_version")),
+            "mostro_version",
             vec![env!("CARGO_PKG_VERSION").to_string()],
         ),
+        Tag::custom("mostro_commit_hash", vec![env!("GIT_HASH").to_string()]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("mostro_commit_hash")),
-            vec![env!("GIT_HASH").to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("max_order_amount")),
+            "max_order_amount",
             vec![mostro_settings.max_order_amount.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("min_order_amount")),
+            "min_order_amount",
             vec![mostro_settings.min_payment_amount.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration_hours")),
+            "expiration_hours",
             vec![mostro_settings.expiration_hours.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("expiration_seconds")),
+            "expiration_seconds",
             vec![mostro_settings.expiration_seconds.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fiat_currencies_accepted")),
+            "fiat_currencies_accepted",
             vec![mostro_settings.fiat_currencies_accepted.join(",")],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("max_orders_per_response")),
+            "max_orders_per_response",
             vec![mostro_settings.max_orders_per_response.to_string()],
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("fee")),
-            vec![mostro_settings.fee.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pow")),
-            vec![mostro_settings.pow.to_string()],
-        ),
+        Tag::custom("fee", vec![mostro_settings.fee.to_string()]),
+        Tag::custom("pow", vec![mostro_settings.pow.to_string()]),
         // Companion of `pow` for the Phase 2 anti-spam gate: the difficulty an
         // event from a sender that is *not* in the active-trade cache must
         // clear. Advertised as an already-resolved absolute difficulty so a
@@ -580,65 +611,38 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
         // its first accepted event and its follow-ups must carry the same
         // work. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("pow_first_contact")),
+            "pow_first_contact",
             vec![advertised_first_contact_pow(mostro_settings).to_string()],
         ),
         // Capability advertisement: which Mostro protocol version this node
         // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
         // `transport` setting so clients pick the right wire format before
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("protocol_version")),
-            vec![protocol_version.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hold_invoice_expiration_window")),
+            "hold_invoice_expiration_window",
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hold_invoice_cltv_delta")),
+            "hold_invoice_cltv_delta",
             vec![ln_settings.hold_invoice_cltv_delta.to_string()],
         ),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("invoice_expiration_window")),
+            "invoice_expiration_window",
             vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),
+        Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
+        Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
+        Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
+        Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
+        Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
+        Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
+        Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_version")),
-            vec![ln_status.version.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_node_pubkey")),
-            vec![ln_status.node_pubkey.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_commit_hash")),
-            vec![ln_status.commit_hash.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_node_alias")),
-            vec![ln_status.node_alias.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_chains")),
-            vec![ln_status.chains.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_networks")),
-            vec![ln_status.networks.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("lnd_uris")),
-            vec![ln_status.uris.join(",")],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["info".to_string()],
-        ),
+        Tag::custom("z", vec!["info".to_string()]),
     ];
 
     tags_vec.extend(bond_policy_tags(bond_settings));
@@ -664,10 +668,7 @@ fn bond_policy_tags(
 ) -> Vec<Tag> {
     let mut tags = Vec::with_capacity(7);
     let bond_enabled = bond_settings.is_some_and(|b| b.enabled);
-    tags.push(Tag::custom(
-        TagKind::Custom(Cow::Borrowed("bond_enabled")),
-        vec![bond_enabled.to_string()],
-    ));
+    tags.push(Tag::custom("bond_enabled", vec![bond_enabled.to_string()]));
     if let Some(bond) = bond_settings {
         if bond.enabled {
             let apply_to_str = match bond.apply_to {
@@ -676,27 +677,24 @@ fn bond_policy_tags(
                 BondApplyTo::Both => "both",
             };
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_amount_pct")),
+                "bond_amount_pct",
                 vec![bond.amount_pct.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_base_amount_sats")),
+                "bond_base_amount_sats",
                 vec![bond.base_amount_sats.to_string()],
             ));
+            tags.push(Tag::custom("bond_apply_to", vec![apply_to_str.to_string()]));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_apply_to")),
-                vec![apply_to_str.to_string()],
-            ));
-            tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_slash_on_waiting_timeout")),
+                "bond_slash_on_waiting_timeout",
                 vec![bond.slash_on_waiting_timeout.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_slash_node_share_pct")),
+                "bond_slash_node_share_pct",
                 vec![bond.slash_node_share_pct.to_string()],
             ));
             tags.push(Tag::custom(
-                TagKind::Custom(Cow::Borrowed("bond_payout_claim_window_days")),
+                "bond_payout_claim_window_days",
                 vec![bond.payout_claim_window_days.to_string()],
             ));
         }
@@ -714,7 +712,6 @@ mod tests {
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
     use nostr_sdk::prelude::*;
-    use std::borrow::Cow;
 
     // ── Shared test helpers ──────────────────────────────────────────────────────
 
@@ -798,6 +795,81 @@ mod tests {
         assert_eq!(
             create_platform_tag_values(Some("   \t  ")),
             vec!["mostro".to_string()]
+        );
+    }
+
+    // ── NIP-40 expiration: ghost-order TTL ───────────────────────────────────
+    // (uses the shared `get_tag_value` helper defined further below)
+
+    /// A `pending` event must self-destruct at the order's real take-window
+    /// TTL (`expires_at`), not the 30-day retention window: if a terminal
+    /// revision is ever lost, relays delete the stale `pending` state at the
+    /// order's actual deadline instead of advertising phantom liquidity for
+    /// a month.
+    #[test]
+    fn pending_event_nip40_expiration_matches_order_expires_at() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.expires_at = 1_900_000_000;
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let expiration = get_tag_value(&tags, "expiration").expect("expiration tag present");
+        assert_eq!(
+            expiration, "1900000000",
+            "pending events must expire at the order's real expires_at"
+        );
+    }
+
+    /// Terminal revisions keep the configured retention window so trade
+    /// history stays queryable — only the `pending` face of the order gets
+    /// the short TTL.
+    #[test]
+    fn canceled_event_nip40_expiration_keeps_configured_retention() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::Canceled.to_string();
+        order.expires_at = 1_900_000_000;
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("canceled order must produce Some(tags)");
+
+        let expiration: i64 = get_tag_value(&tags, "expiration")
+            .expect("expiration tag present")
+            .parse()
+            .expect("expiration must be a unix timestamp");
+        let now = Timestamp::now().as_secs() as i64;
+        assert!(
+            expiration > now,
+            "terminal events keep a future retention-based expiration"
+        );
+        assert_ne!(
+            expiration, order.expires_at,
+            "terminal events do not inherit the take-window TTL"
+        );
+    }
+
+    /// Legacy rows without `expires_at` fall back to the configured
+    /// retention window instead of emitting an instantly-expired event.
+    #[test]
+    fn pending_event_without_expires_at_falls_back_to_retention() {
+        init_test_settings();
+        let order = make_pending_order(); // Default: expires_at = 0
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        let expiration: i64 = get_tag_value(&tags, "expiration")
+            .expect("expiration tag present")
+            .parse()
+            .expect("expiration must be a unix timestamp");
+        assert!(
+            expiration > Timestamp::now().as_secs() as i64,
+            "zero expires_at must not produce an already-expired event"
         );
     }
 
@@ -1128,34 +1200,19 @@ mod tests {
 
     // ── Dispute event tag list: end-to-end y-tag emission (kind 38386) ──────────
 
-    /// Verifies that the tag list built for dispute events emits the correct y tag.
-    ///
-    /// Mirrors the exact inline tag construction used in `publish_dispute_event` and
-    /// `close_dispute_after_user_resolution` in src/app/dispute.rs, as well as the
-    /// admin handlers in admin_cancel.rs, admin_settle.rs, and admin_take_dispute.rs.
-    /// All five callsites use the identical pattern verified here.
+    /// Verifies that [`create_dispute_event_tags`] emits status, initiator,
+    /// stable open-time `created_at`, platform `y`, and `z=dispute`.
     #[test]
     fn dispute_event_tags_emit_y_tag_matching_platform_helper() {
         init_test_settings();
 
-        let tags = Tags::from_list(vec![
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("s")),
-                vec!["initiated-by-buyer".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("initiator")),
-                vec!["buyer".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
-                create_platform_tag_values(test_settings().mostro.name.as_deref()),
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["dispute".to_string()],
-            ),
-        ]);
+        let opened_at = 1_700_000_100_i64;
+        let tags = super::create_dispute_event_tags(
+            "initiated",
+            "buyer",
+            opened_at,
+            test_settings().mostro.name.as_deref(),
+        );
 
         let y_values = get_y_tag_values(&tags)
             .expect("y tag must be present in dispute event tags (kind 38386)");
@@ -1167,6 +1224,51 @@ mod tests {
             y_values, expected,
             "dispute event tag list must wire create_platform_tag_values correctly"
         );
+        assert_eq!(
+            get_tag_value(&tags, "s").as_deref(),
+            Some("initiated"),
+            "status tag must match"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "initiator").as_deref(),
+            Some("buyer"),
+            "initiator tag must match"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "created_at").as_deref(),
+            Some("1700000100"),
+            "created_at tag must carry the SQLite dispute open time"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "z").as_deref(),
+            Some("dispute"),
+            "z tag must be dispute"
+        );
+    }
+
+    /// Kind-38386 `event.created_at` stays "signed now"; the business open
+    /// time lives only on the `created_at` tag so NIP-33 replace still works.
+    #[test]
+    fn new_dispute_event_keeps_nostr_created_at_independent_of_open_time_tag() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let opened_at = 1_600_000_000_i64;
+        let tags = super::create_dispute_event_tags("initiated", "seller", opened_at, None);
+        let before = Timestamp::now().as_secs();
+        let event = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags)
+            .expect("dispute event");
+        let after = Timestamp::now().as_secs();
+
+        assert_eq!(event.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
+        assert!(
+            event.created_at.as_secs() >= before && event.created_at.as_secs() <= after,
+            "event.created_at must be wall-clock now, not the open-time tag"
+        );
+        assert_eq!(
+            get_tag_value(&event.tags, "created_at").as_deref(),
+            Some("1600000000")
+        );
+        assert_ne!(event.created_at.as_secs() as i64, opened_at);
     }
 
     // ── Dev-fee audit event tag list: end-to-end y-tag emission (kind 8383) ─────
@@ -1182,33 +1284,18 @@ mod tests {
 
         let tags = Tags::from_list(vec![
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("order-id")),
+                "order-id",
                 vec!["00000000-0000-0000-0000-000000000000".to_string()],
             ),
+            Tag::custom("amount", vec!["300".to_string()]),
+            Tag::custom("hash", vec!["deadbeef".to_string()]),
+            Tag::custom("destination", vec!["dev@lightning.address".to_string()]),
+            Tag::custom("network", vec!["mainnet".to_string()]),
             Tag::custom(
-                TagKind::Custom(Cow::Borrowed("amount")),
-                vec!["300".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("hash")),
-                vec!["deadbeef".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("destination")),
-                vec!["dev@lightning.address".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("network")),
-                vec!["mainnet".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("y")),
+                "y",
                 create_platform_tag_values(test_settings().mostro.name.as_deref()),
             ),
-            Tag::custom(
-                TagKind::Custom(Cow::Borrowed("z")),
-                vec!["dev-fee-payment".to_string()],
-            ),
+            Tag::custom("z", vec!["dev-fee-payment".to_string()]),
         ]);
 
         let y_values = get_y_tag_values(&tags)
@@ -1224,6 +1311,57 @@ mod tests {
     }
 
     // ── Event constructors (kinds 38383/38384/38385/38386/30078) ─────────
+
+    /// Regression: after a same-second CAS miss the repair event must win
+    /// NIP-01 replaceable-event ordering. Same-timestamp ties fall back to
+    /// lowest event id — which the repair could lose — so the repair is
+    /// stamped strictly after the stale event and must win on `created_at`
+    /// alone, regardless of how the ids compare.
+    #[test]
+    fn same_second_cas_miss_repair_event_wins_nip01_ordering() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let tags = Tags::from_list(vec![]);
+
+        // The stale event the losing caller already published.
+        let stale = super::new_order_event(&keys, "", "order-id".to_string(), tags.clone())
+            .expect("stale event");
+
+        // The repair runs milliseconds later — same Unix second. It is
+        // stamped one second after the stale event (see
+        // `util::repair_timestamp`).
+        let repair = super::new_order_event_with_created_at(
+            &keys,
+            "",
+            "order-id".to_string(),
+            tags,
+            Timestamp::from(stale.created_at.as_secs() + 1),
+        )
+        .expect("repair event");
+
+        assert!(
+            repair.created_at > stale.created_at,
+            "repair must out-order the stale event on created_at alone"
+        );
+        // NIP-01: for replaceable events the higher created_at wins; the id
+        // tie-breaker only applies on equal timestamps, which the strictly
+        // newer stamp rules out.
+        let nip01_winner = if repair.created_at != stale.created_at {
+            if repair.created_at > stale.created_at {
+                &repair
+            } else {
+                &stale
+            }
+        } else if repair.id < stale.id {
+            &repair
+        } else {
+            &stale
+        };
+        assert_eq!(
+            nip01_winner.id, repair.id,
+            "repair event must replace the stale one"
+        );
+    }
 
     #[test]
     fn event_constructors_emit_expected_kinds_and_identifier() {
@@ -1245,16 +1383,24 @@ mod tests {
             super::new_info_event(&keys, "", "mostro-pk".to_string(), tags.clone()).expect("info");
         assert_eq!(info.kind.as_u16(), NOSTR_INFO_EVENT_KIND);
         assert!(
-            !info
-                .tags
-                .iter()
-                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            !info.tags.iter().any(|t| t.kind() == "expiration"),
             "info events must not carry an expiration tag"
         );
 
         let dispute = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags.clone())
             .expect("dispute event");
         assert_eq!(dispute.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
+
+        let stamped = super::new_order_event_with_created_at(
+            &keys,
+            "",
+            "order-id".to_string(),
+            tags.clone(),
+            Timestamp::from(1_700_000_000),
+        )
+        .expect("order event with explicit created_at");
+        assert_eq!(stamped.kind.as_u16(), NOSTR_ORDER_EVENT_KIND);
+        assert_eq!(stamped.created_at.as_secs(), 1_700_000_000);
 
         let rates =
             super::new_exchange_rates_event(&keys, "{}", tags.clone()).expect("rates event");
@@ -1271,10 +1417,7 @@ mod tests {
 
         // Order events DO get an expiration tag from configuration.
         assert!(
-            order
-                .tags
-                .iter()
-                .any(|t| matches!(t.kind(), TagKind::Expiration)),
+            order.tags.iter().any(|t| t.kind() == "expiration"),
             "order events must carry an expiration tag"
         );
     }

@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use nostr_sdk::EventId;
+use nostr_sdk::prelude::EventId;
 
 /// How long (seconds) a seen event id is remembered for replay dedup. Must be
 /// ≥ the event loop's 10-second freshness window so a duplicate can never slip
@@ -149,11 +149,11 @@ impl SpamGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{EventBuilder, Keys};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
 
     fn an_event_id(note: &str) -> EventId {
-        EventBuilder::text_note(note)
-            .sign_with_keys(&Keys::generate())
+        EventBuilder::new(Kind::TextNote, note)
+            .finalize(&Keys::generate())
             .expect("sign test event")
             .id
     }

@@ -3784,7 +3784,7 @@ mod tests {
 
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use mostro_core::message::MessageKind;
-    use nostr_sdk::Timestamp;
+    use nostr_sdk::prelude::Timestamp;
 
     fn build_ctx(pool: &Pool<Sqlite>) -> crate::app::context::AppContext {
         TestContextBuilder::new()

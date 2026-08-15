@@ -186,12 +186,12 @@ impl NostrProvider {
             .iter()
             .filter(|e| trusted.contains(&e.pubkey))
             .filter(|e| e.kind == Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
-            .filter(|e| e.tags.identifier() == Some("mostro-rates"))
+            .filter(|e| e.tags.identifier() == Some("mostro-rates".to_string()))
             // A future-dated `created_at` (forged or clock-skewed relay) would
             // otherwise saturate the age check to 0 and win the ranking outright.
             .filter(|e| e.created_at <= now)
             .filter(|e| now.as_secs().saturating_sub(e.created_at.as_secs()) <= max_age_secs)
-            .filter(|e| !e.is_expired_at(&now))
+            .filter(|e| !e.is_expired_at(now))
             .collect();
         candidates.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
         candidates
@@ -232,7 +232,7 @@ impl NostrProvider {
     pub(crate) fn is_plausible_candidate(event: &Event, trusted: &[PublicKey]) -> bool {
         trusted.contains(&event.pubkey)
             && event.kind == Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND)
-            && event.tags.identifier() == Some("mostro-rates")
+            && event.tags.identifier() == Some("mostro-rates".to_string())
     }
 
     /// Keep at most `limit` plausible candidates from `incoming`, dropping
@@ -281,12 +281,16 @@ impl PriceProvider for NostrProvider {
         // relays into one stream, so one noisy peer could fill a global
         // first-N cutoff before an honest relay's trusted event arrives.
         let mut stream = client
-            .stream_events(self.build_filter(), self.query_timeout)
+            .stream_events(self.build_filter())
+            .timeout(self.query_timeout)
             .await
             .map_err(|e| ProviderError::Http(format!("nostr: relay query failed: {e}")))?;
 
         let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
+        while let Some((_relay_url, result)) = stream.next().await {
+            let Ok(event) = result else {
+                continue;
+            };
             if Self::is_plausible_candidate(&event, &self.trusted_nodes) {
                 events.push(event);
                 if events.len() >= MAX_FETCHED_RATE_EVENTS {
@@ -341,7 +345,7 @@ mod tests {
         EventBuilder::new(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND), content)
             .tags(vec![Tag::identifier("mostro-rates")])
             .custom_created_at(Timestamp::from(created_at))
-            .sign_with_keys(keys)
+            .finalize(keys)
             .expect("event must sign")
     }
 
@@ -360,7 +364,7 @@ mod tests {
                 Tag::expiration(Timestamp::from(expiration)),
             ])
             .custom_created_at(Timestamp::from(created_at))
-            .sign_with_keys(keys)
+            .finalize(keys)
             .expect("event must sign")
     }
 
@@ -507,7 +511,7 @@ mod tests {
         EventBuilder::new(Kind::Custom(kind), content)
             .tags(vec![Tag::identifier(identifier)])
             .custom_created_at(Timestamp::from(created_at))
-            .sign_with_keys(keys)
+            .finalize(keys)
             .expect("event must sign")
     }
 
@@ -711,9 +715,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits a real Nostr relay; run explicitly for manual verification"]
     async fn live_relay_fetch_returns_real_rates() {
-        let client = ClientBuilder::default()
-            .opts(crate::util::price_nostr_client_options())
-            .build();
+        let client = crate::util::price_nostr_client_options().build();
         client
             .add_relay("wss://relay.mostro.network")
             .await

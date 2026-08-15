@@ -52,6 +52,7 @@ use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
+use crate::Result;
 
 // External dependencies
 use mostro_core::error::CantDoReason;
@@ -460,8 +461,8 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
 
-        while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event { event, .. } = notification {
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
                 let Some((action, message, unwrapped)) = accept_event(
                     &ctx,
                     &event,
@@ -511,8 +512,8 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     loop {
         let mut notifications = client.notifications();
 
-        while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event { event, .. } = notification {
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
                 let Some((action, message, unwrapped)) = accept_event(
                     &ctx,
                     &event,
@@ -576,8 +577,8 @@ mod tests {
     use super::*;
     use mostro_core::message::Action;
 
-    use nostr_sdk::secp256k1::schnorr::Signature;
-    use nostr_sdk::{Keys, Kind as NostrKind, Timestamp};
+    use nostr_sdk::prelude::{Keys, Kind as NostrKind, Timestamp};
+    use secp256k1::schnorr::Signature;
 
     // Helper function to create test keys
     fn create_test_keys() -> Keys {
@@ -956,7 +957,7 @@ mod tests {
             // Globals some handlers reach for; installing them is idempotent.
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
-            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
 
             let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
             sqlx::migrate!("./migrations")
@@ -1061,7 +1062,7 @@ mod tests {
         async fn blocks_every_order_lifecycle_action_with_invalid_action() {
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
-            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::Client::default());
+            let _ = crate::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
             let ctx = create_ctx().await;
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();

@@ -958,7 +958,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ### Project Structure
 
-```
+```text
 mostro/
 ├── src/
 │   ├── main.rs              # Entry point, initialization

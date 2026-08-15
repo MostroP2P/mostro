@@ -10,7 +10,10 @@ use crate::flow;
 use crate::lightning;
 use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
-use crate::nip33::{create_platform_tag_values, new_order_event, new_rating_event, order_to_tags};
+use crate::nip33::{
+    create_platform_tag_values, new_order_event_with_created_at, new_rating_event, order_to_tags,
+};
+use crate::Result;
 
 use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
@@ -456,7 +459,11 @@ async fn finalize_order_publication(
     let event = if let Some(tags) =
         get_tags_for_new_order(&order, pool, &identity_pubkey, &trade_pubkey, keys).await?
     {
-        new_order_event(keys, "", order_id.to_string(), tags)
+        // Register the initial `pending` publish in the monotonic registry
+        // so a same-second follow-up transition (instant take, maker
+        // cancel) is stamped strictly after it and wins NIP-01 ordering.
+        let created_at = monotonic_order_event_timestamp(order_id, Timestamp::now());
+        new_order_event_with_created_at(keys, "", order_id.to_string(), tags, created_at)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?
     } else {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
@@ -492,7 +499,13 @@ async fn finalize_order_publication(
         .send_event(&event)
         .await
         .map(|_s| ())
-        .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
+        .map_err(|err| {
+            // The row is already `Pending` in the DB; queue it so the
+            // orderbook reconciler retries the publish instead of leaving
+            // an order that exists in the DB but never reached relays.
+            mark_orderbook_publish_failed(order_id);
+            MostroInternalErr(ServiceError::NostrError(err.to_string()))
+        })
 }
 
 /// Finish publishing an order whose maker bond has just locked.
@@ -742,7 +755,6 @@ pub async fn publish_dev_fee_audit_event(
     order: &Order,
     payment_hash: &str,
 ) -> Result<(), MostroError> {
-    use std::borrow::Cow;
     let ln_network = match LN_STATUS.get() {
         Some(status) => status.networks.join(","),
         None => "unknown".to_string(),
@@ -755,31 +767,16 @@ pub async fn publish_dev_fee_audit_event(
 
     // Create tags for queryability
     let mut tag_list = vec![
+        Tag::custom("order-id", vec![order.id.to_string()]),
+        Tag::custom("amount", vec![order.dev_fee.to_string()]),
+        Tag::custom("hash", vec![payment_hash.to_string()]),
+        Tag::custom("destination", vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()]),
+        Tag::custom("network", vec![ln_network]),
         Tag::custom(
-            TagKind::Custom(Cow::Borrowed("order-id")),
-            vec![order.id.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("amount")),
-            vec![order.dev_fee.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("hash")),
-            vec![payment_hash.to_string()],
-        ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("destination")),
-            vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()],
-        ),
-        Tag::custom(TagKind::Custom(Cow::Borrowed("network")), vec![ln_network]),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
+            "y",
             create_platform_tag_values(Settings::get_mostro().name.as_deref()),
         ),
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["dev-fee-payment".to_string()],
-        ),
+        Tag::custom("z", vec!["dev-fee-payment".to_string()]),
     ];
 
     // Add expiration tag if configured
@@ -793,9 +790,9 @@ pub async fn publish_dev_fee_audit_event(
     let tags = Tags::from_list(tag_list);
 
     // Create and sign event
-    let event = EventBuilder::new(nostr_sdk::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
+    let event = EventBuilder::new(nostr::event::Kind::Custom(DEV_FEE_AUDIT_EVENT_KIND), "")
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
     // Publish event to relays
@@ -831,32 +828,20 @@ pub fn get_keys() -> Result<&'static Keys, MostroError> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Build and enqueue a replaceable rating event for `user` (NIP-33 kind 38384).
+///
+/// Callers must have already claimed the order's rating flag and persisted the
+/// aggregate user rating inside a committed transaction — this helper only
+/// publishes the Nostr side-effect after that durable claim. It does not write
+/// `buyer_sent_rate` / `seller_sent_rate`.
 pub async fn update_user_rating_event(
     user: &str,
-    buyer_sent_rate: bool,
-    seller_sent_rate: bool,
     tags: Tags,
-    msg: &Message,
     keys: &Keys,
-    pool: &SqlitePool,
-) -> Result<()> {
-    // Get order from msg
-    let mut order = get_order(msg, pool).await?;
-
-    // nip33 kind with user as identifier (kind 38384 for ratings)
-    let event = new_rating_event(keys, "", user.to_string(), tags)?;
+) -> Result<(), MostroError> {
+    let event = new_rating_event(keys, "", user.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Sending replaceable event: {event:#?}");
-    // We update the order vote status
-    if buyer_sent_rate {
-        order.buyer_sent_rate = buyer_sent_rate;
-    }
-    if seller_sent_rate {
-        order.seller_sent_rate = seller_sent_rate;
-    }
-    order.update(pool).await?;
-
-    // Add event message to global list
     MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
     Ok(())
 }
@@ -907,11 +892,313 @@ async fn get_ratings_for_pending_order(
     }
 }
 
+/// Best-effort repair of the relay view after a pre-trade CAS miss. The
+/// caller published its transition via `update_order_event` *before*
+/// learning it lost the race, so the newest replaceable event on relays
+/// contradicts the database (e.g. relays advertise `waiting-payment` for
+/// an order that is actually `canceled`). Republish the state that
+/// actually won so the orderbook converges. Never fails the caller: the
+/// database is already correct — this is only the advertised view.
+pub async fn republish_winning_state_after_cas_miss(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    order_id: Uuid,
+) {
+    let current = match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("cas miss repair: could not reload order {order_id}: {e}");
+            return;
+        }
+    };
+    match current.get_order_status() {
+        Ok(status) => {
+            // The stale event was published moments ago, usually within the
+            // same Unix second. NIP-01 breaks same-timestamp ties by lowest
+            // event id, so stamp the repair strictly after `now` to guarantee
+            // it replaces the stale event on relays.
+            let repair_created_at = repair_timestamp(Timestamp::now());
+            if let Err(e) = update_order_event_with_created_at(
+                my_keys,
+                status,
+                &current,
+                Some(repair_created_at),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "cas miss repair: could not republish order {order_id} as {status}: {e}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("cas miss repair: order {order_id} has bad status: {e}"),
+    }
+}
+
+/// Timestamp for a CAS-miss repair event: strictly after `now`, so the repair
+/// wins NIP-01 replaceable-event ordering even against a stale event
+/// published in the same Unix second (same-second ties fall back to lowest
+/// event id, which the repair could lose).
+fn repair_timestamp(now: Timestamp) -> Timestamp {
+    Timestamp::from(now.as_secs() + 1)
+}
+
+/// Per-order publication state behind one lock: the last `created_at`
+/// published per order d-tag, plus a process-wide publication generation
+/// counter. Consecutive kind-38383 revisions of the same order never tie
+/// on the same Unix second — NIP-01 breaks same-timestamp ties on
+/// replaceable events by *lowest* event id, a coin flip that can leave a
+/// dead `pending` revision as the winning state on relays (e.g. create +
+/// instant take, create + maker cancel).
+///
+/// The generation counter lives under the same mutex so generation order
+/// always matches stamp order: a publication stamped later is guaranteed a
+/// larger generation, which is what lets a successful send clear only
+/// failures recorded by publications stamped no later than itself.
+///
+/// Process-local by design: this daemon's key is the only legitimate
+/// publisher of its orders' events, so a per-process registry is enough to
+/// order its own revisions. Across a restart the map starts empty, but two
+/// publishes for the same order on both sides of a restart cannot land in
+/// the same second in practice.
+struct OrderbookRegistry {
+    last_ts: HashMap<Uuid, u64>,
+    generation: u64,
+}
+
+static ORDERBOOK_REGISTRY: std::sync::LazyLock<std::sync::Mutex<OrderbookRegistry>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(OrderbookRegistry {
+            last_ts: HashMap::new(),
+            generation: 0,
+        })
+    });
+
+/// Registry entries older than this are pruned once the map grows past
+/// [`ORDER_TS_PRUNE_THRESHOLD`]; ties only matter within the same second,
+/// so anything published days ago can never tie with a new revision.
+const ORDER_TS_MAX_AGE_SECS: u64 = 48 * 3600;
+const ORDER_TS_PRUNE_THRESHOLD: usize = 16_384;
+
+/// The `created_at` to stamp on a kind-38383 revision plus the publication
+/// generation assigned under the same lock (see [`ORDERBOOK_REGISTRY`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OrderbookStamp {
+    pub created_at: Timestamp,
+    pub generation: u64,
+}
+
+fn stamp_locked(
+    registry: &mut OrderbookRegistry,
+    order_id: Uuid,
+    candidate: u64,
+) -> OrderbookStamp {
+    let effective = match registry.last_ts.get(&order_id) {
+        Some(&last) => candidate.max(last + 1),
+        None => candidate,
+    };
+    if registry.last_ts.len() >= ORDER_TS_PRUNE_THRESHOLD {
+        registry
+            .last_ts
+            .retain(|_, &mut ts| ts + ORDER_TS_MAX_AGE_SECS > effective);
+    }
+    registry.last_ts.insert(order_id, effective);
+    registry.generation += 1;
+    OrderbookStamp {
+        created_at: Timestamp::from(effective),
+        generation: registry.generation,
+    }
+}
+
+/// Stamp the next kind-38383 revision of `order_id`: the candidate
+/// timestamp, bumped to strictly after the last published revision when
+/// both land in the same second (`max(candidate, last + 1)`). Records the
+/// result and assigns the publication generation atomically.
+pub(crate) fn stamp_orderbook_event(order_id: Uuid, candidate: Timestamp) -> OrderbookStamp {
+    let mut registry = ORDERBOOK_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stamp_locked(&mut registry, order_id, candidate.as_secs())
+}
+
+/// Like [`stamp_orderbook_event`], but refuses to stamp when the order was
+/// already stamped within the last `quiet_secs` — the reconciler's guard
+/// against superseding an in-flight transition. Handlers publish *before*
+/// persisting their CAS, so a background republish that reads the DB row
+/// and stamps after such a handler would advertise the stale pre-CAS state
+/// with a newer `created_at`, and the relay would keep it forever. The
+/// check and the stamp share one lock, so the guard is airtight: any
+/// transition stamped before this call is visible here (and recent →
+/// skip), and any transition stamped after it gets a strictly larger
+/// timestamp and wins on relays regardless.
+pub(crate) fn try_stamp_orderbook_event_quiescent(
+    order_id: Uuid,
+    candidate: Timestamp,
+    quiet_secs: u64,
+) -> Option<OrderbookStamp> {
+    let mut registry = ORDERBOOK_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let candidate = candidate.as_secs();
+    if let Some(&last) = registry.last_ts.get(&order_id) {
+        if candidate < last.saturating_add(quiet_secs) {
+            return None;
+        }
+    }
+    Some(stamp_locked(&mut registry, order_id, candidate))
+}
+
+/// Next `created_at` for a kind-38383 revision of `order_id`, for callers
+/// that mark publish failures out-of-band (with a fresh generation) and
+/// only need the timestamp half of [`stamp_orderbook_event`].
+pub(crate) fn monotonic_order_event_timestamp(order_id: Uuid, candidate: Timestamp) -> Timestamp {
+    stamp_orderbook_event(order_id, candidate).created_at
+}
+
+/// Orders whose latest kind-38383 publish failed (relay send error or no
+/// Nostr client), so the DB state and the advertised orderbook diverged.
+/// The scheduler's orderbook reconciler drains this map and republishes the
+/// current DB state until the wire converges.
+///
+/// Each entry carries the publication generation that recorded the failure
+/// (see [`ORDERBOOK_REGISTRY`]). A successful send clears an entry only if
+/// the failure is not newer than itself: without the generation, a slow
+/// old send completing *after* a newer publication failed would erase that
+/// newer failure, and the state the newer publication carried would never
+/// be republished.
+static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Queue `order_id` for republish, recording the failure at `generation`.
+/// A newer failure already recorded for the order is never downgraded.
+pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) {
+    let mut queue = PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = queue.entry(order_id).or_insert(generation);
+    *entry = (*entry).max(generation);
+}
+
+/// Queue `order_id` for republish stamped with a fresh generation, for
+/// callers whose failure is detected out-of-band from the stamping path
+/// (initial order publication, child-order events). A fresh generation is
+/// the conservative choice: the entry can only be cleared by a publication
+/// stamped after this failure was recorded.
+pub(crate) fn mark_orderbook_publish_failed(order_id: Uuid) {
+    let generation = {
+        let mut registry = ORDERBOOK_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.generation += 1;
+        registry.generation
+    };
+    mark_orderbook_publish_failed_at(order_id, generation);
+}
+
+/// Drop `order_id` from the republish queue after a successful publish —
+/// but only if the recorded failure is not newer than the publication that
+/// succeeded (`generation`). A newer failure means a later publication's
+/// event never reached the relay; it must stay queued.
+pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: u64) {
+    let mut queue = PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&failed_at) = queue.get(&order_id) {
+        if failed_at <= generation {
+            queue.remove(&order_id);
+        }
+    }
+}
+
+/// Take the current set of orders awaiting republish (with the generation
+/// that recorded each failure), leaving the queue empty. Failed retries
+/// re-queue themselves via `update_order_event`.
+pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64)> {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect()
+}
+
+/// `true` when the order's take window has closed (`expires_at` reached,
+/// inclusive: the expiry second itself is already closed) but the expiry
+/// job has not canceled it yet. The scheduler tick runs every ~60 s, so a
+/// `pending` row can outlive its `expires_at` by up to a minute; take
+/// paths must reject in that window instead of relying on the tick.
+pub(crate) fn is_order_take_window_closed(order: &Order, now: i64) -> bool {
+    order.expires_at > 0 && order.expires_at <= now
+}
+
+/// Serializes tests that touch the process-global failed-publish queue
+/// (util + scheduler test modules share one test binary), so one test's
+/// drain cannot race another's enqueue-then-assert sequence.
+#[cfg(test)]
+pub(crate) static ORDERBOOK_QUEUE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Test-only visibility into the republish queue.
+#[cfg(test)]
+pub(crate) fn is_orderbook_publish_queued(order_id: Uuid) -> bool {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&order_id)
+}
+
 pub async fn update_order_event(
     keys: &Keys,
     status: Status,
     order: &Order,
 ) -> Result<Order, MostroError> {
+    update_order_event_with_created_at(keys, status, order, None).await
+}
+
+/// Same as [`update_order_event`], but allows overriding the published
+/// event's `created_at` (used by the CAS-miss repair path, which must stamp
+/// its event strictly after the stale one to win NIP-01 ordering).
+pub async fn update_order_event_with_created_at(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    created_at: Option<Timestamp>,
+) -> Result<Order, MostroError> {
+    update_order_event_stamped(keys, status, order, StampPolicy::Always { created_at })
+        .await
+        .map(|order| order.expect("StampPolicy::Always always stamps"))
+}
+
+/// Same as [`update_order_event`], but publishes only when the order has
+/// not been stamped within the last `quiet_secs` (see
+/// [`try_stamp_orderbook_event_quiescent`]). Returns `Ok(None)` when the
+/// publish was skipped because another publication is (or may be) in
+/// flight. Used by the orderbook reconciler, whose republish must never
+/// supersede a live transition that published before persisting its CAS.
+pub(crate) async fn update_order_event_if_quiescent(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    quiet_secs: u64,
+) -> Result<Option<Order>, MostroError> {
+    update_order_event_stamped(keys, status, order, StampPolicy::IfQuiescent { quiet_secs }).await
+}
+
+/// How [`update_order_event_stamped`] obtains its [`OrderbookStamp`].
+enum StampPolicy {
+    /// Stamp unconditionally, optionally overriding the candidate
+    /// `created_at` (CAS-miss repair).
+    Always { created_at: Option<Timestamp> },
+    /// Stamp only if the order has been quiet for `quiet_secs` (reconciler).
+    IfQuiescent { quiet_secs: u64 },
+}
+
+async fn update_order_event_stamped(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    policy: StampPolicy,
+) -> Result<Option<Order>, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
@@ -922,18 +1209,59 @@ pub async fn update_order_event(
     // We transform the order fields to tags to use in the event
     let mostro_pubkey = keys.public_key().to_hex();
     if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
+        // Every revision of an order's kind-38383 event is stamped through
+        // the monotonic registry so two transitions in the same Unix second
+        // (create + instant take, create + maker cancel, …) never tie on
+        // `created_at` — NIP-01 breaks such ties by lowest event id, which
+        // can leave a dead `pending` revision as the winning state.
+        let stamp = match policy {
+            StampPolicy::Always { created_at } => {
+                stamp_orderbook_event(order.id, created_at.unwrap_or_else(Timestamp::now))
+            }
+            StampPolicy::IfQuiescent { quiet_secs } => {
+                match try_stamp_orderbook_event_quiescent(order.id, Timestamp::now(), quiet_secs) {
+                    Some(stamp) => stamp,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let event_created_at = stamp.created_at;
         // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
-        let event = new_order_event(keys, "", order.id.to_string(), tags)
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        let event =
+            new_order_event_with_created_at(keys, "", order.id.to_string(), tags, event_created_at)
+                .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
         info!("Sending replaceable event: {event:#?}");
 
         // We update the order with the new event_id
         order_updated.event_id = event.id.to_string();
 
-        if let Ok(client) = get_nostr_client() {
-            if client.send_event(&event).await.is_err() {
-                tracing::warn!("order id : {} is expired", order_updated.id)
+        // A failed (or impossible) publish must not stay invisible: the DB
+        // is about to advance while relays keep advertising the previous
+        // state. Queue the order so the scheduler's orderbook reconciler
+        // republishes the current DB state until the wire converges.
+        match get_nostr_client() {
+            Ok(client) => match client.send_event(&event).await {
+                // Only failures recorded by publications stamped no later
+                // than this one may be cleared: a newer concurrent
+                // publication's failure must survive this older success.
+                Ok(_) => clear_orderbook_publish_failure_up_to(order.id, stamp.generation),
+                Err(e) => {
+                    tracing::warn!(
+                        "orderbook publish failed for order {} (status {}): {e}; queued for republish",
+                        order_updated.id,
+                        status
+                    );
+                    mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "orderbook publish skipped for order {} (status {}): no nostr client ({e}); queued for republish",
+                    order_updated.id,
+                    status
+                );
+                mark_orderbook_publish_failed_at(order.id, stamp.generation);
             }
         }
     };
@@ -944,7 +1272,7 @@ pub async fn update_order_event(
         status.to_string()
     );
 
-    Ok(order_updated)
+    Ok(Some(order_updated))
 }
 
 pub async fn connect_nostr() -> Result<Client, MostroError> {
@@ -956,8 +1284,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     // would drop matching trade messages before dispatch (hermeme, PR #841).
     // Price queries use [`connect_price_nostr`] / [`PRICE_NOSTR_CLIENT`] with
     // verification enabled instead.
-    let opts = mostro_nostr_client_options();
-    let client = ClientBuilder::default().opts(opts).build();
+    let client = mostro_nostr_client_options().build();
 
     // Add relays
     for relay in nostr_settings.relays.iter() {
@@ -977,9 +1304,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
 /// daemon client, with [`price_nostr_client_options`]).
 pub async fn connect_price_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
-    let client = ClientBuilder::default()
-        .opts(price_nostr_client_options())
-        .build();
+    let client = price_nostr_client_options().build();
 
     for relay in nostr_settings.relays.iter() {
         client
@@ -992,9 +1317,9 @@ pub async fn connect_price_nostr() -> Result<Client, MostroError> {
     Ok(client)
 }
 
-/// Observable policy for Mostro Nostr clients. [`ClientOptions`] fields are
-/// not publicly readable, so production paths go through this struct and
-/// tests assert on it directly (hermeme, PR #841).
+/// Observable policy for Mostro Nostr clients. [`ClientBuilder`] is
+/// constructed fresh by [`client_options_from_policy`], so production paths
+/// go through this struct and tests assert on it directly (hermeme, PR #841).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MostroNostrClientPolicy {
     /// When true, the relay driver rejects non-matching / over-limit events
@@ -1026,23 +1351,42 @@ fn mostro_nostr_relay_limits() -> RelayLimits {
     limits
 }
 
-fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientOptions {
-    let mut opts = ClientOptions::new().relay_limits(mostro_nostr_relay_limits());
+fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientBuilder {
+    let mut builder = ClientBuilder::new().relay_limits(mostro_nostr_relay_limits());
     if policy.verify_subscriptions {
-        opts = opts.verify_subscriptions(true);
+        builder = builder.verify_subscriptions(true);
     }
-    opts
+    builder
 }
 
-/// Process-wide daemon Nostr [`ClientOptions`] (inbox / publishing).
-pub(crate) fn mostro_nostr_client_options() -> ClientOptions {
+/// Process-wide daemon Nostr [`ClientBuilder`] (inbox / publishing).
+pub(crate) fn mostro_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(daemon_nostr_client_policy())
 }
 
-/// Price-provider Nostr [`ClientOptions`]: size limits plus subscription
+/// Price-provider Nostr [`ClientBuilder`]: size limits plus subscription
 /// filter verification, scoped away from the daemon inbox client.
-pub(crate) fn price_nostr_client_options() -> ClientOptions {
+pub(crate) fn price_nostr_client_options() -> ClientBuilder {
     client_options_from_policy(price_nostr_client_policy())
+}
+
+/// Which caller drove `show_hold_invoice`, and therefore which order
+/// statuses its compare-and-swap may still overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldInvoiceOrigin {
+    /// A take handler: `take_sell`, `take_buy`, or the post-bond resume.
+    /// Only the pre-trade statuses may be swapped out, so a take that raced
+    /// in behind an already-committed one loses instead of clobbering it.
+    Take,
+    /// `add_invoice`: the buyer supplied their payout invoice, so the row
+    /// legitimately sits at `waiting-buyer-invoice`.
+    BuyerInvoice,
+}
+
+impl HoldInvoiceOrigin {
+    fn allows_waiting_buyer_invoice(self) -> bool {
+        matches!(self, Self::BuyerInvoice)
+    }
 }
 
 pub async fn show_hold_invoice(
@@ -1052,6 +1396,7 @@ pub async fn show_hold_invoice(
     seller_pubkey: &PublicKey,
     mut order: Order,
     request_id: Option<u64>,
+    origin: HoldInvoiceOrigin,
 ) -> Result<(), MostroError> {
     let mut ln_client = lightning::LndConnector::new().await?;
     // Seller pays only the order amount and their Mostro fee
@@ -1089,10 +1434,29 @@ pub async fn show_hold_invoice(
     let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    order_updated
-        .update(&pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // Compare-and-swap the escrow storage: if the order left the pre-trade
+    // window while the hold invoice was being created at LND (e.g. a maker
+    // cancel committed), persisting this snapshot would resurrect the row
+    // and strand the invoice. On a miss, cancel the orphaned invoice and
+    // bail instead. Only the `add_invoice` origin may also swap out
+    // `waiting-buyer-invoice`; a take arriving from there raced in behind
+    // a committed take and must lose rather than clobber it.
+    let won = db::cas_complete_pretrade_take(
+        &pool,
+        &order_updated,
+        origin.allows_waiting_buyer_invoice(),
+    )
+    .await?;
+    if !won {
+        if let Err(e) = ln_client.cancel_hold_invoice(&bytes_to_string(&hash)).await {
+            tracing::warn!(
+                "Order id {}: best-effort cancel of orphaned hold invoice failed: {e}",
+                order.id
+            );
+        }
+        republish_winning_state_after_cas_miss(&pool, my_keys, order.id).await;
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
 
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
@@ -1175,7 +1539,14 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result
                     }
                 } else if msg.state == InvoiceState::Canceled {
                     // If the payment was canceled
-                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool).await {
+                    let keys = match get_keys() {
+                        Ok(k) => k,
+                        Err(e) => {
+                            info!("Failed to get keys: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = flow::hold_invoice_canceled(&hash, &pool, keys).await {
                         info!("Invoice flow error {e}");
                     }
                 } else {
@@ -1326,6 +1697,49 @@ pub async fn settle_seller_hold_invoice(
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
     Ok(())
+}
+
+/// Nominal seconds per block for CLTV-horizon math (10 min). Bitcoin's
+/// long-run average. Time-based deadlines derived from it are only an
+/// approximation of the real, block-height-measured CLTV horizon — the
+/// escrow-deadline guardian consults the chain height and the accepted
+/// HTLC's actual expiry height when LND can answer, and falls back to
+/// this nominal clock only when it cannot.
+const SECS_PER_BLOCK: i64 = 600;
+
+/// Seconds between the escrow payment and the moment the deadline
+/// guardian acts: `(cltv_delta - margin)` blocks. A misconfigured margin
+/// `>= cltv_delta` would make the guardian fire on brand-new escrows, so
+/// it is clamped to half the window (loudly) instead of being honored.
+pub fn escrow_guard_window_secs(cltv_delta_blocks: u32, margin_blocks: u32) -> i64 {
+    let effective_margin = if margin_blocks >= cltv_delta_blocks {
+        tracing::error!(
+            "escrow_deadline_margin_blocks ({margin_blocks}) must be below \
+             hold_invoice_cltv_delta ({cltv_delta_blocks}); clamping to half \
+             the window"
+        );
+        cltv_delta_blocks / 2
+    } else {
+        margin_blocks
+    };
+    i64::from(cltv_delta_blocks - effective_margin) * SECS_PER_BLOCK
+}
+
+/// Unix timestamp from which the escrow-deadline guardian acts on an
+/// order when no chain view is available: the nominal CLTV horizon minus
+/// the safety margin, measured in 10-minute blocks from the moment the
+/// escrow was observed (`invoice_held_at`). Only a fallback — the real
+/// deadline is the accepted HTLC's expiry height vs the chain tip.
+/// `None` when `invoice_held_at` is 0 (escrow never observed).
+pub fn escrow_action_deadline_unix(
+    invoice_held_at: i64,
+    cltv_delta_blocks: u32,
+    margin_blocks: u32,
+) -> Option<i64> {
+    if invoice_held_at == 0 {
+        return None;
+    }
+    Some(invoice_held_at + escrow_guard_window_secs(cltv_delta_blocks, margin_blocks))
 }
 
 pub fn bytes_to_string(bytes: &[u8]) -> String {
@@ -1649,6 +2063,216 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    /// Regression: the CAS-miss repair timestamp must be strictly newer than
+    /// `now`, otherwise a repair published in the same Unix second as the
+    /// stale event ties on `created_at` and NIP-01's lowest-id tie-breaker
+    /// can keep the stale state on relays.
+    #[test]
+    fn repair_timestamp_is_strictly_after_now() {
+        let now = Timestamp::from(1_700_000_000);
+        let repair = repair_timestamp(now);
+        assert!(repair > now);
+        assert_eq!(repair.as_secs(), now.as_secs() + 1);
+    }
+
+    // ───────────────── monotonic per-order created_at registry ─────────────────
+
+    /// Two revisions of the same order in the same Unix second must not tie:
+    /// NIP-01 breaks same-timestamp ties by lowest event id, which can keep a
+    /// dead `pending` revision as the winning state on relays.
+    #[test]
+    fn monotonic_timestamp_bumps_same_second_revisions() {
+        let order_id = Uuid::new_v4();
+        let now = Timestamp::from(1_700_000_000);
+
+        let first = monotonic_order_event_timestamp(order_id, now);
+        let second = monotonic_order_event_timestamp(order_id, now);
+        let third = monotonic_order_event_timestamp(order_id, now);
+
+        assert_eq!(first.as_secs(), 1_700_000_000);
+        assert_eq!(second.as_secs(), 1_700_000_001);
+        assert_eq!(third.as_secs(), 1_700_000_002);
+    }
+
+    /// A later wall-clock candidate wins over `last + 1` — the registry only
+    /// bumps when it must, so timestamps track real time whenever possible.
+    #[test]
+    fn monotonic_timestamp_uses_candidate_when_already_newer() {
+        let order_id = Uuid::new_v4();
+
+        let first = monotonic_order_event_timestamp(order_id, Timestamp::from(1_700_000_000));
+        let later = monotonic_order_event_timestamp(order_id, Timestamp::from(1_700_000_100));
+
+        assert_eq!(first.as_secs(), 1_700_000_000);
+        assert_eq!(later.as_secs(), 1_700_000_100);
+    }
+
+    /// Orders are independent d-tags: one order's revisions must not bump
+    /// another order's timestamps.
+    #[test]
+    fn monotonic_timestamp_is_per_order() {
+        let now = Timestamp::from(1_700_000_000);
+        let order_a = Uuid::new_v4();
+        let order_b = Uuid::new_v4();
+
+        let _ = monotonic_order_event_timestamp(order_a, now);
+        let b = monotonic_order_event_timestamp(order_b, now);
+
+        assert_eq!(
+            b.as_secs(),
+            now.as_secs(),
+            "order_b must not inherit order_a's bump"
+        );
+    }
+
+    /// The CAS-miss repair path still wins ordering when routed through the
+    /// registry: the repair candidate (`now + 1`) can never be flattened back
+    /// onto the stale revision's second.
+    #[test]
+    fn monotonic_timestamp_keeps_repair_strictly_after_stale() {
+        let order_id = Uuid::new_v4();
+        let now = Timestamp::from(1_700_000_000);
+
+        let stale = monotonic_order_event_timestamp(order_id, now);
+        let repair = monotonic_order_event_timestamp(order_id, repair_timestamp(now));
+
+        assert!(repair > stale, "repair must out-order the stale revision");
+    }
+
+    /// The quiescence guard: an order stamped within the quiet window must
+    /// not be stamped again by a reconciler republish (it could supersede a
+    /// transition that published before persisting its CAS), while an order
+    /// quiet for longer than the window stamps normally.
+    #[test]
+    fn quiescent_stamp_skips_recently_stamped_order() {
+        let order_id = Uuid::new_v4();
+        let now = Timestamp::from(1_700_000_000);
+        let quiet = 120;
+
+        let transition = stamp_orderbook_event(order_id, now);
+        assert!(
+            try_stamp_orderbook_event_quiescent(order_id, now, quiet).is_none(),
+            "a sweep racing a just-stamped transition must be refused"
+        );
+        assert!(
+            try_stamp_orderbook_event_quiescent(
+                order_id,
+                Timestamp::from(now.as_secs() + quiet - 1),
+                quiet
+            )
+            .is_none(),
+            "still inside the quiet window"
+        );
+
+        let sweep = try_stamp_orderbook_event_quiescent(
+            order_id,
+            Timestamp::from(now.as_secs() + quiet),
+            quiet,
+        )
+        .expect("outside the quiet window the sweep must stamp");
+        assert!(sweep.created_at > transition.created_at);
+        assert!(
+            sweep.generation > transition.generation,
+            "generation order must match stamp order"
+        );
+    }
+
+    /// A never-stamped order (fresh daemon start) has no in-flight
+    /// publication to protect; the quiescent stamp must proceed.
+    #[test]
+    fn quiescent_stamp_allows_never_stamped_order() {
+        let order_id = Uuid::new_v4();
+        let stamp =
+            try_stamp_orderbook_event_quiescent(order_id, Timestamp::from(1_700_000_000), 120)
+                .expect("an order with no registry entry must stamp");
+        assert_eq!(stamp.created_at.as_secs(), 1_700_000_000);
+    }
+
+    /// A slow old send completing after a newer publication failed must not
+    /// erase that newer failure: the newer publication's event never reached
+    /// the relay, so the entry has to stay queued for the reconciler.
+    #[tokio::test]
+    async fn newer_failure_survives_older_success() {
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let order_id = Uuid::new_v4();
+
+        mark_orderbook_publish_failed_at(order_id, 10);
+        clear_orderbook_publish_failure_up_to(order_id, 9);
+        assert!(
+            is_orderbook_publish_queued(order_id),
+            "an older success must not clear a newer failure"
+        );
+
+        // Re-marking with an older generation must not downgrade the entry.
+        mark_orderbook_publish_failed_at(order_id, 5);
+        clear_orderbook_publish_failure_up_to(order_id, 9);
+        assert!(
+            is_orderbook_publish_queued(order_id),
+            "a stale re-mark must not downgrade the recorded failure"
+        );
+
+        clear_orderbook_publish_failure_up_to(order_id, 10);
+        assert!(
+            !is_orderbook_publish_queued(order_id),
+            "a success at least as new as the failure clears it"
+        );
+    }
+
+    // ───────────────── failed-publish queue (orderbook reconciler) ─────────────────
+
+    /// A publish that cannot reach any relay must leave a trace: the order id
+    /// is queued for the orderbook reconciler instead of silently diverging
+    /// DB state from the advertised book (the finding's swallowed-publish
+    /// defect: pre-fix this was a `warn!` and nothing else).
+    #[tokio::test]
+    async fn update_order_event_queues_republish_when_publish_fails() {
+        init_globals();
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let keys = Keys::generate();
+
+        // A `Canceled` transition emits an event but skips the reputation
+        // lookup, so this test never touches the process-global DB pool.
+        let order = base_order(OrderKind::Sell, Status::Pending);
+
+        // The test-global Nostr client has no relays, so the send fails.
+        let updated = update_order_event(&keys, Status::Canceled, &order)
+            .await
+            .expect("publish failure must not fail the caller");
+
+        assert!(!updated.event_id.is_empty(), "event must still be built");
+        assert!(
+            is_orderbook_publish_queued(order.id),
+            "failed publish must queue the order for the reconciler"
+        );
+
+        // A drained entry stays drained until the next failure.
+        let drained = take_failed_orderbook_publishes();
+        assert!(drained.iter().any(|(id, _)| *id == order.id));
+        assert!(!is_orderbook_publish_queued(order.id));
+    }
+
+    // ───────────────── take-window gate ─────────────────
+
+    #[test]
+    fn take_window_closed_for_expired_order() {
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        let now = order.expires_at + 10;
+        assert!(is_order_take_window_closed(&order, now));
+
+        // Equality boundary: the expiry second itself is already closed.
+        // Both take paths (`take_buy`, `take_sell`) gate through this
+        // function with `Timestamp::now()`, so a take landing exactly at
+        // `expires_at` must be rejected.
+        assert!(is_order_take_window_closed(&order, order.expires_at));
+
+        // Still-open window: not closed.
+        assert!(!is_order_take_window_closed(&order, order.expires_at - 10));
+
+        // Legacy rows without expires_at are exempt.
+        order.expires_at = 0;
+        assert!(!is_order_take_window_closed(&order, now));
     }
 
     #[test]
@@ -2117,7 +2741,13 @@ mod tests {
     /// migrations against the live pool unconditionally — they are idempotent
     /// (tracked in `_sqlx_migrations`) and guarantee the tables these tests
     /// need exist regardless of who won.
+    /// Serializes global-pool initialization: two tests racing through this
+    /// helper could interleave `set` + migration runs on the winning pool,
+    /// leaving one of them querying tables that are not applied yet.
+    static GLOBAL_POOL_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn ensure_global_db_pool() -> std::sync::Arc<SqlitePool> {
+        let _guard = GLOBAL_POOL_INIT.lock().await;
         if DB_POOL.get().is_none() {
             let pool = migrated_pool().await;
             let _ = DB_POOL.set(std::sync::Arc::new(pool));
@@ -2561,23 +3191,18 @@ mod tests {
             "price client must enable verify_subscriptions"
         );
         // Helpers remain constructible (SDK copies the flag into RelayOptions).
-        let _daemon = ClientBuilder::default()
-            .opts(mostro_nostr_client_options())
-            .build();
-        let _price = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let _daemon = mostro_nostr_client_options().build();
+        let _price = price_nostr_client_options().build();
     }
 
     #[tokio::test]
     async fn price_client_rejects_mismatched_events_before_pool() {
         use futures::StreamExt;
-        use nostr_relay_builder::builder::RelayTestOptions;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::{LocalRelayTestOptions, MockRelay};
         use std::time::Duration;
 
         // Noncompliant relay floods random events that do not match the REQ.
-        let mock = MockRelay::run_with_opts(RelayTestOptions {
+        let mock = MockRelay::run_with_opts(LocalRelayTestOptions {
             unresponsive_connection: None,
             send_random_events: true,
         })
@@ -2585,18 +3210,17 @@ mod tests {
         .expect("mock relay");
         let url = mock.url().await;
 
-        let price_client = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let price_client = price_nostr_client_options().build();
         price_client
             .add_relay(url.clone())
             .await
             .expect("add_relay");
         price_client.connect().await;
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::Metadata).limit(3);
+        let filter = Filter::new().kind(nostr::event::Kind::Metadata).limit(3);
         let mut stream = price_client
-            .stream_events(filter, Duration::from_secs(3))
+            .stream_events(filter)
+            .timeout(Duration::from_secs(3))
             .await
             .expect("stream");
         let mut received = 0usize;
@@ -2611,7 +3235,8 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_client_limit_zero_still_delivers_live_after_eose() {
-        use nostr_relay_builder::MockRelay;
+        use futures::StreamExt;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Clean mock (no random flood): mirrors main.rs `.limit(0)` inbox —
@@ -2621,9 +3246,7 @@ mod tests {
         let mock = MockRelay::run().await.expect("mock relay");
         let url = mock.url().await;
 
-        let daemon = ClientBuilder::default()
-            .opts(mostro_nostr_client_options())
-            .build();
+        let daemon = mostro_nostr_client_options().build();
         daemon.add_relay(url.clone()).await.expect("add_relay");
         daemon.connect().await;
 
@@ -2635,15 +3258,15 @@ mod tests {
         // the live event.
         let mut notifications = daemon.notifications();
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(0);
-        daemon.subscribe(filter, None).await.expect("subscribe");
+        let filter = Filter::new().kind(nostr::event::Kind::TextNote).limit(0);
+        daemon.subscribe(filter).await.expect("subscribe");
 
         // Empty relay ⇒ EOSE quickly; then publish a matching live event.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let keys = Keys::generate();
-        let live = EventBuilder::text_note("live-after-eose")
-            .sign_with_keys(&keys)
+        let live = EventBuilder::new(nostr::event::Kind::TextNote, "live-after-eose")
+            .finalize(&keys)
             .expect("sign");
         let live_id = live.id;
         publisher
@@ -2652,8 +3275,8 @@ mod tests {
             .expect("publish live event");
 
         let got = tokio::time::timeout(Duration::from_secs(8), async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
+            while let Some(notification) = notifications.next().await {
+                if let ClientNotification::Event { event, .. } = notification {
                     if event.id == live_id {
                         return true;
                     }
@@ -2672,7 +3295,7 @@ mod tests {
     #[tokio::test]
     async fn price_client_enforces_filter_limit_before_pool() {
         use futures::StreamExt;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         let mock = MockRelay::run().await.expect("mock relay");
@@ -2684,21 +3307,20 @@ mod tests {
         seeder.connect().await;
         let keys = Keys::generate();
         for i in 0..10 {
-            let event = EventBuilder::text_note(format!("seed-{i}"))
-                .sign_with_keys(&keys)
+            let event = EventBuilder::new(nostr::event::Kind::TextNote, format!("seed-{i}"))
+                .finalize(&keys)
                 .expect("sign");
             seeder.send_event(&event).await.expect("seed");
         }
 
-        let price_client = ClientBuilder::default()
-            .opts(price_nostr_client_options())
-            .build();
+        let price_client = price_nostr_client_options().build();
         price_client.add_relay(url).await.expect("add_relay");
         price_client.connect().await;
 
-        let filter = Filter::new().kind(nostr_sdk::Kind::TextNote).limit(3);
+        let filter = Filter::new().kind(nostr::event::Kind::TextNote).limit(3);
         let mut stream = price_client
-            .stream_events(filter, Duration::from_secs(5))
+            .stream_events(filter)
+            .timeout(Duration::from_secs(5))
             .await
             .expect("stream");
         let mut received = 0usize;
@@ -2744,6 +3366,64 @@ mod tests {
             .is_err());
     }
 
+    /// Regression: `show_hold_invoice` used to hardcode
+    /// `allow_waiting_buyer_invoice = true` for every caller, so a take that
+    /// raced in behind an already-committed no-invoice take (row at
+    /// `waiting-buyer-invoice`, first taker recorded) still won the CAS and
+    /// clobbered that taker. Only the `add_invoice` caller may treat
+    /// `waiting-buyer-invoice` as a legitimate source.
+    #[test]
+    fn only_the_buyer_invoice_caller_may_swap_out_waiting_buyer_invoice() {
+        assert!(
+            !HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+            "take paths must lose against an already-committed take"
+        );
+        assert!(
+            HoldInvoiceOrigin::BuyerInvoice.allows_waiting_buyer_invoice(),
+            "add_invoice legitimately arrives from waiting-buyer-invoice"
+        );
+    }
+
+    /// The take-path scope must actually be refused by the CAS it feeds, so
+    /// the mapping above is wired to real database behaviour rather than
+    /// just asserting an enum against itself.
+    #[tokio::test]
+    async fn take_origin_cas_scope_cannot_clobber_a_committed_take() {
+        use mostro_core::db::Crud;
+
+        let pool = SqlitePoolOptions::new().connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // First taker already committed: row waits for their invoice.
+        let mut committed = base_order(OrderKind::Sell, Status::WaitingBuyerInvoice);
+        committed.id = Uuid::new_v4();
+        committed.buyer_pubkey = Some("aa".repeat(32));
+        let stored = committed.create(&pool).await.unwrap();
+
+        // Second taker, racing in from a stale `pending` read, reaches
+        // show_hold_invoice and tries to store its own escrow.
+        let mut racer = stored.clone();
+        racer.status = Status::WaitingPayment.to_string();
+        racer.buyer_pubkey = Some("bb".repeat(32));
+
+        let won = db::cas_complete_pretrade_take(
+            &pool,
+            &racer,
+            HoldInvoiceOrigin::Take.allows_waiting_buyer_invoice(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!won, "the racing take must lose");
+        let after = Order::by_id(&pool, stored.id).await.unwrap().unwrap();
+        assert_eq!(after.status, Status::WaitingBuyerInvoice.to_string());
+        assert_eq!(
+            after.buyer_pubkey,
+            Some("aa".repeat(32)),
+            "the first taker must survive"
+        );
+    }
+
     // ───────────────────────── LND-dependent early failures ─────────────────────────
 
     #[tokio::test]
@@ -2754,7 +3434,16 @@ mod tests {
         let seller = Keys::generate().public_key();
         let order = base_order(OrderKind::Sell, Status::WaitingPayment);
 
-        let res = show_hold_invoice(&keys, None, &buyer, &seller, order, None).await;
+        let res = show_hold_invoice(
+            &keys,
+            None,
+            &buyer,
+            &seller,
+            order,
+            None,
+            HoldInvoiceOrigin::Take,
+        )
+        .await;
         assert!(res.is_err(), "no LND reachable in unit tests");
     }
 
@@ -2840,6 +3529,21 @@ mod tests {
             identity: trade.public_key(),
             created_at: Timestamp::now(),
         }
+    }
+
+    #[test]
+    fn escrow_deadline_math_matches_the_cltv_horizon() {
+        // 10-minute blocks: (144 - 24) * 600.
+        assert_eq!(escrow_guard_window_secs(144, 24), 72_000);
+        // A margin at/above the window clamps to half — never negative,
+        // never firing on brand-new escrows.
+        assert_eq!(escrow_guard_window_secs(144, 144), 43_200);
+        assert_eq!(escrow_guard_window_secs(144, 1_000), 43_200);
+        assert_eq!(escrow_action_deadline_unix(0, 144, 24), None);
+        assert_eq!(
+            escrow_action_deadline_unix(1_000, 144, 24),
+            Some(1_000 + 72_000)
+        );
     }
 
     #[tokio::test]

@@ -138,8 +138,21 @@ impl Settings {
     )]
     pub fn get_transport() -> Transport {
         #[allow(deprecated)]
-        MOSTRO_CONFIG
-            .get()
+        Self::transport_or_default(MOSTRO_CONFIG.get())
+    }
+
+    /// Selection logic behind [`Settings::get_transport`], split out so the
+    /// uninitialized (`None`) fallback is unit-testable without touching the
+    /// process-wide `MOSTRO_CONFIG`.
+    ///
+    /// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting.
+    #[deprecated(
+        since = "0.18.0",
+        note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
+    )]
+    fn transport_or_default(settings: Option<&Settings>) -> Transport {
+        #[allow(deprecated)]
+        settings
             .map(|s| s.mostro.transport)
             .unwrap_or_else(crate::config::types::default_transport)
     }
@@ -237,9 +250,31 @@ mod tests {
     }
 
     #[test]
-    fn transport_falls_back_to_nip44() {
-        // Daemon default is protocol v2, regardless of mostro-core's
-        // `Transport::default()` (gift-wrap).
+    #[allow(deprecated)]
+    fn transport_falls_back_to_nip44_when_uninitialized() {
+        // No global config ⇒ daemon default is protocol v2, regardless of
+        // mostro-core's `Transport::default()` (gift-wrap).
+        assert_eq!(Settings::transport_or_default(None), Transport::Nip44Direct);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn transport_uses_configured_value_when_initialized() {
+        let mut settings = test_settings();
+        settings.mostro.transport = Transport::GiftWrap;
+        assert_eq!(
+            Settings::transport_or_default(Some(&settings)),
+            Transport::GiftWrap
+        );
+        settings.mostro.transport = Transport::Nip44Direct;
+        assert_eq!(
+            Settings::transport_or_default(Some(&settings)),
+            Transport::Nip44Direct
+        );
+    }
+
+    #[test]
+    fn get_transport_reads_global_config() {
         init_test_settings();
         #[allow(deprecated)]
         let transport = Settings::get_transport();

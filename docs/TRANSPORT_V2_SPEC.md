@@ -124,8 +124,9 @@ There is **no dual mode**: a node speaks exactly one protocol version.
 
 ```toml
 [mostro]
-# "gift-wrap" (protocol v1, DEPRECATED) | "nip44" (protocol v2)
-transport = "gift-wrap"
+# "nip44" (protocol v2, default) | "gift-wrap" (protocol v1, DEPRECATED,
+# explicit opt-in only)
+transport = "nip44"
 
 [expiration]
 # kind-14 direct messages

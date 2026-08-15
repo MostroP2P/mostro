@@ -61,6 +61,15 @@ pub async fn check_failure_retries(
 
     // Count payment retries up to limit
     order.count_failed_payment(retries_number);
+    // Only update payment-retry fields to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
+    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
+        .bind(order.failed_payment)
+        .bind(order.payment_attempts)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
@@ -111,16 +120,6 @@ pub async fn check_failure_retries(
         )
         .await;
     }
-
-    // Only update payment-retry fields to avoid overwriting fields modified by
-    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
-    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
-        .bind(order.failed_payment)
-        .bind(order.payment_attempts)
-        .bind(order.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
@@ -531,17 +530,26 @@ async fn handle_child_order(
 /// CLTV bound, not already expired) before LND submission; resolve, decode and
 /// validation failures plus `send_payment` RPC errors go through
 /// [`check_failure_retries_or_log`] and return `Err` (no empty status-watcher
-/// spawn). Streamed `PaymentStatus::Failed` updates also bump retry
-/// bookkeeping. Callers such as `release_action` typically ignore the error
-/// after hold settlement — retries are driven by the failed-payment job.
+/// spawn). Missing buyer invoice, zero amount after fee, and LND connection
+/// failures are also routed through [`check_failure_retries_or_log`] so every
+/// failure path marks the order for retry. Streamed `PaymentStatus::Failed`
+/// updates also bump retry bookkeeping. Callers such as `release_action`
+/// typically ignore the error after hold settlement — retries are driven by
+/// the failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
     mut order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    // Seller already settled at this point — every failure must call
+    // check_failure_retries_or_log so the retry scheduler can pay the buyer.
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
-        _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+        _ => {
+            warn!("Order id {}: no buyer invoice; scheduling retry", order.id);
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+        }
     };
 
     let ln_addr = LightningAddress::from_str(&payment_request);
@@ -549,6 +557,11 @@ pub async fn do_payment(
     // Dev fee is NOT charged to buyer - it's paid by mostrod from its earnings
     let amount = (order.amount as u64).saturating_sub(order.fee as u64);
     if amount == 0 {
+        warn!(
+            "Order id {}: payment amount is zero after fee; scheduling retry",
+            order.id
+        );
+        check_failure_retries_or_log(ctx, &order, request_id).await;
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
     // `is_valid_invoice` accepts a Lightning Address *and* an encoded LNURL, so
@@ -607,7 +620,17 @@ pub async fn do_payment(
         },
         None => payment_request,
     };
-    let mut ln_client_payment = LndConnector::new().await?;
+    let mut ln_client_payment = match LndConnector::new().await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(
+                "Order id {}: failed to connect to LND: {}; scheduling retry",
+                order.id, e
+            );
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+            return Err(e);
+        }
+    };
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
@@ -1764,13 +1787,16 @@ mod tests {
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
         let order = fiat_sent_sell_order(seller, buyer);
+        let order = order.create(&pool).await.unwrap();
 
-        let result = do_payment(&ctx, order, None).await;
+        let result = do_payment(&ctx, order.clone(), None).await;
 
         assert!(matches!(
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
     }
 
     #[tokio::test]
@@ -1783,13 +1809,16 @@ mod tests {
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
         order.amount = 100;
         order.fee = 100;
+        let order = order.create(&pool).await.unwrap();
 
-        let result = do_payment(&ctx, order, None).await;
+        let result = do_payment(&ctx, order.clone(), None).await;
 
         assert!(matches!(
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
     }
 
     #[tokio::test]
@@ -1804,12 +1833,15 @@ mod tests {
         let buyer = Keys::generate().public_key();
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        let order = order.create(&pool).await.unwrap();
 
         // Act
-        let result = do_payment(&ctx, order, None).await;
+        let result = do_payment(&ctx, order.clone(), None).await;
 
         // Assert
         assert!(result.is_err());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
     }
 
     /// An expired regtest invoice: rejected by `validate_payout_invoice` on

@@ -284,10 +284,64 @@ mod tests {
     #[test]
     // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
     #[allow(deprecated)]
-    fn transport_defaults_to_gift_wrap() {
-        // v0.18.x default: wire-identical to pre-v2 daemons. The default
-        // flips to nip44 in v0.19.0 (docs/TRANSPORT_V2_SPEC.md §5).
-        assert_eq!(MostroSettings::default().transport, Transport::GiftWrap);
+    fn transport_defaults_to_nip44() {
+        // The daemon defaults to protocol v2; gift-wrap is opt-in only
+        // (docs/TRANSPORT_V2_SPEC.md §5).
+        assert_eq!(MostroSettings::default().transport, Transport::Nip44Direct);
+    }
+
+    #[test]
+    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
+    #[allow(deprecated)]
+    fn transport_omitted_in_toml_deserializes_to_nip44() {
+        // A settings.toml without a `transport` line must land on nip44 —
+        // not on mostro-core's `Transport::default()` (gift-wrap).
+        let toml = r#"
+            fee = 0.0
+            max_routing_fee = 0.002
+            max_order_amount = 1000000
+            min_payment_amount = 100
+            expiration_hours = 24
+            expiration_seconds = 900
+            user_rates_sent_interval_seconds = 3600
+            max_expiration_days = 15
+            publish_relays_interval = 60
+            pow = 0
+            publish_mostro_info_interval = 300
+            bitcoin_price_api_url = "https://api.yadio.io"
+            fiat_currencies_accepted = ["USD"]
+            max_orders_per_response = 10
+            dev_fee_percentage = 0.30
+        "#;
+        let settings: MostroSettings = toml::from_str(toml).expect("valid mostro settings");
+        assert_eq!(settings.transport, Transport::Nip44Direct);
+    }
+
+    #[test]
+    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
+    #[allow(deprecated)]
+    fn transport_gift_wrap_is_explicit_opt_in() {
+        // Operators can still pin protocol v1 by writing it out explicitly.
+        let toml = r#"
+            fee = 0.0
+            max_routing_fee = 0.002
+            max_order_amount = 1000000
+            min_payment_amount = 100
+            expiration_hours = 24
+            expiration_seconds = 900
+            user_rates_sent_interval_seconds = 3600
+            max_expiration_days = 15
+            publish_relays_interval = 60
+            pow = 0
+            publish_mostro_info_interval = 300
+            bitcoin_price_api_url = "https://api.yadio.io"
+            fiat_currencies_accepted = ["USD"]
+            max_orders_per_response = 10
+            dev_fee_percentage = 0.30
+            transport = "gift-wrap"
+        "#;
+        let settings: MostroSettings = toml::from_str(toml).expect("valid mostro settings");
+        assert_eq!(settings.transport, Transport::GiftWrap);
     }
 
     #[test]
@@ -542,9 +596,15 @@ pub struct MostroSettings {
     /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
-    /// Wire transport for protocol messages: `"gift-wrap"` (protocol v1,
-    /// NIP-59) or `"nip44"` (protocol v2, kind-14 direct). A node speaks
-    /// exactly one. See docs/TRANSPORT_V2_SPEC.md.
+    /// Wire transport for protocol messages: `"nip44"` (protocol v2,
+    /// kind-14 direct — the default) or `"gift-wrap"` (protocol v1, NIP-59,
+    /// deprecated opt-in). A node speaks exactly one. See
+    /// docs/TRANSPORT_V2_SPEC.md.
+    ///
+    /// The daemon defaults to `nip44`; `gift-wrap` is only used when the
+    /// operator explicitly sets it in `settings.toml`. This deliberately
+    /// overrides mostro-core's `Transport::default()` (still `gift-wrap`
+    /// for clients' sake) via [`default_transport`].
     ///
     /// DEPRECATED(v0.19.0, #786): transitional knob for the v1→v2 protocol
     /// migration. v0.19.0 removes it and runs protocol v2 (`nip44`) only.
@@ -552,7 +612,7 @@ pub struct MostroSettings {
         since = "0.18.0",
         note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
     )]
-    #[serde(default)]
+    #[serde(default = "default_transport")]
     pub transport: Transport,
     /// Proof-of-work difficulty (leading-zero bits) demanded of a
     /// *first-contact* event on the protocol-v2 (`nip44`) transport — one
@@ -601,6 +661,17 @@ fn default_active_pubkeys_refresh_interval() -> u64 {
     60 // 1 minute — keeps a just-taken order's keys fast-pathing promptly
 }
 
+/// Daemon-side default wire transport: protocol v2 (`nip44`). Operators
+/// must explicitly set `transport = "gift-wrap"` in `settings.toml` to keep
+/// running the deprecated protocol-v1 path. Intentionally *not*
+/// `Transport::default()` — mostro-core keeps `gift-wrap` as its own default
+/// for client-side migration needs.
+///
+/// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting.
+pub(crate) fn default_transport() -> Transport {
+    Transport::Nip44Direct
+}
+
 impl Default for MostroSettings {
     // DEPRECATED(v0.19.0, #786): `transport` init goes away with the field.
     #[allow(deprecated)]
@@ -632,7 +703,7 @@ impl Default for MostroSettings {
             website: None,
             publish_exchange_rates_to_nostr: default_publish_exchange_rates(),
             exchange_rates_update_interval_seconds: default_exchange_rates_update_interval(),
-            transport: Transport::default(),
+            transport: default_transport(),
             pow_first_contact: None,
             active_pubkeys_refresh_interval: default_active_pubkeys_refresh_interval(),
         }

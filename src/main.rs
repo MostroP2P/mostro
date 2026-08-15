@@ -81,8 +81,9 @@ async fn main() -> Result<()> {
     // Get mostro keys
     let mostro_keys = util::get_keys()?;
 
-    // Subscribe only to the configured transport's kind: 1059 (protocol v1
-    // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
+    // Subscribe only to the configured transport's kind: 14 (protocol v2
+    // NIP-44 direct, the default) or 1059 (protocol v1 gift wrap, explicit
+    // opt-in only). See docs/TRANSPORT_V2_SPEC.md.
     // DEPRECATED(v0.19.0, #786): the `transport` knob disappears in v0.19.0
     // and this subscription becomes unconditionally kind 14.
     #[allow(deprecated)]
@@ -97,9 +98,10 @@ async fn main() -> Result<()> {
     if transport == mostro_core::transport::Transport::GiftWrap {
         tracing::warn!(
             "transport = \"gift-wrap\" (protocol v1) is DEPRECATED and will be removed in \
-             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. Switch \
-             once the clients your community uses support protocol v2. \
-             See https://github.com/MostroP2P/mostro/issues/786"
+             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. You \
+             opted into it explicitly in settings.toml — remove the line (or set \
+             transport = \"nip44\", the default) once the clients your community uses \
+             support protocol v2. See https://github.com/MostroP2P/mostro/issues/786"
         );
     }
     let subscription = Filter::new()

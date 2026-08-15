@@ -124,8 +124,9 @@ There is **no dual mode**: a node speaks exactly one protocol version.
 
 ```toml
 [mostro]
-# "gift-wrap" (protocol v1, DEPRECATED) | "nip44" (protocol v2)
-transport = "gift-wrap"
+# "nip44" (protocol v2, default) | "gift-wrap" (protocol v1, DEPRECATED,
+# explicit opt-in only)
+transport = "nip44"
 
 [expiration]
 # kind-14 direct messages
@@ -134,8 +135,12 @@ dm_days = 30
 
 | `transport` | event kind | who can trade on this node |
 |---|---|---|
-| `gift-wrap` *(default in 0.18.x)* | 1059 (v1) | every current client — wire behavior identical to pre-v2 daemons |
-| `nip44` | 14 (v2) | v2-capable clients only — the only mode from v0.19.0 |
+| `nip44` *(default)* | 14 (v2) | v2-capable clients only — the only mode from v0.19.0 |
+| `gift-wrap` *(deprecated, explicit opt-in only)* | 1059 (v1) | every current client — wire behavior identical to pre-v2 daemons |
+
+A node with no `transport` line starts in `nip44`. Operators who still need
+to serve protocol-v1 clients must write `transport = "gift-wrap"` explicitly
+in `settings.toml`; it is never selected automatically.
 
 **Capability discovery:** the node advertises its protocol in the kind
 `38385` instance-info event with a `protocol_version` tag (`"1"` or
@@ -153,6 +158,11 @@ with the clients that community uses.
   (nothing changes for existing clients). **Protocol v1 is DEPRECATED**:
   announced in release notes, protocol docs and the `protocol_version`
   tag. Client developers have the 0.18.x cycle to ship v2.
+- **v0.18.5** — the daemon default flips to `transport = "nip44"`.
+  `gift-wrap` stays fully functional but only as an explicit opt-in in
+  `settings.toml` (the code path is untouched; removal is deferred to
+  v0.19.0). The mostro-core `Transport::default()` remains `gift-wrap`
+  for clients; mostrod overrides it with its own `default_transport()`.
 - **v0.19.0** — protocol v2 becomes the default and only protocol.
   Everything v1-related is removed from mostrod (gift-wrap path,
   `"gift-wrap"` setting value, v1 acceptance). mostro-core keeps its
@@ -180,8 +190,9 @@ The bulk of the work, all additive, in mostro-core's `transport` module:
 Minimal daemon integration; **zero handler changes** by design:
 
 - `mostro-core` 0.12.1 → **0.13.0**.
-- `[mostro] transport` setting (`Transport`, serde default = `gift-wrap`)
-  in `src/config/types.rs` + `settings.tpl.toml`.
+- `[mostro] transport` setting (`Transport`, serde default = `gift-wrap`
+  at the time; `nip44` since v0.18.5) in `src/config/types.rs` +
+  `settings.tpl.toml`.
 - `[expiration] dm_days` knob (default 30) in `ExpirationSettings` and the
   `get_expiration_timestamp_for_kind` fallback (`DM_EVENT_KIND = 14` in
   `src/config/constants.rs`).

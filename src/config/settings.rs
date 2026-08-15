@@ -123,11 +123,12 @@ impl Settings {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
     }
 
-    /// Wire transport for protocol messages. Falls back to the default
-    /// (`gift-wrap`, protocol v1) when the global settings haven't been
-    /// initialized yet — `send_dm()` sits on every reply path and must
-    /// degrade to v1 behavior rather than panic in unit tests that don't
-    /// bring up the full configuration, mirroring [`Settings::get_bond`].
+    /// Wire transport for protocol messages. Falls back to the daemon
+    /// default (`nip44`, protocol v2 — see `default_transport`) when the
+    /// global settings haven't been initialized yet — `send_dm()` sits on
+    /// every reply path and must degrade gracefully rather than panic in
+    /// unit tests that don't bring up the full configuration, mirroring
+    /// [`Settings::get_bond`].
     ///
     /// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting —
     /// v0.19.0 hardcodes the protocol-v2 (`nip44`) wire format.
@@ -140,7 +141,7 @@ impl Settings {
         MOSTRO_CONFIG
             .get()
             .map(|s| s.mostro.transport)
-            .unwrap_or_default()
+            .unwrap_or_else(crate::config::types::default_transport)
     }
 
     /// Retrieve the multi-source price configuration from the global
@@ -236,10 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn transport_falls_back_to_default() {
+    fn transport_falls_back_to_nip44() {
+        // Daemon default is protocol v2, regardless of mostro-core's
+        // `Transport::default()` (gift-wrap).
         init_test_settings();
         #[allow(deprecated)]
         let transport = Settings::get_transport();
-        assert_eq!(transport, Transport::default());
+        assert_eq!(transport, Transport::Nip44Direct);
     }
 }

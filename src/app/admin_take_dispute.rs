@@ -1,7 +1,7 @@
 use crate::app::admin_add_solver::SOLVER_CATEGORY_READ_ONLY;
 use crate::app::context::AppContext;
 use crate::db::{find_solver_pubkey, is_user_present, user_has_solver_write_permission};
-use crate::nip33::{create_platform_tag_values, new_dispute_event};
+use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{get_dispute, send_dm};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -263,16 +263,12 @@ pub async fn admin_take_dispute_action(
     };
 
     // We create a tag to show status of the dispute
-    let tags: Tags = Tags::from_list(vec![
-        Tag::custom("s", vec![Status::InProgress.to_string()]),
-        // Who is the dispute creator
-        Tag::custom("initiator", vec![dispute_initiator]),
-        Tag::custom(
-            "y",
-            create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
-        ),
-        Tag::custom("z", vec!["dispute".to_string()]),
-    ]);
+    let tags = create_dispute_event_tags(
+        Status::InProgress.to_string(),
+        dispute_initiator,
+        dispute.created_at,
+        ctx.settings().mostro.name.as_deref(),
+    );
     // nip33 kind with dispute id as identifier (kind 38386 for disputes)
     let event = new_dispute_event(mostro_keys, "", dispute.id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

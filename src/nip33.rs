@@ -177,6 +177,27 @@ pub fn new_dispute_event(
     )
 }
 
+/// Builds the standard tag set for a kind-38386 dispute event.
+///
+/// `created_at` is the dispute open time from SQLite (`disputes.created_at`),
+/// carried as a business tag so clients can show when the dispute was opened.
+/// It is independent of the Nostr event's `created_at`, which stays as "signed
+/// now" for NIP-33 replaceable-event ordering.
+pub fn create_dispute_event_tags(
+    status: impl Into<String>,
+    initiator: impl Into<String>,
+    created_at: i64,
+    platform_name: Option<&str>,
+) -> Tags {
+    Tags::from_list(vec![
+        Tag::custom("s", vec![status.into()]),
+        Tag::custom("initiator", vec![initiator.into()]),
+        Tag::custom("created_at", vec![created_at.to_string()]),
+        Tag::custom("y", create_platform_tag_values(platform_name)),
+        Tag::custom("z", vec!["dispute".to_string()]),
+    ])
+}
+
 /// Creates a new exchange rates event (kind 30078, NIP-33)
 ///
 /// This event publishes Bitcoin/fiat exchange rates to Nostr relays,
@@ -1179,25 +1200,19 @@ mod tests {
 
     // ── Dispute event tag list: end-to-end y-tag emission (kind 38386) ──────────
 
-    /// Verifies that the tag list built for dispute events emits the correct y tag.
-    ///
-    /// Mirrors the exact inline tag construction used in `publish_dispute_event` and
-    /// `close_dispute_after_user_resolution` in src/app/dispute.rs, as well as the
-    /// admin handlers in admin_cancel.rs, admin_settle.rs, and admin_take_dispute.rs.
-    /// All five callsites use the identical pattern verified here.
+    /// Verifies that [`create_dispute_event_tags`] emits status, initiator,
+    /// stable open-time `created_at`, platform `y`, and `z=dispute`.
     #[test]
     fn dispute_event_tags_emit_y_tag_matching_platform_helper() {
         init_test_settings();
 
-        let tags = Tags::from_list(vec![
-            Tag::custom("s", vec!["initiated-by-buyer".to_string()]),
-            Tag::custom("initiator", vec!["buyer".to_string()]),
-            Tag::custom(
-                "y",
-                create_platform_tag_values(test_settings().mostro.name.as_deref()),
-            ),
-            Tag::custom("z", vec!["dispute".to_string()]),
-        ]);
+        let opened_at = 1_700_000_100_i64;
+        let tags = super::create_dispute_event_tags(
+            "initiated",
+            "buyer",
+            opened_at,
+            test_settings().mostro.name.as_deref(),
+        );
 
         let y_values = get_y_tag_values(&tags)
             .expect("y tag must be present in dispute event tags (kind 38386)");
@@ -1209,6 +1224,51 @@ mod tests {
             y_values, expected,
             "dispute event tag list must wire create_platform_tag_values correctly"
         );
+        assert_eq!(
+            get_tag_value(&tags, "s").as_deref(),
+            Some("initiated"),
+            "status tag must match"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "initiator").as_deref(),
+            Some("buyer"),
+            "initiator tag must match"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "created_at").as_deref(),
+            Some("1700000100"),
+            "created_at tag must carry the SQLite dispute open time"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "z").as_deref(),
+            Some("dispute"),
+            "z tag must be dispute"
+        );
+    }
+
+    /// Kind-38386 `event.created_at` stays "signed now"; the business open
+    /// time lives only on the `created_at` tag so NIP-33 replace still works.
+    #[test]
+    fn new_dispute_event_keeps_nostr_created_at_independent_of_open_time_tag() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let opened_at = 1_600_000_000_i64;
+        let tags = super::create_dispute_event_tags("initiated", "seller", opened_at, None);
+        let before = Timestamp::now().as_secs();
+        let event = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags)
+            .expect("dispute event");
+        let after = Timestamp::now().as_secs();
+
+        assert_eq!(event.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
+        assert!(
+            event.created_at.as_secs() >= before && event.created_at.as_secs() <= after,
+            "event.created_at must be wall-clock now, not the open-time tag"
+        );
+        assert_eq!(
+            get_tag_value(&event.tags, "created_at").as_deref(),
+            Some("1600000000")
+        );
+        assert_ne!(event.created_at.as_secs() as i64, opened_at);
     }
 
     // ── Dev-fee audit event tag list: end-to-end y-tag emission (kind 8383) ─────

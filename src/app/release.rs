@@ -674,8 +674,10 @@ pub async fn do_payment(
                                 request_id,
                             )
                             .await;
-                            // Terminal success: release the in-flight marker.
-                            let _ = crate::db::clear_order_payout(ctx.pool(), order.id).await;
+                            // Terminal success: release our own claim only.
+                            let _ =
+                                crate::db::clear_order_payout(ctx.pool(), order.id, &payout_hash)
+                                    .await;
                         }
                         PaymentStatus::Failed => {
                             warn!(
@@ -683,10 +685,13 @@ pub async fn do_payment(
                                 order.id, msg.payment.payment_hash
                             );
 
-                            // Mark payment as failed and release the in-flight
-                            // marker so a fresh invoice can be retried.
+                            // Mark payment as failed and release our own claim
+                            // (scoped to this hash) so a fresh invoice can be
+                            // retried without erasing a newer claim.
                             check_failure_retries_or_log(&ctx, &order, request_id).await;
-                            let _ = crate::db::clear_order_payout(ctx.pool(), order.id).await;
+                            let _ =
+                                crate::db::clear_order_payout(ctx.pool(), order.id, &payout_hash)
+                                    .await;
                         }
                         _ => {}
                     }
@@ -792,7 +797,7 @@ pub async fn reconcile_inflight_payout(
 
     let Some(hash_bytes) = hex_to_bytes(payout_payment_hash) else {
         warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
-        crate::db::fail_order_payout(pool, order_id).await?;
+        crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
         return Ok(());
     };
 
@@ -804,10 +809,10 @@ pub async fn reconcile_inflight_payout(
                     let _ = payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None).await;
                 }
             }
-            crate::db::clear_order_payout(pool, order_id).await?;
+            crate::db::clear_order_payout(pool, order_id, payout_payment_hash).await?;
         }
         Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
-            crate::db::fail_order_payout(pool, order_id).await?;
+            crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
         }
         Ok(Some(PaymentStatus::InFlight)) => {
             // Still pending — do not re-dispatch; a later tick will reconcile.

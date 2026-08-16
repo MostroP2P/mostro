@@ -1228,11 +1228,23 @@ pub async fn claim_order_payout(
 
 /// Clear the in-flight payout marker for `order_id` after a successful terminal
 /// outcome (or as tidy-up once the order has moved to `Success`).
-pub async fn clear_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+///
+/// Scoped to `payment_hash`: the release only fires when the marker still holds
+/// the hash this caller claimed. A status watcher can outlive its own claim (its
+/// stream stalls, reconciliation resolves the payout, and a new payout is
+/// claimed for the same order); scoping the CAS stops such a stale watcher from
+/// erasing a *newer* claim and letting a second payment be dispatched.
+pub async fn clear_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+) -> Result<(), MostroError> {
     sqlx::query(
-        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL WHERE id = ?1",
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL \
+         WHERE id = ?1 AND payout_payment_hash = ?2",
     )
     .bind(order_id)
+    .bind(payment_hash)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1242,11 +1254,20 @@ pub async fn clear_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(),
 /// Release the in-flight marker AND re-arm retry after a failed / unknown
 /// terminal outcome: the next scheduler tick may dispatch a fresh payout once
 /// the buyer supplies a new invoice.
-pub async fn fail_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+///
+/// Scoped to `payment_hash` for the same reason as [`clear_order_payout`]: a
+/// stale caller must not re-arm retry against a newer in-flight claim.
+pub async fn fail_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+) -> Result<(), MostroError> {
     sqlx::query(
-        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true WHERE id = ?1",
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true \
+         WHERE id = ?1 AND payout_payment_hash = ?2",
     )
     .bind(order_id)
+    .bind(payment_hash)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -3013,12 +3034,11 @@ mod tests {
     async fn test_clear_order_payout_releases_marker() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
+        let hash = "e".repeat(64);
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id, &"e".repeat(64))
-            .await
-            .unwrap();
+        super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        super::clear_order_payout(&pool, id).await.unwrap();
+        super::clear_order_payout(&pool, id, &hash).await.unwrap();
         assert!(payout_hash_of(&pool, id).await.is_none());
     }
 
@@ -3026,12 +3046,11 @@ mod tests {
     async fn test_fail_order_payout_clears_marker_and_rearms_retry() {
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
+        let hash = "f".repeat(64);
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id, &"f".repeat(64))
-            .await
-            .unwrap();
+        super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        super::fail_order_payout(&pool, id).await.unwrap();
+        super::fail_order_payout(&pool, id, &hash).await.unwrap();
 
         assert!(payout_hash_of(&pool, id).await.is_none());
         let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
@@ -3043,6 +3062,52 @@ mod tests {
         // Now that the marker is clear, the order is retry-eligible again.
         let matching = super::find_failed_payment(&pool).await.unwrap();
         assert_eq!(matching.len(), 1);
+    }
+
+    /// A stale caller (e.g. a watcher that outlived its own claim) must not
+    /// release a *newer* claim: `clear`/`fail` scoped to a different hash are
+    /// no-ops, so the current in-flight marker survives and no second payout
+    /// can be dispatched.
+    #[tokio::test]
+    async fn test_clear_and_fail_order_payout_ignore_stale_hash() {
+        let pool = setup_orders_db().await.unwrap();
+        let current = "1".repeat(64);
+        let stale = "2".repeat(64);
+
+        // clear_order_payout with the wrong hash leaves the current marker.
+        let id_a = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_a, "settled-hold-invoice").await;
+        super::claim_order_payout(&pool, id_a, &current)
+            .await
+            .unwrap();
+        super::clear_order_payout(&pool, id_a, &stale)
+            .await
+            .unwrap();
+        assert_eq!(
+            payout_hash_of(&pool, id_a).await.as_deref(),
+            Some(current.as_str()),
+            "clear with a stale hash must not erase the current marker"
+        );
+
+        // fail_order_payout with the wrong hash likewise leaves it intact and
+        // does not re-arm retry.
+        let id_b = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_b, "settled-hold-invoice").await;
+        super::claim_order_payout(&pool, id_b, &current)
+            .await
+            .unwrap();
+        super::fail_order_payout(&pool, id_b, &stale).await.unwrap();
+        assert_eq!(
+            payout_hash_of(&pool, id_b).await.as_deref(),
+            Some(current.as_str()),
+            "fail with a stale hash must not erase the current marker"
+        );
+        let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
+            .bind(id_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed, 0, "a stale fail must not re-arm retry");
     }
 
     async fn insert_inflight_order(

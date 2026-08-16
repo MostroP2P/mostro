@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // Constants for status filtering used across restore session functions
-const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 
 /// Terminal order statuses for the Phase 2 active-trade-pubkey cache: an
@@ -24,7 +24,7 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 /// disputed order is still active (buyer, seller and the assigned solver keep
 /// messaging), so its trade keys must stay fast-pathed. See
 /// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
-const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -2078,6 +2078,45 @@ mod tests {
             None,
         )
         .await;
+        // Terminal statuses whose serialized form is hyphenated. These are the
+        // ones a mis-spelled TERMINAL_ORDER_STATUSES silently fails to match,
+        // so they must be covered explicitly.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "cooperatively-canceled",
+            Some("creator_coop"),
+            Some("buyer_coop"),
+            Some("seller_coop"),
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "canceled-by-admin",
+            Some("creator_cba"),
+            None,
+            None,
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "settled-by-admin",
+            Some("creator_sba"),
+            None,
+            None,
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "completed-by-admin",
+            Some("creator_cpa"),
+            None,
+            None,
+        )
+        .await;
 
         // Active dispute with an assigned solver → solver key included.
         sqlx::query(
@@ -2123,12 +2162,77 @@ mod tests {
             "seller_succ",
             "creator_canc",
             "solver_settled",
+            "creator_coop",
+            "buyer_coop",
+            "seller_coop",
+            "creator_cba",
+            "creator_sba",
+            "creator_cpa",
         ] {
             assert!(
                 !keys.contains(k),
                 "{k} must NOT be known (terminal/resolved)"
             );
         }
+    }
+
+    /// Restore-session must not hand back orders that are already over.
+    ///
+    /// Four of the eight excluded statuses serialize with hyphens
+    /// (`canceled-by-admin`, `settled-by-admin`, `completed-by-admin`,
+    /// `cooperatively-canceled`). A status list written without them still
+    /// filters the single-word ones, so the query keeps *looking* correct
+    /// while quietly restoring dead orders — which is why every hyphenated
+    /// status is asserted here individually.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_excludes_all_terminal_statuses() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        async fn insert_for_master(pool: &SqlitePool, status: &str, master_key: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                                    master_buyer_pubkey, trade_index_buyer)
+                VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400, ?3, 1)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(master_key)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        // One live order — the only row the user should get back.
+        insert_for_master(&pool, "waiting-payment", &master_key).await;
+
+        for status in [
+            "expired",
+            "success",
+            "canceled",
+            "dispute",
+            "canceled-by-admin",
+            "completed-by-admin",
+            "settled-by-admin",
+            "cooperatively-canceled",
+        ] {
+            insert_for_master(&pool, status, &master_key).await;
+        }
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+
+        let statuses: Vec<&str> = orders.iter().map(|o| o.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec!["waiting-payment"],
+            "restore must return only the live order, got {statuses:?}"
+        );
     }
 
     #[tokio::test]

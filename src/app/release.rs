@@ -640,9 +640,32 @@ pub async fn do_payment(
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(payment_result) = payment_task.await {
         warn!("Error during ln payment : {}", payment_result);
-        check_failure_retries_or_log(ctx, &order, request_id).await;
-        // Do not spawn the status watcher or report Ok: nothing was submitted
-        // to LND (or the attempt aborted before a usable status stream).
+        // `send_payment` returned before spawning the status watcher, so the
+        // claim we just set would otherwise stay locked (blocking retry and
+        // AddInvoice) until the grace-delayed reconciliation job runs. Ask LND
+        // what actually happened to this hash and resolve the claim inline:
+        //   - in flight / succeeded / lookup error -> KEEP the marker; the
+        //     payment may still settle, so reconciliation owns the outcome and
+        //     no second payout is ever dispatched.
+        //   - not registered / failed              -> re-arm retry now (and
+        //     notify the buyer) instead of waiting.
+        let keep_marker = match Vec::<u8>::from_hex(&payout_hash) {
+            Ok(bytes) if bytes.len() == 32 => matches!(
+                ln_client_payment.lookup_payment_status(&bytes).await,
+                Ok(Some(PaymentStatus::InFlight)) | Ok(Some(PaymentStatus::Succeeded)) | Err(_)
+            ),
+            // Should not happen (we just built this hash), but if it is
+            // unusable we cannot confirm an in-flight payment — re-arm.
+            _ => false,
+        };
+        if !keep_marker
+            && crate::db::fail_order_payout(ctx.pool(), order.id, &payout_hash)
+                .await
+                .unwrap_or(false)
+        {
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+        }
+        // Do not spawn the status watcher or report Ok.
         return Err(payment_result);
     }
 

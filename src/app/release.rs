@@ -667,18 +667,21 @@ pub async fn do_payment(
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ = payment_success(
-                                &ctx,
-                                &mut order,
-                                buyer_pubkey,
-                                &my_keys,
-                                request_id,
-                            )
-                            .await;
-                            // Terminal success: release our own claim only.
-                            let _ =
-                                crate::db::clear_order_payout(ctx.pool(), order.id, &payout_hash)
-                                    .await;
+                            // Release our claim only if the order actually
+                            // reached Success. If finalization fails, keep the
+                            // marker so reconciliation retries it — clearing it
+                            // here would strand a paid order with no recovery.
+                            if payment_success(&ctx, &mut order, buyer_pubkey, &my_keys, request_id)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                let _ = crate::db::clear_order_payout(
+                                    ctx.pool(),
+                                    order.id,
+                                    &payout_hash,
+                                )
+                                .await;
+                            }
                         }
                         PaymentStatus::Failed => {
                             warn!(
@@ -686,13 +689,17 @@ pub async fn do_payment(
                                 order.id, msg.payment.payment_hash
                             );
 
-                            // Mark payment as failed and release our own claim
-                            // (scoped to this hash) so a fresh invoice can be
-                            // retried without erasing a newer claim.
-                            check_failure_retries_or_log(&ctx, &order, request_id).await;
-                            let _ =
-                                crate::db::clear_order_payout(ctx.pool(), order.id, &payout_hash)
-                                    .await;
+                            // Release our own claim (scoped to this hash) and
+                            // re-arm retry. Only do the failure bookkeeping and
+                            // buyer notification if we still owned the claim, so
+                            // a stale watcher never pollutes a newer payout's
+                            // retry state or notifies against it.
+                            if crate::db::fail_order_payout(ctx.pool(), order.id, &payout_hash)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                check_failure_retries_or_log(&ctx, &order, request_id).await;
+                            }
                         }
                         _ => {}
                     }
@@ -704,60 +711,79 @@ pub async fn do_payment(
     Ok(())
 }
 
+/// Finalize a paid order: transition `settled-hold-invoice` → `Success` and
+/// notify the buyer, but only after the status CAS actually commits.
+///
+/// Returns `Ok(true)` when the order is now terminal — this call committed the
+/// transition, or a concurrent task already did — meaning the caller may safely
+/// release the payout marker. Returns `Ok(false)` when the transition could not
+/// be built/persisted (`update_order_event` failed): the caller must KEEP the
+/// marker so reconciliation retries finalization, otherwise the buyer would be
+/// paid on an order stranded in `settled-hold-invoice` with no recovery hook.
+///
+/// Buyer notifications (`PurchaseCompleted`, `Rate`) are enqueued only after a
+/// successful commit, so a retried finalization never spams the buyer.
 async fn payment_success(
     ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
-) -> Result<()> {
-    // Purchase completed message to buyer
+) -> Result<bool> {
+    let pool = ctx.pool();
+
+    let order_updated = match update_order_event(my_keys, Status::Success, order).await {
+        Ok(updated) => updated,
+        // Could not build/publish the Success event: leave the order in
+        // settled-hold-invoice and signal "not finalized" so the caller keeps
+        // the marker for reconciliation.
+        Err(_) => return Ok(false),
+    };
+
+    // Only update status and event_id to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
+    // The WHERE guard prevents double success transitions from concurrent tasks.
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+            .bind(&order_updated.status)
+            .bind(&order_updated.event_id)
+            .bind(order_updated.id)
+            .bind(Status::SettledHoldInvoice.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        // Another task already finalized this order: it is terminal, so the
+        // caller may release the marker, but the notifications were already
+        // sent by that task — do not duplicate them.
+        tracing::warn!(
+            "Order {} not transitioned to success: already processed by another task",
+            order_updated.id
+        );
+        return Ok(true);
+    }
+
+    // Committed by us — notify the buyer now.
     enqueue_order_msg(
         None,
-        Some(order.id),
+        Some(order_updated.id),
         Action::PurchaseCompleted,
         None,
         buyer_pubkey,
         None,
     )
     .await;
-
-    let pool = ctx.pool();
-
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        // Only update status and event_id to avoid overwriting fields modified by
-        // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
-        // The WHERE guard prevents double success transitions from concurrent tasks.
-        let result =
-            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
-                .bind(&order_updated.status)
-                .bind(&order_updated.event_id)
-                .bind(order_updated.id)
-                .bind(Status::SettledHoldInvoice.to_string())
-                .execute(pool)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        if result.rows_affected() == 0 {
-            tracing::warn!(
-                "Order {} not transitioned to success: already processed by another task",
-                order_updated.id
-            );
-            return Ok(());
-        }
-
-        // Send dm to buyer to rate counterpart
-        enqueue_order_msg(
-            request_id,
-            Some(order_updated.id),
-            Action::Rate,
-            None,
-            buyer_pubkey,
-            None,
-        )
-        .await;
-    }
-    Ok(())
+    enqueue_order_msg(
+        request_id,
+        Some(order_updated.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
+    Ok(true)
 }
 
 /// Reconcile a single in-flight buyer payout against LND.
@@ -799,13 +825,27 @@ pub async fn reconcile_inflight_payout(
 
     match ln_client.lookup_payment_status(&hash_bytes).await {
         Ok(Some(PaymentStatus::Succeeded)) => {
-            if let Ok(Some(mut order)) = Order::by_id(pool, order_id).await {
-                let my_keys = ctx.keys().clone();
-                if let Ok(buyer_pubkey) = order.get_buyer_pubkey() {
-                    let _ = payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None).await;
+            // Clear the marker only once the order is actually finalized. If
+            // finalization fails (or the buyer key is unreadable), keep the
+            // marker so a later tick retries it instead of stranding a paid
+            // order in settled-hold-invoice.
+            let finalized = match Order::by_id(pool, order_id).await {
+                Ok(Some(mut order)) => {
+                    let my_keys = ctx.keys().clone();
+                    match order.get_buyer_pubkey() {
+                        Ok(buyer_pubkey) => {
+                            payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None)
+                                .await
+                                .unwrap_or(false)
+                        }
+                        Err(_) => false,
+                    }
                 }
+                _ => false,
+            };
+            if finalized {
+                crate::db::clear_order_payout(pool, order_id, payout_payment_hash).await?;
             }
-            crate::db::clear_order_payout(pool, order_id, payout_payment_hash).await?;
         }
         Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
             crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
@@ -2008,8 +2048,8 @@ mod tests {
         // Act
         let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
 
-        // Assert
-        assert!(result.is_ok());
+        // Assert: committed the transition (returns true) and notified the buyer.
+        assert!(result.unwrap(), "a committed finalization returns true");
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::Success.to_string());
         let actions = queued_actions_for(order.id).await;
@@ -2033,12 +2073,18 @@ mod tests {
         // Act
         let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
 
-        // Assert: early return — status untouched, no Rate message queued.
-        assert!(result.is_ok());
+        // Assert: the guarded UPDATE matched no rows (already finalized
+        // elsewhere), so the call reports terminal (`true`) — the caller may
+        // release the marker — but sends no duplicate notifications, and the
+        // status is left untouched.
+        assert!(
+            result.unwrap(),
+            "a no-op CAS (already processed) is terminal and returns true"
+        );
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::Active.to_string());
         let actions = queued_actions_for(order.id).await;
-        assert!(actions.contains(&Action::PurchaseCompleted));
+        assert!(!actions.contains(&Action::PurchaseCompleted));
         assert!(!actions.contains(&Action::Rate));
     }
 }

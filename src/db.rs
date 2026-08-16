@@ -1234,12 +1234,15 @@ pub async fn claim_order_payout(
 /// stream stalls, reconciliation resolves the payout, and a new payout is
 /// claimed for the same order); scoping the CAS stops such a stale watcher from
 /// erasing a *newer* claim and letting a second payment be dispatched.
+///
+/// Returns `true` when this caller still owned the claim (the row was cleared),
+/// so callers can gate their own terminal side-effects on claim ownership.
 pub async fn clear_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
-) -> Result<(), MostroError> {
-    sqlx::query(
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
         "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL \
          WHERE id = ?1 AND payout_payment_hash = ?2",
     )
@@ -1248,7 +1251,7 @@ pub async fn clear_order_payout(
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Release the in-flight marker AND re-arm retry after a failed / unknown
@@ -1256,13 +1259,15 @@ pub async fn clear_order_payout(
 /// the buyer supplies a new invoice.
 ///
 /// Scoped to `payment_hash` for the same reason as [`clear_order_payout`]: a
-/// stale caller must not re-arm retry against a newer in-flight claim.
+/// stale caller must not re-arm retry against a newer in-flight claim. Returns
+/// `true` when this caller still owned the claim, so failure bookkeeping and
+/// buyer notifications can be gated on ownership.
 pub async fn fail_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
-) -> Result<(), MostroError> {
-    sqlx::query(
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
         "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true \
          WHERE id = ?1 AND payout_payment_hash = ?2",
     )
@@ -1271,7 +1276,7 @@ pub async fn fail_order_payout(
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Orders with a buyer payout in flight (marker set) that are old enough to
@@ -3038,7 +3043,8 @@ mod tests {
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
         super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        super::clear_order_payout(&pool, id, &hash).await.unwrap();
+        let owned = super::clear_order_payout(&pool, id, &hash).await.unwrap();
+        assert!(owned, "clearing an owned claim must report ownership");
         assert!(payout_hash_of(&pool, id).await.is_none());
     }
 
@@ -3050,7 +3056,8 @@ mod tests {
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
         super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        super::fail_order_payout(&pool, id, &hash).await.unwrap();
+        let owned = super::fail_order_payout(&pool, id, &hash).await.unwrap();
+        assert!(owned, "failing an owned claim must report ownership");
 
         assert!(payout_hash_of(&pool, id).await.is_none());
         let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
@@ -3080,9 +3087,13 @@ mod tests {
         super::claim_order_payout(&pool, id_a, &current)
             .await
             .unwrap();
-        super::clear_order_payout(&pool, id_a, &stale)
+        let owned = super::clear_order_payout(&pool, id_a, &stale)
             .await
             .unwrap();
+        assert!(
+            !owned,
+            "clearing with a stale hash must report no ownership"
+        );
         assert_eq!(
             payout_hash_of(&pool, id_a).await.as_deref(),
             Some(current.as_str()),
@@ -3096,7 +3107,8 @@ mod tests {
         super::claim_order_payout(&pool, id_b, &current)
             .await
             .unwrap();
-        super::fail_order_payout(&pool, id_b, &stale).await.unwrap();
+        let owned = super::fail_order_payout(&pool, id_b, &stale).await.unwrap();
+        assert!(!owned, "failing with a stale hash must report no ownership");
         assert_eq!(
             payout_hash_of(&pool, id_b).await.as_deref(),
             Some(current.as_str()),

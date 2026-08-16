@@ -337,6 +337,48 @@ mod tests {
             .contains(&Action::InvoiceUpdated));
     }
 
+    /// A swap must be rejected while a payout for the order is already in
+    /// flight (`payout_payment_hash` set): otherwise a fresh invoice would reset
+    /// `payment_attempts` on top of a pending payout and re-arm a second one.
+    #[tokio::test]
+    async fn pay_new_invoice_rejects_swap_while_payout_in_flight() {
+        let pool = setup_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = waiting_invoice_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        order.payment_attempts = 2;
+        order.buyer_invoice = Some("lnbc-current".to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        // A payout is already in flight for this order.
+        crate::db::claim_order_payout(&pool, order.id, &"a".repeat(64))
+            .await
+            .unwrap();
+
+        let mut swap = order.clone();
+        swap.buyer_invoice = Some("lnbc-new".to_string());
+        let result = pay_new_invoice(
+            &mut swap,
+            &pool,
+            &Message::new_order(Some(order.id), Some(1), None, Action::AddInvoice, None),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "swap must be rejected while a payout is in flight: {result:?}"
+        );
+        // Neither the invoice nor the attempts counter changed.
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.buyer_invoice.as_deref(), Some("lnbc-current"));
+        assert_eq!(stored.payment_attempts, 2);
+        assert!(!queued_actions_for(buyer)
+            .await
+            .contains(&Action::InvoiceUpdated));
+    }
+
     /// A `SettledHoldInvoice` order routes through `pay_new_invoice`: the
     /// payment-attempts counter is reset and the buyer is told the invoice
     /// was updated. No LND is involved so the handler returns `Ok`.

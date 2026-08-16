@@ -2893,6 +2893,159 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_find_failed_payment_ignores_inflight_payout() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // failed_payment = true and settled-hold-invoice, but a payout is
+        // already in flight (payout_payment_hash set) → must be skipped so the
+        // retry job never dispatches a second payment for the same escrow.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid, payout_payment_hash)
+            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    1, 0, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("a".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_failed_payment(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Orders with a payout in flight must be excluded from retry"
+        );
+    }
+
+    // -- Tests for the in-flight payout marker --
+
+    async fn insert_settled_order(pool: &SqlitePool, id: uuid::Uuid, status: &str) {
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0)"#,
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn payout_hash_of(pool: &SqlitePool, id: uuid::Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT payout_payment_hash FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_claim_order_payout_is_atomic() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+
+        let hash = "b".repeat(64);
+        // First claim wins.
+        assert!(super::claim_order_payout(&pool, id, &hash).await.unwrap());
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+
+        // A second claim (concurrent tick / re-arm) loses — the marker is set.
+        assert!(
+            !super::claim_order_payout(&pool, id, &"c".repeat(64))
+                .await
+                .unwrap(),
+            "second claim must lose the CAS"
+        );
+        // The original hash is untouched.
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_order_payout_rejects_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "active").await;
+
+        assert!(
+            !super::claim_order_payout(&pool, id, &"d".repeat(64))
+                .await
+                .unwrap(),
+            "must not claim a payout on a non settled-hold-invoice order"
+        );
+        assert!(payout_hash_of(&pool, id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_order_payout_releases_marker() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+        super::claim_order_payout(&pool, id, &"e".repeat(64))
+            .await
+            .unwrap();
+
+        super::clear_order_payout(&pool, id).await.unwrap();
+        assert!(payout_hash_of(&pool, id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fail_order_payout_clears_marker_and_rearms_retry() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+        super::claim_order_payout(&pool, id, &"f".repeat(64))
+            .await
+            .unwrap();
+
+        super::fail_order_payout(&pool, id).await.unwrap();
+
+        assert!(payout_hash_of(&pool, id).await.is_none());
+        let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed, 1, "failed_payment must be re-armed for retry");
+        // Now that the marker is clear, the order is retry-eligible again.
+        let matching = super::find_failed_payment(&pool).await.unwrap();
+        assert_eq!(matching.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_inflight_payouts_returns_only_marked() {
+        let pool = setup_orders_db().await.unwrap();
+        let marked = uuid::Uuid::new_v4();
+        let unmarked = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, marked, "settled-hold-invoice").await;
+        insert_settled_order(&pool, unmarked, "settled-hold-invoice").await;
+        let hash = "1".repeat(64);
+        super::claim_order_payout(&pool, marked, &hash)
+            .await
+            .unwrap();
+
+        let inflight = super::find_inflight_payouts(&pool).await.unwrap();
+        assert_eq!(inflight.len(), 1);
+        assert_eq!(inflight[0].0, marked);
+        assert_eq!(inflight[0].1, hash);
+    }
+
     // -- Tests for find_order_by_hash --
 
     #[tokio::test]

@@ -959,6 +959,20 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
+    #[test]
+    fn hex_to_bytes_roundtrips_and_rejects_malformed() {
+        // Round-trip a payment hash: bytes -> hex -> bytes.
+        let bytes: Vec<u8> = (0u8..32).collect();
+        let hex = bytes_to_string(&bytes);
+        assert_eq!(super::hex_to_bytes(&hex), Some(bytes));
+
+        // Odd length and non-hex digits are rejected.
+        assert_eq!(super::hex_to_bytes("abc"), None);
+        assert_eq!(super::hex_to_bytes("zz"), None);
+        // Empty string is valid (zero bytes).
+        assert_eq!(super::hex_to_bytes(""), Some(vec![]));
+    }
+
     /// The `MOSTRO_CONFIG` OnceLock is process-global: set it to the shared
     /// `test_settings()` defaults (idempotent across concurrent tests).
     fn init_global_config() {

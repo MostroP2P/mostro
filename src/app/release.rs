@@ -11,6 +11,7 @@ use crate::util::{
     monotonic_order_event_timestamp, settle_seller_hold_invoice, update_order_event,
 };
 use crate::Result;
+use bitcoin::hashes::hex::FromHex;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -759,18 +760,6 @@ async fn payment_success(
     Ok(())
 }
 
-/// Decode a lowercase-hex string (e.g. a 32-byte `payment_hash`) into bytes.
-/// Returns `None` on odd length or a non-hex digit.
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
 /// Reconcile a single in-flight buyer payout against LND.
 ///
 /// Called by the scheduler for every order whose `payout_payment_hash` is set.
@@ -795,10 +784,17 @@ pub async fn reconcile_inflight_payout(
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
 
-    let Some(hash_bytes) = hex_to_bytes(payout_payment_hash) else {
-        warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
-        crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
-        return Ok(());
+    // A payment hash is exactly 32 bytes (64 hex chars). Decode with the same
+    // `FromHex` used across the codebase and length-check it; a bad-hex or
+    // wrong-length marker is corrupt, so treat it as malformed and re-arm rather
+    // than sending a truncated hash to LND.
+    let hash_bytes = match Vec::<u8>::from_hex(payout_payment_hash) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
+            crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
+            return Ok(());
+        }
     };
 
     match ln_client.lookup_payment_status(&hash_bytes).await {
@@ -971,20 +967,6 @@ mod tests {
     use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
-
-    #[test]
-    fn hex_to_bytes_roundtrips_and_rejects_malformed() {
-        // Round-trip a payment hash: bytes -> hex -> bytes.
-        let bytes: Vec<u8> = (0u8..32).collect();
-        let hex = bytes_to_string(&bytes);
-        assert_eq!(super::hex_to_bytes(&hex), Some(bytes));
-
-        // Odd length and non-hex digits are rejected.
-        assert_eq!(super::hex_to_bytes("abc"), None);
-        assert_eq!(super::hex_to_bytes("zz"), None);
-        // Empty string is valid (zero bytes).
-        assert_eq!(super::hex_to_bytes(""), Some(vec![]));
-    }
 
     /// The `MOSTRO_CONFIG` OnceLock is process-global: set it to the shared
     /// `test_settings()` defaults (idempotent across concurrent tests).

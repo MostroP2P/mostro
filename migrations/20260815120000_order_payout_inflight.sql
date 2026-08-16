@@ -1,0 +1,11 @@
+-- Track the payment hash of an in-flight buyer payout so a
+-- `settled-hold-invoice` order is paid at most once.
+--
+-- While this column is non-NULL a payout for the order is considered in
+-- flight: the failed-payment retry job skips the order and `AddInvoice`
+-- swaps are rejected, so no second payout can be dispatched against the
+-- same settled escrow. A reconciliation job resolves the marker against
+-- LND (Succeeded -> finalize, Failed/Unknown -> clear & re-arm retry,
+-- InFlight -> wait) so a stranded payout neither drains funds nor blocks
+-- the order forever.
+ALTER TABLE orders ADD COLUMN payout_payment_hash char(64);

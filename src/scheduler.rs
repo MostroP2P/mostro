@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
-use crate::app::release::do_payment;
+use crate::app::release::{do_payment, reconcile_inflight_payout};
 use crate::config;
 use crate::db::*;
 use crate::escrow::EscrowBackend;
@@ -41,6 +41,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_cancel_orders(ctx.clone()).await;
         job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
+        job_reconcile_inflight_payouts(ctx.clone()).await;
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
@@ -237,6 +238,50 @@ async fn job_retry_failed_payments(ctx: AppContext) {
                         }
                     }
                 }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Reconcile buyer payouts left in flight (`payout_payment_hash` set) against
+/// LND. Complements `job_retry_failed_payments`: that job only dispatches fresh
+/// payouts (marker NULL), while this one resolves the durable marker so a
+/// held/stranded payout — or one whose in-process watcher was lost across a
+/// restart — is finalized, re-armed, or left pending based on LND's real state,
+/// instead of blocking the order forever. Runs at startup and every tick.
+async fn job_reconcile_inflight_payouts(ctx: AppContext) {
+    let interval = 60u64;
+
+    tokio::spawn(async move {
+        // Same capped-backoff LndConnector bootstrap as the bond payout job: a
+        // transient LND outage at boot must not permanently halt reconciliation.
+        let mut backoff_secs: u64 = 2;
+        let mut ln_client = loop {
+            match LndConnector::new().await {
+                Ok(client) => break client,
+                Err(e) => {
+                    error!("payout reconcile: LndConnector::new failed: {e} — retrying in {backoff_secs}s");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            }
+        };
+
+        let pool = ctx.pool();
+        loop {
+            match crate::db::find_inflight_payouts(pool).await {
+                Ok(inflight) => {
+                    for (order_id, payout_hash) in inflight.into_iter() {
+                        if let Err(e) =
+                            reconcile_inflight_payout(&ctx, &mut ln_client, order_id, &payout_hash)
+                                .await
+                        {
+                            error!("payout reconcile for order {order_id}: {e}");
+                        }
+                    }
+                }
+                Err(e) => error!("payout reconcile: find_inflight_payouts failed: {e}"),
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }

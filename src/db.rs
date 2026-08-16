@@ -1176,11 +1176,16 @@ pub async fn find_escrow_deadline_orders(
 }
 
 pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    // `payout_payment_hash IS NULL` excludes orders that already have a payout
+    // in flight: retrying them would dispatch a second payment against the same
+    // settled escrow. Those are resolved by `find_inflight_payouts` /
+    // reconciliation instead.
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE failed_payment == true AND  status == 'settled-hold-invoice'
+          WHERE failed_payment == true AND status == 'settled-hold-invoice'
+            AND payout_payment_hash IS NULL
         "#,
     )
     .fetch_all(pool)
@@ -1188,6 +1193,84 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
+}
+
+/// Atomically claim the buyer payout for `order_id` by persisting the payout
+/// invoice's `payment_hash`, but only while no payout is already in flight and
+/// the order is still `settled-hold-invoice`. Returns `true` when this caller
+/// won the claim and may proceed to `send_payment`.
+///
+/// The CAS is the idempotency anchor: once set, `find_failed_payment` skips the
+/// order and `pay_new_invoice` rejects invoice swaps, so a concurrent tick (or a
+/// re-arm attempt) can never dispatch a second payout for the same escrow.
+pub async fn claim_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET payout_payment_hash = ?1 \
+         WHERE id = ?2 AND payout_payment_hash IS NULL AND status = 'settled-hold-invoice'",
+    )
+    .bind(payment_hash)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Clear the in-flight payout marker for `order_id` after a successful terminal
+/// outcome (or as tidy-up once the order has moved to `Success`).
+pub async fn clear_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+    sqlx::query("UPDATE orders SET payout_payment_hash = NULL WHERE id = ?1")
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(())
+}
+
+/// Release the in-flight marker AND re-arm retry after a failed / unknown
+/// terminal outcome: the next scheduler tick may dispatch a fresh payout once
+/// the buyer supplies a new invoice.
+pub async fn fail_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+    sqlx::query(
+        "UPDATE orders SET payout_payment_hash = NULL, failed_payment = true WHERE id = ?1",
+    )
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(())
+}
+
+/// Orders with a buyer payout in flight (marker set) awaiting reconciliation
+/// against LND. Returns `(order_id, payout_payment_hash)` pairs.
+pub async fn find_inflight_payouts(pool: &SqlitePool) -> Result<Vec<(Uuid, String)>, MostroError> {
+    let rows = sqlx::query(
+        r#"
+          SELECT id, payout_payment_hash
+          FROM orders
+          WHERE payout_payment_hash IS NOT NULL AND status == 'settled-hold-invoice'
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row
+            .try_get("id")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let hash: String = row
+            .try_get("payout_payment_hash")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        out.push((id, hash));
+    }
+    Ok(out)
 }
 
 pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
@@ -1843,7 +1926,8 @@ mod tests {
                 dev_fee_payment_hash char(64),
                 cashu_mint_url text,
                 cashu_escrow_token text,
-                cashu_escrow_locked_at integer
+                cashu_escrow_locked_at integer,
+                payout_payment_hash char(64)
             )
             "#,
         )

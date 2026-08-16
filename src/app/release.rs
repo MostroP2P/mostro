@@ -7,8 +7,8 @@ use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
-    enqueue_order_msg, get_order, mark_orderbook_publish_failed, monotonic_order_event_timestamp,
-    settle_seller_hold_invoice, update_order_event,
+    bytes_to_string, enqueue_order_msg, get_order, mark_orderbook_publish_failed,
+    monotonic_order_event_timestamp, settle_seller_hold_invoice, update_order_event,
 };
 use crate::Result;
 
@@ -607,6 +607,24 @@ pub async fn do_payment(
         },
         None => payment_request,
     };
+
+    // Idempotency claim: persist the payout invoice's `payment_hash` before
+    // dispatching to LND. While the marker is set, `find_failed_payment` skips
+    // this order and `pay_new_invoice` rejects invoice swaps, so no second
+    // payout can be dispatched for the same settled escrow. This CAS also loses
+    // to a concurrent claim (two scheduler ticks racing) — only the winner
+    // pays. Cleared on a confirmed-terminal outcome or by reconciliation.
+    let payout_hash = decode_invoice(&payment_request)
+        .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
+        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
+    if !crate::db::claim_order_payout(ctx.pool(), order.id, &payout_hash).await? {
+        warn!(
+            "Order {}: a payout is already in flight (or status changed); skipping duplicate send_payment",
+            order.id
+        );
+        return Ok(());
+    }
+
     let mut ln_client_payment = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
@@ -648,6 +666,8 @@ pub async fn do_payment(
                                 request_id,
                             )
                             .await;
+                            // Terminal success: release the in-flight marker.
+                            let _ = crate::db::clear_order_payout(ctx.pool(), order.id).await;
                         }
                         PaymentStatus::Failed => {
                             warn!(
@@ -655,8 +675,10 @@ pub async fn do_payment(
                                 order.id, msg.payment.payment_hash
                             );
 
-                            // Mark payment as failed
+                            // Mark payment as failed and release the in-flight
+                            // marker so a fresh invoice can be retried.
                             check_failure_retries_or_log(&ctx, &order, request_id).await;
+                            let _ = crate::db::clear_order_payout(ctx.pool(), order.id).await;
                         }
                         _ => {}
                     }
@@ -721,6 +743,72 @@ async fn payment_success(
         )
         .await;
     }
+    Ok(())
+}
+
+/// Decode a lowercase-hex string (e.g. a 32-byte `payment_hash`) into bytes.
+/// Returns `None` on odd length or a non-hex digit.
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Reconcile a single in-flight buyer payout against LND.
+///
+/// Called by the scheduler for every order whose `payout_payment_hash` is set.
+/// This is the counterpart to `do_payment`'s in-process status watcher: it
+/// resolves the durable marker for payouts whose watcher never delivered a
+/// terminal update — a held/stranded HTLC, or a payout whose watcher task was
+/// lost across a restart. Without it, such an order would stay locked forever
+/// (regressing the do-payment-stuck bug); with it, the marker is authoritative
+/// only until LND confirms the real outcome:
+///
+/// - `Succeeded` → finalize as `Success` (idempotent via the status CAS) and
+///   clear the marker.
+/// - `Failed` / `Unknown` / not found → clear the marker and re-arm retry;
+///   `send_payment`'s own pre-send `track_payment_v2` check backstops any race
+///   where LND actually still has the payment.
+/// - `InFlight` → leave as is; the payout is genuinely pending.
+pub async fn reconcile_inflight_payout(
+    ctx: &AppContext,
+    ln_client: &mut LndConnector,
+    order_id: uuid::Uuid,
+    payout_payment_hash: &str,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+
+    let Some(hash_bytes) = hex_to_bytes(payout_payment_hash) else {
+        warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
+        crate::db::fail_order_payout(pool, order_id).await?;
+        return Ok(());
+    };
+
+    match ln_client.lookup_payment_status(&hash_bytes).await {
+        Ok(Some(PaymentStatus::Succeeded)) => {
+            if let Ok(Some(mut order)) = Order::by_id(pool, order_id).await {
+                let my_keys = ctx.keys().clone();
+                if let Ok(buyer_pubkey) = order.get_buyer_pubkey() {
+                    let _ = payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None).await;
+                }
+            }
+            crate::db::clear_order_payout(pool, order_id).await?;
+        }
+        Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
+            crate::db::fail_order_payout(pool, order_id).await?;
+        }
+        Ok(Some(PaymentStatus::InFlight)) => {
+            // Still pending — do not re-dispatch; a later tick will reconcile.
+        }
+        Err(e) => {
+            warn!("Order {order_id}: payout reconciliation lookup failed: {e}");
+        }
+    }
+
     Ok(())
 }
 

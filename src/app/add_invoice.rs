@@ -13,7 +13,11 @@ use sqlx::{Pool, Sqlite};
 ///
 /// Uses a status-guarded targeted `UPDATE` (`WHERE status = settled-hold-invoice`)
 /// so a stale full-row write cannot resurrect payment state after
-/// `payment_success` has already moved the order to `Success`. When the CAS
+/// `payment_success` has already moved the order to `Success`. The
+/// `payout_payment_hash IS NULL` guard additionally rejects the swap while a
+/// prior payout for the order is still in flight: without it, swapping to a
+/// fresh invoice and resetting `payment_attempts` re-arms a new payout on top of
+/// an already-dispatched one (the invoice-swap re-arm drain). When the CAS
 /// misses, returns `CantDo(NotAllowedByStatus)` and does not enqueue
 /// `InvoiceUpdated`.
 pub async fn pay_new_invoice(
@@ -22,7 +26,8 @@ pub async fn pay_new_invoice(
     msg: &Message,
 ) -> Result<(), MostroError> {
     let result = sqlx::query(
-        "UPDATE orders SET buyer_invoice = ?, payment_attempts = 0 WHERE id = ? AND status = ?",
+        "UPDATE orders SET buyer_invoice = ?, payment_attempts = 0 \
+         WHERE id = ? AND status = ? AND payout_payment_hash IS NULL",
     )
     .bind(&order.buyer_invoice)
     .bind(order.id)
@@ -33,7 +38,7 @@ pub async fn pay_new_invoice(
 
     if result.rows_affected() == 0 {
         tracing::warn!(
-            "Ignoring stale buyer invoice update for order {}: row no longer in settled-hold-invoice",
+            "Ignoring buyer invoice update for order {}: not in settled-hold-invoice or a payout is already in flight",
             order.id
         );
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));

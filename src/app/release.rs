@@ -608,12 +608,21 @@ pub async fn do_payment(
         None => payment_request,
     };
 
-    // Idempotency claim: persist the payout invoice's `payment_hash` before
-    // dispatching to LND. While the marker is set, `find_failed_payment` skips
-    // this order and `pay_new_invoice` rejects invoice swaps, so no second
-    // payout can be dispatched for the same settled escrow. This CAS also loses
-    // to a concurrent claim (two scheduler ticks racing) — only the winner
-    // pays. Cleared on a confirmed-terminal outcome or by reconciliation.
+    // Connect to LND *before* claiming: if the connection fails, `?` returns
+    // here without a claim, so a transient connect blip never leaves a marker
+    // set with no payment behind it.
+    let mut ln_client_payment = LndConnector::new().await?;
+
+    // Idempotency claim: persist the payout invoice's `payment_hash` (and the
+    // claim timestamp) immediately before dispatch. While the marker is set,
+    // `find_failed_payment` skips this order and `pay_new_invoice` rejects
+    // invoice swaps, so no second payout can be dispatched for the same settled
+    // escrow. This CAS also loses to a concurrent claim (two scheduler ticks
+    // racing) — only the winner pays. Cleared on a confirmed-terminal outcome or
+    // by reconciliation; the timestamp keeps reconciliation from acting on this
+    // payout until LND has surely registered it (closing the reconcile-vs-send
+    // race). Placed right before `send_payment` so the window between claim and
+    // LND registering the payment is only the send call itself.
     let payout_hash = decode_invoice(&payment_request)
         .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
@@ -625,7 +634,6 @@ pub async fn do_payment(
         return Ok(());
     }
 
-    let mut ln_client_payment = LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);

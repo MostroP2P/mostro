@@ -1202,17 +1202,22 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
 ///
 /// The CAS is the idempotency anchor: once set, `find_failed_payment` skips the
 /// order and `pay_new_invoice` rejects invoice swaps, so a concurrent tick (or a
-/// re-arm attempt) can never dispatch a second payout for the same escrow.
+/// re-arm attempt) can never dispatch a second payout for the same escrow. The
+/// claim timestamp (`payout_claimed_at`) is sealed in the same write so
+/// reconciliation can ignore a just-claimed payout until LND has surely
+/// registered it.
 pub async fn claim_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
 ) -> Result<bool, MostroError> {
+    let claimed_at = chrono::Utc::now().timestamp();
     let result = sqlx::query(
-        "UPDATE orders SET payout_payment_hash = ?1 \
-         WHERE id = ?2 AND payout_payment_hash IS NULL AND status = 'settled-hold-invoice'",
+        "UPDATE orders SET payout_payment_hash = ?1, payout_claimed_at = ?2 \
+         WHERE id = ?3 AND payout_payment_hash IS NULL AND status = 'settled-hold-invoice'",
     )
     .bind(payment_hash)
+    .bind(claimed_at)
     .bind(order_id)
     .execute(pool)
     .await
@@ -1224,20 +1229,8 @@ pub async fn claim_order_payout(
 /// Clear the in-flight payout marker for `order_id` after a successful terminal
 /// outcome (or as tidy-up once the order has moved to `Success`).
 pub async fn clear_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
-    sqlx::query("UPDATE orders SET payout_payment_hash = NULL WHERE id = ?1")
-        .bind(order_id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(())
-}
-
-/// Release the in-flight marker AND re-arm retry after a failed / unknown
-/// terminal outcome: the next scheduler tick may dispatch a fresh payout once
-/// the buyer supplies a new invoice.
-pub async fn fail_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
     sqlx::query(
-        "UPDATE orders SET payout_payment_hash = NULL, failed_payment = true WHERE id = ?1",
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL WHERE id = ?1",
     )
     .bind(order_id)
     .execute(pool)
@@ -1246,16 +1239,39 @@ pub async fn fail_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), 
     Ok(())
 }
 
-/// Orders with a buyer payout in flight (marker set) awaiting reconciliation
-/// against LND. Returns `(order_id, payout_payment_hash)` pairs.
-pub async fn find_inflight_payouts(pool: &SqlitePool) -> Result<Vec<(Uuid, String)>, MostroError> {
+/// Release the in-flight marker AND re-arm retry after a failed / unknown
+/// terminal outcome: the next scheduler tick may dispatch a fresh payout once
+/// the buyer supplies a new invoice.
+pub async fn fail_order_payout(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+    sqlx::query(
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true WHERE id = ?1",
+    )
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(())
+}
+
+/// Orders with a buyer payout in flight (marker set) that are old enough to
+/// reconcile: only those claimed at or before `claimed_before` (unix seconds)
+/// are returned, so a payout still inside its grace window — where LND may not
+/// have registered it yet — is never reconciled and mistaken for lost. Rows
+/// predating the `payout_claimed_at` column (NULL) are always eligible.
+/// Returns `(order_id, payout_payment_hash)` pairs.
+pub async fn find_inflight_payouts(
+    pool: &SqlitePool,
+    claimed_before: i64,
+) -> Result<Vec<(Uuid, String)>, MostroError> {
     let rows = sqlx::query(
         r#"
           SELECT id, payout_payment_hash
           FROM orders
           WHERE payout_payment_hash IS NOT NULL AND status == 'settled-hold-invoice'
+            AND (payout_claimed_at IS NULL OR payout_claimed_at <= ?1)
         "#,
     )
+    .bind(claimed_before)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1927,7 +1943,8 @@ mod tests {
                 cashu_mint_url text,
                 cashu_escrow_token text,
                 cashu_escrow_locked_at integer,
-                payout_payment_hash char(64)
+                payout_payment_hash char(64),
+                payout_claimed_at integer
             )
             "#,
         )
@@ -3028,22 +3045,66 @@ mod tests {
         assert_eq!(matching.len(), 1);
     }
 
+    async fn insert_inflight_order(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+        hash: &str,
+        claimed_at: Option<i64>,
+    ) {
+        insert_settled_order(pool, id, "settled-hold-invoice").await;
+        sqlx::query(
+            "UPDATE orders SET payout_payment_hash = ?1, payout_claimed_at = ?2 WHERE id = ?3",
+        )
+        .bind(hash)
+        .bind(claimed_at)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_find_inflight_payouts_returns_only_marked() {
         let pool = setup_orders_db().await.unwrap();
         let marked = uuid::Uuid::new_v4();
         let unmarked = uuid::Uuid::new_v4();
-        insert_settled_order(&pool, marked, "settled-hold-invoice").await;
-        insert_settled_order(&pool, unmarked, "settled-hold-invoice").await;
         let hash = "1".repeat(64);
-        super::claim_order_payout(&pool, marked, &hash)
-            .await
-            .unwrap();
+        insert_inflight_order(&pool, marked, &hash, Some(1000)).await;
+        insert_settled_order(&pool, unmarked, "settled-hold-invoice").await;
 
-        let inflight = super::find_inflight_payouts(&pool).await.unwrap();
+        // cutoff well after the claim → the marked order is old enough.
+        let inflight = super::find_inflight_payouts(&pool, 2000).await.unwrap();
         assert_eq!(inflight.len(), 1);
         assert_eq!(inflight[0].0, marked);
         assert_eq!(inflight[0].1, hash);
+    }
+
+    #[tokio::test]
+    async fn test_find_inflight_payouts_respects_grace_window() {
+        let pool = setup_orders_db().await.unwrap();
+        let fresh = uuid::Uuid::new_v4();
+        let aged = uuid::Uuid::new_v4();
+        let legacy = uuid::Uuid::new_v4();
+        insert_inflight_order(&pool, fresh, &"a".repeat(64), Some(2000)).await;
+        insert_inflight_order(&pool, aged, &"b".repeat(64), Some(500)).await;
+        // Row predating the payout_claimed_at column (NULL) is always eligible.
+        insert_inflight_order(&pool, legacy, &"c".repeat(64), None).await;
+
+        // Grace cutoff = 1000: the fresh claim (2000) is skipped; the aged (500)
+        // and legacy (NULL) ones are eligible for reconciliation.
+        let inflight = super::find_inflight_payouts(&pool, 1000).await.unwrap();
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            inflight.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !ids.contains(&fresh),
+            "a just-claimed payout must not reconcile"
+        );
+        assert!(ids.contains(&aged), "an aged payout must reconcile");
+        assert!(
+            ids.contains(&legacy),
+            "a NULL-timestamp payout must reconcile"
+        );
+        assert_eq!(ids.len(), 2);
     }
 
     // -- Tests for find_order_by_hash --

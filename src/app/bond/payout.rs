@@ -664,10 +664,44 @@ async fn pay_counterparty(
 
     // send_payment. The helper caps the fee via `routing_fee_cap_sats`,
     // the same value persisted above as `payout_routing_fee_sats`.
+    // `send_payment` consumes LND's payment stream until a terminal state,
+    // which a locked-in but unresolved HTLC (hold invoice as the winner's
+    // payout invoice, or an HTLC stuck in route) can delay indefinitely —
+    // unbounded, that pins this scheduler task forever and, because the
+    // status channel is drained only after `send_payment` returns, a chatty
+    // stream could also deadlock on the full channel. Bound it with the same
+    // timeout as the buyer payout; LND stops launching route attempts at 60s,
+    // so past 75s only an unresolved HTLC keeps the stream open.
     let (tx, mut rx) = channel(100);
-    let send_outcome = ln_client
-        .send_payment(invoice, counterparty_share, tx)
-        .await;
+    let send_outcome = timeout(
+        crate::app::release::PAYOUT_SEND_PAYMENT_TIMEOUT,
+        ln_client.send_payment(invoice, counterparty_share, tx),
+    )
+    .await;
+    let send_outcome = match send_outcome {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // Timed out without a terminal state. Dropping the future closes
+            // our side of the gRPC stream but does NOT cancel the payment: a
+            // locked-in HTLC cannot be cancelled by the sender and may still
+            // settle. Indeterminate keeps the invoice + hash so the
+            // reconciliation branch above resolves the real outcome on the
+            // next tick — never re-prompt the winner against a payment that
+            // may still succeed.
+            return on_send_payment_failure(
+                pool,
+                bond,
+                max_retries,
+                claim_window_seconds,
+                PaymentFailureKind::Indeterminate,
+                &format!(
+                    "send_payment reached no terminal state after {}s",
+                    crate::app::release::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                ),
+            )
+            .await;
+        }
+    };
     if let Err(e) = send_outcome {
         // The RPC call itself errored. We cannot be sure the payment did
         // not partially enter LND, so treat it as indeterminate: keep

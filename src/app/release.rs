@@ -7,10 +7,11 @@ use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
-    enqueue_order_msg, get_order, mark_orderbook_publish_failed, monotonic_order_event_timestamp,
-    settle_seller_hold_invoice, update_order_event,
+    bytes_to_string, enqueue_order_msg, get_order, mark_orderbook_publish_failed,
+    monotonic_order_event_timestamp, settle_seller_hold_invoice, update_order_event,
 };
 use crate::Result;
+use bitcoin::hashes::hex::FromHex;
 
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
@@ -607,15 +608,71 @@ pub async fn do_payment(
         },
         None => payment_request,
     };
+
+    // Connect to LND *before* claiming: if the connection fails, `?` returns
+    // here without a claim, so a transient connect blip never leaves a marker
+    // set with no payment behind it.
     let mut ln_client_payment = LndConnector::new().await?;
+
+    // Idempotency claim: persist the payout invoice's `payment_hash` (and the
+    // claim timestamp) immediately before dispatch. While the marker is set,
+    // `find_failed_payment` skips this order and `pay_new_invoice` rejects
+    // invoice swaps, so no second payout can be dispatched for the same settled
+    // escrow. This CAS also loses to a concurrent claim (two scheduler ticks
+    // racing) — only the winner pays. Cleared on a confirmed-terminal outcome or
+    // by reconciliation; the timestamp keeps reconciliation from acting on this
+    // payout until LND has surely registered it (closing the reconcile-vs-send
+    // race). Placed right before `send_payment` so the window between claim and
+    // LND registering the payment is only the send call itself.
+    let payout_hash = decode_invoice(&payment_request)
+        .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
+        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
+    let Some(payout_claimed_at) =
+        crate::db::claim_order_payout(ctx.pool(), order.id, &payout_hash).await?
+    else {
+        warn!(
+            "Order {}: a payout is already in flight (or status changed); skipping duplicate send_payment",
+            order.id
+        );
+        return Ok(());
+    };
+
     let (tx, mut rx) = channel(100);
 
     let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
     if let Err(payment_result) = payment_task.await {
         warn!("Error during ln payment : {}", payment_result);
-        check_failure_retries_or_log(ctx, &order, request_id).await;
-        // Do not spawn the status watcher or report Ok: nothing was submitted
-        // to LND (or the attempt aborted before a usable status stream).
+        // `send_payment` returned before spawning the status watcher, so the
+        // claim we just set would otherwise stay locked (blocking retry and
+        // AddInvoice) until the grace-delayed reconciliation job runs. Ask LND
+        // what actually happened to this hash and resolve the claim inline:
+        //   - in flight / succeeded / lookup error -> KEEP the marker; the
+        //     payment may still settle, so reconciliation owns the outcome and
+        //     no second payout is ever dispatched.
+        //   - not registered / failed              -> re-arm retry now (and
+        //     notify the buyer) instead of waiting.
+        let keep_marker = match Vec::<u8>::from_hex(&payout_hash) {
+            Ok(bytes) if bytes.len() == 32 => matches!(
+                ln_client_payment.lookup_payment_status(&bytes).await,
+                Ok(Some(PaymentStatus::InFlight)) | Ok(Some(PaymentStatus::Succeeded)) | Err(_)
+            ),
+            // Should not happen (we just built this hash), but if it is
+            // unusable we cannot confirm an in-flight payment — re-arm.
+            _ => false,
+        };
+        if !keep_marker
+            && crate::db::fail_order_payout(
+                ctx.pool(),
+                order.id,
+                &payout_hash,
+                Some(payout_claimed_at),
+            )
+            .await
+            .unwrap_or(false)
+        {
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+        }
+        // Do not spawn the status watcher or report Ok.
         return Err(payment_result);
     }
 
@@ -640,14 +697,22 @@ pub async fn do_payment(
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-                            let _ = payment_success(
-                                &ctx,
-                                &mut order,
-                                buyer_pubkey,
-                                &my_keys,
-                                request_id,
-                            )
-                            .await;
+                            // Release our claim only if the order actually
+                            // reached Success. If finalization fails, keep the
+                            // marker so reconciliation retries it — clearing it
+                            // here would strand a paid order with no recovery.
+                            if payment_success(&ctx, &mut order, buyer_pubkey, &my_keys, request_id)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                let _ = crate::db::clear_order_payout(
+                                    ctx.pool(),
+                                    order.id,
+                                    &payout_hash,
+                                    Some(payout_claimed_at),
+                                )
+                                .await;
+                            }
                         }
                         PaymentStatus::Failed => {
                             warn!(
@@ -655,8 +720,24 @@ pub async fn do_payment(
                                 order.id, msg.payment.payment_hash
                             );
 
-                            // Mark payment as failed
-                            check_failure_retries_or_log(&ctx, &order, request_id).await;
+                            // Release our own claim (scoped to this hash and the
+                            // per-claim timestamp) and re-arm retry. Only do the
+                            // failure bookkeeping and buyer notification if we
+                            // still owned the claim, so a stale watcher never
+                            // pollutes a newer payout's retry state or notifies
+                            // against it — even when the retry reused the same
+                            // invoice/hash.
+                            if crate::db::fail_order_payout(
+                                ctx.pool(),
+                                order.id,
+                                &payout_hash,
+                                Some(payout_claimed_at),
+                            )
+                            .await
+                            .unwrap_or(false)
+                            {
+                                check_failure_retries_or_log(&ctx, &order, request_id).await;
+                            }
                         }
                         _ => {}
                     }
@@ -668,59 +749,216 @@ pub async fn do_payment(
     Ok(())
 }
 
+/// Finalize a paid order: transition `settled-hold-invoice` → `Success` and
+/// notify the buyer, but only after the status CAS actually commits.
+///
+/// Returns `Ok(true)` when the order is now terminal — this call committed the
+/// transition, or a concurrent task already did — meaning the caller may safely
+/// release the payout marker. Returns `Ok(false)` when the transition could not
+/// be built/persisted (`update_order_event` failed): the caller must KEEP the
+/// marker so reconciliation retries finalization, otherwise the buyer would be
+/// paid on an order stranded in `settled-hold-invoice` with no recovery hook.
+///
+/// Buyer notifications (`PurchaseCompleted`, `Rate`) are enqueued only after a
+/// successful commit, so a retried finalization never spams the buyer.
 async fn payment_success(
     ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
-) -> Result<()> {
-    // Purchase completed message to buyer
+) -> Result<bool> {
+    let pool = ctx.pool();
+
+    let order_updated = match update_order_event(my_keys, Status::Success, order).await {
+        Ok(updated) => updated,
+        // Could not build/publish the Success event: leave the order in
+        // settled-hold-invoice and signal "not finalized" so the caller keeps
+        // the marker for reconciliation.
+        Err(_) => return Ok(false),
+    };
+
+    // Only update status and event_id to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
+    // The WHERE guard prevents double success transitions from concurrent tasks.
+    let result =
+        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+            .bind(&order_updated.status)
+            .bind(&order_updated.event_id)
+            .bind(order_updated.id)
+            .bind(Status::SettledHoldInvoice.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if result.rows_affected() == 0 {
+        // Another task already finalized this order: it is terminal, so the
+        // caller may release the marker, but the notifications were already
+        // sent by that task — do not duplicate them.
+        tracing::warn!(
+            "Order {} not transitioned to success: already processed by another task",
+            order_updated.id
+        );
+        return Ok(true);
+    }
+
+    // Committed by us — notify the buyer now.
     enqueue_order_msg(
         None,
-        Some(order.id),
+        Some(order_updated.id),
         Action::PurchaseCompleted,
         None,
         buyer_pubkey,
         None,
     )
     .await;
+    enqueue_order_msg(
+        request_id,
+        Some(order_updated.id),
+        Action::Rate,
+        None,
+        buyer_pubkey,
+        None,
+    )
+    .await;
+    Ok(true)
+}
 
+/// The one LND capability `reconcile_inflight_payout` needs: query a payment's
+/// status by hash. Behind a trait (mirroring [`crate::app::cancel`]'s
+/// `CancelLightning`) so the reconcile branches are unit-testable with a stub
+/// instead of a live node.
+pub trait PayoutStatusLookup {
+    fn lookup_payment_status<'a>(
+        &'a mut self,
+        payment_hash: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+impl PayoutStatusLookup for LndConnector {
+    fn lookup_payment_status<'a>(
+        &'a mut self,
+        payment_hash: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { LndConnector::lookup_payment_status(self, payment_hash).await })
+    }
+}
+
+/// Reconcile a single in-flight buyer payout against LND.
+///
+/// Called by the scheduler for every order whose `payout_payment_hash` is set.
+/// This is the counterpart to `do_payment`'s in-process status watcher: it
+/// resolves the durable marker for payouts whose watcher never delivered a
+/// terminal update — a held/stranded HTLC, or a payout whose watcher task was
+/// lost across a restart. Without it, such an order would stay locked forever
+/// (regressing the do-payment-stuck bug); with it, the marker is authoritative
+/// only until LND confirms the real outcome:
+///
+/// - `Succeeded` → finalize as `Success` (idempotent via the status CAS) and
+///   clear the marker.
+/// - `Failed` / `Unknown` / not found → clear the marker, re-arm retry, and run
+///   the same failure bookkeeping as the in-process watcher (advance
+///   `payment_attempts`, notify the buyer). Re-arming is safe because LND itself
+///   rejects a second `SendPaymentV2` for a payment hash it already has in
+///   flight or settled, so a fresh dispatch of the same invoice cannot
+///   double-pay.
+/// - `InFlight` → leave as is; the payout is genuinely pending.
+///
+/// `payout_claimed_at` is the per-claim token observed for this marker; every
+/// release is scoped to it so a claim replaced between the snapshot and here is
+/// never clobbered.
+pub async fn reconcile_inflight_payout(
+    ctx: &AppContext,
+    ln_client: &mut impl PayoutStatusLookup,
+    order_id: uuid::Uuid,
+    payout_payment_hash: &str,
+    payout_claimed_at: Option<i64>,
+) -> Result<(), MostroError> {
     let pool = ctx.pool();
 
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Success, order).await {
-        // Only update status and event_id to avoid overwriting fields modified by
-        // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
-        // The WHERE guard prevents double success transitions from concurrent tasks.
-        let result =
-            sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
-                .bind(&order_updated.status)
-                .bind(&order_updated.event_id)
-                .bind(order_updated.id)
-                .bind(Status::SettledHoldInvoice.to_string())
-                .execute(pool)
-                .await
-                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        if result.rows_affected() == 0 {
-            tracing::warn!(
-                "Order {} not transitioned to success: already processed by another task",
-                order_updated.id
-            );
+    // A payment hash is exactly 32 bytes (64 hex chars). Decode with the same
+    // `FromHex` used across the codebase and length-check it; a bad-hex or
+    // wrong-length marker is corrupt, so treat it as malformed and re-arm rather
+    // than sending a truncated hash to LND.
+    let hash_bytes = match Vec::<u8>::from_hex(payout_payment_hash) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
+            crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
+                .await?;
             return Ok(());
         }
+    };
 
-        // Send dm to buyer to rate counterpart
-        enqueue_order_msg(
-            request_id,
-            Some(order_updated.id),
-            Action::Rate,
-            None,
-            buyer_pubkey,
-            None,
-        )
-        .await;
+    match ln_client.lookup_payment_status(&hash_bytes).await {
+        Ok(Some(PaymentStatus::Succeeded)) => {
+            // Clear the marker only once the order is actually finalized. If
+            // finalization fails (or the buyer key is unreadable), keep the
+            // marker so a later tick retries it instead of stranding a paid
+            // order in settled-hold-invoice.
+            let finalized = match Order::by_id(pool, order_id).await {
+                Ok(Some(mut order)) => {
+                    let my_keys = ctx.keys().clone();
+                    match order.get_buyer_pubkey() {
+                        Ok(buyer_pubkey) => {
+                            payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None)
+                                .await
+                                .unwrap_or(false)
+                        }
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            };
+            if finalized {
+                crate::db::clear_order_payout(
+                    pool,
+                    order_id,
+                    payout_payment_hash,
+                    payout_claimed_at,
+                )
+                .await?;
+            }
+        }
+        Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
+            // Snapshot the order *before* re-arming so the bookkeeping sees the
+            // pre-failure state: `fail_order_payout` sets failed_payment = true,
+            // and `count_failed_payment` treats an already-failed order as a
+            // subsequent failure (no first-failure notice / attempt bump). This
+            // mirrors the in-process watcher, which passes its pre-failure copy.
+            let pre = Order::by_id(pool, order_id).await.ok().flatten();
+            // Re-arm retry, and — only if we still owned this claim — run the
+            // same failure bookkeeping the in-process watcher does, so a payout
+            // that resolves only through reconciliation (watcher lost across a
+            // restart) still advances payment_attempts and notifies the buyer.
+            if crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
+                .await?
+            {
+                if let Some(order) = pre {
+                    check_failure_retries_or_log(ctx, &order, None).await;
+                }
+            }
+        }
+        Ok(Some(PaymentStatus::InFlight)) => {
+            // Still pending — do not re-dispatch; a later tick will reconcile.
+        }
+        Err(e) => {
+            warn!("Order {order_id}: payout reconciliation lookup failed: {e}");
+        }
     }
+
     Ok(())
 }
 
@@ -1911,8 +2149,8 @@ mod tests {
         // Act
         let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
 
-        // Assert
-        assert!(result.is_ok());
+        // Assert: committed the transition (returns true) and notified the buyer.
+        assert!(result.unwrap(), "a committed finalization returns true");
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::Success.to_string());
         let actions = queued_actions_for(order.id).await;
@@ -1936,12 +2174,195 @@ mod tests {
         // Act
         let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
 
-        // Assert: early return — status untouched, no Rate message queued.
-        assert!(result.is_ok());
+        // Assert: the guarded UPDATE matched no rows (already finalized
+        // elsewhere), so the call reports terminal (`true`) — the caller may
+        // release the marker — but sends no duplicate notifications, and the
+        // status is left untouched.
+        assert!(
+            result.unwrap(),
+            "a no-op CAS (already processed) is terminal and returns true"
+        );
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::Active.to_string());
         let actions = queued_actions_for(order.id).await;
-        assert!(actions.contains(&Action::PurchaseCompleted));
+        assert!(!actions.contains(&Action::PurchaseCompleted));
         assert!(!actions.contains(&Action::Rate));
+    }
+
+    // --- reconcile_inflight_payout branch coverage (stubbed LND) ---
+
+    /// Configurable LND stub: returns a fixed `PaymentStatus` (or an error) for
+    /// every `lookup_payment_status`, so the four reconcile branches can be
+    /// exercised without a live node.
+    struct StubLnClient {
+        status: Option<PaymentStatus>,
+        error: bool,
+    }
+
+    impl PayoutStatusLookup for StubLnClient {
+        fn lookup_payment_status<'a>(
+            &'a mut self,
+            _payment_hash: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let status = self.status;
+            let error = self.error;
+            Box::pin(async move {
+                if error {
+                    Err(MostroInternalErr(ServiceError::LnPaymentError(
+                        "stub".to_string(),
+                    )))
+                } else {
+                    Ok(status)
+                }
+            })
+        }
+    }
+
+    /// Create a `settled-hold-invoice` order and claim a payout marker on it,
+    /// returning `(order_id, payout_hash, claim_token)`.
+    async fn settled_order_with_marker(pool: &SqlitePool) -> (uuid::Uuid, String, i64) {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(pool).await.unwrap();
+        let hash = "a".repeat(64);
+        let token = crate::db::claim_order_payout(pool, order.id, &hash)
+            .await
+            .unwrap()
+            .expect("claim must win on a fresh order");
+        (order.id, hash, token)
+    }
+
+    async fn marker_of(pool: &SqlitePool, id: uuid::Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT payout_payment_hash FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_succeeded_finalizes_and_clears_marker() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+        };
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert!(
+            marker_of(&pool, id).await.is_none(),
+            "marker released after finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_failed_rearms_and_runs_bookkeeping() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Failed),
+            error: false,
+        };
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        assert!(marker_of(&pool, id).await.is_none(), "marker released");
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "retry re-armed");
+        assert_eq!(
+            db_order.payment_attempts, 1,
+            "bookkeeping advanced payment_attempts"
+        );
+        assert!(
+            queued_actions_for(id)
+                .await
+                .contains(&Action::PaymentFailed),
+            "buyer notified on first failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_inflight_is_a_noop() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::InFlight),
+            error: false,
+        };
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            marker_of(&pool, id).await.as_deref(),
+            Some(hash.as_str()),
+            "an in-flight payout keeps its marker"
+        );
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        assert!(!db_order.failed_payment, "in-flight must not re-arm retry");
+    }
+
+    #[tokio::test]
+    async fn reconcile_malformed_hash_rearms_without_lookup() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        // Force a corrupt (non-32-byte) marker directly.
+        sqlx::query(
+            "UPDATE orders SET payout_payment_hash = ?, payout_claimed_at = ? WHERE id = ?",
+        )
+        .bind("abc")
+        .bind(1000_i64)
+        .bind(order.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Stub set to error to prove it is never consulted for a malformed hash.
+        let mut ln = StubLnClient {
+            status: None,
+            error: true,
+        };
+        reconcile_inflight_payout(&ctx, &mut ln, order.id, "abc", Some(1000))
+            .await
+            .unwrap();
+
+        assert!(
+            marker_of(&pool, order.id).await.is_none(),
+            "malformed marker cleared"
+        );
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "malformed marker re-arms retry");
     }
 }

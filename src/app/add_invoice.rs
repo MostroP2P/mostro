@@ -13,7 +13,11 @@ use sqlx::{Pool, Sqlite};
 ///
 /// Uses a status-guarded targeted `UPDATE` (`WHERE status = settled-hold-invoice`)
 /// so a stale full-row write cannot resurrect payment state after
-/// `payment_success` has already moved the order to `Success`. When the CAS
+/// `payment_success` has already moved the order to `Success`. The
+/// `payout_payment_hash IS NULL` guard additionally rejects the swap while a
+/// prior payout for the order is still in flight: without it, swapping to a
+/// fresh invoice and resetting `payment_attempts` re-arms a new payout on top of
+/// an already-dispatched one (the invoice-swap re-arm drain). When the CAS
 /// misses, returns `CantDo(NotAllowedByStatus)` and does not enqueue
 /// `InvoiceUpdated`.
 pub async fn pay_new_invoice(
@@ -22,7 +26,8 @@ pub async fn pay_new_invoice(
     msg: &Message,
 ) -> Result<(), MostroError> {
     let result = sqlx::query(
-        "UPDATE orders SET buyer_invoice = ?, payment_attempts = 0 WHERE id = ? AND status = ?",
+        "UPDATE orders SET buyer_invoice = ?, payment_attempts = 0 \
+         WHERE id = ? AND status = ? AND payout_payment_hash IS NULL",
     )
     .bind(&order.buyer_invoice)
     .bind(order.id)
@@ -33,7 +38,7 @@ pub async fn pay_new_invoice(
 
     if result.rows_affected() == 0 {
         tracing::warn!(
-            "Ignoring stale buyer invoice update for order {}: row no longer in settled-hold-invoice",
+            "Ignoring buyer invoice update for order {}: not in settled-hold-invoice or a payout is already in flight",
             order.id
         );
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
@@ -327,6 +332,48 @@ mod tests {
         assert_eq!(stored.status, Status::Active.to_string());
         assert_eq!(stored.payment_attempts, 7, "newer state must remain intact");
         assert_eq!(stored.buyer_invoice.as_deref(), Some("lnbc-old"));
+        assert!(!queued_actions_for(buyer)
+            .await
+            .contains(&Action::InvoiceUpdated));
+    }
+
+    /// A swap must be rejected while a payout for the order is already in
+    /// flight (`payout_payment_hash` set): otherwise a fresh invoice would reset
+    /// `payment_attempts` on top of a pending payout and re-arm a second one.
+    #[tokio::test]
+    async fn pay_new_invoice_rejects_swap_while_payout_in_flight() {
+        let pool = setup_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = waiting_invoice_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        order.payment_attempts = 2;
+        order.buyer_invoice = Some("lnbc-current".to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        // A payout is already in flight for this order.
+        crate::db::claim_order_payout(&pool, order.id, &"a".repeat(64))
+            .await
+            .unwrap();
+
+        let mut swap = order.clone();
+        swap.buyer_invoice = Some("lnbc-new".to_string());
+        let result = pay_new_invoice(
+            &mut swap,
+            &pool,
+            &Message::new_order(Some(order.id), Some(1), None, Action::AddInvoice, None),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "swap must be rejected while a payout is in flight: {result:?}"
+        );
+        // Neither the invoice nor the attempts counter changed.
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.buyer_invoice.as_deref(), Some("lnbc-current"));
+        assert_eq!(stored.payment_attempts, 2);
         assert!(!queued_actions_for(buyer)
             .await
             .contains(&Action::InvoiceUpdated));

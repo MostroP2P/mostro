@@ -609,6 +609,11 @@ pub async fn do_payment(
         None => payment_request,
     };
 
+    // Resolve the buyer pubkey *before* claiming: a malformed order fails
+    // here without a claim, so no marker is ever left set for a payout that
+    // was never dispatched.
+    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
+
     // Connect to LND *before* claiming: if the connection fails, `?` returns
     // here without a claim, so a transient connect blip never leaves a marker
     // set with no payment behind it.
@@ -678,9 +683,6 @@ pub async fn do_payment(
 
     // Get Mostro keys from context
     let my_keys = ctx.keys().clone();
-
-    // Get buyer and seller pubkeys
-    let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Clone ctx for the async closure
     let ctx = ctx.clone();

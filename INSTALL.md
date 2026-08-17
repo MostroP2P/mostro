@@ -110,7 +110,7 @@ Here some parameters you might want to change:
 
 ### Protect the admin macaroon
 
-The admin macaroon is a spend-capable credential: any user who can read it has full control of the LND node, including the funds escrowed in Mostro's hold invoices. The `mostro` service account created above must be able to read it, and no one else.
+The admin macaroon is a spend-capable credential: any user who can read it has full control of the LND node, including the funds escrowed in Mostro's hold invoices. Access should reach no further than the `mostro` service account created above and the LND account the node already runs as.
 
 If LND runs on this same VPS, grant access through the node's group instead of loosening the file (LND creates `admin.macaroon` with mode `0640`):
 

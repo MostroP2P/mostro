@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
-/// Warn when a credential file is reachable by users outside its owner and
-/// group.
+/// Warn when a credential file has any of its "other" permission bits set,
+/// which puts it within reach of every account on the host.
 ///
 /// The check is advisory: a node whose macaroon is `0644` still starts, it
 /// just says so out loud once per boot. Refusing to start would turn a
@@ -25,9 +25,13 @@ pub fn warn_if_other_accessible(path: &str, label: &str) {
     }
 
     if let Some(mode) = other_accessible_mode(Path::new(path)) {
+        // `chmod o=` rather than `chmod 600`: the file may legitimately be
+        // owned by the LND account and read by mostrod through the node's
+        // group, and following advice that drops the group bits would leave
+        // the daemon unable to authenticate on its next restart.
         tracing::warn!(
-            "{label} ({path}) has permissions {mode:04o}: it is reachable by users other than \
-             its owner and group. Restrict it to the account running mostrod with: chmod 600 {path}"
+            "{label} ({path}) has permissions {mode:04o}: its \"other\" bits are set, so every \
+             account on this host can reach it. Clear them with: chmod o= {path}"
         );
     }
 }
@@ -38,6 +42,11 @@ pub fn warn_if_other_accessible(path: &str, label: &str) {
 /// Group access is deliberately tolerated: LND itself creates
 /// `admin.macaroon` with mode `0640`, and granting a service account access
 /// through the node's group is a legitimate deployment, not a finding.
+///
+/// Only the mode bits are read. A POSIX ACL can widen access without touching
+/// them, so a quiet startup means "the mode bits are sane", not "no other
+/// account can read this file" — the check is a cheap guard against the
+/// documented copy-it-into-place flows, not an audit.
 ///
 /// `metadata` follows symlinks on purpose — pointing `lnd_macaroon_file` at a
 /// link is common, and what matters is the mode of the file that is actually

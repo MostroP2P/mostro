@@ -108,10 +108,14 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
     the node, including the funds escrowed in Mostro's hold invoices. Keep it
     readable only by the user running `mostrod` (`chmod 600`).
   - At startup (Lightning mode only, right before the LND connection is opened)
-    `config::permissions::warn_if_other_accessible` logs a warning when the file
-    is reachable by users outside its owner and group. The check is advisory —
-    the daemon still starts — and tolerates `0640`, the mode LND itself writes
-    the macaroon with, so reaching it through the node's group stays supported.
+    `config::permissions::warn_if_other_accessible` logs a warning when the
+    file's `other` permission bits are set, and suggests `chmod o=`. The check
+    is advisory — the daemon still starts — and tolerates `0640`, the mode LND
+    itself writes the macaroon with, so reading it through the node's group
+    stays supported.
+  - Only the mode bits are inspected: a POSIX ACL can grant a named user access
+    without setting them, so a quiet startup is not proof that no other account
+    can read the file.
 - `lnd_grpc_host` (String): LND gRPC endpoint URL
 - `invoice_expiration_window` (u32): Required invoice validity window in seconds (default: 3600)
 - `hold_invoice_cltv_delta` (u32): Hold invoice CLTV delta in blocks (default: 144)

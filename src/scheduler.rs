@@ -251,7 +251,11 @@ async fn job_retry_failed_payments(ctx: AppContext) {
 /// restart — is finalized, re-armed, or left pending based on LND's real state,
 /// instead of blocking the order forever. Runs at startup and every tick.
 async fn job_reconcile_inflight_payouts(ctx: AppContext) {
-    let interval = 60u64;
+    // Reconcile poll cadence. Deliberately a fixed value and NOT derived from
+    // `payment_retries_interval`: it only bounds how quickly a stranded payout
+    // is noticed (a liveness knob), not correctness, so it stays independent of
+    // the operator's retry tuning.
+    const RECONCILE_INTERVAL_SECS: u64 = 60;
     // Grace window: a payout claimed less than this many seconds ago is not
     // reconciled yet, so LND has surely registered it before we ever act on a
     // `None`/`Failed` lookup. Tied to the retry cadence — comfortably larger
@@ -303,7 +307,7 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
                 }
                 Err(e) => error!("payout reconcile: find_inflight_payouts failed: {e}"),
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(RECONCILE_INTERVAL_SECS)).await;
         }
     });
 }

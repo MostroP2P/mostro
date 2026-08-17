@@ -1296,6 +1296,13 @@ pub async fn fail_order_payout(
 /// predating the `payout_claimed_at` column (NULL) are always eligible.
 /// Returns `(order_id, payout_payment_hash, payout_claimed_at)` tuples so the
 /// caller can scope its release to the exact claim it observed.
+///
+/// Note: the `status = 'settled-hold-invoice'` filter means a marker left on an
+/// order that has since moved to a terminal status (e.g. `Success` when the
+/// post-finalize `clear_order_payout` lost to a DB blip) is never returned here.
+/// Such a marker is inert residue — `find_failed_payment` and `pay_new_invoice`
+/// also require `settled-hold-invoice`, so nothing ever acts on it — but it can
+/// linger; treat a marker on a non-`settled-hold-invoice` order as stale.
 pub async fn find_inflight_payouts(
     pool: &SqlitePool,
     claimed_before: i64,

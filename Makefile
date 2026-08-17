@@ -4,7 +4,7 @@ VERSION := $(shell grep "^version = " Cargo.toml | sed "s/version = \"\(.*\)\"/\
 docker-build:
 	@set -o pipefail; \
 	cd docker && \
-	mkdir -p config/lnd && \
+	install -d -m 700 config/lnd && \
 	echo "Checking LND files..." && \
 	echo "LND_CERT_FILE=$${LND_CERT_FILE}" && \
 	echo "LND_MACAROON_FILE=$${LND_MACAROON_FILE}" && \
@@ -27,8 +27,11 @@ docker-build:
 		exit 1; \
 	fi && \
 	echo "Copying LND cert and macaroon to docker config" && \
-	cp -v $${LND_CERT_FILE} config/lnd/tls.cert && \
-	cp -v $${LND_MACAROON_FILE} config/lnd/admin.macaroon && \
+	install -m 644 "$${LND_CERT_FILE}" config/lnd/tls.cert && \
+	install -m 600 "$${LND_MACAROON_FILE}" config/lnd/admin.macaroon && \
+	echo "Wrote config/lnd/tls.cert (mode 644) and config/lnd/admin.macaroon (mode 600)" && \
+	echo "Note: the container runs as uid/gid 1000. If these files are owned by another user," && \
+	echo "      run: sudo chown 1000:1000 docker/config/lnd/tls.cert docker/config/lnd/admin.macaroon" && \
 	echo "Building docker image" && \
 	docker compose build
 

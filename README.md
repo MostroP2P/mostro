@@ -495,7 +495,7 @@ This starts:
 - Mostro daemon (exposed via configured relays)
 - Local Nostr relay (port 7000 by default)
 
-`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node. The container runs as uid/gid 1000, so run `sudo chown -R 1000:1000 docker/config/lnd` if you built as a different user.
+`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node. The container runs as uid/gid 1000 by default; if your user is not uid 1000, `export MOSTRO_CONTAINER_USER=$(id -u):$(id -g)` so it runs as you and can read the macaroon.
 
 **Stop**: `make docker-down`
 

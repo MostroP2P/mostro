@@ -256,7 +256,16 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
     // reconciled yet, so LND has surely registered it before we ever act on a
     // `None`/`Failed` lookup. Tied to the retry cadence — comfortably larger
     // than the sub-second claim→register window.
-    let grace_secs = ctx.settings().lightning.payment_retries_interval.max(1) as i64;
+    //
+    // Floor it: `LightningSettings::default()` has payment_retries_interval = 0,
+    // and a 1s grace would be narrower than the claim→register window it guards,
+    // re-opening the reconcile-vs-dispatch race the grace exists to close.
+    const MIN_GRACE_SECS: u32 = 30;
+    let grace_secs = ctx
+        .settings()
+        .lightning
+        .payment_retries_interval
+        .max(MIN_GRACE_SECS) as i64;
 
     tokio::spawn(async move {
         // Same capped-backoff LndConnector bootstrap as the bond payout job: a
@@ -278,10 +287,15 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
             let claimed_before = Utc::now().timestamp() - grace_secs;
             match crate::db::find_inflight_payouts(pool, claimed_before).await {
                 Ok(inflight) => {
-                    for (order_id, payout_hash) in inflight.into_iter() {
-                        if let Err(e) =
-                            reconcile_inflight_payout(&ctx, &mut ln_client, order_id, &payout_hash)
-                                .await
+                    for (order_id, payout_hash, payout_claimed_at) in inflight.into_iter() {
+                        if let Err(e) = reconcile_inflight_payout(
+                            &ctx,
+                            &mut ln_client,
+                            order_id,
+                            &payout_hash,
+                            payout_claimed_at,
+                        )
+                        .await
                         {
                             error!("payout reconcile for order {order_id}: {e}");
                         }

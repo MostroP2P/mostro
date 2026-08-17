@@ -627,13 +627,15 @@ pub async fn do_payment(
     let payout_hash = decode_invoice(&payment_request)
         .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
-    if !crate::db::claim_order_payout(ctx.pool(), order.id, &payout_hash).await? {
+    let Some(payout_claimed_at) =
+        crate::db::claim_order_payout(ctx.pool(), order.id, &payout_hash).await?
+    else {
         warn!(
             "Order {}: a payout is already in flight (or status changed); skipping duplicate send_payment",
             order.id
         );
         return Ok(());
-    }
+    };
 
     let (tx, mut rx) = channel(100);
 
@@ -659,9 +661,14 @@ pub async fn do_payment(
             _ => false,
         };
         if !keep_marker
-            && crate::db::fail_order_payout(ctx.pool(), order.id, &payout_hash)
-                .await
-                .unwrap_or(false)
+            && crate::db::fail_order_payout(
+                ctx.pool(),
+                order.id,
+                &payout_hash,
+                Some(payout_claimed_at),
+            )
+            .await
+            .unwrap_or(false)
         {
             check_failure_retries_or_log(ctx, &order, request_id).await;
         }
@@ -702,6 +709,7 @@ pub async fn do_payment(
                                     ctx.pool(),
                                     order.id,
                                     &payout_hash,
+                                    Some(payout_claimed_at),
                                 )
                                 .await;
                             }
@@ -712,14 +720,21 @@ pub async fn do_payment(
                                 order.id, msg.payment.payment_hash
                             );
 
-                            // Release our own claim (scoped to this hash) and
-                            // re-arm retry. Only do the failure bookkeeping and
-                            // buyer notification if we still owned the claim, so
-                            // a stale watcher never pollutes a newer payout's
-                            // retry state or notifies against it.
-                            if crate::db::fail_order_payout(ctx.pool(), order.id, &payout_hash)
-                                .await
-                                .unwrap_or(false)
+                            // Release our own claim (scoped to this hash and the
+                            // per-claim timestamp) and re-arm retry. Only do the
+                            // failure bookkeeping and buyer notification if we
+                            // still owned the claim, so a stale watcher never
+                            // pollutes a newer payout's retry state or notifies
+                            // against it — even when the retry reused the same
+                            // invoice/hash.
+                            if crate::db::fail_order_payout(
+                                ctx.pool(),
+                                order.id,
+                                &payout_hash,
+                                Some(payout_claimed_at),
+                            )
+                            .await
+                            .unwrap_or(false)
                             {
                                 check_failure_retries_or_log(&ctx, &order, request_id).await;
                             }
@@ -821,15 +836,23 @@ async fn payment_success(
 ///
 /// - `Succeeded` → finalize as `Success` (idempotent via the status CAS) and
 ///   clear the marker.
-/// - `Failed` / `Unknown` / not found → clear the marker and re-arm retry;
-///   `send_payment`'s own pre-send `track_payment_v2` check backstops any race
-///   where LND actually still has the payment.
+/// - `Failed` / `Unknown` / not found → clear the marker, re-arm retry, and run
+///   the same failure bookkeeping as the in-process watcher (advance
+///   `payment_attempts`, notify the buyer). Re-arming is safe because LND itself
+///   rejects a second `SendPaymentV2` for a payment hash it already has in
+///   flight or settled, so a fresh dispatch of the same invoice cannot
+///   double-pay.
 /// - `InFlight` → leave as is; the payout is genuinely pending.
+///
+/// `payout_claimed_at` is the per-claim token observed for this marker; every
+/// release is scoped to it so a claim replaced between the snapshot and here is
+/// never clobbered.
 pub async fn reconcile_inflight_payout(
     ctx: &AppContext,
     ln_client: &mut LndConnector,
     order_id: uuid::Uuid,
     payout_payment_hash: &str,
+    payout_claimed_at: Option<i64>,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
 
@@ -841,7 +864,8 @@ pub async fn reconcile_inflight_payout(
         Ok(bytes) if bytes.len() == 32 => bytes,
         _ => {
             warn!("Order {order_id}: malformed payout_payment_hash; clearing and re-arming retry");
-            crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
+            crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
+                .await?;
             return Ok(());
         }
     };
@@ -867,11 +891,27 @@ pub async fn reconcile_inflight_payout(
                 _ => false,
             };
             if finalized {
-                crate::db::clear_order_payout(pool, order_id, payout_payment_hash).await?;
+                crate::db::clear_order_payout(
+                    pool,
+                    order_id,
+                    payout_payment_hash,
+                    payout_claimed_at,
+                )
+                .await?;
             }
         }
         Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
-            crate::db::fail_order_payout(pool, order_id, payout_payment_hash).await?;
+            // Re-arm retry, and — only if we still owned this claim — run the
+            // same failure bookkeeping the in-process watcher does, so a payout
+            // that resolves only through reconciliation (watcher lost across a
+            // restart) still advances payment_attempts and notifies the buyer.
+            if crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
+                .await?
+            {
+                if let Ok(Some(order)) = Order::by_id(pool, order_id).await {
+                    check_failure_retries_or_log(ctx, &order, None).await;
+                }
+            }
         }
         Ok(Some(PaymentStatus::InFlight)) => {
             // Still pending — do not re-dispatch; a later tick will reconcile.

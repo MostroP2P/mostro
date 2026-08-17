@@ -1196,21 +1196,24 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
 }
 
 /// Atomically claim the buyer payout for `order_id` by persisting the payout
-/// invoice's `payment_hash`, but only while no payout is already in flight and
-/// the order is still `settled-hold-invoice`. Returns `true` when this caller
-/// won the claim and may proceed to `send_payment`.
+/// invoice's `payment_hash` (and a claim timestamp), but only while no payout is
+/// already in flight and the order is still `settled-hold-invoice`. Returns
+/// `Some(claimed_at)` — the unix-second timestamp sealed into the claim — when
+/// this caller won, or `None` when it lost the CAS.
 ///
 /// The CAS is the idempotency anchor: once set, `find_failed_payment` skips the
 /// order and `pay_new_invoice` rejects invoice swaps, so a concurrent tick (or a
 /// re-arm attempt) can never dispatch a second payout for the same escrow. The
-/// claim timestamp (`payout_claimed_at`) is sealed in the same write so
-/// reconciliation can ignore a just-claimed payout until LND has surely
-/// registered it.
+/// returned `claimed_at` is a per-claim token: releases are scoped to it (not
+/// just the hash), so when a retry re-claims the *same* invoice/hash a stale
+/// caller from the previous attempt still loses the release CAS. It also lets
+/// reconciliation ignore a just-claimed payout until LND has surely registered
+/// it (grace window).
 pub async fn claim_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
-) -> Result<bool, MostroError> {
+) -> Result<Option<i64>, MostroError> {
     let claimed_at = chrono::Utc::now().timestamp();
     let result = sqlx::query(
         "UPDATE orders SET payout_payment_hash = ?1, payout_claimed_at = ?2 \
@@ -1223,17 +1226,20 @@ pub async fn claim_order_payout(
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    Ok(result.rows_affected() > 0)
+    Ok((result.rows_affected() > 0).then_some(claimed_at))
 }
 
 /// Clear the in-flight payout marker for `order_id` after a successful terminal
 /// outcome (or as tidy-up once the order has moved to `Success`).
 ///
-/// Scoped to `payment_hash`: the release only fires when the marker still holds
-/// the hash this caller claimed. A status watcher can outlive its own claim (its
-/// stream stalls, reconciliation resolves the payout, and a new payout is
-/// claimed for the same order); scoping the CAS stops such a stale watcher from
-/// erasing a *newer* claim and letting a second payment be dispatched.
+/// Scoped to both `payment_hash` and `claimed_at` (the per-claim token): the
+/// release only fires when the marker still holds *this* caller's claim. A
+/// status watcher can outlive its own claim (its stream stalls, reconciliation
+/// resolves the payout, and a new payout — possibly with the same reused
+/// invoice/hash — is claimed for the same order); scoping the CAS to the claim
+/// timestamp stops such a stale watcher from erasing a *newer* claim and letting
+/// a second payment be dispatched. `claimed_at` uses `IS` so a legacy NULL
+/// timestamp still matches.
 ///
 /// Returns `true` when this caller still owned the claim (the row was cleared),
 /// so callers can gate their own terminal side-effects on claim ownership.
@@ -1241,13 +1247,15 @@ pub async fn clear_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
+    claimed_at: Option<i64>,
 ) -> Result<bool, MostroError> {
     let result = sqlx::query(
         "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL \
-         WHERE id = ?1 AND payout_payment_hash = ?2",
+         WHERE id = ?1 AND payout_payment_hash = ?2 AND payout_claimed_at IS ?3",
     )
     .bind(order_id)
     .bind(payment_hash)
+    .bind(claimed_at)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1258,21 +1266,23 @@ pub async fn clear_order_payout(
 /// terminal outcome: the next scheduler tick may dispatch a fresh payout once
 /// the buyer supplies a new invoice.
 ///
-/// Scoped to `payment_hash` for the same reason as [`clear_order_payout`]: a
-/// stale caller must not re-arm retry against a newer in-flight claim. Returns
-/// `true` when this caller still owned the claim, so failure bookkeeping and
-/// buyer notifications can be gated on ownership.
+/// Scoped to `payment_hash` and `claimed_at` for the same reason as
+/// [`clear_order_payout`]: a stale caller must not re-arm retry against a newer
+/// in-flight claim. Returns `true` when this caller still owned the claim, so
+/// failure bookkeeping and buyer notifications can be gated on ownership.
 pub async fn fail_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
     payment_hash: &str,
+    claimed_at: Option<i64>,
 ) -> Result<bool, MostroError> {
     let result = sqlx::query(
         "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true \
-         WHERE id = ?1 AND payout_payment_hash = ?2",
+         WHERE id = ?1 AND payout_payment_hash = ?2 AND payout_claimed_at IS ?3",
     )
     .bind(order_id)
     .bind(payment_hash)
+    .bind(claimed_at)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1284,14 +1294,15 @@ pub async fn fail_order_payout(
 /// are returned, so a payout still inside its grace window — where LND may not
 /// have registered it yet — is never reconciled and mistaken for lost. Rows
 /// predating the `payout_claimed_at` column (NULL) are always eligible.
-/// Returns `(order_id, payout_payment_hash)` pairs.
+/// Returns `(order_id, payout_payment_hash, payout_claimed_at)` tuples so the
+/// caller can scope its release to the exact claim it observed.
 pub async fn find_inflight_payouts(
     pool: &SqlitePool,
     claimed_before: i64,
-) -> Result<Vec<(Uuid, String)>, MostroError> {
+) -> Result<Vec<(Uuid, String, Option<i64>)>, MostroError> {
     let rows = sqlx::query(
         r#"
-          SELECT id, payout_payment_hash
+          SELECT id, payout_payment_hash, payout_claimed_at
           FROM orders
           WHERE payout_payment_hash IS NOT NULL AND status == 'settled-hold-invoice'
             AND (payout_claimed_at IS NULL OR payout_claimed_at <= ?1)
@@ -1310,7 +1321,10 @@ pub async fn find_inflight_payouts(
         let hash: String = row
             .try_get("payout_payment_hash")
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-        out.push((id, hash));
+        let claimed_at: Option<i64> = row
+            .try_get("payout_claimed_at")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        out.push((id, hash, claimed_at));
     }
     Ok(out)
 }
@@ -2999,8 +3013,11 @@ mod tests {
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
 
         let hash = "b".repeat(64);
-        // First claim wins.
-        assert!(super::claim_order_payout(&pool, id, &hash).await.unwrap());
+        // First claim wins and returns its timestamp token.
+        assert!(super::claim_order_payout(&pool, id, &hash)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             payout_hash_of(&pool, id).await.as_deref(),
             Some(hash.as_str())
@@ -3008,9 +3025,10 @@ mod tests {
 
         // A second claim (concurrent tick / re-arm) loses — the marker is set.
         assert!(
-            !super::claim_order_payout(&pool, id, &"c".repeat(64))
+            super::claim_order_payout(&pool, id, &"c".repeat(64))
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "second claim must lose the CAS"
         );
         // The original hash is untouched.
@@ -3027,9 +3045,10 @@ mod tests {
         insert_settled_order(&pool, id, "active").await;
 
         assert!(
-            !super::claim_order_payout(&pool, id, &"d".repeat(64))
+            super::claim_order_payout(&pool, id, &"d".repeat(64))
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "must not claim a payout on a non settled-hold-invoice order"
         );
         assert!(payout_hash_of(&pool, id).await.is_none());
@@ -3041,9 +3060,11 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let hash = "e".repeat(64);
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id, &hash).await.unwrap();
+        let claimed_at = super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        let owned = super::clear_order_payout(&pool, id, &hash).await.unwrap();
+        let owned = super::clear_order_payout(&pool, id, &hash, claimed_at)
+            .await
+            .unwrap();
         assert!(owned, "clearing an owned claim must report ownership");
         assert!(payout_hash_of(&pool, id).await.is_none());
     }
@@ -3054,9 +3075,11 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let hash = "f".repeat(64);
         insert_settled_order(&pool, id, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id, &hash).await.unwrap();
+        let claimed_at = super::claim_order_payout(&pool, id, &hash).await.unwrap();
 
-        let owned = super::fail_order_payout(&pool, id, &hash).await.unwrap();
+        let owned = super::fail_order_payout(&pool, id, &hash, claimed_at)
+            .await
+            .unwrap();
         assert!(owned, "failing an owned claim must report ownership");
 
         assert!(payout_hash_of(&pool, id).await.is_none());
@@ -3072,9 +3095,10 @@ mod tests {
     }
 
     /// A stale caller (e.g. a watcher that outlived its own claim) must not
-    /// release a *newer* claim: `clear`/`fail` scoped to a different hash are
-    /// no-ops, so the current in-flight marker survives and no second payout
-    /// can be dispatched.
+    /// release a *newer* claim. The release is scoped to both the hash and the
+    /// per-claim timestamp token, so neither a different hash nor — the case a
+    /// hash alone misses when a retry reuses the same invoice — a different
+    /// timestamp against the same hash can erase the current marker.
     #[tokio::test]
     async fn test_clear_and_fail_order_payout_ignore_stale_hash() {
         let pool = setup_orders_db().await.unwrap();
@@ -3084,10 +3108,10 @@ mod tests {
         // clear_order_payout with the wrong hash leaves the current marker.
         let id_a = uuid::Uuid::new_v4();
         insert_settled_order(&pool, id_a, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id_a, &current)
+        let token_a = super::claim_order_payout(&pool, id_a, &current)
             .await
             .unwrap();
-        let owned = super::clear_order_payout(&pool, id_a, &stale)
+        let owned = super::clear_order_payout(&pool, id_a, &stale, token_a)
             .await
             .unwrap();
         assert!(
@@ -3104,10 +3128,12 @@ mod tests {
         // does not re-arm retry.
         let id_b = uuid::Uuid::new_v4();
         insert_settled_order(&pool, id_b, "settled-hold-invoice").await;
-        super::claim_order_payout(&pool, id_b, &current)
+        let token_b = super::claim_order_payout(&pool, id_b, &current)
             .await
             .unwrap();
-        let owned = super::fail_order_payout(&pool, id_b, &stale).await.unwrap();
+        let owned = super::fail_order_payout(&pool, id_b, &stale, token_b)
+            .await
+            .unwrap();
         assert!(!owned, "failing with a stale hash must report no ownership");
         assert_eq!(
             payout_hash_of(&pool, id_b).await.as_deref(),
@@ -3120,6 +3146,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(failed, 0, "a stale fail must not re-arm retry");
+
+        // Correct hash but a STALE timestamp token (the same-invoice retry
+        // case): a watcher from a previous attempt must still lose the release
+        // even though the hash matches the live claim.
+        let id_c = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_c, "settled-hold-invoice").await;
+        let live_token = super::claim_order_payout(&pool, id_c, &current)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_token = Some(live_token - 1);
+        let owned = super::clear_order_payout(&pool, id_c, &current, stale_token)
+            .await
+            .unwrap();
+        assert!(
+            !owned,
+            "a stale timestamp token must lose even when the hash matches"
+        );
+        assert_eq!(
+            payout_hash_of(&pool, id_c).await.as_deref(),
+            Some(current.as_str()),
+            "a stale-token release must not erase the live claim"
+        );
     }
 
     async fn insert_inflight_order(
@@ -3154,6 +3203,7 @@ mod tests {
         assert_eq!(inflight.len(), 1);
         assert_eq!(inflight[0].0, marked);
         assert_eq!(inflight[0].1, hash);
+        assert_eq!(inflight[0].2, Some(1000), "the claim token is returned");
     }
 
     #[tokio::test]
@@ -3171,7 +3221,7 @@ mod tests {
         // and legacy (NULL) ones are eligible for reconciliation.
         let inflight = super::find_inflight_payouts(&pool, 1000).await.unwrap();
         let ids: std::collections::HashSet<uuid::Uuid> =
-            inflight.iter().map(|(id, _)| *id).collect();
+            inflight.iter().map(|(id, _, _)| *id).collect();
         assert!(
             !ids.contains(&fresh),
             "a just-claimed payout must not reconcile"

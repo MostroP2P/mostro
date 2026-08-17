@@ -24,6 +24,7 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -37,6 +38,17 @@ use tracing::{info, warn};
 /// and `reconcile_inflight_payout` resolves the outcome by payment hash.
 /// Fixed for now; could become a settings knob later.
 pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Cap on concurrently running payout send tasks. Since `do_payment` returns
+/// right after claiming, the scheduler retry loop can fan a backlog of N
+/// failed payouts into N background tasks, each holding its own LND gRPC
+/// connection and payment stream for up to [`PAYOUT_SEND_PAYMENT_TIMEOUT`];
+/// this semaphore makes a backlog queue instead of fanning out. A task queued
+/// past the reconcile grace window can lose its claim to re-arm-and-redispatch;
+/// that is safe: the pre-send duplicate guard in `send_payment` (keyed on the
+/// real payment hash) and LND's own duplicate rejection stop the late sender
+/// from double-paying. Fixed for now; could become a settings knob later.
+static PAYOUT_DISPATCH_SEMAPHORE: Semaphore = Semaphore::const_new(8);
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
@@ -679,6 +691,13 @@ pub async fn do_payment(
     // always finish or fail the payout by hash, so it is never lost or paid
     // twice.
     tokio::spawn(async move {
+        // Bound concurrent sends (see PAYOUT_DISPATCH_SEMAPHORE). The
+        // semaphore is static and never closed, so acquire() only errs if it
+        // were closed; proceeding unpermitted in that impossible case beats
+        // silently dropping a claimed payout. The permit is held for the
+        // whole task (send, watcher drain, RPC-error reconcile) via RAII.
+        let _permit = PAYOUT_DISPATCH_SEMAPHORE.acquire().await;
+
         let (tx, mut rx) = channel::<PaymentMessage>(100);
 
         // Start the status watcher BEFORE `send_payment` and run them

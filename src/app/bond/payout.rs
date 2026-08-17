@@ -683,7 +683,7 @@ async fn pay_counterparty(
     let (tx, mut rx) = channel(100);
 
     let send_fut = timeout(
-        crate::app::release::PAYOUT_SEND_PAYMENT_TIMEOUT,
+        crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT,
         ln_client.send_payment(invoice, counterparty_share, tx),
     );
 
@@ -794,7 +794,7 @@ fn classify_send_verdict(
             PaymentFailureKind::Indeterminate,
             format!(
                 "send_payment reached no terminal state after {}s",
-                crate::app::release::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
             ),
         ),
         Ok(Err(e)) => {
@@ -2491,7 +2491,7 @@ mod tests {
                 PaymentFailureKind::Indeterminate,
                 format!(
                     "send_payment reached no terminal state after {}s",
-                    crate::app::release::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                    crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
                 )
             )
         );

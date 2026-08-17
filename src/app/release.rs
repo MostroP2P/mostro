@@ -3,7 +3,7 @@ use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
-use crate::lightning::{LndConnector, PaymentMessage};
+use crate::lightning::{LndConnector, PaymentMessage, PAYOUT_SEND_PAYMENT_TIMEOUT};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
@@ -22,22 +22,10 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{info, warn};
-
-/// Upper bound on how long the background payout task waits for
-/// `send_payment` to reach a terminal state. LND itself stops launching new
-/// route attempts after `timeout_seconds: 60`, so 75s leaves margin for LND to
-/// exhaust its own attempts; past that, the stream is only kept open by an
-/// HTLC that is locked-in but unresolved (hold invoice or stuck route), which
-/// the sender cannot cancel anyway. Hitting this timeout does NOT fail the
-/// payout: the payment may still settle in LND, so the claim marker is kept
-/// and `reconcile_inflight_payout` resolves the outcome by payment hash.
-/// Fixed for now; could become a settings knob later.
-pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Cap on concurrently running payout send tasks. Since `do_payment` returns
 /// right after claiming, the scheduler retry loop can fan a backlog of N

@@ -18,8 +18,25 @@ use fedimint_tonic_lnd::Client;
 use mostro_core::prelude::*;
 use rand::{self, RngCore};
 use std::cmp::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
+
+/// Seconds LND keeps launching route attempts for a payment
+/// (`SendPaymentRequest.timeout_seconds`). Past this window an open payment
+/// stream is only kept alive by an HTLC that is locked-in but unresolved,
+/// which the sender cannot cancel.
+pub(crate) const LND_PAYMENT_ROUTE_TIMEOUT_SECS: i32 = 60;
+
+/// Upper bound on how long a payout waits for `send_payment` to reach a
+/// terminal state: LND's own route-attempt window plus margin, DERIVED so
+/// that raising [`LND_PAYMENT_ROUTE_TIMEOUT_SECS`] can never silently
+/// undercut LND's retries. Hitting this bound does NOT fail the payout —
+/// the payment may still settle, so callers keep their claim/hash and let
+/// reconciliation resolve the real outcome. Fixed for now; could become a
+/// settings knob later.
+pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration =
+    Duration::from_secs(LND_PAYMENT_ROUTE_TIMEOUT_SECS as u64 + 15);
 
 #[derive(Clone)]
 pub struct LndConnector {
@@ -302,7 +319,7 @@ impl LndConnector {
 
         let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
-            timeout_seconds: 60,
+            timeout_seconds: LND_PAYMENT_ROUTE_TIMEOUT_SECS,
             fee_limit_sat: max_fee,
             ..Default::default()
         };

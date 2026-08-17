@@ -1,0 +1,21 @@
+-- Persist the winning counterparty's trade pubkey on the bond row at slash
+-- time so the Phase 3 payout resolver does not have to re-derive it from the
+-- order row later.
+--
+-- The timeout-slash path (`scheduler::job_cancel_orders` →
+-- `slash_or_release_on_timeout`) settles the responsible bond into
+-- `PendingPayout` and then calls `edit_pubkeys_order`, which NULLs the
+-- slashed side's trade pubkey on the order (buyer_pubkey on a sell order,
+-- seller_pubkey on a buy order) to reset/republish it. The payout resolver
+-- (`resolve_recipient`) matches `bond.pubkey` against both order pubkeys and
+-- needs *both* present, so once one is wiped it falls through to `None`: the
+-- wronged counterparty is never asked for a payout invoice and the bond
+-- eventually forfeits to the node instead of compensating them.
+--
+-- Capturing the recipient here — while the order is still intact, before the
+-- wipe runs — makes the winner recoverable regardless of any later mutation
+-- to the order row. Written by the slash CAS in `slash_one`, alongside
+-- `slashed_reason` / `slashed_at` / `node_share_sats`. Nullable: rows slashed
+-- before this migration (and paths that do not populate it) leave it NULL,
+-- and the resolver falls back to the order-derived lookup.
+ALTER TABLE bonds ADD COLUMN payout_recipient_pubkey char(64);

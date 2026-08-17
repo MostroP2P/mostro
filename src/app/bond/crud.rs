@@ -43,6 +43,7 @@ pub(crate) const BOND_INSERT_COLUMNS: &[&str] = &[
     "taker_amount",
     "taker_fee",
     "taker_dev_fee",
+    "payout_recipient_pubkey",
 ];
 
 fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
@@ -76,7 +77,8 @@ fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
         .push_bind(bond.taker_fiat_amount)
         .push_bind(bond.taker_amount)
         .push_bind(bond.taker_fee)
-        .push_bind(bond.taker_dev_fee);
+        .push_bind(bond.taker_dev_fee)
+        .push_bind(&bond.payout_recipient_pubkey);
 }
 
 fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
@@ -135,6 +137,8 @@ fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
         .push_bind_unseparated(bond.taker_fee);
     set.push("taker_dev_fee = ")
         .push_bind_unseparated(bond.taker_dev_fee);
+    set.push("payout_recipient_pubkey = ")
+        .push_bind_unseparated(&bond.payout_recipient_pubkey);
 }
 
 impl Crud for Bond {

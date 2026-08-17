@@ -354,6 +354,12 @@ mod tests {
         .await
         .expect("bond_payout_payment_hash migration");
         sqlx::query(include_str!(
+            "../../../migrations/20260813120000_bond_payout_recipient.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient migration");
+        sqlx::query(include_str!(
             "../../../migrations/20260611120000_bond_slice_slash_unique.sql"
         ))
         .execute(&pool)
@@ -461,6 +467,7 @@ mod tests {
             taker_amount: Some(29),
             taker_fee: Some(30),
             taker_dev_fee: Some(31),
+            payout_recipient_pubkey: Some("r".repeat(64)),
         }
     }
 
@@ -497,6 +504,7 @@ mod tests {
             "taker_amount" => bond.taker_amount.map(|v| v.to_string()),
             "taker_fee" => bond.taker_fee.map(|v| v.to_string()),
             "taker_dev_fee" => bond.taker_dev_fee.map(|v| v.to_string()),
+            "payout_recipient_pubkey" => bond.payout_recipient_pubkey.clone(),
             other => panic!("BOND_INSERT_COLUMNS entry {other:?} has no sentinel expectation"),
         }
     }
@@ -523,7 +531,8 @@ mod tests {
             | "payout_invoice"
             | "payout_payment_hash"
             | "taker_identity"
-            | "taker_invoice" => row.try_get::<Option<String>, _>(column).unwrap(),
+            | "taker_invoice"
+            | "payout_recipient_pubkey" => row.try_get::<Option<String>, _>(column).unwrap(),
             "payout_routing_fee_sats"
             | "node_share_sats"
             | "last_invoice_request_at"

@@ -9,8 +9,8 @@ use crate::config::{init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use std::fs;
-use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 const DB_FILENAME: &str = "mostro.db";
@@ -129,6 +129,47 @@ fn validate_cashu_settings(
     Ok(())
 }
 
+/// Write `contents` to `path` with owner-only permissions (0o600).
+///
+/// On Unix the file is created with mode 0o600 and permissions are tightened
+/// after opening so that pre-existing files are also restricted. This matches
+/// how the `.env` file and the SQLite database are protected.
+pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), MostroError> {
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        file.set_permissions(permissions)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
+
+    file.write_all(contents)
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    Ok(())
+}
+
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
@@ -163,8 +204,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             wizard::run_setup_menu(&settings_dir, &config_file_path)?
         } else {
             // Non-interactive (Docker, CI, systemd): copy template and exit
-            std::fs::write(&config_file_path, include_bytes!("../../settings.tpl.toml"))
-                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            write_private_file(&config_file_path, include_bytes!("../../settings.tpl.toml"))?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
                 config_file_path.display()
@@ -580,5 +620,66 @@ mod init_configuration_file_tests {
         std::fs::write(dir.join("settings.toml"), tampered).expect("write settings.toml");
         let result = init_configuration_file(Some(dir.to_string_lossy().into_owned()));
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod write_private_file_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mostro-write-private-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("stat file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn writes_expected_content() {
+        let dir = temp_dir("content");
+        let path = dir.join("settings.toml");
+        write_private_file(&path, b"nsec_privkey = 'nsec1...'\n").expect("write file");
+        let contents = std::fs::read_to_string(&path).expect("read file");
+        assert_eq!(contents, "nsec_privkey = 'nsec1...'\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_file_is_owner_only() {
+        let dir = temp_dir("new");
+        let path = dir.join("settings.toml");
+        write_private_file(&path, b"secret").expect("write file");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preexisting_world_readable_file_is_tightened() {
+        let dir = temp_dir("existing");
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "old content").expect("seed file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("loosen permissions");
+        }
+        assert_eq!(mode_of(&path), 0o644);
+
+        write_private_file(&path, b"new secret").expect("overwrite file");
+
+        assert_eq!(mode_of(&path), 0o600);
+        let contents = std::fs::read_to_string(&path).expect("read file");
+        assert_eq!(contents, "new secret");
     }
 }

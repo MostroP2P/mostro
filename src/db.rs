@@ -1229,6 +1229,49 @@ pub async fn claim_order_payout(
     Ok((result.rows_affected() > 0).then_some(claimed_at))
 }
 
+/// Re-validate ownership of a payout claim and refresh its timestamp, as one
+/// CAS.
+///
+/// Used by the dispatch task after waiting in the send-semaphore queue: a task
+/// can queue past the reconcile grace window, and reconciliation may then
+/// re-arm the claim (buyer prompted for a fresh invoice → different payment
+/// hash), in which case a newer payout owns the order and the queued invoice
+/// must not be sent. Refreshing `payout_claimed_at` — rather than merely
+/// checking it — also restarts the reconcile grace clock, restoring the
+/// invariant that a claim is never older than its send by more than the send
+/// itself; a mere ownership check would leave reconciliation free to re-arm in
+/// the instant between the check and LND registering the payment. The refresh
+/// also invalidates any pre-touch snapshot a reconciler already holds: its
+/// release CAS is scoped to the timestamp it observed, which no longer
+/// matches.
+///
+/// Scoped to hash + token + `settled-hold-invoice` status: a marker lingering
+/// on an order that has since gone terminal must never turn into a send.
+/// Returns `Some(refreshed_at)` — the new per-claim token every later release
+/// must be scoped to — when the caller still owned the claim, or `None` when
+/// the claim was re-armed or replaced while queued (drop the send).
+pub async fn touch_order_payout_claim(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<Option<i64>, MostroError> {
+    let refreshed_at = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        "UPDATE orders SET payout_claimed_at = ?1 \
+         WHERE id = ?2 AND payout_payment_hash = ?3 AND payout_claimed_at IS ?4 \
+           AND status = 'settled-hold-invoice'",
+    )
+    .bind(refreshed_at)
+    .bind(order_id)
+    .bind(payment_hash)
+    .bind(claimed_at)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok((result.rows_affected() > 0).then_some(refreshed_at))
+}
+
 /// Clear the in-flight payout marker for `order_id` after a successful terminal
 /// outcome (or as tidy-up once the order has moved to `Success`).
 ///
@@ -3176,6 +3219,140 @@ mod tests {
             Some(current.as_str()),
             "a stale-token release must not erase the live claim"
         );
+    }
+
+    async fn claimed_at_of(pool: &SqlitePool, id: uuid::Uuid) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT payout_claimed_at FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_refreshes_token() {
+        // An owned claim (backdated, as if the dispatch task queued for a
+        // while) is revalidated: the touch returns a fresh token and the row
+        // reflects it, restarting the reconcile grace clock.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "a".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+
+        let refreshed = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap()
+            .expect("owner must keep its claim");
+        assert!(refreshed > 1000, "token must be refreshed forward");
+        assert_eq!(claimed_at_of(&pool, id).await, Some(refreshed));
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_loses_after_rearm() {
+        // Reconciliation re-armed (cleared) the claim while the task queued:
+        // the touch must lose and leave the row alone.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "b".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+        assert!(super::fail_order_payout(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap());
+
+        let touched = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(touched.is_none(), "a re-armed claim must not be touchable");
+        assert!(payout_hash_of(&pool, id).await.is_none());
+        assert_eq!(claimed_at_of(&pool, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_loses_to_replacement_claim() {
+        // The double-payout scenario: while the task queued, its claim was
+        // re-armed and a NEW payout (fresh invoice, different hash) claimed
+        // the order. The stale task's touch must lose and must not disturb
+        // the replacement claim.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let old_hash = "c".repeat(64);
+        let new_hash = "d".repeat(64);
+        insert_inflight_order(&pool, id, &old_hash, Some(1000)).await;
+        assert!(super::fail_order_payout(&pool, id, &old_hash, Some(1000))
+            .await
+            .unwrap());
+        let new_token = super::claim_order_payout(&pool, id, &new_hash)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let touched = super::touch_order_payout_claim(&pool, id, &old_hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(
+            touched.is_none(),
+            "the stale dispatch must drop its send once a newer payout owns the order"
+        );
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(new_hash.as_str()),
+            "the replacement claim must be untouched"
+        );
+        assert_eq!(claimed_at_of(&pool, id).await, Some(new_token));
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_refuses_terminal_status() {
+        // A marker lingering on an order that already went terminal must
+        // never be refreshed into a send.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "e".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+        sqlx::query("UPDATE orders SET status = 'success' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let touched = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(touched.is_none());
+        assert_eq!(claimed_at_of(&pool, id).await, Some(1000), "row untouched");
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_invalidates_pre_touch_snapshot() {
+        // A reconciler that read the claim BEFORE the touch holds a stale
+        // token: its scoped release must lose after the refresh, so it cannot
+        // re-arm a payout whose send is imminent.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "f".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+
+        let refreshed = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap()
+            .unwrap();
+        // Reconciler acts on its pre-touch snapshot (token 1000): loses.
+        assert!(!super::fail_order_payout(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap());
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+        // The dispatch task's own release with the refreshed token still wins.
+        assert!(super::clear_order_payout(&pool, id, &hash, Some(refreshed))
+            .await
+            .unwrap());
+        assert!(payout_hash_of(&pool, id).await.is_none());
     }
 
     async fn insert_inflight_order(

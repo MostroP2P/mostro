@@ -31,11 +31,14 @@ use tracing::{info, warn};
 /// right after claiming, the scheduler retry loop can fan a backlog of N
 /// failed payouts into N background tasks, each holding its own LND gRPC
 /// connection and payment stream for up to [`PAYOUT_SEND_PAYMENT_TIMEOUT`];
-/// this semaphore makes a backlog queue instead of fanning out. A task queued
-/// past the reconcile grace window can lose its claim to re-arm-and-redispatch;
-/// that is safe: the pre-send duplicate guard in `send_payment` (keyed on the
-/// real payment hash) and LND's own duplicate rejection stop the late sender
-/// from double-paying. Fixed for now; could become a settings knob later.
+/// this semaphore makes a backlog queue instead of fanning out. The queue puts
+/// an unbounded wait between the claim and the send, during which
+/// reconciliation may re-arm the claim — and the buyer may then supply a fresh
+/// invoice with a *different* hash, a case neither the pre-send duplicate
+/// guard nor LND's duplicate rejection can catch; that window is closed by
+/// `touch_order_payout_claim` right after the permit: a task whose claim was
+/// re-armed or replaced while it queued drops its send. Fixed for now; could
+/// become a settings knob later.
 static PAYOUT_DISPATCH_SEMAPHORE: Semaphore = Semaphore::const_new(8);
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
@@ -649,8 +652,10 @@ pub async fn do_payment(
     // racing) — only the winner pays. Cleared on a confirmed-terminal outcome or
     // by reconciliation; the timestamp keeps reconciliation from acting on this
     // payout until LND has surely registered it (closing the reconcile-vs-send
-    // race). Placed right before `send_payment` so the window between claim and
-    // LND registering the payment is only the send call itself.
+    // race). The dispatch task re-validates and refreshes this claim
+    // (`touch_order_payout_claim`) after its semaphore wait, so the window
+    // between the (refreshed) claim and LND registering the payment is only
+    // the send call itself even when the task queued behind a backlog.
     let payout_hash = decode_invoice(&payment_request)
         .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
@@ -685,6 +690,40 @@ pub async fn do_payment(
         // silently dropping a claimed payout. The permit is held for the
         // whole task (send, watcher drain, RPC-error reconcile) via RAII.
         let _permit = PAYOUT_DISPATCH_SEMAPHORE.acquire().await;
+
+        // Re-validate the claim now that the queue wait is over, refreshing
+        // its timestamp in the same CAS. If reconciliation re-armed the claim
+        // while this task queued (the buyer may already have supplied a fresh
+        // invoice under a different hash), a newer payout owns the order and
+        // this invoice must NOT be sent. On a DB error, dropping the send is
+        // also the safe direction: the kept marker is recoverable by
+        // reconciliation, a blind send is not. The refreshed timestamp is the
+        // claim token from here on — it restarts the reconcile grace clock
+        // and invalidates any pre-touch snapshot a reconciler already holds.
+        let payout_claimed_at = match crate::db::touch_order_payout_claim(
+            ctx.pool(),
+            order.id,
+            &payout_hash,
+            Some(payout_claimed_at),
+        )
+        .await
+        {
+            Ok(Some(refreshed_at)) => refreshed_at,
+            Ok(None) => {
+                warn!(
+                    "Order {}: payout claim was re-armed or replaced while queued; dropping stale dispatch of hash {}",
+                    order.id, payout_hash
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Order {}: could not re-validate payout claim after queue ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
+                    order.id, payout_hash
+                );
+                return;
+            }
+        };
 
         let (tx, mut rx) = channel::<PaymentMessage>(100);
 

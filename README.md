@@ -794,17 +794,19 @@ For client documentation, see the respective client repositories.
 
 ### Admin Operations (RPC Interface)
 
-If RPC is enabled, use admin tools for dispute resolution:
+If RPC is enabled, use admin tools for dispute resolution. Every call requires the `authorization: Bearer <token>` header set to your `[rpc].auth_token` / `MOSTRO_RPC_AUTH_TOKEN` value:
 
 ```bash
+export MOSTRO_RPC_AUTH_TOKEN="your-configured-token"
+
 # Cancel an order (admin override)
-grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/CancelOrder
+grpcurl -plaintext -H "authorization: Bearer $MOSTRO_RPC_AUTH_TOKEN" -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/CancelOrder
 
 # Settle disputed order
-grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/SettleOrder
+grpcurl -plaintext -H "authorization: Bearer $MOSTRO_RPC_AUTH_TOKEN" -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/SettleOrder
 
 # Add dispute solver
-grpcurl -plaintext -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
+grpcurl -plaintext -H "authorization: Bearer $MOSTRO_RPC_AUTH_TOKEN" -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
 ```
 
 ---

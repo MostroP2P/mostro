@@ -41,7 +41,7 @@ sequenceDiagram
 ```
 
 ## Audit and Safety
-- Require admin authentication/authorization at message level.
+- Admin RPC transport requires a bearer token (`[rpc].auth_token` / `MOSTRO_RPC_AUTH_TOKEN`), validated by `TokenAuthInterceptor` (`src/rpc/auth.rs`) before any request reaches a handler — see `docs/RPC.md#security-considerations`. The daemon refuses to start if `[rpc].enabled = true` without a token configured.
 - Enforce solver permission levels in the daemon: `read` solvers can assist but cannot execute `admin-settle` or `admin-cancel`.
 - Record solver, timestamps, and decisions in DB for traceability.
 - Avoid leaking sensitive data in logs; scrub invoices and keys.

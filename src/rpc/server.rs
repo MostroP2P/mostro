@@ -2,8 +2,10 @@
 
 use crate::config::settings::Settings;
 use crate::lightning::LndConnector;
+use crate::rpc::auth::TokenAuthInterceptor;
 use crate::rpc::service::AdminServiceImpl;
 use nostr_sdk::prelude::Keys;
+use secrecy::SecretString;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -15,6 +17,7 @@ use super::admin::admin_service_server::AdminServiceServer;
 pub struct RpcServer {
     listen_address: String,
     port: u16,
+    auth_token: SecretString,
 }
 
 impl RpcServer {
@@ -24,6 +27,7 @@ impl RpcServer {
         Self {
             listen_address: rpc_config.listen_address.clone(),
             port: rpc_config.port,
+            auth_token: rpc_config.auth_token.clone(),
         }
     }
 
@@ -39,11 +43,15 @@ impl RpcServer {
             .map_err(|e| format!("Invalid address: {}", e))?;
 
         let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client);
+        let interceptor = TokenAuthInterceptor::new(self.auth_token.clone());
 
         info!("Starting RPC server on {}", addr);
 
         let server = Server::builder()
-            .add_service(AdminServiceServer::new(admin_service))
+            .add_service(AdminServiceServer::with_interceptor(
+                admin_service,
+                interceptor,
+            ))
             .serve(addr);
 
         if let Err(e) = server.await {
@@ -85,6 +93,7 @@ mod tests {
         let server = RpcServer {
             listen_address: "localhost".to_string(),
             port: 8080,
+            auth_token: SecretString::default(),
         };
 
         assert_eq!(server.listen_address, "localhost");
@@ -96,6 +105,7 @@ mod tests {
         let server = RpcServer {
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
+            auth_token: SecretString::default(),
         };
 
         let expected_addr = format!("{}:{}", server.listen_address, server.port);
@@ -151,6 +161,7 @@ mod tests {
         let server = RpcServer {
             listen_address: "not an address".to_string(),
             port: 50051,
+            auth_token: SecretString::default(),
         };
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let result = server
@@ -167,12 +178,69 @@ mod tests {
         let server = RpcServer {
             listen_address: "8.8.8.8".to_string(),
             port: 1,
+            auth_token: SecretString::default(),
         };
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let result = server
             .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
             .await;
         assert!(result.is_err());
+    }
+
+    /// End-to-end proof that `start()`'s `with_interceptor` wiring — not
+    /// just the `TokenAuthInterceptor` struct in isolation (covered in
+    /// `rpc::auth`'s own tests) — actually gates the bound server: a real
+    /// client, over a real connection, without the header, gets rejected.
+    #[tokio::test]
+    async fn start_rejects_calls_without_auth_token() {
+        init_test_settings();
+
+        // Bind an OS-assigned ephemeral port to avoid CI port collisions,
+        // then hand that exact address to the server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = RpcServer {
+            listen_address: addr.ip().to_string(),
+            port: addr.port(),
+            auth_token: SecretString::from("test-token".to_string()),
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let ln_client = offline_ln_client().await;
+
+        let handle = tokio::spawn(async move {
+            let _ = server
+                .start(Keys::generate(), Arc::new(pool), ln_client)
+                .await;
+        });
+
+        // Give the server a moment to bind before connecting.
+        let mut attempts = 0;
+        let channel = loop {
+            match tonic::transport::Channel::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(channel) => break channel,
+                Err(_) if attempts < 50 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("failed to connect to test server: {e}"),
+            }
+        };
+
+        let mut client = crate::rpc::admin::admin_service_client::AdminServiceClient::new(channel);
+        let result = client
+            .get_version(crate::rpc::admin::GetVersionRequest {})
+            .await;
+
+        let err = result.expect_err("call without an authorization header must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        handle.abort();
     }
 
     #[test]

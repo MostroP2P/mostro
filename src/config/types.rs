@@ -505,7 +505,7 @@ impl Default for LightningSettings {
 pub struct NostrSettings {
     /// Nostr private key. Optional when `MOSTRO_NSEC_PRIVKEY` is provided via
     /// environment variable or `<settings_dir>/.env`.
-    #[serde(default, serialize_with = "crate::config::secret::serialize_nsec")]
+    #[serde(default, serialize_with = "crate::config::secret::serialize_secret")]
     pub nsec_privkey: secrecy::SecretString,
     /// Nostr relays list
     pub relays: Vec<String>,
@@ -522,6 +522,14 @@ pub struct RpcSettings {
     /// Duration in seconds after which inactive rate-limiter entries are evicted
     #[serde(default = "default_rate_limiter_stale_duration")]
     pub rate_limiter_stale_duration: u64,
+    /// Bearer token required on every admin gRPC call (`authorization: Bearer
+    /// <token>` metadata). Optional in TOML when `MOSTRO_RPC_AUTH_TOKEN` is
+    /// provided via environment variable or `<settings_dir>/.env` — mirrors
+    /// `NostrSettings::nsec_privkey`. Unlike the Nostr key, this stays live
+    /// in `MOSTRO_CONFIG` for the process lifetime (the auth interceptor
+    /// reads it on every request) rather than being cleared after startup.
+    #[serde(default, serialize_with = "crate::config::secret::serialize_secret")]
+    pub auth_token: secrecy::SecretString,
 }
 
 fn default_rate_limiter_stale_duration() -> u64 {
@@ -535,6 +543,7 @@ impl Default for RpcSettings {
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
             rate_limiter_stale_duration: default_rate_limiter_stale_duration(),
+            auth_token: secrecy::SecretString::default(),
         }
     }
 }

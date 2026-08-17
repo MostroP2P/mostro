@@ -91,6 +91,7 @@ cdk = { version = "0.17.2", default-features = false, features = ["wallet"] }
 secp256k1 = { version = "0.30", features = ["serde"] }
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = "1.8"
+subtle = "2.6"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }

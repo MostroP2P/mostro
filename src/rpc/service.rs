@@ -66,7 +66,12 @@ impl AdminServiceImpl {
         // enforced downstream: the caller must be the assigned solver
         // (`is_assigned_solver`), with `ensure_dispute_finalize_permission`
         // bypassing solver category checks for the daemon key (same as
-        // `admin_take_dispute`). gRPC transport authenticates the operator.
+        // `admin_take_dispute`). The gRPC transport authenticates the *caller*
+        // via `TokenAuthInterceptor` (src/rpc/auth.rs), which rejects the
+        // request before it reaches this handler — this synthesized event
+        // still uses the daemon's own keys as both sender and identity
+        // because there is no per-operator Nostr identity on this surface,
+        // only the shared bearer token.
         let event = UnwrappedMessage {
             message: msg.clone(),
             signature: None,

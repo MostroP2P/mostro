@@ -1,7 +1,7 @@
 //! Helpers for loading and parsing the Mostro Nostr private key with
 //! zeroization of transient buffers.
 
-use crate::config::constants::NSEC_ENV_VAR;
+use crate::config::constants::{NSEC_ENV_VAR, RPC_TOKEN_ENV_VAR};
 use crate::config::types::NostrSettings;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -11,7 +11,8 @@ use serde::Serializer;
 use zeroize::Zeroize;
 
 /// Serialize a [`SecretString`] for config files (wizard / TOML export only).
-pub fn serialize_nsec<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
+/// Shared by every `SecretString`-typed setting (`nsec_privkey`, `auth_token`).
+pub fn serialize_secret<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -29,6 +30,21 @@ pub fn read_nsec_env_var() -> Option<SecretString> {
     }
     let secret = SecretString::from(trimmed.to_owned());
     nsec_from_env.zeroize();
+    Some(secret)
+}
+
+/// Read `MOSTRO_RPC_AUTH_TOKEN` from the process environment, trim
+/// whitespace, and wrap in a [`SecretString`]. Returns `None` when unset or
+/// blank.
+pub fn read_rpc_token_env_var() -> Option<SecretString> {
+    let mut token_from_env = std::env::var(RPC_TOKEN_ENV_VAR).ok()?;
+    let trimmed = token_from_env.trim();
+    if trimmed.is_empty() {
+        token_from_env.zeroize();
+        return None;
+    }
+    let secret = SecretString::from(trimmed.to_owned());
+    token_from_env.zeroize();
     Some(secret)
 }
 

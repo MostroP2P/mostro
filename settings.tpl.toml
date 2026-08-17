@@ -138,6 +138,11 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+# Bearer token required on every admin RPC call (authorization: Bearer <token>).
+# Required when enabled = true - the daemon refuses to start otherwise.
+# Prefer the MOSTRO_RPC_AUTH_TOKEN environment variable (or <settings_dir>/.env)
+# over storing this in plaintext TOML.
+# auth_token = "change-me-to-a-long-random-value"
 
 # Multi-source price providers (see docs/PRICE_PROVIDERS.md).
 # Absent section ≡ legacy single-source behaviour synthesised from

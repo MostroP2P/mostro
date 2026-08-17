@@ -30,3 +30,7 @@ pub const ENV_FILENAME: &str = ".env";
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
+
+/// Environment variable name used to override the admin RPC bearer token
+/// from the process environment. Shared between the wizard and the loader.
+pub const RPC_TOKEN_ENV_VAR: &str = "MOSTRO_RPC_AUTH_TOKEN";

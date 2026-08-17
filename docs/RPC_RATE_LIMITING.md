@@ -69,7 +69,7 @@ How the original issue’s ideas map to the codebase today:
 | Exponential backoff / lockout | Implemented inside **`RateLimiter`**; **not** triggered by **`ValidateDbPassword`** (no **`record_failure`**). |
 | Audit logging | **tracing** in service + limiter. |
 | Localhost-only | Default RPC bind **`127.0.0.1`** (see `settings.toml` / `docs/RPC.md`). |
-| Strong auth | Out of scope for this stub; would need API keys or similar. |
+| Strong auth | Implemented (issue #807): a bearer token (`[rpc].auth_token` / `MOSTRO_RPC_AUTH_TOKEN`) is required on every admin RPC call, enforced transport-wide by **`TokenAuthInterceptor`** (`src/rpc/auth.rs`) before any request — including `ValidateDbPassword` — reaches a handler. See `docs/RPC.md#security-considerations`. This module's `RateLimiter` remains in place as defense-in-depth specifically on `ValidateDbPassword`, since token auth already blocks unauthenticated callers entirely and the limiter is cheap, already-reviewed code that adds a second layer against a leaked/brute-forced token. |
 
 ## Testing
 

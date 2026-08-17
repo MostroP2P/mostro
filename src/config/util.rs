@@ -3,11 +3,12 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
-use crate::config::secret::read_nsec_env_var;
+use crate::config::secret::{read_nsec_env_var, read_rpc_token_env_var};
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use secrecy::ExposeSecret;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -46,6 +47,16 @@ fn apply_nsec_env_override(settings: &mut Settings) {
     }
 }
 
+/// If the `MOSTRO_RPC_AUTH_TOKEN` environment variable is set to a non-empty
+/// value, override the RPC auth token loaded from `settings.toml`.
+/// Whitespace is trimmed; blank values are ignored so the TOML stays the
+/// fallback.
+fn apply_rpc_token_env_override(settings: &mut Settings) {
+    if let Some(token) = read_rpc_token_env_var() {
+        settings.rpc.auth_token = token;
+    }
+}
+
 /// Validates Mostro settings on startup
 fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
     let dev_fee = settings.mostro.dev_fee_percentage;
@@ -63,6 +74,16 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             "dev_fee_percentage ({}) exceeds maximum ({})",
             dev_fee, MAX_DEV_FEE_PERCENTAGE
         ))));
+    }
+
+    // An admin RPC surface with no credential is the exact vulnerability
+    // issue #807 fixes — refuse to boot rather than silently run it open.
+    if settings.rpc.enabled && settings.rpc.auth_token.expose_secret().is_empty() {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "[rpc].enabled = true requires an auth token: set [rpc].auth_token in \
+             settings.toml or the MOSTRO_RPC_AUTH_TOKEN environment variable."
+                .to_string(),
+        )));
     }
 
     validate_cashu_settings(
@@ -173,6 +194,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         };
 
         apply_nsec_env_override(&mut settings);
+        apply_rpc_token_env_override(&mut settings);
         validate_mostro_settings(&settings)?;
         init_mostro_settings(settings)?;
         tracing::info!("Settings correctly loaded!");
@@ -190,9 +212,10 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     let mut settings: Settings = toml::from_str(&contents)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    // Apply MOSTRO_NSEC_PRIVKEY override before validation so an empty TOML
-    // value is fine when the env var is set.
+    // Apply MOSTRO_NSEC_PRIVKEY / MOSTRO_RPC_AUTH_TOKEN overrides before
+    // validation so an empty TOML value is fine when the env var is set.
     apply_nsec_env_override(&mut settings);
+    apply_rpc_token_env_override(&mut settings);
 
     // Validate settings before initializing
     validate_mostro_settings(&settings)?;
@@ -367,6 +390,90 @@ mod tests {
             toml::from_str(toml_without_nsec).expect("nsec_privkey should be optional in TOML");
         assert!(nostr.nsec_privkey.expose_secret().is_empty());
         assert_eq!(nostr.relays, vec!["wss://relay.test"]);
+    }
+
+    // ── RPC auth token env override (issue #807) ───────────────────────────
+    // Mirrors the MOSTRO_NSEC_PRIVKEY suite above, sharing the same
+    // EnvVarGuard/ENV_LOCK machinery (ENV_LOCK guards the whole module's env
+    // access, not just NSEC_ENV_VAR, so these are safe to run concurrently
+    // with the nsec tests).
+
+    use crate::config::constants::RPC_TOKEN_ENV_VAR;
+
+    #[test]
+    fn env_var_overrides_toml_rpc_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvVarGuard::new(RPC_TOKEN_ENV_VAR);
+        guard.set("token_from_env");
+
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.auth_token = SecretString::from("token_from_toml".to_string());
+        apply_rpc_token_env_override(&mut settings);
+
+        assert_eq!(settings.rpc.auth_token.expose_secret(), "token_from_env");
+    }
+
+    #[test]
+    fn empty_env_var_falls_back_to_toml_rpc_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvVarGuard::new(RPC_TOKEN_ENV_VAR);
+        guard.set("");
+
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.auth_token = SecretString::from("token_from_toml".to_string());
+        apply_rpc_token_env_override(&mut settings);
+
+        assert_eq!(settings.rpc.auth_token.expose_secret(), "token_from_toml");
+    }
+
+    #[test]
+    fn no_env_var_keeps_toml_rpc_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::new(RPC_TOKEN_ENV_VAR);
+
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.auth_token = SecretString::from("token_from_toml".to_string());
+        apply_rpc_token_env_override(&mut settings);
+
+        assert_eq!(settings.rpc.auth_token.expose_secret(), "token_from_toml");
+    }
+
+    #[test]
+    fn whitespace_only_env_is_ignored_rpc_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvVarGuard::new(RPC_TOKEN_ENV_VAR);
+        guard.set("   \t  ");
+
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.auth_token = SecretString::from("token_from_toml".to_string());
+        apply_rpc_token_env_override(&mut settings);
+
+        assert_eq!(settings.rpc.auth_token.expose_secret(), "token_from_toml");
+    }
+
+    // ── fail-closed validation (issue #807) ────────────────────────────────
+
+    #[test]
+    fn validate_mostro_settings_rejects_enabled_rpc_without_token() {
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.enabled = true;
+        assert!(validate_mostro_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn validate_mostro_settings_accepts_enabled_rpc_with_token() {
+        let mut settings = make_settings("nsec_from_toml");
+        settings.rpc.enabled = true;
+        settings.rpc.auth_token = SecretString::from("a-real-token".to_string());
+        assert!(validate_mostro_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn validate_mostro_settings_accepts_disabled_rpc_without_token() {
+        // Default RpcSettings (enabled = false) must stay valid — untouched
+        // deployments that never opted into [rpc] are unaffected.
+        let settings = make_settings("nsec_from_toml");
+        assert!(validate_mostro_settings(&settings).is_ok());
     }
 }
 

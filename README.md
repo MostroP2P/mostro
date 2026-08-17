@@ -567,7 +567,7 @@ payment_retries_interval = 60  # seconds between retries
 
 **Required**: LND connection details. Mostro needs admin macaroon for hold invoice management.
 
-**Permissions**: the admin macaroon is a spend-capable credential — anyone who can read it controls the node, including the funds escrowed in Mostro's hold invoices. Keep it readable only by the user running `mostrod` (`chmod 600 /path/to/lnd/admin.macaroon`).
+**Permissions**: the admin macaroon is a spend-capable credential — anyone who can read it controls the node, including the funds escrowed in Mostro's hold invoices. Keep it readable only by the user running `mostrod` (`chmod 600 /path/to/lnd/admin.macaroon`). mostrod logs a warning at startup when the file is reachable by other users on the host.
 
 ---
 

@@ -25,7 +25,8 @@ use crate::app::context::AppContext;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
-    get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
+    get_db_pool, permissions, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG,
+    NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
@@ -220,6 +221,16 @@ async fn main() -> Result<()> {
         // Run the Mostro Cashu event loop and be happy!!
         return run_cashu(ctx).await;
     }
+
+    // The admin macaroon is spend-capable: whoever reads it controls the node,
+    // including the funds escrowed in the hold invoices mostrod manages. Say so
+    // once per boot when the file is left reachable by other local accounts —
+    // the documented deployment flows copy it around, and a bad mode is
+    // otherwise invisible until it is abused.
+    permissions::warn_if_other_accessible(
+        &Settings::get_ln().lnd_macaroon_file,
+        "LND admin macaroon",
+    );
 
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;

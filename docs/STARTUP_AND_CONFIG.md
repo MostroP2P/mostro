@@ -104,6 +104,14 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 **Lightning** (`src/config/types.rs:27-46`):
 - `lnd_cert_file` (String): Path to LND TLS certificate
 - `lnd_macaroon_file` (String): Path to LND macaroon auth file
+  - The admin macaroon is spend-capable: any account that can read it controls
+    the node, including the funds escrowed in Mostro's hold invoices. Keep it
+    readable only by the user running `mostrod` (`chmod 600`).
+  - At startup (Lightning mode only, right before the LND connection is opened)
+    `config::permissions::warn_if_other_accessible` logs a warning when the file
+    is reachable by users outside its owner and group. The check is advisory —
+    the daemon still starts — and tolerates `0640`, the mode LND itself writes
+    the macaroon with, so reaching it through the node's group stays supported.
 - `lnd_grpc_host` (String): LND gRPC endpoint URL
 - `invoice_expiration_window` (u32): Required invoice validity window in seconds (default: 3600)
 - `hold_invoice_cltv_delta` (u32): Hold invoice CLTV delta in blocks (default: 144)

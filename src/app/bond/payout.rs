@@ -79,15 +79,6 @@ use super::db::{find_bond_by_id, find_bonds_by_state};
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 
-/// Per-message ceiling for the `send_payment` status stream. LND
-/// streams periodic InFlight updates while a payment is routing; if no
-/// update lands inside this window the channel is treated as dead and
-/// the attempt is routed through `on_send_payment_failure`. Picked to
-/// be longer than the typical InFlight cadence (a few seconds) but
-/// short enough to keep a single bond from blocking a scheduler task
-/// indefinitely.
-const PAYMENT_STATUS_RECV_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// One full pass over every bond in [`BondState::PendingPayout`].
 ///
 /// Mirror of `dev_fee::run_dev_fee_cycle`: each tick walks the work
@@ -664,82 +655,139 @@ async fn pay_counterparty(
 
     // send_payment. The helper caps the fee via `routing_fee_cap_sats`,
     // the same value persisted above as `payout_routing_fee_sats`.
+    // `send_payment` consumes LND's payment stream until a terminal state,
+    // which a locked-in but unresolved HTLC (hold invoice as the winner's
+    // payout invoice, or an HTLC stuck in route) can delay indefinitely, so
+    // it is bounded with the same timeout as the buyer payout; LND stops
+    // launching route attempts at 60s, so past 75s only an unresolved HTLC
+    // keeps the stream open.
+    //
+    // The bounded send and the status drain run CONCURRENTLY (`join!`):
+    // `send_payment` forwards every LND update through `tx` and blocks when
+    // the channel fills, so draining only after it returned could deadlock a
+    // chatty stream (>100 updates) until the timeout. Same watcher-before-send
+    // pattern as the buyer payout in `do_payment`, kept on this task (no
+    // spawn) because the scheduler job needs a single combined outcome. The
+    // drain always terminates: when the send future ends — normal return, RPC
+    // error, or dropped by the timeout — `tx` drops and `rx.recv()` yields
+    // `None`.
     let (tx, mut rx) = channel(100);
-    let send_outcome = ln_client
-        .send_payment(invoice, counterparty_share, tx)
-        .await;
-    if let Err(e) = send_outcome {
-        // The RPC call itself errored. We cannot be sure the payment did
-        // not partially enter LND, so treat it as indeterminate: keep
-        // the invoice + hash for reconciliation rather than risk a
-        // double payout by re-prompting.
-        return on_send_payment_failure(
-            pool,
-            bond,
-            max_retries,
-            claim_window_seconds,
-            PaymentFailureKind::Indeterminate,
-            &format!("{e}"),
-        )
-        .await;
-    }
+
+    let send_fut = timeout(
+        crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT,
+        ln_client.send_payment(invoice, counterparty_share, tx),
+    );
 
     // Collect the first terminal status from the stream. Mirrors
-    // dev_fee::send_dev_fee_payment, but each recv is bounded by
-    // `PAYMENT_STATUS_RECV_TIMEOUT` so a wedged LND stream (no terminal
-    // update, no EOF, no InFlight churn) does not pin the scheduler
-    // task forever. We track *why* the stream ended: only an explicit
-    // `PaymentStatus::Failed` is terminal. A timeout or clean EOF leaves
-    // the payment outcome unknown (it may still be in flight), so it is
-    // routed as `Indeterminate` — `on_send_payment_failure` then keeps
-    // the invoice + hash for reconciliation instead of re-prompting.
-    let mut succeeded = false;
-    let mut failure: Option<(PaymentFailureKind, String)> = None;
-    loop {
-        match timeout(PAYMENT_STATUS_RECV_TIMEOUT, rx.recv()).await {
-            Err(_) => {
-                failure = Some((
-                    PaymentFailureKind::Indeterminate,
-                    format!(
-                        "payment status stream timed out after {}s without a terminal update",
-                        PAYMENT_STATUS_RECV_TIMEOUT.as_secs()
-                    ),
-                ));
-                break;
-            }
-            Ok(None) => break,
-            Ok(Some(msg)) => {
-                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-                    match status {
-                        PaymentStatus::Succeeded => {
-                            succeeded = true;
-                            break;
-                        }
-                        PaymentStatus::Failed => {
-                            failure = Some((
-                                PaymentFailureKind::Terminal,
-                                format!("payment failed: reason {}", msg.payment.failure_reason),
-                            ));
-                            break;
-                        }
-                        _ => {}
+    // dev_fee::send_dev_fee_payment. The drain is bounded transitively by the
+    // send-side timeout above: when the send future ends — normal return, RPC
+    // error, or dropped at the 75s bound — `tx` drops and `recv()` yields
+    // `None`. We track *why* the stream ended: only an explicit
+    // `PaymentStatus::Failed` is terminal. A clean EOF leaves the payment
+    // outcome unknown (it may still be in flight), so it is routed as
+    // `Indeterminate` — `on_send_payment_failure` then keeps the invoice +
+    // hash for reconciliation instead of re-prompting.
+    let drain_fut = async move {
+        let mut succeeded = false;
+        let mut failure: Option<(PaymentFailureKind, String)> = None;
+        while let Some(msg) = rx.recv().await {
+            if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                match status {
+                    PaymentStatus::Succeeded => {
+                        succeeded = true;
+                        break;
                     }
+                    PaymentStatus::Failed => {
+                        failure = Some((
+                            PaymentFailureKind::Terminal,
+                            format!("payment failed: reason {}", msg.payment.failure_reason),
+                        ));
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
-    }
+        // Unblock a send that is still pushing updates into a channel we are
+        // done reading: dropping `rx` fails its next `listener.send`, so the
+        // send future returns immediately instead of riding out the 75s
+        // bound for a payment whose verdict we already hold.
+        drop(rx);
+        (succeeded, failure)
+    };
 
+    let (send_outcome, (succeeded, stream_failure)) = tokio::join!(send_fut, drain_fut);
+
+    match classify_send_verdict(send_outcome, succeeded, stream_failure) {
+        SendVerdict::Settled => slash_after_success(pool, bond, counterparty_share).await,
+        SendVerdict::Failure(kind, msg) => {
+            on_send_payment_failure(pool, bond, max_retries, claim_window_seconds, kind, &msg).await
+        }
+    }
+}
+
+/// Combined verdict of a bounded `send_payment` and its concurrent status
+/// drain (see `pay_counterparty`).
+#[derive(Debug, PartialEq)]
+enum SendVerdict {
+    /// The stream reported `Succeeded`: the payment settled — finalize the
+    /// slash.
+    Settled,
+    /// No settlement: route through `on_send_payment_failure` with this kind
+    /// and cause.
+    Failure(PaymentFailureKind, String),
+}
+
+/// Classify the joint outcome of the bounded send future and the status
+/// drain into a single verdict.
+///
+/// A terminal verdict from the stream is the payment's actual outcome and
+/// takes priority over however the send future ended: a `Succeeded`
+/// delivered just before the timeout finalizes the slash immediately instead
+/// of deferring to reconciliation, and an explicit `Failed` is safe to act
+/// on regardless of the send-side result.
+///
+/// With no terminal verdict, classify by the most specific cause. Every such
+/// branch is indeterminate — the payment may still settle, so the caller
+/// keeps the invoice + hash for reconciliation and never re-prompts the
+/// winner against a payment that may still succeed. (A locked-in HTLC cannot
+/// be cancelled by the sender; dropping the send future on timeout closes
+/// our side of the gRPC stream only.)
+fn classify_send_verdict(
+    send_outcome: Result<Result<(), MostroError>, tokio::time::error::Elapsed>,
+    succeeded: bool,
+    stream_failure: Option<(PaymentFailureKind, String)>,
+) -> SendVerdict {
     if succeeded {
-        return slash_after_success(pool, bond, counterparty_share).await;
+        return SendVerdict::Settled;
     }
-
-    // EOF with no terminal status (the `Ok(None)` break above) is also
-    // indeterminate: the stream closed without telling us the outcome.
-    let (kind, msg) = failure.unwrap_or((
-        PaymentFailureKind::Indeterminate,
-        "payment stream ended without terminal status".to_string(),
-    ));
-    on_send_payment_failure(pool, bond, max_retries, claim_window_seconds, kind, &msg).await
+    let stream_failure = match stream_failure {
+        Some((PaymentFailureKind::Terminal, msg)) => {
+            return SendVerdict::Failure(PaymentFailureKind::Terminal, msg);
+        }
+        other => other,
+    };
+    let (kind, msg) = match send_outcome {
+        Err(_) => (
+            PaymentFailureKind::Indeterminate,
+            format!(
+                "send_payment reached no terminal state after {}s",
+                crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+            ),
+        ),
+        Ok(Err(e)) => {
+            // The RPC call itself errored. We cannot be sure the payment did
+            // not partially enter LND.
+            (PaymentFailureKind::Indeterminate, format!("{e}"))
+        }
+        // EOF with no terminal status: the stream closed without telling us
+        // the outcome.
+        Ok(Ok(())) => stream_failure.unwrap_or((
+            PaymentFailureKind::Indeterminate,
+            "payment stream ended without terminal status".to_string(),
+        )),
+    };
+    SendVerdict::Failure(kind, msg)
 }
 
 /// Flip a `PendingPayout` row to `Slashed` after a confirmed payment.
@@ -2291,6 +2339,97 @@ mod tests {
         assert_eq!(after.payout_attempts, 3);
         assert_eq!(after.payout_invoice.as_deref(), Some("lnbc1pINFLIGHT"));
         assert_eq!(after.payout_payment_hash.as_deref(), Some("cafebabe"));
+    }
+
+    /// Produce a real `tokio::time::error::Elapsed` (it has no public
+    /// constructor): a zero-duration timeout over a pending future.
+    async fn elapsed() -> tokio::time::error::Elapsed {
+        timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn classify_stream_succeeded_wins_over_send_timeout() {
+        // A Succeeded delivered just before the 75s cutoff is the payment's
+        // real outcome: finalize the slash immediately instead of deferring
+        // to reconciliation, no matter how the send future ended.
+        let verdict = classify_send_verdict(Err(elapsed().await), true, None);
+        assert_eq!(verdict, SendVerdict::Settled);
+    }
+
+    #[tokio::test]
+    async fn classify_stream_terminal_failed_maps_to_terminal() {
+        let verdict = classify_send_verdict(
+            Ok(Ok(())),
+            false,
+            Some((
+                PaymentFailureKind::Terminal,
+                "payment failed: reason 1".to_string(),
+            )),
+        );
+        assert_eq!(
+            verdict,
+            SendVerdict::Failure(
+                PaymentFailureKind::Terminal,
+                "payment failed: reason 1".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_send_timeout_is_indeterminate() {
+        // The Elapsed branch: dropping the send future does not cancel a
+        // locked-in HTLC, so the verdict must be Indeterminate (keep the
+        // invoice + hash for reconciliation), never Terminal.
+        let verdict = classify_send_verdict(Err(elapsed().await), false, None);
+        assert_eq!(
+            verdict,
+            SendVerdict::Failure(
+                PaymentFailureKind::Indeterminate,
+                format!(
+                    "send_payment reached no terminal state after {}s",
+                    crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                )
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_send_rpc_error_is_indeterminate() {
+        let rpc_err = MostroInternalErr(ServiceError::LnPaymentError("boom".to_string()));
+        let verdict = classify_send_verdict(Ok(Err(rpc_err)), false, None);
+        match verdict {
+            SendVerdict::Failure(PaymentFailureKind::Indeterminate, msg) => {
+                assert!(
+                    msg.contains("boom"),
+                    "cause must carry the RPC error: {msg}"
+                );
+            }
+            other => panic!("expected indeterminate failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_stream_succeeded_wins_over_send_error() {
+        // Once the drain sees Succeeded it drops `rx`, which fails the send's
+        // next `listener.send` — the resulting Ok(Err(..)) from the send
+        // future must not shadow the settled verdict.
+        let send_err = MostroInternalErr(ServiceError::LnNodeError("channel closed".to_string()));
+        let verdict = classify_send_verdict(Ok(Err(send_err)), true, None);
+        assert_eq!(verdict, SendVerdict::Settled);
+    }
+
+    #[tokio::test]
+    async fn classify_stream_eof_is_indeterminate() {
+        let verdict = classify_send_verdict(Ok(Ok(())), false, None);
+        assert_eq!(
+            verdict,
+            SendVerdict::Failure(
+                PaymentFailureKind::Indeterminate,
+                "payment stream ended without terminal status".to_string()
+            )
+        );
     }
 
     #[tokio::test]

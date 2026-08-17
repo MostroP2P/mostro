@@ -495,6 +495,8 @@ This starts:
 - Mostro daemon (exposed via configured relays)
 - Local Nostr relay (port 7000 by default)
 
+`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node. The container runs as uid/gid 1000, so run `sudo chown -R 1000:1000 docker/config/lnd` if you built as a different user.
+
 **Stop**: `make docker-down`
 
 For detailed Docker setup, see [docker/README.md](docker/README.md).
@@ -564,6 +566,8 @@ payment_retries_interval = 60  # seconds between retries
 ```
 
 **Required**: LND connection details. Mostro needs admin macaroon for hold invoice management.
+
+**Permissions**: the admin macaroon is a spend-capable credential — anyone who can read it controls the node, including the funds escrowed in Mostro's hold invoices. Keep it readable only by the user running `mostrod` (`chmod 600 /path/to/lnd/admin.macaroon`).
 
 ---
 

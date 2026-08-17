@@ -30,8 +30,8 @@ docker-build:
 	install -m 644 "$${LND_CERT_FILE}" config/lnd/tls.cert && \
 	install -m 600 "$${LND_MACAROON_FILE}" config/lnd/admin.macaroon && \
 	echo "Wrote config/lnd/tls.cert (mode 644) and config/lnd/admin.macaroon (mode 600)" && \
-	echo "Note: the container runs as uid/gid 1000. If these files are owned by another user," && \
-	echo "      run: sudo chown 1000:1000 docker/config/lnd/tls.cert docker/config/lnd/admin.macaroon" && \
+	echo "Note: the container runs as uid/gid 1000. If they are owned by another user," && \
+	echo "      run: sudo chown -R 1000:1000 docker/config/lnd" && \
 	echo "Building docker image" && \
 	docker compose build
 

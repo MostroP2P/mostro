@@ -10,7 +10,13 @@ This document describes the environment variables used by the Docker setup.
 - `LND_MACAROON_FILE`: Path to the LND admin macaroon file on your host system
   - Example: `~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon`
 
-These files are copied to `docker/config/lnd/` during the build process.
+These files are copied to `docker/config/lnd/` during the build process: the cert with mode `0644`, the admin macaroon with mode `0600`, both inside a directory with mode `0700`. The macaroon grants full control of your LND node, so it is never left readable by other users on the host.
+
+The container runs as uid/gid 1000, so that directory and its contents must be owned by uid 1000 for mostrod to reach them. If you run `make docker-build` as another user, fix the ownership afterwards:
+
+```sh
+sudo chown -R 1000:1000 docker/config/lnd
+```
 
 ## Optional Variables
 

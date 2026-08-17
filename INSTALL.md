@@ -108,6 +108,25 @@ Here some parameters you might want to change:
 - **nsec_privkey** : Your mostro private key
 - **relays** : List of relays you want to connect to
 
+### Protect the admin macaroon
+
+The admin macaroon is a spend-capable credential: any user who can read it has full control of the LND node, including the funds escrowed in Mostro's hold invoices. The `mostro` service account created above must be able to read it, and no one else.
+
+If LND runs on this same VPS, grant access through the node's group instead of loosening the file (LND creates `admin.macaroon` with mode `0640`):
+
+```bash
+usermod -aG lnd mostro
+```
+
+If you copy the macaroon into `/opt/mostro` instead, install it owner-readable only and hand it to the service account — do not use plain `cp`, which keeps whatever mode the source file or an existing destination happens to have:
+
+```bash
+install -d -m 700 -o mostro -g mostro /opt/mostro/lnd
+install -m 600 -o mostro -g mostro /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
+```
+
+Then point `lnd_macaroon_file` at `/opt/mostro/lnd/admin.macaroon`.
+
 ## Database
 
 The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.

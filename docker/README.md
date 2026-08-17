@@ -62,6 +62,12 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-build
    ```
 
+   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The container runs as uid/gid 1000, so that directory and its contents must be owned by uid 1000 for mostrod to reach the macaroon. If you ran `make docker-build` as a different user, fix the ownership:
+
+   ```sh
+   sudo chown -R 1000:1000 docker/config/lnd
+   ```
+
 4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set). This can be set before running `make docker-up`:
 
    ```sh
@@ -89,18 +95,21 @@ You can run the plain Mostro image without building locally. Use a single **conf
    **Option A — download the template** (from the [settings.tpl.toml](https://github.com/MostroP2P/mostro/blob/main/settings.tpl.toml) repo file):
 
    ```sh
-   mkdir -p ~/mostro-config/lnd
+   mkdir -p ~/mostro-config
+   install -d -m 700 ~/mostro-config/lnd
    curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
    ```
 
    **Option B — use the entrypoint default:** run the container once with an empty config dir; the entrypoint copies a default `settings.toml` (from the image, built from `settings.tpl.toml`) into `/config`. Stop the container, edit the file on the host (e.g. `~/mostro-config/settings.toml`), then start the container again.
 
-2. Copy your LND TLS cert and macaroon into the config dir (so they appear at `/config/lnd/` in the container):
+2. Copy your LND TLS cert and macaroon into the config dir (so they appear at `/config/lnd/` in the container). Use `install` rather than `cp`: `cp` keeps whatever mode the source file (or an already existing destination file) happens to have, while `install -m` sets the mode explicitly. The admin macaroon grants full control of your LND node, so it must not be readable by other users on the host:
 
    ```sh
-   cp /path/to/your/tls.cert ~/mostro-config/lnd/tls.cert
-   cp /path/to/your/admin.macaroon ~/mostro-config/lnd/admin.macaroon
+   install -m 644 /path/to/your/tls.cert ~/mostro-config/lnd/tls.cert
+   install -m 600 /path/to/your/admin.macaroon ~/mostro-config/lnd/admin.macaroon
    ```
+
+   The container runs as uid/gid 1000, and mode `0600` on the macaroon inside a `0700` directory means only their owner can reach the file. If your user is not uid 1000, either hand the directory to the container's user with `sudo chown -R 1000:1000 ~/mostro-config/lnd`, or keep your own ownership and run the container as yourself by adding `--user $(id -u):$(id -g)` to the `docker run` command in step 4.
 
 3. Edit `~/mostro-config/settings.toml`: set `nsec_privkey`, `relays`, and for Docker set `lnd_cert_file` / `lnd_macaroon_file` to `/config/lnd/...`, `lnd_grpc_host` (e.g. `https://host.docker.internal:10009`), and `[database]` `url = "sqlite:///config/mostro.db"`.
 
@@ -126,8 +135,11 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
 2. **Create a config directory** (e.g. `/opt/mostro` or `~/mostro-config`):
 
    ```sh
-   mkdir -p /opt/mostro/lnd
+   mkdir -p /opt/mostro
+   install -d -m 700 -o 1000 -g 1000 /opt/mostro/lnd
    ```
+
+   These steps run as root, while the container runs as uid/gid 1000, so the directory holding the LND credentials is created owner-only and handed to the container's user (see step 4).
 
 3. **Get the settings template** into that directory as `settings.toml`:
 
@@ -138,12 +150,14 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
    curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
    ```
 
-4. **Put LND files** in the config dir so they appear at `/config/lnd/` in the container:
+4. **Put LND files** in the config dir so they appear at `/config/lnd/` in the container. Use `install -m` rather than `cp`, which would keep whatever mode the source file (or an already existing destination file) happens to have:
 
    ```sh
-   cp /path/to/lnd/tls.cert /opt/mostro/lnd/tls.cert
-   cp /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
+   install -m 644 /path/to/lnd/tls.cert /opt/mostro/lnd/tls.cert
+   install -m 600 -o 1000 -g 1000 /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
    ```
+
+   The admin macaroon grants full control of your LND node — anyone who reads it can move the funds escrowed in Mostro's hold invoices — so it is installed owner-readable only, and `-o 1000 -g 1000` hands it to the container's user (as the `0700` directory from step 2 already was). Without that ownership, mode `0600` would leave mostrod unable to read the macaroon. (`-o`/`-g` require root; as a non-root user, drop them and run the steps as the account that owns the config dir.)
 
    (If LND is on another host, you only need the cert and macaroon copied here; point `lnd_grpc_host` at that host in step 5.)
 

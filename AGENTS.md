@@ -44,5 +44,5 @@
 
 ## Security & Configuration Tips
 - Do not commit populated `settings.toml`. Copy from `settings.tpl.toml` to `~/.mostro/settings.toml` for local runs.
-- Protect LND credentials before `make docker-build`.
+- Protect LND credentials before `make docker-build`. The admin macaroon is spend-capable: copy it with `install -m 600` (never plain `cp`, which inherits the source or destination mode) and keep its directory at `0700`.
 - Scrub logs that might leak invoices or Nostr keys; rotate secrets promptly if exposed.

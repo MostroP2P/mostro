@@ -79,15 +79,6 @@ use super::db::{find_bond_by_id, find_bonds_by_state};
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 
-/// Per-message ceiling for the `send_payment` status stream. LND
-/// streams periodic InFlight updates while a payment is routing; if no
-/// update lands inside this window the channel is treated as dead and
-/// the attempt is routed through `on_send_payment_failure`. Picked to
-/// be longer than the typical InFlight cadence (a few seconds) but
-/// short enough to keep a single bond from blocking a scheduler task
-/// indefinitely.
-const PAYMENT_STATUS_RECV_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// One full pass over every bond in [`BondState::PendingPayout`].
 ///
 /// Mirror of `dev_fee::run_dev_fee_cycle`: each tick walks the work
@@ -688,53 +679,40 @@ async fn pay_counterparty(
     );
 
     // Collect the first terminal status from the stream. Mirrors
-    // dev_fee::send_dev_fee_payment; each recv stays bounded by
-    // `PAYMENT_STATUS_RECV_TIMEOUT` as a second line of defense, although the
-    // send-side timeout above already bounds the whole exchange. We track
-    // *why* the stream ended: only an explicit `PaymentStatus::Failed` is
-    // terminal. A timeout or clean EOF leaves the payment outcome unknown
-    // (it may still be in flight), so it is routed as `Indeterminate` —
-    // `on_send_payment_failure` then keeps the invoice + hash for
-    // reconciliation instead of re-prompting.
-    let drain_fut = async {
+    // dev_fee::send_dev_fee_payment. The drain is bounded transitively by the
+    // send-side timeout above: when the send future ends — normal return, RPC
+    // error, or dropped at the 75s bound — `tx` drops and `recv()` yields
+    // `None`. We track *why* the stream ended: only an explicit
+    // `PaymentStatus::Failed` is terminal. A clean EOF leaves the payment
+    // outcome unknown (it may still be in flight), so it is routed as
+    // `Indeterminate` — `on_send_payment_failure` then keeps the invoice +
+    // hash for reconciliation instead of re-prompting.
+    let drain_fut = async move {
         let mut succeeded = false;
         let mut failure: Option<(PaymentFailureKind, String)> = None;
-        loop {
-            match timeout(PAYMENT_STATUS_RECV_TIMEOUT, rx.recv()).await {
-                Err(_) => {
-                    failure = Some((
-                        PaymentFailureKind::Indeterminate,
-                        format!(
-                            "payment status stream timed out after {}s without a terminal update",
-                            PAYMENT_STATUS_RECV_TIMEOUT.as_secs()
-                        ),
-                    ));
-                    break;
-                }
-                Ok(None) => break,
-                Ok(Some(msg)) => {
-                    if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-                        match status {
-                            PaymentStatus::Succeeded => {
-                                succeeded = true;
-                                break;
-                            }
-                            PaymentStatus::Failed => {
-                                failure = Some((
-                                    PaymentFailureKind::Terminal,
-                                    format!(
-                                        "payment failed: reason {}",
-                                        msg.payment.failure_reason
-                                    ),
-                                ));
-                                break;
-                            }
-                            _ => {}
-                        }
+        while let Some(msg) = rx.recv().await {
+            if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                match status {
+                    PaymentStatus::Succeeded => {
+                        succeeded = true;
+                        break;
                     }
+                    PaymentStatus::Failed => {
+                        failure = Some((
+                            PaymentFailureKind::Terminal,
+                            format!("payment failed: reason {}", msg.payment.failure_reason),
+                        ));
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
+        // Unblock a send that is still pushing updates into a channel we are
+        // done reading: dropping `rx` fails its next `listener.send`, so the
+        // send future returns immediately instead of riding out the 75s
+        // bound for a payment whose verdict we already hold.
+        drop(rx);
         (succeeded, failure)
     };
 
@@ -802,8 +780,8 @@ fn classify_send_verdict(
             // not partially enter LND.
             (PaymentFailureKind::Indeterminate, format!("{e}"))
         }
-        // EOF (or recv timeout) with no terminal status: the stream closed
-        // without telling us the outcome.
+        // EOF with no terminal status: the stream closed without telling us
+        // the outcome.
         Ok(Ok(())) => stream_failure.unwrap_or((
             PaymentFailureKind::Indeterminate,
             "payment stream ended without terminal status".to_string(),
@@ -2513,24 +2491,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classify_stream_recv_timeout_is_indeterminate() {
-        // The drain's own recv-timeout (second line of defense) surfaces its
-        // message when the send side ended cleanly.
-        let verdict = classify_send_verdict(
-            Ok(Ok(())),
-            false,
-            Some((
-                PaymentFailureKind::Indeterminate,
-                "payment status stream timed out after 120s without a terminal update".to_string(),
-            )),
-        );
-        assert_eq!(
-            verdict,
-            SendVerdict::Failure(
-                PaymentFailureKind::Indeterminate,
-                "payment status stream timed out after 120s without a terminal update".to_string()
-            )
-        );
+    async fn classify_stream_succeeded_wins_over_send_error() {
+        // Once the drain sees Succeeded it drops `rx`, which fails the send's
+        // next `listener.send` — the resulting Ok(Err(..)) from the send
+        // future must not shadow the settled verdict.
+        let send_err = MostroInternalErr(ServiceError::LnNodeError("channel closed".to_string()));
+        let verdict = classify_send_verdict(Ok(Err(send_err)), true, None);
+        assert_eq!(verdict, SendVerdict::Settled);
     }
 
     #[tokio::test]

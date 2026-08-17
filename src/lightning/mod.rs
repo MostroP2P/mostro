@@ -20,6 +20,7 @@ use rand::{self, RngCore};
 use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use tokio::time::timeout;
 use tracing::info;
 
 /// Seconds LND keeps launching route attempts for a payment
@@ -37,6 +38,14 @@ pub(crate) const LND_PAYMENT_ROUTE_TIMEOUT_SECS: i32 = 60;
 /// settings knob later.
 pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration =
     Duration::from_secs(LND_PAYMENT_ROUTE_TIMEOUT_SECS as u64 + 15);
+
+/// Bound on the duplicate-guard lookup inside `send_payment`. The guard is
+/// advisory — on timeout or transport error the send proceeds, because LND
+/// itself rejects a genuine duplicate for an in-flight/settled hash — so it
+/// must never eat a caller's whole budget: `dev_fee::send_dev_fee_payment`
+/// wraps `send_payment` in a 5s total timeout, and 2s leaves the majority of
+/// that for the send itself.
+const DUPLICATE_GUARD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct LndConnector {
@@ -299,13 +308,20 @@ impl LndConnector {
         // Duplicate-dispatch guard: refuse to send only when LND reports this
         // hash as already in flight or settled. A Failed/Unknown/absent record
         // must NOT abort — the retry flow legitimately re-sends the same
-        // invoice after a failure. A lookup transport error also proceeds:
-        // LND itself rejects a duplicate SendPaymentV2 for an in-flight or
-        // settled hash (the hard backstop behind this check), and if LND is
-        // truly unreachable the send below fails anyway.
-        match self.lookup_payment_status(&payment_hash).await {
-            Ok(Some(payment::PaymentStatus::InFlight))
-            | Ok(Some(payment::PaymentStatus::Succeeded)) => {
+        // invoice after a failure. A lookup transport error or timeout also
+        // proceeds: LND itself rejects a duplicate SendPaymentV2 for an
+        // in-flight or settled hash (the hard backstop behind this check),
+        // and if LND is truly unreachable the send below fails anyway. The
+        // lookup is bounded so this advisory check can never eat a caller's
+        // budget (see DUPLICATE_GUARD_LOOKUP_TIMEOUT).
+        match timeout(
+            DUPLICATE_GUARD_LOOKUP_TIMEOUT,
+            self.lookup_payment_status(&payment_hash),
+        )
+        .await
+        {
+            Ok(Ok(Some(payment::PaymentStatus::InFlight)))
+            | Ok(Ok(Some(payment::PaymentStatus::Succeeded))) => {
                 info!(
                     "Aborting payment for hash {}: already in flight or settled",
                     hash

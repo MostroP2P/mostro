@@ -809,8 +809,13 @@ pub async fn do_payment(
         )
         .await
         {
-            // The stream reached a terminal state; the watcher drains the
-            // remaining updates and finishes the bookkeeping.
+            // The send stream ended. Usually a terminal update was delivered
+            // and the watcher finishes the bookkeeping — but send_payment's
+            // `while let Ok(Some(..))` swallows a mid-stream gRPC error, so
+            // this branch also covers a stream that died or EOF'd with no
+            // terminal update. In that case the watcher exits without acting,
+            // the claim marker stays set, and reconciliation resolves the
+            // real outcome by payment hash.
             Ok(Ok(())) => {}
             Ok(Err(payment_result)) => {
                 warn!("Error during ln payment : {}", payment_result);

@@ -416,6 +416,10 @@ fn handle_sell_child_order(
         }
     }
 
+    // Clear next trade fields for sell order
+    child_order.next_trade_index = None;
+    child_order.next_trade_pubkey = None;
+
     Ok((
         child_order.seller_pubkey.clone(),
         child_order.trade_index_seller,
@@ -1729,6 +1733,23 @@ mod tests {
         let mut child = fiat_sent_sell_order(seller, buyer);
         handle_sell_child_order(&mut child, Some((next_seller.to_string(), 3)), None).unwrap();
         assert_eq!(child.master_seller_pubkey, Some(next_seller.to_string()));
+    }
+
+    #[test]
+    fn handle_sell_child_order_clears_next_trade_fields() {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+
+        // The child is cloned from the parent, next-trade fields included.
+        let mut child = fiat_sent_sell_order(seller, buyer);
+        child.next_trade_pubkey = Some(next_seller.to_string());
+        child.next_trade_index = Some(9);
+
+        handle_sell_child_order(&mut child, Some((next_seller.to_string(), 3)), None).unwrap();
+
+        assert_eq!(child.next_trade_pubkey, None);
+        assert_eq!(child.next_trade_index, None);
     }
 
     // ---------------------------------------------------------------

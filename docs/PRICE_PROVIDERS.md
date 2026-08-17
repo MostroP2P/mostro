@@ -353,7 +353,9 @@ of the last tick that produced a fresh aggregate for it.
 
 `max_price_staleness_seconds` defaults to **1800** (30 min) — long enough
 to ride out short API outages, short enough that nobody trades on an
-hours-old quote.
+hours-old quote. See §11.7 for `nostr_ingestion_budget_pct`, which carves a
+fraction of this same TTL out for the Nostr provider's own ingestion gate
+(issue #860) rather than letting `as_of` double-count it.
 
 ### 6.5 Per-provider health / circuit breaker
 
@@ -891,6 +893,22 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
 - **Currency codes are re-upper-cased** (§6.6) even though a Mostro
   publisher already emits uppercase codes — a third-party trusted node is
   outside this codebase's control.
+- **Ingestion budget, not the full TTL (issue #860).** A rate event's
+  `created_at` may be up to `max_price_staleness_seconds` old and still be
+  accepted, and once accepted the store (§6.4) allows serving it for
+  another full `max_price_staleness_seconds` before refusing it — stacking
+  the two would let a Nostr-sourced price be served for close to *twice*
+  the configured TTL, against a setting whose name implies one TTL. To
+  bound that, the provider's acceptance window is
+  `max_price_staleness_seconds × nostr_ingestion_budget_pct` (default
+  `0.5`, i.e. half the TTL) instead of the full TTL, so total age is
+  bounded at `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds`
+  — 1.5x at the default, tunable down (e.g. `0.2` → 1.2x) if an operator
+  wants a tighter bound at the cost of the fallback provider rejecting more
+  still-useful-but-lagging events. This only affects currencies where
+  Nostr is a *contributor* this tick; a fiat-cross currency resolved
+  against a Nostr-tainted anchor (`nostr_anchor_dependent`, §6.3) benefits
+  transitively from a fresher anchor without needing separate handling.
 
 ---
 

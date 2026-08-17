@@ -148,6 +148,10 @@ port = 50051
 # # Poll cadence and freshness budget.
 # update_interval_seconds = 300
 # max_price_staleness_seconds = 1800
+# # Nostr provider only: fraction of max_price_staleness_seconds an event's
+# # own created_at may consume before ingestion refuses it, leaving the
+# # remainder as the store's serving budget (issue #860). Default 0.5.
+# nostr_ingestion_budget_pct = 0.5
 # # Discard a source whose value deviates more than this % from the median
 # # (only applies with >= 3 sources for a currency).
 # outlier_threshold_pct = 5.0

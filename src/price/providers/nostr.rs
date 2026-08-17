@@ -59,9 +59,14 @@ pub struct NostrProvider {
     /// timeout before they can complete or fail on their own (CodeRabbit,
     /// PR #841).
     query_timeout: Duration,
-    /// Maximum age of a trusted-node rate event (`created_at`), taken from
-    /// the shared `[price].max_price_staleness_seconds` so upstream Nostr
-    /// freshness uses the same TTL the store enforces on cached quotes.
+    /// Maximum age of a trusted-node rate event (`created_at`) accepted at
+    /// ingestion: `max_price_staleness_seconds * nostr_ingestion_budget_pct`
+    /// (issue #860), not the full TTL. The store then enforces its own full
+    /// `max_price_staleness_seconds` window on top of whatever age the event
+    /// already had when accepted — using the full TTL for both would let a
+    /// just-under-TTL-old event be served for another full TTL afterwards
+    /// (~2x total age). Splitting the budget bounds total age at
+    /// `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds`.
     max_age: Duration,
 }
 
@@ -81,12 +86,15 @@ impl NostrProvider {
     /// client's own per-attempt timeout.
     ///
     /// `max_price_staleness_seconds` is the same shared TTL used by
-    /// [`crate::price::store::PriceStore`]: events older than that are not
-    /// eligible as this tick's source.
+    /// [`crate::price::store::PriceStore`]; `nostr_ingestion_budget_pct`
+    /// (issue #860) carves out the fraction of it an event's own `created_at`
+    /// may consume at ingestion, so the store's later full-TTL serving
+    /// window is not stacked on top of an already-near-TTL-old event.
     pub fn new(
         cfg: &ProviderConfig,
         provider_timeout_seconds: u64,
         max_price_staleness_seconds: i64,
+        nostr_ingestion_budget_pct: f64,
     ) -> Result<Self, String> {
         if cfg.trusted_nodes.is_empty() {
             return Err(
@@ -110,9 +118,13 @@ impl NostrProvider {
         Ok(Self {
             trusted_nodes,
             query_timeout: Duration::from_secs(provider_timeout_seconds.max(1)),
-            // `PriceSettings::validate` already rejects non-positive values;
-            // clamp here so a zero can never make every event look fresh.
-            max_age: Duration::from_secs(max_price_staleness_seconds.max(1) as u64),
+            // `PriceSettings::validate` already rejects non-positive
+            // staleness/budget values; clamp here so a zero (or a scaled
+            // result that rounds down to zero) can never make every event
+            // look fresh.
+            max_age: Duration::from_secs(
+                ((max_price_staleness_seconds as f64 * nostr_ingestion_budget_pct) as u64).max(1),
+            ),
         })
     }
 
@@ -637,20 +649,77 @@ mod tests {
     #[test]
     fn new_parses_valid_hex_trusted_nodes() {
         let cfg = sample_cfg(Keys::generate().public_key().to_hex());
-        assert!(NostrProvider::new(&cfg, 10, 1_800).is_ok());
+        assert!(NostrProvider::new(&cfg, 10, 1_800, 0.5).is_ok());
     }
 
     #[test]
     fn new_derives_query_timeout_and_max_age_from_shared_settings() {
         let cfg = sample_cfg(Keys::generate().public_key().to_hex());
-        let provider = NostrProvider::new(&cfg, 7, 1_800).unwrap();
+        // max_age is now the ingestion *budget* carved out of the full TTL
+        // (issue #860), not the TTL itself: 1_800 * 0.5 = 900.
+        let provider = NostrProvider::new(&cfg, 7, 1_800, 0.5).unwrap();
         assert_eq!(provider.query_timeout, Duration::from_secs(7));
-        assert_eq!(provider.max_age, Duration::from_secs(1_800));
+        assert_eq!(provider.max_age, Duration::from_secs(900));
 
         // A misconfigured 0 must not produce a zero-duration timeout/age.
-        let provider = NostrProvider::new(&cfg, 0, 0).unwrap();
+        let provider = NostrProvider::new(&cfg, 0, 0, 0.5).unwrap();
         assert_eq!(provider.query_timeout, Duration::from_secs(1));
         assert_eq!(provider.max_age, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn new_scales_max_age_by_ingestion_budget() {
+        let cfg = sample_cfg(Keys::generate().public_key().to_hex());
+        let provider = NostrProvider::new(&cfg, 10, 2_000, 0.25).unwrap();
+        assert_eq!(provider.max_age, Duration::from_secs(500));
+    }
+
+    #[test]
+    fn new_floors_a_budget_that_would_round_to_zero() {
+        let cfg = sample_cfg(Keys::generate().public_key().to_hex());
+        // 1 * 0.001 rounds down to 0 seconds before the floor — must not
+        // produce a zero-duration max_age (every event would look "too old"
+        // instantly, or worse, a zero-width window has surprising edge
+        // behavior).
+        let provider = NostrProvider::new(&cfg, 10, 1, 0.001).unwrap();
+        assert_eq!(provider.max_age, Duration::from_secs(1));
+    }
+
+    /// Regression for issue #860: with the old unscaled gate, an event up
+    /// to the *full* `max_price_staleness_seconds` old was accepted at
+    /// ingestion and then served for another full TTL by the store — total
+    /// ~2x age. With the default 0.5 ingestion budget, an event at 1000s
+    /// old (well inside the old 1800s window) must now be **rejected**,
+    /// since the ingestion budget is only 1800 * 0.5 = 900s.
+    #[test]
+    fn new_default_budget_rejects_an_event_the_old_unscaled_gate_would_have_accepted() {
+        let keys = Keys::generate();
+        let trusted = vec![keys.public_key()];
+        let cfg = sample_cfg(keys.public_key().to_hex());
+
+        let provider = NostrProvider::new(&cfg, 10, 1_800, 0.5).unwrap();
+        assert_eq!(provider.max_age, Duration::from_secs(900));
+
+        let now = Timestamp::from(10_000u64);
+        let event_1000s_old = signed_event(&keys, SAMPLE_CONTENT, 10_000 - 1_000);
+
+        // Old behavior (pre-#860, unscaled 1800s window): would have kept it.
+        assert!(!NostrProvider::rank_candidates(
+            std::slice::from_ref(&event_1000s_old),
+            &trusted,
+            now,
+            Duration::from_secs(1_800),
+        )
+        .is_empty());
+
+        // New behavior (scaled 900s ingestion budget): rejected.
+        assert!(NostrProvider::rank_candidates(
+            &[event_1000s_old],
+            &trusted,
+            now,
+            provider.max_age,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -667,7 +736,7 @@ mod tests {
             except: None,
             trusted_nodes: vec![node_a.to_hex(), node_b.to_hex()],
         };
-        let provider = NostrProvider::new(&cfg, 10, 1_800).unwrap();
+        let provider = NostrProvider::new(&cfg, 10, 1_800, 0.5).unwrap();
 
         let expected = Filter::new()
             .kind(Kind::Custom(NOSTR_EXCHANGE_RATES_EVENT_KIND))
@@ -695,13 +764,13 @@ mod tests {
             except: None,
             trusted_nodes: vec![],
         };
-        assert!(NostrProvider::new(&cfg, 10, 1_800).is_err());
+        assert!(NostrProvider::new(&cfg, 10, 1_800, 0.5).is_err());
     }
 
     #[test]
     fn new_rejects_invalid_hex_pubkey() {
         let cfg = sample_cfg("not-a-pubkey".to_string());
-        assert!(NostrProvider::new(&cfg, 10, 1_800).is_err());
+        assert!(NostrProvider::new(&cfg, 10, 1_800, 0.5).is_err());
     }
 
     /// Live-relay evidence for issue #697: exercises the real `fetch()` path
@@ -739,7 +808,7 @@ mod tests {
                 "00000235a3e904cfe1213a8a54d6f1ec1bef7cc6bfaabd6193e82931ccf1366a".to_string(),
             ],
         };
-        let provider = NostrProvider::new(&cfg, 10, 1_800).expect("valid hex pubkeys");
+        let provider = NostrProvider::new(&cfg, 10, 1_800, 0.5).expect("valid hex pubkeys");
         let http = reqwest::Client::new();
 
         let quotes = provider.fetch(&http).await.expect("live relay fetch");

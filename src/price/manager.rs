@@ -115,6 +115,7 @@ impl PriceManager {
                         cfg,
                         settings.provider_timeout_seconds,
                         settings.max_price_staleness_seconds,
+                        settings.nostr_ingestion_budget_pct,
                     )?;
                     providers.push(EnabledProvider {
                         id,
@@ -725,6 +726,7 @@ fn build_provider(
     cfg: &ProviderConfig,
     provider_timeout_seconds: u64,
     max_price_staleness_seconds: i64,
+    nostr_ingestion_budget_pct: f64,
 ) -> Result<Box<dyn PriceProvider>, String> {
     match id {
         ProviderId::Yadio => Ok(Box::new(YadioProvider::new(cfg))),
@@ -738,12 +740,16 @@ fn build_provider(
         // Nostr trusted-node relay mode (§11.7). `new` returns `Err` when
         // `trusted_nodes` is empty or contains an unparsable hex pubkey.
         // `provider_timeout_seconds` sizes its one-shot relay query;
-        // `max_price_staleness_seconds` is the freshness gate on event
-        // `created_at` so zombie relay data cannot refresh the store clock.
+        // `max_price_staleness_seconds * nostr_ingestion_budget_pct` is the
+        // freshness gate on event `created_at` so zombie relay data cannot
+        // refresh the store clock — only a fraction of the TTL, not the
+        // whole thing, is spent before the store's own window even starts
+        // (issue #860).
         ProviderId::Nostr => Ok(Box::new(NostrProvider::new(
             cfg,
             provider_timeout_seconds,
             max_price_staleness_seconds,
+            nostr_ingestion_budget_pct,
         )?)),
     }
 }

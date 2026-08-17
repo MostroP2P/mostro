@@ -347,22 +347,7 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
             // a transient settle failure leaves the bond `Locked` for an
             // admin retry, never released. Confirm the slash via the durable
             // `slashed_reason` witness before queueing a notice.
-            // Persist the recipient from the intact order too. The admin
-            // dispute path never wipes the order pubkeys, so this is not a
-            // correctness requirement here (the order-derived fallback would
-            // resolve), but populating it keeps the column uniform across
-            // every `slash_one` row and lets the resolver trust it directly.
-            let recipient = crate::app::bond::payout::resolve_recipient(order, &target, reason)?
-                .map(|pk| pk.to_string());
-            slash_one(
-                pool,
-                ln_client,
-                &target,
-                reason,
-                node_share_pct,
-                recipient.as_deref(),
-            )
-            .await;
+            slash_one(pool, ln_client, &target, reason, node_share_pct).await;
             slashed_ids.insert(target.id);
             if slash_reason_recorded(pool, target.id, reason).await? {
                 notify_rows.push(target.clone());
@@ -600,24 +585,12 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
             None
         }
     } else {
-        // Resolve the winning counterparty *now*, while `order` still carries
-        // both trade pubkeys. The scheduler's `edit_pubkeys_order` runs after
-        // this returns and NULLs the slashed side, so a later order-derived
-        // lookup would fall through to `None`; persisting the recipient on the
-        // bond row keeps the payout addressable regardless.
-        let recipient = crate::app::bond::payout::resolve_recipient(
-            order,
-            &responsible,
-            BondSlashReason::Timeout,
-        )?
-        .map(|pk| pk.to_string());
         slash_one(
             pool,
             ln_client,
             &responsible,
             BondSlashReason::Timeout,
             node_share_pct,
-            recipient.as_deref(),
         )
         .await;
         // Confirm the slash actually landed before claiming it: a transient
@@ -803,21 +776,16 @@ pub async fn notify_bond_slashed(order: &Order, slashed: &Bond) {
 /// `WHERE id = ? AND state = 'locked'` so a duplicate admin call or a
 /// concurrent transition cannot overwrite a row that already moved on.
 ///
-/// The CAS write is the only place `slashed_reason`, `slashed_at`,
-/// `node_share_sats`, and `payout_recipient_pubkey` are populated for a
-/// `LostDispute` row, which is what makes the split snapshot
-/// deterministic across restarts and config changes. `recipient` is the
-/// winning counterparty's trade pubkey, resolved by the caller from the
-/// still-intact order (before any `edit_pubkeys_order` wipe); `None`
-/// leaves the column NULL and defers resolution to the order-derived
-/// fallback.
+/// The CAS write is the only place `slashed_reason`, `slashed_at`, and
+/// `node_share_sats` are populated for a `LostDispute` row, which is
+/// what makes the split snapshot deterministic across restarts and
+/// config changes.
 async fn slash_one<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
     bond: &Bond,
     reason: BondSlashReason,
     node_share_pct: f64,
-    recipient: Option<&str>,
 ) {
     let preimage = match bond.preimage.as_deref() {
         Some(p) => p,
@@ -852,15 +820,13 @@ async fn slash_one<L: SettleLightning + Send>(
     let now = Utc::now().timestamp();
     let result = sqlx::query(
         "UPDATE bonds \
-           SET state = ?, slashed_reason = ?, slashed_at = ?, node_share_sats = ?, \
-               payout_recipient_pubkey = ? \
+           SET state = ?, slashed_reason = ?, slashed_at = ?, node_share_sats = ? \
          WHERE id = ? AND state = ?",
     )
     .bind(BondState::PendingPayout.to_string())
     .bind(reason.to_string())
     .bind(now)
     .bind(node_share_sats)
-    .bind(recipient)
     .bind(bond.id)
     .bind(BondState::Locked.to_string())
     .execute(pool)
@@ -942,17 +908,6 @@ async fn record_maker_slice_slash(
         );
         return Ok(false);
     };
-    // The slashed maker share is owed to the slice's *other* side (the
-    // winning taker). Capture it now, while the slice order still carries
-    // both trade pubkeys: on a maker-responsible timeout the scheduler calls
-    // `edit_pubkeys_order` right after this, NULLing the taker key — which is
-    // exactly this child row's recipient. Without the capture the payout
-    // would later fall through to `resolve_recipient` → `None` and forfeit to
-    // the node instead of compensating the taker.
-    let recipient_slice_pubkey = match kind {
-        Kind::Sell => slice.buyer_pubkey.as_deref(),
-        Kind::Buy => slice.seller_pubkey.as_deref(),
-    };
     let Some(max_fiat) = root.max_amount.filter(|m| *m > 0) else {
         warn!(
             bond_id = %parent_bond.id,
@@ -1010,9 +965,8 @@ async fn record_maker_slice_slash(
     let insert = sqlx::query(
         "INSERT INTO bonds \
             (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
-             amount_sats, state, slashed_reason, node_share_sats, \
-             payout_recipient_pubkey, slashed_at, created_at) \
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?) \
            AND EXISTS ( \
@@ -1028,7 +982,6 @@ async fn record_maker_slice_slash(
     .bind(BondState::PendingPayout.to_string())
     .bind(reason.to_string())
     .bind(node_share)
-    .bind(recipient_slice_pubkey)
     .bind(now)
     .bind(now)
     .bind(parent_bond.id)
@@ -1564,12 +1517,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
-        sqlx::query(include_str!(
-            "../../../migrations/20260813120000_bond_payout_recipient.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("bond_payout_recipient migration");
         // Phase 6 chain-walk tests load full `Order` rows via `Order::by_id`,
         // which selects every column the model declares — so the orders
         // table must carry the later Cashu columns too.
@@ -2363,79 +2310,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_slash_payout_survives_scheduler_pubkey_wipe() {
-        // Regression for the timeout-slash forfeit bug. `job_cancel_orders`
-        // runs the slash and then calls `edit_pubkeys_order`, which NULLs the
-        // slashed taker's trade pubkey on the order to reset/republish it.
-        // Composing both here proves the payout recipient is still resolvable
-        // afterwards: the winning maker was captured on the bond at slash
-        // time, so it no longer depends on the now-wiped order row.
-        use crate::app::bond::payout::resolve_payout_recipient;
-        use crate::db::edit_pubkeys_order;
-
-        let pool = setup_pool().await;
-        // Sell order, WaitingBuyerInvoice: maker = seller, taker = buyer. The
-        // buyer abandons → the taker bond is slashed and the seller (maker)
-        // is the wronged party owed the counterparty share.
-        let order = waiting_order(
-            Kind::Sell,
-            maker_pk(),
-            taker_pk(),
-            Status::WaitingBuyerInvoice,
-        );
-        insert_order_row(&pool, &order).await;
-        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
-        let mut ln = StubSettle::new();
-
-        // Step 1 — the real timeout slash. Besides settling the HTLC and
-        // moving the bond to PendingPayout, its CAS captures the recipient.
-        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
-        let slashed = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
-            .await
-            .unwrap()
-            .expect("taker bond is slashed on timeout");
-        assert_eq!(slashed.id, bond.id);
-
-        // Step 2 — the scheduler's republish step wipes the taker pubkey.
-        edit_pubkeys_order(&pool, &order)
-            .await
-            .expect("edit_pubkeys_order");
-
-        // The order row can no longer be matched by `bond.pubkey`...
-        let wiped = Order::by_id(&pool, order.id)
-            .await
-            .unwrap()
-            .expect("order row present");
-        assert!(
-            wiped.buyer_pubkey.is_none(),
-            "the scheduler wipe NULLs the taker (buyer) pubkey"
-        );
-
-        // ...but the slash CAS captured the winner on the bond row.
-        let slashed_row = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")
-            .bind(slashed.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            slashed_row.payout_recipient_pubkey.as_deref(),
-            Some(maker_pk()),
-            "the slash CAS recorded the winning counterparty before the wipe"
-        );
-
-        // So the payout still resolves to the maker instead of falling
-        // through to `None` (which would forfeit the share to the node).
-        let recipient = resolve_payout_recipient(&wiped, &slashed_row, BondSlashReason::Timeout)
-            .unwrap()
-            .expect("recipient must still resolve after the pubkey wipe");
-        assert_eq!(
-            recipient.to_string(),
-            maker_pk(),
-            "the wronged maker is paid, not forfeited to the node"
-        );
-    }
-
-    #[tokio::test]
     async fn timeout_republish_retains_maker_bond_sell_order() {
         // Regression (PR #767 review): sell order, WaitingBuyerInvoice. The
         // buyer (taker) times out, so the order is **republished** to the
@@ -2858,79 +2732,6 @@ mod tests {
             read_bond_state(&pool, taker_bond.id).await,
             BondState::Released.to_string(),
             "taker bond released on the terminal cancel"
-        );
-    }
-
-    #[tokio::test]
-    async fn timeout_range_maker_slash_payout_survives_scheduler_pubkey_wipe() {
-        // Regression companion to the taker/non-range case, for the Phase 6
-        // slice-slash child. A maker-responsible *range* timeout records the
-        // child via `record_maker_slice_slash`; the scheduler then cancels the
-        // slice and calls `edit_pubkeys_order`, which NULLs the taker — the
-        // child's own payout recipient. The child must still resolve to that
-        // taker because the winner was captured at slash time.
-        use crate::app::bond::payout::resolve_payout_recipient;
-        use crate::db::edit_pubkeys_order;
-
-        let pool = setup_pool().await;
-        // Sell range, WaitingPayment → the seller (maker) is responsible; the
-        // wronged party owed the slice share is the buyer (taker).
-        let mut root = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
-        root.status = Status::WaitingPayment.to_string();
-        insert_range_order_row(&pool, &root).await;
-        let _parent = insert_parent_maker_bond(&pool, root.id, maker_pk(), 1000).await;
-        let _taker_bond = insert_bond(&pool, root.id, taker_pk(), BondState::Locked).await;
-        let mut ln = StubSettle::new();
-
-        // Step 1 — the real range-maker timeout slash records the child row,
-        // capturing the winning taker.
-        let cfg = timeout_cfg(true, true, BondApplyTo::Both);
-        let child = slash_or_release_on_timeout(&pool, &mut ln, &root, Some(&cfg))
-            .await
-            .unwrap()
-            .expect("range maker timeout records the slice-slash child");
-        let child_row = sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE id = ?")
-            .bind(child.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            child_row.payout_recipient_pubkey.as_deref(),
-            Some(taker_pk()),
-            "the slice slash captured the winning taker before the wipe"
-        );
-
-        // Step 2 — the scheduler's cancel step wipes the taker (buyer) pubkey.
-        edit_pubkeys_order(&pool, &root)
-            .await
-            .expect("edit_pubkeys_order");
-        let wiped = Order::by_id(&pool, root.id)
-            .await
-            .unwrap()
-            .expect("order row present");
-        assert!(
-            wiped.buyer_pubkey.is_none(),
-            "the cancel wipe NULLs the taker (buyer) pubkey"
-        );
-
-        // With the capture, the payout still resolves to the taker...
-        let recipient = resolve_payout_recipient(&wiped, &child_row, BondSlashReason::Timeout)
-            .unwrap()
-            .expect("recipient must still resolve after the pubkey wipe");
-        assert_eq!(
-            recipient.to_string(),
-            taker_pk(),
-            "the wronged taker is paid, not forfeited to the node"
-        );
-
-        // ...whereas a pre-fix child row (no captured recipient) would strand
-        // on the wiped order — the gap this commit closes.
-        let mut legacy = child_row.clone();
-        legacy.payout_recipient_pubkey = None;
-        let none = resolve_payout_recipient(&wiped, &legacy, BondSlashReason::Timeout).unwrap();
-        assert!(
-            none.is_none(),
-            "without the capture the wiped slice order is unrecoverable"
         );
     }
 
@@ -4493,15 +4294,7 @@ mod tests {
         bond.clone().create(&pool).await.unwrap();
         let mut ln = StubSettle::new();
 
-        slash_one(
-            &pool,
-            &mut ln,
-            &bond,
-            BondSlashReason::LostDispute,
-            0.0,
-            None,
-        )
-        .await;
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
 
         assert!(
             ln.calls().is_empty(),
@@ -4531,15 +4324,7 @@ mod tests {
             .unwrap();
         let mut ln = StubSettle::new();
 
-        slash_one(
-            &pool,
-            &mut ln,
-            &bond,
-            BondSlashReason::LostDispute,
-            0.0,
-            None,
-        )
-        .await;
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
 
         assert_eq!(
             ln.calls(),
@@ -4575,15 +4360,7 @@ mod tests {
         let mut ln = StubSettle::new();
 
         // Must not panic despite the CAS query itself failing.
-        slash_one(
-            &pool,
-            &mut ln,
-            &bond,
-            BondSlashReason::LostDispute,
-            0.0,
-            None,
-        )
-        .await;
+        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
 
         assert_eq!(
             ln.calls(),

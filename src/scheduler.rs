@@ -1067,11 +1067,6 @@ async fn enforce_escrow_deadline_pass(
 
 /// How often the orderbook reconciler drains the failed-publish queue.
 const ORDERBOOK_RECONCILE_INTERVAL_SECS: u64 = 60;
-/// Every this many reconciler ticks, the whole `pending` book is
-/// re-asserted on relays (once per hour at the 60 s tick), healing states
-/// relays lost for reasons the daemon never saw (dropped events, relay
-/// restores from backup, NIP-01 ties lost before the monotonic stamp).
-const ORDERBOOK_FULL_SWEEP_EVERY_TICKS: u64 = 60;
 
 /// A reconciler republish only proceeds when the order has not been
 /// stamped for this long. Handlers publish their kind-38383 revision
@@ -1083,18 +1078,17 @@ const ORDERBOOK_FULL_SWEEP_EVERY_TICKS: u64 = 60;
 const ORDERBOOK_QUIESCENT_SECS: u64 = 120;
 
 /// One reconciler pass: republish every order whose last kind-38383
-/// publish failed (`util::take_failed_orderbook_publishes`), and — when
-/// `full_sweep` — re-assert every live `pending` order from the DB.
+/// publish failed (`util::take_failed_orderbook_publishes`).
 ///
 /// Every publish goes through `update_order_event_if_quiescent`: an order
 /// stamped within the last [`ORDERBOOK_QUIESCENT_SECS`] is skipped (queue
-/// entries are kept for the next pass), so a sweep can never supersede a
-/// transition that published before persisting its CAS. On publish
+/// entries are kept for the next pass), so a republish can never supersede
+/// a transition that published before persisting its CAS. On publish
 /// failure the order re-queues itself, so a relay outage self-heals on a
 /// later pass. The returned order (fresh `event_id`) is deliberately not
 /// persisted, matching the CAS-miss repair path: the DB row's status is
 /// the source of truth being re-advertised, not mutated.
-async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys, full_sweep: bool) {
+async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
     for (order_id, generation) in util::take_failed_orderbook_publishes() {
         match Order::by_id(pool, order_id).await {
             Ok(Some(order)) => match order.get_order_status() {
@@ -1130,62 +1124,20 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys, full_swe
             }
         }
     }
-
-    if full_sweep {
-        match crate::db::find_pending_orders_for_reconcile(pool).await {
-            Ok(orders) => {
-                info!(
-                    "orderbook reconciler: re-asserting {} pending order(s) on relays",
-                    orders.len()
-                );
-                for order in orders {
-                    match order.get_order_status() {
-                        Ok(status) => {
-                            match util::update_order_event_if_quiescent(
-                                keys,
-                                status,
-                                &order,
-                                ORDERBOOK_QUIESCENT_SECS,
-                            )
-                            .await
-                            {
-                                Ok(Some(_)) => {}
-                                // Recently stamped — the normal publish
-                                // path owns convergence for this order; a
-                                // lost event is healed by the next sweep.
-                                Ok(None) => {}
-                                Err(e) => warn!(
-                                    "orderbook reconciler: re-assert of order {} failed: {e}",
-                                    order.id
-                                ),
-                            }
-                        }
-                        Err(e) => warn!(
-                            "orderbook reconciler: order {} has bad status: {e}",
-                            order.id
-                        ),
-                    }
-                }
-            }
-            Err(e) => warn!("orderbook reconciler: could not list pending orders: {e}"),
-        }
-    }
 }
 
 /// Keeps the public NIP-33 orderbook converged with the DB: drains the
-/// failed-publish queue every minute and re-asserts the whole pending book
-/// hourly (first sweep right at startup, healing relay state lost across
-/// daemon restarts). Without this job a single dropped publish
-/// leaves a dead order advertised as `pending` until its NIP-40 expiration.
+/// failed-publish queue every minute. Without this job a single dropped
+/// publish leaves a dead order advertised as `pending` until its NIP-40
+/// expiration. Orders whose publishes succeeded are never re-sent: a
+/// kind-38383 revision is published once, when the order actually
+/// transitions.
 async fn job_orderbook_reconciler(ctx: AppContext) {
     let keys = ctx.keys().clone();
     tokio::spawn(async move {
         let pool = ctx.pool();
-        let mut tick: u64 = 0;
         loop {
-            let full_sweep = tick.is_multiple_of(ORDERBOOK_FULL_SWEEP_EVERY_TICKS);
-            reconcile_orderbook_once(pool, &keys, full_sweep).await;
-            tick = tick.wrapping_add(1);
+            reconcile_orderbook_once(pool, &keys).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ORDERBOOK_RECONCILE_INTERVAL_SECS,
             ))
@@ -1649,7 +1601,7 @@ mod tests {
         let ghost = Uuid::new_v4();
         crate::util::mark_orderbook_publish_failed(ghost);
 
-        reconcile_orderbook_once(ctx.pool(), &keys, false).await;
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
 
         assert!(
             !crate::util::is_orderbook_publish_queued(ghost),
@@ -1681,7 +1633,7 @@ mod tests {
         let order = order.create(ctx.pool()).await.unwrap();
         crate::util::mark_orderbook_publish_failed(order.id);
 
-        reconcile_orderbook_once(ctx.pool(), &keys, false).await;
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
 
         assert!(
             crate::util::is_orderbook_publish_queued(order.id),
@@ -1717,7 +1669,7 @@ mod tests {
         let _ = crate::util::stamp_orderbook_event(order.id, nostr_sdk::prelude::Timestamp::now());
         crate::util::mark_orderbook_publish_failed(order.id);
 
-        reconcile_orderbook_once(ctx.pool(), &keys, false).await;
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
 
         assert!(
             crate::util::is_orderbook_publish_queued(order.id),

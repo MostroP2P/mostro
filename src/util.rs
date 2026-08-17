@@ -2163,7 +2163,7 @@ mod tests {
         let transition = stamp_orderbook_event(order_id, now);
         assert!(
             try_stamp_orderbook_event_quiescent(order_id, now, quiet).is_none(),
-            "a sweep racing a just-stamped transition must be refused"
+            "a republish racing a just-stamped transition must be refused"
         );
         assert!(
             try_stamp_orderbook_event_quiescent(
@@ -2175,15 +2175,15 @@ mod tests {
             "still inside the quiet window"
         );
 
-        let sweep = try_stamp_orderbook_event_quiescent(
+        let republish = try_stamp_orderbook_event_quiescent(
             order_id,
             Timestamp::from(now.as_secs() + quiet),
             quiet,
         )
-        .expect("outside the quiet window the sweep must stamp");
-        assert!(sweep.created_at > transition.created_at);
+        .expect("outside the quiet window the republish must stamp");
+        assert!(republish.created_at > transition.created_at);
         assert!(
-            sweep.generation > transition.generation,
+            republish.generation > transition.generation,
             "generation order must match stamp order"
         );
     }

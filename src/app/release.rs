@@ -3,7 +3,7 @@ use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
-use crate::lightning::LndConnector;
+use crate::lightning::{LndConnector, PaymentMessage};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
@@ -22,8 +22,21 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::mpsc::channel;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+/// Upper bound on how long the background payout task waits for
+/// `send_payment` to reach a terminal state. LND itself stops launching new
+/// route attempts after `timeout_seconds: 60`, so 75s leaves margin for LND to
+/// exhaust its own attempts; past that, the stream is only kept open by an
+/// HTLC that is locked-in but unresolved (hold invoice or stuck route), which
+/// the sender cannot cancel anyway. Hitting this timeout does NOT fail the
+/// payout: the payment may still settle in LND, so the claim marker is kept
+/// and `reconcile_inflight_payout` resolves the outcome by payment hash.
+/// Fixed for now; could become a settings knob later.
+pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
@@ -524,20 +537,29 @@ async fn handle_child_order(
     Ok(())
 }
 
-/// Pay the buyer invoice for a settled-hold-invoice order.
+/// Dispatch the buyer payout for a settled-hold-invoice order.
+///
+/// `Ok(())` means the payout was *dispatched* (or a claim already exists),
+/// not that it settled: everything up to and including the idempotency claim
+/// runs inline — bounded work only — and the `send_payment` call itself runs
+/// in a background task so a payment that never reaches a terminal state
+/// (hold invoice, HTLC stuck in route) cannot freeze the event loop. The
+/// task is bounded by [`PAYOUT_SEND_PAYMENT_TIMEOUT`]; on timeout the claim
+/// marker is kept and `reconcile_inflight_payout` owns the outcome.
 ///
 /// Lightning Addresses **and** bech32 LNURLs are resolved via
 /// [`resolv_ln_address`] under the LNURL host policy. A non-empty `pr` must
 /// decode as BOLT11 and pass [`validate_payout_invoice`] (chain match, final
-/// CLTV bound, not already expired) before LND submission; resolve, decode and
-/// validation failures plus `send_payment` RPC errors go through
-/// [`check_failure_retries_or_log`] and return `Err` (no empty status-watcher
-/// spawn). Streamed `PaymentStatus::Failed` updates also bump retry
-/// bookkeeping. Callers such as `release_action` typically ignore the error
-/// after hold settlement — retries are driven by the failed-payment job.
+/// CLTV bound, not already expired) before LND submission; resolve, decode
+/// and validation failures — all pre-claim — go through
+/// [`check_failure_retries_or_log`] and return `Err`. `send_payment` RPC
+/// errors and streamed `PaymentStatus::Failed` updates bump the same retry
+/// bookkeeping from the background task. Callers such as `release_action`
+/// ignore the result after hold settlement — retries are driven by the
+/// failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
-    mut order: Order,
+    order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
@@ -642,112 +664,165 @@ pub async fn do_payment(
         return Ok(());
     };
 
-    let (tx, mut rx) = channel(100);
-
-    let payment_task = ln_client_payment.send_payment(&payment_request, amount as i64, tx);
-    if let Err(payment_result) = payment_task.await {
-        warn!("Error during ln payment : {}", payment_result);
-        // `send_payment` returned before spawning the status watcher, so the
-        // claim we just set would otherwise stay locked (blocking retry and
-        // AddInvoice) until the grace-delayed reconciliation job runs. Ask LND
-        // what actually happened to this hash and resolve the claim inline:
-        //   - in flight / succeeded / lookup error -> KEEP the marker; the
-        //     payment may still settle, so reconciliation owns the outcome and
-        //     no second payout is ever dispatched.
-        //   - not registered / failed              -> re-arm retry now (and
-        //     notify the buyer) instead of waiting.
-        let keep_marker = match Vec::<u8>::from_hex(&payout_hash) {
-            Ok(bytes) if bytes.len() == 32 => matches!(
-                ln_client_payment.lookup_payment_status(&bytes).await,
-                Ok(Some(PaymentStatus::InFlight)) | Ok(Some(PaymentStatus::Succeeded)) | Err(_)
-            ),
-            // Should not happen (we just built this hash), but if it is
-            // unusable we cannot confirm an in-flight payment — re-arm.
-            _ => false,
-        };
-        if !keep_marker
-            && crate::db::fail_order_payout(
-                ctx.pool(),
-                order.id,
-                &payout_hash,
-                Some(payout_claimed_at),
-            )
-            .await
-            .unwrap_or(false)
-        {
-            check_failure_retries_or_log(ctx, &order, request_id).await;
-        }
-        // Do not spawn the status watcher or report Ok.
-        return Err(payment_result);
-    }
-
     // Get Mostro keys from context
     let my_keys = ctx.keys().clone();
 
-    // Clone ctx for the async closure
+    // Clone ctx for the background task
     let ctx = ctx.clone();
 
-    let payment = {
-        async move {
-            // We redeclare vars to use inside this block
-            // Receiving msgs from send_payment()
-            while let Some(msg) = rx.recv().await {
-                if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
-                    match status {
-                        PaymentStatus::Succeeded => {
-                            info!(
-                                "Order Id {}: Invoice with hash: {} paid!",
-                                order.id, msg.payment.payment_hash
-                            );
-                            // Release our claim only if the order actually
-                            // reached Success. If finalization fails, keep the
-                            // marker so reconciliation retries it — clearing it
-                            // here would strand a paid order with no recovery.
-                            if payment_success(&ctx, &mut order, buyer_pubkey, &my_keys, request_id)
+    // From here on the payout runs OFF the event loop: `send_payment` waits
+    // for LND's payment stream to reach a terminal state, which a locked-in
+    // but unresolved HTLC (hold invoice, HTLC stuck in route) can delay
+    // indefinitely — awaiting it inline froze the whole daemon. The claim
+    // persisted above is what makes backgrounding safe: whatever happens to
+    // this task (RPC error, timeout, process restart), reconciliation can
+    // always finish or fail the payout by hash, so it is never lost or paid
+    // twice.
+    tokio::spawn(async move {
+        let (tx, mut rx) = channel::<PaymentMessage>(100);
+
+        // Start the status watcher BEFORE `send_payment` and run them
+        // concurrently: `send_payment` forwards every LND update through `tx`
+        // and blocks when the channel fills, so a watcher started only after
+        // it returns could deadlock the payment on a chatty stream. The
+        // watcher ends on its own when `tx` drops (send_payment returned or
+        // its future was dropped by the timeout).
+        let watcher = {
+            let ctx = ctx.clone();
+            let payout_hash = payout_hash.clone();
+            let mut order = order.clone();
+            async move {
+                // Receiving msgs from send_payment()
+                while let Some(msg) = rx.recv().await {
+                    if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
+                        match status {
+                            PaymentStatus::Succeeded => {
+                                info!(
+                                    "Order Id {}: Invoice with hash: {} paid!",
+                                    order.id, msg.payment.payment_hash
+                                );
+                                // Release our claim only if the order actually
+                                // reached Success. If finalization fails, keep the
+                                // marker so reconciliation retries it — clearing it
+                                // here would strand a paid order with no recovery.
+                                if payment_success(
+                                    &ctx,
+                                    &mut order,
+                                    buyer_pubkey,
+                                    &my_keys,
+                                    request_id,
+                                )
                                 .await
                                 .unwrap_or(false)
-                            {
-                                let _ = crate::db::clear_order_payout(
+                                {
+                                    let _ = crate::db::clear_order_payout(
+                                        ctx.pool(),
+                                        order.id,
+                                        &payout_hash,
+                                        Some(payout_claimed_at),
+                                    )
+                                    .await;
+                                }
+                            }
+                            PaymentStatus::Failed => {
+                                warn!(
+                                    "Order Id {}: Invoice with hash: {} has failed!",
+                                    order.id, msg.payment.payment_hash
+                                );
+
+                                // Release our own claim (scoped to this hash and
+                                // the per-claim timestamp) and re-arm retry. Only
+                                // do the failure bookkeeping and buyer
+                                // notification if we still owned the claim, so a
+                                // stale watcher never pollutes a newer payout's
+                                // retry state or notifies against it — even when
+                                // the retry reused the same invoice/hash.
+                                if crate::db::fail_order_payout(
                                     ctx.pool(),
                                     order.id,
                                     &payout_hash,
                                     Some(payout_claimed_at),
                                 )
-                                .await;
+                                .await
+                                .unwrap_or(false)
+                                {
+                                    check_failure_retries_or_log(&ctx, &order, request_id).await;
+                                }
                             }
+                            _ => {}
                         }
-                        PaymentStatus::Failed => {
-                            warn!(
-                                "Order Id {}: Invoice with hash: {} has failed!",
-                                order.id, msg.payment.payment_hash
-                            );
-
-                            // Release our own claim (scoped to this hash and the
-                            // per-claim timestamp) and re-arm retry. Only do the
-                            // failure bookkeeping and buyer notification if we
-                            // still owned the claim, so a stale watcher never
-                            // pollutes a newer payout's retry state or notifies
-                            // against it — even when the retry reused the same
-                            // invoice/hash.
-                            if crate::db::fail_order_payout(
-                                ctx.pool(),
-                                order.id,
-                                &payout_hash,
-                                Some(payout_claimed_at),
-                            )
-                            .await
-                            .unwrap_or(false)
-                            {
-                                check_failure_retries_or_log(&ctx, &order, request_id).await;
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
+        };
+        tokio::spawn(watcher);
+
+        match timeout(
+            PAYOUT_SEND_PAYMENT_TIMEOUT,
+            ln_client_payment.send_payment(&payment_request, amount as i64, tx),
+        )
+        .await
+        {
+            // The stream reached a terminal state; the watcher drains the
+            // remaining updates and finishes the bookkeeping.
+            Ok(Ok(())) => {}
+            Ok(Err(payment_result)) => {
+                warn!("Error during ln payment : {}", payment_result);
+                // `send_payment` failed at the RPC level, so the claim set
+                // above would otherwise stay locked (blocking retry and
+                // AddInvoice) until the grace-delayed reconciliation job runs.
+                // Ask LND what actually happened to this hash and resolve the
+                // claim now:
+                //   - in flight / succeeded / lookup error -> KEEP the marker;
+                //     the payment may still settle, so reconciliation owns the
+                //     outcome and no second payout is ever dispatched.
+                //   - not registered / failed              -> re-arm retry now
+                //     (and notify the buyer) instead of waiting.
+                let keep_marker = match Vec::<u8>::from_hex(&payout_hash) {
+                    Ok(bytes) if bytes.len() == 32 => matches!(
+                        ln_client_payment.lookup_payment_status(&bytes).await,
+                        Ok(Some(PaymentStatus::InFlight))
+                            | Ok(Some(PaymentStatus::Succeeded))
+                            | Err(_)
+                    ),
+                    // Should not happen (we just built this hash), but if it is
+                    // unusable we cannot confirm an in-flight payment — re-arm.
+                    _ => false,
+                };
+                if !keep_marker
+                    && crate::db::fail_order_payout(
+                        ctx.pool(),
+                        order.id,
+                        &payout_hash,
+                        Some(payout_claimed_at),
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    check_failure_retries_or_log(&ctx, &order, request_id).await;
+                }
+            }
+            Err(_) => {
+                // Timed out without a terminal state. Dropping the
+                // `send_payment` future closes our side of the gRPC stream but
+                // does NOT cancel the payment: a locked-in HTLC cannot be
+                // cancelled by the sender and may still settle later (up to
+                // its CLTV). Do NOT call `fail_order_payout` here — re-arming
+                // a retry against a payment that may still succeed risks a
+                // double payout. Keep the marker: reconciliation looks the
+                // hash up in LND and finalizes or fails the order with the
+                // real outcome, so a slow-but-successful payment is delayed by
+                // at most the reconciler cadence, never lost.
+                warn!(
+                    "Order Id {}: payout with hash {} got no terminal state after {}s; keeping claim marker for reconciliation",
+                    order.id,
+                    payout_hash,
+                    PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                );
+            }
         }
-    };
-    tokio::spawn(payment);
+    });
+
     Ok(())
 }
 

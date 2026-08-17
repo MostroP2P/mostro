@@ -341,7 +341,7 @@ async fn accept_event(
             // we decrypt. New orders/takes legitimately arrive
             // here — so does spam, hence the PoW toll.
             if !gate.is_known(&event.pubkey.to_string()) && !event.check_pow(pow_first_contact) {
-                // No key in the log line — sender pubkey (AGENTS.md:48).
+                // No key in the log line — sender pubkey (AGENTS.md, Security & Configuration Tips).
                 tracing::info!(
                     "Dropping first-contact kind-14 event below pow_first_contact ({} bits)",
                     pow_first_contact
@@ -386,7 +386,7 @@ async fn accept_event(
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
     if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
-        // No keys in the log line — identity/trade key (AGENTS.md:48).
+        // No keys in the log line — identity/trade key (AGENTS.md, Security & Configuration Tips).
         tracing::warn!("Missing inner signature: identity differs from trade key");
         return None;
     }

@@ -318,7 +318,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<AddSolverRequest>,
     ) -> Result<Response<AddSolverResponse>, Status> {
         let req = request.into_inner();
-        // No key in the log line — solver pubkey (AGENTS.md:48).
+        // No key in the log line — solver pubkey (AGENTS.md, Security & Configuration Tips).
         info!("Received add solver request");
 
         match self

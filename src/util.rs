@@ -469,7 +469,8 @@ async fn finalize_order_publication(
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     };
 
-    info!("Order event to be published: {event:#?}");
+    // No full event dump — it carries the pubkey, tags and content in clear
+    // (AGENTS.md, Security & Configuration Tips); the id below is enough.
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order with the new event_id (and Pending status)
@@ -670,13 +671,18 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    // No keys in the log line — sender/receiver pubkeys (AGENTS.md:48). This
-    // is the highest-frequency send path in the daemon (every outbound
-    // protocol message), so it's also the highest-blast-radius instance of
-    // this pattern.
-    info!("Sending DM");
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+    // No keys in the log line — sender/receiver pubkeys (AGENTS.md, Security
+    // & Configuration Tips). This is the highest-frequency send path in the
+    // daemon (every outbound protocol message), so it's also the highest-
+    // blast-radius instance of this pattern. request_id gives a correlation
+    // handle at no extra parsing cost, since `message` is already parsed.
+    info!(
+        "Sending DM, request_id: {:?}",
+        message.get_inner_message_kind().request_id
+    );
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
@@ -718,7 +724,7 @@ pub async fn send_dm(
     .await?;
 
     // No key in the log line — payload can carry a Nostr pubkey (e.g.
-    // Payload::Peer sent by admin_take_dispute_action) (AGENTS.md:48).
+    // Payload::Peer sent by admin_take_dispute_action) (AGENTS.md, Security & Configuration Tips).
     info!("Sending message, Event ID: {}", event.id);
 
     if let Ok(client) = get_nostr_client() {
@@ -838,7 +844,9 @@ pub async fn update_user_rating_event(
 ) -> Result<(), MostroError> {
     let event = new_rating_event(keys, "", user.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    info!("Sending replaceable event: {event:#?}");
+    // No full event dump — it carries the rated user's pubkey, tags and
+    // content in clear (AGENTS.md, Security & Configuration Tips).
+    info!("Sending replaceable rating event");
     MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
     Ok(())
 }
@@ -1228,7 +1236,9 @@ async fn update_order_event_stamped(
             new_order_event_with_created_at(keys, "", order.id.to_string(), tags, event_created_at)
                 .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-        info!("Sending replaceable event: {event:#?}");
+        // No full event dump — it carries the pubkey, tags and content in
+        // clear (AGENTS.md, Security & Configuration Tips).
+        info!("Sending replaceable event for order {}", order.id);
 
         // We update the order with the new event_id
         order_updated.event_id = event.id.to_string();

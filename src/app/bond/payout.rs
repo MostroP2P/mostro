@@ -454,7 +454,7 @@ async fn request_payout_invoice(
         return Ok(());
     }
 
-    // No key in the log fields — recipient pubkey (AGENTS.md:48).
+    // No key in the log fields — recipient pubkey (AGENTS.md, Security & Configuration Tips).
     info!(
         bond_id = %bond.id,
         order_id = %bond.order_id,
@@ -1349,7 +1349,7 @@ pub async fn add_bond_invoice_action(
 
     match apply_payout_invoice(pool, &bond, &payment_request, now, claim_window_seconds).await? {
         InvoiceApplyOutcome::Persisted => {
-            // No key in the log fields — sender pubkey (AGENTS.md:48).
+            // No key in the log fields — sender pubkey (AGENTS.md, Security & Configuration Tips).
             info!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
@@ -1357,7 +1357,7 @@ pub async fn add_bond_invoice_action(
             );
         }
         InvoiceApplyOutcome::Resurrected => {
-            // No key in the log fields — sender pubkey (AGENTS.md:48).
+            // No key in the log fields — sender pubkey (AGENTS.md, Security & Configuration Tips).
             info!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,

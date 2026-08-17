@@ -307,7 +307,7 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // No key in the log line — taker pubkey (AGENTS.md:48).
+    // No key in the log line — taker pubkey (AGENTS.md, Security & Configuration Tips).
     info!("Canceled order Id {} republishing order", order.id);
 
     // Notify the creator about the republished order after the taker-side cancellation flow completes

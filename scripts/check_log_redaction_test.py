@@ -57,6 +57,29 @@ class CheckLogRedactionTest(unittest.TestCase):
         violations = self._violations('fn x() { info!("logging pubkey redaction"); }')
         self.assertEqual(violations, [])
 
+    def test_inline_capture_flags_pubkey(self):
+        # Rust 2021 captured identifiers live inside the string literal
+        # itself — the checker must pull them out before blanking, not lose
+        # them along with the surrounding prose.
+        violations = self._violations(
+            'fn x(pubkey: &str) { tracing::info!("User with pubkey {pubkey} did X"); }'
+        )
+        self.assertEqual(violations, [(1, "pubkey")])
+
+    def test_inline_capture_with_format_spec_flags_pubkey(self):
+        violations = self._violations(
+            'fn x(pubkey: &str) { info!("pubkey={pubkey:?}"); }'
+        )
+        self.assertEqual(violations, [(1, "pubkey")])
+
+    def test_positional_placeholder_is_not_a_capture(self):
+        violations = self._violations('fn x() { info!("{} {:?}", pubkey, 1); }')
+        self.assertEqual(violations, [(1, "pubkey")])
+
+    def test_escaped_braces_are_not_a_capture(self):
+        violations = self._violations('fn x() { info!("{{pubkey}}"); }')
+        self.assertEqual(violations, [])
+
     def test_allow_comment_exempts_call(self):
         violations = self._violations(
             "fn x() {\n"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""CI gate for AGENTS.md:48 ("Scrub logs that might leak invoices or Nostr
-keys"). Flags any `tracing::{trace,debug,info,warn,error}!(...)` call whose
+"""CI gate for AGENTS.md's Security & Configuration Tips ("Scrub logs that
+might leak invoices or Nostr keys"). Flags any
+`tracing::{trace,debug,info,warn,error}!(...)` call whose
 argument list interpolates an identifier that looks like a Nostr
 key/identity, so a new log-scrubbing regression (issue #836's pattern) fails
 CI instead of shipping quietly.
@@ -21,6 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
 
 MACRO_RE = re.compile(r"\b(?:tracing::)?(?:trace|debug|info|warn|error)!\s*([({\[])")
+
+# Rust 2021 captured identifiers in a format string, e.g. `"pubkey {pubkey}"`.
+# Only bare identifiers are captures (`{}`/`{:?}`/`{0}` are positional/empty
+# and can't name a variable), and `{{`/`}}` are the escaped-brace literals —
+# excluded so `"{{not_a_capture}}"` isn't misread as one.
+FORMAT_CAPTURE_RE = re.compile(r"(?<!\{)\{([A-Za-z_]\w*)(?::[^}]*)?\}(?!\})")
 
 # Rust macros accept any of these three delimiter pairs; the matcher must
 # track whichever one was actually opened.
@@ -47,18 +54,20 @@ SUSPICIOUS_RE = re.compile(
 ALLOW_COMMENT = "pubkey-log-allow:"
 
 
-def find_call_span(text: str, open_delim: int) -> tuple[int, str]:
-    """Return (index just past the delimiter matching
-    `text[open_delim]`, the call's source with string-literal *contents*
-    blanked out). Handles all three Rust macro delimiter pairs: `()`,
-    `{}`, `[]`.
+def find_call_span(text: str, open_delim: int) -> tuple[int, str, str]:
+    """Return (index just past the delimiter matching `text[open_delim]`,
+    the call's source with string-literal *contents* blanked out, and the
+    format captures pulled from those strings before blanking). Handles all
+    three Rust macro delimiter pairs: `()`, `{}`, `[]`.
 
     Blanking string contents (not just skipping them for delimiter-matching)
     matters: a format string's own English prose can contain a key-shaped
     word ("...pubkey in order...") that isn't an interpolated argument at
     all — only the blanked version should be searched for suspicious
     identifiers, or every message that merely *mentions* a pubkey false-
-    positives.
+    positives. But a Rust 2021 captured identifier (`"pubkey {pubkey}"`) IS
+    an interpolated argument living inside that same string, so its capture
+    names are extracted first and returned alongside, not lost to blanking.
     """
     open_ch = text[open_delim]
     close_ch = DELIMITER_PAIRS[open_ch]
@@ -66,6 +75,7 @@ def find_call_span(text: str, open_delim: int) -> tuple[int, str]:
     i = open_delim
     n = len(text)
     out = []
+    captures = []
     while i < n:
         c = text[i]
         if c == '"':
@@ -74,6 +84,8 @@ def find_call_span(text: str, open_delim: int) -> tuple[int, str]:
             while i < n and text[i] != '"':
                 i += 2 if text[i] == "\\" else 1
             i += 1
+            literal = text[start:i]
+            captures.extend(m.group(1) for m in FORMAT_CAPTURE_RE.finditer(literal))
             out.append('"' * (i - start))
             continue
         out.append(c)
@@ -82,9 +94,9 @@ def find_call_span(text: str, open_delim: int) -> tuple[int, str]:
         elif c == close_ch:
             depth -= 1
             if depth == 0:
-                return i + 1, "".join(out)
+                return i + 1, "".join(out), " ".join(captures)
         i += 1
-    return n, "".join(out)  # unbalanced — best effort
+    return n, "".join(out), " ".join(captures)  # unbalanced — best effort
 
 
 def line_before(text: str, index: int) -> str:
@@ -98,8 +110,8 @@ def check_file(path: Path) -> list[tuple[int, str]]:
     violations = []
     for m in MACRO_RE.finditer(text):
         open_delim = m.end() - 1
-        _end, code_only = find_call_span(text, open_delim)
-        found = SUSPICIOUS_RE.search(code_only)
+        _end, code_only, captures = find_call_span(text, open_delim)
+        found = SUSPICIOUS_RE.search(code_only) or SUSPICIOUS_RE.search(captures)
         if not found:
             continue
         if ALLOW_COMMENT in line_before(text, m.start()):
@@ -116,7 +128,8 @@ def main() -> int:
             rel = path.relative_to(REPO_ROOT)
             print(
                 f"{rel}:{line_no}: tracing call interpolates `{ident}` — "
-                f"looks like a Nostr key/identity (AGENTS.md:48). Drop it from "
+                f"looks like a Nostr key/identity (AGENTS.md, Security & "
+                f"Configuration Tips). Drop it from "
                 f"the log line, or mark a deliberate exception with a "
                 f"`// {ALLOW_COMMENT} <reason>` comment on the line above."
             )

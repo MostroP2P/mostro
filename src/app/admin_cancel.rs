@@ -151,8 +151,9 @@ pub async fn admin_cancel_action(
         let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-        // Publish dispute event with update
-        info!("Dispute event to be published: {event:#?}");
+        // Publish dispute event with update. No full event dump — it carries
+        // the pubkey, tags and content in clear (AGENTS.md, Security & Configuration Tips).
+        info!("Dispute event to be published for dispute {dispute_id}");
 
         let client = ctx.nostr_client();
         if let Err(e) = client.send_event(&event).await {

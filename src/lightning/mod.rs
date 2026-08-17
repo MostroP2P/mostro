@@ -10,7 +10,8 @@ use fedimint_tonic_lnd::invoicesrpc::{
     SettleInvoiceMsg, SettleInvoiceResp,
 };
 use fedimint_tonic_lnd::lnrpc::{
-    invoice::InvoiceState, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment, PaymentHash,
+    invoice::InvoiceState, payment, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment,
+    PaymentHash,
 };
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
@@ -266,7 +267,11 @@ impl LndConnector {
         listener: Sender<PaymentMessage>,
     ) -> Result<(), MostroError> {
         let invoice = decode_invoice(payment_request)?;
-        let payment_hash = invoice.signable_hash();
+        // The BOLT11 payment hash — the key LND indexes payments by. NOT
+        // `signable_hash()`, which is the invoice's signature digest and is
+        // never known to LND, so a guard keyed on it can never fire.
+        let payment_hash_ref: &[u8] = invoice.payment_hash().as_ref();
+        let payment_hash = payment_hash_ref.to_vec();
         let hash = bytes_to_string(&payment_hash);
 
         // We need to set a max fee amount. `routing_fee_cap_sats` is the
@@ -274,24 +279,25 @@ impl LndConnector {
         // debugging always matches what LND actually enforces.
         let max_fee = routing_fee_cap_sats(amount);
 
-        let track_payment_req = TrackPaymentRequest {
-            payment_hash: payment_hash.to_vec(),
-            no_inflight_updates: true,
-        };
-
-        let track = self
-            .client
-            .router()
-            .track_payment_v2(track_payment_req)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())));
-
-        // We only send the payment if it wasn't attempted before
-        if track.is_ok() {
-            info!("Aborting paying invoice with hash {} to buyer", hash);
-            return Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Track error".to_string(),
-            )));
+        // Duplicate-dispatch guard: refuse to send only when LND reports this
+        // hash as already in flight or settled. A Failed/Unknown/absent record
+        // must NOT abort — the retry flow legitimately re-sends the same
+        // invoice after a failure. A lookup transport error also proceeds:
+        // LND itself rejects a duplicate SendPaymentV2 for an in-flight or
+        // settled hash (the hard backstop behind this check), and if LND is
+        // truly unreachable the send below fails anyway.
+        match self.lookup_payment_status(&payment_hash).await {
+            Ok(Some(payment::PaymentStatus::InFlight))
+            | Ok(Some(payment::PaymentStatus::Succeeded)) => {
+                info!(
+                    "Aborting payment for hash {}: already in flight or settled",
+                    hash
+                );
+                return Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "payment already dispatched for this hash".to_string(),
+                )));
+            }
+            _ => {}
         }
 
         let mut request = SendPaymentRequest {

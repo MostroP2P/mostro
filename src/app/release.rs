@@ -279,9 +279,25 @@ pub async fn release_action(
             {
                 Ok(()) => {
                     let client = ctx.nostr_client();
-                    if client.send_event(&event).await.is_err() {
-                        tracing::warn!("Failed sending child order event for order id: {}; queued for republish by the orderbook reconciler", child_order_id);
-                        mark_orderbook_publish_failed(child_order_id);
+                    // A per-relay rejection resolves to `Ok` with the
+                    // refusing relays in `output.failed`; both that and a
+                    // full send error leave the book divergent somewhere,
+                    // so queue the child for the reconciler.
+                    match client.send_event(&event).await {
+                        Ok(output) if output.failed.is_empty() => {}
+                        Ok(output) => {
+                            tracing::warn!(
+                                "child order event rejected by {} relay(s) for order id: {}: {:?}; queued for republish by the orderbook reconciler",
+                                output.failed.len(),
+                                child_order_id,
+                                output.failed
+                            );
+                            mark_orderbook_publish_failed(child_order_id);
+                        }
+                        Err(_) => {
+                            tracing::warn!("Failed sending child order event for order id: {}; queued for republish by the orderbook reconciler", child_order_id);
+                            mark_orderbook_publish_failed(child_order_id);
+                        }
                     }
                 }
                 Err(e) => {

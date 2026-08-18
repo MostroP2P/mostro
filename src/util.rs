@@ -498,7 +498,22 @@ async fn finalize_order_publication(
         .unwrap()
         .send_event(&event)
         .await
-        .map(|_s| ())
+        .map(|output| {
+            // A per-relay rejection resolves to `Ok` with the refusing
+            // relays in `output.failed`. The publish still stands — the row
+            // is `Pending` and at least one side of the wire may have it —
+            // but the divergent relays must be converged, so queue the
+            // order for the reconciler.
+            if !output.failed.is_empty() {
+                tracing::warn!(
+                    "initial orderbook publish rejected by {} relay(s) for order {}: {:?}; queued for republish",
+                    output.failed.len(),
+                    order_id,
+                    output.failed
+                );
+                mark_orderbook_publish_failed(order_id);
+            }
+        })
         .map_err(|err| {
             // The row is already `Pending` in the DB; queue it so the
             // orderbook reconciler retries the publish instead of leaving
@@ -1245,7 +1260,25 @@ async fn update_order_event_stamped(
                 // Only failures recorded by publications stamped no later
                 // than this one may be cleared: a newer concurrent
                 // publication's failure must survive this older success.
-                Ok(_) => clear_orderbook_publish_failure_up_to(order.id, stamp.generation),
+                Ok(output) if output.failed.is_empty() => {
+                    clear_orderbook_publish_failure_up_to(order.id, stamp.generation)
+                }
+                // A per-relay rejection or timeout resolves to `Ok` with the
+                // refusing relays in `output.failed` — `send_event` returns
+                // `Err` only when there was no relay to send to at all. Any
+                // rejected relay means the book is divergent there, so the
+                // publish counts as failed and stays queued until a
+                // republish converges it.
+                Ok(output) => {
+                    tracing::warn!(
+                        "orderbook publish rejected by {} relay(s) for order {} (status {}): {:?}; queued for republish",
+                        output.failed.len(),
+                        order_updated.id,
+                        status,
+                        output.failed
+                    );
+                    mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "orderbook publish failed for order {} (status {}): {e}; queued for republish",

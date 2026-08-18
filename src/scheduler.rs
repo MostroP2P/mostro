@@ -1132,16 +1132,25 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
 /// expiration. Orders whose publishes succeeded are never re-sent: a
 /// kind-38383 revision is published once, when the order actually
 /// transitions.
+///
+/// Accepted trade-off: the queue is process-local and only records
+/// failures the daemon observed. An entry queued right before a restart
+/// is lost, and a relay that silently drops an event (or restores from a
+/// backup) is never healed — periodic re-assertion of the whole book was
+/// deliberately removed as unintended behavior. NIP-40 expiration bounds
+/// any such divergence to the order's real take window.
 async fn job_orderbook_reconciler(ctx: AppContext) {
     let keys = ctx.keys().clone();
     tokio::spawn(async move {
         let pool = ctx.pool();
         loop {
-            reconcile_orderbook_once(pool, &keys).await;
+            // Sleep first: the queue is process-local, so at startup it is
+            // always empty and an immediate pass could only be a no-op.
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ORDERBOOK_RECONCILE_INTERVAL_SECS,
             ))
             .await;
+            reconcile_orderbook_once(pool, &keys).await;
         }
     });
 }
@@ -1677,6 +1686,49 @@ mod tests {
         );
         // Leave the shared queue clean for other tests.
         let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
+    /// Pins the invariant the reconciler now promises: an order whose
+    /// publishes all succeeded is never re-sent. A live `pending` order
+    /// that is not in the failed-publish queue must come out of a pass
+    /// untouched — nothing queued and, crucially, no kind-38383 revision
+    /// stamped for it.
+    #[tokio::test]
+    async fn reconciler_never_republishes_order_without_failed_publish() {
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Pending.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+
+        assert!(
+            !crate::util::is_orderbook_publish_queued(order.id),
+            "a healthy order must not end up queued by a reconciler pass"
+        );
+        // If the pass had stamped (republished) the order, the monotonic
+        // registry would hold an entry near `now` and bump this past
+        // candidate to `last + 1`. Getting the candidate back unchanged
+        // proves no stamp was created for the order during the pass.
+        let probe = crate::util::stamp_orderbook_event(
+            order.id,
+            nostr_sdk::prelude::Timestamp::from(1_700_000_000),
+        );
+        assert_eq!(
+            probe.created_at.as_secs(),
+            1_700_000_000,
+            "a reconciler pass must not stamp an order that has no failed publish"
+        );
     }
 
     // ── notify_users_canceled_order ──────────────────────────────────────

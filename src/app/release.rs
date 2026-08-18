@@ -867,78 +867,120 @@ pub async fn do_payment(
         };
         tokio::spawn(watcher);
 
-        match timeout(
+        let send_outcome = timeout(
             PAYOUT_SEND_PAYMENT_TIMEOUT,
             ln_client_payment.send_payment(&payment_request, amount as i64, tx),
         )
-        .await
-        {
+        .await;
+
+        // The status lookup is only meaningful after an RPC-level send
+        // failure: it is what decides between keeping the marker and
+        // re-arming. `None` alongside an Ok(Err) send means the hash was
+        // unusable (should not happen — it was built from the invoice).
+        let lookup = match &send_outcome {
+            Ok(Err(_)) => match Vec::<u8>::from_hex(&payout_hash) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    Some(ln_client_payment.lookup_payment_status(&bytes).await)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
+        match classify_dispatch(send_outcome, lookup) {
             // The send stream ended. Usually a terminal update was delivered
             // and the watcher finishes the bookkeeping — but send_payment's
             // `while let Ok(Some(..))` swallows a mid-stream gRPC error, so
-            // this branch also covers a stream that died or EOF'd with no
-            // terminal update. In that case the watcher exits without acting,
-            // the claim marker stays set, and reconciliation resolves the
-            // real outcome by payment hash.
-            Ok(Ok(())) => {}
-            Ok(Err(payment_result)) => {
-                warn!("Error during ln payment : {}", payment_result);
-                // `send_payment` failed at the RPC level, so the claim set
-                // above would otherwise stay locked (blocking retry and
-                // AddInvoice) until the grace-delayed reconciliation job runs.
-                // Ask LND what actually happened to this hash and resolve the
-                // claim now:
-                //   - in flight / succeeded / lookup error -> KEEP the marker;
-                //     the payment may still settle, so reconciliation owns the
-                //     outcome and no second payout is ever dispatched.
-                //   - not registered / failed              -> re-arm retry now
-                //     (and notify the buyer) instead of waiting.
-                let keep_marker = match Vec::<u8>::from_hex(&payout_hash) {
-                    Ok(bytes) if bytes.len() == 32 => matches!(
-                        ln_client_payment.lookup_payment_status(&bytes).await,
-                        Ok(Some(PaymentStatus::InFlight))
-                            | Ok(Some(PaymentStatus::Succeeded))
-                            | Err(_)
-                    ),
-                    // Should not happen (we just built this hash), but if it is
-                    // unusable we cannot confirm an in-flight payment — re-arm.
-                    _ => false,
-                };
-                if !keep_marker
-                    && crate::db::fail_order_payout(
-                        ctx.pool(),
-                        order.id,
-                        &payout_hash,
-                        Some(payout_claimed_at),
-                    )
-                    .await
-                    .unwrap_or(false)
+            // this also covers a stream that died or EOF'd with no terminal
+            // update. In that case the watcher exits without acting, the
+            // claim marker stays set, and reconciliation resolves the real
+            // outcome by payment hash.
+            DispatchVerdict::StreamEnded => {}
+            DispatchVerdict::KeepMarker(cause) => {
+                warn!(
+                    "Order Id {}: keeping payout claim for hash {}: {cause}",
+                    order.id, payout_hash
+                );
+            }
+            DispatchVerdict::ReArm(cause) => {
+                warn!(
+                    "Order Id {}: payout dispatch failed ({cause}); re-arming retry for hash {}",
+                    order.id, payout_hash
+                );
+                if crate::db::fail_order_payout(
+                    ctx.pool(),
+                    order.id,
+                    &payout_hash,
+                    Some(payout_claimed_at),
+                )
+                .await
+                .unwrap_or(false)
                 {
                     check_failure_retries_or_log(&ctx, &order, request_id).await;
                 }
-            }
-            Err(_) => {
-                // Timed out without a terminal state. Dropping the
-                // `send_payment` future closes our side of the gRPC stream but
-                // does NOT cancel the payment: a locked-in HTLC cannot be
-                // cancelled by the sender and may still settle later (up to
-                // its CLTV). Do NOT call `fail_order_payout` here — re-arming
-                // a retry against a payment that may still succeed risks a
-                // double payout. Keep the marker: reconciliation looks the
-                // hash up in LND and finalizes or fails the order with the
-                // real outcome, so a slow-but-successful payment is delayed by
-                // at most the reconciler cadence, never lost.
-                warn!(
-                    "Order Id {}: payout with hash {} got no terminal state after {}s; keeping claim marker for reconciliation",
-                    order.id,
-                    payout_hash,
-                    PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
-                );
             }
         }
     });
 
     Ok(())
+}
+
+/// What the dispatch task must do with its claim once the bounded send has
+/// ended (see `do_payment`).
+#[derive(Debug, PartialEq)]
+enum DispatchVerdict {
+    /// The send stream ended; the watcher owns any bookkeeping. Nothing to
+    /// do with the claim here.
+    StreamEnded,
+    /// KEEP the claim marker (with this cause): the payment may still
+    /// settle, so reconciliation owns the outcome and no second payout is
+    /// ever dispatched.
+    KeepMarker(String),
+    /// Release the claim (scoped to hash + token) and re-arm retry now, with
+    /// this cause: LND confirms nothing is or will be in flight for it.
+    ReArm(String),
+}
+
+/// Classify the outcome of the bounded `send_payment` into what happens to
+/// the payout claim. Pure — the LND status lookup is a parameter — so the
+/// central safety invariant of the background dispatch ("a timed-out send
+/// keeps the claim") is under test rather than under a comment.
+///
+/// - A timed-out send KEEPS the marker: dropping the send future closes our
+///   side of the gRPC stream but does NOT cancel the payment — a locked-in
+///   HTLC cannot be cancelled by the sender and may still settle later (up
+///   to its CLTV). Re-arming against it risks a double payout; kept, the
+///   payout is delayed by at most the reconciler cadence, never lost.
+/// - An RPC-level send failure resolves the claim by what LND reports for
+///   the hash: in flight / settled / lookup error → KEEP (the payment may
+///   still settle); failed / unknown / no record / unusable hash → re-arm
+///   retry now (and notify the buyer) instead of waiting for the
+///   grace-delayed reconciliation job.
+fn classify_dispatch(
+    send_outcome: Result<Result<(), MostroError>, tokio::time::error::Elapsed>,
+    lookup: Option<Result<Option<PaymentStatus>, MostroError>>,
+) -> DispatchVerdict {
+    match send_outcome {
+        Ok(Ok(())) => DispatchVerdict::StreamEnded,
+        Err(_) => DispatchVerdict::KeepMarker(format!(
+            "no terminal state after {}s; a locked-in HTLC cannot be cancelled by the sender and may still settle — reconciliation will resolve it",
+            PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+        )),
+        Ok(Err(send_err)) => match lookup {
+            Some(Ok(Some(PaymentStatus::InFlight))) | Some(Ok(Some(PaymentStatus::Succeeded))) => {
+                DispatchVerdict::KeepMarker(format!(
+                    "send errored ({send_err}) but LND reports the payment in flight or settled"
+                ))
+            }
+            Some(Err(lookup_err)) => DispatchVerdict::KeepMarker(format!(
+                "send errored ({send_err}) and the status lookup failed ({lookup_err}); the payment may still settle"
+            )),
+            // Failed / Unknown / no record — or an unusable hash (None),
+            // which cannot confirm an in-flight payment: nothing to wait
+            // for.
+            Some(Ok(_)) | None => DispatchVerdict::ReArm(format!("{send_err}")),
+        },
+    }
 }
 
 /// Finalize a paid order: transition `settled-hold-invoice` → `Success` and
@@ -2323,6 +2365,115 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// Produce a real `tokio::time::error::Elapsed` (it has no public
+    /// constructor): a zero-duration timeout over a pending future.
+    async fn elapsed() -> tokio::time::error::Elapsed {
+        timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err()
+    }
+
+    fn send_err() -> MostroError {
+        MostroInternalErr(ServiceError::LnPaymentError("boom".to_string()))
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_end_needs_no_claim_action() {
+        assert_eq!(
+            classify_dispatch(Ok(Ok(())), None),
+            DispatchVerdict::StreamEnded
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_timeout_keeps_the_marker() {
+        // The central safety invariant of the background dispatch: a
+        // timed-out send must NEVER re-arm retry — the HTLC may still
+        // settle, and re-arming against it risks a double payout.
+        match classify_dispatch(Err(elapsed().await), None) {
+            DispatchVerdict::KeepMarker(cause) => assert!(
+                cause.contains(&format!(
+                    "no terminal state after {}s",
+                    PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
+                )),
+                "cause must name the timeout: {cause}"
+            ),
+            other => panic!("a timed-out send must keep the marker, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_inflight_payment_keeps_the_marker() {
+        match classify_dispatch(Ok(Err(send_err())), Some(Ok(Some(PaymentStatus::InFlight)))) {
+            DispatchVerdict::KeepMarker(cause) => {
+                assert!(cause.contains("boom"), "cause must carry the send error")
+            }
+            other => panic!("an in-flight payment must keep the marker, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_settled_payment_keeps_the_marker() {
+        assert!(matches!(
+            classify_dispatch(
+                Ok(Err(send_err())),
+                Some(Ok(Some(PaymentStatus::Succeeded)))
+            ),
+            DispatchVerdict::KeepMarker(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_failed_lookup_keeps_the_marker() {
+        // An unanswerable lookup cannot rule out an in-flight payment, so
+        // the conservative direction is to keep the claim.
+        assert!(matches!(
+            classify_dispatch(
+                Ok(Err(send_err())),
+                Some(Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "lookup down".to_string()
+                ))))
+            ),
+            DispatchVerdict::KeepMarker(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_failed_payment_rearms() {
+        match classify_dispatch(Ok(Err(send_err())), Some(Ok(Some(PaymentStatus::Failed)))) {
+            DispatchVerdict::ReArm(cause) => {
+                assert!(cause.contains("boom"), "cause must carry the send error")
+            }
+            other => panic!("a failed payment must re-arm retry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_unknown_payment_rearms() {
+        assert!(matches!(
+            classify_dispatch(Ok(Err(send_err())), Some(Ok(Some(PaymentStatus::Unknown)))),
+            DispatchVerdict::ReArm(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_no_lnd_record_rearms() {
+        assert!(matches!(
+            classify_dispatch(Ok(Err(send_err())), Some(Ok(None))),
+            DispatchVerdict::ReArm(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_unusable_hash_rearms() {
+        // No lookup was possible (hash undecodable): an in-flight payment
+        // cannot be confirmed, so re-arm rather than strand the payout.
+        assert!(matches!(
+            classify_dispatch(Ok(Err(send_err())), None),
+            DispatchVerdict::ReArm(_)
+        ));
     }
 
     #[tokio::test]

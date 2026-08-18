@@ -1085,14 +1085,36 @@ const ORDERBOOK_QUIESCENT_SECS: u64 = 120;
 /// entries are kept for the next pass), so a republish can never supersede
 /// a transition that published before persisting its CAS. On publish
 /// failure the order re-queues itself, so a relay outage self-heals on a
-/// later pass. The returned order (fresh `event_id`) is deliberately not
-/// persisted, matching the CAS-miss repair path: the DB row's status is
-/// the source of truth being re-advertised, not mutated.
+/// later pass — up to [`util::MAX_ORDERBOOK_REPUBLISH_ATTEMPTS`] failed
+/// attempts, after which the entry is dropped: a persistently-failing
+/// relay cannot be converged by republishing (each retry only rewrites
+/// the healthy relays' copies with a fresh `created_at`), so the cap
+/// trades the retry loop for a residual divergence bounded by NIP-40.
+/// The returned order (fresh `event_id`) is deliberately not persisted,
+/// matching the CAS-miss repair path: the DB row's status is the source
+/// of truth being re-advertised, not mutated.
 async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
-    for (order_id, generation) in util::take_failed_orderbook_publishes() {
+    for (order_id, generation, attempts) in util::take_failed_orderbook_publishes() {
+        if attempts >= util::MAX_ORDERBOOK_REPUBLISH_ATTEMPTS {
+            warn!(
+                "orderbook reconciler: giving up on order {order_id} after {attempts} failed \
+                 publish attempts — check the relay list; the residual divergence is bounded \
+                 by the event's NIP-40 expiration"
+            );
+            continue;
+        }
         match Order::by_id(pool, order_id).await {
             Ok(Some(order)) => match order.get_order_status() {
                 Ok(status) => {
+                    // Re-seed the drained entry *before* attempting the
+                    // republish: the send path records its own failures via
+                    // `mark_orderbook_publish_failed_at`, which must
+                    // increment on top of the consumed attempts — against
+                    // an absent entry it would restart the count at 1 and
+                    // the attempt cap would never trip. A full success
+                    // clears the entry (its stamp generation is newer), a
+                    // quiescent skip leaves it untouched for the next pass.
+                    util::requeue_orderbook_publish_failure(order_id, generation, attempts);
                     match util::update_order_event_if_quiescent(
                         keys,
                         status,
@@ -1103,8 +1125,12 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
                     {
                         Ok(Some(_)) => {}
                         // Stamped too recently — another publication may be
-                        // in flight; keep the failure queued for later.
-                        Ok(None) => util::mark_orderbook_publish_failed_at(order_id, generation),
+                        // in flight; the re-seeded entry keeps the failure
+                        // queued without consuming an attempt.
+                        Ok(None) => {}
+                        // Pre-send failure (tags/ratings/event build):
+                        // consume an attempt so a permanently broken order
+                        // cannot occupy the queue forever.
                         Err(e) => {
                             warn!(
                                 "orderbook reconciler: republish of order {order_id} failed: {e}"
@@ -1119,8 +1145,9 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
             Ok(None) => {}
             Err(e) => {
                 warn!("orderbook reconciler: could not reload order {order_id}: {e}");
-                // Transient DB error: keep it queued for the next pass.
-                util::mark_orderbook_publish_failed_at(order_id, generation);
+                // Transient DB error: keep it queued for the next pass
+                // without consuming an attempt — nothing was published.
+                util::requeue_orderbook_publish_failure(order_id, generation, attempts);
             }
         }
     }
@@ -1728,6 +1755,96 @@ mod tests {
             probe.created_at.as_secs(),
             1_700_000_000,
             "a reconciler pass must not stamp an order that has no failed publish"
+        );
+    }
+
+    /// The drained entry is re-seeded before the republish attempt, so a
+    /// failed send increments the consumed-attempt count instead of
+    /// restarting it at 1 — and a quiescence skip consumes nothing.
+    #[tokio::test]
+    async fn reconciler_failed_retry_consumes_exactly_one_attempt() {
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Canceled.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+        crate::util::mark_orderbook_publish_failed(order.id);
+        assert_eq!(crate::util::orderbook_publish_attempts(order.id), Some(1));
+
+        // No reachable relays in tests: the republish is attempted and
+        // fails, which must cost exactly one more attempt.
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+        assert_eq!(
+            crate::util::orderbook_publish_attempts(order.id),
+            Some(2),
+            "a failed republish must increment the consumed attempts, not reset them"
+        );
+
+        // The republish just stamped the order, so the next pass hits the
+        // quiescence guard: requeued without consuming an attempt.
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+        assert_eq!(
+            crate::util::orderbook_publish_attempts(order.id),
+            Some(2),
+            "a quiescence skip must not consume an attempt"
+        );
+
+        // Leave the shared queue clean for other tests.
+        let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
+    /// Once an entry has consumed its attempt budget the reconciler drops
+    /// it instead of republishing again: the retry cannot converge a relay
+    /// that keeps failing — each extra cycle would only rewrite the healthy
+    /// relays' copies with a fresh `created_at`. The residual divergence is
+    /// bounded by the event's NIP-40 expiration.
+    #[tokio::test]
+    async fn reconciler_drops_entry_after_max_attempts() {
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Canceled.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+        crate::util::requeue_orderbook_publish_failure(
+            order.id,
+            1,
+            crate::util::MAX_ORDERBOOK_REPUBLISH_ATTEMPTS,
+        );
+
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+
+        assert!(
+            !crate::util::is_orderbook_publish_queued(order.id),
+            "an entry at the attempt cap must be dropped, not retried"
+        );
+        // No stamp may have been created for the dropped entry: probing
+        // with a past candidate must return it unchanged.
+        let probe = crate::util::stamp_orderbook_event(
+            order.id,
+            nostr_sdk::prelude::Timestamp::from(1_700_000_000),
+        );
+        assert_eq!(
+            probe.created_at.as_secs(),
+            1_700_000_000,
+            "a dropped entry must not be republished"
         );
     }
 

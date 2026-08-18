@@ -98,7 +98,7 @@ mod tests {
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::app::context::AppContext;
     use crate::config::{MESSAGE_QUEUES, MOSTRO_CONFIG};
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

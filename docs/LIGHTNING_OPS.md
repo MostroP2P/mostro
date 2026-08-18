@@ -39,17 +39,17 @@ Decodes a BOLT11 invoice string into a structured invoice object.
 **Parameters**:
 - `payment_request`: BOLT11 invoice string
 
-**Returns**: `Bolt11Invoice` or `MostroError::InvalidInvoice`
+**Returns**: `Bolt11Invoice` or `MostroError` (`InvoiceInvalidError` / related)
 
-**Entry**: `src/lightning/invoice.rs:33`
+**Entry**: `src/lightning/invoice.rs` (`fn decode_invoice`)
 
 #### is_valid_invoice
 ```rust
 pub async fn is_valid_invoice(
-    amount: i64,
-    fee: i64,
-    payment_request: &str,
-) -> Result<String, MostroError>
+    payment_request: String,
+    amount: Option<u64>,
+    fee: Option<u64>,
+) -> Result<(), MostroError>
 ```
 Comprehensive validation supporting:
 - BOLT11 Lightning invoices
@@ -62,27 +62,52 @@ Comprehensive validation supporting:
 3. Minimum payment amount enforcement (`mostro_settings.min_payment_amount`)
 4. Expiration validation (`invoice.is_expired()`)
 5. Expiration window compliance: `expires_at > now + invoice_expiration_window`
-6. Lightning Address resolution via LNURL
-7. LNURL callback with amount parameter
+6. Lightning Address / LNURL existence via `ln_exists` (see LNURL host policy below)
+7. LNURL-pay metadata must advertise `tag: payRequest`
 
-**Entry**: `src/lightning/invoice.rs:181`
+**Entry**: `src/lightning/invoice.rs` (`fn is_valid_invoice`)
 
 **Error cases**:
-- `InvalidInvoice`: Decoding fails or format invalid
+- `InvalidInvoice` / `InvoiceInvalidError`: Decoding fails or format invalid
 - `WrongAmountError`: Invoice amount doesn't match expected (after fee deduction)
 - `MinAmountError`: Amount below minimum threshold
 - `InvoiceExpiredError`: Invoice already expired
 - `ExpirationWindowTooShort`: Expires before required window
 
+## LNURL / Lightning Address fetches
+
+Source: `src/lnurl.rs`
+
+Buyer- and operator-supplied Lightning Addresses and LNURL-pay strings are resolved over HTTP. Those URLs are attacker-influenced, so every GET goes through `lnurl_get`:
+
+| Control | Behavior |
+|---------|----------|
+| Scheme | `http` / `https` only; userinfo rejected |
+| Host policy | Rejects link-local, CGNAT (`100.64.0.0/10`), NAT64 (`64:ff9b::/96`), multicast, unspecified, documentation ranges; loopback/RFC1918 forbidden in production (test-only allow guard for local mocks) |
+| DNS | Lookup capped (~2s); result pinned via reqwest `.resolve` (no rebinding) |
+| Redirects | Disabled (`Policy::none()`) |
+| Timeouts | Connect ~2s, full request ~4s (bounds serial message-loop stall) |
+| Errors | LNURL `status: ERROR`, missing `payRequest`, amount out of range, empty `pr` → `Err` (not soft empty success) |
+
+**Public helpers**:
+- `ln_exists` — metadata probe (`payRequest` tag)
+- `resolv_ln_address` — resolve to BOLT11 `pr` (LUD-12 comment when allowed)
+- `extract_lnurl` — parse address/LNURL to a single `Url` (no second parse at callers)
+
+**Payout path** (`src/app/release.rs`, `fn do_payment`):
+- Resolves Lightning Addresses under the policy above
+- Decodes non-empty `pr` as BOLT11 before LND `send_payment`
+- Resolve/decode/`send_payment` failures go through `check_failure_retries` bookkeeping and return `Err` (does not spawn an empty status watcher or report success)
+
 ## Payment Retry System
 
-Source: `src/scheduler.rs:172` (job_retry_failed_payments)
+Source: `src/scheduler.rs` (`fn job_retry_failed_payments`)
 
 Failed outgoing payments are automatically retried via the scheduler.
 
 ### Configuration
 
-**Settings** (`src/config/types.rs:28-46`):
+**Settings** (`src/config/types.rs`, `LightningSettings`):
 ```rust
 pub struct LightningSettings {
     // ... other fields ...
@@ -97,20 +122,20 @@ pub struct LightningSettings {
 - Queries database for failed payments with retry attempts remaining
 - Respects `payment_attempts` limit
 - Scheduled at `payment_retries_interval` frequency
-- Automatically invokes `send_payment()` for each retry
+- Automatically invokes `do_payment()` for each retry
 - Updates payment status and attempt count in database
 
 ### Workflow
 1. Payment fails initially → marked as failed in DB
 2. Scheduler runs retry job every N seconds (payment_retries_interval)
 3. Job finds failed payments with `attempts < payment_attempts`
-4. Invokes send_payment() again
+4. Invokes `do_payment()` again
 5. Increments attempt counter
 6. Continues until success or max attempts reached
 
 ## Payment Error Handling
 
-**Pre-flight Checks** (lines 183-201):
+**Pre-flight Checks** (`LndConnector::send_payment` in `src/lightning/mod.rs`):
 Before attempting payment, `send_payment()` uses `track_payment_v2` to detect duplicate attempts:
 
 ```rust
@@ -126,7 +151,7 @@ match ln_client.router().track_payment_v2(track_req).await {
 }
 ```
 
-**Amount Validation** (lines 210-220):
+**Amount Validation**:
 ```rust
 if let Some(amt_msat) = invoice.amount_milli_satoshis() {
     let invoice_amount_sats = amt_msat / 1000;
@@ -137,7 +162,7 @@ if let Some(amt_msat) = invoice.amount_milli_satoshis() {
 }
 ```
 
-**Zero-Amount Invoice Handling** (lines 222-228):
+**Zero-Amount Invoice Handling**:
 If invoice has no amount, the `amt` field is populated in SendPaymentRequest:
 ```rust
 if invoice.amount_milli_satoshis().is_none() {
@@ -155,7 +180,7 @@ let max_fee = match amount.cmp(&1000) {
 req.fee_limit_sat = max_fee as i64;
 ```
 
-**Timeout**: 60 seconds (line 205)
+**Timeout**: 60 seconds (`SendPaymentRequest::timeout_seconds`)
 
 ## Node Information
 

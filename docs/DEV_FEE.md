@@ -106,7 +106,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
 
 ### Fee Flow Diagram
 
-```
+```text
 Order Creation → Fee Calculation → Hold Invoice → Seller Release → Buyer Payment → Dev Payment
      ↓                 ↓                ↓              ↓                ↓             ↓
   amount         mostro_fee        seller pays    settle hold      buyer paid    mostrod pays
@@ -202,7 +202,7 @@ pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
 - Production code uses Settings seamlessly
 
 **Formula Specification:**
-```
+```text
 total_dev_fee = round(total_mostro_fee × dev_fee_percentage)
 ```
 
@@ -259,7 +259,7 @@ When a user takes a market price order, the following sequence occurs:
 
 **Example Scenario:**
 
-```
+```text
 Initial Order: 100,000 sats at $50,000/BTC (market price)
 - Mostro fee: 1,000 sats
 - Dev fee (30%): 300 sats
@@ -353,7 +353,7 @@ if order.has_no_amount() {
 **Example Scenarios:**
 
 **Fixed Price Order:**
-```
+```text
 Order Created:
 - amount: 100,000 sats (known at creation)
 - fee: 1,000 sats (calculated at creation)
@@ -372,7 +372,7 @@ Order Completes:
 ```
 
 **Market Price Order:**
-```
+```text
 Order Created:
 - Fiat: $100 USD
 - amount: 0 (unknown until taken)
@@ -417,7 +417,7 @@ Order Completes:
 - Leaving stale `dev_fee` value causes incorrect charges on re-take
 
 **Example Flow:**
-```
+```text
 Order Created (market price):
 - amount: 0, fee: 0, dev_fee: 0, status: pending
 
@@ -768,7 +768,7 @@ let payment_hash = rx.recv().await?;  // ← THIS is what goes into dev_fee_paym
 
 Complete timeline showing database field states at each stage:
 
-```
+```text
 Order Creation (t=0):
   └─> dev_fee = 0 (always zero at creation)
   └─> dev_fee_paid = 0
@@ -1315,13 +1315,13 @@ RUST_LOG="dev_fee=error" mostrod
 **Log Examples:**
 
 Success:
-```
+```text
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 amount_sats=300 destination=<dev@lightning.address> Initiating development fee payment
 [INFO dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 payment_hash=abcd1234... Development fee payment succeeded
 ```
 
 Failure:
-```
+```text
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 error=LnAddressParseError stage=address_resolution Failed to resolve development Lightning Address
 [ERROR dev_fee] order_id=550e8400-e29b-41d4-a716-446655440000 dev_fee=300 Development fee payment failed - order completing anyway
 ```
@@ -1331,7 +1331,7 @@ Failure:
 ### Common Issues
 
 **1. Daemon Won't Start - Invalid Configuration**
-```
+```text
 Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 ```
 **Solution:** Set `dev_fee_percentage` to at least 0.10 in settings.toml

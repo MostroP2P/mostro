@@ -4,20 +4,19 @@
 
 use crate::app::context::AppContext;
 use crate::db::find_dispute_by_order_id;
-use crate::nip33::{create_platform_tag_values, new_dispute_event};
+use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use mostro_core::db::Crud;
-use std::borrow::Cow;
 use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
 ///
 /// Creates and publishes a NIP-33 replaceable event containing dispute details,
 /// including status, initiator (`buyer` or `seller`), and application metadata.
-async fn publish_dispute_event(
+pub(crate) async fn publish_dispute_event(
     ctx: &AppContext,
     dispute: &Dispute,
     my_keys: &Keys,
@@ -29,29 +28,14 @@ async fn publish_dispute_event(
         false => "seller",
     };
 
-    // Create tags for the dispute event
-    let tags = Tags::from_list(vec![
-        // Status tag - indicates the current state of the dispute
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("s")),
-            vec![dispute.status.to_string()],
-        ),
-        // Who is the dispute creator
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("initiator")),
-            vec![initiator.to_string()],
-        ),
-        // Application identifier tag
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("y")),
-            create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
-        ),
-        // Event type tag
-        Tag::custom(
-            TagKind::Custom(Cow::Borrowed("z")),
-            vec!["dispute".to_string()],
-        ),
-    ]);
+    // Create tags for the dispute event (includes SQLite open time as
+    // `created_at`; Nostr event.created_at remains "signed now").
+    let tags = create_dispute_event_tags(
+        dispute.status.as_str(),
+        initiator,
+        dispute.created_at,
+        ctx.settings().mostro.name.as_deref(),
+    );
 
     // Create a new NIP-33 replaceable event (kind 38386 for disputes)
     // Empty content string as the information is in the tags
@@ -259,6 +243,7 @@ pub async fn close_dispute_after_user_resolution(
     let pool = ctx.pool();
     if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
         let dispute_id = dispute.id;
+        let opened_at = dispute.created_at;
         dispute.status = new_status.to_string();
 
         if let Err(e) = dispute.update(pool).await {
@@ -294,24 +279,12 @@ pub async fn close_dispute_after_user_resolution(
             };
 
             // Publish updated dispute event to Nostr so admin clients see it as resolved
-            let tags = Tags::from_list(vec![
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("s")),
-                    vec![new_status.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("initiator")),
-                    vec![dispute_initiator.to_string()],
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("y")),
-                    create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
-                ),
-                Tag::custom(
-                    TagKind::Custom(Cow::Borrowed("z")),
-                    vec!["dispute".to_string()],
-                ),
-            ]);
+            let tags = create_dispute_event_tags(
+                new_status.to_string(),
+                dispute_initiator,
+                opened_at,
+                ctx.settings().mostro.name.as_deref(),
+            );
 
             match new_dispute_event(my_keys, "", dispute_id.to_string(), tags) {
                 Ok(event) => {
@@ -338,7 +311,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::config::MESSAGE_QUEUES;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

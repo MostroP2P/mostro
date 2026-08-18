@@ -9,7 +9,7 @@
 use crate::cashu::CashuClient;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
-use nostr_sdk::{Client, Keys, PublicKey};
+use nostr_sdk::prelude::{Client, Keys, PublicKey};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -122,10 +122,12 @@ impl AppContext {
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
+    use crate::config::secret::take_nsec_for_init;
     use crate::config::types::{
         DatabaseSettings, ExpirationSettings, LightningSettings, MostroSettings, NostrSettings,
         RpcSettings,
     };
+    use secrecy::SecretString;
 
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
@@ -255,11 +257,18 @@ pub mod test_utils {
                 .order_msg_queue
                 .unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
 
-            // Use provided keys or parse from settings
-            let keys = self.keys.unwrap_or_else(|| {
-                Keys::parse(&settings.nostr.nsec_privkey)
-                    .expect("TestContextBuilder: invalid nsec_privkey in settings")
-            });
+            let mut settings = Arc::try_unwrap(settings).unwrap_or_else(|arc| (*arc).clone());
+
+            let keys = match self.keys {
+                Some(keys) => {
+                    settings.nostr.nsec_privkey = SecretString::default();
+                    keys
+                }
+                None => take_nsec_for_init(&mut settings.nostr)
+                    .expect("TestContextBuilder: invalid nsec_privkey in settings"),
+            };
+
+            let settings = Arc::new(settings);
 
             AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
         }
@@ -286,8 +295,9 @@ pub mod test_utils {
             },
             nostr: NostrSettings {
                 // Valid test nsec from src/config/mod.rs tests
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec!["wss://relay.test".to_string()],
             },
             mostro: MostroSettings::default(),
@@ -325,8 +335,8 @@ mod tests {
     #[tokio::test]
     async fn context_accessors_expose_injected_dependencies() {
         let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-        let keys = nostr_sdk::Keys::generate();
-        let client = nostr_sdk::Client::default();
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let client = nostr_sdk::prelude::Client::default();
 
         let ctx = TestContextBuilder::new()
             .with_pool(pool.clone())
@@ -369,7 +379,7 @@ mod tests {
 
         // Push through the context handle, observe through the mock handle.
         let msg = mostro_core::prelude::Message::new_restore(None);
-        let key = nostr_sdk::Keys::generate().public_key();
+        let key = nostr_sdk::prelude::Keys::generate().public_key();
         ctx.order_msg_queue().write().await.push((msg, key));
         assert_eq!(mock.len().await, 1);
         assert!(!mock.is_empty().await);

@@ -1,19 +1,69 @@
 use crate::util::{enqueue_order_msg, notify_taker_reputation};
+use crate::Result;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
 use tracing::info;
 
+/// Advance an order whose seller has just paid the hold invoice.
+///
+/// Called from the LND invoice subscriber on `InvoiceState::Accepted`, which
+/// means it can fire more than once for the same invoice: LND replays the
+/// current state whenever a subscription is (re)attached, and every restart
+/// reattaches one for each row `crate::db::find_held_invoices` returns.
+///
+/// It therefore only acts on an order that is still in `WaitingPayment` or
+/// `WaitingBuyerInvoice` *and* still has `invoice_held_at == 0`. Anything else
+/// — a replay, or a late event for an order canceled while its hold invoice
+/// lived on in LND — is a no-op that returns `Ok` after a warning, never an
+/// error, since there is nothing for the caller to retry.
+///
+/// Not atomic: the check and the write are separate statements, so a cancel
+/// running concurrently on the main loop can still interleave. See #855.
 pub async fn hold_invoice_paid(
     hash: &str,
     request_id: Option<u64>,
     pool: &SqlitePool,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    let order = crate::db::find_order_by_hash(pool, hash)
+    let mut order = crate::db::find_order_by_hash(pool, hash)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Decide whether this event may advance the order before touching anything
+    // else, so a replay costs one status read and cannot surface a spurious
+    // error from a degraded row.
+    //
+    // Two conditions, and both are load-bearing:
+    //
+    // - Status must still be pre-payment. Otherwise a late `Accepted` — the row
+    //   was canceled while the hold invoice lived on in LND — would drag a dead
+    //   order back into a live trade.
+    // - `invoice_held_at` must still be unset. This is the idempotency marker:
+    //   it is written at the end of this function and read nowhere else, and
+    //   `WaitingBuyerInvoice` is both an entry *and* an exit state of the flow
+    //   below. Without it, every restart resubscribes such a row, LND replays
+    //   the held invoice's `Accepted`, and the buyer gets another `AddInvoice`
+    //   while the maker gets another reputation notification.
+    let current_status = order.get_order_status().map_err(MostroInternalErr)?;
+    let is_pre_payment = matches!(
+        current_status,
+        Status::WaitingPayment | Status::WaitingBuyerInvoice
+    );
+    if !is_pre_payment || order.invoice_held_at != 0 {
+        // Loud on purpose: the HTLC is real and locked, but this order is past
+        // the point where we can credit it, so an operator has to look.
+        tracing::warn!(
+            order_id = %order.id,
+            status = %current_status,
+            invoice_held_at = order.invoice_held_at,
+            "Ignoring hold-invoice payment for an order already past the \
+             pre-payment window; the invoice with hash {hash} may still be \
+             locked in LND"
+        );
+        return Ok(());
+    }
 
     let buyer_pubkey = order
         .get_buyer_pubkey()
@@ -85,6 +135,15 @@ pub async fn hold_invoice_paid(
         order_data.status = Some(status);
         order_data.buyer_trade_pubkey = None;
         order_data.seller_trade_pubkey = None;
+        // Entering `waiting-buyer-invoice` starts the *buyer's* waiting
+        // duty, and `taken_at` anchors the timeout clock that
+        // `find_order_by_seconds` / `slash_or_release_on_timeout` blame by
+        // current duty. Restart it here so a seller who stalled through
+        // `waiting-payment` can't eat the buyer's window and get the
+        // buyer's bond wrongly slashed (buy-order mirror of the
+        // `show_hold_invoice` re-anchor). Persisted by the
+        // `updated_order.update` below.
+        order.set_timestamp_now();
         // We ask to buyer for a new invoice
         enqueue_order_msg(
             request_id,
@@ -135,12 +194,118 @@ pub async fn hold_invoice_settlement(hash: &str, pool: &SqlitePool) -> Result<()
     Ok(())
 }
 
-pub async fn hold_invoice_canceled(hash: &str, pool: &SqlitePool) -> Result<()> {
-    let order = crate::db::find_order_by_hash(pool, hash).await?;
-    info!(
-        "Order Id: {} - Invoice with hash: {} was canceled!",
-        order.id, hash
+/// Handle an LND `Canceled` update for an order's hold invoice.
+///
+/// Most cancels are expected: the daemon itself canceled the invoice
+/// (waiting-state timeout, cooperative cancel, admin cancel) and already
+/// moved the order on, so the event only earns a log line.
+///
+/// The dangerous case is a cancel landing while the order is still in an
+/// escrow-backed state (`Active` / `FiatSent` / `Dispute`): the trade
+/// relies on that HTLC, so its loss means LND auto-canceled it at the
+/// CLTV horizon, refunding the escrow to the seller (or the deadline
+/// guardian job could not act — e.g. the daemon was down past the
+/// horizon and this is the restart replay). To avoid misreading an
+/// in-flight *intentional* cancel as an evaporation, the alarm only
+/// fires once the order is past the guardian's nominal action deadline
+/// ([`crate::util::escrow_action_deadline_unix`]); before that, an
+/// escrow-backed cancel is treated as intentional and only logged. This
+/// gate is a wall-clock approximation of the block-height horizon (no
+/// LND handle here to consult the chain); the guardian job is the
+/// height-accurate layer and normally acts first.
+///
+/// Past the deadline:
+///
+/// - every escrow-backed state gets both parties notified with
+///   [`Action::HoldInvoicePaymentCanceled`], plus an `error!` for the
+///   operator;
+/// - `Active` additionally transitions to `Canceled`: with no fiat claim
+///   on record the trade is simply dead, and leaving it `Active` would
+///   keep showing a trade that no escrow backs;
+/// - `FiatSent` / `Dispute` keep their status — the fiat leg may already
+///   have moved, so a human must resolve the fallout. The notifications
+///   and the `error!` are the alarm.
+pub async fn hold_invoice_canceled(
+    hash: &str,
+    pool: &SqlitePool,
+    my_keys: &Keys,
+) -> Result<(), MostroError> {
+    let order = crate::db::find_order_by_hash(pool, hash)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let status = order.get_order_status().map_err(MostroInternalErr)?;
+
+    let is_escrow_backed = matches!(status, Status::Active | Status::FiatSent | Status::Dispute);
+    // `invoice_held_at == 0` (escrow never observed, or a row predating the
+    // column) yields no deadline: nothing reliable to reason about, keep
+    // the legacy log-only behaviour.
+    let ln_settings = crate::config::Settings::get_ln();
+    let past_action_deadline = crate::util::escrow_action_deadline_unix(
+        order.invoice_held_at,
+        ln_settings.hold_invoice_cltv_delta,
+        ln_settings.escrow_deadline_margin_blocks,
+    )
+    .map(|deadline| Timestamp::now().as_secs() as i64 >= deadline)
+    .unwrap_or(false);
+
+    if !is_escrow_backed || !past_action_deadline {
+        info!(
+            "Order Id: {} - Invoice with hash: {} was canceled!",
+            order.id, hash
+        );
+        return Ok(());
+    }
+
+    tracing::error!(
+        order_id = %order.id,
+        status = %status,
+        "Hold invoice canceled while the order still relies on its escrow: \
+         the escrow was refunded to the seller at the CLTV horizon and the \
+         trade can no longer be settled — manual intervention required"
     );
+
+    // Missing party keys must not mute the alarm: the operator-facing
+    // error above still fires, and whichever key resolves gets notified.
+    for party in [order.get_buyer_pubkey(), order.get_seller_pubkey()]
+        .into_iter()
+        .flatten()
+    {
+        enqueue_order_msg(
+            None,
+            Some(order.id),
+            Action::HoldInvoicePaymentCanceled,
+            None,
+            party,
+            None,
+        )
+        .await;
+    }
+
+    if status == Status::Active {
+        match crate::util::update_order_event(my_keys, Status::Canceled, &order).await {
+            Ok(updated) => {
+                let updated = updated
+                    .update(pool)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                crate::scheduler::notify_users_canceled_order(
+                    &updated,
+                    &order,
+                    Some(Action::Canceled),
+                )
+                .await;
+            }
+            Err(e) => {
+                // The next subscription replay (or restart) retries; the
+                // error above already flagged the order for the operator.
+                tracing::warn!(
+                    "Could not publish the cancel for order {} ({e}); will retry",
+                    order.id
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -148,7 +313,7 @@ pub async fn hold_invoice_canceled(hash: &str, pool: &SqlitePool) -> Result<()> 
 mod tests {
     use super::*;
     use mostro_core::order::{Kind as OrderKind, Status};
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
 
     async fn create_test_pool() -> SqlitePool {
@@ -258,6 +423,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hold_invoice_paid_reanchors_taken_at_for_buyer_duty() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "dd".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+        // A counterparty that stalled through its own waiting duty: the
+        // take-time anchor is already past any timeout window when the hold
+        // invoice settles. If this stale value survived the transition, the
+        // scheduler would immediately deem the buyer's brand-new duty
+        // expired and slash their bond.
+        let stale_taken_at = Timestamp::now().as_secs() as i64 - 10_000;
+        sqlx::query("UPDATE orders SET taken_at = ?1 WHERE id = ?2")
+            .bind(stale_taken_at)
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "add-invoice path must succeed: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert!(
+            updated.taken_at > stale_taken_at,
+            "entering waiting-buyer-invoice must restart the per-duty timeout clock, got {}",
+            updated.taken_at
+        );
+        assert!(
+            updated.taken_at >= Timestamp::now().as_secs() as i64 - 60,
+            "re-anchored taken_at must be current, got {}",
+            updated.taken_at
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_does_not_revive_a_settled_order() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "cc".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        // A redelivered or late Accepted event for an order that has already
+        // left the pre-payment window must not drag it back into a live trade.
+        insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Canceled,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "a stale Accepted is a no-op, not a failure: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Canceled.to_string());
+        assert_eq!(
+            updated.invoice_held_at, 0,
+            "no side effects on an order outside the pre-payment window"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_paid_is_a_noop_on_redelivery() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "ee".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        // This is the else-branch's *own* output state: WaitingBuyerInvoice with
+        // the hold invoice already observed. Such a row is resubscribed on every
+        // restart, and LND replays the current Accepted state on resubscribe, so
+        // the flow must not run a second time — it would re-send AddInvoice to
+        // the buyer and re-notify the maker on each restart.
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "a replayed Accepted is a no-op, not a failure: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(
+            updated.invoice_held_at, 1_700_000_000,
+            "a replayed Accepted must not re-run the flow"
+        );
+    }
+
+    #[tokio::test]
     async fn hold_invoice_paid_errors_when_buyer_pubkey_missing() {
         init_global_settings();
         let pool = create_migrated_pool().await;
@@ -279,7 +565,9 @@ mod tests {
         insert_order_with_hash(&pool, &hash, Status::Active, None, None, None, None).await;
 
         assert!(hold_invoice_settlement(&hash, &pool).await.is_ok());
-        assert!(hold_invoice_canceled(&hash, &pool).await.is_ok());
+        assert!(hold_invoice_canceled(&hash, &pool, &create_test_keys())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -316,9 +604,131 @@ mod tests {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // This test would require setting up database with order data
-        let result = hold_invoice_canceled(hash, &pool).await;
+        let result = hold_invoice_canceled(hash, &pool, &create_test_keys()).await;
         // Should fail without proper database setup
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_closes_active_order_past_the_escrow_deadline() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f1".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Active,
+            None,
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+        // The escrow was observed long enough ago that the guardian's
+        // action deadline is behind us (test settings clamp the window,
+        // so any past timestamp qualifies).
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_canceled(&hash, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "evaporation handling must not error: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(
+            updated.status,
+            Status::Canceled.to_string(),
+            "an Active order whose escrow evaporated must stop looking live"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_ignores_active_order_inside_the_escrow_window() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f2".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Active,
+            None,
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+        // The action deadline is still ahead (test settings clamp the
+        // guard window to zero, so only a future held_at lands inside the
+        // window): an intentional cooperative/admin cancel in flight must
+        // not be misread as an evaporation.
+        let future = Timestamp::now().as_secs() as i64 + 86_400;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, future)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_canceled(&hash, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "intentional cancels stay no-ops: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_leaves_fiat_sent_order_for_a_human() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f3".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::FiatSent,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_canceled(&hash, &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "the alarm must not error: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(
+            updated.status,
+            Status::FiatSent.to_string(),
+            "fiat may already have moved: only a human can resolve this"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_without_held_timestamp_keeps_legacy_noop() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f4".repeat(32);
+        // Active with invoice_held_at == 0: no deadline to reason about
+        // (escrow never observed, or a row predating the column).
+        insert_order_with_hash(&pool, &hash, Status::Active, None, None, None, None).await;
+
+        let result = hold_invoice_canceled(&hash, &pool, &create_test_keys()).await;
+        assert!(result.is_ok(), "legacy no-op must not error: {result:?}");
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::Active.to_string());
     }
 
     mod hold_invoice_flow_tests {

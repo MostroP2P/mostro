@@ -1,5 +1,5 @@
 use crate::app::context::AppContext;
-use crate::db::{is_user_present, update_user_rating};
+use crate::db::{claim_order_rating_flag, update_user_rating};
 use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -61,12 +61,11 @@ pub fn prepare_variables_for_vote(
 /// 1. Retrieves the order information from the database
 /// 2. Verifies the order status is "Success", or "SettledHoldInvoice" for seller-initiated ratings
 /// 3. Determines if the rating is from buyer or seller
-/// 4. Checks if the user has already rated their counterpart
+/// 4. Fast-path skips when the sender's rate flag is already set (durable claim is step 6)
 /// 5. Validates privacy mode settings
-/// 6. Updates the recipient's rating metrics
-/// 7. Creates and saves a new rating event
-/// 8. Updates the database with the new rating information
-/// 9. Sends a confirmation message to the rating user
+/// 6. Claims the sender's rating flag and updates the recipient's metrics in one transaction
+/// 7. Creates and enqueues a new rating event after commit
+/// 8. Sends a confirmation message to the rating user
 pub async fn update_user_reputation_action(
     ctx: &AppContext,
     msg: Message,
@@ -112,31 +111,68 @@ pub async fn update_user_reputation_action(
         .is_full_privacy_order()
         .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?;
 
-    // Get counter to vote from db, but only if they're not in privacy mode
-    let mut user_to_vote = if buyer_rating {
-        // If buyer is rating seller, check if seller is in privacy mode
-        if let Some(seller_key) = normal_seller_idkey {
-            is_user_present(pool, seller_key).await.map_err(|cause| {
-                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-            })?
-        } else {
-            return Ok(());
+    // Resolve which identity key receives the vote (skip full-privacy counterpart)
+    let rated_pubkey = if buyer_rating {
+        match normal_seller_idkey {
+            Some(seller_key) => seller_key,
+            None => return Ok(()),
         }
     } else {
-        // If seller is rating buyer, check if buyer is in privacy mode
-        if let Some(buyer_key) = normal_buyer_idkey {
-            is_user_present(pool, buyer_key).await.map_err(|cause| {
-                MostroInternalErr(ServiceError::DbAccessError(cause.to_string()))
-            })?
-        } else {
-            return Ok(());
+        match normal_buyer_idkey {
+            Some(buyer_key) => buyer_key,
+            None => return Ok(()),
         }
     };
 
-    // Calculate new rating
+    // Claim the order-side flag and apply the aggregate in one transaction so a
+    // concurrent Rate cannot double-apply, and so a lost claim never mutates
+    // the users table. Only the applicable unset flag is written.
+    let mut tx = pool.begin().await.map_err(|e| {
+        MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Failed to begin rating transaction: {e}"
+        )))
+    })?;
+
+    let claimed = claim_order_rating_flag(&mut tx, order.id, update_buyer_rate).await?;
+    if !claimed {
+        // Another writer won the flag (or status left the eligible window).
+        return Ok(());
+    }
+
+    // Read the rated user inside the transaction for a consistent aggregate base.
+    let mut user_to_vote = sqlx::query_as::<_, User>(
+        r#"
+            SELECT *
+            FROM users
+            WHERE pubkey == ?1
+            LIMIT 1
+        "#,
+    )
+    .bind(&rated_pubkey)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     user_to_vote.update_rating(new_rating);
 
-    // Create new rating event
+    update_user_rating(
+        &mut *tx,
+        user_to_vote.pubkey.clone(),
+        user_to_vote.last_rating,
+        user_to_vote.min_rating,
+        user_to_vote.max_rating,
+        user_to_vote.total_reviews,
+        user_to_vote.total_rating,
+    )
+    .await?;
+
+    tx.commit().await.map_err(|e| {
+        MostroInternalErr(ServiceError::DbAccessError(format!(
+            "Failed to commit rating transaction: {e}"
+        )))
+    })?;
+
+    // Create new rating event only after the claim+aggregate commit.
     let reputation_event = Rating::new(
         user_to_vote.total_reviews as u64,
         user_to_vote.total_rating as f64,
@@ -144,56 +180,16 @@ pub async fn update_user_reputation_action(
         user_to_vote.min_rating as u8,
         user_to_vote.max_rating as u8,
     )
-    .to_tags()
-    .map_err(|cause| MostroInternalErr(ServiceError::NostrError(cause.to_string())))?;
+    .to_tags();
 
-    // Calculate days since user creation and add to rating tags
     let days = calculate_days_since_creation(user_to_vote.created_at);
     let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
-    tags.push(Tag::custom(
-        TagKind::Custom(std::borrow::Cow::Borrowed("days")),
-        vec![days.to_string()],
-    ));
+    tags.push(Tag::custom("days", vec![days.to_string()]));
     let reputation_event = Tags::from_list(tags);
 
-    // Save new rating to db
-    if let Err(e) = update_user_rating(
-        pool,
-        user_to_vote.pubkey,
-        user_to_vote.last_rating,
-        user_to_vote.min_rating,
-        user_to_vote.max_rating,
-        user_to_vote.total_reviews,
-        user_to_vote.total_rating,
-    )
-    .await
-    {
-        return Err(MostroInternalErr(ServiceError::DbAccessError(format!(
-            "Error updating user rating : {}",
-            e
-        ))));
-    }
-
     if buyer_rating || seller_rating {
-        // Update db with rate flags
-        update_user_rating_event(
-            &counterpart_trade_pubkey,
-            update_buyer_rate,
-            update_seller_rate,
-            reputation_event,
-            &msg,
-            my_keys,
-            pool,
-        )
-        .await
-        .map_err(|cause| {
-            MostroInternalErr(ServiceError::DbAccessError(format!(
-                "Error updating user rating event : {}",
-                cause
-            )))
-        })?;
+        update_user_rating_event(&counterpart_trade_pubkey, reputation_event, my_keys).await?;
 
-        // Send confirmation message to user that rated
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
             Some(order.id),
@@ -227,19 +223,21 @@ mod tests {
     use mostro_core::db::Crud;
     use mostro_core::message::{MessageKind, Payload};
     use mostro_core::order::Order;
-    use nostr_sdk::{Keys, Timestamp};
+    use nostr_sdk::prelude::{Keys, Timestamp};
     use sqlx::SqlitePool;
     use uuid::Uuid;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
             nostr: crate::config::NostrSettings {
                 // Valid canonical test nsec: whichever module wins the
                 // MOSTRO_CONFIG race must install a parseable key, or tests
                 // that reach get_keys() flake on init ordering.
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),
@@ -429,7 +427,7 @@ mod tests {
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((seller_user.total_rating - 2.5).abs() < f64::EPSILON);
 
-        // Order buyer_sent_rate flag must be set via update_user_rating_event
+        // Order buyer_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)
             .await
             .unwrap()
@@ -538,7 +536,7 @@ mod tests {
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((buyer_user.total_rating - 2.0).abs() < f64::EPSILON);
 
-        // Order seller_sent_rate flag must be set via update_user_rating_event
+        // Order seller_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)
             .await
             .unwrap()
@@ -902,9 +900,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_user_rating_event_db_failure_surfaces_error() {
-        // The user rating write succeeds, but the follow-up order-flag
-        // update (`update_user_rating_event`) fails via a RAISE trigger
-        // on `orders` — the error must map to DbAccessError.
+        // The rating claim UPDATE on `orders` fails via a RAISE trigger —
+        // the transaction must abort and surface DbAccessError (no aggregate
+        // write, no queued rating event).
         use crate::db::add_new_user;
 
         let pool = create_test_pool().await;

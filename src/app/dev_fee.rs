@@ -61,7 +61,7 @@
 
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;
-use crate::lightning::invoice::decode_invoice;
+use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{bytes_to_string, publish_dev_fee_audit_event};
@@ -72,7 +72,7 @@ use mostro_core::error::MostroError::MostroInternalErr;
 use mostro_core::error::ServiceError;
 use mostro_core::order::Order;
 use nostr_sdk::prelude::ToBech32;
-use nostr_sdk::{Keys, PublicKey};
+use nostr_sdk::prelude::{Keys, PublicKey};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
@@ -783,7 +783,7 @@ async fn check_dev_fee_payment_status(
         }
     };
 
-    use nostr_sdk::nostr::hashes::hex::FromHex;
+    use bitcoin::hashes::hex::FromHex;
     let payment_hash_bytes: Vec<u8> = match FromHex::from_hex(&payment_hash_str) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -890,11 +890,13 @@ fn dev_fee_comment(order_id: &uuid::Uuid, node: &PublicKey) -> String {
 
 /// Resolve a dev fee LNURL invoice for the given order.
 ///
-/// Contacts the dev fee lightning address, obtains a fresh invoice,
-/// decodes it, and returns the payment request and payment hash.
+/// Contacts the dev fee lightning address via [`resolv_ln_address`] (shared
+/// LNURL host policy, DNS pin, and per-request timeouts in `src/lnurl.rs`),
+/// obtains a fresh invoice, decodes it, and returns the payment request and
+/// payment hash.
 ///
 /// # Timeouts
-/// - LNURL resolution: 15 seconds
+/// - Outer LNURL resolution budget: 15 seconds (inner GETs are shorter)
 pub async fn resolve_dev_fee_invoice(
     order: &Order,
     keys: &Keys,
@@ -945,6 +947,9 @@ pub async fn resolve_dev_fee_invoice(
     }
 
     let invoice = decode_invoice(&payment_request)?;
+    // Resolved by an LNURL server rather than validated on the way in, so apply
+    // the chain and final-CLTV rules here too.
+    validate_payout_invoice(&invoice)?;
     let payment_hash_hex = bytes_to_string(invoice.payment_hash().as_ref());
 
     info!(
@@ -1065,14 +1070,16 @@ mod tests {
     use std::collections::HashSet;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
             nostr: crate::config::NostrSettings {
                 // Valid canonical test nsec: whichever module wins the
                 // MOSTRO_CONFIG race must install a parseable key, or tests
                 // that reach get_keys() flake on init ordering.
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),
@@ -1522,7 +1529,7 @@ mod tests {
         verify_confirmed_orders,
     };
     use crate::lightning::LndConnector;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
 
     /// Real `LndConnector` against a dead endpoint: `connect` is lazy,
     /// so it always builds; every RPC fails in ~1ms with a transport

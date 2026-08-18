@@ -3,20 +3,49 @@ pub mod invoice;
 use crate::config::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
 use crate::util::bytes_to_string;
+use bitcoin::hashes::hex::FromHex;
 use easy_hasher::easy_hasher::*;
 use fedimint_tonic_lnd::invoicesrpc::{
     AddHoldInvoiceRequest, AddHoldInvoiceResp, CancelInvoiceMsg, CancelInvoiceResp,
     SettleInvoiceMsg, SettleInvoiceResp,
 };
-use fedimint_tonic_lnd::lnrpc::{invoice::InvoiceState, GetInfoRequest, GetInfoResponse, Payment};
+use fedimint_tonic_lnd::lnrpc::{
+    invoice::InvoiceState, payment, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment,
+    PaymentHash,
+};
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
 use mostro_core::prelude::*;
-use nostr_sdk::nostr::hashes::hex::FromHex;
-use nostr_sdk::nostr::secp256k1::rand::{self, RngCore};
+use rand::{self, RngCore};
 use std::cmp::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use tokio::time::timeout;
 use tracing::info;
+
+/// Seconds LND keeps launching route attempts for a payment
+/// (`SendPaymentRequest.timeout_seconds`). Past this window an open payment
+/// stream is only kept alive by an HTLC that is locked-in but unresolved,
+/// which the sender cannot cancel.
+pub(crate) const LND_PAYMENT_ROUTE_TIMEOUT_SECS: i32 = 60;
+
+/// Upper bound on how long a payout waits for `send_payment` to reach a
+/// terminal state: LND's own route-attempt window plus margin, DERIVED so
+/// that raising [`LND_PAYMENT_ROUTE_TIMEOUT_SECS`] can never silently
+/// undercut LND's retries. Hitting this bound does NOT fail the payout —
+/// the payment may still settle, so callers keep their claim/hash and let
+/// reconciliation resolve the real outcome. Fixed for now; could become a
+/// settings knob later.
+pub(crate) const PAYOUT_SEND_PAYMENT_TIMEOUT: Duration =
+    Duration::from_secs(LND_PAYMENT_ROUTE_TIMEOUT_SECS as u64 + 15);
+
+/// Bound on the duplicate-guard lookup inside `send_payment`. The guard is
+/// advisory — on timeout or transport error the send proceeds, because LND
+/// itself rejects a genuine duplicate for an in-flight/settled hash — so it
+/// must never eat a caller's whole budget: `dev_fee::send_dev_fee_payment`
+/// wraps `send_payment` in a 5s total timeout, and 2s leaves the majority of
+/// that for the send itself.
+const DUPLICATE_GUARD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct LndConnector {
@@ -72,7 +101,7 @@ const HASH_LEN: usize = 32;
 /// `field` names the column for the log line. The value itself is never
 /// included in the error: the preimage is the secret that claims the
 /// HTLC, and errors end up in logs.
-fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
+pub(crate) fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroError> {
     let bytes = Vec::<u8>::from_hex(value).map_err(|e| {
         MostroInternalErr(ServiceError::HoldInvoiceError(format!(
             "invalid {field}: not valid hex ({e})"
@@ -224,6 +253,39 @@ impl LndConnector {
         }
     }
 
+    /// Current chain tip height as seen by LND, for CLTV-deadline math.
+    pub async fn get_chain_height(&mut self) -> Result<u32, MostroError> {
+        self.get_node_info().await.map(|info| info.block_height)
+    }
+
+    /// Earliest CLTV expiry height among the ACCEPTED HTLCs backing the
+    /// hold invoice `hash` (hex). `None` when no accepted HTLC backs it
+    /// anymore — the invoice was canceled, settled, or never held.
+    pub async fn get_hold_invoice_expiry_height(
+        &mut self,
+        hash: &str,
+    ) -> Result<Option<u32>, MostroError> {
+        let r_hash = decode_hash32("payment hash", hash)?;
+
+        let invoice = self
+            .client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .into_inner();
+
+        Ok(invoice
+            .htlcs
+            .iter()
+            .filter(|htlc| htlc.state == InvoiceHtlcState::Accepted as i32)
+            .map(|htlc| htlc.expiry_height.max(0) as u32)
+            .min())
+    }
+
     pub async fn send_payment(
         &mut self,
         payment_request: &str,
@@ -231,7 +293,11 @@ impl LndConnector {
         listener: Sender<PaymentMessage>,
     ) -> Result<(), MostroError> {
         let invoice = decode_invoice(payment_request)?;
-        let payment_hash = invoice.signable_hash();
+        // The BOLT11 payment hash — the key LND indexes payments by. NOT
+        // `signable_hash()`, which is the invoice's signature digest and is
+        // never known to LND, so a guard keyed on it can never fire.
+        let payment_hash_ref: &[u8] = invoice.payment_hash().as_ref();
+        let payment_hash = payment_hash_ref.to_vec();
         let hash = bytes_to_string(&payment_hash);
 
         // We need to set a max fee amount. `routing_fee_cap_sats` is the
@@ -239,29 +305,37 @@ impl LndConnector {
         // debugging always matches what LND actually enforces.
         let max_fee = routing_fee_cap_sats(amount);
 
-        let track_payment_req = TrackPaymentRequest {
-            payment_hash: payment_hash.to_vec(),
-            no_inflight_updates: true,
-        };
-
-        let track = self
-            .client
-            .router()
-            .track_payment_v2(track_payment_req)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())));
-
-        // We only send the payment if it wasn't attempted before
-        if track.is_ok() {
-            info!("Aborting paying invoice with hash {} to buyer", hash);
-            return Err(MostroInternalErr(ServiceError::LnPaymentError(
-                "Track error".to_string(),
-            )));
+        // Duplicate-dispatch guard: refuse to send only when LND reports this
+        // hash as already in flight or settled. A Failed/Unknown/absent record
+        // must NOT abort — the retry flow legitimately re-sends the same
+        // invoice after a failure. A lookup transport error or timeout also
+        // proceeds: LND itself rejects a duplicate SendPaymentV2 for an
+        // in-flight or settled hash (the hard backstop behind this check),
+        // and if LND is truly unreachable the send below fails anyway. The
+        // lookup is bounded so this advisory check can never eat a caller's
+        // budget (see DUPLICATE_GUARD_LOOKUP_TIMEOUT).
+        match timeout(
+            DUPLICATE_GUARD_LOOKUP_TIMEOUT,
+            self.lookup_payment_status(&payment_hash),
+        )
+        .await
+        {
+            Ok(Ok(Some(payment::PaymentStatus::InFlight)))
+            | Ok(Ok(Some(payment::PaymentStatus::Succeeded))) => {
+                info!(
+                    "Aborting payment for hash {}: already in flight or settled",
+                    hash
+                );
+                return Err(MostroInternalErr(ServiceError::LnPaymentError(
+                    "payment already dispatched for this hash".to_string(),
+                )));
+            }
+            _ => {}
         }
 
         let mut request = SendPaymentRequest {
             payment_request: payment_request.to_string(),
-            timeout_seconds: 60,
+            timeout_seconds: LND_PAYMENT_ROUTE_TIMEOUT_SECS,
             fee_limit_sat: max_fee,
             ..Default::default()
         };
@@ -464,12 +538,14 @@ mod tests {
     use mostro_core::prelude::*;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         // Defaults set `max_routing_fee = 0.002`.
         let _ = MOSTRO_CONFIG.set(Settings {
             database: Default::default(),
             nostr: crate::config::NostrSettings {
-                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
-                    .to_string(),
+                nsec_privkey: secrecy::SecretString::from(
+                    "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd",
+                ),
                 relays: vec![],
             },
             mostro: Default::default(),
@@ -616,6 +692,7 @@ mod offline_connector_tests {
     use fedimint_tonic_lnd::lnrpc::GetInfoResponse;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
     }
 

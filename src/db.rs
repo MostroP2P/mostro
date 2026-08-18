@@ -627,33 +627,6 @@ pub async fn edit_pubkeys_order(pool: &SqlitePool, order: &Order) -> Result<Orde
     Ok(order)
 }
 
-/// Returns orders with `failed_payment = true` and `status = "settled-hold-invoice"`
-/// for the given buyer's `master_buyer_pubkey`. Used during restore-session to
-/// re-send `Action::AddInvoice` to buyers whose Lightning payment failed.
-pub async fn find_failed_payment_for_master_key(
-    pool: &SqlitePool,
-    master_key: &str,
-) -> Result<Vec<Order>, MostroError> {
-    // Validate public key format (32-bytes hex)
-    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
-    }
-    let orders = sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE failed_payment = true
-            AND status = 'settled-hold-invoice'
-            AND master_buyer_pubkey = ?1
-        "#,
-    )
-    .bind(master_key)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(orders)
-}
-
 pub async fn find_order_by_hash(pool: &SqlitePool, hash: &str) -> Result<Order, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
@@ -832,6 +805,162 @@ pub async fn update_order_invoice_held_at_time(
     Ok(rows_affected > 0)
 }
 
+/// Statuses from which a take (or a maker cancel) may still start: the
+/// order has no live trade escrow yet. Used as the `WHERE` guard for the
+/// pre-trade compare-and-swap writes below, so a writer working from a
+/// stale snapshot loses cleanly instead of clobbering whoever committed
+/// first.
+const PRETRADE_STATUSES: &str = "'pending','waiting-taker-bond'";
+
+/// Compare-and-swap a pre-trade status transition (`status` + `event_id`
+/// only). Returns `false` when the order has already left the pre-trade
+/// window — e.g. a take committed `waiting-payment` while a maker cancel
+/// was publishing — letting the caller bail instead of resurrecting or
+/// clobbering the row with a stale full-row write.
+pub async fn cas_pretrade_order_status(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    new_status: Status,
+    event_id: &str,
+) -> Result<bool, MostroError> {
+    let query = format!(
+        "UPDATE orders SET status = ?1, event_id = ?2 \
+         WHERE id = ?3 AND status IN ({PRETRADE_STATUSES})"
+    );
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(new_status.to_string())
+        .bind(event_id)
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Compare-and-swap the winning taker's bond context onto the order row
+/// (see `promote_taker_context_to_order`). Writes only the promoted
+/// columns — never `status` — and only while the order is still
+/// pre-trade, so a maker cancel that already committed is not undone.
+/// `order` must be the merged in-memory row (taker fields applied).
+/// Returns `false` when the CAS missed.
+pub async fn cas_promote_taker_context(
+    pool: &SqlitePool,
+    order: &Order,
+) -> Result<bool, MostroError> {
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let taker_columns = match kind {
+        OrderKind::Buy => "seller_pubkey = ?2, master_seller_pubkey = ?3, trade_index_seller = ?4",
+        OrderKind::Sell => {
+            "buyer_pubkey = ?2, master_buyer_pubkey = ?3, trade_index_buyer = ?4, \
+             buyer_invoice = ?5"
+        }
+    };
+    let query = format!(
+        "UPDATE orders SET {taker_columns}, fiat_amount = ?6, amount = ?7, fee = ?8, \
+         dev_fee = ?9, created_at = ?10, taken_at = ?11 \
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
+    );
+    // The unused ?5 slot for buy orders binds a throwaway `None`.
+    let buyer_invoice: Option<&str> = match kind {
+        OrderKind::Sell => order.buyer_invoice.as_deref(),
+        OrderKind::Buy => None,
+    };
+    let (trade_pubkey, identity, trade_index) = match kind {
+        OrderKind::Buy => (
+            &order.seller_pubkey,
+            &order.master_seller_pubkey,
+            order.trade_index_seller,
+        ),
+        OrderKind::Sell => (
+            &order.buyer_pubkey,
+            &order.master_buyer_pubkey,
+            order.trade_index_buyer,
+        ),
+    };
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(order.id)
+        .bind(trade_pubkey.as_deref())
+        .bind(identity.as_deref())
+        .bind(trade_index)
+        .bind(buyer_invoice)
+        .bind(order.fiat_amount)
+        .bind(order.amount)
+        .bind(order.fee)
+        .bind(order.dev_fee)
+        .bind(order.created_at)
+        .bind(order.taken_at)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Compare-and-swap the full take-context transition: everything the take
+/// handlers mutate on their in-memory row before persisting — taker
+/// context, computed amounts, the take timestamp (`taken_at`, which the
+/// scheduler's timeout-cancel query keys on), trade escrow material (when
+/// the hold invoice was created) and the status/event pair — in one
+/// guarded write.
+///
+/// The `WHERE` guard always covers the pre-trade statuses
+/// (`pending` / `waiting-taker-bond`). `allow_waiting_buyer_invoice`
+/// adds that status for the one caller that legitimately arrives from
+/// it: `show_hold_invoice` when driven by `add_invoice`. Take paths
+/// (`take_sell`, `take_buy`, the bond resume) must pass `false`, so a
+/// stale take can never overwrite an already-committed one even if a
+/// future change lets two take handlers overlap.
+///
+/// Returns `false` when the order moved on meanwhile (e.g. a maker
+/// cancel committed while the hold invoice was being created at LND) —
+/// the caller must then cancel any orphaned invoice instead of
+/// resurrecting the row.
+pub async fn cas_complete_pretrade_take(
+    pool: &SqlitePool,
+    order: &Order,
+    allow_waiting_buyer_invoice: bool,
+) -> Result<bool, MostroError> {
+    let extra_status = if allow_waiting_buyer_invoice {
+        ", 'waiting-buyer-invoice'"
+    } else {
+        ""
+    };
+    let query = format!(
+        "UPDATE orders SET status = ?2, event_id = ?3, \
+         buyer_pubkey = ?4, seller_pubkey = ?5, \
+         master_buyer_pubkey = ?6, master_seller_pubkey = ?7, \
+         trade_index_buyer = ?8, trade_index_seller = ?9, \
+         fiat_amount = ?10, amount = ?11, fee = ?12, dev_fee = ?13, created_at = ?14, \
+         buyer_invoice = ?15, preimage = ?16, hash = ?17, taken_at = ?18 \
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES}{extra_status})"
+    );
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(order.id)
+        .bind(order.status.clone())
+        .bind(order.event_id.clone())
+        .bind(order.buyer_pubkey.as_deref())
+        .bind(order.seller_pubkey.as_deref())
+        .bind(order.master_buyer_pubkey.as_deref())
+        .bind(order.master_seller_pubkey.as_deref())
+        .bind(order.trade_index_buyer)
+        .bind(order.trade_index_seller)
+        .bind(order.fiat_amount)
+        .bind(order.amount)
+        .bind(order.fee)
+        .bind(order.dev_fee)
+        .bind(order.created_at)
+        .bind(order.buyer_invoice.as_deref())
+        .bind(order.preimage.as_deref())
+        .bind(order.hash.as_deref())
+        .bind(order.taken_at)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Atomically persist a validated Cashu escrow and advance the order status
 /// (Cashu foundation CF-4, `docs/cashu/01-fundamentals.md` §6).
 ///
@@ -946,12 +1075,35 @@ pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, M
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Orders whose hold invoice still needs an LND subscription attached.
+///
+/// Two disjoint cases, and the second is the one that matters after a restart:
+///
+/// - a post-payment status with `invoice_held_at != 0` — the seller already
+///   paid, so the subscription is there to observe settle/cancel. All three
+///   such statuses belong here, not just `active`: an order reaches
+///   `fiat-sent` and `dispute` with the escrow HTLC still locked, so a
+///   restart in either one used to stop observing that invoice for the rest
+///   of the run (#856). That is the window in which LND force-cancels an
+///   accepted hold HTLC at the CLTV horizon, and
+///   [`crate::flow::hold_invoice_canceled`] cannot react to a cancel it
+///   never observes.
+/// - `waiting-payment` / `waiting-buyer-invoice` with a hash — the invoice
+///   exists but nobody has paid it yet. `invoice_held_at` is still 0 here
+///   (only [`crate::flow::hold_invoice_paid`] ever writes it), which is why
+///   that column cannot gate this branch: these rows would never match.
+///   Missing this window is what makes a seller who paid during a restart
+///   look like a seller who never paid.
+///
+/// Terminal and post-escrow statuses are deliberately absent: once the hold
+/// is settled or canceled there is nothing left to observe.
 pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE invoice_held_at !=0 AND  status == 'active'
+          WHERE (invoice_held_at != 0 AND status IN ('active', 'fiat-sent', 'dispute'))
+             OR (status IN ('waiting-payment', 'waiting-buyer-invoice') AND hash IS NOT NULL)
         "#,
     )
     .fetch_all(pool)
@@ -961,12 +1113,51 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// Orders whose trade escrow is a paid hold invoice approaching the point
+/// where the daemon must act before LND does: LND auto-cancels an accepted
+/// hold invoice `invoices.holdexpirydelta` blocks before the HTLC's CLTV
+/// expiry, silently refunding the seller while the order still looks live.
+///
+/// `held_before` is a unix cutoff on `invoice_held_at` (written by
+/// [`crate::flow::hold_invoice_paid`] when the escrow was observed paid):
+/// rows at or before it are due. Only `active` / `fiat-sent` qualify —
+/// `dispute` already has a human solver in the loop (the reactive
+/// `hold_invoice_canceled` path raises the alarm there), and every other
+/// state has no live escrow to protect. `hash IS NOT NULL` because the
+/// guardian needs the payment hash to cancel the invoice proactively.
+pub async fn find_escrow_deadline_orders(
+    pool: &SqlitePool,
+    held_before: i64,
+) -> Result<Vec<Order>, MostroError> {
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE status IN ('active', 'fiat-sent')
+            AND invoice_held_at != 0
+            AND invoice_held_at <= ?1
+            AND hash IS NOT NULL
+        "#,
+    )
+    .bind(held_before)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(orders)
+}
+
 pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
+    // `payout_payment_hash IS NULL` excludes orders that already have a payout
+    // in flight: retrying them would dispatch a second payment against the same
+    // settled escrow. Those are resolved by `find_inflight_payouts` /
+    // reconciliation instead.
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
           FROM orders
-          WHERE failed_payment == true AND  status == 'settled-hold-invoice'
+          WHERE failed_payment == true AND status == 'settled-hold-invoice'
+            AND payout_payment_hash IS NULL
         "#,
     )
     .fetch_all(pool)
@@ -974,6 +1165,214 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
+}
+
+pub async fn find_failed_payment_for_master_key(
+    pool: &SqlitePool,
+    master_key: &str,
+) -> Result<Vec<Order>, MostroError> {
+    // Validate public key format (32-bytes hex)
+    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+    let orders = sqlx::query_as::<_, Order>(
+        r#"
+          SELECT *
+          FROM orders
+          WHERE failed_payment = true
+            AND status = 'settled-hold-invoice'
+            AND master_buyer_pubkey = ?1
+        "#,
+    )
+    .bind(master_key)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(orders)
+}
+
+/// Atomically claim the buyer payout for `order_id` by persisting the payout
+/// invoice's `payment_hash` (and a claim timestamp), but only while no payout is
+/// already in flight and the order is still `settled-hold-invoice`. Returns
+/// `Some(claimed_at)` — the unix-second timestamp sealed into the claim — when
+/// this caller won, or `None` when it lost the CAS.
+///
+/// The CAS is the idempotency anchor: once set, `find_failed_payment` skips the
+/// order and `pay_new_invoice` rejects invoice swaps, so a concurrent tick (or a
+/// re-arm attempt) can never dispatch a second payout for the same escrow. The
+/// returned `claimed_at` is a per-claim token: releases are scoped to it (not
+/// just the hash), so when a retry re-claims the *same* invoice/hash a stale
+/// caller from the previous attempt still loses the release CAS. It also lets
+/// reconciliation ignore a just-claimed payout until LND has surely registered
+/// it (grace window).
+pub async fn claim_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+) -> Result<Option<i64>, MostroError> {
+    let claimed_at = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        "UPDATE orders SET payout_payment_hash = ?1, payout_claimed_at = ?2 \
+         WHERE id = ?3 AND payout_payment_hash IS NULL AND status = 'settled-hold-invoice'",
+    )
+    .bind(payment_hash)
+    .bind(claimed_at)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok((result.rows_affected() > 0).then_some(claimed_at))
+}
+
+/// Re-validate ownership of a payout claim and refresh its timestamp, as one
+/// CAS.
+///
+/// Used by the dispatch task after waiting in the send-semaphore queue: a task
+/// can queue past the reconcile grace window, and reconciliation may then
+/// re-arm the claim (buyer prompted for a fresh invoice → different payment
+/// hash), in which case a newer payout owns the order and the queued invoice
+/// must not be sent. Refreshing `payout_claimed_at` — rather than merely
+/// checking it — also restarts the reconcile grace clock, restoring the
+/// invariant that a claim is never older than its send by more than the send
+/// itself; a mere ownership check would leave reconciliation free to re-arm in
+/// the instant between the check and LND registering the payment. The refresh
+/// also invalidates any pre-touch snapshot a reconciler already holds: its
+/// release CAS is scoped to the timestamp it observed, which no longer
+/// matches.
+///
+/// Scoped to hash + token + `settled-hold-invoice` status: a marker lingering
+/// on an order that has since gone terminal must never turn into a send.
+/// Returns `Some(refreshed_at)` — the new per-claim token every later release
+/// must be scoped to — when the caller still owned the claim, or `None` when
+/// the claim was re-armed or replaced while queued (drop the send).
+pub async fn touch_order_payout_claim(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<Option<i64>, MostroError> {
+    let refreshed_at = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        "UPDATE orders SET payout_claimed_at = ?1 \
+         WHERE id = ?2 AND payout_payment_hash = ?3 AND payout_claimed_at IS ?4 \
+           AND status = 'settled-hold-invoice'",
+    )
+    .bind(refreshed_at)
+    .bind(order_id)
+    .bind(payment_hash)
+    .bind(claimed_at)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok((result.rows_affected() > 0).then_some(refreshed_at))
+}
+
+/// Clear the in-flight payout marker for `order_id` after a successful terminal
+/// outcome (or as tidy-up once the order has moved to `Success`).
+///
+/// Scoped to both `payment_hash` and `claimed_at` (the per-claim token): the
+/// release only fires when the marker still holds *this* caller's claim. A
+/// status watcher can outlive its own claim (its stream stalls, reconciliation
+/// resolves the payout, and a new payout — possibly with the same reused
+/// invoice/hash — is claimed for the same order); scoping the CAS to the claim
+/// timestamp stops such a stale watcher from erasing a *newer* claim and letting
+/// a second payment be dispatched. `claimed_at` uses `IS` so a legacy NULL
+/// timestamp still matches.
+///
+/// Returns `true` when this caller still owned the claim (the row was cleared),
+/// so callers can gate their own terminal side-effects on claim ownership.
+pub async fn clear_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL \
+         WHERE id = ?1 AND payout_payment_hash = ?2 AND payout_claimed_at IS ?3",
+    )
+    .bind(order_id)
+    .bind(payment_hash)
+    .bind(claimed_at)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Release the in-flight marker AND re-arm retry after a failed / unknown
+/// terminal outcome: the next scheduler tick may dispatch a fresh payout once
+/// the buyer supplies a new invoice.
+///
+/// Scoped to `payment_hash` and `claimed_at` for the same reason as
+/// [`clear_order_payout`]: a stale caller must not re-arm retry against a newer
+/// in-flight claim. Returns `true` when this caller still owned the claim, so
+/// failure bookkeeping and buyer notifications can be gated on ownership.
+pub async fn fail_order_payout(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    payment_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET payout_payment_hash = NULL, payout_claimed_at = NULL, failed_payment = true \
+         WHERE id = ?1 AND payout_payment_hash = ?2 AND payout_claimed_at IS ?3",
+    )
+    .bind(order_id)
+    .bind(payment_hash)
+    .bind(claimed_at)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Orders with a buyer payout in flight (marker set) that are old enough to
+/// reconcile: only those claimed at or before `claimed_before` (unix seconds)
+/// are returned, so a payout still inside its grace window — where LND may not
+/// have registered it yet — is never reconciled and mistaken for lost. Rows
+/// predating the `payout_claimed_at` column (NULL) are always eligible.
+/// Returns `(order_id, payout_payment_hash, payout_claimed_at)` tuples so the
+/// caller can scope its release to the exact claim it observed.
+///
+/// Note: the `status = 'settled-hold-invoice'` filter means a marker left on an
+/// order that has since moved to a terminal status (e.g. `Success` when the
+/// post-finalize `clear_order_payout` lost to a DB blip) is never returned here.
+/// Such a marker is inert residue — `find_failed_payment` and `pay_new_invoice`
+/// also require `settled-hold-invoice`, so nothing ever acts on it — but it can
+/// linger; treat a marker on a non-`settled-hold-invoice` order as stale.
+pub async fn find_inflight_payouts(
+    pool: &SqlitePool,
+    claimed_before: i64,
+) -> Result<Vec<(Uuid, String, Option<i64>)>, MostroError> {
+    let rows = sqlx::query(
+        r#"
+          SELECT id, payout_payment_hash, payout_claimed_at
+          FROM orders
+          WHERE payout_payment_hash IS NOT NULL AND status == 'settled-hold-invoice'
+            AND (payout_claimed_at IS NULL OR payout_claimed_at <= ?1)
+        "#,
+    )
+    .bind(claimed_before)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row
+            .try_get("id")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let hash: String = row
+            .try_get("payout_payment_hash")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        let claimed_at: Option<i64> = row
+            .try_get("payout_claimed_at")
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        out.push((id, hash, claimed_at));
+    }
+    Ok(out)
 }
 
 pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
@@ -1142,15 +1541,63 @@ async fn has_pending_order_with_status(
     Ok(exists)
 }
 
-pub async fn update_user_rating(
-    pool: &SqlitePool,
+/// Claim the buyer or seller rating slot on an order (CAS).
+///
+/// Updates **only** the applicable unset flag and leaves the other untouched.
+/// Buyer claims require `status = success`; seller claims allow `success` or
+/// `settled-hold-invoice`.
+///
+/// Returns `Ok(true)` when this caller won the claim, or `Ok(false)` when the
+/// flag was already set or the order left the eligible status window.
+pub async fn claim_order_rating_flag(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    order_id: Uuid,
+    buyer_side: bool,
+) -> Result<bool, MostroError> {
+    let result = if buyer_side {
+        sqlx::query(
+            "UPDATE orders SET buyer_sent_rate = 1 \
+             WHERE id = ? AND buyer_sent_rate = 0 AND status = ?",
+        )
+        .bind(order_id)
+        .bind(Status::Success.to_string())
+        .execute(&mut **tx)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE orders SET seller_sent_rate = 1 \
+             WHERE id = ? AND seller_sent_rate = 0 AND status IN (?, ?)",
+        )
+        .bind(order_id)
+        .bind(Status::Success.to_string())
+        .bind(Status::SettledHoldInvoice.to_string())
+        .execute(&mut **tx)
+        .await
+    }
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// Persist a user's aggregate rating columns.
+///
+/// `executor` may be a pool or an open transaction — callers that claim an
+/// order rating flag in the same transaction should pass `&mut *tx` so the
+/// flag claim and this write commit or roll back together.
+///
+/// Returns `Ok(true)` when a matching `users` row was updated.
+pub async fn update_user_rating<'e, E>(
+    executor: E,
     public_key: String,
     last_rating: i64,
     min_rating: i64,
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
-) -> Result<bool, MostroError> {
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     // Validate public key format (32-bytes hex)
     if !public_key.chars().all(|c| c.is_ascii_hexdigit()) || public_key.len() != 64 {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
@@ -1185,7 +1632,7 @@ pub async fn update_user_rating(
     .bind(total_reviews)
     .bind(total_rating)
     .bind(public_key)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
@@ -1581,7 +2028,9 @@ mod tests {
                 dev_fee_payment_hash char(64),
                 cashu_mint_url text,
                 cashu_escrow_token text,
-                cashu_escrow_locked_at integer
+                cashu_escrow_locked_at integer,
+                payout_payment_hash char(64),
+                payout_claimed_at integer
             )
             "#,
         )
@@ -1999,18 +2448,152 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_held_invoices_ignores_non_active() {
+    async fn test_find_held_invoices_returns_every_escrow_status() {
         let pool = setup_orders_db().await.unwrap();
 
-        // Insert order with invoice_held_at != 0 but wrong status
+        // The three statuses an order can sit in while its escrow HTLC is
+        // still locked. `fiat-sent` and `dispute` were missing before #856,
+        // so a restart during either one left the hold invoice unobserved
+        // for the rest of the run.
+        for status in ["active", "fiat-sent", "dispute"] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 1700001000, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("cc".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "every status that can still hold escrow must be resubscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_statuses_without_live_escrow() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // `pending` never had an escrow; the rest already resolved theirs.
+        // A stale `invoice_held_at` on such a row must not resubscribe it —
+        // there is no HTLC left to observe.
+        for status in [
+            "pending",
+            "settled-hold-invoice",
+            "success",
+            "canceled",
+            "cooperatively-canceled",
+        ] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 1700001000, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("dd".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "only statuses with a live escrow are resubscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_includes_orders_awaiting_seller_payment() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // The hold invoice exists (hash set) but the seller has not paid it yet,
+        // so invoice_held_at is still 0 — it is only written by hold_invoice_paid.
+        // This is precisely the window a restart must not drop: the Accepted
+        // event has not arrived, so the subscription is what is load-bearing.
+        for status in ["waiting-payment", "waiting-buyer-invoice"] {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, 0, ?3)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind("aa".repeat(32))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "both pre-payment statuses must be resubscribed on restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_includes_waiting_buyer_invoice_after_payment() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // The state hold_invoice_paid leaves behind on its no-buyer-invoice
+        // branch: still waiting-buyer-invoice, but the invoice was already
+        // observed. It must keep being resubscribed so later settle/cancel
+        // events are seen; hold_invoice_paid itself no-ops on the replay.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                    invoice_held_at, hash)
+            VALUES (?1, 'buy', 'ev1', 'waiting-buyer-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0, 1700001000, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("bb".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_held_invoices(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "post-payment rows stay subscribed");
+    }
+
+    #[tokio::test]
+    async fn test_find_held_invoices_ignores_orders_without_hash() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // Nothing to subscribe to without an r_hash, so such a row must not be
+        // returned — the caller would have no bytes to hand LND.
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                     amount, fiat_code, fiat_amount, created_at, expires_at,
                     failed_payment, payment_attempts, dev_fee, dev_fee_paid,
                     invoice_held_at)
-            VALUES (?1, 'buy', 'ev1', 'pending', 0, 'lightning',
+            VALUES (?1, 'buy', 'ev1', 'waiting-payment', 0, 'lightning',
                     100000, 'USD', 100, 1700000000, 1700086400,
-                    0, 0, 0, 0, 1700001000)"#,
+                    0, 0, 0, 0, 0)"#,
         )
         .bind(uuid::Uuid::new_v4())
         .execute(&pool)
@@ -2018,7 +2601,253 @@ mod tests {
         .unwrap();
 
         let result = super::find_held_invoices(&pool).await.unwrap();
-        assert!(result.is_empty(), "Should not find non-active orders");
+        assert!(result.is_empty(), "rows without a hash must be skipped");
+    }
+
+    // ── pre-trade compare-and-swap writes ────────────────────────────────
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// A `pending` sell order carrying escrow material, so a targeted write
+    /// that touches columns it shouldn't is visible in the assertions.
+    async fn insert_pretrade_order(pool: &SqlitePool, status: &str) -> super::Order {
+        use mostro_core::db::Crud;
+        let order = super::Order {
+            id: uuid::Uuid::new_v4(),
+            kind: "sell".to_string(),
+            status: status.to_string(),
+            creator_pubkey: "aa".repeat(32),
+            seller_pubkey: Some("aa".repeat(32)),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            amount: 100_000,
+            fiat_amount: 100,
+            hash: Some("cc".repeat(32)),
+            preimage: Some("dd".repeat(32)),
+            ..Default::default()
+        };
+        order.create(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn cas_pretrade_order_status_flips_only_status_and_event_id() {
+        let pool = migrated_pool().await;
+        let order = insert_pretrade_order(&pool, "pending").await;
+
+        let won =
+            super::cas_pretrade_order_status(&pool, order.id, super::Status::Canceled, "ev-new")
+                .await
+                .unwrap();
+        assert!(won, "pending orders accept the transition");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "canceled");
+        assert_eq!(after.event_id, "ev-new");
+        // The targeted write must not clobber unrelated columns.
+        assert_eq!(after.hash, Some("cc".repeat(32)));
+        assert_eq!(after.preimage, Some("dd".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn cas_pretrade_order_status_loses_once_the_take_committed() {
+        let pool = migrated_pool().await;
+        let order = insert_pretrade_order(&pool, "waiting-payment").await;
+
+        let won =
+            super::cas_pretrade_order_status(&pool, order.id, super::Status::Canceled, "ev-new")
+                .await
+                .unwrap();
+        assert!(!won, "waiting-payment is past the pre-trade window");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-payment");
+        assert_ne!(after.event_id, "ev-new");
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_covers_every_legitimate_caller_state() {
+        let pool = migrated_pool().await;
+        // `waiting-buyer-invoice` is legitimate only for the `add_invoice`
+        // → `show_hold_invoice` caller, which passes `true`.
+        for (from, allow_wbi) in [
+            ("pending", false),
+            ("waiting-taker-bond", false),
+            ("waiting-buyer-invoice", true),
+        ] {
+            let mut order = insert_pretrade_order(&pool, from).await;
+            // What the take handlers mutate in memory before persisting:
+            // the transition, the taker context, the computed amounts and
+            // the take timestamp (`set_timestamp_now()` — the scheduler's
+            // timeout-cancel query keys on it, so dropping it from the
+            // write cancels every take on the next tick).
+            order.status = super::Status::WaitingPayment.to_string();
+            order.event_id = "ev-escrow".to_string();
+            order.buyer_pubkey = Some("bb".repeat(32));
+            order.master_buyer_pubkey = Some("bb".repeat(32));
+            order.trade_index_buyer = Some(3);
+            order.amount = 200_000;
+            order.dev_fee = 5;
+            order.taken_at = 1_700_000_500;
+            // The helper writes `hash`/`preimage` from the caller's
+            // snapshot: use values that differ from the inserted row's, so
+            // the assertions prove whose values landed.
+            order.hash = Some("ee".repeat(32));
+            order.preimage = Some("ff".repeat(32));
+
+            let won = super::cas_complete_pretrade_take(&pool, &order, allow_wbi)
+                .await
+                .unwrap();
+            assert!(won, "{from} must accept the take transition");
+
+            use mostro_core::db::Crud;
+            let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(after.status, "waiting-payment");
+            assert_eq!(after.event_id, "ev-escrow");
+            assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.master_buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.trade_index_buyer, Some(3));
+            assert_eq!(after.amount, 200_000);
+            assert_eq!(after.dev_fee, 5);
+            assert_eq!(after.hash, Some("ee".repeat(32)));
+            assert_eq!(after.preimage, Some("ff".repeat(32)));
+            assert_eq!(after.taken_at, 1_700_000_500);
+        }
+    }
+
+    #[tokio::test]
+    async fn cas_promote_taker_context_persists_taker_context_and_take_time() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "pending").await;
+        // What promote_taker_context_to_order mutates in memory before
+        // persisting (sell order → taker is the buyer side).
+        order.buyer_pubkey = Some("bb".repeat(32));
+        order.master_buyer_pubkey = Some("99".repeat(32));
+        order.trade_index_buyer = Some(4);
+        order.buyer_invoice = Some("lnbc1-taker".to_string());
+        order.fiat_amount = 250;
+        order.amount = 300_000;
+        order.fee = 900;
+        order.dev_fee = 9;
+        order.taken_at = 1_700_000_500;
+
+        let won = super::cas_promote_taker_context(&pool, &order)
+            .await
+            .unwrap();
+        assert!(won, "pending orders accept the promotion");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.master_buyer_pubkey, Some("99".repeat(32)));
+        assert_eq!(after.trade_index_buyer, Some(4));
+        assert_eq!(after.buyer_invoice, Some("lnbc1-taker".to_string()));
+        assert_eq!(after.fiat_amount, 250);
+        assert_eq!(after.amount, 300_000);
+        assert_eq!(after.fee, 900);
+        assert_eq!(after.dev_fee, 9);
+        assert_eq!(after.taken_at, 1_700_000_500);
+        // The promotion never writes status — the resume owns that flip.
+        assert_eq!(after.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_rejects_waiting_buyer_invoice_for_take_callers() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "waiting-buyer-invoice").await;
+        order.status = super::Status::WaitingPayment.to_string();
+        order.buyer_pubkey = Some("bb".repeat(32));
+
+        // A take path must never overwrite a row that is already waiting
+        // for the first buyer's invoice.
+        let won = super::cas_complete_pretrade_take(&pool, &order, false)
+            .await
+            .unwrap();
+        assert!(!won);
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-buyer-invoice");
+        assert_ne!(after.buyer_pubkey, Some("bb".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_loses_on_a_canceled_order() {
+        let pool = migrated_pool().await;
+        let mut order = insert_pretrade_order(&pool, "canceled").await;
+        order.status = super::Status::WaitingPayment.to_string();
+        order.event_id = "ev-escrow".to_string();
+
+        let won = super::cas_complete_pretrade_take(&pool, &order, true)
+            .await
+            .unwrap();
+        assert!(!won, "a committed cancel must win over the escrow storage");
+
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "canceled");
+        assert_ne!(after.event_id, "ev-escrow");
+    }
+
+    #[tokio::test]
+    async fn test_find_escrow_deadline_orders_selects_only_due_escrows() {
+        async fn insert_order(pool: &SqlitePool, status: &str, held_at: i64, with_hash: bool) {
+            sqlx::query(
+                r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                        amount, fiat_code, fiat_amount, created_at, expires_at,
+                        failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                        invoice_held_at, hash)
+                VALUES (?1, 'sell', 'ev1', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400,
+                        0, 0, 0, 0, ?3, ?4)"#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(held_at)
+            .bind(if with_hash {
+                Some("aa".repeat(32))
+            } else {
+                None
+            })
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let pool = setup_orders_db().await.unwrap();
+        let cutoff = 1_700_100_000i64;
+
+        // Due: escrow-backed states observed paid before the cutoff.
+        insert_order(&pool, "active", cutoff - 1, true).await;
+        insert_order(&pool, "fiat-sent", cutoff - 1, true).await;
+        // Due: exactly at the cutoff — the bound is inclusive.
+        insert_order(&pool, "active", cutoff, true).await;
+        // Not due: inside the window still.
+        insert_order(&pool, "active", cutoff + 1, true).await;
+        // Excluded: a dispute already has a solver in the loop.
+        insert_order(&pool, "dispute", cutoff - 1, true).await;
+        // Excluded: no live escrow behind these.
+        insert_order(&pool, "waiting-payment", cutoff - 1, true).await;
+        insert_order(&pool, "active", 0, true).await;
+        // Excluded: nothing to cancel without the payment hash.
+        insert_order(&pool, "active", cutoff - 1, false).await;
+
+        let result = super::find_escrow_deadline_orders(&pool, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "only due active/fiat-sent orders with a hash qualify: {result:?}"
+        );
+        assert!(result
+            .iter()
+            .all(|o| o.invoice_held_at <= cutoff && o.invoice_held_at != 0));
     }
 
     #[tokio::test]
@@ -2110,6 +2939,424 @@ mod tests {
             result.is_empty(),
             "Should not find orders with wrong status"
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_failed_payment_ignores_inflight_payout() {
+        let pool = setup_orders_db().await.unwrap();
+
+        // failed_payment = true and settled-hold-invoice, but a payout is
+        // already in flight (payout_payment_hash set) → must be skipped so the
+        // retry job never dispatches a second payment for the same escrow.
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid, payout_payment_hash)
+            VALUES (?1, 'buy', 'ev1', 'settled-hold-invoice', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    1, 0, 0, 0, ?2)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("a".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::find_failed_payment(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Orders with a payout in flight must be excluded from retry"
+        );
+    }
+
+    // -- Tests for the in-flight payout marker --
+
+    async fn insert_settled_order(pool: &SqlitePool, id: uuid::Uuid, status: &str) {
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'buy', 'ev1', ?2, 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400,
+                    0, 0, 0, 0)"#,
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn payout_hash_of(pool: &SqlitePool, id: uuid::Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT payout_payment_hash FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_claim_order_payout_is_atomic() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+
+        let hash = "b".repeat(64);
+        // First claim wins and returns its timestamp token.
+        assert!(super::claim_order_payout(&pool, id, &hash)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+
+        // A second claim (concurrent tick / re-arm) loses — the marker is set.
+        assert!(
+            super::claim_order_payout(&pool, id, &"c".repeat(64))
+                .await
+                .unwrap()
+                .is_none(),
+            "second claim must lose the CAS"
+        );
+        // The original hash is untouched.
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_order_payout_rejects_wrong_status() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id, "active").await;
+
+        assert!(
+            super::claim_order_payout(&pool, id, &"d".repeat(64))
+                .await
+                .unwrap()
+                .is_none(),
+            "must not claim a payout on a non settled-hold-invoice order"
+        );
+        assert!(payout_hash_of(&pool, id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_order_payout_releases_marker() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "e".repeat(64);
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+        let claimed_at = super::claim_order_payout(&pool, id, &hash).await.unwrap();
+
+        let owned = super::clear_order_payout(&pool, id, &hash, claimed_at)
+            .await
+            .unwrap();
+        assert!(owned, "clearing an owned claim must report ownership");
+        assert!(payout_hash_of(&pool, id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fail_order_payout_clears_marker_and_rearms_retry() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "f".repeat(64);
+        insert_settled_order(&pool, id, "settled-hold-invoice").await;
+        let claimed_at = super::claim_order_payout(&pool, id, &hash).await.unwrap();
+
+        let owned = super::fail_order_payout(&pool, id, &hash, claimed_at)
+            .await
+            .unwrap();
+        assert!(owned, "failing an owned claim must report ownership");
+
+        assert!(payout_hash_of(&pool, id).await.is_none());
+        let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed, 1, "failed_payment must be re-armed for retry");
+        // Now that the marker is clear, the order is retry-eligible again.
+        let matching = super::find_failed_payment(&pool).await.unwrap();
+        assert_eq!(matching.len(), 1);
+    }
+
+    /// A stale caller (e.g. a watcher that outlived its own claim) must not
+    /// release a *newer* claim. The release is scoped to both the hash and the
+    /// per-claim timestamp token, so neither a different hash nor — the case a
+    /// hash alone misses when a retry reuses the same invoice — a different
+    /// timestamp against the same hash can erase the current marker.
+    #[tokio::test]
+    async fn test_clear_and_fail_order_payout_ignore_stale_hash() {
+        let pool = setup_orders_db().await.unwrap();
+        let current = "1".repeat(64);
+        let stale = "2".repeat(64);
+
+        // clear_order_payout with the wrong hash leaves the current marker.
+        let id_a = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_a, "settled-hold-invoice").await;
+        let token_a = super::claim_order_payout(&pool, id_a, &current)
+            .await
+            .unwrap();
+        let owned = super::clear_order_payout(&pool, id_a, &stale, token_a)
+            .await
+            .unwrap();
+        assert!(
+            !owned,
+            "clearing with a stale hash must report no ownership"
+        );
+        assert_eq!(
+            payout_hash_of(&pool, id_a).await.as_deref(),
+            Some(current.as_str()),
+            "clear with a stale hash must not erase the current marker"
+        );
+
+        // fail_order_payout with the wrong hash likewise leaves it intact and
+        // does not re-arm retry.
+        let id_b = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_b, "settled-hold-invoice").await;
+        let token_b = super::claim_order_payout(&pool, id_b, &current)
+            .await
+            .unwrap();
+        let owned = super::fail_order_payout(&pool, id_b, &stale, token_b)
+            .await
+            .unwrap();
+        assert!(!owned, "failing with a stale hash must report no ownership");
+        assert_eq!(
+            payout_hash_of(&pool, id_b).await.as_deref(),
+            Some(current.as_str()),
+            "fail with a stale hash must not erase the current marker"
+        );
+        let failed: i64 = sqlx::query_scalar("SELECT failed_payment FROM orders WHERE id = ?")
+            .bind(id_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed, 0, "a stale fail must not re-arm retry");
+
+        // Correct hash but a STALE timestamp token (the same-invoice retry
+        // case): a watcher from a previous attempt must still lose the release
+        // even though the hash matches the live claim.
+        let id_c = uuid::Uuid::new_v4();
+        insert_settled_order(&pool, id_c, "settled-hold-invoice").await;
+        let live_token = super::claim_order_payout(&pool, id_c, &current)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_token = Some(live_token - 1);
+        let owned = super::clear_order_payout(&pool, id_c, &current, stale_token)
+            .await
+            .unwrap();
+        assert!(
+            !owned,
+            "a stale timestamp token must lose even when the hash matches"
+        );
+        assert_eq!(
+            payout_hash_of(&pool, id_c).await.as_deref(),
+            Some(current.as_str()),
+            "a stale-token release must not erase the live claim"
+        );
+    }
+
+    async fn claimed_at_of(pool: &SqlitePool, id: uuid::Uuid) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT payout_claimed_at FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_refreshes_token() {
+        // An owned claim (backdated, as if the dispatch task queued for a
+        // while) is revalidated: the touch returns a fresh token and the row
+        // reflects it, restarting the reconcile grace clock.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "a".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+
+        let refreshed = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap()
+            .expect("owner must keep its claim");
+        assert!(refreshed > 1000, "token must be refreshed forward");
+        assert_eq!(claimed_at_of(&pool, id).await, Some(refreshed));
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_loses_after_rearm() {
+        // Reconciliation re-armed (cleared) the claim while the task queued:
+        // the touch must lose and leave the row alone.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "b".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+        assert!(super::fail_order_payout(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap());
+
+        let touched = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(touched.is_none(), "a re-armed claim must not be touchable");
+        assert!(payout_hash_of(&pool, id).await.is_none());
+        assert_eq!(claimed_at_of(&pool, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_loses_to_replacement_claim() {
+        // The double-payout scenario: while the task queued, its claim was
+        // re-armed and a NEW payout (fresh invoice, different hash) claimed
+        // the order. The stale task's touch must lose and must not disturb
+        // the replacement claim.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let old_hash = "c".repeat(64);
+        let new_hash = "d".repeat(64);
+        insert_inflight_order(&pool, id, &old_hash, Some(1000)).await;
+        assert!(super::fail_order_payout(&pool, id, &old_hash, Some(1000))
+            .await
+            .unwrap());
+        let new_token = super::claim_order_payout(&pool, id, &new_hash)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let touched = super::touch_order_payout_claim(&pool, id, &old_hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(
+            touched.is_none(),
+            "the stale dispatch must drop its send once a newer payout owns the order"
+        );
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(new_hash.as_str()),
+            "the replacement claim must be untouched"
+        );
+        assert_eq!(claimed_at_of(&pool, id).await, Some(new_token));
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_refuses_terminal_status() {
+        // A marker lingering on an order that already went terminal must
+        // never be refreshed into a send.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "e".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+        sqlx::query("UPDATE orders SET status = 'success' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let touched = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap();
+        assert!(touched.is_none());
+        assert_eq!(claimed_at_of(&pool, id).await, Some(1000), "row untouched");
+    }
+
+    #[tokio::test]
+    async fn test_touch_payout_claim_invalidates_pre_touch_snapshot() {
+        // A reconciler that read the claim BEFORE the touch holds a stale
+        // token: its scoped release must lose after the refresh, so it cannot
+        // re-arm a payout whose send is imminent.
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = "f".repeat(64);
+        insert_inflight_order(&pool, id, &hash, Some(1000)).await;
+
+        let refreshed = super::touch_order_payout_claim(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap()
+            .unwrap();
+        // Reconciler acts on its pre-touch snapshot (token 1000): loses.
+        assert!(!super::fail_order_payout(&pool, id, &hash, Some(1000))
+            .await
+            .unwrap());
+        assert_eq!(
+            payout_hash_of(&pool, id).await.as_deref(),
+            Some(hash.as_str())
+        );
+        // The dispatch task's own release with the refreshed token still wins.
+        assert!(super::clear_order_payout(&pool, id, &hash, Some(refreshed))
+            .await
+            .unwrap());
+        assert!(payout_hash_of(&pool, id).await.is_none());
+    }
+
+    async fn insert_inflight_order(
+        pool: &SqlitePool,
+        id: uuid::Uuid,
+        hash: &str,
+        claimed_at: Option<i64>,
+    ) {
+        insert_settled_order(pool, id, "settled-hold-invoice").await;
+        sqlx::query(
+            "UPDATE orders SET payout_payment_hash = ?1, payout_claimed_at = ?2 WHERE id = ?3",
+        )
+        .bind(hash)
+        .bind(claimed_at)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_inflight_payouts_returns_only_marked() {
+        let pool = setup_orders_db().await.unwrap();
+        let marked = uuid::Uuid::new_v4();
+        let unmarked = uuid::Uuid::new_v4();
+        let hash = "1".repeat(64);
+        insert_inflight_order(&pool, marked, &hash, Some(1000)).await;
+        insert_settled_order(&pool, unmarked, "settled-hold-invoice").await;
+
+        // cutoff well after the claim → the marked order is old enough.
+        let inflight = super::find_inflight_payouts(&pool, 2000).await.unwrap();
+        assert_eq!(inflight.len(), 1);
+        assert_eq!(inflight[0].0, marked);
+        assert_eq!(inflight[0].1, hash);
+        assert_eq!(inflight[0].2, Some(1000), "the claim token is returned");
+    }
+
+    #[tokio::test]
+    async fn test_find_inflight_payouts_respects_grace_window() {
+        let pool = setup_orders_db().await.unwrap();
+        let fresh = uuid::Uuid::new_v4();
+        let aged = uuid::Uuid::new_v4();
+        let legacy = uuid::Uuid::new_v4();
+        insert_inflight_order(&pool, fresh, &"a".repeat(64), Some(2000)).await;
+        insert_inflight_order(&pool, aged, &"b".repeat(64), Some(500)).await;
+        // Row predating the payout_claimed_at column (NULL) is always eligible.
+        insert_inflight_order(&pool, legacy, &"c".repeat(64), None).await;
+
+        // Grace cutoff = 1000: the fresh claim (2000) is skipped; the aged (500)
+        // and legacy (NULL) ones are eligible for reconciliation.
+        let inflight = super::find_inflight_payouts(&pool, 1000).await.unwrap();
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            inflight.iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            !ids.contains(&fresh),
+            "a just-claimed payout must not reconcile"
+        );
+        assert!(ids.contains(&aged), "an aged payout must reconcile");
+        assert!(
+            ids.contains(&legacy),
+            "a NULL-timestamp payout must reconcile"
+        );
+        assert_eq!(ids.len(), 2);
     }
 
     // -- Tests for find_failed_payment_for_master_key --
@@ -2263,7 +3510,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_order_by_date_includes_waiting_taker_bond() {
         let pool = setup_orders_db().await.unwrap();
-        let now = nostr_sdk::Timestamp::now().as_secs() as i64;
+        let now = nostr_sdk::prelude::Timestamp::now().as_secs() as i64;
         let past = now - 3600;
         let future = now + 3600;
 
@@ -3094,6 +4341,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_order_rating_flag_sets_only_the_claimed_side() {
+        let pool = setup_orders_db().await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                amount, fiat_code, fiat_amount, created_at, expires_at,
+                failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                buyer_sent_rate, seller_sent_rate)
+            VALUES (?1, 'sell', 'ev', 'success', 0, 'lightning',
+                    1000, 'USD', 10, 1, 2,
+                    0, 0, 0, 0,
+                    0, 1)"#,
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let won = super::claim_order_rating_flag(&mut tx, id, true)
+            .await
+            .unwrap();
+        assert!(won, "buyer claim must succeed while flag is unset");
+        // Second claim in the same tx must lose — flag already set.
+        let lost = super::claim_order_rating_flag(&mut tx, id, true)
+            .await
+            .unwrap();
+        assert!(!lost, "duplicate buyer claim must lose the CAS");
+        tx.commit().await.unwrap();
+
+        let row: (bool, bool) =
+            sqlx::query_as("SELECT buyer_sent_rate, seller_sent_rate FROM orders WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0, "buyer_sent_rate must be claimed");
+        assert!(row.1, "seller_sent_rate must be preserved");
+    }
+
+    #[tokio::test]
     async fn update_user_rating_only_touches_rating_columns_of_target_user() {
         let pool = setup_users_db().await.unwrap();
         insert_sentinel_user(&pool, VALID_PUBKEY).await;
@@ -3470,6 +4758,7 @@ mod migration_and_query_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     fn init_test_settings() {
+        crate::config::init_test_nostr_keys();
         let _ = MOSTRO_CONFIG.set(test_settings());
     }
 
@@ -3968,6 +5257,52 @@ mod migration_and_query_tests {
         let stale = find_order_by_seconds(&pool).await.unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].id, stale_id);
+    }
+
+    /// Regression: the pre-trade take CAS must persist `taken_at`, or a
+    /// freshly taken order looks expired to the scheduler (`taken_at = 0`
+    /// is always older than `now - expiration_seconds`) and gets its hold
+    /// invoice canceled on the very next timeout tick.
+    #[tokio::test]
+    async fn freshly_taken_order_is_not_scheduler_timeout_eligible() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+
+        // A maker's pending order: `taken_at` still at the schema default 0.
+        let id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            id,
+            "sell",
+            "pending",
+            None,
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            0,
+        )
+        .await;
+
+        // The take transition exactly as the handlers drive it: mutate the
+        // in-memory row (including `set_timestamp_now()`) and persist via
+        // the wide CAS.
+        use mostro_core::db::Crud;
+        let mut order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        order.status = Status::WaitingPayment.to_string();
+        order.event_id = "ev-take".to_string();
+        order.buyer_pubkey = Some(HEX_KEY_A.to_string());
+        order.set_timestamp_now();
+        let won = cas_complete_pretrade_take(&pool, &order, false)
+            .await
+            .unwrap();
+        assert!(won, "pending order accepts the take");
+
+        let after = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert!(after.taken_at > 0, "take must persist taken_at");
+        let stale = find_order_by_seconds(&pool).await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "a just-taken order must not be timeout-cancel eligible"
+        );
     }
 
     #[tokio::test]

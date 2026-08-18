@@ -1,5 +1,6 @@
 // Mostro module for configurataion settings
 pub mod constants;
+pub mod secret;
 pub mod settings;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.
@@ -19,7 +20,8 @@ use tokio::sync::RwLock;
 pub use constants::{DEV_FEE_LIGHTNING_ADDRESS, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-pub use settings::{get_db_pool, init_mostro_settings, Settings};
+pub use secret::{parse_mostro_keys, read_nsec_env_var, take_nsec_for_init};
+pub use settings::{get_db_pool, get_mostro_keys, init_mostro_settings, Settings};
 pub use types::{
     AntiAbuseBondSettings, BondApplyTo, DatabaseSettings, ExpirationSettings, LightningSettings,
     MostroSettings, NostrSettings,
@@ -29,9 +31,29 @@ pub use types::{
 // almost all of them are initialized with OnceLock to ensure they are set only once
 // They are shared across the application using Arc and Mutex/RwLock for thread safety
 pub static MOSTRO_CONFIG: OnceLock<Settings> = OnceLock::new();
+pub static NOSTR_KEYS: OnceLock<Keys> = OnceLock::new();
 pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
+/// Dedicated Nostr client for the price provider's kind-30078 queries.
+///
+/// Kept separate from [`NOSTR_CLIENT`] so `verify_subscriptions(true)` (and
+/// the REQ `limit` it enforces) applies only to price fetches — not to the
+/// daemon's long-lived `.limit(0)` inbox subscription in `main.rs`, where
+/// pre-EOSE filter verification would reject matching trade messages
+/// (hermeme, PR #841).
+pub static PRICE_NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 pub static LN_STATUS: OnceLock<LnStatus> = OnceLock::new();
 pub static DB_POOL: OnceLock<Arc<sqlx::SqlitePool>> = OnceLock::new();
+
+/// Install the canonical test keys into [`NOSTR_KEYS`] so code paths that
+/// call `get_keys()` work in unit tests. Idempotent: whichever test module
+/// wins the race installs the same key.
+#[cfg(test)]
+pub fn init_test_nostr_keys() {
+    let _ = NOSTR_KEYS.set(
+        Keys::parse("nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd")
+            .expect("valid canonical test nsec"),
+    );
+}
 
 /// Global message queues for Mostro
 /// This struct holds three queues:
@@ -56,6 +78,7 @@ mod tests {
     use super::*;
     use crate::config::constants::DEV_FEE_AUDIT_EVENT_KIND;
     use mostro_core::prelude::{NOSTR_DISPUTE_EVENT_KIND, NOSTR_ORDER_EVENT_KIND};
+    use secrecy::ExposeSecret;
     use serde::Deserialize;
 
     // Fake settings for the test
@@ -179,6 +202,12 @@ mod tests {
         );
         assert_eq!(lightning_settings.lightning.payment_attempts, 3);
         assert_eq!(lightning_settings.lightning.payment_retries_interval, 60);
+        // Absent from this TOML: an existing operator config keeps working and
+        // picks up the bound from the serde default.
+        assert_eq!(
+            lightning_settings.lightning.max_final_cltv_expiry_delta,
+            432
+        );
     }
 
     #[test]
@@ -195,7 +224,7 @@ mod tests {
         let nostr_settings: StubSettingsNostr =
             toml::from_str(NOSTR_SETTINGS).expect("Failed to deserialize");
         assert_eq!(
-            nostr_settings.nostr.nsec_privkey,
+            nostr_settings.nostr.nsec_privkey.expose_secret(),
             "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
         );
         assert_eq!(

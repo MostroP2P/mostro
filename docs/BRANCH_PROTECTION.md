@@ -163,7 +163,7 @@ Yes, but it **requires at least 1 approval from another person** before merge.
 ### What happens if I accidentally push to main?
 
 GitHub rejects it:
-```
+```text
 ! [remote rejected] main -> main (protected branch hook declined)
 ```
 

@@ -16,6 +16,11 @@ pub mod scheduler;
 pub mod spam_gate;
 pub mod util;
 
+/// Convenience alias mirroring the one `nostr` (pre-0.45) used to re-export
+/// via `nostr_sdk::prelude::*`; nostr 0.45 dropped it, so it's recreated here
+/// for the crate root and pulled into other modules via `use crate::Result;`.
+pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
+
 use crate::app::context::AppContext;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
@@ -76,8 +81,9 @@ async fn main() -> Result<()> {
     // Get mostro keys
     let mostro_keys = util::get_keys()?;
 
-    // Subscribe only to the configured transport's kind: 1059 (protocol v1
-    // gift wrap) or 14 (protocol v2 NIP-44 direct). See docs/TRANSPORT_V2_SPEC.md.
+    // Subscribe only to the configured transport's kind: 14 (protocol v2
+    // NIP-44 direct, the default) or 1059 (protocol v1 gift wrap, explicit
+    // opt-in only). See docs/TRANSPORT_V2_SPEC.md.
     // DEPRECATED(v0.19.0, #786): the `transport` knob disappears in v0.19.0
     // and this subscription becomes unconditionally kind 14.
     #[allow(deprecated)]
@@ -92,9 +98,10 @@ async fn main() -> Result<()> {
     if transport == mostro_core::transport::Transport::GiftWrap {
         tracing::warn!(
             "transport = \"gift-wrap\" (protocol v1) is DEPRECATED and will be removed in \
-             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. Switch \
-             once the clients your community uses support protocol v2. \
-             See https://github.com/MostroP2P/mostro/issues/786"
+             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. You \
+             opted into it explicitly in settings.toml — remove the line (or set \
+             transport = \"nip44\", the default) once the clients your community uses \
+             support protocol v2. See https://github.com/MostroP2P/mostro/issues/786"
         );
     }
     let subscription = Filter::new()
@@ -112,12 +119,12 @@ async fn main() -> Result<()> {
     };
 
     // Client subscription
-    client.subscribe(subscription, None).await?;
+    client.subscribe(subscription).await?;
 
     // Publish NIP-01 kind 0 metadata event
     let mostro_settings = Settings::get_mostro();
     let mut has_metadata = false;
-    let mut metadata = nostr_sdk::Metadata::new();
+    let mut metadata = Metadata::new();
 
     if let Some(ref name) = mostro_settings.name {
         metadata = metadata.name(name);
@@ -128,7 +135,7 @@ async fn main() -> Result<()> {
         has_metadata = true;
     }
     if let Some(ref picture) = mostro_settings.picture {
-        if let Ok(url) = nostr_sdk::Url::parse(picture) {
+        if let Ok(url) = Url::parse(picture) {
             metadata = metadata.picture(url);
             has_metadata = true;
         } else {
@@ -136,7 +143,7 @@ async fn main() -> Result<()> {
         }
     }
     if let Some(ref website) = mostro_settings.website {
-        if let Ok(url) = nostr_sdk::Url::parse(website) {
+        if let Ok(url) = Url::parse(website) {
             metadata = metadata.website(url);
             has_metadata = true;
         } else {
@@ -145,7 +152,7 @@ async fn main() -> Result<()> {
     }
 
     if has_metadata {
-        if let Ok(metadata_ev) = EventBuilder::metadata(&metadata).sign_with_keys(&mostro_keys) {
+        if let Ok(metadata_ev) = metadata.finalize(mostro_keys) {
             let _ = client.send_event(&metadata_ev).await;
             tracing::info!("Published NIP-01 kind 0 metadata event");
         }
@@ -221,12 +228,33 @@ async fn main() -> Result<()> {
         panic!("No connection to LND node - shutting down Mostro!");
     };
 
-    if let Ok(held_invoices) = find_held_invoices(get_db_pool().as_ref()).await {
-        for invoice in held_invoices.iter() {
-            if let Some(hash) = &invoice.hash {
-                tracing::info!("Resubscribing order id - {}", invoice.id);
-                if let Err(e) = invoice_subscribe(hash.as_bytes().to_vec(), None).await {
-                    tracing::error!("Ln node error {e}")
+    // A failure here means no in-flight hold invoice is resubscribed for the
+    // whole run, which is indistinguishable from "there were none" unless it is
+    // said out loud — the same silent-failure shape this path already had.
+    match find_held_invoices(get_db_pool().as_ref()).await {
+        Err(e) => tracing::error!(
+            "Could not load held invoices to resubscribe; in-flight trades will \
+             not be observed until the next restart: {e}"
+        ),
+        Ok(held_invoices) => {
+            for invoice in held_invoices.iter() {
+                if let Some(hash) = &invoice.hash {
+                    // `orders.hash` is hex text; LND's SubscribeSingleInvoiceRequest
+                    // wants the 32 raw bytes. Passing the 64 ASCII characters makes
+                    // every resubscribe fail, which is silent here because the error
+                    // is only logged — and a missed subscription looks exactly like
+                    // a seller who never paid.
+                    let r_hash = match crate::lightning::decode_hash32("order hash", hash) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::error!("Order {} has an undecodable hash: {e}", invoice.id);
+                            continue;
+                        }
+                    };
+                    tracing::info!("Resubscribing order id - {}", invoice.id);
+                    if let Err(e) = invoice_subscribe(r_hash, None).await {
+                        tracing::error!("Ln node error {e}")
+                    }
                 }
             }
         }

@@ -9,19 +9,19 @@ allowing clients to identify which Mostro instance published the order.
 
 ### Before
 
-```
+```text
 mostro:{order_id}?relays={relay1},{relay2}
 ```
 
 ### After
 
-```
+```text
 mostro:{order_id}?relays={relay1},{relay2}&mostro={pubkey}
 ```
 
 ### Example
 
-```
+```text
 mostro:e215c07e-b1f9-45b0-9640-0295067ee99a?relays=wss://relay.mostro.network,wss://nos.lol&mostro=82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390
 ```
 

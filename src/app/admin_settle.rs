@@ -5,7 +5,7 @@ use crate::db::{
     is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
-use crate::nip33::{create_platform_tag_values, new_dispute_event};
+use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
 
 use mostro_core::db::Crud;
@@ -124,6 +124,7 @@ pub async fn admin_settle_action(
 
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
+        let opened_at = d.created_at;
         // we update the dispute
         d.status = DisputeStatus::Settled.to_string();
         d.update(pool)
@@ -138,25 +139,12 @@ pub async fn admin_settle_action(
         };
 
         // We create a tag to show status of the dispute
-        let tags: Tags = Tags::from_list(vec![
-            Tag::custom(
-                TagKind::Custom(std::borrow::Cow::Borrowed("s")),
-                vec![DisputeStatus::Settled.to_string()],
-            ),
-            // Who is the dispute creator
-            Tag::custom(
-                TagKind::Custom(std::borrow::Cow::Borrowed("initiator")),
-                vec![dispute_initiator],
-            ),
-            Tag::custom(
-                TagKind::Custom(std::borrow::Cow::Borrowed("y")),
-                create_platform_tag_values(ctx.settings().mostro.name.as_deref()),
-            ),
-            Tag::custom(
-                TagKind::Custom(std::borrow::Cow::Borrowed("z")),
-                vec!["dispute".to_string()],
-            ),
-        ]);
+        let tags = create_dispute_event_tags(
+            DisputeStatus::Settled.to_string(),
+            dispute_initiator,
+            opened_at,
+            ctx.settings().mostro.name.as_deref(),
+        );
 
         // nip33 kind with dispute id as identifier (kind 38386 for disputes)
         let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)

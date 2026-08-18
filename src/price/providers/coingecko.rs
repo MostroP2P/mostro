@@ -144,6 +144,7 @@ mod tests {
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         }
     }
 

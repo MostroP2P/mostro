@@ -127,6 +127,7 @@ mod tests {
             token: None,
             only: None,
             except: None,
+            trusted_nodes: vec![],
         };
         let p = YadioProvider::new(&cfg);
         // We rebuild the request URL by appending `/exrates/BTC`; without

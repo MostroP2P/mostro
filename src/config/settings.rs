@@ -1,10 +1,14 @@
-use super::{DB_POOL, MOSTRO_CONFIG};
+use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
+use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
     LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use mostro_core::transport::Transport;
+use nostr_sdk::prelude::Keys;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -38,11 +42,25 @@ pub struct Settings {
     pub price: Option<PriceSettings>,
 }
 
-/// Initialize the global MOSTRO_CONFIG struct
-pub fn init_mostro_settings(s: Settings) {
-    MOSTRO_CONFIG
-        .set(s)
-        .expect("Failed to set Mostro global settings");
+/// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
+pub fn init_mostro_settings(mut s: Settings) -> Result<(), MostroError> {
+    let keys = take_nsec_for_init(&mut s.nostr)?;
+    NOSTR_KEYS.set(keys).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(
+            "Mostro nostr keys already initialized".to_string(),
+        ))
+    })?;
+    MOSTRO_CONFIG.set(s).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(
+            "Mostro settings already initialized".to_string(),
+        ))
+    })?;
+    Ok(())
+}
+
+/// Parsed Mostro Nostr signing keys, initialized once at startup.
+pub fn get_mostro_keys() -> Option<&'static Keys> {
+    NOSTR_KEYS.get()
 }
 
 /// Get database pool for Mostro db operations to share across the thread
@@ -105,11 +123,12 @@ impl Settings {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
     }
 
-    /// Wire transport for protocol messages. Falls back to the default
-    /// (`gift-wrap`, protocol v1) when the global settings haven't been
-    /// initialized yet — `send_dm()` sits on every reply path and must
-    /// degrade to v1 behavior rather than panic in unit tests that don't
-    /// bring up the full configuration, mirroring [`Settings::get_bond`].
+    /// Wire transport for protocol messages. Falls back to the daemon
+    /// default (`nip44`, protocol v2 — see `default_transport`) when the
+    /// global settings haven't been initialized yet — `send_dm()` sits on
+    /// every reply path and must degrade gracefully rather than panic in
+    /// unit tests that don't bring up the full configuration, mirroring
+    /// [`Settings::get_bond`].
     ///
     /// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting —
     /// v0.19.0 hardcodes the protocol-v2 (`nip44`) wire format.
@@ -119,10 +138,23 @@ impl Settings {
     )]
     pub fn get_transport() -> Transport {
         #[allow(deprecated)]
-        MOSTRO_CONFIG
-            .get()
+        Self::transport_or_default(MOSTRO_CONFIG.get())
+    }
+
+    /// Selection logic behind [`Settings::get_transport`], split out so the
+    /// uninitialized (`None`) fallback is unit-testable without touching the
+    /// process-wide `MOSTRO_CONFIG`.
+    ///
+    /// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting.
+    #[deprecated(
+        since = "0.18.0",
+        note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
+    )]
+    fn transport_or_default(settings: Option<&Settings>) -> Transport {
+        #[allow(deprecated)]
+        settings
             .map(|s| s.mostro.transport)
-            .unwrap_or_default()
+            .unwrap_or_else(crate::config::types::default_transport)
     }
 
     /// Retrieve the multi-source price configuration from the global
@@ -218,10 +250,34 @@ mod tests {
     }
 
     #[test]
-    fn transport_falls_back_to_default() {
+    #[allow(deprecated)]
+    fn transport_falls_back_to_nip44_when_uninitialized() {
+        // No global config ⇒ daemon default is protocol v2, regardless of
+        // mostro-core's `Transport::default()` (gift-wrap).
+        assert_eq!(Settings::transport_or_default(None), Transport::Nip44Direct);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn transport_uses_configured_value_when_initialized() {
+        let mut settings = test_settings();
+        settings.mostro.transport = Transport::GiftWrap;
+        assert_eq!(
+            Settings::transport_or_default(Some(&settings)),
+            Transport::GiftWrap
+        );
+        settings.mostro.transport = Transport::Nip44Direct;
+        assert_eq!(
+            Settings::transport_or_default(Some(&settings)),
+            Transport::Nip44Direct
+        );
+    }
+
+    #[test]
+    fn get_transport_reads_global_config() {
         init_test_settings();
         #[allow(deprecated)]
         let transport = Settings::get_transport();
-        assert_eq!(transport, Transport::default());
+        assert_eq!(transport, Transport::Nip44Direct);
     }
 }

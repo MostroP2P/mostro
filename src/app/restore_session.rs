@@ -184,7 +184,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::config::MESSAGE_QUEUES;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 

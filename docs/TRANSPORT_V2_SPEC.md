@@ -235,6 +235,18 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   re-sent identical event id before decryption. The existing 10-second
   freshness window (post-decrypt, on the inner `created_at`) still applies as
   the precise stale-event check.
+- **Validation order is load-bearing.** `accept_event` runs PoW → kind →
+  **event signature** → gate (replay dedup, then the lane check) →
+  `unwrap_incoming` (decrypt). The signature check must stay ahead of the
+  gate: a nostr event id commits to `[0, pubkey, created_at, kind, tags,
+  content]` and *not* to `sig`, so a copy of a victim's event with only `sig`
+  tampered keeps the victim's id and its mined PoW. Recording ids before
+  authentication would make the dedup a censorship primitive — the forged copy
+  gets recorded, the genuine event that follows is dropped as a replay, and
+  per the "no reply for dropped events" rule the sender never learns why.
+  Verifying first costs one Schnorr check on events the gate would have
+  dropped, and still runs entirely before the NIP-44 decrypt the gate exists
+  to protect.
 - **Discoverability** (`src/nip33.rs`): the kind-38385 info event carries a
   `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
   reply — it never reaches a handler — so the info event is the only way a

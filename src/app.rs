@@ -362,6 +362,13 @@ async fn accept_event(
         // must clear the stiffer `pow_first_contact` before
         // we decrypt. New orders/takes legitimately arrive
         // here — so does spam, hence the PoW toll.
+        //
+        // The lane is decided on a *verified* author on
+        // purpose: `is_known` keys off `event.pubkey`, and in
+        // v2 the trade keys of active orders are public by
+        // design. Deciding it before the signature check would
+        // let any flooder claim a known key and skip the
+        // first-contact toll entirely.
         if !gate.is_known(&event.pubkey.to_string()) && !event.check_pow(pow_first_contact) {
             tracing::info!(
                 "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
@@ -616,6 +623,20 @@ mod tests {
         )
     }
 
+    // An AppContext backed by a fresh in-memory database with the migrations
+    // applied. Shared by every child test module through `use super::*`.
+    async fn create_migrated_ctx() -> AppContext {
+        let pool = std::sync::Arc::new(sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        crate::app::context::test_utils::TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(crate::app::context::test_utils::test_settings())
+            .build()
+    }
+
     // Helper function to create an UnwrappedMessage for testing. Identity and
     // sender (trade key) are distinct to mirror the canonical Mostro flow.
     fn create_test_unwrapped_message() -> UnwrappedMessage {
@@ -705,24 +726,9 @@ mod tests {
     /// event dropped as a replay.
     mod accept_event_ordering_tests {
         use super::*;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
         use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
         use mostro_core::nip59::WrapOptions;
         use mostro_core::transport::wrap_message_nip44;
-        use sqlx::SqlitePool;
-        use std::sync::Arc;
-
-        async fn create_migrated_ctx() -> AppContext {
-            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-            sqlx::migrate!("./migrations")
-                .run(pool.as_ref())
-                .await
-                .unwrap();
-            TestContextBuilder::new()
-                .with_pool(pool)
-                .with_settings(test_settings())
-                .build()
-        }
 
         /// A protocol-v2 (kind 14) event addressed to `mostro`, in full-privacy
         /// mode (trade key doubles as identity, so no identity proof is needed).
@@ -756,13 +762,15 @@ mod tests {
             mostro: &Keys,
             gate: &SpamGate,
         ) -> Option<(Action, Message, UnwrappedMessage)> {
+            // Same constant the event loops derive `is_v2` from, so the test
+            // fails if it ever drifts from `Transport::Nip44Direct`'s kind.
             accept_event(
                 ctx,
                 event,
                 mostro,
                 0,
                 0,
-                NostrKind::PrivateDirectMessage,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
                 Some(gate),
             )
             .await
@@ -820,7 +828,7 @@ mod tests {
                 &mostro,
                 0,
                 0,
-                NostrKind::PrivateDirectMessage,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
                 None,
             )
             .await;
@@ -860,18 +868,6 @@ mod tests {
 
             let result = check_trade_index(&ctx, &event, &message).await;
             assert!(result.is_ok());
-        }
-
-        async fn create_migrated_ctx() -> AppContext {
-            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-            sqlx::migrate!("./migrations")
-                .run(pool.as_ref())
-                .await
-                .unwrap();
-            TestContextBuilder::new()
-                .with_pool(pool)
-                .with_settings(test_settings())
-                .build()
         }
 
         /// Insert a user row for `identity` with the given last_trade_index.
@@ -1179,21 +1175,6 @@ mod tests {
 
     mod dispatch_cashu_tests {
         use super::*;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        use sqlx::SqlitePool;
-        use std::sync::Arc;
-
-        async fn create_ctx() -> AppContext {
-            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-            sqlx::migrate!("./migrations")
-                .run(pool.as_ref())
-                .await
-                .unwrap();
-            TestContextBuilder::new()
-                .with_pool(pool)
-                .with_settings(test_settings())
-                .build()
-        }
 
         fn is_invalid_action(result: Result<()>) -> bool {
             matches!(
@@ -1214,7 +1195,7 @@ mod tests {
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
             let _ = crate::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
-            let ctx = create_ctx().await;
+            let ctx = create_migrated_ctx().await;
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
 
@@ -1249,7 +1230,7 @@ mod tests {
         /// returns `Ok` — proving it was NOT short-circuited to `InvalidAction`.
         #[tokio::test]
         async fn allows_restore_session_through_no_ln_router() {
-            let ctx = create_ctx().await;
+            let ctx = create_migrated_ctx().await;
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
             let msg = Message::new_restore(None);

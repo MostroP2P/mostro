@@ -26,7 +26,11 @@ pub struct PriceSettings {
     /// serving budget, so total age is bounded at
     /// `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds`
     /// instead of accepting an event up to the full TTL old and then
-    /// serving it for another full TTL (~2x).
+    /// serving it for another full TTL (~2x). The provider floors the
+    /// scaled product at one second, so that bound only holds exactly when
+    /// `max_price_staleness_seconds * nostr_ingestion_budget_pct >= 1`;
+    /// below that the ingestion window is one second regardless of how
+    /// small the product is.
     #[serde(default = "default_nostr_ingestion_budget_pct")]
     pub nostr_ingestion_budget_pct: f64,
     /// Discard a source whose value deviates more than this percent from the

@@ -66,7 +66,11 @@ pub struct NostrProvider {
     /// already had when accepted — using the full TTL for both would let a
     /// just-under-TTL-old event be served for another full TTL afterwards
     /// (~2x total age). Splitting the budget bounds total age at
-    /// `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds`.
+    /// `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds` —
+    /// except that the product is floored at one second (`new` below), so a
+    /// config where `max_price_staleness_seconds * nostr_ingestion_budget_pct
+    /// < 1` gets that one-second minimum instead of its own smaller share,
+    /// widening the effective bound for that edge case only.
     max_age: Duration,
 }
 

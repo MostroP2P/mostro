@@ -909,6 +909,11 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
   Nostr is a *contributor* this tick; a fiat-cross currency resolved
   against a Nostr-tainted anchor (`nostr_anchor_dependent`, §6.3) benefits
   transitively from a fresher anchor without needing separate handling.
+  The acceptance window is floored at one second, so this exact multiplier
+  only holds when `max_price_staleness_seconds × nostr_ingestion_budget_pct
+  ≥ 1`; a config below that (e.g. a 1s TTL with a 0.001 budget) gets a
+  1-second window instead of its own smaller share, widening total age for
+  that edge case rather than shrinking it below a second.
 
 ---
 

@@ -150,8 +150,9 @@ pub async fn admin_settle_action(
         let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
             .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-        // Print event dispute with update
-        tracing::info!("Dispute event to be published: {event:#?}");
+        // No full event dump — it carries the pubkey, tags and content in
+        // clear (AGENTS.md, Security & Configuration Tips).
+        tracing::info!("Dispute event to be published for dispute {dispute_id}");
 
         let client = ctx.nostr_client();
         if let Err(e) = client.send_event(&event).await {

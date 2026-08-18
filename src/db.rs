@@ -1732,12 +1732,7 @@ pub async fn is_assigned_solver(
     solver_pubkey: &str,
     order_id: Uuid,
 ) -> Result<bool, MostroError> {
-    tracing::info!(
-        "Solver_pubkey: {} assigned to order {}",
-        solver_pubkey,
-        order_id
-    );
-    let result = sqlx::query(
+    let result: bool = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM disputes WHERE solver_pubkey = ? AND order_id = ?)",
     )
     .bind(solver_pubkey)
@@ -1746,6 +1741,11 @@ pub async fn is_assigned_solver(
     .fetch_one(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // No key in the log line — solver pubkey (AGENTS.md, Security & Configuration Tips).
+    if result {
+        tracing::info!("Solver assigned to order {}", order_id);
+    }
 
     Ok(result)
 }

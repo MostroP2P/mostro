@@ -445,11 +445,11 @@ async fn request_payout_invoice(
         return Ok(());
     }
 
+    // No key in the log fields — recipient pubkey (AGENTS.md, Security & Configuration Tips).
     info!(
         bond_id = %bond.id,
         order_id = %bond.order_id,
         amount_sats = counterparty_share,
-        recipient = %recipient_pubkey,
         slashed_at,
         attempt = bond.invoice_request_attempts + 1,
         "bond payout: requesting invoice from counterparty"
@@ -1397,18 +1397,18 @@ pub async fn add_bond_invoice_action(
 
     match apply_payout_invoice(pool, &bond, &payment_request, now, claim_window_seconds).await? {
         InvoiceApplyOutcome::Persisted => {
+            // No key in the log fields — sender pubkey (AGENTS.md, Security & Configuration Tips).
             info!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
-                sender = %sender,
                 "bond payout: invoice accepted; awaiting scheduler tick for payout"
             );
         }
         InvoiceApplyOutcome::Resurrected => {
+            // No key in the log fields — sender pubkey (AGENTS.md, Security & Configuration Tips).
             info!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
-                sender = %sender,
                 "bond payout: Failed -> PendingPayout (user submitted fresh invoice within claim window); payout_attempts reset, awaiting scheduler tick for payout"
             );
         }

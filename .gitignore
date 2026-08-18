@@ -24,3 +24,5 @@ CLAUDE.md
 # Mutation testing output
 mutants.out/
 mutants.out.old/
+
+__pycache__/

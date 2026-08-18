@@ -92,12 +92,9 @@ pub async fn pubkey_event_can_solve(
 ) -> bool {
     let sender_pubkey = ev_pubkey.to_string();
 
-    // Is mostro admin taking dispute?
-    info!(
-        "admin pubkey {} -event pubkey {} ",
-        my_keys.public_key().to_string(),
-        sender_pubkey
-    );
+    // Is mostro admin taking dispute? No keys in the log line — admin/event
+    // pubkeys (AGENTS.md, Security & Configuration Tips).
+    info!("Checking whether the dispute event was sent by the mostro admin");
     if sender_pubkey == my_keys.public_key().to_string()
         && matches!(status, DisputeStatus::InProgress | DisputeStatus::Initiated)
     {
@@ -192,7 +189,8 @@ pub async fn admin_take_dispute_action(
     dispute.solver_pubkey = Some(event.identity.to_string());
     dispute.taken_at = Timestamp::now().as_secs() as i64;
 
-    info!("Dispute {} taken by {}", dispute.id, event.identity);
+    // No key in the log line — solver identity (AGENTS.md, Security & Configuration Tips).
+    info!("Dispute {} taken by a solver", dispute.id);
 
     // Save it to DB
     dispute
@@ -272,7 +270,9 @@ pub async fn admin_take_dispute_action(
     // nip33 kind with dispute id as identifier (kind 38386 for disputes)
     let event = new_dispute_event(mostro_keys, "", dispute.id.to_string(), tags)
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    info!("Dispute event to be published: {event:#?}");
+    // No full event dump — it carries the pubkey, tags and content in clear
+    // (AGENTS.md, Security & Configuration Tips).
+    info!("Dispute event to be published for dispute {}", dispute.id);
 
     let client = ctx.nostr_client();
     client

@@ -70,7 +70,8 @@ pub async fn admin_add_solver_action(
     let user = User::new(public_key.to_string(), 0, 1, 0, category, trade_index);
 
     match add_new_user(pool, user).await {
-        Ok(r) => info!("Solver added: {} with category {}", r, category),
+        // No key in the log line — solver pubkey (AGENTS.md, Security & Configuration Tips).
+        Ok(_) => info!("Solver added with category {}", category),
         Err(ee) => {
             error!("Error creating solver: {:#?}", ee);
             return Err(MostroInternalErr(ServiceError::DbAccessError(

@@ -22,6 +22,7 @@ use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -29,17 +30,35 @@ use tracing::{info, warn};
 
 /// Cap on concurrently running payout send tasks. Since `do_payment` returns
 /// right after claiming, the scheduler retry loop can fan a backlog of N
-/// failed payouts into N background tasks, each holding its own LND gRPC
-/// connection and payment stream for up to [`PAYOUT_SEND_PAYMENT_TIMEOUT`];
-/// this semaphore makes a backlog queue instead of fanning out. The queue puts
-/// an unbounded wait between the claim and the send, during which
-/// reconciliation may re-arm the claim — and the buyer may then supply a fresh
-/// invoice with a *different* hash, a case neither the pre-send duplicate
-/// guard nor LND's duplicate rejection can catch; that window is closed by
-/// `touch_order_payout_claim` right after the permit: a task whose claim was
-/// re-armed or replaced while it queued drops its send. Fixed for now; could
-/// become a settings knob later.
+/// failed payouts into N background tasks; this semaphore makes the sends
+/// queue instead of fanning out. It bounds concurrent *payment streams*, NOT
+/// LND connections: `LndConnector::new()` runs before the claim (a connect
+/// blip must never leave a marker set), so a backlog still opens N
+/// connections that sit idle while queued — a deliberate trade for the
+/// fail-fast-before-claim property.
+///
+/// The queue puts an unbounded wait between the claim and the send, with two
+/// hazards, both closed by `touch_order_payout_claim`:
+/// - **double payout**: reconciliation re-arms the claim and the buyer
+///   supplies a fresh invoice under a *different* hash — a case neither the
+///   pre-send duplicate guard nor LND's duplicate rejection can catch.
+///   Closed by the revalidating touch right after the permit: a task whose
+///   claim was re-armed or replaced while it queued drops its send.
+/// - **spurious failure**: a queued-but-never-sent payout ages past the
+///   reconcile grace window and is re-armed as failed, burning the buyer's
+///   retry budget and eventually re-prompting for an invoice that was never
+///   needed. Closed by the heartbeat touch while waiting (see
+///   [`PAYOUT_QUEUE_HEARTBEAT`]), which keeps the claim younger than grace.
+///
+/// Fixed for now; could become a settings knob later.
 static PAYOUT_DISPATCH_SEMAPHORE: Semaphore = Semaphore::const_new(8);
+
+/// Refresh cadence for a payout claim while its task waits for a send
+/// permit. Derived from — and strictly below — the reconciler's minimum
+/// grace window, so a queued claim is always re-stamped before it becomes
+/// eligible for reconciliation.
+const PAYOUT_QUEUE_HEARTBEAT: Duration =
+    Duration::from_secs(crate::scheduler::MIN_GRACE_SECS as u64 * 2 / 3);
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
@@ -684,23 +703,68 @@ pub async fn do_payment(
     // always finish or fail the payout by hash, so it is never lost or paid
     // twice.
     tokio::spawn(async move {
-        // Bound concurrent sends (see PAYOUT_DISPATCH_SEMAPHORE). The
-        // semaphore is static and never closed, so acquire() only errs if it
-        // were closed; proceeding unpermitted in that impossible case beats
-        // silently dropping a claimed payout. The permit is held for the
-        // whole task (send, watcher drain, RPC-error reconcile) via RAII.
-        let _permit = PAYOUT_DISPATCH_SEMAPHORE.acquire().await;
+        // The claim token; refreshed by every successful touch below.
+        let mut payout_claimed_at = payout_claimed_at;
 
-        // Re-validate the claim now that the queue wait is over, refreshing
-        // its timestamp in the same CAS. If reconciliation re-armed the claim
-        // while this task queued (the buyer may already have supplied a fresh
-        // invoice under a different hash), a newer payout owns the order and
-        // this invoice must NOT be sent. On a DB error, dropping the send is
-        // also the safe direction: the kept marker is recoverable by
-        // reconciliation, a blind send is not. The refreshed timestamp is the
-        // claim token from here on — it restarts the reconcile grace clock
-        // and invalidates any pre-touch snapshot a reconciler already holds.
-        let payout_claimed_at = match crate::db::touch_order_payout_claim(
+        // Bound concurrent sends (see PAYOUT_DISPATCH_SEMAPHORE). While
+        // queued, heartbeat the claim: re-validate and re-stamp it every
+        // PAYOUT_QUEUE_HEARTBEAT so it never ages past the reconcile grace
+        // window — without this, reconciliation would treat a queued-but-
+        // never-sent payout as failed, burning the buyer's retry budget for
+        // a payment that was never attempted. The acquire future is pinned
+        // OUTSIDE the loop so the task keeps its FIFO position in the
+        // semaphore queue across heartbeats. The semaphore is static and
+        // never closed, so acquire() only errs if it were closed; proceeding
+        // unpermitted in that impossible case beats silently dropping a
+        // claimed payout. The permit is then held for the send and the
+        // RPC-error reconcile via RAII — the watcher is a sibling task and
+        // finishes its bookkeeping outside the bound.
+        let acquire = PAYOUT_DISPATCH_SEMAPHORE.acquire();
+        tokio::pin!(acquire);
+        let _permit = loop {
+            tokio::select! {
+                permit = &mut acquire => break permit,
+                _ = tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT) => {
+                    match crate::db::touch_order_payout_claim(
+                        ctx.pool(),
+                        order.id,
+                        &payout_hash,
+                        Some(payout_claimed_at),
+                    )
+                    .await
+                    {
+                        Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
+                        Ok(None) => {
+                            warn!(
+                                "Order {}: payout claim was re-armed or replaced while queued; dropping stale dispatch of hash {}",
+                                order.id, payout_hash
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Order {}: could not heartbeat payout claim while queued ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
+                                order.id, payout_hash
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Final re-validation now that the queue wait is over, refreshing
+        // the timestamp in the same CAS (the last heartbeat may be up to a
+        // full PAYOUT_QUEUE_HEARTBEAT old). If reconciliation re-armed the
+        // claim while this task queued (the buyer may already have supplied
+        // a fresh invoice under a different hash), a newer payout owns the
+        // order and this invoice must NOT be sent. On a DB error, dropping
+        // the send is also the safe direction: the kept marker is
+        // recoverable by reconciliation, a blind send is not. The refreshed
+        // timestamp is the claim token from here on — it restarts the
+        // reconcile grace clock and invalidates any pre-touch snapshot a
+        // reconciler already holds.
+        payout_claimed_at = match crate::db::touch_order_payout_claim(
             ctx.pool(),
             order.id,
             &payout_hash,

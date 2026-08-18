@@ -89,6 +89,17 @@ class CheckLogRedactionTest(unittest.TestCase):
         )
         self.assertEqual(violations, [])
 
+    def test_allow_marker_inside_string_literal_does_not_exempt(self):
+        # The marker must sit in an actual `//` comment on the line above —
+        # not just appear anywhere on that line, e.g. inside another string.
+        violations = self._violations(
+            "fn x() {\n"
+            'let note = "pubkey-log-allow: not a real exemption";\n'
+            'info!("{}", pubkey);\n'
+            "}"
+        )
+        self.assertEqual(violations, [(3, "pubkey")])
+
 
 if __name__ == "__main__":
     unittest.main()

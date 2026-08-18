@@ -114,7 +114,8 @@ def check_file(path: Path) -> list[tuple[int, str]]:
         found = SUSPICIOUS_RE.search(code_only) or SUSPICIOUS_RE.search(captures)
         if not found:
             continue
-        if ALLOW_COMMENT in line_before(text, m.start()):
+        previous_line = line_before(text, m.start()).lstrip()
+        if previous_line.startswith(f"// {ALLOW_COMMENT}"):
             continue
         line_no = text.count("\n", 0, m.start()) + 1
         violations.append((line_no, found.group(0)))

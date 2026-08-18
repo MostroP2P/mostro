@@ -498,7 +498,22 @@ async fn finalize_order_publication(
         .unwrap()
         .send_event(&event)
         .await
-        .map(|_s| ())
+        .map(|output| {
+            // A per-relay rejection resolves to `Ok` with the refusing
+            // relays in `output.failed`. The publish still stands — the row
+            // is `Pending` and at least one side of the wire may have it —
+            // but the divergent relays must be converged, so queue the
+            // order for the reconciler.
+            if !output.failed.is_empty() {
+                tracing::warn!(
+                    "initial orderbook publish rejected by {} relay(s) for order {}: {:?}; queued for republish",
+                    output.failed.len(),
+                    order_id,
+                    output.failed
+                );
+                mark_orderbook_publish_failed(order_id);
+            }
+        })
         .map_err(|err| {
             // The row is already `Pending` in the DB; queue it so the
             // orderbook reconciler retries the publish instead of leaving
@@ -1056,28 +1071,64 @@ pub(crate) fn monotonic_order_event_timestamp(order_id: Uuid, candidate: Timesta
     stamp_orderbook_event(order_id, candidate).created_at
 }
 
-/// Orders whose latest kind-38383 publish failed (relay send error or no
-/// Nostr client), so the DB state and the advertised orderbook diverged.
-/// The scheduler's orderbook reconciler drains this map and republishes the
-/// current DB state until the wire converges.
+/// Orders whose latest kind-38383 publish failed (a relay rejected the
+/// event, the send errored, or no Nostr client existed), so the DB state
+/// and the advertised orderbook diverged. The scheduler's orderbook
+/// reconciler drains this map and republishes the current DB state until
+/// the wire converges — or until [`MAX_ORDERBOOK_REPUBLISH_ATTEMPTS`] is
+/// reached.
 ///
-/// Each entry carries the publication generation that recorded the failure
-/// (see [`ORDERBOOK_REGISTRY`]). A successful send clears an entry only if
-/// the failure is not newer than itself: without the generation, a slow
-/// old send completing *after* a newer publication failed would erase that
-/// newer failure, and the state the newer publication carried would never
-/// be republished.
-static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+/// Each entry carries `(generation, attempts)`:
+///
+/// - the publication generation that recorded the failure (see
+///   [`ORDERBOOK_REGISTRY`]). A successful send clears an entry only if
+///   the failure is not newer than itself: without the generation, a slow
+///   old send completing *after* a newer publication failed would erase
+///   that newer failure, and the state the newer publication carried
+///   would never be republished;
+/// - the number of failed publish attempts recorded for this divergence
+///   episode. Without the cap, a single persistently-failing relay (offline,
+///   rate-limiting, refusing the kind) would put every touched order into a
+///   permanent republish cycle: each retry stamps a fresh `created_at` that
+///   the *healthy* relays dutifully replace, churning the public book while
+///   converging nothing — the retry cannot reach the relay that failed.
+static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, (u64, u8)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// Queue `order_id` for republish, recording the failure at `generation`.
-/// A newer failure already recorded for the order is never downgraded.
+/// Failed publish attempts after which the reconciler gives up on an
+/// order and drops its queue entry. Bounds the churn of a persistent
+/// per-relay failure to this many published revisions per episode; the
+/// residual divergence is bounded by the event's NIP-40 expiration, the
+/// same trade-off the reconciler already accepts for silent relay loss.
+/// A later transition that fails again re-queues the order with a fresh
+/// attempt budget.
+pub(crate) const MAX_ORDERBOOK_REPUBLISH_ATTEMPTS: u8 = 5;
+
+/// Queue `order_id` for republish, recording one more failed publish
+/// attempt at `generation`. A newer failure already recorded for the
+/// order is never downgraded.
 pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) {
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = queue.entry(order_id).or_insert(generation);
-    *entry = (*entry).max(generation);
+    let entry = queue.entry(order_id).or_insert((generation, 0));
+    entry.0 = entry.0.max(generation);
+    entry.1 = entry.1.saturating_add(1);
+}
+
+/// Re-insert a drained entry without consuming an attempt, for reconciler
+/// passes that did not publish anything (the quiescence guard refused, or
+/// the order row could not be reloaded). Merges with any failure recorded
+/// concurrently: neither the generation nor the attempt count is ever
+/// downgraded.
+pub(crate) fn requeue_orderbook_publish_failure(order_id: Uuid, generation: u64, attempts: u8) {
+    let mut queue = PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = queue.entry(order_id).or_insert((generation, attempts));
+    entry.0 = entry.0.max(generation);
+    entry.1 = entry.1.max(attempts);
 }
 
 /// Queue `order_id` for republish stamped with a fresh generation, for
@@ -1104,7 +1155,7 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&failed_at) = queue.get(&order_id) {
+    if let Some(&(failed_at, _)) = queue.get(&order_id) {
         if failed_at <= generation {
             queue.remove(&order_id);
         }
@@ -1112,13 +1163,15 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
 }
 
 /// Take the current set of orders awaiting republish (with the generation
-/// that recorded each failure), leaving the queue empty. Failed retries
-/// re-queue themselves via `update_order_event`.
-pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64)> {
+/// that recorded each failure and the attempts consumed so far), leaving
+/// the queue empty. Failed retries re-queue themselves via
+/// `update_order_event`.
+pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64, u8)> {
     PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain()
+        .map(|(order_id, (generation, attempts))| (order_id, generation, attempts))
         .collect()
 }
 
@@ -1145,6 +1198,16 @@ pub(crate) fn is_orderbook_publish_queued(order_id: Uuid) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains_key(&order_id)
+}
+
+/// Test-only visibility into an entry's consumed attempt count.
+#[cfg(test)]
+pub(crate) fn orderbook_publish_attempts(order_id: Uuid) -> Option<u8> {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&order_id)
+        .map(|&(_, attempts)| attempts)
 }
 
 pub async fn update_order_event(
@@ -1245,7 +1308,25 @@ async fn update_order_event_stamped(
                 // Only failures recorded by publications stamped no later
                 // than this one may be cleared: a newer concurrent
                 // publication's failure must survive this older success.
-                Ok(_) => clear_orderbook_publish_failure_up_to(order.id, stamp.generation),
+                Ok(output) if output.failed.is_empty() => {
+                    clear_orderbook_publish_failure_up_to(order.id, stamp.generation)
+                }
+                // A per-relay rejection or timeout resolves to `Ok` with the
+                // refusing relays in `output.failed` — `send_event` returns
+                // `Err` only when there was no relay to send to at all. Any
+                // rejected relay means the book is divergent there, so the
+                // publish counts as failed and stays queued until a
+                // republish converges it.
+                Ok(output) => {
+                    tracing::warn!(
+                        "orderbook publish rejected by {} relay(s) for order {} (status {}): {:?}; queued for republish",
+                        output.failed.len(),
+                        order_updated.id,
+                        status,
+                        output.failed
+                    );
+                    mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "orderbook publish failed for order {} (status {}): {e}; queued for republish",
@@ -2163,7 +2244,7 @@ mod tests {
         let transition = stamp_orderbook_event(order_id, now);
         assert!(
             try_stamp_orderbook_event_quiescent(order_id, now, quiet).is_none(),
-            "a sweep racing a just-stamped transition must be refused"
+            "a republish racing a just-stamped transition must be refused"
         );
         assert!(
             try_stamp_orderbook_event_quiescent(
@@ -2175,15 +2256,15 @@ mod tests {
             "still inside the quiet window"
         );
 
-        let sweep = try_stamp_orderbook_event_quiescent(
+        let republish = try_stamp_orderbook_event_quiescent(
             order_id,
             Timestamp::from(now.as_secs() + quiet),
             quiet,
         )
-        .expect("outside the quiet window the sweep must stamp");
-        assert!(sweep.created_at > transition.created_at);
+        .expect("outside the quiet window the republish must stamp");
+        assert!(republish.created_at > transition.created_at);
         assert!(
-            sweep.generation > transition.generation,
+            republish.generation > transition.generation,
             "generation order must match stamp order"
         );
     }
@@ -2258,8 +2339,50 @@ mod tests {
 
         // A drained entry stays drained until the next failure.
         let drained = take_failed_orderbook_publishes();
-        assert!(drained.iter().any(|(id, _)| *id == order.id));
+        assert!(drained.iter().any(|(id, _, _)| *id == order.id));
         assert!(!is_orderbook_publish_queued(order.id));
+    }
+
+    /// Attempt accounting: every recorded failure consumes an attempt, a
+    /// requeue never does (and never downgrades), and a success resets the
+    /// episode by removing the entry entirely.
+    #[tokio::test]
+    async fn republish_attempts_count_failures_not_requeues() {
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let order_id = Uuid::new_v4();
+
+        mark_orderbook_publish_failed_at(order_id, 1);
+        mark_orderbook_publish_failed_at(order_id, 2);
+        assert_eq!(
+            orderbook_publish_attempts(order_id),
+            Some(2),
+            "each recorded failure must consume one attempt"
+        );
+
+        // A requeue preserves the count and never downgrades it.
+        requeue_orderbook_publish_failure(order_id, 2, 1);
+        assert_eq!(
+            orderbook_publish_attempts(order_id),
+            Some(2),
+            "a requeue must not downgrade the consumed attempts"
+        );
+        requeue_orderbook_publish_failure(order_id, 2, 4);
+        assert_eq!(
+            orderbook_publish_attempts(order_id),
+            Some(4),
+            "a requeue must keep the highest attempt count seen"
+        );
+
+        // A success removes the entry: the next episode starts fresh.
+        clear_orderbook_publish_failure_up_to(order_id, 2);
+        assert_eq!(orderbook_publish_attempts(order_id), None);
+        mark_orderbook_publish_failed_at(order_id, 3);
+        assert_eq!(
+            orderbook_publish_attempts(order_id),
+            Some(1),
+            "a new failure after a success starts a fresh attempt budget"
+        );
+        clear_orderbook_publish_failure_up_to(order_id, 3);
     }
 
     // ───────────────── take-window gate ─────────────────

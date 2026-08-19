@@ -1109,9 +1109,18 @@ pub(crate) fn monotonic_order_event_timestamp(order_id: Uuid, candidate: Timesta
 /// orderbook's generation counter.
 ///
 /// Process-local by design, exactly as for orders: this daemon's key is the
-/// only legitimate publisher of its disputes' events, and two publishes for
-/// the same dispute on opposite sides of a restart cannot land in the same
-/// second in practice.
+/// only legitimate publisher of its disputes' events, so nothing outside
+/// this process can stamp a revision that has to be ordered against these.
+///
+/// A restart therefore drops the map, and the residual is bounded and
+/// accepted rather than persisted: a bump only ever pushes a revision one
+/// second past the previous one, so the map is "ahead" of wall clock only
+/// while a burst of revisions is being published inside a single second.
+/// Losing the state matters only if the daemon dies *and* comes back
+/// inside that window — a restart takes far longer than the fraction of a
+/// second it lasts. Persisting a value that is stale by construction (the
+/// relay may have rejected the revision it records) would buy no ordering
+/// guarantee the wall clock does not already give after a restart.
 static DISPUTE_EVENT_TIMESTAMPS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 

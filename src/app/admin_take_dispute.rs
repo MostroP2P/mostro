@@ -201,6 +201,36 @@ pub async fn admin_take_dispute_action(
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
+    // Get the creator of the dispute
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
+    };
+
+    // We create a tag to show status of the dispute
+    let tags = create_dispute_event_tags(
+        Status::InProgress.to_string(),
+        dispute_initiator,
+        dispute.created_at,
+        ctx.settings().mostro.name.as_deref(),
+    );
+    // nip33 kind with dispute id as identifier (kind 38386 for disputes).
+    //
+    // Built here, adjacent to the transition it advertises, rather than
+    // after the notifications below: `new_dispute_event` stamps the
+    // revision from the per-dispute monotonic registry, and relays resolve
+    // kind-38386 replacement by `created_at`, not by arrival order. Signing
+    // it three DM round-trips later would let a concurrent finalizer
+    // (`admin_settle_action`, `admin_cancel_action`) — which becomes
+    // reachable the moment the solver above is persisted — commit and stamp
+    // `settled` first, and this older `in-progress` would then claim the
+    // larger timestamp and replace the terminal status on relays. Stamping
+    // at the committed transition keeps timestamp order equal to state
+    // order; the send itself stays below and can arrive whenever.
+    let dispute_event = new_dispute_event(mostro_keys, "", dispute.id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+
     // Prepare payload for solver information message
     let dispute_info = prepare_solver_info_message(pool, &order, &dispute).await?;
 
@@ -255,28 +285,11 @@ pub async fn admin_take_dispute_action(
     .await
     .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // Get the creator of the dispute
-    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-        (true, false) => "seller",
-        (false, true) => "buyer",
-        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
-    };
-
-    // We create a tag to show status of the dispute
-    let tags = create_dispute_event_tags(
-        Status::InProgress.to_string(),
-        dispute_initiator,
-        dispute.created_at,
-        ctx.settings().mostro.name.as_deref(),
-    );
-    // nip33 kind with dispute id as identifier (kind 38386 for disputes)
-    let event = new_dispute_event(mostro_keys, "", dispute.id.to_string(), tags)
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    info!("Dispute event to be published: {event:#?}");
+    info!("Dispute event to be published: {dispute_event:#?}");
 
     let client = ctx.nostr_client();
     client
-        .send_event(&event)
+        .send_event(&dispute_event)
         .await
         .map_err(|e| {
             info!("Failed to send dispute {} status event: {}", dispute.id, e);
@@ -844,6 +857,77 @@ mod tests {
             Some(solver_keys.public_key().to_string())
         );
         assert!(stored.taken_at > 0);
+    }
+
+    /// Regression guard for the kind-38386 stamping order.
+    ///
+    /// `new_dispute_event` draws each revision's `created_at` from the
+    /// per-dispute monotonic registry, and relays resolve replacement by
+    /// that timestamp. So the stamp has to be taken where the transition is
+    /// committed, not after the notification round-trips below it: a
+    /// concurrent finalizer becomes reachable as soon as the solver is
+    /// persisted, and if it committed and stamped `settled` first, a
+    /// late-stamped `in-progress` would take the larger timestamp and
+    /// replace the terminal status on relays.
+    ///
+    /// The observation point here is a solver-payload failure: the order
+    /// carries an unparsable buyer pubkey, so the handler aborts right
+    /// after committing the take and before it would have stamped under
+    /// the old ordering. The dispute must already hold a registry entry by
+    /// then — a tiny candidate timestamp shows it, since an existing entry
+    /// bumps it and a missing one lets it through unchanged.
+    #[tokio::test]
+    async fn dispute_event_is_stamped_before_the_notification_round_trips() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let mostro_keys = Keys::generate();
+        let solver_keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        insert_solver(
+            &pool,
+            &solver_keys.public_key().to_string(),
+            SOLVER_CATEGORY_READ_WRITE,
+        )
+        .await;
+
+        let mut order = create_dispute_order(buyer, seller);
+        order.buyer_dispute = true;
+        // Aborts the handler between the commit and the notifications.
+        order.buyer_pubkey = Some("not-a-pubkey".to_string());
+        let order = order.create(&pool).await.unwrap();
+        let dispute = Dispute::new(order.id, Status::Active.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        let event = create_admin_event(solver_keys.public_key());
+        let result = admin_take_dispute_action(
+            &ctx,
+            take_dispute_msg(Some(dispute.id)),
+            &event,
+            &mostro_keys,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::InvalidPubkey))),
+            "expected the handler to abort on the unparsable buyer pubkey, got {result:?}"
+        );
+        // The take is committed: a concurrent finalizer is reachable from here.
+        let stored = Dispute::by_id(&pool, dispute.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, DisputeStatus::InProgress.to_string());
+
+        let probe = crate::util::monotonic_dispute_event_timestamp(
+            &dispute.id.to_string(),
+            Timestamp::from(1),
+        );
+        assert!(
+            probe.as_secs() > 1,
+            "taking a dispute must stamp its kind-38386 revision at the committed \
+             transition, not after the notification round-trips a concurrent \
+             finalizer can overtake"
+        );
     }
 
     #[tokio::test]

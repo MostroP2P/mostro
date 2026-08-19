@@ -64,7 +64,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-build
    ```
 
-   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The `config` root itself is set to `0700` as well, since `settings.toml` and `mostro.db` sit next to the credentials. All of them belong to the user that ran the command.
+   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The `config` root itself is set to `0700` as well, since `settings.toml` and `mostro.db` sit next to the credentials. The directories and files this command creates belong to the user who ran it; `mostro.db` is created later by the container and belongs to whoever `MOSTRO_CONTAINER_USER` names, uid/gid 1000 by default.
 
    The container runs as uid/gid 1000 by default, which matches the first user account on most hosts. If yours is not uid 1000, run the container as yourself instead of handing the config directory over — the daemon also writes `mostro.db` into it:
 
@@ -102,7 +102,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
 
    ```sh
    install -d -m 700 ~/mostro-config ~/mostro-config/lnd
-   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
+   curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
    chmod 600 ~/mostro-config/settings.toml
    ```
 
@@ -140,7 +140,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
 
 1. **Install Docker** on the VPS (e.g. [Docker Engine](https://docs.docker.com/engine/install/)).
 
-2. **Create a config directory** (e.g. `/opt/mostro` or `~/mostro-config`):
+2. **Create a config directory** at `/opt/mostro`:
 
    ```sh
    install -d -m 700 -o 1000 -g 1000 /opt/mostro
@@ -155,7 +155,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
    - Or download the template and copy it:
 
    ```sh
-   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
+   curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
    chmod 600 /opt/mostro/settings.toml
    chown 1000:1000 /opt/mostro/settings.toml
    ```

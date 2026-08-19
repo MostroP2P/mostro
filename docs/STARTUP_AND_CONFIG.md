@@ -205,9 +205,13 @@ There is **no** database password or separate global for SQLite; the daemon open
   Docker flows, the LND credentials under `lnd/`. Keep the directory at mode `0700` and
   the file at `0600`.
 - Both paths that create them do so already: `src/config/util.rs`, `fn create_settings_dir`
-  and `fn write_owner_only` for the non-interactive template copy, and
+  and `fn create_owner_only` for the non-interactive template copy, and
   `src/config/wizard.rs`, `fn run_setup_wizard` for the interactive one. A directory or
   file created outside the daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so
   the deployment guides use `install -d -m 700` and `install -m 600`.
 - An existing settings directory is left as it is, so a deliberately group-readable
   deployment keeps working.
+- The template copy is created with `O_CREAT | O_EXCL` and refuses to start if anything
+  already occupies `settings.toml`. On a settings directory another local account can
+  write to, following a symlink planted between the existence check and the create would
+  truncate its target and reset that target's mode to `0600`.

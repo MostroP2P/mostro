@@ -151,12 +151,20 @@ fn create_settings_dir(settings_dir: &std::path::Path) -> Result<(), MostroError
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))
 }
 
-/// Write `contents` to `path` with owner-only permissions (`0600` on Unix).
+/// Create `path` and write `contents` to it with owner-only permissions
+/// (`0600` on Unix). Fails if anything already exists at `path`.
 ///
-/// `OpenOptionsExt::mode` only applies when the file is created, so the mode is
-/// also set explicitly afterwards: the caller checks for the file's absence
-/// first, and another process could create it in between.
-fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> Result<(), MostroError> {
+/// `create_new` maps to `O_CREAT | O_EXCL`, which POSIX requires to fail with
+/// `EEXIST` when the path names a symbolic link, whatever it points at. The
+/// caller only reaches this after finding no settings file, but that check and
+/// this call cannot be one operation: on a settings directory another local
+/// account can write to, a symlink planted in between would otherwise have its
+/// target truncated and its mode reset to `0600` by the two steps below.
+///
+/// `OpenOptionsExt::mode` is also masked by the process umask, so the mode is
+/// set again through the file descriptor — never through the path, which would
+/// reintroduce the symlink it just refused to follow.
+fn create_owner_only(path: &std::path::Path, contents: &[u8]) -> Result<(), MostroError> {
     use std::io::Write;
 
     #[cfg(unix)]
@@ -164,18 +172,22 @@ fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> Result<(), Mostr
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
     };
     #[cfg(not(unix))]
     let file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path);
-    let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    let mut file = file.map_err(|e| {
+        MostroInternalErr(ServiceError::IOError(format!(
+            "Could not create {}: {}",
+            path.display(),
+            e
+        )))
+    })?;
 
     #[cfg(unix)]
     {
@@ -221,7 +233,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             wizard::run_setup_menu(&settings_dir, &config_file_path)?
         } else {
             // Non-interactive (Docker, CI, systemd): copy template and exit
-            write_owner_only(&config_file_path, include_bytes!("../../settings.tpl.toml"))?;
+            create_owner_only(&config_file_path, include_bytes!("../../settings.tpl.toml"))?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
                 config_file_path.display()
@@ -695,7 +707,7 @@ mod owner_only_tests {
     fn template_is_written_owner_only() {
         let root = temp_root("file");
         let config_file = root.join("settings.toml");
-        write_owner_only(&config_file, b"nsec_privkey = 'nsec1...'\n").expect("write template");
+        create_owner_only(&config_file, b"nsec_privkey = 'nsec1...'\n").expect("write template");
         assert_eq!(mode_of(&config_file), 0o600);
         assert_eq!(
             std::fs::read_to_string(&config_file).expect("read back"),
@@ -704,18 +716,59 @@ mod owner_only_tests {
     }
 
     #[test]
-    fn writing_tightens_a_preexisting_broader_file() {
+    fn a_preexisting_file_is_refused_instead_of_truncated() {
         let root = temp_root("file-existing");
         let config_file = root.join("settings.toml");
-        std::fs::write(&config_file, "stale contents that must be truncated").expect("seed file");
+        std::fs::write(&config_file, "operator contents").expect("seed file");
         std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o644))
             .expect("loosen permissions");
-        write_owner_only(&config_file, b"fresh\n").expect("write template");
-        assert_eq!(mode_of(&config_file), 0o600);
+        assert!(create_owner_only(&config_file, b"fresh\n").is_err());
+        // Neither the contents nor the mode of what was already there change.
         assert_eq!(
             std::fs::read_to_string(&config_file).expect("read back"),
-            "fresh\n"
+            "operator contents"
         );
+        assert_eq!(mode_of(&config_file), 0o644);
+    }
+
+    #[test]
+    fn a_symlink_in_the_settings_path_is_refused_and_its_target_untouched() {
+        let root = temp_root("file-symlink");
+        let victim = root.join("victim");
+        std::fs::write(&victim, "victim contents").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
+            .expect("set victim mode");
+
+        // What another local account could plant in a settings directory it can
+        // write to, in the window between the caller's existence check and this
+        // call. Following it would truncate the victim and reset it to 0600.
+        let config_file = root.join("settings.toml");
+        std::os::unix::fs::symlink(&victim, &config_file).expect("plant symlink");
+
+        assert!(create_owner_only(&config_file, b"template\n").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read back"),
+            "victim contents"
+        );
+        assert_eq!(mode_of(&victim), 0o644);
+        // The symlink itself is left in place; nothing was written through it.
+        assert!(std::fs::symlink_metadata(&config_file)
+            .expect("symlink metadata")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_refused_rather_than_created_through() {
+        let root = temp_root("file-dangling");
+        let config_file = root.join("settings.toml");
+        // `Path::exists` follows symlinks, so the caller's check reports false
+        // here and this call is what has to refuse.
+        std::os::unix::fs::symlink(root.join("does-not-exist"), &config_file)
+            .expect("plant dangling symlink");
+        assert!(!config_file.exists());
+        assert!(create_owner_only(&config_file, b"template\n").is_err());
+        assert!(!root.join("does-not-exist").exists());
     }
 
     #[test]
@@ -725,6 +778,6 @@ mod owner_only_tests {
         // error branch instead of silently succeeding.
         let config_file = root.join("settings.toml");
         std::fs::create_dir(&config_file).expect("create dir in the file's place");
-        assert!(write_owner_only(&config_file, b"x").is_err());
+        assert!(create_owner_only(&config_file, b"x").is_err());
     }
 }

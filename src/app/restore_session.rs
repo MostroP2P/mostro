@@ -74,7 +74,9 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
             tracing::error!("Restore session result channel closed unexpectedly");
         }
         Err(_) => {
-            tracing::error!("Restore session timed out after 1 hour");
+            tracing::error!(
+                "Restore session timed out after {RESTORE_SESSION_TIMEOUT_SECS} seconds"
+            );
             // Send timeout message to user
             if let Err(e) = send_restore_session_timeout(&trade_key).await {
                 tracing::error!("Failed to send timeout message: {}", e);

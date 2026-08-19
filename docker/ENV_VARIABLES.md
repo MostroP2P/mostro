@@ -10,7 +10,7 @@ This document describes the environment variables used by the Docker setup.
 - `LND_MACAROON_FILE`: Path to the LND admin macaroon file on your host system
   - Example: `~/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon`
 
-These files are copied to `docker/config/lnd/` during the build process: the cert with mode `0644`, the admin macaroon with mode `0600`, both inside a directory with mode `0700`. The macaroon grants full control of your LND node, so it is never left readable by other users on the host.
+These files are copied to `docker/config/lnd/` during the build process: the cert with mode `0644`, the admin macaroon with mode `0600`, both inside a directory with mode `0700`. The macaroon grants full control of your LND node, so it is never left readable by other users on the host. The `docker/config` root is set to mode `0700` as well, since `settings.toml` (which carries `nsec_privkey`) and `mostro.db` live beside the credentials.
 
 The copies belong to the user that ran the command, and the container runs as uid/gid 1000 by default. If your user is not uid 1000, run the container as yourself with the optional variable below rather than handing the config directory over to uid 1000.
 

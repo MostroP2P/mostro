@@ -92,10 +92,11 @@ adduser --disabled-login mostro  # keep pressing enter until it ends
 cd /opt/mostro
 ```
 
-Create a new settings file from `/opt/mostro/mostro/settings.tpl.toml` and save it to `/opt/mostro`:
+Create a new settings file from `/opt/mostro/mostro/settings.tpl.toml` and save it to `/opt/mostro`. `/opt/mostro` holds `settings.toml`, whose `nsec_privkey` is the daemon's identity, and the `mostro.db` created later, so both the directory and the file are restricted to the service account — `install -m` rather than `cp`, which keeps whatever mode the template happens to have:
 
 ```bash
-cp /opt/mostro/mostro/settings.tpl.toml /opt/mostro/settings.toml
+install -d -m 700 -o mostro -g mostro /opt/mostro
+install -m 600 -o mostro -g mostro /opt/mostro/mostro/settings.tpl.toml /opt/mostro/settings.toml
 ```
 
 Update the file `/opt/mostro/settings.toml` with your favourite editor.
@@ -144,7 +145,7 @@ Check the DB files are there
 
 ```bash
 ls -al /opt/mostro
-drwxrwxr-x root root 4.0 KB Fri Jun 14 15:52:07 2024 .
+drwx------ mostro mostro 4.0 KB Fri Jun 14 15:52:07 2024 .
 drwxr-x--- root root 4.0 KB Sat Jun 15 15:50:32 2024 ..
 .rw-r--r-- root root  52 KB Fri May 31 16:35:34 2024 mostro.db
 .rw-r--r-- root root  32 KB Sat Jun 15 15:28:23 2024 mostro.db-shm

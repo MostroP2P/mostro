@@ -29,9 +29,10 @@ Before settings initialization, the daemon performs (see `src/main.rs`):
 ### Settings Initialization Details
 
 **Directory setup**:
-- Creates `~/.mostro/` directory if not exists
+- Creates `~/.mostro/` directory if not exists, owner-only (mode `0700` on Unix)
 - Checks for existing `~/.mostro/settings.toml`
-- If missing: copies `settings.tpl.toml` to `~/.mostro/settings.toml`
+- If missing: copies `settings.tpl.toml` to `~/.mostro/settings.toml`, owner-only
+  (mode `0600` on Unix), since the file receives `nsec_privkey` once edited
 - On first run after creating the file, the process exits so the user can edit `settings.toml`, then restart Mostro.
 - Overrides database URL: `~/.mostro/mostro.db`
 **Settings loading**:
@@ -108,7 +109,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
     the node, including the funds escrowed in Mostro's hold invoices. Keep it
     readable only by the user running `mostrod` (`chmod 600`).
   - At startup (Lightning mode only, right before the LND connection is opened)
-    `config::permissions::warn_if_other_accessible` logs a warning when the
+    `src/config/permissions.rs`, `fn warn_if_other_accessible` logs a warning when the
     file's `other` permission bits are set, and suggests `chmod o=`. The check
     is advisory — the daemon still starts — and tolerates `0640`, the mode LND
     itself writes the macaroon with, so reading it through the node's group
@@ -199,3 +200,14 @@ There is **no** database password or separate global for SQLite; the daemon open
 ## Security
 - Do not commit populated `settings.toml`.
 - Keep templates in `settings.tpl.toml`; place runtime config at `~/.mostro/settings.toml`.
+- `settings.toml` carries `nsec_privkey` in plaintext unless it is supplied through
+  `MOSTRO_NSEC_PRIVKEY`, and the settings directory also holds `mostro.db` and, in the
+  Docker flows, the LND credentials under `lnd/`. Keep the directory at mode `0700` and
+  the file at `0600`.
+- Both paths that create them do so already: `src/config/util.rs`, `fn create_settings_dir`
+  and `fn write_owner_only` for the non-interactive template copy, and
+  `src/config/wizard.rs`, `fn run_setup_wizard` for the interactive one. A directory or
+  file created outside the daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so
+  the deployment guides use `install -d -m 700` and `install -m 600`.
+- An existing settings directory is left as it is, so a deliberately group-readable
+  deployment keeps working.

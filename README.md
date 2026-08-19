@@ -443,9 +443,10 @@ cargo build --release
 # Install to system
 sudo install target/release/mostrod /usr/local/bin
 
-# Setup configuration
-mkdir -p ~/.mostro
-cp settings.tpl.toml ~/.mostro/settings.toml
+# Setup configuration (0700/0600: settings.toml holds nsec_privkey, and
+# mostro.db lands in the same directory)
+install -d -m 700 ~/.mostro
+install -m 600 settings.tpl.toml ~/.mostro/settings.toml
 # Edit ~/.mostro/settings.toml (see Configuration section)
 
 # Initialize database (optional — mostrod also migrates on first connect)
@@ -479,9 +480,10 @@ Best for: Local testing, development environments, quick experiments
 git clone https://github.com/MostroP2P/mostro.git
 cd mostro
 
-# Setup configuration
-mkdir -p docker/config
-cp settings.tpl.toml docker/config/settings.toml
+# Setup configuration (0700/0600: the config dir ends up holding nsec_privkey,
+# the LND credentials and mostro.db)
+install -d -m 700 docker/config
+install -m 600 settings.tpl.toml docker/config/settings.toml
 # Edit docker/config/settings.toml
 
 # Build and run (provide LND paths as environment variables)
@@ -495,7 +497,7 @@ This starts:
 - Mostro daemon (exposed via configured relays)
 - Local Nostr relay (port 7000 by default)
 
-`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node. The container runs as uid/gid 1000 by default; if your user is not uid 1000, `export MOSTRO_CONTAINER_USER=$(id -u):$(id -g)` so it runs as you and can read the macaroon.
+`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node, and sets `docker/config` and `docker/config/lnd` to mode `0700` — the same directory holds `settings.toml` and `mostro.db`. The container runs as uid/gid 1000 by default; if your user is not uid 1000, `export MOSTRO_CONTAINER_USER=$(id -u):$(id -g)` so it runs as you and can read those files.
 
 **Stop**: `make docker-down`
 
@@ -593,6 +595,8 @@ rana --vanity mostro
 ```
 
 **Important**: Never reuse keys between Mostro instances. Each daemon needs a unique identity.
+
+**Permissions**: `settings.toml` holds `nsec_privkey` in plaintext unless you move it to the environment (see below), and `mostro.db` sits in the same directory. Keep both owner-only: `chmod 700` on the settings directory and `chmod 600` on `settings.toml`. mostrod already creates them that way when it has to — both through the interactive setup wizard and through the template copy it makes on a non-interactive first run — but a directory or file you create yourself with `mkdir`, `cp` or `curl` inherits your umask instead, so use `install -d -m 700` and `install -m 600`.
 
 ##### Providing the nsec via environment variable
 

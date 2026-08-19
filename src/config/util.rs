@@ -129,6 +129,65 @@ fn validate_cashu_settings(
     Ok(())
 }
 
+/// Create the settings directory owner-only (`0700` on Unix).
+///
+/// The directory holds `settings.toml` with a plaintext `nsec_privkey`, the
+/// `mostro.db` database and, in the Docker flows, the LND credentials under
+/// `lnd/`. `create_dir_all` would apply the process umask instead, which on a
+/// typical host leaves the directory at `0755`.
+///
+/// Only directories this call creates are affected: an operator who already set
+/// up the directory with deliberate group access keeps it.
+fn create_settings_dir(settings_dir: &std::path::Path) -> Result<(), MostroError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(settings_dir)
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))
+}
+
+/// Write `contents` to `path` with owner-only permissions (`0600` on Unix).
+///
+/// `OpenOptionsExt::mode` only applies when the file is created, so the mode is
+/// also set explicitly afterwards: the caller checks for the file's absence
+/// first, and another process could create it in between.
+fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> Result<(), MostroError> {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path);
+    let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+    }
+
+    file.write_all(contents)
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))
+}
+
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
@@ -147,8 +206,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
     // Check if /.mostro directory exists
     if !settings_dir.exists() {
-        std::fs::create_dir_all(&settings_dir)
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        create_settings_dir(&settings_dir)?;
     }
 
     // Load `<settings_dir>/.env` so MOSTRO_NSEC_PRIVKEY (and any future env
@@ -163,8 +221,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             wizard::run_setup_menu(&settings_dir, &config_file_path)?
         } else {
             // Non-interactive (Docker, CI, systemd): copy template and exit
-            std::fs::write(&config_file_path, include_bytes!("../../settings.tpl.toml"))
-                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            write_owner_only(&config_file_path, include_bytes!("../../settings.tpl.toml"))?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
                 config_file_path.display()
@@ -580,5 +637,94 @@ mod init_configuration_file_tests {
         std::fs::write(dir.join("settings.toml"), tampered).expect("write settings.toml");
         let result = init_configuration_file(Some(dir.to_string_lossy().into_owned()));
         assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owner_only_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mostro-owner-only-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn settings_dir_is_created_owner_only() {
+        let root = temp_root("dir");
+        let settings_dir = root.join(".mostro");
+        create_settings_dir(&settings_dir).expect("create settings dir");
+        assert_eq!(mode_of(&settings_dir), 0o700);
+    }
+
+    #[test]
+    fn settings_dir_creation_is_recursive_and_owner_only() {
+        let root = temp_root("dir-nested");
+        let settings_dir = root.join("nested").join(".mostro");
+        create_settings_dir(&settings_dir).expect("create nested settings dir");
+        assert_eq!(mode_of(&settings_dir), 0o700);
+        assert_eq!(mode_of(&root.join("nested")), 0o700);
+    }
+
+    #[test]
+    fn settings_dir_creation_leaves_an_existing_directory_alone() {
+        let root = temp_root("dir-existing");
+        let settings_dir = root.join(".mostro");
+        std::fs::create_dir(&settings_dir).expect("create settings dir");
+        std::fs::set_permissions(&settings_dir, std::fs::Permissions::from_mode(0o750))
+            .expect("loosen permissions");
+        // `recursive(true)` makes this a no-op rather than an error, and a
+        // deliberate group-readable directory must survive it.
+        create_settings_dir(&settings_dir).expect("existing directory is not an error");
+        assert_eq!(mode_of(&settings_dir), 0o750);
+    }
+
+    #[test]
+    fn template_is_written_owner_only() {
+        let root = temp_root("file");
+        let config_file = root.join("settings.toml");
+        write_owner_only(&config_file, b"nsec_privkey = 'nsec1...'\n").expect("write template");
+        assert_eq!(mode_of(&config_file), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&config_file).expect("read back"),
+            "nsec_privkey = 'nsec1...'\n"
+        );
+    }
+
+    #[test]
+    fn writing_tightens_a_preexisting_broader_file() {
+        let root = temp_root("file-existing");
+        let config_file = root.join("settings.toml");
+        std::fs::write(&config_file, "stale contents that must be truncated").expect("seed file");
+        std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions");
+        write_owner_only(&config_file, b"fresh\n").expect("write template");
+        assert_eq!(mode_of(&config_file), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&config_file).expect("read back"),
+            "fresh\n"
+        );
+    }
+
+    #[test]
+    fn writing_to_an_unwritable_path_is_an_error() {
+        let root = temp_root("file-error");
+        // A directory cannot be opened for writing, so this exercises the
+        // error branch instead of silently succeeding.
+        let config_file = root.join("settings.toml");
+        std::fs::create_dir(&config_file).expect("create dir in the file's place");
+        assert!(write_owner_only(&config_file, b"x").is_err());
     }
 }

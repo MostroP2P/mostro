@@ -33,9 +33,11 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
    ```sh
    cd docker
-   mkdir -p config
-   cp ../settings.tpl.toml config/settings.toml
+   install -d -m 700 config
+   install -m 600 ../settings.tpl.toml config/settings.toml
    ```
+
+   Mode `0700` on `config` and `0600` on `settings.toml` because that directory ends up holding every secret this deployment has: `nsec_privkey` in `settings.toml`, the LND credentials in `config/lnd/`, and the `mostro.db` the daemon writes. `install -d -m 700` also tightens a `config` directory an earlier `mkdir -p` left at `0755`.
 
    _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file. Note that paths in `settings.toml` refer to paths **inside the container**, so use `/config/lnd/tls.cert` and `/config/lnd/admin.macaroon` for the LND certificate and macaroon files (these will be copied there by `make docker-build`)._
 
@@ -62,7 +64,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-build
    ```
 
-   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. Both belong to the user that ran the command.
+   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The `config` root itself is set to `0700` as well, since `settings.toml` and `mostro.db` sit next to the credentials. All of them belong to the user that ran the command.
 
    The container runs as uid/gid 1000 by default, which matches the first user account on most hosts. If yours is not uid 1000, run the container as yourself instead of handing the config directory over — the daemon also writes `mostro.db` into it:
 
@@ -99,12 +101,14 @@ You can run the plain Mostro image without building locally. Use a single **conf
    **Option A — download the template** (from the [settings.tpl.toml](https://github.com/MostroP2P/mostro/blob/main/settings.tpl.toml) repo file):
 
    ```sh
-   mkdir -p ~/mostro-config
-   install -d -m 700 ~/mostro-config/lnd
+   install -d -m 700 ~/mostro-config ~/mostro-config/lnd
    curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
+   chmod 600 ~/mostro-config/settings.toml
    ```
 
-   **Option B — use the entrypoint default:** run the container once with an empty config dir; the entrypoint copies a default `settings.toml` (from the image, built from `settings.tpl.toml`) into `/config`. Stop the container, edit the file on the host (e.g. `~/mostro-config/settings.toml`), then start the container again.
+   The config root is `0700` and `settings.toml` is `0600` because both `nsec_privkey` and, later, `mostro.db` live there. `curl` creates the file under your umask, typically `0644`, so the mode has to be set afterwards.
+
+   **Option B — use the entrypoint default:** create the config dir with `install -d -m 700 ~/mostro-config ~/mostro-config/lnd`, then run the container once against it; the entrypoint installs a default `settings.toml` (from the image, built from `settings.tpl.toml`) into `/config` with mode `0600`. Stop the container, edit the file on the host (e.g. `~/mostro-config/settings.toml`), then start the container again.
 
 2. Copy your LND TLS cert and macaroon into the config dir (so they appear at `/config/lnd/` in the container). Use `install` rather than `cp`: `cp` keeps whatever mode the source file (or an already existing destination file) happens to have, while `install -m` sets the mode explicitly. The admin macaroon grants full control of your LND node, so it must not be readable by other users on the host:
 
@@ -139,20 +143,24 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
 2. **Create a config directory** (e.g. `/opt/mostro` or `~/mostro-config`):
 
    ```sh
-   install -d -o 1000 -g 1000 /opt/mostro
+   install -d -m 700 -o 1000 -g 1000 /opt/mostro
    install -d -m 700 -o 1000 -g 1000 /opt/mostro/lnd
    ```
 
-   These steps run as root, while the container runs as uid/gid 1000, so both directories are handed to the container's user: it needs to write `mostro.db` into the config directory, and the `lnd` subdirectory is created owner-only because of what goes in it (step 4).
+   These steps run as root, while the container runs as uid/gid 1000, so both directories are handed to the container's user: it needs to write `mostro.db` into the config directory. Both are owner-only because of what goes in them — `nsec_privkey` in `settings.toml` and the database in the config root, the LND credentials in `lnd` (step 4).
 
 3. **Get the settings template** into that directory as `settings.toml`:
 
-   - Either run the container once with an empty config dir; the entrypoint will copy the default template to `/config/settings.toml`. Stop the container, then edit the file on the host.
+   - Either run the container once with an empty config dir; the entrypoint installs the default template at `/config/settings.toml` with mode `0600`. Stop the container, then edit the file on the host.
    - Or download the template and copy it:
 
    ```sh
    curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
+   chmod 600 /opt/mostro/settings.toml
+   chown 1000:1000 /opt/mostro/settings.toml
    ```
+
+   `curl` writes the file under root's umask, typically `0644` and root-owned, so the mode and the owner have to be set afterwards: the file receives `nsec_privkey` in step 5, and the container reads it as uid/gid 1000.
 
 4. **Put LND files** in the config dir so they appear at `/config/lnd/` in the container. Use `install -m` rather than `cp`, which would keep whatever mode the source file (or an already existing destination file) happens to have:
 

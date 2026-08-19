@@ -4,7 +4,7 @@ VERSION := $(shell grep "^version = " Cargo.toml | sed "s/version = \"\(.*\)\"/\
 docker-build:
 	@set -o pipefail; \
 	cd docker && \
-	install -d -m 700 config/lnd && \
+	install -d -m 700 config config/lnd && \
 	echo "Checking LND files..." && \
 	echo "LND_CERT_FILE=$${LND_CERT_FILE}" && \
 	echo "LND_MACAROON_FILE=$${LND_MACAROON_FILE}" && \
@@ -30,6 +30,7 @@ docker-build:
 	install -m 644 "$${LND_CERT_FILE}" config/lnd/tls.cert && \
 	install -m 600 "$${LND_MACAROON_FILE}" config/lnd/admin.macaroon && \
 	echo "Wrote config/lnd/tls.cert (mode 644) and config/lnd/admin.macaroon (mode 600)" && \
+	echo "config and config/lnd are mode 700: settings.toml holds nsec_privkey and mostro.db lands there too" && \
 	echo "Note: the container runs as uid/gid 1000 by default. If your user is not uid 1000," && \
 	echo '      export MOSTRO_CONTAINER_USER=$$(id -u):$$(id -g) before make docker-up' && \
 	echo "Building docker image" && \
@@ -39,6 +40,7 @@ docker-up:
 	@set -o pipefail; \
 	cd docker && \
 	echo "Copying Nostr relay config" && \
+	install -d -m 700 config && \
 	mkdir -p config/relay && \
 	cp -v ./relay_config.toml config/relay/config.toml && \
 	echo "Starting services" && \
@@ -48,6 +50,7 @@ docker-relay-up:
 	@set -o pipefail; \
 	cd docker && \
 	echo "Copying Nostr relay config" && \
+	install -d -m 700 config && \
 	mkdir -p config/relay && \
 	cp -v ./relay_config.toml config/relay/config.toml && \
 	echo "Starting Nostr relay" && \

@@ -246,7 +246,10 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   per the "no reply for dropped events" rule the sender never learns why.
   Verifying first costs one Schnorr check on events the gate would have
   dropped, and still runs entirely before the NIP-44 decrypt the gate exists
-  to protect.
+  to protect. The check is transport-agnostic and applies to v1 gift wraps
+  too, where it is the daemon's *only* outer-event check: `unwrap_incoming`
+  re-verifies the event on the v2 path alone, while `nip59::unwrap_message`
+  verifies the seal's signature and never the outer wrap.
 - **Discoverability** (`src/nip33.rs`): the kind-38385 info event carries a
   `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
   reply — it never reaches a handler — so the info event is the only way a

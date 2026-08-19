@@ -335,8 +335,13 @@ async fn accept_event(
     // the victim's id. Verifying here (cheap Schnorr, pre-decrypt) is what
     // makes the spam gate's dedup safe: only ids that are provably the
     // author's own are ever recorded, so a forged copy cannot get the genuine
-    // event dropped as a replay. `unwrap_incoming` re-checks the signature for
-    // both transports; this is the daemon's own gate, not a substitute.
+    // event dropped as a replay.
+    //
+    // It is also the only outer-event check on the v1 path: `unwrap_incoming`
+    // re-verifies the event itself on v2 only (`unwrap_message_nip44` calls
+    // `event.verify()`), while v1's `nip59::unwrap_message` decrypts the wrap
+    // and verifies the *seal's* signature alone — never the outer gift wrap's
+    // id or signature. Do not delete this as redundant.
     if event.verify().is_err() {
         tracing::warn!("Dropping event {} with an invalid signature", event.id);
         return None;
@@ -455,6 +460,24 @@ async fn finalize_dispatch(
     }
 }
 
+/// Resolve the anti-spam gate for a transport, once per event loop.
+///
+/// The gate applies to the v2 (kind-14) transport only: there the visible
+/// author is the trade key, so the daemon can pre-validate before decrypting.
+/// `None` fail-opens — v1 gift wraps (throwaway outer key, no pre-validatable
+/// signal) or no gate installed. Shared by `run` and `run_cashu` so the single
+/// v2-only policy cannot drift between the two loops.
+///
+/// `install_spam_gate` (`main.rs`) runs before both loops, so the `OnceLock`
+/// load is loop-invariant and stays out of the per-event path.
+fn gate_for(is_v2: bool) -> Option<&'static SpamGate> {
+    if is_v2 {
+        SpamGate::global()
+    } else {
+        None
+    }
+}
+
 /// Main event loop that processes incoming Nostr events.
 /// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
 ///
@@ -479,15 +502,13 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // clear `pow_first_contact`; known active-trade keys need only `pow`. The
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
 
     loop {
         let mut notifications = client.notifications();
 
         while let Some(notification) = notifications.next().await {
             if let ClientNotification::Event { event, .. } = notification {
-                // The gate is v2-only; `None` fail-opens (v1, or not installed).
-                let gate = if is_v2 { SpamGate::global() } else { None };
                 let Some((action, message, unwrapped)) = accept_event(
                     &ctx,
                     &event,
@@ -532,15 +553,13 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     #[allow(deprecated)]
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
 
     loop {
         let mut notifications = client.notifications();
 
         while let Some(notification) = notifications.next().await {
             if let ClientNotification::Event { event, .. } = notification {
-                // The gate is v2-only; `None` fail-opens (v1, or not installed).
-                let gate = if is_v2 { SpamGate::global() } else { None };
                 let Some((action, message, unwrapped)) = accept_event(
                     &ctx,
                     &event,
@@ -727,7 +746,7 @@ mod tests {
     mod accept_event_ordering_tests {
         use super::*;
         use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
-        use mostro_core::nip59::WrapOptions;
+        use mostro_core::nip59::{wrap_message, WrapOptions};
         use mostro_core::transport::wrap_message_nip44;
 
         /// A protocol-v2 (kind 14) event addressed to `mostro`, in full-privacy
@@ -816,8 +835,7 @@ mod tests {
 
         #[tokio::test]
         async fn invalid_signature_is_dropped_without_a_gate() {
-            // v1 gift wraps and un-installed gates take the `None` path; the
-            // signature check must reject there too.
+            // The `None` path — no gate installed — must still reject.
             let ctx = create_migrated_ctx().await;
             let mostro = create_test_keys();
             let forged = with_tampered_signature(&v2_event(&mostro));
@@ -833,6 +851,58 @@ mod tests {
             )
             .await;
             assert!(accepted.is_none());
+        }
+
+        /// A protocol-v1 gift wrap addressed to `mostro`, in full-privacy mode
+        /// (trade key doubles as identity).
+        async fn v1_event(mostro: &Keys) -> Event {
+            let trade = create_test_keys();
+            let message = create_test_message(Action::FiatSent, None);
+            wrap_message(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .await
+            .expect("wrap gift wrap event")
+        }
+
+        /// The v1 path takes `gate = None` and `nip59::unwrap_message` never
+        /// checks the outer event, so `accept_event`'s own `verify()` is the
+        /// only thing standing between a malformed gift wrap and the decrypt.
+        /// The second assertion is the one that pins the behaviour change:
+        /// well-formed gift wraps still go through.
+        #[tokio::test]
+        async fn v1_gift_wrap_with_invalid_signature_is_dropped() {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let genuine = v1_event(&mostro).await;
+            let forged = with_tampered_signature(&genuine);
+
+            assert!(
+                accept_event(&ctx, &forged, &mostro, 0, 0, NostrKind::GiftWrap, None)
+                    .await
+                    .is_none(),
+                "a gift wrap with an invalid signature must be dropped"
+            );
+            assert!(
+                accept_event(&ctx, &genuine, &mostro, 0, 0, NostrKind::GiftWrap, None)
+                    .await
+                    .is_some(),
+                "a well-formed gift wrap must still be accepted"
+            );
+        }
+
+        /// The v2-only policy lives in one place now; both event loops read it
+        /// from here, so this is where it gets covered.
+        #[test]
+        fn gate_applies_to_v2_only() {
+            assert!(gate_for(false).is_none(), "v1 must fail open");
+            // `SpamGate::global()` is `None` unless `install_spam_gate` ran, so
+            // the v2 arm can only be pinned against the installed state.
+            assert_eq!(gate_for(true).is_some(), SpamGate::global().is_some());
         }
     }
 

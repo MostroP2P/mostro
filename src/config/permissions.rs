@@ -80,6 +80,13 @@ fn other_accessible_mode(_path: &Path) -> Option<u32> {
 ///
 /// Only directories this call creates are affected: an operator who already set
 /// up the directory with deliberate group access keeps it.
+///
+/// The recursive builder resolves symlinked components on the way, unlike
+/// `create_owner_only` for the final file. That is deliberate: symlinking a
+/// config directory onto another volume is a legitimate setup, and planting a
+/// link on the default `~/.mostro` path takes write access to `$HOME`, which
+/// already owns the account. A settings directory that is itself a symlink to
+/// an existing directory never reaches here — the caller finds it and uses it.
 pub(crate) fn create_settings_dir(settings_dir: &Path) -> Result<(), MostroError> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);

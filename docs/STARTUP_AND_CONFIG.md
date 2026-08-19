@@ -222,3 +222,11 @@ There is **no** database password or separate global for SQLite; the daemon open
 - It is not a check on startup as a whole. A `settings.toml` that already exists is read
   and loaded normally, symlink or not — `fn init_configuration_file` only reaches the
   creation path when it finds no settings file at all.
+- The guarantee covers the final entry, not the directory path leading to it.
+  `fn create_settings_dir` uses a recursive `DirBuilder`, which resolves symlinked
+  components on the way, so a settings directory reached through a symlinked parent is
+  created at whatever that link points to. This is deliberate: operators do symlink a
+  config directory onto another volume, and planting such a link on the default
+  `~/.mostro` path means write access to `$HOME`, which is a compromise of the account
+  already. A settings directory that is itself a symlink to an existing directory is used
+  as-is, and a dangling one is refused.

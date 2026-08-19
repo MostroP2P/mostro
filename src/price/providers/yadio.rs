@@ -47,7 +47,9 @@ impl YadioProvider {
             .btc
             .into_iter()
             .filter_map(|(code, value)| match value {
-                Some(v) if v.is_finite() && v > 0.0 => Some((code.to_uppercase(), Quote::PerBtc(v))),
+                Some(v) if v.is_finite() && v > 0.0 => {
+                    Some((code.to_uppercase(), Quote::PerBtc(v)))
+                }
                 _ => None,
             })
             .collect())
@@ -117,7 +119,10 @@ mod tests {
         let quotes = YadioProvider::parse(body).unwrap();
         assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(75_000.0)));
         assert_eq!(quotes.get("EUR"), Some(&Quote::PerBtc(65_000.0)));
-        assert!(!quotes.contains_key("usd"), "raw lowercase key must not survive");
+        assert!(
+            !quotes.contains_key("usd"),
+            "raw lowercase key must not survive"
+        );
     }
 
     #[test]

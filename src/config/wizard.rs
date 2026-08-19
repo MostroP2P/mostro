@@ -9,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
+use super::permissions::create_owner_only;
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -43,8 +44,7 @@ pub fn run_setup_menu(
             Ok(settings)
         }
         _ => {
-            std::fs::write(config_file_path, TEMPLATE_BYTES)
-                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            create_owner_only(config_file_path, TEMPLATE_BYTES)?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
                 config_file_path.display()
@@ -79,32 +79,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         price: None,
     };
 
-    let toml_content = toml::to_string_pretty(&settings)
-        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-
-    {
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(config_file_path)
-        };
-        #[cfg(not(unix))]
-        let file = {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(config_file_path)
-        };
-        let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        file.write_all(toml_content.as_bytes())
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    }
+    save_settings(config_file_path, &settings)?;
 
     println!("\nConfiguration saved to {}\n", config_file_path.display());
 
@@ -253,6 +228,20 @@ fn prompt_nsec_storage(
     );
 
     Ok(nsec_in_toml)
+}
+
+/// Serialize `settings` and create `config_file_path` from it, owner-only.
+///
+/// Shares `create_owner_only` with the manual template copy here and the
+/// non-interactive one in `config::util`, so every path that brings an initial
+/// `settings.toml` into existence gets the same mode and the same refusal to
+/// follow a symlink — this file is about to hold `nsec_privkey`.
+fn save_settings(config_file_path: &Path, settings: &Settings) -> Result<(), MostroError> {
+    let toml_content = Zeroizing::new(
+        toml::to_string_pretty(settings)
+            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?,
+    );
+    create_owner_only(config_file_path, toml_content.as_bytes())
 }
 
 /// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path with 0o600 permissions on Unix.
@@ -512,5 +501,110 @@ mod tests {
         assert_eq!(contents, format!("{}=nsec1replaced\n", NSEC_ENV_VAR));
         #[cfg(unix)]
         assert_eq!(mode_of(&env_path), 0o600);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod save_settings_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mostro-wizard-save-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn sample_settings() -> Settings {
+        Settings {
+            database: DatabaseSettings::default(),
+            lightning: LightningSettings::default(),
+            nostr: NostrSettings {
+                nsec_privkey: "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
+                    .to_string()
+                    .into(),
+                relays: vec!["wss://relay.mostro.network".to_string()],
+            },
+            mostro: MostroSettings::default(),
+            rpc: RpcSettings::default(),
+            expiration: None,
+            anti_abuse_bond: None,
+            cashu: None,
+            price: None,
+        }
+    }
+
+    #[test]
+    fn wizard_save_creates_the_file_owner_only() {
+        let root = temp_root("ok");
+        let config_file = root.join("settings.toml");
+        save_settings(&config_file, &sample_settings()).expect("save settings");
+        assert_eq!(mode_of(&config_file), 0o600);
+        let written = std::fs::read_to_string(&config_file).expect("read back");
+        assert!(written.contains("nsec_privkey"));
+    }
+
+    #[test]
+    fn wizard_save_refuses_a_preexisting_file() {
+        let root = temp_root("existing");
+        let config_file = root.join("settings.toml");
+        std::fs::write(&config_file, "operator contents").expect("seed file");
+        assert!(save_settings(&config_file, &sample_settings()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_file).expect("read back"),
+            "operator contents"
+        );
+    }
+
+    #[test]
+    fn wizard_save_leaves_a_symlink_target_untouched() {
+        let root = temp_root("symlink");
+        let victim = root.join("victim");
+        std::fs::write(&victim, "victim contents").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
+            .expect("set victim mode");
+
+        let config_file = root.join("settings.toml");
+        std::os::unix::fs::symlink(&victim, &config_file).expect("plant symlink");
+
+        // The nsec must not be written through a link another local account
+        // could have planted in the settings directory.
+        assert!(save_settings(&config_file, &sample_settings()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read back"),
+            "victim contents"
+        );
+        assert_eq!(mode_of(&victim), 0o644);
+    }
+
+    #[test]
+    fn manual_template_copy_is_owner_only_and_refuses_a_symlink() {
+        let root = temp_root("template");
+        let config_file = root.join("settings.toml");
+        // The manual branch of `run_setup_menu` writes TEMPLATE_BYTES through
+        // the same primitive; the menu itself needs a terminal, so exercise
+        // the write it performs.
+        create_owner_only(&config_file, TEMPLATE_BYTES).expect("write template");
+        assert_eq!(mode_of(&config_file), 0o600);
+
+        let victim = root.join("victim");
+        std::fs::write(&victim, "victim contents").expect("seed victim");
+        let linked = root.join("linked.toml");
+        std::os::unix::fs::symlink(&victim, &linked).expect("plant symlink");
+        assert!(create_owner_only(&linked, TEMPLATE_BYTES).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read back"),
+            "victim contents"
+        );
     }
 }

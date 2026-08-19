@@ -204,14 +204,21 @@ There is **no** database password or separate global for SQLite; the daemon open
   `MOSTRO_NSEC_PRIVKEY`, and the settings directory also holds `mostro.db` and, in the
   Docker flows, the LND credentials under `lnd/`. Keep the directory at mode `0700` and
   the file at `0600`.
-- Both paths that create them do so already: `src/config/util.rs`, `fn create_settings_dir`
-  and `fn create_owner_only` for the non-interactive template copy, and
-  `src/config/wizard.rs`, `fn run_setup_wizard` for the interactive one. A directory or
-  file created outside the daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so
-  the deployment guides use `install -d -m 700` and `install -m 600`.
+- Every path that creates them does so already, through one primitive:
+  `src/config/permissions.rs`, `fn create_settings_dir` for the directory and
+  `fn create_owner_only` for the file. Its three callers are the non-interactive template
+  copy (`src/config/util.rs`, `fn init_configuration_file`), the manual template copy
+  (`src/config/wizard.rs`, `fn run_setup_menu`) and the guided wizard save
+  (`src/config/wizard.rs`, `fn save_settings`). A directory or file created outside the
+  daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so the deployment guides
+  use `install -d -m 700` and `install -m 600`.
 - An existing settings directory is left as it is, so a deliberately group-readable
   deployment keeps working.
-- The template copy is created with `O_CREAT | O_EXCL` and refuses to start if anything
-  already occupies `settings.toml`. On a settings directory another local account can
-  write to, following a symlink planted between the existence check and the create would
-  truncate its target and reset that target's mode to `0600`.
+- `create_owner_only` uses `O_CREAT | O_EXCL`, so it fails rather than write through
+  whatever already occupies the path. This covers initial creation only: on a settings
+  directory another local account can write to, a symlink planted between the caller's
+  existence check and the create would otherwise have its target truncated and its mode
+  reset to `0600`.
+- It is not a check on startup as a whole. A `settings.toml` that already exists is read
+  and loaded normally, symlink or not — `fn init_configuration_file` only reaches the
+  creation path when it finds no settings file at all.

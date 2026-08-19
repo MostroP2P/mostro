@@ -1181,6 +1181,25 @@ pub async fn find_failed_payment(pool: &SqlitePool) -> Result<Vec<Order>, Mostro
 /// caller from the previous attempt still loses the release CAS. It also lets
 /// reconciliation ignore a just-claimed payout until LND has surely registered
 /// it (grace window).
+///
+/// # Token caveats (wall-clock, not monotonic)
+///
+/// The token is `Utc::now().timestamp()`, which makes it *nearly* an
+/// identity, not exactly one:
+/// - **1-second resolution.** A claim released and re-claimed within the same
+///   second yields an identical token, so a stale caller's release or touch
+///   can match the newer claim. Not exploitable: every claim CAS also matches
+///   on `payout_payment_hash`, so a same-token collision implies the same
+///   invoice, and LND's duplicate rejection covers a re-send of it.
+/// - **Backward clock steps.** `find_inflight_payouts` filters on
+///   `payout_claimed_at <= now - grace`, so an NTP step backwards can make a
+///   just-stamped claim immediately reconcilable. In practice the dispatch
+///   task's queue heartbeat re-stamps the claim well inside the grace window,
+///   which bounds the exposure.
+///
+/// The clean fix — a monotonic per-order sequence as the identity token, with
+/// wall-clock kept only for the grace window — needs a migration and a change
+/// to every claim CAS, and is deliberately left as future work.
 pub async fn claim_order_payout(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -1222,6 +1241,11 @@ pub async fn claim_order_payout(
 /// Returns `Some(refreshed_at)` — the new per-claim token every later release
 /// must be scoped to — when the caller still owned the claim, or `None` when
 /// the claim was re-armed or replaced while queued (drop the send).
+///
+/// The token shares [`claim_order_payout`]'s wall-clock caveats (1-second
+/// resolution, backward clock steps) — see the "Token caveats" section there;
+/// the touch leans on the token harder than the claim does, so keep them in
+/// mind before treating it as a strict identity.
 pub async fn touch_order_payout_claim(
     pool: &SqlitePool,
     order_id: Uuid,

@@ -114,6 +114,10 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
     is advisory — the daemon still starts — and tolerates `0640`, the mode LND
     itself writes the macaroon with, so reading it through the node's group
     stays supported.
+  - The same check runs over `settings.toml` and `<settings_dir>/.env` right after
+    the settings load, in both Lightning and Cashu mode: those two carry
+    `nsec_privkey`, which is the instance's identity regardless of which escrow
+    it uses. A missing `.env` is silent, since it is optional.
   - Only the mode bits are inspected: a POSIX ACL can grant a named user access
     without setting them, so a quiet startup is not proof that no other account
     can read the file.
@@ -204,29 +208,44 @@ There is **no** database password or separate global for SQLite; the daemon open
   `MOSTRO_NSEC_PRIVKEY`, and the settings directory also holds `mostro.db` and, in the
   Docker flows, the LND credentials under `lnd/`. Keep the directory at mode `0700` and
   the file at `0600`.
-- Every path that creates them does so already, through one primitive:
-  `src/config/permissions.rs`, `fn create_settings_dir` for the directory and
-  `fn create_owner_only` for the file. Its three callers are the non-interactive template
-  copy (`src/config/util.rs`, `fn init_configuration_file`), the manual template copy
+- Every path that creates them does so already, through one of three primitives in
+  `src/config/permissions.rs`: `fn create_settings_dir` for the directory,
+  `fn create_owner_only` for a file that must not already exist, and
+  `fn write_owner_only_atomic` for one that is rewritten. A directory or file created
+  outside the daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so the
+  deployment guides use `install -d -m 700` and `install -m 600`.
+- `create_owner_only`'s three callers are the non-interactive template copy
+  (`src/config/util.rs`, `fn init_configuration_file`), the manual template copy
   (`src/config/wizard.rs`, `fn run_setup_menu`) and the guided wizard save
-  (`src/config/wizard.rs`, `fn save_settings`). A directory or file created outside the
-  daemon — `mkdir`, `cp`, `curl` — inherits the umask instead, so the deployment guides
-  use `install -d -m 700` and `install -m 600`.
+  (`src/config/wizard.rs`, `fn save_settings`). `write_owner_only_atomic` has one:
+  the wizard's `.env` write (`src/config/wizard.rs`, `fn write_env_file`).
 - An existing settings directory is left as it is, so a deliberately group-readable
-  deployment keeps working.
+  deployment keeps working. `0700` also applies to the settings directory alone — any
+  missing parents are created under the umask, the way `mkdir -p` would, so
+  `mostrod -d /srv/apps/mostro/conf` on a fresh tree closes off `conf` without closing
+  off `/srv/apps` for anything else that lives there.
 - `create_owner_only` uses `O_CREAT | O_EXCL`, so it fails rather than write through
   whatever already occupies the path. This covers initial creation only: on a settings
   directory another local account can write to, a symlink planted between the caller's
   existence check and the create would otherwise have its target truncated and its mode
-  reset to `0600`.
+  reset to `0600`. A write that fails partway removes the file it created, so a full
+  disk cannot leave a truncated `settings.toml` behind for the next boot to reject as
+  malformed TOML.
+- `write_env_file` cannot refuse an existing path the way `create_owner_only` does —
+  rewriting an existing `.env` is a supported thing to do — so
+  `write_owner_only_atomic` stages the line in a fresh `O_EXCL` temporary beside the
+  target and `rename`s it into place. `rename` never opens the destination, so a
+  planted symlink is replaced rather than followed and its target keeps both its
+  contents and its mode. `.env` matters here as much as `settings.toml`: it carries the
+  same `nsec_privkey`, and in the wizard flow it is written first.
 - It is not a check on startup as a whole. A `settings.toml` that already exists is read
   and loaded normally, symlink or not — `fn init_configuration_file` only reaches the
   creation path when it finds no settings file at all.
-- The guarantee covers the final entry, not the directory path leading to it.
-  `fn create_settings_dir` uses a recursive `DirBuilder`, which resolves symlinked
-  components on the way, so a settings directory reached through a symlinked parent is
-  created at whatever that link points to. This is deliberate: operators do symlink a
-  config directory onto another volume, and planting such a link on the default
-  `~/.mostro` path means write access to `$HOME`, which is a compromise of the account
-  already. A settings directory that is itself a symlink to an existing directory is used
-  as-is, and a dangling one is refused.
+- The guarantee covers the final entry, not the directory path leading to it. The
+  parents `fn create_settings_dir` has to invent are made with a recursive
+  `DirBuilder`, which resolves symlinked components on the way, so a settings directory
+  reached through a symlinked parent is created at whatever that link points to. This is
+  deliberate: operators do symlink a config directory onto another volume, and planting
+  such a link on the default `~/.mostro` path means write access to `$HOME`, which is a
+  compromise of the account already. A settings directory that is itself a symlink to an
+  existing directory is used as-is, and a dangling one is refused.

@@ -497,7 +497,7 @@ This starts:
 - Mostro daemon (exposed via configured relays)
 - Local Nostr relay (port 7000 by default)
 
-`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node, and sets `docker/config` and `docker/config/lnd` to mode `0700` — the same directory holds `settings.toml` and `mostro.db`. The container runs as uid/gid 1000 by default; if your user is not uid 1000, `export MOSTRO_CONTAINER_USER=$(id -u):$(id -g)` so it runs as you and can read those files.
+`make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node, and sets `docker/config` and `docker/config/lnd` to mode `0700` — the same directory holds `settings.toml` and `mostro.db`. `make docker-up` then runs the container as the owner of `docker/config`, so it can read those files whatever your uid is; `export MOSTRO_CONTAINER_USER=uid:gid` to override that.
 
 **Stop**: `make docker-down`
 
@@ -569,7 +569,7 @@ payment_retries_interval = 60  # seconds between retries
 
 **Required**: LND connection details. Mostro needs admin macaroon for hold invoice management.
 
-**Permissions**: the admin macaroon is a spend-capable credential — anyone who can read it controls the node, including the funds escrowed in Mostro's hold invoices. Keep it readable only by the account running `mostrod`, or by that account and LND's group (`chmod 600` for a private copy, `chmod o=` to keep group access). mostrod logs a warning at startup when the file's `other` permission bits are set.
+**Permissions**: the admin macaroon is a spend-capable credential — anyone who can read it controls the node, including the funds escrowed in Mostro's hold invoices. Keep it readable only by the account running `mostrod`, or by that account and LND's group (`chmod 600` for a private copy, `chmod o=` to keep group access). mostrod logs a warning at startup when the file's `other` permission bits are set. That check runs in Lightning mode only, right before the LND connection is opened, so a node running Cashu escrow never reaches it.
 
 ---
 
@@ -596,7 +596,7 @@ rana --vanity mostro
 
 **Important**: Never reuse keys between Mostro instances. Each daemon needs a unique identity.
 
-**Permissions**: `settings.toml` holds `nsec_privkey` in plaintext unless you move it to the environment (see below), and `mostro.db` sits in the same directory. Keep both owner-only: `chmod 700` on the settings directory and `chmod 600` on `settings.toml`. mostrod already creates them that way when it has to — both through the interactive setup wizard and through the template copy it makes on a non-interactive first run — but a directory or file you create yourself with `mkdir`, `cp` or `curl` inherits your umask instead, so use `install -d -m 700` and `install -m 600`.
+**Permissions**: `settings.toml` holds `nsec_privkey` in plaintext unless you move it to the environment (see below), and `mostro.db` sits in the same directory. Keep both owner-only: `chmod 700` on the settings directory and `chmod 600` on `settings.toml`. mostrod already creates them that way when it has to — both through the interactive setup wizard and through the template copy it makes on a non-interactive first run — but a directory or file you create yourself with `mkdir`, `cp` or `curl` inherits your umask instead, so use `install -d -m 700` and `install -m 600`. At startup mostrod logs a warning when `settings.toml` or `<settings_dir>/.env` has its `other` permission bits set; unlike the macaroon check, this one runs in both Lightning and Cashu mode, because the nsec is the instance's identity either way.
 
 ##### Providing the nsec via environment variable
 

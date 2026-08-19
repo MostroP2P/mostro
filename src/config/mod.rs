@@ -3,6 +3,8 @@ pub mod constants;
 pub mod permissions;
 pub mod secret;
 pub mod settings;
+#[cfg(test)]
+pub(crate) mod test_support;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.
 pub mod types;

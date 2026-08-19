@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, Password, Select};
@@ -9,7 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
-use super::permissions::create_owner_only;
+use super::permissions::{create_owner_only, write_owner_only_atomic};
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -244,43 +243,24 @@ fn save_settings(config_file_path: &Path, settings: &Settings) -> Result<(), Mos
     create_owner_only(config_file_path, toml_content.as_bytes())
 }
 
-/// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path with 0o600 permissions on Unix.
+/// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path, owner-only (`0600` on
+/// Unix), replacing whatever is already there.
 ///
-/// `OpenOptionsExt::mode(0o600)` only applies when the file is created, so for
-/// preexisting files we must explicitly tighten permissions after opening to
-/// avoid leaving a previously-broader mode in place.
+/// Goes through `write_owner_only_atomic` rather than opening the path
+/// directly. `.env` holds the same `nsec_privkey` as `settings.toml` and, in
+/// the wizard flow, is written first — so opening it with
+/// `create(true).truncate(true)` would follow a symlink another local account
+/// planted in the settings directory, truncating its target and resetting it
+/// to `0600`. That is the one thing `create_owner_only` exists to prevent for
+/// `settings.toml`, and this file is worth exactly as much. `create_owner_only`
+/// itself cannot serve here: it refuses a path that already exists, and
+/// rewriting an existing `.env` is a supported thing to do.
+///
+/// The line goes through a `Zeroizing` buffer so the plaintext nsec is wiped
+/// once handed off, the way `save_settings` treats the serialized TOML.
 fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let file = {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-    };
-    let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        file.set_permissions(permissions)
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    }
-
-    writeln!(file, "{}={}", NSEC_ENV_VAR, nsec)
-        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    Ok(())
+    let line = Zeroizing::new(format!("{}={}\n", NSEC_ENV_VAR, nsec));
+    write_owner_only_atomic(path, line.as_bytes())
 }
 
 fn prompt_mostro_settings() -> Result<MostroSettings, MostroError> {
@@ -375,6 +355,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_support::{assert_mode, set_mode};
 
     #[test]
     fn test_validate_nsec_valid() {
@@ -422,10 +403,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mostro-wizard-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::config::test_support::temp_dir("wizard", tag)
     }
 
     #[test]
@@ -459,16 +437,6 @@ mod tests {
         assert!(resolve_file_path("/definitely/not/here.macaroon").is_err());
     }
 
-    #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .expect("stat env file")
-            .permissions()
-            .mode()
-            & 0o777
-    }
-
     #[test]
     fn test_write_env_file_creates_file_with_owner_only_permissions() {
         let dir = temp_dir("env-new");
@@ -478,8 +446,7 @@ mod tests {
 
         let contents = std::fs::read_to_string(&env_path).expect("read env file");
         assert_eq!(contents, format!("{}=nsec1testvalue\n", NSEC_ENV_VAR));
-        #[cfg(unix)]
-        assert_eq!(mode_of(&env_path), 0o600);
+        assert_mode(&env_path, 0o600);
     }
 
     #[test]
@@ -487,42 +454,49 @@ mod tests {
         let dir = temp_dir("env-existing");
         let env_path = dir.join(ENV_FILENAME);
         std::fs::write(&env_path, "OLD=stale\n").expect("seed env file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o644))
-                .expect("loosen permissions");
-        }
+        set_mode(&env_path, 0o644);
 
         write_env_file(&env_path, "nsec1replaced").expect("rewrite env file");
 
-        // Old content truncated, permissions tightened back to 0600.
+        // Old content replaced, permissions tightened back to 0600.
         let contents = std::fs::read_to_string(&env_path).expect("read env file");
         assert_eq!(contents, format!("{}=nsec1replaced\n", NSEC_ENV_VAR));
-        #[cfg(unix)]
-        assert_eq!(mode_of(&env_path), 0o600);
+        assert_mode(&env_path, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_env_file_does_not_write_the_nsec_through_a_planted_symlink() {
+        let dir = temp_dir("env-symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "victim contents").expect("seed victim");
+        set_mode(&victim, 0o644);
+
+        // The wizard writes `.env` before `settings.toml`, so on a settings
+        // directory another local account can write to this is the first shot
+        // it gets at the nsec.
+        let env_path = dir.join(ENV_FILENAME);
+        std::os::unix::fs::symlink(&victim, &env_path).expect("plant symlink");
+
+        write_env_file(&env_path, "nsec1secret").expect("write env file");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "victim contents",
+            "the nsec must not be written through the link"
+        );
+        assert_mode(&victim, 0o644);
+        assert_mode(&env_path, 0o600);
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod save_settings_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::config::test_support::{assert_mode, set_mode};
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mostro-wizard-save-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777
+        crate::config::test_support::temp_dir("wizard-save", tag)
     }
 
     fn sample_settings() -> Settings {
@@ -549,7 +523,7 @@ mod save_settings_tests {
         let root = temp_root("ok");
         let config_file = root.join("settings.toml");
         save_settings(&config_file, &sample_settings()).expect("save settings");
-        assert_eq!(mode_of(&config_file), 0o600);
+        assert_mode(&config_file, 0o600);
         let written = std::fs::read_to_string(&config_file).expect("read back");
         assert!(written.contains("nsec_privkey"));
     }
@@ -566,13 +540,13 @@ mod save_settings_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn wizard_save_leaves_a_symlink_target_untouched() {
         let root = temp_root("symlink");
         let victim = root.join("victim");
         std::fs::write(&victim, "victim contents").expect("seed victim");
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
-            .expect("set victim mode");
+        set_mode(&victim, 0o644);
 
         let config_file = root.join("settings.toml");
         std::os::unix::fs::symlink(&victim, &config_file).expect("plant symlink");
@@ -584,19 +558,24 @@ mod save_settings_tests {
             std::fs::read_to_string(&victim).expect("read back"),
             "victim contents"
         );
-        assert_eq!(mode_of(&victim), 0o644);
+        assert_mode(&victim, 0o644);
     }
 
     #[test]
-    fn manual_template_copy_is_owner_only_and_refuses_a_symlink() {
+    fn manual_template_copy_is_owner_only() {
         let root = temp_root("template");
         let config_file = root.join("settings.toml");
         // The manual branch of `run_setup_menu` writes TEMPLATE_BYTES through
         // the same primitive; the menu itself needs a terminal, so exercise
         // the write it performs.
         create_owner_only(&config_file, TEMPLATE_BYTES).expect("write template");
-        assert_eq!(mode_of(&config_file), 0o600);
+        assert_mode(&config_file, 0o600);
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn manual_template_copy_refuses_a_symlink() {
+        let root = temp_root("template-symlink");
         let victim = root.join("victim");
         std::fs::write(&victim, "victim contents").expect("seed victim");
         let linked = root.join("linked.toml");

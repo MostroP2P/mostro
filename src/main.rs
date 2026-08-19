@@ -24,6 +24,7 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 use crate::app::context::AppContext;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
+use crate::config::constants::{ENV_FILENAME, SETTINGS_FILENAME};
 use crate::config::{
     get_db_pool, permissions, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG,
     NOSTR_CLIENT,
@@ -60,7 +61,22 @@ async fn main() -> Result<()> {
         .init();
 
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    settings_init()?;
+    let settings_dir = settings_init()?;
+
+    // `settings.toml` carries `nsec_privkey` in plaintext unless it was moved
+    // to `<settings_dir>/.env`, which carries it instead — either way the key
+    // that signs every event this instance publishes sits in one of these two
+    // files. Both are what the deployment guides have operators create by hand
+    // with `cp`, `curl` or an editor, all of which apply the umask, so a `0644`
+    // settings file is the normal accident. Checked in both Lightning and
+    // Cashu mode, unlike the macaroon further down, because the identity is
+    // not specific to either.
+    for (name, label) in [
+        (SETTINGS_FILENAME, "Mostro settings file"),
+        (ENV_FILENAME, "Mostro env file"),
+    ] {
+        permissions::warn_if_other_accessible(&settings_dir.join(name), label);
+    }
 
     // Build and install the multi-source price manager (spec §9 Phase 1).
     // Done immediately after settings load so every later subsystem
@@ -227,8 +243,9 @@ async fn main() -> Result<()> {
     // once per boot when the file is left reachable by other local accounts —
     // the documented deployment flows copy it around, and a bad mode is
     // otherwise invisible until it is abused.
+    let macaroon_file = &Settings::get_ln().lnd_macaroon_file;
     permissions::warn_if_other_accessible(
-        &Settings::get_ln().lnd_macaroon_file,
+        std::path::Path::new(macaroon_file),
         "LND admin macaroon",
     );
 

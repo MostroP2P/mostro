@@ -762,6 +762,10 @@ pub async fn cas_promote_taker_context(
 /// the hold invoice was created) and the status/event pair — in one
 /// guarded write.
 ///
+/// The maker side is deliberately excluded: only the taker's pubkey,
+/// master key and trade index are written, selected by order kind exactly
+/// as `cas_promote_taker_context` does.
+///
 /// The `WHERE` guard always covers the pre-trade statuses
 /// (`pending` / `waiting-taker-bond`). `allow_waiting_buyer_invoice`
 /// adds that status for the one caller that legitimately arrives from
@@ -784,15 +788,27 @@ pub async fn cas_complete_pretrade_take(
     } else {
         ""
     };
+    // Only the taker side, selected by kind — same rule as
+    // `cas_promote_taker_context`. The maker's pubkey, master key and trade
+    // index are persisted at order creation and a take never learns new
+    // values for them, so writing them back from the caller's snapshot can
+    // only undo someone else's committed write: a maker trade-pubkey
+    // rotation landing during the `create_hold_invoice` round trip used to
+    // be reverted here, and only halfway, since `creator_pubkey` was left
+    // alone — the resulting mismatch fails the
+    // `seller_pubkey == creator_pubkey` gate in `handle_child_order`.
+    let kind = order.get_order_kind().map_err(MostroInternalErr)?;
+    let taker_columns = match kind {
+        OrderKind::Sell => "buyer_pubkey = ?4, master_buyer_pubkey = ?6, trade_index_buyer = ?8",
+        OrderKind::Buy => "seller_pubkey = ?5, master_seller_pubkey = ?7, trade_index_seller = ?9",
+    };
     let query = format!(
-        "UPDATE orders SET status = ?2, event_id = ?3, \
-         buyer_pubkey = ?4, seller_pubkey = ?5, \
-         master_buyer_pubkey = ?6, master_seller_pubkey = ?7, \
-         trade_index_buyer = ?8, trade_index_seller = ?9, \
+        "UPDATE orders SET status = ?2, event_id = ?3, {taker_columns}, \
          fiat_amount = ?10, amount = ?11, fee = ?12, dev_fee = ?13, created_at = ?14, \
          buyer_invoice = ?15, preimage = ?16, hash = ?17, taken_at = ?18 \
          WHERE id = ?1 AND status IN ({PRETRADE_STATUSES}{extra_status})"
     );
+    // The slots the unselected side would have used stay bound but unreferenced.
     let result = sqlx::query(AssertSqlSafe(query.as_str()))
         .bind(order.id)
         .bind(order.status.clone())
@@ -2654,6 +2670,102 @@ mod tests {
             assert_eq!(after.preimage, Some("ff".repeat(32)));
             assert_eq!(after.taken_at, 1_700_000_500);
         }
+    }
+
+    /// The take snapshots the order before its `create_hold_invoice` round
+    /// trip. A maker trade-pubkey rotation committing inside that window
+    /// must survive the take: the write covers the taker side only.
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_preserves_a_maker_key_rotated_meanwhile() {
+        use mostro_core::db::Crud;
+        let pool = migrated_pool().await;
+        // Sell order → the maker is the seller side.
+        let stale = insert_pretrade_order(&pool, "pending").await;
+
+        let rotated = "ff".repeat(32);
+        let won =
+            super::cas_rotate_maker_trade_pubkey(&pool, stale.id, super::OrderKind::Sell, &rotated)
+                .await
+                .unwrap();
+        assert!(
+            won,
+            "the rotation commits while the order is still pre-trade"
+        );
+
+        // The take now commits from the snapshot it took before the
+        // rotation — it still carries the old maker key.
+        let mut committing = stale.clone();
+        committing.status = super::Status::WaitingPayment.to_string();
+        committing.event_id = "ev-escrow".to_string();
+        committing.buyer_pubkey = Some("bb".repeat(32));
+        committing.master_buyer_pubkey = Some("bb".repeat(32));
+        committing.trade_index_buyer = Some(3);
+        committing.hash = Some("ee".repeat(32));
+        committing.taken_at = 1_700_000_500;
+        let won = super::cas_complete_pretrade_take(&pool, &committing, false)
+            .await
+            .unwrap();
+        assert!(won, "the take still wins the pre-trade window");
+
+        let after = super::Order::by_id(&pool, stale.id).await.unwrap().unwrap();
+        // The take landed in full...
+        assert_eq!(after.status, "waiting-payment");
+        assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.master_buyer_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.trade_index_buyer, Some(3));
+        assert_eq!(after.hash, Some("ee".repeat(32)));
+        // ...and the rotation survived it, `creator_pubkey` included, so
+        // the `seller_pubkey == creator_pubkey` gate still holds.
+        assert_eq!(after.seller_pubkey, Some(rotated.clone()));
+        assert_eq!(after.creator_pubkey, rotated);
+    }
+
+    /// Mirror of the above on a buy order, where the maker is the buyer
+    /// and the take writes the seller side.
+    #[tokio::test]
+    async fn cas_complete_pretrade_take_preserves_a_rotated_buy_maker_key() {
+        use mostro_core::db::Crud;
+        let pool = migrated_pool().await;
+        let stale = super::Order {
+            id: uuid::Uuid::new_v4(),
+            kind: "buy".to_string(),
+            status: "pending".to_string(),
+            creator_pubkey: "aa".repeat(32),
+            buyer_pubkey: Some("aa".repeat(32)),
+            master_buyer_pubkey: Some("aa".repeat(32)),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            amount: 100_000,
+            fiat_amount: 100,
+            ..Default::default()
+        };
+        let stale = stale.create(&pool).await.unwrap();
+
+        let rotated = "ff".repeat(32);
+        assert!(super::cas_rotate_maker_trade_pubkey(
+            &pool,
+            stale.id,
+            super::OrderKind::Buy,
+            &rotated
+        )
+        .await
+        .unwrap());
+
+        let mut committing = stale.clone();
+        committing.status = super::Status::WaitingPayment.to_string();
+        committing.event_id = "ev-escrow".to_string();
+        committing.seller_pubkey = Some("bb".repeat(32));
+        committing.master_seller_pubkey = Some("bb".repeat(32));
+        assert!(super::cas_complete_pretrade_take(&pool, &committing, false)
+            .await
+            .unwrap());
+
+        let after = super::Order::by_id(&pool, stale.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-payment");
+        assert_eq!(after.seller_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.master_seller_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.buyer_pubkey, Some(rotated.clone()));
+        assert_eq!(after.creator_pubkey, rotated);
     }
 
     #[tokio::test]

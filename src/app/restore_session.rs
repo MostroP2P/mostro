@@ -3,6 +3,10 @@ use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+/// Restore session results wait for this long before the requester is told
+/// to retry instead of hanging forever.
+const RESTORE_SESSION_TIMEOUT_SECS: u64 = 60 * 60;
+
 /// Handle restore session action
 /// This function starts a background task to process the restore session
 /// and immediately returns, avoiding blocking the main application
@@ -51,7 +55,7 @@ pub async fn restore_session_action(
 /// Handle restore session results in the background
 async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
     // Wait for the result with a timeout
-    let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
+    let timeout = tokio::time::Duration::from_secs(RESTORE_SESSION_TIMEOUT_SECS);
 
     match tokio::time::timeout(timeout, manager.wait_for_result()).await {
         Ok(Some(result)) => {
@@ -127,6 +131,11 @@ mod tests {
     use nostr_sdk::prelude::Keys;
     use sqlx::SqlitePool;
     use std::sync::Arc;
+
+    #[test]
+    fn restore_session_timeout_is_one_hour() {
+        assert_eq!(RESTORE_SESSION_TIMEOUT_SECS, 3600);
+    }
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();

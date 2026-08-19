@@ -819,6 +819,48 @@ pub async fn cas_complete_pretrade_take(
     Ok(result.rows_affected() > 0)
 }
 
+/// Compare-and-swap the maker's per-trade pubkey rotation
+/// (see `trade_pubkey_action`). Writes only the maker-side trade pubkey
+/// and `creator_pubkey` — never the status, the taker context or the
+/// escrow material — and only while the order is still pre-trade.
+///
+/// The rotation handler reads the order, validates maker ownership and
+/// then persists; a take (or the post-bond resume, whose
+/// `create_hold_invoice` round trip keeps the order pre-trade for
+/// seconds) can commit in between. A full-row write from the handler's
+/// stale snapshot would revert that take — status back to `pending`,
+/// `hash`/`preimage` NULLed, the seller's paid hold invoice orphaned.
+/// Guarding on the pre-trade statuses makes the rotation lose cleanly
+/// instead.
+///
+/// `maker_trade_pubkey` lands on the maker side fixed by the order kind:
+/// the seller of a sell order, the buyer of a buy order. Returns `false`
+/// when the CAS missed.
+pub async fn cas_rotate_maker_trade_pubkey(
+    pool: &SqlitePool,
+    order_id: Uuid,
+    kind: OrderKind,
+    maker_trade_pubkey: &str,
+) -> Result<bool, MostroError> {
+    let maker_column = match kind {
+        OrderKind::Sell => "seller_pubkey",
+        OrderKind::Buy => "buyer_pubkey",
+    };
+    let query = format!(
+        "UPDATE orders SET {maker_column} = ?2, creator_pubkey = ?3 \
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
+    );
+    let result = sqlx::query(AssertSqlSafe(query.as_str()))
+        .bind(order_id)
+        .bind(maker_trade_pubkey)
+        .bind(maker_trade_pubkey)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Atomically persist a validated Cashu escrow and advance the order status
 /// (Cashu foundation CF-4, `docs/cashu/01-fundamentals.md` §6).
 ///
@@ -2686,6 +2728,100 @@ mod tests {
         let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(after.status, "canceled");
         assert_ne!(after.event_id, "ev-escrow");
+    }
+
+    #[tokio::test]
+    async fn cas_rotate_maker_trade_pubkey_moves_only_the_seller_side_and_creator() {
+        use mostro_core::db::Crud;
+        let pool = migrated_pool().await;
+        // Both pre-trade entry points the rotation handler accepts.
+        for status in ["pending", "waiting-taker-bond"] {
+            let mut order = insert_pretrade_order(&pool, status).await;
+            // A taker context the rotation must leave alone: the bond flow
+            // can promote it onto a still-pre-trade row.
+            order.buyer_pubkey = Some("bb".repeat(32));
+            order.master_buyer_pubkey = Some("bb".repeat(32));
+            order.taken_at = 1_700_000_500;
+            let order = order.update(&pool).await.unwrap();
+
+            let fresh = "ff".repeat(32);
+            let won = super::cas_rotate_maker_trade_pubkey(
+                &pool,
+                order.id,
+                super::OrderKind::Sell,
+                &fresh,
+            )
+            .await
+            .unwrap();
+            assert!(won, "{status} is inside the pre-trade window");
+
+            let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(after.seller_pubkey, Some(fresh.clone()));
+            assert_eq!(after.creator_pubkey, fresh);
+            // Everything else is untouched — above all the escrow material
+            // and the taker context a full-row write used to clobber.
+            assert_eq!(after.status, status);
+            assert_eq!(after.buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.master_buyer_pubkey, Some("bb".repeat(32)));
+            assert_eq!(after.hash, Some("cc".repeat(32)));
+            assert_eq!(after.preimage, Some("dd".repeat(32)));
+            assert_eq!(after.taken_at, 1_700_000_500);
+        }
+    }
+
+    #[tokio::test]
+    async fn cas_rotate_maker_trade_pubkey_moves_the_buyer_side_on_a_buy_order() {
+        use mostro_core::db::Crud;
+        let pool = migrated_pool().await;
+        let order = super::Order {
+            id: uuid::Uuid::new_v4(),
+            kind: "buy".to_string(),
+            status: "pending".to_string(),
+            creator_pubkey: "aa".repeat(32),
+            buyer_pubkey: Some("aa".repeat(32)),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            amount: 100_000,
+            fiat_amount: 100,
+            ..Default::default()
+        };
+        let order = order.create(&pool).await.unwrap();
+
+        let fresh = "ff".repeat(32);
+        let won =
+            super::cas_rotate_maker_trade_pubkey(&pool, order.id, super::OrderKind::Buy, &fresh)
+                .await
+                .unwrap();
+        assert!(won);
+
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.buyer_pubkey, Some(fresh.clone()));
+        assert_eq!(after.creator_pubkey, fresh);
+        assert_eq!(after.seller_pubkey, None);
+    }
+
+    #[tokio::test]
+    async fn cas_rotate_maker_trade_pubkey_loses_once_the_take_committed() {
+        use mostro_core::db::Crud;
+        let pool = migrated_pool().await;
+        // The window the finding turns on: the take committed
+        // `waiting-payment` with the escrow material while the rotation was
+        // in flight. The stale rotation must miss, not revert it.
+        let order = insert_pretrade_order(&pool, "waiting-payment").await;
+
+        let fresh = "ff".repeat(32);
+        let won =
+            super::cas_rotate_maker_trade_pubkey(&pool, order.id, super::OrderKind::Sell, &fresh)
+                .await
+                .unwrap();
+        assert!(!won, "waiting-payment is past the pre-trade window");
+
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "waiting-payment");
+        assert_eq!(after.seller_pubkey, Some("aa".repeat(32)));
+        assert_eq!(after.creator_pubkey, "aa".repeat(32));
+        assert_eq!(after.hash, Some("cc".repeat(32)));
+        assert_eq!(after.preimage, Some("dd".repeat(32)));
     }
 
     #[tokio::test]

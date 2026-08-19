@@ -1004,21 +1004,41 @@ pub(crate) struct OrderbookStamp {
     pub generation: u64,
 }
 
+/// Next `created_at` for a revision of the replaceable event identified by
+/// `key`: `candidate`, bumped to strictly after the last revision recorded
+/// for the same key (`max(candidate, last + 1)`), then recorded.
+///
+/// This is the whole NIP-01 tie-break defence in one place: relays resolve
+/// two replaceable events sharing `(kind, pubkey, d)` *and* `created_at` by
+/// keeping the lowest event id, so consecutive revisions that land in the
+/// same Unix second must never tie. Prunes entries too old to ever tie
+/// again once the map grows past [`ORDER_TS_PRUNE_THRESHOLD`].
+///
+/// Generic over the key so the kind-38383 orderbook registry (keyed by
+/// order id) and the kind-38386 dispute registry (keyed by `d` tag) share
+/// one implementation of the rule.
+fn monotonic_created_at<K: std::hash::Hash + Eq>(
+    last_ts: &mut HashMap<K, u64>,
+    key: K,
+    candidate: u64,
+) -> u64 {
+    let effective = match last_ts.get(&key) {
+        Some(&last) => candidate.max(last + 1),
+        None => candidate,
+    };
+    if last_ts.len() >= ORDER_TS_PRUNE_THRESHOLD {
+        last_ts.retain(|_, &mut ts| ts + ORDER_TS_MAX_AGE_SECS > effective);
+    }
+    last_ts.insert(key, effective);
+    effective
+}
+
 fn stamp_locked(
     registry: &mut OrderbookRegistry,
     order_id: Uuid,
     candidate: u64,
 ) -> OrderbookStamp {
-    let effective = match registry.last_ts.get(&order_id) {
-        Some(&last) => candidate.max(last + 1),
-        None => candidate,
-    };
-    if registry.last_ts.len() >= ORDER_TS_PRUNE_THRESHOLD {
-        registry
-            .last_ts
-            .retain(|_, &mut ts| ts + ORDER_TS_MAX_AGE_SECS > effective);
-    }
-    registry.last_ts.insert(order_id, effective);
+    let effective = monotonic_created_at(&mut registry.last_ts, order_id, candidate);
     registry.generation += 1;
     OrderbookStamp {
         created_at: Timestamp::from(effective),
@@ -1069,6 +1089,44 @@ pub(crate) fn try_stamp_orderbook_event_quiescent(
 /// only need the timestamp half of [`stamp_orderbook_event`].
 pub(crate) fn monotonic_order_event_timestamp(order_id: Uuid, candidate: Timestamp) -> Timestamp {
     stamp_orderbook_event(order_id, candidate).created_at
+}
+
+/// Last `created_at` published per kind-38386 `d` tag (the dispute id).
+///
+/// Dispute events face the same NIP-01 hazard [`ORDERBOOK_REGISTRY`] solves
+/// for orders, and it bites harder: a dispute's transitions are driven by
+/// clients reacting to each other, so they routinely land in the *same*
+/// Unix second as the event before them — a solver taking a dispute the
+/// moment it is opened is two publishes milliseconds apart. On a tie the
+/// relay keeps the lowest event id, a coin flip that can leave `initiated`
+/// as the state on relays while the daemon's DB already says `in-progress`.
+/// The daemon believes it published; clients never see the dispute advance.
+///
+/// Kept separate from [`ORDERBOOK_REGISTRY`] rather than sharing its map:
+/// dispute events carry none of the publication-generation and republish
+/// bookkeeping the orderbook reconciler needs, so they only need the
+/// timestamp half — and a shared map would let dispute publishes bump the
+/// orderbook's generation counter.
+///
+/// Process-local by design, exactly as for orders: this daemon's key is the
+/// only legitimate publisher of its disputes' events, and two publishes for
+/// the same dispute on opposite sides of a restart cannot land in the same
+/// second in practice.
+static DISPUTE_EVENT_TIMESTAMPS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Next `created_at` for a kind-38386 revision of the dispute identified by
+/// `d_tag`: `candidate`, bumped to strictly after the last revision
+/// published for that dispute when both land in the same second.
+pub(crate) fn monotonic_dispute_event_timestamp(d_tag: &str, candidate: Timestamp) -> Timestamp {
+    let mut last_ts = DISPUTE_EVENT_TIMESTAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Timestamp::from(monotonic_created_at(
+        &mut last_ts,
+        d_tag.to_owned(),
+        candidate.as_secs(),
+    ))
 }
 
 /// Orders whose latest kind-38383 publish failed (a relay rejected the

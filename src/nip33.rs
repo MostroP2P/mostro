@@ -2,7 +2,7 @@ use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
 use crate::config::types::{BondApplyTo, MostroSettings};
 use crate::lightning::LnStatus;
-use crate::util::{get_expiration_timestamp_for_kind, get_keys};
+use crate::util::{get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
 use nostr::error::Error;
@@ -167,13 +167,23 @@ pub fn new_dispute_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
+    // Every kind-38386 publish funnels through here, so this is where the
+    // replaceable-event ordering is enforced — no call site can forget it.
+    //
+    // "Signed now" alone is not enough: two revisions of the same dispute
+    // that land in the same Unix second tie on `created_at`, and the relay
+    // then breaks the tie by lowest event id instead of by order, silently
+    // discarding the newer status. Stamp each revision strictly after the
+    // previous one published for this dispute.
+    let created_at = monotonic_dispute_event_timestamp(&identifier, Timestamp::now());
+
     create_event(
         keys,
         content,
         identifier,
         extra_tags,
         NOSTR_DISPUTE_EVENT_KIND,
-        None,
+        Some(created_at),
     )
 }
 
@@ -181,8 +191,10 @@ pub fn new_dispute_event(
 ///
 /// `created_at` is the dispute open time from SQLite (`disputes.created_at`),
 /// carried as a business tag so clients can show when the dispute was opened.
-/// It is independent of the Nostr event's `created_at`, which stays as "signed
-/// now" for NIP-33 replaceable-event ordering.
+/// It is independent of the Nostr event's `created_at`, which stays "now"
+/// (bumped past the dispute's previous revision when they share a second, see
+/// [`new_dispute_event`]) so NIP-33 replacement keeps resolving to the latest
+/// status.
 pub fn create_dispute_event_tags(
     status: impl Into<String>,
     initiator: impl Into<String>,
@@ -1248,6 +1260,10 @@ mod tests {
 
     /// Kind-38386 `event.created_at` stays "signed now"; the business open
     /// time lives only on the `created_at` tag so NIP-33 replace still works.
+    ///
+    /// Uses a `d` tag unique to this test: `created_at` is now stamped
+    /// monotonically per dispute, so a first revision only equals wall-clock
+    /// now when no other test has published under the same identifier.
     #[test]
     fn new_dispute_event_keeps_nostr_created_at_independent_of_open_time_tag() {
         init_test_settings();
@@ -1255,7 +1271,7 @@ mod tests {
         let opened_at = 1_600_000_000_i64;
         let tags = super::create_dispute_event_tags("initiated", "seller", opened_at, None);
         let before = Timestamp::now().as_secs();
-        let event = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags)
+        let event = super::new_dispute_event(&keys, "", "dispute-open-time-tag".to_string(), tags)
             .expect("dispute event");
         let after = Timestamp::now().as_secs();
 
@@ -1269,6 +1285,68 @@ mod tests {
             Some("1600000000")
         );
         assert_ne!(event.created_at.as_secs() as i64, opened_at);
+    }
+
+    /// Regression guard for the bug this stamping exists to prevent: a
+    /// dispute opened and then taken by a solver within the same Unix second
+    /// produced two kind-38386 events with an identical `created_at`. Relays
+    /// break that tie by lowest event id, not by order, so `in-progress`
+    /// could lose to `initiated` and never reach clients.
+    ///
+    /// Both events are built back to back here, which is exactly the
+    /// same-second case; the assertion is on strict ordering, so it holds
+    /// whether or not the two calls straddle a second boundary.
+    #[test]
+    fn consecutive_dispute_revisions_never_share_a_created_at() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let dispute_id = "same-second-dispute".to_string();
+
+        let opened = super::new_dispute_event(
+            &keys,
+            "",
+            dispute_id.clone(),
+            super::create_dispute_event_tags("initiated", "buyer", 1_600_000_000, None),
+        )
+        .expect("initiated event");
+        let taken = super::new_dispute_event(
+            &keys,
+            "",
+            dispute_id,
+            super::create_dispute_event_tags("in-progress", "buyer", 1_600_000_000, None),
+        )
+        .expect("in-progress event");
+
+        assert!(
+            taken.created_at > opened.created_at,
+            "a later dispute revision must carry a strictly later created_at \
+             (opened at {}, taken at {}), otherwise the relay resolves the two \
+             by lowest event id and can keep the stale status",
+            opened.created_at.as_secs(),
+            taken.created_at.as_secs()
+        );
+    }
+
+    /// The monotonic bump is scoped to one dispute: an unrelated dispute
+    /// published in the same second must still be stamped with plain "now",
+    /// never pushed into the future by another dispute's activity.
+    #[test]
+    fn dispute_stamping_does_not_leak_across_identifiers() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let tags = || super::create_dispute_event_tags("initiated", "buyer", 1_600_000_000, None);
+
+        let before = Timestamp::now().as_secs();
+        let _first = super::new_dispute_event(&keys, "", "dispute-alpha".to_string(), tags())
+            .expect("alpha");
+        let second =
+            super::new_dispute_event(&keys, "", "dispute-beta".to_string(), tags()).expect("beta");
+        let after = Timestamp::now().as_secs();
+
+        assert!(
+            second.created_at.as_secs() >= before && second.created_at.as_secs() <= after,
+            "a different dispute must be stamped with wall-clock now"
+        );
     }
 
     // ── Dev-fee audit event tag list: end-to-end y-tag emission (kind 8383) ─────
@@ -1387,8 +1465,12 @@ mod tests {
             "info events must not carry an expiration tag"
         );
 
-        let dispute = super::new_dispute_event(&keys, "", "dispute-id".to_string(), tags.clone())
-            .expect("dispute event");
+        // `d` tag unique to this test: dispute `created_at` is stamped
+        // monotonically per identifier, so sharing one across tests would
+        // couple them through the process-wide registry.
+        let dispute =
+            super::new_dispute_event(&keys, "", "dispute-expiration".to_string(), tags.clone())
+                .expect("dispute event");
         assert_eq!(dispute.kind.as_u16(), NOSTR_DISPUTE_EVENT_KIND);
 
         let stamped = super::new_order_event_with_created_at(

@@ -17,11 +17,12 @@ on:
 permissions:
   contents: read
 
-# Two runs must never push to the registry at once: they would race on the
-# shared `latest` tag and the slower one would win. Queue instead of cancelling,
-# so every version tag still gets its image.
+# Two runs of the same ref must never push to the registry at once: they would
+# race on the tags they share. The group is per-ref because GitHub keeps only one
+# pending run per group, so a single global group would drop an intermediate
+# version tag when several tag pushes arrive together.
 concurrency:
-  group: docker-images
+  group: docker-images-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

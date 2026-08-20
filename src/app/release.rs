@@ -98,6 +98,25 @@ pub async fn check_failure_retries(
     // Count payment retries up to limit
     order.count_failed_payment(retries_number);
 
+    // Persist before anything that can fail. The flag is what keeps a settled
+    // order selectable by `find_failed_payment`, so it must not depend on the
+    // notification path below succeeding: resolving the buyer pubkey, and the
+    // three payload checks in the retries-exhausted branch, all return early.
+    // An order reaching here with an unusable buyer key would otherwise end up
+    // with neither the flag nor a payout marker — invisible to every recovery
+    // job, exactly the state this bookkeeping exists to prevent. Writing first
+    // also means the buyer is never told about a failure that was not stored.
+    //
+    // Only the payment-retry fields, to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
+    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
+        .bind(order.failed_payment)
+        .bind(order.payment_attempts)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Only send notification on first failure
@@ -147,16 +166,6 @@ pub async fn check_failure_retries(
         )
         .await;
     }
-
-    // Only update payment-retry fields to avoid overwriting fields modified by
-    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
-    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
-        .bind(order.failed_payment)
-        .bind(order.payment_attempts)
-        .bind(order.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
@@ -2369,6 +2378,42 @@ mod tests {
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
         assert_payout_failure_recorded(&pool, order_id).await;
+    }
+
+    /// An unusable buyer pubkey fails inside `dispatch_payout` *and* inside
+    /// the bookkeeping's own `get_buyer_pubkey` call. The retry state is still
+    /// persisted, because it is written before the notification path — without
+    /// that ordering the settled order would again carry neither the flag nor
+    /// a payout marker. No message is enqueued: there is no key to send one to.
+    #[tokio::test]
+    async fn do_payment_records_the_failure_when_the_buyer_pubkey_is_unusable() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.buyer_pubkey = None;
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
+
+        let result = do_payment(&ctx, order, None).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+        let db_order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert!(
+            db_order.failed_payment,
+            "the retry flag must survive a failed notification"
+        );
+        assert_eq!(db_order.payment_attempts, 1);
+        assert!(
+            queued_actions_for(order_id).await.is_empty(),
+            "no buyer key, so nothing can be notified"
+        );
     }
 
     /// Regression test for the stranded-order class: this exit is reached

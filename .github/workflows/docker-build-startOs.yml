@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag (used when run manually; default: latest)'
+        description: 'Image tag for manual runs (cannot be "latest" or a vX.Y.Z release tag; default: dev-<short-sha>)'
         required: false
-        default: 'latest'
+        default: ''
 
 jobs:
   build-and-push-plain:
@@ -25,10 +25,26 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            tag="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${INPUT_TAG:-latest}" >> "$GITHUB_OUTPUT"
+            # A manual run gets a build-specific tag. latest and vX.Y.Z name
+            # published images, so only a tag push is allowed to write them.
+            tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
+            if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
+              echo "::error::manual runs must not publish release tags (latest or vX.Y.Z); got '$tag'"
+              exit 1
+            fi
           fi
+          # Anything outside the OCI tag charset is rejected before the write:
+          # a newline would append a second tag= line and silently override the
+          # value checked above.
+          oci_re='^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'
+          if [[ ! "$tag" =~ $oci_re ]]; then
+            echo "::error::not a valid OCI image tag: '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Check if stable release
         id: check_stable
@@ -86,10 +102,26 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            tag="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${INPUT_TAG:-latest}" >> "$GITHUB_OUTPUT"
+            # A manual run gets a build-specific tag. latest and vX.Y.Z name
+            # published images, so only a tag push is allowed to write them.
+            tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
+            if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
+              echo "::error::manual runs must not publish release tags (latest or vX.Y.Z); got '$tag'"
+              exit 1
+            fi
           fi
+          # Anything outside the OCI tag charset is rejected before the write:
+          # a newline would append a second tag= line and silently override the
+          # value checked above.
+          oci_re='^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'
+          if [[ ! "$tag" =~ $oci_re ]]; then
+            echo "::error::not a valid OCI image tag: '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Check if stable release
         id: check_stable

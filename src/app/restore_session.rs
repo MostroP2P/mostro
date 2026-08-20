@@ -1,9 +1,9 @@
 use crate::app::context::AppContext;
-use crate::config::settings::get_db_pool;
 use crate::db::{find_failed_payment_for_master_key, RestoreSessionManager};
 use crate::util::{enqueue_order_msg_on_restore_queue, enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 
 /// Handle restore session action
 /// This function starts a background task to process the restore session
@@ -43,8 +43,9 @@ pub async fn restore_session_action(
         .await?;
 
     // Start a background task to handle the results
+    let pool_for_results = pool.clone();
     tokio::spawn(async move {
-        handle_restore_session_results(manager, trade_key, master_key).await;
+        handle_restore_session_results(pool_for_results, manager, trade_key, master_key).await;
     });
 
     Ok(())
@@ -52,6 +53,7 @@ pub async fn restore_session_action(
 
 /// Handle restore session results in the background
 async fn handle_restore_session_results(
+    pool: SqlitePool,
     mut manager: RestoreSessionManager,
     trade_key: String,
     master_key: String,
@@ -63,6 +65,7 @@ async fn handle_restore_session_results(
         Ok(Some(result)) => {
             // Send the restore session response
             if let Err(e) = send_restore_session_response(
+                &pool,
                 &trade_key,
                 &master_key,
                 result.restore_orders,
@@ -88,6 +91,7 @@ async fn handle_restore_session_results(
 
 /// Send restore session response to the user
 async fn send_restore_session_response(
+    pool: &SqlitePool,
     trade_key: &str,
     master_key: &str,
     orders: Vec<RestoredOrdersInfo>,
@@ -111,7 +115,8 @@ async fn send_restore_session_response(
     tracing::info!("Restore session response sent to user");
 
     // Re-send AddInvoice for any orders stuck in settled-hold-invoice with a failed payment.
-    // Uses get_db_pool() since pool is not available in this function's scope.
+    // The pool is threaded in from restore_session_action (ctx.pool()) rather
+    // than read from a process global, so this path works under tests too.
     //
     // `find_failed_payment_for_master_key` filters on `master_buyer_pubkey =
     // master_key`, so every order returned belongs to this restoring user as
@@ -122,8 +127,7 @@ async fn send_restore_session_response(
     // order messages are only delivered to trade keys, and (b) publish the
     // identity key as a gift-wrap recipient on Nostr, linking it to this
     // order and breaking trade-key unlinkability.
-    let pool = get_db_pool();
-    match find_failed_payment_for_master_key(&pool, master_key).await {
+    match find_failed_payment_for_master_key(pool, master_key).await {
         Ok(failed_orders) => {
             for order in failed_orders {
                 let buyer_trade_pubkey = match order.get_buyer_pubkey() {
@@ -255,7 +259,7 @@ mod tests {
             .await
             .unwrap();
 
-        handle_restore_session_results(manager, trade_key, master_key).await;
+        handle_restore_session_results(pool.clone(), manager, trade_key, master_key).await;
 
         let queued = queued_restore_msgs_for(&trade_pubkey).await;
         assert_eq!(queued.len(), 1);
@@ -279,14 +283,22 @@ mod tests {
             .unwrap();
 
         // Must not panic; the send failure is logged and swallowed
-        handle_restore_session_results(manager, "not-a-hex-key".to_string(), master_key).await;
+        handle_restore_session_results(
+            pool.clone(),
+            manager,
+            "not-a-hex-key".to_string(),
+            master_key,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn send_restore_session_response_queues_message_for_valid_key() {
         let trade_pubkey = Keys::generate().public_key();
+        let pool = create_test_pool().await;
 
         let result = send_restore_session_response(
+            &pool,
             &trade_pubkey.to_string(),
             &Keys::generate().public_key().to_string(),
             Vec::new(),
@@ -305,9 +317,16 @@ mod tests {
 
     #[tokio::test]
     async fn send_restore_session_response_rejects_invalid_key() {
+        let pool = create_test_pool().await;
         let master_key = Keys::generate().public_key().to_string();
-        let result =
-            send_restore_session_response("invalid-key", &master_key, Vec::new(), Vec::new()).await;
+        let result = send_restore_session_response(
+            &pool,
+            "invalid-key",
+            &master_key,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
 
         assert!(matches!(
             result,

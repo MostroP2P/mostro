@@ -11,6 +11,12 @@ on:
         required: false
         default: ''
 
+# The images are pushed with the Docker Hub credentials and the layer cache
+# uses the runner's own token, so nothing here needs GITHUB_TOKEN beyond the
+# checkout. Narrow it rather than inheriting the repository default.
+permissions:
+  contents: read
+
 jobs:
   build-and-push-plain:
     runs-on: ubuntu-latest

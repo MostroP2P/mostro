@@ -31,6 +31,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # check_stable compares the pushed tag against every other version tag.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set image tag for metadata
         id: set_tag
@@ -75,11 +79,19 @@ jobs:
           # Anchored: the v*.*.* trigger is a glob, so it also admits refs like
           # v1.2.3foo. Only an exact vX.Y.Z names a stable release.
           release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          is_stable=false
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ $release_re ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+            # latest follows the highest version rather than whichever run
+            # finishes last, so two overlapping tag pushes cannot leave it
+            # pointing at the older release.
+            newest=$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [[ -z "$newest" ]]; then
+              echo "::warning::no version tags visible, leaving latest untouched"
+            elif [[ "${GITHUB_REF#refs/tags/}" == "$newest" ]]; then
+              is_stable=true
+            fi
           fi
+          echo "is_stable=$is_stable" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -119,6 +131,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # check_stable compares the pushed tag against every other version tag.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set image tag for metadata
         id: set_tag
@@ -163,11 +179,19 @@ jobs:
           # Anchored: the v*.*.* trigger is a glob, so it also admits refs like
           # v1.2.3foo. Only an exact vX.Y.Z names a stable release.
           release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          is_stable=false
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ $release_re ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+            # latest follows the highest version rather than whichever run
+            # finishes last, so two overlapping tag pushes cannot leave it
+            # pointing at the older release.
+            newest=$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [[ -z "$newest" ]]; then
+              echo "::warning::no version tags visible, leaving latest untouched"
+            elif [[ "${GITHUB_REF#refs/tags/}" == "$newest" ]]; then
+              is_stable=true
+            fi
           fi
+          echo "is_stable=$is_stable" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

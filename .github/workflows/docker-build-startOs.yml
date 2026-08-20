@@ -65,7 +65,10 @@ jobs:
         id: check_stable
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v && "$GITHUB_REF" != *"-"* ]]; then
+          # Anchored: the v*.*.* trigger is a glob, so it also admits refs like
+          # v1.2.3foo. Only an exact vX.Y.Z names a stable release.
+          release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ $release_re ]]; then
             echo "is_stable=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_stable=false" >> "$GITHUB_OUTPUT"
@@ -143,7 +146,10 @@ jobs:
         id: check_stable
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v && "$GITHUB_REF" != *"-"* ]]; then
+          # Anchored: the v*.*.* trigger is a glob, so it also admits refs like
+          # v1.2.3foo. Only an exact vX.Y.Z names a stable release.
+          release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ $release_re ]]; then
             echo "is_stable=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_stable=false" >> "$GITHUB_OUTPUT"

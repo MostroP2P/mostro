@@ -775,6 +775,15 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     };
 
+    // Resolve the caller's role *before* the escrow guard below, which talks
+    // to LND: a sender who is neither party must be rejected as such, without
+    // costing a lookup RPC and without learning from the error whether the
+    // escrow is funded.
+    let sender_is_maker = order.sent_from_maker(event.sender).is_ok();
+    if !sender_is_maker && event.sender != taker_pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
     // Never void an escrow that is already funded. Both branches below cancel
     // the hold invoice, and in `waiting-payment` an accepted HTLC means the
     // seller paid between this handler's read and now — refunding them here
@@ -801,7 +810,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
         }
     }
 
-    if order.sent_from_maker(event.sender).is_ok() {
+    if sender_is_maker {
         cancel_order_by_maker(
             pool,
             event,
@@ -812,7 +821,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
             ln_client,
         )
         .await?;
-    } else if event.sender == taker_pubkey {
+    } else {
         cancel_order_by_taker(
             pool,
             event,
@@ -823,8 +832,6 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
             taker_pubkey,
         )
         .await?;
-    } else {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     Ok(())
 }
@@ -939,6 +946,7 @@ mod tests {
         fail_lookup: bool,
         fail_cancel: bool,
         canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        looked_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl StubEscrowLnClient {
@@ -948,6 +956,7 @@ mod tests {
                 fail_lookup: false,
                 fail_cancel: false,
                 canceled: Default::default(),
+                looked_up: Default::default(),
             }
         }
 
@@ -957,6 +966,7 @@ mod tests {
                 fail_lookup: true,
                 fail_cancel: false,
                 canceled: Default::default(),
+                looked_up: Default::default(),
             }
         }
 
@@ -967,11 +977,16 @@ mod tests {
                 fail_lookup: false,
                 fail_cancel: true,
                 canceled: Default::default(),
+                looked_up: Default::default(),
             }
         }
 
         fn escrow_was_canceled(&self) -> bool {
             self.canceled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn escrow_was_looked_up(&self) -> bool {
+            self.looked_up.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1005,7 +1020,9 @@ mod tests {
             >,
         > {
             let (state, fail) = (self.state, self.fail_lookup);
+            let looked_up = self.looked_up.clone();
             Box::pin(async move {
+                looked_up.store(true, std::sync::atomic::Ordering::SeqCst);
                 if fail {
                     Err(MostroInternalErr(ServiceError::LnNodeError(
                         "node unreachable".to_string(),
@@ -1802,15 +1819,17 @@ mod tests {
 
         let mut order = create_pending_order(maker, taker);
         order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
         let order = order.create(ctx.pool()).await.unwrap();
 
         let event = create_unwrapped_message_with_pubkey(Keys::generate().public_key());
+        let mut ln = StubEscrowLnClient::reporting(Some(InvoiceState::Accepted));
         let result = cancel_action_generic(
             &ctx,
             cancel_msg(order.id),
             &event,
             &Keys::generate(),
-            &mut StubLnClient,
+            &mut ln,
         )
         .await;
 
@@ -1818,6 +1837,14 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidPubkey))
         ));
+        // The escrow guard runs after authorization, so a stranger neither
+        // costs a lookup RPC nor learns from the error that the escrow is
+        // funded — the funded escrow above would otherwise answer
+        // `NotAllowedByStatus`.
+        assert!(
+            !ln.escrow_was_looked_up(),
+            "an unauthorized sender must not reach the node"
+        );
     }
 
     #[tokio::test]

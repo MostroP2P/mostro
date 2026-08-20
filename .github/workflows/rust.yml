@@ -105,11 +105,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cross
-          key: cross-${{ runner.os }}-0.2.5
+          # Must change whenever the install command below does: a cache hit
+          # skips that step entirely and restores the previously built binary.
+          key: cross-${{ runner.os }}-0.2.5-locked
 
       - name: Install cross ( pinned version for reproducibility )
         if: matrix.target != 'x86_64-pc-windows-gnu' && steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --version 0.2.5
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Build release
         shell: bash

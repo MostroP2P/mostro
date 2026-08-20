@@ -57,6 +57,62 @@ impl CancelLightning for LndConnector {
     }
 }
 
+/// What to do with an escrow hold invoice a cancel path is about to void.
+#[derive(Debug, PartialEq)]
+pub(crate) enum EscrowCancelDecision {
+    /// Nothing is locked in — cancel the invoice.
+    Cancel,
+    /// The seller's HTLC is accepted *right now*: canceling refunds it while
+    /// `hold_invoice_paid` is concurrently telling the buyer the payment went
+    /// through. Leave the escrow alone and let the trade advance.
+    SkipPaid,
+    /// LND could not be asked. Skipping only delays a cancel; canceling blind
+    /// can refund a live escrow, so this is the safe direction.
+    SkipUnknown(String),
+}
+
+/// Decide whether an escrow invoice may be canceled, from the order's status
+/// and the invoice's state at LND.
+///
+/// The two waiting states give the same `Accepted` opposite meanings:
+///
+/// - `waiting-payment` — the seller is supposed *not* to have paid yet. An
+///   accepted HTLC means they just did, in the gap between the caller's read
+///   and now. That is the race that turns a timeout (or a counterparty
+///   cancel) into a refund of a live escrow while the buyer is being told to
+///   send fiat. Skip.
+/// - `waiting-buyer-invoice` — the seller has already paid by definition, and
+///   returning their funds is precisely what canceling here is for. Cancel.
+///
+/// `Settled` cannot arise in `waiting-payment` (only a release settles, and
+/// only from a live trade), but it is treated like `Accepted`: whatever it
+/// means, it is not something to void blindly. `Open`, `Canceled` and an
+/// invoice LND has no record of all mean no live escrow.
+pub(crate) fn classify_escrow_cancel(
+    status: Status,
+    lookup: Result<Option<InvoiceState>, MostroError>,
+) -> EscrowCancelDecision {
+    if status != Status::WaitingPayment {
+        return EscrowCancelDecision::Cancel;
+    }
+    match lookup {
+        Ok(Some(InvoiceState::Accepted)) | Ok(Some(InvoiceState::Settled)) => {
+            EscrowCancelDecision::SkipPaid
+        }
+        Ok(_) => EscrowCancelDecision::Cancel,
+        Err(e) => EscrowCancelDecision::SkipUnknown(e.to_string()),
+    }
+}
+
+/// [`classify_escrow_cancel`] evaluated against the live node.
+pub(crate) async fn decide_escrow_cancel<L: CancelLightning + Send + ?Sized>(
+    ln_client: &mut L,
+    status: Status,
+    hash: &str,
+) -> EscrowCancelDecision {
+    classify_escrow_cancel(status, ln_client.lookup_invoice_state(hash).await)
+}
+
 /// Reset API-provided quote-derived amounts when republishing an order.
 ///
 /// When an order was created with `price_from_api`, its `amount` and `fee`
@@ -710,6 +766,32 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
     } else {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     };
+
+    // Never void an escrow that is already funded. Both branches below cancel
+    // the hold invoice, and in `waiting-payment` an accepted HTLC means the
+    // seller paid between this handler's read and now — refunding them here
+    // would leave the buyer sending fiat against nothing, since
+    // `hold_invoice_paid` is concurrently telling them the payment landed.
+    if let Some(hash) = order.hash.as_deref() {
+        let status = order.get_order_status().map_err(MostroInternalErr)?;
+        match decide_escrow_cancel(ln_client, status, hash).await {
+            EscrowCancelDecision::Cancel => {}
+            EscrowCancelDecision::SkipPaid => {
+                warn!(
+                    "Order Id {}: refusing to cancel — the seller's escrow payment just landed",
+                    order.id
+                );
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+            EscrowCancelDecision::SkipUnknown(cause) => {
+                warn!(
+                    "Order Id {}: could not read the escrow state before canceling ({cause}); rejecting so the caller retries",
+                    order.id
+                );
+                return Err(MostroInternalErr(ServiceError::LnNodeError(cause)));
+            }
+        }
+    }
 
     if order.sent_from_maker(event.sender).is_ok() {
         cancel_order_by_maker(

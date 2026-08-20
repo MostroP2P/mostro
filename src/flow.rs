@@ -19,6 +19,13 @@ use tracing::info;
 /// lived on in LND — is a no-op that returns `Ok` after a warning, never an
 /// error, since there is nothing for the caller to retry.
 ///
+/// Notifications are enqueued only after the new status is persisted: the
+/// buyer's next step on `HoldInvoicePaymentAccepted` is to send fiat, so it
+/// must never be sent for a transition that did not land. A failed publish or
+/// write returns `Ok` without notifying and without stamping
+/// `invoice_held_at`, leaving the order eligible for the replay
+/// `crate::db::find_held_invoices` drives on restart.
+///
 /// Not atomic: the check and the write are separate statements, so a cancel
 /// running concurrently on the main loop can still interleave. See #855.
 pub async fn hold_invoice_paid(
@@ -100,6 +107,12 @@ pub async fn hold_invoice_paid(
     );
     let status;
 
+    // Messages are built here but sent only once the transition is durably
+    // persisted (see below), so a party is never told the escrow advanced on
+    // the strength of a write that did not land.
+    let mut pending_msgs: Vec<(Action, Option<Payload>, PublicKey)> = Vec::new();
+    let mut notify_reputation = false;
+
     // Dev fee is NOT charged to users - it's paid by mostrod from its earnings
     if order.buyer_invoice.is_some() {
         status = Status::Active;
@@ -107,27 +120,19 @@ pub async fn hold_invoice_paid(
         // We send a confirmation message to seller
         let mut seller_order_data = order_data.clone();
         seller_order_data.amount = order.amount.saturating_add(order.fee);
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
+        pending_msgs.push((
             Action::BuyerTookOrder,
             Some(Payload::Order(seller_order_data)),
             seller_pubkey,
-            None,
-        )
-        .await;
+        ));
         // We send a message to buyer saying seller paid
         let mut buyer_order_data = order_data.clone();
         buyer_order_data.amount = order.amount.saturating_sub(order.fee);
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
+        pending_msgs.push((
             Action::HoldInvoicePaymentAccepted,
             Some(Payload::Order(buyer_order_data)),
             buyer_pubkey,
-            None,
-        )
-        .await;
+        ));
     } else {
         let new_amount = order_data.amount - order.fee;
         order_data.amount = new_amount;
@@ -145,36 +150,63 @@ pub async fn hold_invoice_paid(
         // `updated_order.update` below.
         order.set_timestamp_now();
         // We ask to buyer for a new invoice
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
+        pending_msgs.push((
             Action::AddInvoice,
             Some(Payload::Order(order_data)),
             buyer_pubkey,
-            None,
-        )
-        .await;
+        ));
 
         // We send a message to seller we are waiting for buyer invoice
-        enqueue_order_msg(
-            request_id,
-            Some(order.id),
-            Action::WaitingBuyerInvoice,
-            None,
-            seller_pubkey,
-            None,
-        )
-        .await;
+        pending_msgs.push((Action::WaitingBuyerInvoice, None, seller_pubkey));
 
-        // Notify taker reputation to maker
-        tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(pool, &order).await?;
+        notify_reputation = true;
     }
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
-    if let Ok(updated_order) = crate::util::update_order_event(my_keys, status, &order).await {
-        // Update order on db
-        let _ = updated_order.update(pool).await;
+    let persisted = match crate::util::update_order_event(my_keys, status, &order).await {
+        Ok(updated_order) => match updated_order.update(pool).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::error!(order_id = %order.id, "hold_invoice_paid: could not persist {status}: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!(order_id = %order.id, "hold_invoice_paid: could not publish {status}: {e}");
+            false
+        }
+    };
+
+    // Bail before notifying *and* before marking the invoice processed. The
+    // parties must never be told the escrow advanced — least of all the buyer,
+    // whose next step is to send fiat — on the strength of a transition that
+    // was not stored. Leaving `invoice_held_at` at 0 keeps the order eligible
+    // for the replay `find_held_invoices` drives on restart, which re-runs
+    // this whole flow.
+    if !persisted {
+        tracing::warn!(
+            order_id = %order.id,
+            "hold_invoice_paid: transition not persisted; not notifying, leaving the order for the invoice replay to retry"
+        );
+        return Ok(());
+    }
+
+    for (action, payload, destination) in pending_msgs {
+        enqueue_order_msg(
+            request_id,
+            Some(order.id),
+            action,
+            payload,
+            destination,
+            None,
+        )
+        .await;
+    }
+
+    if notify_reputation {
+        // Notify taker reputation to maker
+        tracing::info!("Notifying taker reputation to maker");
+        notify_taker_reputation(pool, &order).await?;
     }
 
     // Update the invoice_held_at field
@@ -364,6 +396,69 @@ mod tests {
             ..Default::default()
         };
         order.create(pool).await.unwrap()
+    }
+
+    /// Every message this flow sends is queued by order id, so a test can
+    /// assert that nothing at all was sent.
+    async fn queued_actions_for(order_id: uuid::Uuid) -> Vec<Action> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(msg, _)| msg.get_inner_message_kind().id == Some(order_id))
+            .map(|(msg, _)| msg.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    /// The buyer's next move on `HoldInvoicePaymentAccepted` is to send fiat,
+    /// so it must never go out for a transition that was not stored — and the
+    /// order must stay replayable rather than be stamped as processed. A
+    /// read-only pool fails the write while leaving the status read intact.
+    #[tokio::test]
+    async fn hold_invoice_paid_does_not_notify_when_the_write_fails() {
+        init_global_settings();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let hash = "cc".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingPayment,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer),
+            Some(seller),
+            None,
+        )
+        .await;
+        // One connection in the pool, so the flag holds for every later query.
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = hold_invoice_paid(&hash, Some(1), &pool, &create_test_keys()).await;
+
+        assert!(
+            result.is_ok(),
+            "a lost write is not the caller's to retry: {result:?}"
+        );
+        let after = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(after.status, Status::WaitingPayment.to_string());
+        assert_eq!(
+            after.invoice_held_at, 0,
+            "the order must stay eligible for the invoice replay"
+        );
+        assert!(
+            queued_actions_for(order.id).await.is_empty(),
+            "no party may be told the escrow advanced"
+        );
     }
 
     #[tokio::test]

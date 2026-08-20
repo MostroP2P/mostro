@@ -5,9 +5,8 @@ use crate::config::settings::Settings;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, is_order_take_window_closed, set_waiting_invoice_status,
-    show_cashu_escrow_request, show_hold_invoice, update_order_event, validate_invoice,
-    HoldInvoiceOrigin,
+    get_order, is_order_take_window_closed, set_waiting_invoice_status, show_cashu_escrow_request,
+    show_hold_invoice, update_order_event, validate_invoice, HoldInvoiceOrigin,
 };
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;

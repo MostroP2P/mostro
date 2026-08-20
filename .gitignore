@@ -12,6 +12,9 @@ lnurl-test-server/target
 # settings file
 settings.toml
 
+# Local e2e harness key material (never a repo artifact)
+*-keys.json
+
 book/book/
 bin/
 

@@ -1691,6 +1691,14 @@ pub async fn show_cashu_escrow_request(
     // trade keys and null every column its stale copy does not carry —
     // including a `cashu_escrow_token` the TA-1 CAS may already have persisted.
     // Only the winner proceeds; the loser aborts having changed nothing.
+    //
+    // `Pending` is the only reachable pre-state here even though both callers
+    // also admit `WaitingTakerBond`: `validate_cashu_settings`
+    // (`src/config/util.rs`) rejects `cashu.enabled` together with
+    // `anti_abuse_bond.enabled` as a startup-fatal error (§4.5), so a Cashu node
+    // never mints a `WaitingTakerBond` order. If that exclusivity is ever
+    // relaxed, this claim must accept both statuses — otherwise a legitimate
+    // take on a bonded order is refused here with `NotAllowedByStatus`.
     if !claim_order_status(pool, order.id, Status::Pending, Status::WaitingPayment).await? {
         tracing::info!(
             "cashu take: order {} was claimed concurrently or already funded — refusing the take",
@@ -1703,7 +1711,20 @@ pub async fn show_cashu_escrow_request(
     order.buyer_pubkey = Some(buyer_pubkey.to_string());
     order.seller_pubkey = Some(seller_pubkey.to_string());
 
-    // Publish the updated (WaitingPayment) order event and persist it.
+    // Publish the updated (WaitingPayment) order event, then persist the full
+    // row. The full-row write is built from `order`, the copy read before the
+    // CAS, so between the two TA-1's lock CAS — which fires on
+    // `WaitingPayment` — would be clobbered: the write would null
+    // `cashu_escrow_token` / `cashu_escrow_locked_at`, the exact damage the
+    // claim above exists to prevent, arriving via the seller instead of a
+    // second taker.
+    //
+    // That window is closed by ordering elsewhere, not by anything in this
+    // function: the seller cannot build the 2-of-3 without the buyer's trade
+    // pubkey, which only ships in the message enqueued *below* the write, and
+    // at this point the row carries no `buyer_pubkey` for the lock handler to
+    // validate against. Do not move either `enqueue_order_msg` above the
+    // `update` without re-reading the row (or narrowing the write) first.
     let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;

@@ -596,6 +596,18 @@ pub async fn do_payment(
     order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    dispatch_payout(ctx, &order, request_id).await
+}
+
+/// Body of [`do_payment`]: the bounded inline work — resolve the payout
+/// destination, connect to LND, persist the idempotency claim — and the spawn
+/// of the background dispatch task. See [`do_payment`] for the contract this
+/// implements.
+async fn dispatch_payout(
+    ctx: &AppContext,
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
         Some(req) => req.to_string(),
         _ => return Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
@@ -637,7 +649,7 @@ pub async fn do_payment(
                             "Order id {}: payout address returned unpayable invoice: {:?}",
                             order.id, e
                         );
-                        check_failure_retries_or_log(ctx, &order, request_id).await;
+                        check_failure_retries_or_log(ctx, order, request_id).await;
                         return Err(e);
                     }
                 },
@@ -646,7 +658,7 @@ pub async fn do_payment(
                         "Order id {}: payout address returned malformed invoice: {:?}",
                         order.id, e
                     );
-                    check_failure_retries_or_log(ctx, &order, request_id).await;
+                    check_failure_retries_or_log(ctx, order, request_id).await;
                     return Err(MostroInternalErr(ServiceError::LnAddressParseError));
                 }
             },
@@ -658,7 +670,7 @@ pub async fn do_payment(
                     ),
                     _ => warn!("Order id {}: payout address returned no invoice", order.id),
                 }
-                check_failure_retries_or_log(ctx, &order, request_id).await;
+                check_failure_retries_or_log(ctx, order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
         },
@@ -703,8 +715,9 @@ pub async fn do_payment(
     // Get Mostro keys from context
     let my_keys = ctx.keys().clone();
 
-    // Clone ctx for the background task
+    // Clone ctx and the order for the background task
     let ctx = ctx.clone();
+    let order = order.clone();
 
     // From here on the payout runs OFF the event loop: `send_payment` waits
     // for LND's payment stream to reach a terminal state, which a locked-in

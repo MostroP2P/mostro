@@ -105,10 +105,10 @@ pub async fn pubkey_event_can_solve(
     }
 
     // Sender must be a solver user
-    let Ok(solver) = find_solver_pubkey(pool, sender_pubkey.clone()).await else {
-        return false;
-    };
-    if solver.is_solver == 0_i64 {
+    if find_solver_pubkey(pool, sender_pubkey.clone())
+        .await
+        .is_err()
+    {
         return false;
     }
 

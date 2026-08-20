@@ -428,10 +428,6 @@ fn handle_buy_child_order(
         }
     }
 
-    // Clear next trade fields for buy order
-    child_order.next_trade_index = None;
-    child_order.next_trade_pubkey = None;
-
     Ok((
         child_order.buyer_pubkey.clone(),
         child_order.trade_index_buyer,
@@ -1258,6 +1254,10 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     new_order.taken_at = 0;
     new_order.invoice_held_at = 0;
     new_order.range_parent_id = Some(order.id);
+    // The next-trade rotation is consumed by the time a child is spawned —
+    // it is how the child got its counterparty. Never carry it forward.
+    new_order.next_trade_index = None;
+    new_order.next_trade_pubkey = None;
 
     match new_order.get_order_kind().map_err(MostroInternalErr)? {
         mostro_core::order::Kind::Sell => {
@@ -1768,6 +1768,8 @@ mod tests {
         order.max_amount = Some(100);
         order.min_amount = Some(10);
         order.fiat_amount = 40;
+        order.next_trade_pubkey = Some(Keys::generate().public_key().to_string());
+        order.next_trade_index = Some(9);
         let order = order.create(&pool).await.unwrap();
         let event = create_unwrapped_message_with_pubkey(seller);
         let msg = release_message(
@@ -1793,6 +1795,8 @@ mod tests {
         assert_eq!(child.fiat_amount, 0);
         assert_eq!(child.seller_pubkey, Some(next_seller.to_string()));
         assert_eq!(child.trade_index_seller, Some(2));
+        assert_eq!(child.next_trade_pubkey, None);
+        assert_eq!(child.next_trade_index, None);
         assert!(queued_actions_for(child.id)
             .await
             .contains(&Action::NewOrder));
@@ -1907,8 +1911,6 @@ mod tests {
         assert_eq!(trade_index, Some(5));
         assert_eq!(child.master_buyer_pubkey, Some(idkey));
         assert_eq!(child.creator_pubkey, next_buyer.to_string());
-        assert_eq!(child.next_trade_pubkey, None);
-        assert_eq!(child.next_trade_index, None);
     }
 
     #[test]
@@ -1997,9 +1999,7 @@ mod tests {
         order.creator_pubkey = buyer.to_string();
         order.next_trade_pubkey = Some(next_buyer.to_string());
         order.next_trade_index = Some(4);
-        let mut child = order.clone();
-        child.id = uuid::Uuid::new_v4();
-        child.status = Status::Pending.to_string();
+        let child = create_base_order(&order).unwrap();
 
         // Act
         let result = handle_child_order(child.clone(), &order, None, &pool, None).await;
@@ -2009,6 +2009,8 @@ mod tests {
         let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
         assert_eq!(db_child.buyer_pubkey, Some(next_buyer.to_string()));
         assert_eq!(db_child.trade_index_buyer, Some(4));
+        assert_eq!(db_child.next_trade_pubkey, None);
+        assert_eq!(db_child.next_trade_index, None);
         assert!(queued_actions_for(child.id)
             .await
             .contains(&Action::NewOrder));
@@ -2021,10 +2023,12 @@ mod tests {
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
         let next_seller = Keys::generate().public_key();
-        let order = fiat_sent_sell_order(seller, buyer);
-        let mut child = order.clone();
-        child.id = uuid::Uuid::new_v4();
-        child.status = Status::Pending.to_string();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        // Seed the rotation on the parent. `create_base_order` is the only
+        // path that builds a child, so this is the shape production sees.
+        order.next_trade_pubkey = Some(Keys::generate().public_key().to_string());
+        order.next_trade_index = Some(9);
+        let child = create_base_order(&order).unwrap();
 
         // Act
         let result = handle_child_order(
@@ -2041,6 +2045,8 @@ mod tests {
         let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
         assert_eq!(db_child.seller_pubkey, Some(next_seller.to_string()));
         assert_eq!(db_child.trade_index_seller, Some(6));
+        assert_eq!(db_child.next_trade_pubkey, None);
+        assert_eq!(db_child.next_trade_index, None);
     }
 
     #[tokio::test]
@@ -2090,7 +2096,9 @@ mod tests {
     fn create_base_order_resets_trade_state_for_sell_orders() {
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
-        let order = fiat_sent_sell_order(seller, buyer);
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.next_trade_pubkey = Some(Keys::generate().public_key().to_string());
+        order.next_trade_index = Some(9);
 
         let base = create_base_order(&order).unwrap();
 
@@ -2106,6 +2114,9 @@ mod tests {
         assert_eq!(base.trade_index_buyer, None);
         // ... and keep the seller side.
         assert_eq!(base.seller_pubkey, order.seller_pubkey);
+        // ... and drop the consumed next-trade rotation.
+        assert_eq!(base.next_trade_pubkey, None);
+        assert_eq!(base.next_trade_index, None);
     }
 
     #[test]

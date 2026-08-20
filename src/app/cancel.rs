@@ -4,6 +4,7 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
+use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -11,11 +12,24 @@ use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
 use tracing::{info, warn};
 
+/// The Lightning capabilities the cancel paths need: cancel an escrow, and
+/// first find out whether it is safe to.
 pub trait CancelLightning {
     fn cancel_hold_invoice<'a>(
         &'a mut self,
         hash: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>;
+
+    /// Current state of the escrow invoice at LND, `None` when the node has no
+    /// record of it. See [`LndConnector::lookup_invoice_state`].
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a,
+        >,
+    >;
 }
 
 impl CancelLightning for LndConnector {
@@ -29,6 +43,17 @@ impl CancelLightning for LndConnector {
                 .await
                 .map(|_| ())
         })
+    }
+
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { LndConnector::lookup_invoice_state(self, hash).await })
     }
 }
 
@@ -798,6 +823,20 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
         {
             Box::pin(async move { Ok(()) })
+        }
+
+        /// Unpaid escrow: the state every existing cancel test assumes.
+        fn lookup_invoice_state<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Some(InvoiceState::Open)) })
         }
     }
 

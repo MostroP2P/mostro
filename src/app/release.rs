@@ -584,25 +584,55 @@ async fn handle_child_order(
 /// Lightning Addresses **and** bech32 LNURLs are resolved via
 /// [`resolv_ln_address`] under the LNURL host policy. A non-empty `pr` must
 /// decode as BOLT11 and pass [`validate_payout_invoice`] (chain match, final
-/// CLTV bound, not already expired) before LND submission; resolve, decode
-/// and validation failures — all pre-claim — go through
-/// [`check_failure_retries_or_log`] and return `Err`. `send_payment` RPC
-/// errors and streamed `PaymentStatus::Failed` updates bump the same retry
-/// bookkeeping from the background task. Callers such as `release_action`
-/// ignore the result after hold settlement — retries are driven by the
-/// failed-payment job.
+/// CLTV bound, not already expired) before LND submission. *Every* pre-claim
+/// failure — destination resolve, invoice decode, payout validation, LND
+/// client setup, the claim write itself — goes through
+/// [`check_failure_retries_or_log`] here before returning `Err`, so a settled
+/// order is never left invisible to both recovery jobs (see
+/// [`dispatch_payout`]). `send_payment` RPC errors and streamed
+/// `PaymentStatus::Failed` updates bump the same retry bookkeeping from the
+/// background task. Callers such as `release_action` ignore the result after
+/// hold settlement — retries are driven by the failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
     order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    dispatch_payout(ctx, &order, request_id).await
+    // Single bookkeeping point for the pre-claim paths. An `Err` out of
+    // `dispatch_payout` means the buyer was not paid *and* no payout marker
+    // was left behind, so the order has to be marked `failed_payment` here:
+    // otherwise it is selected by neither `find_failed_payment` (which needs
+    // the flag) nor `find_inflight_payouts` (which needs the marker), and it
+    // sits in settled-hold-invoice forever with the buyer never notified and
+    // no retry ever attempted.
+    match dispatch_payout(ctx, &order, request_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+            Err(e)
+        }
+    }
 }
 
 /// Body of [`do_payment`]: the bounded inline work — resolve the payout
 /// destination, connect to LND, persist the idempotency claim — and the spawn
 /// of the background dispatch task. See [`do_payment`] for the contract this
 /// implements.
+///
+/// **Every `Err` returned from here is treated as a payment failure** by
+/// [`do_payment`], which runs [`check_failure_retries_or_log`] on it. That
+/// holds exactly today — this function is only reached once the order itself
+/// has been validated, so every error exit means "the buyer could not be
+/// paid" — and centralizing it is what keeps the bookkeeping off the
+/// individual `?` sites, where it was repeatedly forgotten. Keep it that way:
+/// an error that is *not* a payment failure would burn a retry and send the
+/// buyer a spurious `PaymentFailed`.
+///
+/// Two paths deliberately return `Ok(())` and so skip that bookkeeping: a
+/// lost claim CAS (another payout is already in flight for this order), and
+/// all post-claim work, which runs in the spawned task and does its own — the
+/// task keeps or releases the claim marker, and `reconcile_inflight_payout`
+/// owns whatever it leaves behind.
 async fn dispatch_payout(
     ctx: &AppContext,
     order: &Order,
@@ -634,9 +664,9 @@ async fn dispatch_payout(
         // Resolving a payout destination is a network round-trip to a host the
         // buyer chose. When it yields no usable invoice — forbidden host (SSRF
         // policy), unreachable, LNURL-level ERROR, malformed or unpayable `pr`
-        // — that is a payment failure and must go through the same bookkeeping
-        // as a failed `send_payment`. Returning early would leave
-        // `failed_payment = false` and hide the order from the retry job.
+        // — that is a payment failure and gets the same bookkeeping as a failed
+        // `send_payment`: the `Err` returns to `do_payment`, which marks the
+        // order and notifies the buyer.
         Some(destination) => match resolv_ln_address(&destination, amount, None).await {
             Ok(pr) if !pr.is_empty() => match decode_invoice(&pr) {
                 // The LNURL server picked this invoice, not the buyer, so it
@@ -649,7 +679,6 @@ async fn dispatch_payout(
                             "Order id {}: payout address returned unpayable invoice: {:?}",
                             order.id, e
                         );
-                        check_failure_retries_or_log(ctx, order, request_id).await;
                         return Err(e);
                     }
                 },
@@ -658,7 +687,6 @@ async fn dispatch_payout(
                         "Order id {}: payout address returned malformed invoice: {:?}",
                         order.id, e
                     );
-                    check_failure_retries_or_log(ctx, order, request_id).await;
                     return Err(MostroInternalErr(ServiceError::LnAddressParseError));
                 }
             },
@@ -670,7 +698,6 @@ async fn dispatch_payout(
                     ),
                     _ => warn!("Order id {}: payout address returned no invoice", order.id),
                 }
-                check_failure_retries_or_log(ctx, order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
         },

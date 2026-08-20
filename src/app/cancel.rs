@@ -425,17 +425,25 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     request_id: Option<u64>,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
+    // Void the escrow *before* persisting the cancel. On a cancel failure `?`
+    // returns with the order untouched, so the caller retries against a state
+    // that still matches the HTLC. Persisting first left a canceled order
+    // whose hold invoice was still live at LND — payable for as long as its
+    // expiry allows, and cleaned up by nothing: `find_held_invoices` and the
+    // escrow-deadline guardian both ignore canceled orders, so the seller's
+    // funds would sit locked until LND itself voided the invoice near the
+    // CLTV horizon. Same ordering, and the same reasoning, as the scheduler's
+    // timeout path and the taker branch above.
+    if let Some(hash) = &order.hash {
+        ln_client.cancel_hold_invoice(hash).await?;
+        info!("Order Id {}: Funds returned to seller", &order.id);
+    }
     // We publish a new replaceable kind nostr event with the status updated
     if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
         order_updated
             .update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    }
-    // Cancel hold invoice if present
-    if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
     }
 
     enqueue_order_msg(
@@ -929,6 +937,7 @@ mod tests {
         /// `None` models an invoice LND has no record of.
         state: Option<InvoiceState>,
         fail_lookup: bool,
+        fail_cancel: bool,
         canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -937,6 +946,7 @@ mod tests {
             Self {
                 state,
                 fail_lookup: false,
+                fail_cancel: false,
                 canceled: Default::default(),
             }
         }
@@ -945,6 +955,17 @@ mod tests {
             Self {
                 state: None,
                 fail_lookup: true,
+                fail_cancel: false,
+                canceled: Default::default(),
+            }
+        }
+
+        /// Unpaid escrow whose cancel LND refuses.
+        fn refusing_cancel() -> Self {
+            Self {
+                state: Some(InvoiceState::Open),
+                fail_lookup: false,
+                fail_cancel: true,
                 canceled: Default::default(),
             }
         }
@@ -961,7 +982,13 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
         {
             let canceled = self.canceled.clone();
+            let fail = self.fail_cancel;
             Box::pin(async move {
+                if fail {
+                    return Err(MostroInternalErr(ServiceError::LnNodeError(
+                        "cancel refused".to_string(),
+                    )));
+                }
                 canceled.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             })
@@ -1724,6 +1751,45 @@ mod tests {
         assert_eq!(
             order_by_id(ctx.pool(), order.id).await.status,
             Status::Pending.to_string()
+        );
+    }
+
+    /// The escrow is voided before the cancel is persisted, so a refused
+    /// cancel leaves the order intact for the caller to retry. Persisting
+    /// first would strand a canceled order behind a live, still-payable hold
+    /// invoice that no job cleans up.
+    #[tokio::test]
+    async fn maker_cancel_is_not_persisted_when_the_escrow_cancel_fails() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::refusing_cancel();
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::LnNodeError(_)))),
+            "a refused escrow cancel must surface: {result:?}"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingPayment.to_string(),
+            "the order must not be canceled while its hold invoice is live"
         );
     }
 

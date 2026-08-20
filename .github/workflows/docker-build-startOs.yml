@@ -17,6 +17,13 @@ on:
 permissions:
   contents: read
 
+# Two runs must never push to the registry at once: they would race on the
+# shared `latest` tag and the slower one would win. Queue instead of cancelling,
+# so every version tag still gets its image.
+concurrency:
+  group: docker-images
+  cancel-in-progress: false
+
 jobs:
   build-and-push-plain:
     runs-on: ubuntu-latest

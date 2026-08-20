@@ -1475,6 +1475,38 @@ mod tests {
             .collect()
     }
 
+    /// Assert a pre-claim payout failure left the order recoverable: the
+    /// failure bookkeeping ran, so the row carries the retry flag and its
+    /// first attempt, the buyer was told, and no payout marker was left
+    /// behind for a payment that was never sent. Without the flag the order
+    /// is invisible to `find_failed_payment`, and without a marker it is
+    /// invisible to `find_inflight_payouts` — it would sit in
+    /// settled-hold-invoice forever.
+    async fn assert_payout_failure_recorded(pool: &SqlitePool, order_id: uuid::Uuid) {
+        let db_order = Order::by_id(pool, order_id).await.unwrap().unwrap();
+        assert!(
+            db_order.failed_payment,
+            "a pre-claim payout failure must set failed_payment"
+        );
+        assert_eq!(
+            db_order.payment_attempts, 1,
+            "the failure must count exactly once"
+        );
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT payout_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(
+            marker.is_none(),
+            "no payout marker may be left for a payment that was never sent"
+        );
+        assert!(queued_actions_for(order_id)
+            .await
+            .contains(&Action::PaymentFailed));
+    }
+
     struct StubEscrow;
 
     #[async_trait]
@@ -2302,7 +2334,10 @@ mod tests {
         let ctx = build_ctx(&pool);
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
-        let order = fiat_sent_sell_order(seller, buyer);
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2310,6 +2345,7 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
     #[tokio::test]
@@ -2322,6 +2358,9 @@ mod tests {
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
         order.amount = 100;
         order.fee = 100;
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2329,8 +2368,13 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
+    /// Regression test for the stranded-order class: this exit is reached
+    /// through `?`, and before the bookkeeping moved into `do_payment` it
+    /// left a settled order with neither the retry flag nor a payout marker
+    /// — invisible to both recovery jobs, with the buyer never notified.
     #[tokio::test]
     async fn do_payment_fails_fast_when_lnd_is_unreachable() {
         // Arrange: with the global config set to test defaults, the LND cert
@@ -2343,12 +2387,16 @@ mod tests {
         let buyer = Keys::generate().public_key();
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         // Act
         let result = do_payment(&ctx, order, None).await;
 
         // Assert
         assert!(result.is_err());
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
     /// An expired regtest invoice: rejected by `validate_payout_invoice` on
@@ -2420,6 +2468,9 @@ mod tests {
 
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_invoice = Some(lnurl);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2430,6 +2481,10 @@ mod tests {
             ),
             "the resolved invoice must be rejected before LND is contacted: {result:?}"
         );
+        // This branch used to run the bookkeeping inline; `do_payment` now
+        // owns it. `payment_attempts == 1` pins that it runs exactly once —
+        // counting twice would silently halve the buyer's retry budget.
+        assert_payout_failure_recorded(&pool, order_id).await;
 
         server.abort();
     }

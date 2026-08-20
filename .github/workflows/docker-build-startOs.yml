@@ -37,11 +37,12 @@ jobs:
           INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
           else
-            # A manual run gets a build-specific tag. latest and vX.Y.Z name
-            # published images, so only a tag push is allowed to write them.
+            # Anything that is not a tag push takes the guarded path, including a
+            # dispatch aimed at a tag: latest and vX.Y.Z name published images,
+            # so only a tag push is allowed to write them.
             tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
             release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
             if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
@@ -114,11 +115,12 @@ jobs:
           INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
           else
-            # A manual run gets a build-specific tag. latest and vX.Y.Z name
-            # published images, so only a tag push is allowed to write them.
+            # Anything that is not a tag push takes the guarded path, including a
+            # dispatch aimed at a tag: latest and vX.Y.Z name published images,
+            # so only a tag push is allowed to write them.
             tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
             release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
             if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then

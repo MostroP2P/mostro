@@ -1,6 +1,10 @@
 [build]
+# cross joins these entries with newlines and runs them as a single `RUN eval`
+# with no `set -e`, so a failing entry does not stop the ones after it. The
+# download, checksum and extraction must stay chained with `&&` or the
+# verification silently becomes a no-op.
 pre-build = [
     "apt update && apt install -y unzip",
-    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-linux-x86_64.zip && unzip protoc-28.2-linux-x86_64.zip -d /usr/",
+    "curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-linux-x86_64.zip && echo '2febfd42b59ce93a28eb789019a470a3dd0449619bc04f84dad1333da261dec1  /tmp/protoc.zip' | sha256sum -c - && unzip /tmp/protoc.zip -d /usr/ && rm -f /tmp/protoc.zip",
     "chmod 755 /usr/bin/protoc"
 ]

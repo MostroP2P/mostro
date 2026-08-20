@@ -20,17 +20,21 @@ jobs:
 
       - name: Set image tag for metadata
         id: set_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${INPUT_TAG:-latest}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check if stable release
         id: check_stable
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v && "$GITHUB_REF" != *"-"* ]]; then
             echo "is_stable=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_stable=false" >> "$GITHUB_OUTPUT"
@@ -77,17 +81,21 @@ jobs:
 
       - name: Set image tag for metadata
         id: set_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${INPUT_TAG:-latest}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check if stable release
         id: check_stable
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v && "$GITHUB_REF" != *"-"* ]]; then
             echo "is_stable=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_stable=false" >> "$GITHUB_OUTPUT"

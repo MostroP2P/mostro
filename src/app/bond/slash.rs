@@ -482,6 +482,19 @@ async fn release_on_timeout(pool: &Pool<Sqlite>, order_id: Uuid, republishes: bo
     }
 }
 
+/// Resolve a timed-out order's bonds without holding anyone responsible.
+///
+/// Used when the timeout cannot be attributed to the user: the daemon's Nostr
+/// inbox has been unreachable long enough that waiting any longer would keep
+/// hold invoices encumbered until CLTV expiry (see `job_cancel_orders`). The
+/// order still has to be unwound, but a silence the node could not hear is not
+/// evidence of abandonment, so every bond involved is released rather than
+/// settled — the republish-vs-cancel distinction is honoured exactly as in
+/// [`slash_or_release_on_timeout`].
+pub async fn release_on_timeout_without_slashing(pool: &Pool<Sqlite>, order: &Order) {
+    release_on_timeout(pool, order.id, order_republishes_on_timeout(order)).await;
+}
+
 pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,

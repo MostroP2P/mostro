@@ -19,8 +19,9 @@ use nostr_sdk::prelude::EventBuilder;
 use nostr_sdk::prelude::{FinalizeEvent, Kind as NostrKind, Nip65Tag, Tag};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
 
 pub async fn start_scheduler(ctx: AppContext) {
@@ -54,8 +55,56 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
     job_refresh_active_pubkeys(ctx.clone()).await;
+    job_inbox_watchdog(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// Longest the timeout job defers to an inbox that has not been confirmed
+/// listening.
+///
+/// Holding timeouts is the right call for an outage, but it cannot be
+/// unconditional: the same pass that slashes a bond is the one that releases
+/// it, and the one that cancels the seller's hold invoice. Waiting forever on
+/// a permanently broken inbox would leave escrows encumbered until CLTV expiry
+/// and honest takers' bonds locked indefinitely. Three hours is far longer
+/// than any transient relay problem and far shorter than the CLTV horizon, so
+/// an operator has time to notice while the funds never become hostage to it.
+const MAX_UNCONFIRMED_INBOX_PAUSE_SECS: i64 = 3 * 3600;
+
+/// How often the inbox watchdog audits the subscription across relays.
+///
+/// Short enough that a lost ear is measured in seconds rather than the 60s
+/// timeout tick, long enough that it is not a source of traffic on its own.
+/// Hardcoded like the other maintenance intervals in this module.
+///
+/// Visible to `crate::inbox` because the two pacing knobs interact: the audit
+/// draws on the same per-relay budget as the event loop, so this interval is
+/// what decides how many doublings pass before `RESUBSCRIBE_MAX_BACKOFF` is
+/// the thing actually limiting retries.
+pub(crate) const INBOX_WATCHDOG_INTERVAL: u64 = 30;
+
+/// Audit the daemon's Nostr inbox and re-subscribe any relay that stopped
+/// serving it (see `crate::inbox`).
+///
+/// The event loop already reacts to a `CLOSED` frame, but only to frames it
+/// actually receives — the SDK's notification channel drops them when the
+/// consumer lags, and some ways of losing a subscription produce no frame at
+/// all. This job is the backstop, and the only thing that notices when *every*
+/// relay has gone quiet.
+async fn job_inbox_watchdog(ctx: AppContext) {
+    #[allow(deprecated)]
+    let event_kind = ctx.settings().mostro.transport.event_kind();
+    let subscription = crate::inbox::InboxSubscription::new(ctx.keys().public_key(), event_kind);
+
+    tokio::spawn(async move {
+        loop {
+            // Sleep first: at startup the event loop has just subscribed, and a
+            // REQ still in flight would look exactly like a missing one.
+            tokio::time::sleep(tokio::time::Duration::from_secs(INBOX_WATCHDOG_INTERVAL)).await;
+            crate::inbox::check_inbox_health(ctx.nostr_client(), &subscription).await;
+        }
+    });
 }
 
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
@@ -486,7 +535,75 @@ async fn job_cancel_orders(ctx: AppContext) {
         loop {
             info!("Check for order to republish for late actions of users");
 
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
+            // A timeout means "the user did not answer in time", and that
+            // conclusion is only sound while Mostro can hear. With the inbox
+            // down, an answer that was sent is simply never delivered — and
+            // the ten-second replay window means it is lost, not queued — so
+            // acting on the deadline would cancel escrows and slash bonds over
+            // the node's own deafness. Skip the whole tick: cancel, refund,
+            // republish and slash all rest on the same unsound premise.
+            //
+            // The test is "an audit confirmed we can hear", not "no audit has
+            // reported deafness". This job's first tick runs immediately while
+            // the watchdog's comes later, so an unaudited record would let a
+            // node that never obtained a working inbox act on that window.
+            //
+            // Waiting cannot be unconditional, though. A permanently deaf
+            // inbox is an operator problem, and holding every tick forever
+            // turns it into a second one: hold invoices stay encumbered until
+            // CLTV expiry and honest takers never get their bonds back, since
+            // the same pass that slashes is the one that releases. Past
+            // `MAX_UNCONFIRMED_INBOX_PAUSE_SECS` the orders are unwound
+            // anyway — but blamelessly, which is the part that matters.
+            let health = crate::inbox::InboxHealth::global();
+            let mut blameless = false;
+            if let Some(health) = health.as_ref() {
+                if !health.is_confirmed_listening() {
+                    let deaf_for = health.unconfirmed_for_secs();
+                    if deaf_for < MAX_UNCONFIRMED_INBOX_PAUSE_SECS {
+                        warn!(
+                            "scheduler_timeout: inbox not confirmed listening for {deaf_for}s, holding order timeouts"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    warn!(
+                        "scheduler_timeout: inbox unconfirmed for {deaf_for}s, past the \
+                         {MAX_UNCONFIRMED_INBOX_PAUSE_SECS}s bound; unwinding timed-out orders \
+                         WITHOUT slashing so escrows and bonds are not held until CLTV expiry"
+                    );
+                    blameless = true;
+                }
+            }
+
+            // Compensation for inbox downtime is per order, and applied in two
+            // steps. The query widens its window by the most any order could
+            // be owed, so nothing eligible is missed; the exact figure — the
+            // downtime that overlaps *this* order's own wait — then decides.
+            // A single global allowance cannot do this: it would either
+            // under-credit an order that waited through the whole outage or
+            // hand the same credit to one taken long after it ended.
+            //
+            // The credit is skipped once the pause bound is passed. By then
+            // the outage is hours deep, so every waiting order would be owed
+            // more than its deadline and none would ever be unwound — which is
+            // the state this branch exists to escape. Nobody is punished for
+            // it: `blameless` releases the bonds instead of settling them.
+            let max_grace = if blameless {
+                0
+            } else {
+                health.as_ref().map(|h| h.max_blind_seconds()).unwrap_or(0)
+            };
+            if max_grace > 0 {
+                info!(
+                    "scheduler_timeout: up to {max_grace}s of inbox downtime is credited against order deadlines"
+                );
+            }
+
+            if let Ok(older_orders_list) =
+                crate::db::find_order_by_seconds(pool, Duration::from_secs(max_grace.max(0) as u64))
+                    .await
+            {
                 for order in older_orders_list.into_iter() {
                     // The tick-start snapshot may be stale by the time this
                     // iteration is reached — re-read and re-confirm before
@@ -498,6 +615,23 @@ async fn job_cancel_orders(ctx: AppContext) {
                     else {
                         continue;
                     };
+
+                    // Give this order back the downtime it actually waited
+                    // through. Orders taken after the outage are owed nothing
+                    // and fall through unchanged.
+                    if let Some(health) = health.as_ref().filter(|_| !blameless) {
+                        let owed = health.blind_seconds_since(order.taken_at);
+                        let waited =
+                            nostr_sdk::prelude::Timestamp::now().as_secs() as i64 - order.taken_at;
+                        if waited < exp_seconds as i64 + owed {
+                            debug!(
+                                "scheduler_timeout: order {} not late yet; {owed}s of its wait was inbox downtime",
+                                order.id
+                            );
+                            continue;
+                        }
+                    }
+
                     // Check if order is a sell order and Buyer is not sending the invoice for too much time.
                     // Same if seller is not paying hold invoice
                     if order.status == Status::WaitingBuyerInvoice.to_string()
@@ -584,39 +718,50 @@ async fn job_cancel_orders(ctx: AppContext) {
                         // `order` is the pre-mutation snapshot — its
                         // waiting status and trade pubkeys are intact,
                         // which the §3.1 buyer/seller → bond mapping needs.
-                        match bond::slash_or_release_on_timeout(
-                            pool,
-                            &mut ln_client,
-                            &order,
-                            Settings::get_bond(),
-                        )
-                        .await
-                        {
-                            Ok(Some(slashed)) => {
-                                bond::notify_bond_slashed(&order, &slashed).await;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                // `Err` from `slash_or_release_on_timeout` is a DB-read
-                                // failure (e.g. `find_active_bonds_for_order` /
-                                // `timeout_slash_confirmed` couldn't read the bond
-                                // rows), so we don't yet know whether the slash
-                                // applies. Falling through to cancel/republish
-                                // would persist the order out of
-                                // `find_order_by_seconds`'s waiting-state
-                                // eligibility window, and the next tick would
-                                // never re-evaluate it — losing the slash whose
-                                // applicability we couldn't even determine.
-                                // `continue` keeps the order eligible so the
-                                // next tick re-runs the full path (the slash
-                                // primitive is idempotent on a settled HTLC and
-                                // a `PendingPayout` bond, so a retry that
-                                // finds the work already done is a no-op).
-                                tracing::warn!(
-                                    "scheduler_timeout: bond slash/release errored for {} ({}); skipping cancel/republish so next tick retries",
-                                    order.id, e
-                                );
-                                continue;
+                        //
+                        // Past the pause bound (`blameless`) none of that
+                        // applies: the node has been unable to hear for hours,
+                        // so the timeout says nothing about the user. The order
+                        // is still unwound — otherwise the escrow sits until
+                        // CLTV expiry — but every bond is released rather than
+                        // settled.
+                        if blameless {
+                            bond::release_on_timeout_without_slashing(pool, &order).await;
+                        } else {
+                            match bond::slash_or_release_on_timeout(
+                                pool,
+                                &mut ln_client,
+                                &order,
+                                Settings::get_bond(),
+                            )
+                            .await
+                            {
+                                Ok(Some(slashed)) => {
+                                    bond::notify_bond_slashed(&order, &slashed).await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    // `Err` from `slash_or_release_on_timeout` is a DB-read
+                                    // failure (e.g. `find_active_bonds_for_order` /
+                                    // `timeout_slash_confirmed` couldn't read the bond
+                                    // rows), so we don't yet know whether the slash
+                                    // applies. Falling through to cancel/republish
+                                    // would persist the order out of
+                                    // `find_order_by_seconds`'s waiting-state
+                                    // eligibility window, and the next tick would
+                                    // never re-evaluate it — losing the slash whose
+                                    // applicability we couldn't even determine.
+                                    // `continue` keeps the order eligible so the
+                                    // next tick re-runs the full path (the slash
+                                    // primitive is idempotent on a settled HTLC and
+                                    // a `PendingPayout` bond, so a retry that
+                                    // finds the work already done is a no-op).
+                                    tracing::warn!(
+                                        "scheduler_timeout: bond slash/release errored for {} ({}); skipping cancel/republish so next tick retries",
+                                        order.id, e
+                                    );
+                                    continue;
+                                }
                             }
                         }
 

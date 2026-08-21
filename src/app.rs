@@ -50,6 +50,7 @@ use crate::app::trade_pubkey::trade_pubkey_action;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
+use crate::inbox::{InboxKeeper, InboxSubscription};
 use crate::lightning::LndConnector;
 use crate::util::enqueue_cant_do_msg;
 use crate::Result;
@@ -409,6 +410,11 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
+/// How long to wait before re-attaching to the notification stream after it
+/// ended without a shutdown. Long enough that a persistent failure cannot burn
+/// a core, short enough that a transient one costs no meaningful deaf time.
+const NOTIFICATION_STREAM_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Shared post-dispatch error handling (identical in both loops). A handler
 /// `Err` is downcast to a `MostroError` and turned into the right reply
 /// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
@@ -457,37 +463,69 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    // The inbox identity is derived here rather than passed around (see
+    // `crate::inbox`).
+    let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
+    let keeper = InboxKeeper::new(subscription.clone());
+    let mut subscribed = false;
 
     loop {
         let mut notifications = client.notifications();
 
+        // The REQ goes out only once this stream exists. A notification
+        // receiver never sees what was delivered before it was created, so
+        // subscribing any earlier throws away the relay's EOSE — and every
+        // event that lands while the rest of the daemon is still booting.
+        if !subscribed {
+            subscription.subscribe(client).await?;
+            subscribed = true;
+        }
+
         while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    is_v2,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result = handle_message_action(
-                    &action,
-                    message.clone(),
-                    &unwrapped,
-                    my_keys,
-                    ln_client,
-                    &ctx,
-                )
-                .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    let Some((action, message, unwrapped)) = accept_event(
+                        &ctx,
+                        &event,
+                        my_keys,
+                        pow,
+                        pow_first_contact,
+                        accepted_kind,
+                        is_v2,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let result = handle_message_action(
+                        &action,
+                        message.clone(),
+                        &unwrapped,
+                        my_keys,
+                        ln_client,
+                        &ctx,
+                    )
+                    .await;
+                    finalize_dispatch(result, message, unwrapped, &action).await;
+                }
+                ClientNotification::Message { relay_url, message } => {
+                    keeper.on_relay_message(client, &relay_url, &message).await;
+                }
+                ClientNotification::Shutdown => return Ok(()),
             }
         }
+
+        // The stream ended without a `Shutdown` frame. That frame can be
+        // missed — the SDK's notification channel silently drops messages when
+        // the consumer falls behind — and after a shutdown `notifications()`
+        // hands back an empty stream, so re-taking it unconditionally spins
+        // this loop at full tilt. Leave when the client is done, and pace the
+        // retry otherwise.
+        if client.is_shutdown() {
+            return Ok(());
+        }
+        tracing::warn!("Nostr notification stream ended without a shutdown; re-attaching");
+        tokio::time::sleep(NOTIFICATION_STREAM_RETRY).await;
     }
 }
 
@@ -508,30 +546,57 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
+    let keeper = InboxKeeper::new(subscription.clone());
+    let mut subscribed = false;
 
     loop {
         let mut notifications = client.notifications();
 
+        // Subscribe only once the stream exists — see `run`.
+        if !subscribed {
+            subscription.subscribe(client).await?;
+            subscribed = true;
+        }
+
         while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    is_v2,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result =
-                    dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    let Some((action, message, unwrapped)) = accept_event(
+                        &ctx,
+                        &event,
+                        my_keys,
+                        pow,
+                        pow_first_contact,
+                        accepted_kind,
+                        is_v2,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let result =
+                        dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
+                    finalize_dispatch(result, message, unwrapped, &action).await;
+                }
+                ClientNotification::Message { relay_url, message } => {
+                    keeper.on_relay_message(client, &relay_url, &message).await;
+                }
+                ClientNotification::Shutdown => return Ok(()),
             }
         }
+
+        // The stream ended without a `Shutdown` frame. That frame can be
+        // missed — the SDK's notification channel silently drops messages when
+        // the consumer falls behind — and after a shutdown `notifications()`
+        // hands back an empty stream, so re-taking it unconditionally spins
+        // this loop at full tilt. Leave when the client is done, and pace the
+        // retry otherwise.
+        if client.is_shutdown() {
+            return Ok(());
+        }
+        tracing::warn!("Nostr notification stream ended without a shutdown; re-attaching");
+        tokio::time::sleep(NOTIFICATION_STREAM_RETRY).await;
     }
 }
 

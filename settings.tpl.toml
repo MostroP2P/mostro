@@ -134,7 +134,9 @@ dm_days = 30
 # <settings_dir>/.env, never here); the daemon refuses to start otherwise.
 # Generate one with: openssl rand -base64 32
 enabled = false
-# RPC server listen address
+# RPC server listen address. Must be an IP literal, with IPv6 bracketed:
+# "127.0.0.1", "[::1]" or "0.0.0.0". Hostnames such as "localhost" are not
+# resolved and the daemon refuses to start on one.
 listen_address = "127.0.0.1"
 # RPC server port
 port = 50051

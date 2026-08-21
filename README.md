@@ -653,7 +653,7 @@ bitcoin_price_api_url = "https://api.yadio.io"
 ```toml
 [rpc]
 enabled = false              # Set to true to enable gRPC admin interface
-listen_address = "127.0.0.1"
+listen_address = "127.0.0.1" # IP literal, IPv6 bracketed; "localhost" is not resolved
 port = 50051
 allow_remote = false         # Required to bind a non-loopback address
 ```

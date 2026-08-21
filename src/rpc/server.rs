@@ -15,6 +15,32 @@ use tracing::info;
 
 use super::admin::admin_service_server::AdminServiceServer;
 
+/// Resolve `[rpc].listen_address` and `[rpc].port` into the address the server
+/// binds.
+///
+/// `SocketAddr` only parses IP literals, with IPv6 bracketed. Hostnames such as
+/// `localhost` and bare `::1` are therefore not bindable addresses, however
+/// natural they look in a config file.
+///
+/// `config::util::validate_rpc_settings` calls this too, so a `listen_address`
+/// that passes validation is guaranteed to be one `bind` can use: the two must
+/// never disagree, or the daemon accepts a config at startup and then dies on
+/// it.
+pub(crate) fn listen_socket_addr(
+    listen_address: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr, String> {
+    format!("{listen_address}:{port}")
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| {
+            format!(
+                "Invalid address {listen_address:?}: {e}. Expected an IP literal, with IPv6 \
+                 bracketed — for example 127.0.0.1, [::1] or 0.0.0.0. Hostnames such as \
+                 \"localhost\" are not resolved."
+            )
+        })
+}
+
 /// RPC server for admin operations
 pub struct RpcServer {
     listen_address: String,
@@ -37,7 +63,8 @@ impl RpcServer {
         }
     }
 
-    /// Acquire the listener and return the future that serves it.
+    /// Acquire the listener and return the bound address with the future that
+    /// serves it.
     ///
     /// Everything that can fail on the way up happens here, before the caller
     /// gets anything to detach: a missing bearer token, unusable TLS material,
@@ -45,6 +72,10 @@ impl RpcServer {
     /// so a caller that awaits this function knows the admin API is listening
     /// and gated before it lets the rest of the daemon proceed — `[rpc].enabled
     /// = true` becomes an invariant rather than a hope.
+    ///
+    /// The address comes back from the listener rather than from the config, so
+    /// it is the port actually in use: `port = 0` reports the ephemeral port the
+    /// kernel picked instead of a literal `:0`.
     ///
     /// Refusing to serve without a token is deliberately redundant with
     /// `config::util::validate_rpc_settings`: a code path that reached here
@@ -56,12 +87,13 @@ impl RpcServer {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
     ) -> Result<
-        impl std::future::Future<Output = Result<(), tonic::transport::Error>> + Send + 'static,
+        (
+            std::net::SocketAddr,
+            impl std::future::Future<Output = Result<(), tonic::transport::Error>> + Send + 'static,
+        ),
         Box<dyn std::error::Error>,
     > {
-        let addr: std::net::SocketAddr = format!("{}:{}", self.listen_address, self.port)
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
+        let addr = listen_socket_addr(&self.listen_address, self.port)?;
 
         let token = read_rpc_token_env_var().ok_or_else(|| {
             format!("Refusing to start the admin RPC server: {RPC_TOKEN_ENV_VAR} is not set")
@@ -89,14 +121,20 @@ impl RpcServer {
         // discovered later by whoever happens to read the logs.
         let incoming =
             TcpIncoming::bind(addr).map_err(|e| format!("Failed to bind {addr}: {e}"))?;
-        info!("RPC server listening on {} ({})", addr, transport);
+        let bound = incoming
+            .local_addr()
+            .map_err(|e| format!("Failed to read the address bound to {addr}: {e}"))?;
+        info!("RPC server listening on {} ({})", bound, transport);
 
-        Ok(builder
-            .add_service(AdminServiceServer::with_interceptor(
-                admin_service,
-                BearerAuth::new(token),
-            ))
-            .serve_with_incoming(incoming))
+        Ok((
+            bound,
+            builder
+                .add_service(AdminServiceServer::with_interceptor(
+                    admin_service,
+                    BearerAuth::new(token),
+                ))
+                .serve_with_incoming(incoming),
+        ))
     }
 
     /// Check if RPC server is enabled
@@ -232,10 +270,37 @@ mod tests {
         init_test_settings();
         let _lock = RPC_TOKEN_LOCK.lock().await;
         let _token = RpcTokenGuard::set(&"t".repeat(32));
-        let server = server_at("not an address", 50051);
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let result = server.bind(Keys::generate(), Arc::new(pool), offline_ln_client().await);
-        assert!(result.is_err());
+        // `localhost` and bare `::1` are in here on purpose: they read like
+        // valid loopback spellings, and `config::util` rejects them for exactly
+        // this reason — `SocketAddr` cannot parse either.
+        for address in ["not an address", "localhost", "::1"] {
+            let server = server_at(address, 50051);
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+            let error = server
+                .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+                .err()
+                .expect("an address that cannot be parsed must not serve");
+            assert!(
+                error.to_string().contains("Invalid address"),
+                "{address} should have been refused, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn listen_socket_addr_accepts_only_bindable_literals() {
+        for address in ["127.0.0.1", "[::1]", "0.0.0.0", "[::]"] {
+            assert!(
+                listen_socket_addr(address, 50051).is_ok(),
+                "{address} is a bindable literal"
+            );
+        }
+        for address in ["localhost", "::1", "::", "mostro.example.com", ""] {
+            assert!(
+                listen_socket_addr(address, 50051).is_err(),
+                "{address} is not a bindable literal"
+            );
+        }
     }
 
     /// The startup invariant the daemon depends on: a listener that cannot be
@@ -322,18 +387,14 @@ mod tests {
         let token = "t".repeat(32);
         let _guard = RpcTokenGuard::set(&token);
 
-        // Reserve an ephemeral port and release it, so parallel runs of the
-        // suite cannot collide on a fixed one.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("reserve an ephemeral port")
-            .local_addr()
-            .expect("reserved address")
-            .port();
-
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let ln_client = offline_ln_client().await;
-        let server = server_at("127.0.0.1", port);
-        let serving = server
+        // Port 0: the listener `bind` returns owns the ephemeral port for as
+        // long as the test needs it. Reserving a port and releasing it first
+        // would leave a window in which the kernel can hand it to another
+        // process — a flake, not a failure of what is under test.
+        let server = server_at("127.0.0.1", 0);
+        let (bound, serving) = server
             .bind(Keys::generate(), Arc::new(pool), ln_client)
             .expect("bind must succeed on a free loopback port");
         let serving = tokio::spawn(serving);
@@ -341,7 +402,7 @@ mod tests {
         // No retry loop: `bind` returned, so the listener already exists and
         // the connection below must succeed on the first attempt. A retry here
         // would hide exactly the regression this asserts against.
-        let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        let channel = Channel::from_shared(format!("http://{bound}"))
             .expect("valid endpoint")
             .connect()
             .await

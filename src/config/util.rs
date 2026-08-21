@@ -10,6 +10,7 @@ use crate::config::secret::{read_nsec_env_var, read_rpc_token_env_var};
 use crate::config::types::RpcSettings;
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
+use crate::rpc::server::listen_socket_addr;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
 use secrecy::{ExposeSecret, SecretString};
@@ -85,17 +86,12 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
 
 /// True when `addr` can only be reached from the host itself.
 ///
-/// Accepts the `localhost` literal alongside IP literals because
-/// `settings.toml` has always allowed it, and bracketed IPv6 (`[::1]`) because
-/// that is how the address is written in a `host:port` pair.
+/// Parses through `rpc::server::listen_socket_addr`, the same function
+/// `RpcServer::bind` uses, so this can never call an address loopback that the
+/// server would then refuse to bind. Callers must reject unparseable addresses
+/// first — `false` here means "not loopback", not "not an address".
 fn is_loopback_address(addr: &str) -> bool {
-    if addr.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    addr.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    listen_socket_addr(addr, 0).is_ok_and(|socket| socket.ip().is_loopback())
 }
 
 /// Validate the `[rpc]` block (finding 1.5, issue #807).
@@ -113,6 +109,9 @@ fn is_loopback_address(addr: &str) -> bool {
 /// - A non-loopback `listen_address` requires an explicit `allow_remote = true`.
 ///   The defaults are safe, but nothing used to stop `0.0.0.0` from publishing
 ///   the admin API to the LAN silently.
+/// - `listen_address` must be an address `RpcServer::bind` can actually bind.
+///   Validation and binding share `rpc::server::listen_socket_addr` so the two
+///   cannot drift: a config accepted here is one the server will accept.
 ///
 /// A half-configured TLS pair is also fatal: it reads as "TLS is on" while
 /// serving plaintext.
@@ -151,6 +150,14 @@ fn validate_rpc_settings(
         }
         Some(_) => {}
     }
+
+    // Before the loopback check, or an unbindable address would be reported as
+    // a remote-exposure problem: `localhost` and bare `::1` read as loopback to
+    // an operator, so "set allow_remote = true" would be actively misleading
+    // advice for a daemon that is about to die on `Invalid address` instead.
+    listen_socket_addr(&rpc.listen_address, rpc.port).map_err(|e| {
+        MostroInternalErr(ServiceError::IOError(format!("[rpc].listen_address: {e}")))
+    })?;
 
     if !is_loopback_address(&rpc.listen_address) && !rpc.allow_remote {
         return Err(MostroInternalErr(ServiceError::IOError(format!(
@@ -721,15 +728,8 @@ mod rpc_validation_tests {
     }
 
     #[test]
-    fn loopback_is_recognised_in_every_written_form() {
-        for address in [
-            "127.0.0.1",
-            "127.0.0.53",
-            "localhost",
-            "LOCALHOST",
-            "::1",
-            "[::1]",
-        ] {
+    fn loopback_is_recognised_in_every_bindable_form() {
+        for address in ["127.0.0.1", "127.0.0.53", "[::1]"] {
             let rpc = RpcSettings {
                 enabled: true,
                 listen_address: address.to_string(),
@@ -742,9 +742,37 @@ mod rpc_validation_tests {
         }
     }
 
+    /// The contract this pins: validation and `RpcServer::bind` share one
+    /// parser, so anything the server cannot bind is refused here with an
+    /// actionable message instead of at startup with `Invalid address`.
+    ///
+    /// `localhost` and bare `::1` are the cases that matter — they look like
+    /// valid loopback spellings, and reporting them through the `allow_remote`
+    /// branch would send the operator to fix the wrong setting.
+    #[test]
+    fn an_unbindable_listen_address_is_rejected() {
+        for address in ["localhost", "LOCALHOST", "::1", "::", "mostro.example.com"] {
+            let rpc = RpcSettings {
+                enabled: true,
+                listen_address: address.to_string(),
+                // Set so the failure cannot be attributed to the remote-bind
+                // guard: only the parse check can refuse these.
+                allow_remote: true,
+                ..Default::default()
+            };
+            let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+                .expect_err("an address the server cannot bind must not boot");
+            let message = err.to_string();
+            assert!(
+                message.contains("IP literal") && message.contains("[::1]"),
+                "{address} should name the accepted spellings, got: {message}"
+            );
+        }
+    }
+
     #[test]
     fn non_loopback_bind_without_allow_remote_is_rejected() {
-        for address in ["0.0.0.0", "192.168.1.10", "::", "mostro.example.com"] {
+        for address in ["0.0.0.0", "192.168.1.10", "[::]"] {
             let rpc = RpcSettings {
                 enabled: true,
                 listen_address: address.to_string(),

@@ -279,8 +279,10 @@ async fn main() -> Result<()> {
         // and the TLS material here, before any of the startup below runs, so
         // the daemon never advances past this point believing an admin
         // interface is up that nothing is serving.
-        let rpc_serving = match rpc_server.bind(rpc_keys, rpc_pool, rpc_ln_client) {
-            Ok(serving) => serving,
+        // `bind` logs the address it actually acquired, so it is not repeated
+        // here.
+        let (_bound, rpc_serving) = match rpc_server.bind(rpc_keys, rpc_pool, rpc_ln_client) {
+            Ok(bound) => bound,
             Err(e) => {
                 tracing::error!("RPC server failed to start: {}", e);
                 exit(1);

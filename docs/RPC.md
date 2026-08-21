@@ -29,6 +29,12 @@ allow_remote = false
 # tls_key_path = "/etc/mostro/rpc-key.pem"
 ```
 
+`listen_address` must be an IP literal, with IPv6 bracketed: `127.0.0.1`,
+`[::1]` or `0.0.0.0`. Hostnames are never resolved, so `localhost` and
+unbracketed `::1` are refused at startup rather than accepted and then failed on
+at bind time — `validate_rpc_settings` and `RpcServer::bind` parse the address
+through the same function.
+
 The bearer token is **not** configured here. It is read from the `MOSTRO_RPC_TOKEN`
 environment variable, which the daemon also picks up from `<settings_dir>/.env`:
 

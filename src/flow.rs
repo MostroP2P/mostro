@@ -161,6 +161,16 @@ pub async fn hold_invoice_paid(
 
         notify_reputation = true;
     }
+    // Stamp the idempotency marker on the struct so the transition below
+    // carries it: `Crud::update` writes the whole row, so status, event id and
+    // marker land in one statement. A separate write after the transition left
+    // a window where a failed stamp meant a persisted transition with
+    // `invoice_held_at == 0`, and the replay `find_held_invoices` drives would
+    // pass the guard and queue the prompts a second time. There is nothing to
+    // order between them: the marker means "this delivery was processed", and
+    // the transition is what processing it produces.
+    order.invoice_held_at = Timestamp::now().as_secs() as i64;
+
     // We publish a new replaceable kind nostr event with the status updated
     // and update on local database the status and new event id
     let persisted = match crate::util::update_order_event(my_keys, status, &order).await {
@@ -177,10 +187,10 @@ pub async fn hold_invoice_paid(
         }
     };
 
-    // Bail before notifying *and* before marking the invoice processed. The
-    // parties must never be told the escrow advanced — least of all the buyer,
-    // whose next step is to send fiat — on the strength of a transition that
-    // was not stored. Leaving `invoice_held_at` at 0 keeps the order eligible
+    // Bail before notifying. The parties must never be told the escrow
+    // advanced — least of all the buyer, whose next step is to send fiat — on
+    // the strength of a transition that was not stored. The marker rode in
+    // that same failed write, so it is still 0 and the order stays eligible
     // for the replay `find_held_invoices` drives on restart, which re-runs
     // this whole flow.
     if !persisted {
@@ -206,12 +216,11 @@ pub async fn hold_invoice_paid(
     if notify_reputation {
         // Notify taker reputation to maker. Best effort on purpose: this is an
         // extra message riding alongside the `AddInvoice` already queued above,
-        // and letting it abort would skip the `invoice_held_at` stamp below —
-        // leaving the order replayable with its transition already persisted
-        // and its messages already sent, so a resubscribe would duplicate
-        // them. `notify_taker_reputation` keys on the order's *current* status
-        // (the same contract `add_invoice` relies on), and can also fail on a
-        // missing master pubkey; neither is worth a duplicate prompt.
+        // and the transition it belongs to is already committed — failing the
+        // call here would report an error for work that did land.
+        // `notify_taker_reputation` keys on the order's *current* status (the
+        // same contract `add_invoice` relies on), and can also fail on a
+        // missing master pubkey; neither is worth failing the delivery over.
         tracing::info!("Notifying taker reputation to maker");
         if let Err(e) = notify_taker_reputation(pool, &order).await {
             tracing::warn!(
@@ -220,11 +229,6 @@ pub async fn hold_invoice_paid(
             );
         }
     }
-
-    // Update the invoice_held_at field
-    crate::db::update_order_invoice_held_at_time(pool, order.id, Timestamp::now().as_secs() as i64)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(())
 }
@@ -652,6 +656,58 @@ mod tests {
         assert_eq!(
             updated.invoice_held_at, 0,
             "no side effects on an order outside the pre-payment window"
+        );
+    }
+
+    /// The marker rides in the same write as the transition, so once the flow
+    /// has run its prompts cannot be queued twice — which is what a replayed
+    /// `Accepted` would do on every restart. Driven from
+    /// `waiting-buyer-invoice`, the else-branch's own output state, where the
+    /// status is unchanged by the transition and the marker is the only thing
+    /// standing between a replay and a duplicate prompt.
+    #[tokio::test]
+    async fn hold_invoice_paid_replay_does_not_duplicate_the_prompts() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "77".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingBuyerInvoice,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+
+        let keys = create_test_keys();
+        assert!(hold_invoice_paid(&hash, None, &pool, &keys).await.is_ok());
+        let stamped = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert!(
+            stamped.invoice_held_at > 0,
+            "the transition must carry the marker"
+        );
+
+        // The replay LND delivers on every resubscribe.
+        assert!(hold_invoice_paid(&hash, None, &pool, &keys).await.is_ok());
+
+        let queued = queued_actions_for(order.id).await;
+        assert_eq!(
+            queued.iter().filter(|a| **a == Action::AddInvoice).count(),
+            1,
+            "the buyer must be asked for an invoice exactly once: {queued:?}"
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|a| **a == Action::WaitingBuyerInvoice)
+                .count(),
+            1,
+            "the seller must be told exactly once: {queued:?}"
         );
     }
 

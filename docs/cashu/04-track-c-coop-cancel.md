@@ -36,7 +36,10 @@ escrow:
 - Unblocking `Cancel` in `dispatch_cashu`.
 
 ### Out of scope (other tracks)
-- **Unilateral / dispute-driven** cancellation → Track D (`admin_cancel`).
+- **Unilateral / dispute-driven** cancellation of a **locked** escrow → Track D
+  (`admin_cancel`). A take that was **never locked** has no escrow to arbitrate,
+  so it belongs to neither Track D nor the cooperative handshake above — its
+  recovery is the TC-2 timeout job (§5a, raised by the TA-2 review).
 - **Release** happy path → Track B.
 - The **live fee redeem** mechanics (Track A TA-1f follow-up); the refund shares
   the same "Mostro sends ecash" capability and should land with it.
@@ -136,6 +139,45 @@ peer consent) is **not** a Track C concern — that path is a dispute (Track D).
 
 ---
 
+## 5a. The unfunded-take timeout (gap raised by the TA-2 review)
+
+Track A TA-2 (`show_cashu_escrow_request` in `src/util.rs`) claims the
+`Pending → WaitingPayment` transition atomically (`claim_order_status`) and only
+then publishes the order event and persists the row. Two abandonment cases leave
+an order sitting in `WaitingPayment` **with no escrow locked**:
+
+1. **The seller never submits `AddCashuEscrow`** (gone, or their client never
+   retries a rejected lock). Nothing is locked and no fiat has moved — but the
+   order is taken off the book from the maker's perspective, indefinitely.
+2. **A partial failure after the claim** (the Nostr publish or the full-row
+   persist fails). The claim has already committed, so the order is
+   `WaitingPayment` with the trade pubkeys possibly unpersisted and no party
+   notified.
+
+On a Lightning node the equivalent state self-heals: `job_cancel_orders`
+(`src/scheduler.rs`) re-selects stale `WaitingPayment` rows every tick
+(`find_order_by_seconds` against `taken_at`), cancels the hold invoice, and
+republishes or cancels the order. **That job is Lightning-only** (gated behind
+`!Settings::is_cashu_enabled()`), and until Track C lands, `Cancel` itself is
+rejected with `InvalidAction` in `dispatch_cashu` — so today neither recovery
+path exists in Cashu mode.
+
+No funds are ever at risk here (nothing was locked), so this is a
+liveness/book-keeping hole, not a safety hole — but it must be closed before
+Cashu mode is production-usable.
+
+**TC-2 closes it:** a cashu-mode scheduler job that re-selects stale
+`WaitingPayment` rows with `cashu_escrow_locked_at IS NULL` and `taken_at` past
+the `expiration_seconds` window, and drives them back — republishing the order
+as `Pending` when the taker stalled (mirroring the Lightning
+`(WaitingPayment, Buy)` republish arm) or cancelling it when the maker stalled —
+without touching LND. A seller locking *after* the timeout fired is rejected
+cleanly by the TA-1 handler's `WaitingPayment` status check and keeps their
+token; a **locked** escrow is never touched by this job (locked escrows are
+Track C/D territory).
+
+---
+
 ## 6. PR breakdown (atomic, backwards-compatible)
 
 ### TC-1 · `cancel_action` Cashu branch + fee refund
@@ -149,6 +191,17 @@ capability). Conflict surface: `cancel.rs`, possibly `db.rs` (refund bookkeeping
 additive) + `migrations/` if a `cashu_fee_refunded_at` column is chosen,
 `app.rs` (one dispatch arm).*
 
+### TC-2 · Unfunded-take timeout job (cashu-mode `job_cancel_orders` analogue)
+A cashu-gated scheduler job that recovers orders stuck in `WaitingPayment` with
+no locked escrow (§5a): re-select stale rows (`cashu_escrow_locked_at IS NULL`,
+`taken_at` past `expiration_seconds`), republish as `Pending` when the taker
+(buy-order seller) stalled, cancel when the maker (sell-order seller) stalled,
+notify both parties — never touching LND. Unit-tested: a stale unfunded take is
+republished/cancelled and a late-arriving `AddCashuEscrow` is rejected by the
+TA-1 status check; a *locked* escrow is never touched by this job.
+*Depends on CF-1, CF-5, TA-2. Conflict surface: `scheduler.rs` (additive,
+cashu-gated) + tests.*
+
 ---
 
 ## 7. Issues table — sequential vs parallel
@@ -156,9 +209,12 @@ additive) + `migrations/` if a `cashu_fee_refunded_at` column is chosen,
 | ID | Title | Depends on | Parallel with | Conflict surface | Risk |
 |----|-------|-----------|---------------|------------------|------|
 | **TC-1** | `cancel_action` Cashu branch + fee refund + unblock `Cancel` | CF-5, Track A, TA-1f | Tracks B/D | `cancel.rs`, `app.rs`, (opt.) `migrations/` | Medium (funds return + refund) |
+| **TC-2** | Unfunded-take timeout job (§5a) | CF-1, CF-5, TA-2 | TC-1, Tracks B/D | `scheduler.rs` (additive, cashu-gated) | Low |
 
 Track C is parallel with Tracks B/D; the only shared touch point is the
-`dispatch_cashu` `Cancel` arm.
+`dispatch_cashu` `Cancel` arm. TC-2 is independent of the cancel handshake and
+can land before or after TC-1 — until one of them does, a take whose seller
+never locks leaves the order stranded in `WaitingPayment` (§5a).
 
 ---
 
@@ -172,7 +228,10 @@ Track C is parallel with Tracks B/D; the only shared touch point is the
    still requires both).
 3. The fee refund is **single-shot**: a replayed/duplicate cancel never
    double-refunds; a fee-free order refunds nothing.
-4. With Cashu disabled, behaviour is identical to `main`; existing tests pass
+4. A take whose escrow was never locked does not strand the order: the TC-2
+   timeout republishes or cancels it, a late lock is rejected by the TA-1 status
+   check, and a locked escrow is never touched by the job (§5a).
+5. With Cashu disabled, behaviour is identical to `main`; existing tests pass
    unmodified. `fmt`/`clippy -D warnings`/`test` green.
 
 ---
@@ -184,3 +243,4 @@ Track C is parallel with Tracks B/D; the only shared touch point is the
 | Fee refund on non-success (coop cancel after lock), `2 * order.fee` to `P_S` | Track A §4A / §10 | **Executed** (TC-1) |
 | Single-shot refund bookkeeping | Track A §4A | **Executed** (idempotent refund) |
 | Mostro-sends-ecash capability | Track A §4A (TA-1f) | **Shared** with the fee redeem; lands together |
+| Unfunded-take timeout — no `job_cancel_orders` analogue in Cashu mode, so a never-locked take strands the order in `WaitingPayment` | TA-2 review (MostroP2P/mostro#830) | **Raised → TC-2** (§5a) |

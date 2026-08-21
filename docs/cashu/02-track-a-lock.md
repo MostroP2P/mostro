@@ -577,7 +577,7 @@ seller hold invoice:
   (This is the `show_cashu_escrow_request(...)` helper.) The order is left in
   `WaitingPayment`, exactly where the CAS in step 8 expects it.
   The helper **claims the `Pending → WaitingPayment` transition atomically**
-  (`db::claim_order_status`) before it writes anything: two concurrent takes
+  (`claim_order_status` in `src/db.rs`) before it writes anything: two concurrent takes
   both pass the caller's in-memory `check_status`, and the loser's full-row
   write is built from a copy read before either ran — it would drag the status
   back with its own trade keys and null every column its stale copy does not

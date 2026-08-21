@@ -142,14 +142,32 @@ jobs:
           name: artifact-${{ matrix.target }}
           path: artifacts/*
 
+  # Decides whether this run is a release. Actions expressions have no regex, so
+  # the exact tag check lives in a job the release jobs gate on. A
+  # workflow_dispatch can target a tag as well as a branch, hence the event name.
+  version-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - id: check
+        run: |
+          set -euo pipefail
+          release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ $release_re ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Publish to crates.io (only if all builds succeed)
   # This job will only run if both test and build jobs succeed.
   # With fail-fast: false, the build job fails if ANY matrix build fails,
   # ensuring all artifacts are built before publishing.
   publish:
     runs-on: ubuntu-latest
-    needs: [test, build]
-    if: success()
+    needs: [test, build, version-tag]
+    if: success() && needs.version-tag.outputs.is_release == 'true'
     permissions:
       contents: read
     steps:
@@ -165,10 +183,13 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-  # Create release with all artifacts
+  # Create release with all artifacts for the pushed version tag (same guard as
+  # publish). Without it a workflow_dispatch would tag github.ref_name, which on
+  # a branch run means a release named after the branch.
   release:
     runs-on: ubuntu-latest
-    needs: [changelog, build]
+    needs: [changelog, build, version-tag]
+    if: needs.version-tag.outputs.is_release == 'true'
     permissions:
       contents: write
     steps:

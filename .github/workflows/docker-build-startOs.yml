@@ -7,9 +7,23 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag (used when run manually; default: latest)'
+        description: 'Image tag for manual runs (cannot be "latest" or a vX.Y.Z release tag; default: dev-<short-sha>)'
         required: false
-        default: 'latest'
+        default: ''
+
+# The images are pushed with the Docker Hub credentials and the layer cache
+# uses the runner's own token, so nothing here needs GITHUB_TOKEN beyond the
+# checkout. Narrow it rather than inheriting the repository default.
+permissions:
+  contents: read
+
+# Two runs of the same ref must never push to the registry at once: they would
+# race on the tags they share. The group is per-ref because GitHub keeps only one
+# pending run per group, so a single global group would drop an intermediate
+# version tag when several tag pushes arrive together.
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-push-plain:
@@ -20,21 +34,39 @@ jobs:
 
       - name: Set image tag for metadata
         id: set_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            # The v*.*.* trigger is a glob and also admits refs like v1.2.3foo or
+            # v1.2.3-rc.1. Only an exact vX.Y.Z is published.
+            release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+            if [[ ! "$GITHUB_REF" =~ $release_re ]]; then
+              echo "::error::not a release tag, nothing is published: $GITHUB_REF"
+              exit 1
+            fi
+            tag="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+            # Anything that is not a tag push takes the guarded path, including a
+            # dispatch aimed at a tag: latest and vX.Y.Z name published images,
+            # so only a tag push is allowed to write them.
+            tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
+            if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
+              echo "::error::manual runs must not publish release tags (latest or vX.Y.Z); got '$tag'"
+              exit 1
+            fi
           fi
-
-      - name: Check if stable release
-        id: check_stable
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          # Anything outside the OCI tag charset is rejected before the write:
+          # a newline would append a second tag= line and silently override the
+          # value checked above.
+          oci_re='^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'
+          if [[ ! "$tag" =~ $oci_re ]]; then
+            echo "::error::not a valid OCI image tag: '$tag'"
+            exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -55,7 +87,6 @@ jobs:
           images: mostrop2p/mostro
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
 
       - name: Build and push plain Docker image
         uses: docker/build-push-action@v5
@@ -77,21 +108,39 @@ jobs:
 
       - name: Set image tag for metadata
         id: set_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            # The v*.*.* trigger is a glob and also admits refs like v1.2.3foo or
+            # v1.2.3-rc.1. Only an exact vX.Y.Z is published.
+            release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+            if [[ ! "$GITHUB_REF" =~ $release_re ]]; then
+              echo "::error::not a release tag, nothing is published: $GITHUB_REF"
+              exit 1
+            fi
+            tag="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+            # Anything that is not a tag push takes the guarded path, including a
+            # dispatch aimed at a tag: latest and vX.Y.Z name published images,
+            # so only a tag push is allowed to write them.
+            tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
+            if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
+              echo "::error::manual runs must not publish release tags (latest or vX.Y.Z); got '$tag'"
+              exit 1
+            fi
           fi
-
-      - name: Check if stable release
-        id: check_stable
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          # Anything outside the OCI tag charset is rejected before the write:
+          # a newline would append a second tag= line and silently override the
+          # value checked above.
+          oci_re='^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'
+          if [[ ! "$tag" =~ $oci_re ]]; then
+            echo "::error::not a valid OCI image tag: '$tag'"
+            exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -112,7 +161,6 @@ jobs:
           images: mostrop2p/mostro-startos
           tags: |
             type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
 
       - name: Build and push StartOS Docker image
         uses: docker/build-push-action@v5
@@ -125,3 +173,52 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # `latest` is moved after both images exist, not while they are being built:
+  # deciding at build time froze the answer for the length of a multi-arch
+  # build, so a release tagged during that window could be overwritten by the
+  # older run finishing later. The group is shared by every ref, which makes
+  # this the one place where release runs serialize, and the tag list is
+  # refetched inside it so the decision is current at the moment of the move.
+  promote-latest:
+    runs-on: ubuntu-latest
+    needs: [build-and-push-plain, build-and-push-startos]
+    if: github.event_name == 'push'
+    concurrency:
+      group: docker-latest-promotion
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Move latest to this release
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --prune
+          release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ ! "$GITHUB_REF" =~ $release_re ]]; then
+            echo "$GITHUB_REF is not a release tag, leaving latest untouched"
+            exit 0
+          fi
+          tag="${GITHUB_REF#refs/tags/}"
+          newest=$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [[ -z "$newest" ]]; then
+            echo "::warning::no version tags visible, leaving latest untouched"
+            exit 0
+          fi
+          if [[ "$tag" != "$newest" ]]; then
+            echo "$tag is not the highest version ($newest), leaving latest untouched"
+            exit 0
+          fi
+          for image in mostrop2p/mostro mostrop2p/mostro-startos; do
+            docker buildx imagetools create -t "$image:latest" "$image:$tag"
+          done

@@ -1,5 +1,5 @@
 use crate::app::bond;
-use crate::app::cancel::{decide_escrow_cancel, EscrowCancelDecision};
+use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::{do_payment, reconcile_inflight_payout};
@@ -557,7 +557,9 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // Same reasoning as the bond slash/release below:
                             // stay eligible and retry rather than persist a
                             // state that doesn't match the HTLC.
-                            if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
+                            if let Err(e) =
+                                cancel_escrow_idempotent(&mut ln_client, order.id, hash).await
+                            {
                                 error!(
                                     "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
                                     order.id

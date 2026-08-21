@@ -1,4 +1,5 @@
 use crate::app::bond;
+use crate::app::bond::flow::{classify_cancel_error, CancelOutcome};
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
@@ -113,6 +114,37 @@ pub(crate) async fn decide_escrow_cancel<L: CancelLightning + Send + ?Sized>(
     classify_escrow_cancel(status, ln_client.lookup_invoice_state(hash).await)
 }
 
+/// Cancel an escrow hold invoice, treating an invoice LND has already voided
+/// as success.
+///
+/// `cancel_hold_invoice` reports `already canceled` / `not found` as an error,
+/// which is a fact rather than a failure — and aborting on it strands the
+/// order. Every cancel path here voids the escrow before persisting, so a
+/// first attempt that dies in between leaves exactly that shape: the escrow is
+/// gone and the order is still live. Without this, the retry that should
+/// finish the job (the caller's, or the scheduler's next timeout tick) hits
+/// the error again and can never converge.
+///
+/// [`classify_cancel_error`] is the same classifier the bond module uses for
+/// its own idempotent cancels; anything it cannot place confidently stays an
+/// error, so a transient LND problem still aborts.
+pub(crate) async fn cancel_escrow_idempotent<L: CancelLightning + Send + ?Sized>(
+    ln_client: &mut L,
+    order_id: uuid::Uuid,
+    hash: &str,
+) -> Result<(), MostroError> {
+    match ln_client.cancel_hold_invoice(hash).await {
+        Ok(()) => Ok(()),
+        Err(e) => match classify_cancel_error(&e) {
+            CancelOutcome::AlreadyDone => {
+                info!("Order Id {order_id}: escrow was already void at LND ({e}); continuing");
+                Ok(())
+            }
+            CancelOutcome::Transient => Err(e),
+        },
+    }
+}
+
 /// Reset API-provided quote-derived amounts when republishing an order.
 ///
 /// When an order was created with `price_from_api`, its `amount` and `fee`
@@ -176,7 +208,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     // Cancel hold invoice if present; if funds were locked, this returns them to the seller.
     if let Some(hash) = &order.hash {
         // We return funds to seller
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!(
             "Cooperative cancel: Order Id {}: Funds returned to seller",
             &order.id
@@ -367,7 +399,7 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
 ) -> Result<(), MostroError> {
     // Cancel hold invoice if present
     if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
 
@@ -435,7 +467,7 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     // CLTV horizon. Same ordering, and the same reasoning, as the scheduler's
     // timeout path and the taker branch above.
     if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
     // We publish a new replaceable kind nostr event with the status updated.
@@ -949,7 +981,7 @@ mod tests {
         /// `None` models an invoice LND has no record of.
         state: Option<InvoiceState>,
         fail_lookup: bool,
-        fail_cancel: bool,
+        fail_cancel: Option<String>,
         canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         looked_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
@@ -959,7 +991,7 @@ mod tests {
             Self {
                 state,
                 fail_lookup: false,
-                fail_cancel: false,
+                fail_cancel: None,
                 canceled: Default::default(),
                 looked_up: Default::default(),
             }
@@ -969,18 +1001,31 @@ mod tests {
             Self {
                 state: None,
                 fail_lookup: true,
-                fail_cancel: false,
+                fail_cancel: None,
                 canceled: Default::default(),
                 looked_up: Default::default(),
             }
         }
 
-        /// Unpaid escrow whose cancel LND refuses.
+        /// Unpaid escrow whose cancel LND refuses with a transient error.
         fn refusing_cancel() -> Self {
             Self {
                 state: Some(InvoiceState::Open),
                 fail_lookup: false,
-                fail_cancel: true,
+                fail_cancel: Some("cancel refused".to_string()),
+                canceled: Default::default(),
+                looked_up: Default::default(),
+            }
+        }
+
+        /// LND reports the invoice as already void — a fact, not a failure.
+        fn already_canceled() -> Self {
+            Self {
+                state: Some(InvoiceState::Canceled),
+                fail_lookup: false,
+                fail_cancel: Some(
+                    "code=Unknown message=invoice with that hash already canceled".to_string(),
+                ),
                 canceled: Default::default(),
                 looked_up: Default::default(),
             }
@@ -1002,12 +1047,10 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
         {
             let canceled = self.canceled.clone();
-            let fail = self.fail_cancel;
+            let fail = self.fail_cancel.clone();
             Box::pin(async move {
-                if fail {
-                    return Err(MostroInternalErr(ServiceError::LnNodeError(
-                        "cancel refused".to_string(),
-                    )));
+                if let Some(cause) = fail {
+                    return Err(MostroInternalErr(ServiceError::LnNodeError(cause)));
                 }
                 canceled.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -1812,6 +1855,44 @@ mod tests {
             order_by_id(ctx.pool(), order.id).await.status,
             Status::WaitingPayment.to_string(),
             "the order must not be canceled while its hold invoice is live"
+        );
+    }
+
+    /// An escrow LND already voided must not block the cancel: that is the
+    /// retry that finishes a first attempt which died between voiding the
+    /// escrow and persisting, and without this it can never converge.
+    #[tokio::test]
+    async fn maker_cancel_converges_when_the_escrow_is_already_void() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::already_canceled();
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an already-void escrow must not abort the cancel: {result:?}"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Canceled.to_string(),
+            "the retry must finish what the first attempt left half-done"
         );
     }
 

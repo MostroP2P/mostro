@@ -68,6 +68,9 @@ impl ReplayGuard {
     /// present within the window (i.e. a replay the caller should drop).
     /// Expired entries are pruned on the way through so the map stays bounded
     /// by the in-window event rate.
+    ///
+    /// Caller contract: `id` must belong to an event whose signature already
+    /// verified — see [`SpamGate::is_replay`].
     fn check_and_record(&mut self, id: EventId, now: i64) -> bool {
         let cutoff = now - self.window_secs;
         self.seen.retain(|_, &mut seen_at| seen_at >= cutoff);
@@ -138,6 +141,15 @@ impl SpamGate {
     /// Record `id` and report whether it is a replay to drop. A poisoned lock
     /// degrades to `false` (never drop a real message because dedup state was
     /// lost).
+    ///
+    /// **Only call this for events whose signature has already been verified.**
+    /// A nostr event id commits to `[0, pubkey, created_at, kind, tags,
+    /// content]` and *not* to `sig`, so a signature-tampered copy of a victim's
+    /// event carries the victim's id. Recording ids before authentication would
+    /// turn this dedup into a censorship primitive: the forged copy gets
+    /// recorded, and the genuine event that follows is dropped here as a
+    /// replay. `accept_event` verifies the event signature before reaching this
+    /// call for exactly that reason.
     pub fn is_replay(&self, id: EventId, now: i64) -> bool {
         match self.replay.lock() {
             Ok(mut guard) => guard.check_and_record(id, now),

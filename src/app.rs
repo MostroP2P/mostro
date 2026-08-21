@@ -51,6 +51,7 @@ use crate::app::trade_pubkey::trade_pubkey_action;
 use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
+use crate::spam_gate::SpamGate;
 use crate::util::enqueue_cant_do_msg;
 use crate::Result;
 
@@ -295,8 +296,15 @@ async fn handle_message_action(
 
 /// Decode and fully validate one relay event into a dispatchable
 /// `(action, message, unwrapped)` triple, or `None` if it must be skipped
-/// (failed PoW, wrong kind, spam-gate drop, decrypt failure, stale, missing
-/// inner signature, failed trade-index, failed inner verify, no action).
+/// (failed PoW, wrong kind, invalid event signature, spam-gate drop, decrypt
+/// failure, stale, missing inner signature, failed trade-index, failed inner
+/// verify, no action).
+///
+/// **Validation order is load-bearing**: the event signature is checked before
+/// the spam gate, so the gate only ever records ids that survived
+/// authentication. Recording an unauthenticated id would let anyone who can
+/// deliver an event to the daemon censor a trade message by injecting a
+/// same-id, signature-tampered copy first — the id does not commit to `sig`.
 ///
 /// This is the transport + validation **prologue** shared VERBATIM by `run`
 /// (Lightning) and `run_cashu` (Cashu) so the two event loops cannot drift
@@ -310,7 +318,7 @@ async fn accept_event(
     pow: u8,
     pow_first_contact: u8,
     accepted_kind: Kind,
-    is_v2: bool,
+    gate: Option<&SpamGate>,
 ) -> Option<(Action, Message, UnwrappedMessage)> {
     // Verify proof of work
     if !event.check_pow(pow) {
@@ -321,40 +329,60 @@ async fn accept_event(
     if event.kind != accepted_kind {
         return None;
     }
+    // Authenticate the event BEFORE anything downstream records state keyed on
+    // it. A nostr event id commits to `[0, pubkey, created_at, kind, tags,
+    // content]` — **not** to `sig` — so a copy with a tampered signature keeps
+    // the victim's id. Verifying here (cheap Schnorr, pre-decrypt) is what
+    // makes the spam gate's dedup safe: only ids that are provably the
+    // author's own are ever recorded, so a forged copy cannot get the genuine
+    // event dropped as a replay.
+    //
+    // It is also the only outer-event check on the v1 path: `unwrap_incoming`
+    // re-verifies the event itself on v2 only (`unwrap_message_nip44` calls
+    // `event.verify()`), while v1's `nip59::unwrap_message` decrypts the wrap
+    // and verifies the *seal's* signature alone — never the outer gift wrap's
+    // id or signature. Do not delete this as redundant.
+    if event.verify().is_err() {
+        tracing::warn!("Dropping event {} with an invalid signature", event.id);
+        return None;
+    }
     // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
     // cheap pre-validation BEFORE paying the NIP-44 decrypt
-    // cost. v1 gift wraps skip this — their outer key is a
-    // throwaway with no pre-validatable signal.
-    if is_v2 {
-        if let Some(gate) = crate::spam_gate::SpamGate::global() {
-            let now = chrono::Utc::now().timestamp();
-            // Dedup: drop a re-sent identical event (defense in
-            // depth against replay floods).
-            if gate.is_replay(event.id, now) {
-                tracing::debug!("Dropping replayed event {}", event.id);
-                return None;
-            }
-            // Two lanes: a sender already in an active trade is
-            // fast-pathed (only the base `pow` already checked
-            // above applies); an unseen first-contact sender
-            // must clear the stiffer `pow_first_contact` before
-            // we decrypt. New orders/takes legitimately arrive
-            // here — so does spam, hence the PoW toll.
-            if !gate.is_known(&event.pubkey.to_string()) && !event.check_pow(pow_first_contact) {
-                tracing::info!(
-                    "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
-                    event.pubkey,
-                    pow_first_contact
-                );
-                return None;
-            }
+    // cost. `None` means the gate does not apply: v1 gift wraps
+    // (throwaway outer key, no pre-validatable signal) or no
+    // gate installed (fail-open).
+    if let Some(gate) = gate {
+        let now = chrono::Utc::now().timestamp();
+        // Dedup: drop a re-sent identical event (defense in
+        // depth against replay floods). Safe here and not
+        // earlier: the id is only recorded once the signature
+        // above proved the event is the author's own.
+        if gate.is_replay(event.id, now) {
+            tracing::debug!("Dropping replayed event {}", event.id);
+            return None;
+        }
+        // Two lanes: a sender already in an active trade is
+        // fast-pathed (only the base `pow` already checked
+        // above applies); an unseen first-contact sender
+        // must clear the stiffer `pow_first_contact` before
+        // we decrypt. New orders/takes legitimately arrive
+        // here — so does spam, hence the PoW toll.
+        //
+        // The lane is decided on a *verified* author on
+        // purpose: `is_known` keys off `event.pubkey`, and in
+        // v2 the trade keys of active orders are public by
+        // design. Deciding it before the signature check would
+        // let any flooder claim a known key and skip the
+        // first-contact toll entirely.
+        if !gate.is_known(&event.pubkey.to_string()) && !event.check_pow(pow_first_contact) {
+            tracing::info!(
+                "Dropping first-contact kind-14 event from unknown key {} below pow_first_contact ({} bits)",
+                event.pubkey,
+                pow_first_contact
+            );
+            return None;
         }
     }
-
-    // Validate event signature
-    if event.verify().is_err() {
-        tracing::warn!("Error in event verification")
-    };
 
     // Mostro-core dispatches on the event kind: the gift wrap
     // path handles the dual-key layout (identity key signs
@@ -432,6 +460,24 @@ async fn finalize_dispatch(
     }
 }
 
+/// Resolve the anti-spam gate for a transport, once per event loop.
+///
+/// The gate applies to the v2 (kind-14) transport only: there the visible
+/// author is the trade key, so the daemon can pre-validate before decrypting.
+/// `None` fail-opens — v1 gift wraps (throwaway outer key, no pre-validatable
+/// signal) or no gate installed. Shared by `run` and `run_cashu` so the single
+/// v2-only policy cannot drift between the two loops.
+///
+/// `install_spam_gate` (`main.rs`) runs before both loops, so the `OnceLock`
+/// load is loop-invariant and stays out of the per-event path.
+fn gate_for(is_v2: bool) -> Option<&'static SpamGate> {
+    if is_v2 {
+        SpamGate::global()
+    } else {
+        None
+    }
+}
+
 /// Main event loop that processes incoming Nostr events.
 /// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
 ///
@@ -456,7 +502,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // clear `pow_first_contact`; known active-trade keys need only `pow`. The
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
 
     loop {
         let mut notifications = client.notifications();
@@ -470,7 +516,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                     pow,
                     pow_first_contact,
                     accepted_kind,
-                    is_v2,
+                    gate,
                 )
                 .await
                 else {
@@ -507,7 +553,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     #[allow(deprecated)]
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
+    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
 
     loop {
         let mut notifications = client.notifications();
@@ -521,7 +567,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                     pow,
                     pow_first_contact,
                     accepted_kind,
-                    is_v2,
+                    gate,
                 )
                 .await
                 else {
@@ -605,6 +651,20 @@ mod tests {
         )
     }
 
+    // An AppContext backed by a fresh in-memory database with the migrations
+    // applied. Shared by every child test module through `use super::*`.
+    async fn create_migrated_ctx() -> AppContext {
+        let pool = std::sync::Arc::new(sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap());
+        sqlx::migrate!("./migrations")
+            .run(pool.as_ref())
+            .await
+            .unwrap();
+        crate::app::context::test_utils::TestContextBuilder::new()
+            .with_pool(pool)
+            .with_settings(crate::app::context::test_utils::test_settings())
+            .build()
+    }
+
     // Helper function to create an UnwrappedMessage for testing. Identity and
     // sender (trade key) are distinct to mirror the canonical Mostro flow.
     fn create_test_unwrapped_message() -> UnwrappedMessage {
@@ -686,6 +746,175 @@ mod tests {
         // No-op: ensure no panic
     }
 
+    /// Ordering contract of [`accept_event`]: the event signature is verified
+    /// **before** the spam gate records the id. A nostr event id does not
+    /// commit to `sig`, so without that order anyone able to deliver an event
+    /// to the daemon could censor a trade message by racing in a same-id,
+    /// signature-tampered copy: the copy would be recorded and the genuine
+    /// event dropped as a replay.
+    mod accept_event_ordering_tests {
+        use super::*;
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        use mostro_core::nip59::{wrap_message, WrapOptions};
+        use mostro_core::transport::wrap_message_nip44;
+
+        /// A protocol-v2 (kind 14) event addressed to `mostro`, in full-privacy
+        /// mode (trade key doubles as identity, so no identity proof is needed).
+        fn v2_event(mostro: &Keys) -> Event {
+            let trade = create_test_keys();
+            let message = create_test_message(Action::FiatSent, None);
+            wrap_message_nip44(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event")
+        }
+
+        /// The attacker's copy: only `sig` is replaced, which leaves the id —
+        /// and therefore the mined PoW — untouched.
+        fn with_tampered_signature(event: &Event) -> Event {
+            let decoy = EventBuilder::new(NostrKind::TextNote, "decoy")
+                .finalize(&create_test_keys())
+                .expect("sign decoy");
+            let mut forged = event.clone();
+            forged.sig = decoy.sig;
+            forged
+        }
+
+        async fn accept(
+            ctx: &AppContext,
+            event: &Event,
+            mostro: &Keys,
+            gate: &SpamGate,
+        ) -> Option<(Action, Message, UnwrappedMessage)> {
+            // Same constant the event loops derive `is_v2` from, so the test
+            // fails if it ever drifts from `Transport::Nip44Direct`'s kind.
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                Some(gate),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn tampered_copy_does_not_censor_the_genuine_event() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+            let genuine = v2_event(&mostro);
+            let forged = with_tampered_signature(&genuine);
+
+            assert_eq!(forged.id, genuine.id, "tampering sig must preserve the id");
+            assert!(forged.verify().is_err(), "the copy must not verify");
+
+            assert!(
+                accept(&ctx, &forged, &mostro, &gate).await.is_none(),
+                "an event with an invalid signature must be dropped"
+            );
+            assert!(
+                accept(&ctx, &genuine, &mostro, &gate).await.is_some(),
+                "the genuine event must survive a forged same-id copy"
+            );
+        }
+
+        #[tokio::test]
+        async fn genuine_duplicate_is_still_dropped_as_a_replay() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+            let genuine = v2_event(&mostro);
+
+            assert!(
+                accept(&ctx, &genuine, &mostro, &gate).await.is_some(),
+                "first sighting is accepted"
+            );
+            assert!(
+                accept(&ctx, &genuine, &mostro, &gate).await.is_none(),
+                "the replay guard still drops a re-sent identical event"
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_signature_is_dropped_without_a_gate() {
+            // The `None` path — no gate installed — must still reject.
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let forged = with_tampered_signature(&v2_event(&mostro));
+
+            let accepted = accept_event(
+                &ctx,
+                &forged,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await;
+            assert!(accepted.is_none());
+        }
+
+        /// A protocol-v1 gift wrap addressed to `mostro`, in full-privacy mode
+        /// (trade key doubles as identity).
+        async fn v1_event(mostro: &Keys) -> Event {
+            let trade = create_test_keys();
+            let message = create_test_message(Action::FiatSent, None);
+            wrap_message(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .await
+            .expect("wrap gift wrap event")
+        }
+
+        /// The v1 path takes `gate = None` and `nip59::unwrap_message` never
+        /// checks the outer event, so `accept_event`'s own `verify()` is the
+        /// only thing standing between a malformed gift wrap and the decrypt.
+        /// The second assertion is the one that pins the behaviour change:
+        /// well-formed gift wraps still go through.
+        #[tokio::test]
+        async fn v1_gift_wrap_with_invalid_signature_is_dropped() {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let genuine = v1_event(&mostro).await;
+            let forged = with_tampered_signature(&genuine);
+
+            assert!(
+                accept_event(&ctx, &forged, &mostro, 0, 0, NostrKind::GiftWrap, None)
+                    .await
+                    .is_none(),
+                "a gift wrap with an invalid signature must be dropped"
+            );
+            assert!(
+                accept_event(&ctx, &genuine, &mostro, 0, 0, NostrKind::GiftWrap, None)
+                    .await
+                    .is_some(),
+                "a well-formed gift wrap must still be accepted"
+            );
+        }
+
+        /// The v2-only policy lives in one place now; both event loops read it
+        /// from here, so this is where it gets covered.
+        #[test]
+        fn gate_applies_to_v2_only() {
+            assert!(gate_for(false).is_none(), "v1 must fail open");
+            // `SpamGate::global()` is `None` unless `install_spam_gate` ran, so
+            // the v2 arm can only be pinned against the installed state.
+            assert_eq!(gate_for(true).is_some(), SpamGate::global().is_some());
+        }
+    }
+
     mod check_trade_index_tests {
         use super::*;
         use crate::app::context::test_utils::{test_settings, TestContextBuilder};
@@ -718,18 +947,6 @@ mod tests {
 
             let result = check_trade_index(&ctx, &event, &message).await;
             assert!(result.is_ok());
-        }
-
-        async fn create_migrated_ctx() -> AppContext {
-            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-            sqlx::migrate!("./migrations")
-                .run(pool.as_ref())
-                .await
-                .unwrap();
-            TestContextBuilder::new()
-                .with_pool(pool)
-                .with_settings(test_settings())
-                .build()
         }
 
         /// Insert a user row for `identity` with the given last_trade_index.
@@ -1037,21 +1254,6 @@ mod tests {
 
     mod dispatch_cashu_tests {
         use super::*;
-        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        use sqlx::SqlitePool;
-        use std::sync::Arc;
-
-        async fn create_ctx() -> AppContext {
-            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
-            sqlx::migrate!("./migrations")
-                .run(pool.as_ref())
-                .await
-                .unwrap();
-            TestContextBuilder::new()
-                .with_pool(pool)
-                .with_settings(test_settings())
-                .build()
-        }
 
         fn is_invalid_action(result: Result<()>) -> bool {
             matches!(
@@ -1072,7 +1274,7 @@ mod tests {
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
             let _ = crate::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
-            let ctx = create_ctx().await;
+            let ctx = create_migrated_ctx().await;
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
 
@@ -1104,7 +1306,7 @@ mod tests {
         /// returns `Ok` — proving it was NOT short-circuited to `InvalidAction`.
         #[tokio::test]
         async fn allows_restore_session_through_no_ln_router() {
-            let ctx = create_ctx().await;
+            let ctx = create_migrated_ctx().await;
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
             let msg = Message::new_restore(None);

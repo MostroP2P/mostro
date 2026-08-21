@@ -8,7 +8,7 @@ How Nostr events become actions and side effects.
 
 ## The Inbox Subscription
 - Source: `src/inbox.rs`
-- Every trade message reaches Mostro over a single long-lived subscription, created at startup by `main` with a stable id (`InboxSubscription`) so that later frames can be attributed to it. Its filter is p-tagged to the node, restricted to the configured transport's event kind, and carries `limit(0)`: only live traffic is wanted.
+- Every trade message reaches Mostro over a single long-lived subscription, sent by the event loop (`app::run` / `app::run_cashu`) right after it takes its notification stream — a receiver created after the REQ would miss the relay's `EOSE` — with a stable id (`InboxSubscription`) so that later frames can be attributed to it. Its filter is p-tagged to the node, restricted to the configured transport's event kind, and carries `limit(0)`: only live traffic is wanted.
 - `run` consumes the whole notification stream, not just events. `ClientNotification::Message` carries the relay control plane and goes to `InboxKeeper`; `ClientNotification::Shutdown` ends the loop.
 
 ### Recovering a lost ear

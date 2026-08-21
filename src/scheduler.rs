@@ -99,8 +99,8 @@ async fn job_inbox_watchdog(ctx: AppContext) {
 
     tokio::spawn(async move {
         loop {
-            // Sleep first: at startup `main` has just subscribed, and a REQ
-            // still in flight would look exactly like a missing one.
+            // Sleep first: at startup the event loop has just subscribed, and a
+            // REQ still in flight would look exactly like a missing one.
             tokio::time::sleep(tokio::time::Duration::from_secs(INBOX_WATCHDOG_INTERVAL)).await;
             crate::inbox::check_inbox_health(ctx.nostr_client(), &subscription).await;
         }

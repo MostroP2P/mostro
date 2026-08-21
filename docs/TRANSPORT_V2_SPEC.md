@@ -196,7 +196,7 @@ Minimal daemon integration; **zero handler changes** by design:
 - `[expiration] dm_days` knob (default 30) in `ExpirationSettings` and the
   `get_expiration_timestamp_for_kind` fallback (`DM_EVENT_KIND = 14` in
   `src/config/constants.rs`).
-- `src/main.rs` — subscription filter uses `transport.event_kind()`.
+- `src/inbox.rs` — subscription filter uses `transport.event_kind()`.
 - `src/app.rs` — event loop accepts only the configured kind and unwraps
   via `unwrap_incoming()`.
 - `src/util.rs send_dm()` — wraps via `wrap_message_with(transport, …)`;

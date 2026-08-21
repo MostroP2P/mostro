@@ -1379,9 +1379,10 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
 
     // Daemon inbox client: shared size limits, but **no**
-    // `verify_subscriptions`. The long-lived `.limit(0)` subscription in
-    // `main.rs` must not count pre-EOSE frames against a zero limit — that
-    // would drop matching trade messages before dispatch (hermeme, PR #841).
+    // `verify_subscriptions`. The long-lived `.limit(0)` inbox subscription
+    // (`crate::inbox`) must not count pre-EOSE frames against a zero limit —
+    // that would drop matching trade messages before dispatch (hermeme, PR
+    // #841).
     // Price queries use [`connect_price_nostr`] / [`PRICE_NOSTR_CLIENT`] with
     // verification enabled instead.
     let client = mostro_nostr_client_options(nip42_identity()).build();
@@ -3354,7 +3355,7 @@ mod tests {
 
     #[test]
     fn nostr_client_policies_scope_verify_to_price_only() {
-        // Daemon inbox must not enable verify_subscriptions (main.rs limit(0)).
+        // Daemon inbox must not enable verify_subscriptions (inbox limit(0)).
         assert!(
             !daemon_nostr_client_policy().verify_subscriptions,
             "daemon client must leave verify_subscriptions off"
@@ -3483,7 +3484,7 @@ mod tests {
         use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
-        // Clean mock (no random flood): mirrors main.rs `.limit(0)` inbox —
+        // Clean mock (no random flood): mirrors the `.limit(0)` inbox —
         // history is skipped, but live matching events after EOSE must arrive.
         // Daemon options intentionally omit verify_subscriptions so pre-EOSE
         // frames are not counted against limit 0 (hermeme, PR #841).

@@ -4,7 +4,7 @@ use crate::config::constants::{
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
 use crate::db;
-use crate::db::is_user_present;
+use crate::db::{claim_order_status, is_user_present};
 use crate::escrow::EscrowBackend;
 use crate::flow;
 use crate::lightning;
@@ -1648,6 +1648,121 @@ pub async fn show_hold_invoice(
     .await;
 
     let _ = invoice_subscribe(hash, request_id).await;
+
+    Ok(())
+}
+
+/// Cashu analogue of [`show_hold_invoice`] (Track A **TA-2**,
+/// `docs/cashu/02-track-a-lock.md` §5).
+///
+/// Instead of creating a Lightning hold invoice, ask the **seller** to lock the
+/// trade amount in a 2-of-3 Cashu token: advance the order to `WaitingPayment`
+/// (where the CAS in `add_cashu_escrow_action` expects it), record both trade
+/// pubkeys, publish the updated order event, and enqueue an escrow request to
+/// the seller carrying everything the client needs to build the 2-of-3
+/// (`order.amount`, the buyer and seller trade pubkeys). The buyer (taker) gets
+/// a "waiting for the seller" notice — the buyer redeems the ecash directly
+/// later, so there is **no** buyer payout invoice in Cashu mode.
+///
+/// The escrow token locks `order.amount` **exactly** — the Mostro fee is a
+/// separate token (Option 2, added in TA-1f). The **mint URL** and the
+/// **locktime floor** are node policy the daemon enforces authoritatively when
+/// the seller submits (`add_cashu_escrow_action` §5/§7), so a client that funds
+/// against the wrong mint or with too short a locktime is simply rejected and
+/// retries — they are not carried in this request payload (the 0.14.0 protocol
+/// has no field for them).
+///
+/// The request is delivered as `Action::WaitingSellerToPay` carrying a
+/// `Payload::Order` whose `buyer_trade_pubkey`/`seller_trade_pubkey` are set;
+/// on a Cashu node the seller's client reads that as "lock the escrow" (the
+/// Lightning path instead sends `Action::PayInvoice` with a bolt11).
+pub async fn show_cashu_escrow_request(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
+    mut order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Claim the transition before writing anything. Two concurrent takes on the
+    // same pending order both pass the caller's in-memory `check_status`, and
+    // the full-row `update` below is built from a copy read before either ran:
+    // the loser would rewrite the status back to `WaitingPayment` with its own
+    // trade keys and null every column its stale copy does not carry —
+    // including a `cashu_escrow_token` the TA-1 CAS may already have persisted.
+    // Only the winner proceeds; the loser aborts having changed nothing.
+    //
+    // `Pending` is the only reachable pre-state here even though both callers
+    // also admit `WaitingTakerBond`: `validate_cashu_settings`
+    // (`src/config/util.rs`) rejects `cashu.enabled` together with
+    // `anti_abuse_bond.enabled` as a startup-fatal error (§4.5), so a Cashu node
+    // never mints a `WaitingTakerBond` order. If that exclusivity is ever
+    // relaxed, this claim must accept both statuses — otherwise a legitimate
+    // take on a bonded order is refused here with `NotAllowedByStatus`.
+    if !claim_order_status(pool, order.id, Status::Pending, Status::WaitingPayment).await? {
+        tracing::info!(
+            "cashu take: order {} was claimed concurrently or already funded — refusing the take",
+            order.id
+        );
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
+    order.status = Status::WaitingPayment.to_string();
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.seller_pubkey = Some(seller_pubkey.to_string());
+
+    // Publish the updated (WaitingPayment) order event, then persist the full
+    // row. The full-row write is built from `order`, the copy read before the
+    // CAS, so between the two TA-1's lock CAS — which fires on
+    // `WaitingPayment` — would be clobbered: the write would null
+    // `cashu_escrow_token` / `cashu_escrow_locked_at`, the exact damage the
+    // claim above exists to prevent, arriving via the seller instead of a
+    // second taker.
+    //
+    // That window is closed by ordering elsewhere, not by anything in this
+    // function: the seller cannot build the 2-of-3 without the buyer's trade
+    // pubkey, which only ships in the message enqueued *below* the write, and
+    // at this point the row carries no `buyer_pubkey` for the lock handler to
+    // validate against. Do not move either `enqueue_order_msg` above the
+    // `update` without re-reading the row (or narrowing the write) first.
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Build the escrow request for the seller.
+    let mut new_order = order.as_new_order();
+    new_order.status = Some(Status::WaitingPayment);
+    new_order.amount = order.amount;
+    new_order.buyer_trade_pubkey = Some(buyer_pubkey.to_string());
+    new_order.seller_trade_pubkey = Some(seller_pubkey.to_string());
+    // No buyer invoice in Cashu mode.
+    new_order.buyer_invoice = None;
+
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        Some(Payload::Order(new_order)),
+        *seller_pubkey,
+        order.trade_index_seller,
+    )
+    .await;
+
+    // Notify the buyer (taker) that their order was taken and the seller must
+    // lock the escrow.
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        None,
+        *buyer_pubkey,
+        order.trade_index_buyer,
+    )
+    .await;
 
     Ok(())
 }
@@ -3364,6 +3479,148 @@ mod tests {
             .await
             .unwrap();
         assert!(updated5.event_id.is_empty());
+    }
+
+    // ───────────────────────── cashu escrow request (TA-2) ─────────────────────────
+
+    /// `show_cashu_escrow_request` advances the order to `WaitingPayment`,
+    /// records both trade pubkeys, and enqueues the escrow request to the
+    /// seller (carrying the trade pubkeys + bare amount) plus a "wait" notice
+    /// to the buyer — no buyer invoice, no Lightning.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_advances_status_and_notifies_both_parties() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.trade_index_seller = Some(2);
+        order.trade_index_buyer = Some(3);
+        let order = order.create(&pool).await.unwrap();
+
+        show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(7))
+            .await
+            .expect("escrow request must succeed offline");
+
+        // Status advanced + both trade pubkeys recorded.
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(buyer.to_string()));
+        assert_eq!(db.seller_pubkey, Some(seller.to_string()));
+
+        // Collect our order's queued messages (the queue is shared across tests).
+        let msgs: Vec<(Message, PublicKey)> = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| m.get_inner_message_kind().id == Some(order.id))
+            .cloned()
+            .collect();
+
+        // The seller gets the escrow request carrying the 2-of-3 build inputs.
+        let (seller_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == seller)
+            .expect("seller escrow request");
+        assert_eq!(
+            seller_msg.get_inner_message_kind().action,
+            Action::WaitingSellerToPay
+        );
+        match seller_msg.get_inner_message_kind().get_payload() {
+            Some(Payload::Order(so)) => {
+                assert_eq!(so.buyer_trade_pubkey, Some(buyer.to_string()));
+                assert_eq!(so.seller_trade_pubkey, Some(seller.to_string()));
+                assert_eq!(so.amount, order.amount);
+                assert!(so.buyer_invoice.is_none());
+            }
+            other => panic!("expected Order payload for the seller, got {other:?}"),
+        }
+
+        // The buyer gets a bare "waiting for the seller" notice.
+        let (buyer_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == buyer)
+            .expect("buyer notice");
+        assert_eq!(
+            buyer_msg.get_inner_message_kind().action,
+            Action::WaitingSellerToPay
+        );
+        assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
+    }
+
+    /// Two concurrent takes on the same pending order: the second one holds a
+    /// stale `Pending` copy, and without the status claim its full-row write
+    /// would drag the order back and null the columns it does not carry. It
+    /// must be refused instead, leaving the first taker's state intact.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_refuses_a_second_concurrent_take() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let first_buyer = Keys::generate().public_key();
+        let second_buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // The stale copy the loser carries: still Pending, read before the
+        // winner ran.
+        let stale = order.clone();
+
+        show_cashu_escrow_request(&pool, &keys, &first_buyer, &seller, order.clone(), Some(1))
+            .await
+            .expect("the first take must win");
+
+        let result =
+            show_cashu_escrow_request(&pool, &keys, &second_buyer, &seller, stale, Some(2)).await;
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "the second take must be refused, got {result:?}"
+        );
+
+        // The winner's taker is still on the order.
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(first_buyer.to_string()));
+    }
+
+    /// An order whose escrow is already funded must never be dragged back by a
+    /// late take, whatever its status.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_refuses_a_take_on_a_funded_order() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE orders SET cashu_escrow_token = ?1, cashu_escrow_locked_at = ?2 WHERE id = ?3",
+        )
+        .bind("cashuAtoken")
+        .bind(1700000100_i64)
+        .bind(order.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result =
+            show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(3)).await;
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a funded order must not be re-taken, got {result:?}"
+        );
+
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.cashu_escrow_token.as_deref(), Some("cashuAtoken"));
+        assert_eq!(db.cashu_escrow_locked_at, Some(1700000100));
     }
 
     // ───────────────────────── nostr client plumbing ─────────────────────────

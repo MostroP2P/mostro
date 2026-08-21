@@ -1,11 +1,12 @@
 use crate::app::bond;
 use crate::app::bond::TakerContext;
 use crate::app::context::AppContext;
+use crate::config::settings::Settings;
 use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
-    get_order, is_order_take_window_closed, set_waiting_invoice_status, show_hold_invoice,
-    update_order_event, validate_invoice, HoldInvoiceOrigin,
+    get_order, is_order_take_window_closed, set_waiting_invoice_status, show_cashu_escrow_request,
+    show_hold_invoice, update_order_event, validate_invoice, HoldInvoiceOrigin,
 };
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -194,7 +195,8 @@ pub async fn take_sell_action(
 
     // Validate invoice and get payment request if present
     // NOW dev_fee is set correctly for proper validation
-    let payment_request = validate_invoice(&msg, &order).await?;
+    let payment_request =
+        validate_buyer_invoice(&msg, &order, Settings::is_cashu_enabled()).await?;
 
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
@@ -240,6 +242,24 @@ pub async fn take_sell_action(
     order.trade_index_buyer = Some(trade_index);
     order.set_timestamp_now();
 
+    // Cashu escrow mode (Track A TA-2): the seller (maker) locks a 2-of-3 token
+    // instead of paying a hold invoice, and the buyer redeems ecash directly —
+    // so the buyer payout invoice is skipped entirely (a supplied one is
+    // ignored). Emit the escrow request to the seller and leave the order in
+    // WaitingPayment, where the CAS in `add_cashu_escrow_action` expects it.
+    if Settings::is_cashu_enabled() {
+        show_cashu_escrow_request(
+            pool,
+            my_keys,
+            &event.sender,
+            &seller_pubkey,
+            order,
+            request_id,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {
         update_order_status(&mut order, my_keys, pool, request_id).await?;
@@ -259,6 +279,27 @@ pub async fn take_sell_action(
     }
 
     Ok(())
+}
+
+/// Buyer payout invoice gate for a take.
+///
+/// Cashu escrow mode never uses the buyer's payout invoice — the buyer redeems
+/// ecash directly from the 2-of-3 token — so a supplied invoice is ignored
+/// instead of validated. Without this gate a stale or malformed BOLT11 payload
+/// would reject a Cashu take over a field the flow never reads.
+///
+/// The Cashu flag is threaded in as an argument rather than read here because
+/// `Settings::is_cashu_enabled()` reads the process-wide `MOSTRO_CONFIG`
+/// `OnceLock`, which a unit test cannot toggle.
+async fn validate_buyer_invoice(
+    msg: &Message,
+    order: &Order,
+    cashu_enabled: bool,
+) -> Result<Option<String>, MostroError> {
+    if cashu_enabled {
+        return Ok(None);
+    }
+    validate_invoice(msg, order).await
 }
 
 #[cfg(test)]
@@ -309,6 +350,48 @@ mod tests {
             identity: identity.public_key(),
             created_at: Timestamp::now(),
         }
+    }
+
+    /// A garbage BOLT11 payload must not sink a Cashu take: the buyer payout
+    /// invoice is unused in escrow mode, so the gate drops it instead of
+    /// bubbling `InvalidInvoice`. The Lightning path keeps rejecting it.
+    #[tokio::test]
+    async fn cashu_take_ignores_a_malformed_buyer_invoice() {
+        // Arrange
+        let order = Order {
+            id: uuid::Uuid::new_v4(),
+            kind: OrderKind::Sell.to_string(),
+            status: Status::Pending.to_string(),
+            payment_method: "SEPA".to_string(),
+            amount: 1_000,
+            fee: 10,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            ..Default::default()
+        };
+        let msg = Message::new_order(
+            Some(order.id),
+            None,
+            Some(1),
+            Action::TakeSell,
+            Some(Payload::PaymentRequest(
+                None,
+                "notaninvoice".to_string(),
+                None,
+            )),
+        );
+
+        // Act + Assert: Cashu escrow mode ignores the payload entirely.
+        assert_eq!(
+            validate_buyer_invoice(&msg, &order, true).await.unwrap(),
+            None
+        );
+
+        // Act + Assert: Lightning mode still refuses it.
+        let err = validate_buyer_invoice(&msg, &order, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)));
     }
 
     #[tokio::test]

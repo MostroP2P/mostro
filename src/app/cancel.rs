@@ -438,13 +438,18 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
         ln_client.cancel_hold_invoice(hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
-    // We publish a new replaceable kind nostr event with the status updated
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
-        order_updated
-            .update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    }
+    // We publish a new replaceable kind nostr event with the status updated.
+    // A failure here must surface instead of being skipped: the escrow is
+    // already void above, so silently dropping the write left the order live
+    // behind a dead escrow *and* told both parties it was canceled. Note that
+    // a relay rejection is not this branch — `update_order_event` queues those
+    // for republish and returns `Ok` — so this only fires when the event could
+    // not be built at all. Mirrors the taker branch and `hold_invoice_paid`.
+    let order_updated = update_order_event(my_keys, Status::Canceled, &order).await?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     enqueue_order_msg(
         request_id,

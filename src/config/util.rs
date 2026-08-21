@@ -2,7 +2,10 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::constants::{
+    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, SETTINGS_FILENAME,
+};
+use crate::config::permissions::{create_owner_only, create_settings_dir};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
@@ -132,7 +135,13 @@ fn validate_cashu_settings(
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
-pub fn init_configuration_file(config_path: Option<String>) -> Result<(), MostroError> {
+///
+/// Returns the settings directory that was used. The caller needs it because
+/// the files in there — `settings.toml` and the optional `.env`, both carrying
+/// `nsec_privkey` in plaintext — are checked for over-broad permissions at
+/// startup, and the path is otherwise not recoverable from the loaded
+/// `Settings`.
+pub fn init_configuration_file(config_path: Option<String>) -> Result<PathBuf, MostroError> {
     let settings_dir = if let Some(user_path) = config_path {
         PathBuf::from(user_path)
     } else {
@@ -147,15 +156,14 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
     // Check if /.mostro directory exists
     if !settings_dir.exists() {
-        std::fs::create_dir_all(&settings_dir)
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+        create_settings_dir(&settings_dir)?;
     }
 
     // Load `<settings_dir>/.env` so MOSTRO_NSEC_PRIVKEY (and any future env
     // overrides) can be read from it. Real env vars keep precedence.
     load_env_file(&settings_dir);
 
-    let config_file_path = settings_dir.join("settings.toml");
+    let config_file_path = settings_dir.join(SETTINGS_FILENAME);
 
     if !config_file_path.exists() {
         let mut settings = if std::io::stdin().is_terminal() {
@@ -163,8 +171,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
             wizard::run_setup_menu(&settings_dir, &config_file_path)?
         } else {
             // Non-interactive (Docker, CI, systemd): copy template and exit
-            std::fs::write(&config_file_path, include_bytes!("../../settings.tpl.toml"))
-                .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
+            create_owner_only(&config_file_path, include_bytes!("../../settings.tpl.toml"))?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
                 config_file_path.display()
@@ -176,7 +183,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         validate_mostro_settings(&settings)?;
         init_mostro_settings(settings)?;
         tracing::info!("Settings correctly loaded!");
-        return Ok(());
+        return Ok(settings_dir);
     }
 
     // Read the file content into a zeroizing buffer so TOML plaintext is wiped
@@ -205,7 +212,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
     tracing::info!("Settings correctly loaded!");
 
-    Ok(())
+    Ok(settings_dir)
 }
 
 #[cfg(test)]
@@ -497,11 +504,7 @@ mod env_file_tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mostro-config-util-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::config::test_support::temp_dir("config-util", tag)
     }
 
     #[test]
@@ -542,11 +545,7 @@ mod init_configuration_file_tests {
     use super::*;
 
     fn temp_config_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mostro-init-config-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::config::test_support::temp_dir("init-config", tag)
     }
 
     // NOTE: the success path (valid settings.toml) calls

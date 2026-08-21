@@ -27,6 +27,9 @@ pub const NOSTR_EXCHANGE_RATES_EVENT_KIND: u16 = 30078;
 /// startup. Shared between the wizard (writes it) and the loader (reads it).
 pub const ENV_FILENAME: &str = ".env";
 
+/// Name of the settings file inside the settings directory.
+pub const SETTINGS_FILENAME: &str = "settings.toml";
+
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";

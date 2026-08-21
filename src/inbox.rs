@@ -37,6 +37,11 @@
 //! relay that refuses the inbox on principle is retried at a decreasing rate
 //! instead of being hammered.
 //!
+//! Two reason prefixes are the exception. `auth-required` and `rate-limited`
+//! only *mark* the subscription, leaving it registered for the SDK to re-send
+//! by itself, so the keeper stands down on those and lets it: see
+//! [`is_provisional_closure`].
+//!
 //! Not every way of losing the ear announces itself with a frame, though: the
 //! notification channel silently drops messages when the consumer falls
 //! behind, a REQ can fail to go out, a relay can be added after startup.
@@ -203,6 +208,28 @@ impl InboxKeeper {
                 subscription_id,
                 message,
             } if subscription_id.as_ref() == self.subscription.id() => {
+                if is_provisional_closure(message) {
+                    // Not the keeper's to answer: the SDK only *marks* these
+                    // two prefixes and re-sends the REQ itself — after the
+                    // NIP-42 round-trip for `auth-required`, on the next
+                    // reconnect for `rate-limited`. Re-issuing the REQ here
+                    // would drop the entry the SDK is about to re-send, race
+                    // its AUTH, and arm a backoff against a relay that is
+                    // behaving exactly as the protocol says it should.
+                    //
+                    // Whatever the SDK does not get to — a `rate-limited`
+                    // closure on a connection that never drops, an
+                    // `auth-required` one this node cannot answer because it
+                    // has no keys — is left to [`check_inbox_health`]: the
+                    // relay is not acknowledged, so the next audit re-sends
+                    // the REQ. That is the right pace for a relay that has
+                    // just asked to be left alone.
+                    info!(
+                        "Relay {relay_url} closed the Mostro inbox subscription provisionally \
+                         (\"{message}\"); recovery is the SDK's or the watchdog's"
+                    );
+                    return;
+                }
                 warn!("Relay {relay_url} closed the Mostro inbox subscription: \"{message}\"");
                 self.resubscribe(client, relay_url).await;
             }
@@ -270,6 +297,24 @@ impl InboxKeeper {
             }
         }
     }
+}
+
+/// Whether a `CLOSED` reason means "not now" rather than "not ever".
+///
+/// These are the two prefixes nostr-sdk 0.45.1 maps to `MarkAsClosed` instead
+/// of `Remove` (`relay/inner.rs`, the `RelayMessage::Closed` arm), keeping the
+/// subscription registered so it can be re-sent without the keeper's help.
+/// Every other reason — and no reason at all — removes it, which is what
+/// [`InboxKeeper`] exists to undo.
+///
+/// `auth-required` is only marked when an authenticator is configured; without
+/// one the SDK removes it and no re-REQ follows, but a node in that state has
+/// no Nostr keys at all, so the watchdog's pace is the appropriate response.
+fn is_provisional_closure(message: &str) -> bool {
+    matches!(
+        MachineReadablePrefix::parse(message),
+        Some(MachineReadablePrefix::AuthRequired) | Some(MachineReadablePrefix::RateLimited)
+    )
 }
 
 /// Re-send the inbox REQ to one relay.
@@ -880,6 +925,80 @@ mod tests {
         assert!(
             !keeper.backoff.contains_key(&relay),
             "an accepted REQ must reset the pacing for the next failure"
+        );
+    }
+
+    #[test]
+    fn only_the_two_prefixes_the_sdk_recovers_from_are_provisional() {
+        // Mirrors the `RelayMessage::Closed` arm of nostr-sdk 0.45.1: these
+        // two map to `MarkAsClosed`, everything else to `Remove`. A future
+        // bump that changes the split has to change this list with it.
+        assert!(is_provisional_closure(
+            "auth-required: we only serve authenticated users"
+        ));
+        assert!(is_provisional_closure("rate-limited: slow down"));
+
+        for permanent in [
+            "blocked: you are banned",
+            "restricted: not for you",
+            "error: go away",
+            "invalid: bad filter",
+            "unsupported: no such filter",
+            "pow: 24 bits required",
+            "duplicate: already have it",
+            "",
+            "we are closing this one",
+        ] {
+            assert!(
+                !is_provisional_closure(permanent),
+                "{permanent:?} removes the subscription, so the keeper has to re-send the REQ"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provisional_closure_is_left_to_the_sdk() {
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        let health = Arc::new(InboxHealth::at(T0));
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        let relay = relay_url("ws://relay.example");
+
+        health.note_relay_acknowledged(&relay);
+
+        for reason in ["auth-required: please auth", "rate-limited: slow down"] {
+            let closed = RelayMessage::Closed {
+                subscription_id: std::borrow::Cow::Owned(subscription.id().clone()),
+                message: std::borrow::Cow::Borrowed(reason),
+            };
+            keeper.on_relay_message(&client, &relay, &closed).await;
+        }
+
+        assert!(
+            keeper.backoff.is_empty(),
+            "a relay the SDK will re-REQ by itself must not be put on the keeper's backoff"
+        );
+        assert!(
+            acked(&health, &relay),
+            "the subscription is still registered and still answered, so the credit stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_closure_is_still_the_keepers_to_answer() {
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        let mut keeper = keeper();
+        let relay = relay_url("ws://relay.example");
+
+        let closed = RelayMessage::Closed {
+            subscription_id: std::borrow::Cow::Owned(keeper.subscription.id().clone()),
+            message: std::borrow::Cow::Borrowed("blocked: you are banned"),
+        };
+        keeper.on_relay_message(&client, &relay, &closed).await;
+
+        assert!(
+            keeper.backoff.contains_key(&relay),
+            "a CLOSED the SDK removes the subscription for must still arm the keeper"
         );
     }
 

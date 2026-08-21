@@ -14,6 +14,8 @@ How Nostr events become actions and side effects.
 ### Recovering a lost ear
 A relay can end a subscription at any time by sending `CLOSED`. The nostr-sdk removes the subscription for almost every reason prefix, and a removed subscription is never re-REQ'd, not even after a reconnect — so without handling, one frame from one relay leaves the daemon running, connected, and unable to receive anything.
 
+The exceptions are `auth-required` and `rate-limited`, which the SDK only *marks*: the subscription stays registered and the SDK re-sends the REQ itself, after the NIP-42 round-trip in the first case and on the next reconnect in the second. The keeper stands down on those two rather than racing it, and whatever the SDK does not get to — a `rate-limited` closure on a connection that never drops — falls to the watchdog below, which is the right pace for a relay that has just asked to be left alone.
+
 Two mechanisms keep the subscription alive:
 
 - `InboxKeeper::on_relay_message` reacts to a `CLOSED` naming the inbox by re-sending the REQ to that relay, paced by a per-relay backoff (immediate first retry, doubling to a five-minute ceiling, cleared when the relay answers with `EOSE`).

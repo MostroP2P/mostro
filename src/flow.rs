@@ -204,9 +204,21 @@ pub async fn hold_invoice_paid(
     }
 
     if notify_reputation {
-        // Notify taker reputation to maker
+        // Notify taker reputation to maker. Best effort on purpose: this is an
+        // extra message riding alongside the `AddInvoice` already queued above,
+        // and letting it abort would skip the `invoice_held_at` stamp below —
+        // leaving the order replayable with its transition already persisted
+        // and its messages already sent, so a resubscribe would duplicate
+        // them. `notify_taker_reputation` keys on the order's *current* status
+        // (the same contract `add_invoice` relies on), and can also fail on a
+        // missing master pubkey; neither is worth a duplicate prompt.
         tracing::info!("Notifying taker reputation to maker");
-        notify_taker_reputation(pool, &order).await?;
+        if let Err(e) = notify_taker_reputation(pool, &order).await {
+            tracing::warn!(
+                order_id = %order.id,
+                "hold_invoice_paid: taker reputation notice skipped: {e}"
+            );
+        }
     }
 
     // Update the invoice_held_at field
@@ -515,6 +527,51 @@ mod tests {
         let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
         assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
         assert!(updated.invoice_held_at > 0, "invoice_held_at must be set");
+    }
+
+    /// A failing reputation notice must not cost the idempotency stamp: the
+    /// transition is already persisted and the prompts already queued, so
+    /// aborting here would leave the order replayable and a resubscribe would
+    /// duplicate them. Driven from the one status/kind pair
+    /// `notify_taker_reputation` refuses — sell order still in
+    /// `waiting-payment`, which no take path actually produces (`take_sell`
+    /// without an invoice goes straight to `waiting-buyer-invoice`), so this
+    /// stands in for any failure it can return, a missing master pubkey
+    /// included.
+    #[tokio::test]
+    async fn hold_invoice_paid_stamps_even_when_the_reputation_notice_fails() {
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "ee".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let master_buyer = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::WaitingPayment,
+            None,
+            Some(buyer),
+            Some(seller),
+            Some(master_buyer),
+        )
+        .await;
+
+        let result = hold_invoice_paid(&hash, None, &pool, &create_test_keys()).await;
+        assert!(
+            result.is_ok(),
+            "a refused reputation notice must not fail the flow: {result:?}"
+        );
+
+        let updated = crate::db::find_order_by_hash(&pool, &hash).await.unwrap();
+        assert_eq!(updated.status, Status::WaitingBuyerInvoice.to_string());
+        assert!(
+            updated.invoice_held_at > 0,
+            "the order must be marked processed, or a replay duplicates the prompts"
+        );
+        let queued = queued_actions_for(order.id).await;
+        assert!(queued.contains(&Action::AddInvoice));
+        assert!(queued.contains(&Action::WaitingBuyerInvoice));
     }
 
     #[tokio::test]

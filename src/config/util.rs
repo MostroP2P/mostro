@@ -2,12 +2,18 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
-use crate::config::secret::read_nsec_env_var;
+use crate::config::constants::{
+    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, MIN_RPC_TOKEN_LEN,
+    RPC_TOKEN_ENV_VAR,
+};
+use crate::config::secret::{read_nsec_env_var, read_rpc_token_env_var};
+use crate::config::types::RpcSettings;
 use crate::config::wizard;
 use crate::config::{init_mostro_settings, Settings};
+use crate::rpc::server::listen_socket_addr;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -72,6 +78,149 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             .as_ref()
             .is_some_and(|bond| bond.enabled),
     )?;
+
+    validate_rpc_settings(&settings.rpc, read_rpc_token_env_var().as_ref())?;
+
+    Ok(())
+}
+
+/// True when `addr` can only be reached from the host itself.
+///
+/// Parses through `rpc::server::listen_socket_addr`, the same function
+/// `RpcServer::bind` uses, so this can never call an address loopback that the
+/// server would then refuse to bind. Callers must reject unparseable addresses
+/// first — `false` here means "not loopback", not "not an address".
+fn is_loopback_address(addr: &str) -> bool {
+    listen_socket_addr(addr, 0).is_ok_and(|socket| socket.ip().is_loopback())
+}
+
+/// Validate the `[rpc]` block (finding 1.5, issue #807).
+///
+/// The admin gRPC surface settles disputes, moves escrowed funds, and grants
+/// permanent solver rights. Worse, every RPC is executed under the daemon's own
+/// identity, which downstream authorization treats as fully privileged
+/// (`db::ensure_dispute_finalize_permission`). Reaching the port therefore *is*
+/// the authorization, so both guards below are startup-fatal rather than
+/// warnings:
+///
+/// - `enabled = true` requires `MOSTRO_RPC_TOKEN`, so the interceptor always
+///   has a credential to check. A daemon that boots without one would serve an
+///   admin API that nothing gates.
+/// - A non-loopback `listen_address` requires an explicit `allow_remote = true`.
+///   The defaults are safe, but nothing used to stop `0.0.0.0` from publishing
+///   the admin API to the LAN silently.
+/// - `listen_address` must be an address `RpcServer::bind` can actually bind.
+///   Validation and binding share `rpc::server::listen_socket_addr` so the two
+///   cannot drift: a config accepted here is one the server will accept.
+///
+/// A half-configured TLS pair is also fatal: it reads as "TLS is on" while
+/// serving plaintext.
+fn validate_rpc_settings(
+    rpc: &RpcSettings,
+    token: Option<&SecretString>,
+) -> Result<(), MostroError> {
+    if !rpc.enabled {
+        return Ok(());
+    }
+
+    match token {
+        None => {
+            return Err(MostroInternalErr(ServiceError::IOError(format!(
+                "[rpc].enabled = true but {RPC_TOKEN_ENV_VAR} is not set: the admin RPC would \
+                 accept every caller that can reach the port. Set {RPC_TOKEN_ENV_VAR} in the \
+                 environment or <settings_dir>/.env, or set [rpc].enabled = false."
+            ))));
+        }
+        Some(token) if token.expose_secret().chars().count() < MIN_RPC_TOKEN_LEN => {
+            return Err(MostroInternalErr(ServiceError::IOError(format!(
+                "{RPC_TOKEN_ENV_VAR} is shorter than {MIN_RPC_TOKEN_LEN} characters: generate a \
+                 high-entropy token, e.g. `openssl rand -base64 32`."
+            ))));
+        }
+        // The token travels verbatim inside an HTTP/2 `authorization` header.
+        // Anything outside printable ASCII cannot be carried there, so a daemon
+        // that accepted it would boot and then refuse every client — a failure
+        // that looks like a broken build rather than a typo in the token.
+        Some(token) if !token.expose_secret().chars().all(|c| c.is_ascii_graphic()) => {
+            return Err(MostroInternalErr(ServiceError::IOError(format!(
+                "{RPC_TOKEN_ENV_VAR} must contain only printable ASCII characters and no spaces: \
+                 it is sent as an HTTP header, so any other value can never authenticate a \
+                 client. `openssl rand -base64 32` produces a valid token."
+            ))));
+        }
+        Some(_) => {}
+    }
+
+    // Before the loopback check, or an unbindable address would be reported as
+    // a remote-exposure problem: `localhost` and bare `::1` read as loopback to
+    // an operator, so "set allow_remote = true" would be actively misleading
+    // advice for a daemon that is about to die on `Invalid address` instead.
+    listen_socket_addr(&rpc.listen_address, rpc.port).map_err(|e| {
+        MostroInternalErr(ServiceError::IOError(format!("[rpc].listen_address: {e}")))
+    })?;
+
+    if !is_loopback_address(&rpc.listen_address) && !rpc.allow_remote {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[rpc].listen_address ({:?}) is not a loopback address: this publishes the admin API \
+             beyond this host. Set [rpc].allow_remote = true to confirm this is intended, or bind \
+             127.0.0.1.",
+            rpc.listen_address
+        ))));
+    }
+
+    match (rpc.tls_cert_path.as_deref(), rpc.tls_key_path.as_deref()) {
+        (Some(_), None) => {
+            return Err(MostroInternalErr(ServiceError::IOError(
+                "[rpc].tls_cert_path is set without [rpc].tls_key_path: TLS needs both, and the \
+                 server would otherwise fall back to plaintext."
+                    .to_string(),
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(MostroInternalErr(ServiceError::IOError(
+                "[rpc].tls_key_path is set without [rpc].tls_cert_path: TLS needs both, and the \
+                 server would otherwise fall back to plaintext."
+                    .to_string(),
+            )));
+        }
+        (Some(cert), Some(key)) => {
+            for (field, path) in [("tls_cert_path", cert), ("tls_key_path", key)] {
+                // Open rather than stat: `fs::metadata` succeeds for a file the
+                // daemon has no permission to read. Opening is still not
+                // enough on its own — on Linux a directory opens fine and only
+                // fails on read — so the file type is checked through the
+                // handle, which is the capability `RpcServer::start` needs.
+                let opened = fs::File::open(path).map_err(|e| {
+                    MostroInternalErr(ServiceError::IOError(format!(
+                        "[rpc].{field} ({path:?}) is not readable: {e}"
+                    )))
+                })?;
+                let is_regular_file = opened
+                    .metadata()
+                    .map(|metadata| metadata.is_file())
+                    .map_err(|e| {
+                        MostroInternalErr(ServiceError::IOError(format!(
+                            "[rpc].{field} ({path:?}) could not be inspected: {e}"
+                        )))
+                    })?;
+                if !is_regular_file {
+                    return Err(MostroInternalErr(ServiceError::IOError(format!(
+                        "[rpc].{field} ({path:?}) is not a regular file"
+                    ))));
+                }
+            }
+        }
+        (None, None) => {
+            if !is_loopback_address(&rpc.listen_address) {
+                tracing::warn!(
+                    "[rpc] is bound to {} without TLS: admin bearer tokens and dispute data cross \
+                     the network in cleartext. Set [rpc].tls_cert_path and [rpc].tls_key_path, or \
+                     terminate TLS in a reverse proxy.",
+                    rpc.listen_address
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -489,6 +638,223 @@ mod startup_validation_tests {
             escrow_locktime_days: 15,
         });
         assert!(validate_mostro_settings(&settings).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rpc_validation_tests {
+    use super::*;
+    use crate::config::types::RpcSettings;
+
+    fn valid_token() -> SecretString {
+        SecretString::from("a".repeat(MIN_RPC_TOKEN_LEN))
+    }
+
+    fn enabled_rpc() -> RpcSettings {
+        RpcSettings {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn temp_pem(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(format!("{tag}.pem"));
+        std::fs::write(&path, b"not a real certificate").expect("write pem");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn disabled_rpc_needs_no_token() {
+        // The whole block is inert when the server never starts, including a
+        // deliberately unsafe bind.
+        let rpc = RpcSettings {
+            listen_address: "0.0.0.0".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_rpc_settings(&rpc, None).is_ok());
+    }
+
+    #[test]
+    fn enabled_rpc_without_a_token_is_rejected() {
+        let err = validate_rpc_settings(&enabled_rpc(), None)
+            .expect_err("an ungated admin RPC must not boot");
+        assert!(err.to_string().contains(RPC_TOKEN_ENV_VAR));
+    }
+
+    #[test]
+    fn enabled_rpc_with_a_short_token_is_rejected() {
+        let short = SecretString::from("a".repeat(MIN_RPC_TOKEN_LEN - 1));
+        let err = validate_rpc_settings(&enabled_rpc(), Some(&short))
+            .expect_err("a guessable token must not boot");
+        assert!(err.to_string().contains("shorter than"));
+    }
+
+    #[test]
+    fn enabled_rpc_on_loopback_with_a_token_is_accepted() {
+        assert!(validate_rpc_settings(&enabled_rpc(), Some(&valid_token())).is_ok());
+    }
+
+    #[test]
+    fn a_token_that_cannot_travel_in_a_header_is_rejected() {
+        // Long enough to clear the length gate, but unusable as an HTTP header
+        // value: accepting it would boot a daemon that refuses every client.
+        for unusable in ["é".repeat(MIN_RPC_TOKEN_LEN), "a".repeat(31) + " b"] {
+            let token = SecretString::from(unusable.clone());
+            let err = validate_rpc_settings(&enabled_rpc(), Some(&token))
+                .expect_err("a token that cannot be sent must not boot");
+            assert!(
+                err.to_string().contains("printable ASCII"),
+                "{unusable:?} should have been refused as unsendable, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_is_not_accepted_as_tls_material() {
+        // Both `fs::metadata` and `File::open` succeed on a directory, so only
+        // the file-type check rejects this.
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let rpc = RpcSettings {
+            tls_cert_path: Some(dir.to_string_lossy().into_owned()),
+            tls_key_path: Some(temp_pem("dir-case-key")),
+            ..enabled_rpc()
+        };
+        let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+            .expect_err("a directory is not a certificate");
+        assert!(err.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn loopback_is_recognised_in_every_bindable_form() {
+        for address in ["127.0.0.1", "127.0.0.53", "[::1]"] {
+            let rpc = RpcSettings {
+                enabled: true,
+                listen_address: address.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                validate_rpc_settings(&rpc, Some(&valid_token())).is_ok(),
+                "{address} should be treated as loopback"
+            );
+        }
+    }
+
+    /// The contract this pins: validation and `RpcServer::bind` share one
+    /// parser, so anything the server cannot bind is refused here with an
+    /// actionable message instead of at startup with `Invalid address`.
+    ///
+    /// `localhost` and bare `::1` are the cases that matter — they look like
+    /// valid loopback spellings, and reporting them through the `allow_remote`
+    /// branch would send the operator to fix the wrong setting.
+    #[test]
+    fn an_unbindable_listen_address_is_rejected() {
+        for address in ["localhost", "LOCALHOST", "::1", "::", "mostro.example.com"] {
+            let rpc = RpcSettings {
+                enabled: true,
+                listen_address: address.to_string(),
+                // Set so the failure cannot be attributed to the remote-bind
+                // guard: only the parse check can refuse these.
+                allow_remote: true,
+                ..Default::default()
+            };
+            let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+                .expect_err("an address the server cannot bind must not boot");
+            let message = err.to_string();
+            assert!(
+                message.contains("IP literal") && message.contains("[::1]"),
+                "{address} should name the accepted spellings, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_allow_remote_is_rejected() {
+        for address in ["0.0.0.0", "192.168.1.10", "[::]"] {
+            let rpc = RpcSettings {
+                enabled: true,
+                listen_address: address.to_string(),
+                ..Default::default()
+            };
+            let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+                .expect_err("a routable bind must require allow_remote");
+            assert!(
+                err.to_string().contains("allow_remote"),
+                "{address} should have been refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_with_allow_remote_is_accepted() {
+        let rpc = RpcSettings {
+            enabled: true,
+            listen_address: "0.0.0.0".to_string(),
+            allow_remote: true,
+            ..Default::default()
+        };
+        assert!(validate_rpc_settings(&rpc, Some(&valid_token())).is_ok());
+    }
+
+    #[test]
+    fn half_configured_tls_is_rejected() {
+        let cert_only = RpcSettings {
+            tls_cert_path: Some(temp_pem("cert-only")),
+            ..enabled_rpc()
+        };
+        assert!(validate_rpc_settings(&cert_only, Some(&valid_token()))
+            .expect_err("cert without key must fail")
+            .to_string()
+            .contains("tls_key_path"));
+
+        let key_only = RpcSettings {
+            tls_key_path: Some(temp_pem("key-only")),
+            ..enabled_rpc()
+        };
+        assert!(validate_rpc_settings(&key_only, Some(&valid_token()))
+            .expect_err("key without cert must fail")
+            .to_string()
+            .contains("tls_cert_path"));
+    }
+
+    #[test]
+    fn unreadable_tls_material_is_rejected() {
+        let rpc = RpcSettings {
+            tls_cert_path: Some("/nonexistent/mostro-rpc.pem".to_string()),
+            tls_key_path: Some(temp_pem("readable-key")),
+            ..enabled_rpc()
+        };
+        let err = validate_rpc_settings(&rpc, Some(&valid_token()))
+            .expect_err("unreadable TLS material must fail");
+        assert!(err.to_string().contains("not readable"));
+    }
+
+    #[test]
+    fn readable_tls_pair_is_accepted() {
+        let rpc = RpcSettings {
+            tls_cert_path: Some(temp_pem("pair-cert")),
+            tls_key_path: Some(temp_pem("pair-key")),
+            ..enabled_rpc()
+        };
+        assert!(validate_rpc_settings(&rpc, Some(&valid_token())).is_ok());
+    }
+
+    #[test]
+    fn tls_paths_helper_requires_both_halves() {
+        let rpc = RpcSettings {
+            tls_cert_path: Some("cert.pem".to_string()),
+            ..Default::default()
+        };
+        assert!(rpc.tls_paths().is_none());
+
+        let rpc = RpcSettings {
+            tls_cert_path: Some("cert.pem".to_string()),
+            tls_key_path: Some("key.pem".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(rpc.tls_paths(), Some(("cert.pem", "key.pem")));
     }
 }
 

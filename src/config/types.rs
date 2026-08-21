@@ -522,6 +522,18 @@ pub struct RpcSettings {
     /// Duration in seconds after which inactive rate-limiter entries are evicted
     #[serde(default = "default_rate_limiter_stale_duration")]
     pub rate_limiter_stale_duration: u64,
+    /// Acknowledge binding the admin RPC to a non-loopback address. The daemon
+    /// refuses to start on a routable address unless this is set, so an
+    /// operator cannot publish the admin surface to a LAN by accident.
+    #[serde(default)]
+    pub allow_remote: bool,
+    /// Path to the PEM-encoded TLS certificate chain served by the admin RPC.
+    /// Must be set together with `tls_key_path`; absent means plaintext.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to the PEM-encoded TLS private key matching `tls_cert_path`.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
 }
 
 fn default_rate_limiter_stale_duration() -> u64 {
@@ -535,6 +547,22 @@ impl Default for RpcSettings {
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
             rate_limiter_stale_duration: default_rate_limiter_stale_duration(),
+            allow_remote: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+        }
+    }
+}
+
+impl RpcSettings {
+    /// TLS certificate/key pair when both are configured.
+    ///
+    /// `validate_rpc_settings` rejects a half-configured pair at startup, so a
+    /// `None` here means plaintext was chosen, never that one path was lost.
+    pub fn tls_paths(&self) -> Option<(&str, &str)> {
+        match (self.tls_cert_path.as_deref(), self.tls_key_path.as_deref()) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            _ => None,
         }
     }
 }

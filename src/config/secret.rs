@@ -1,7 +1,7 @@
 //! Helpers for loading and parsing the Mostro Nostr private key with
 //! zeroization of transient buffers.
 
-use crate::config::constants::NSEC_ENV_VAR;
+use crate::config::constants::{NSEC_ENV_VAR, RPC_TOKEN_ENV_VAR};
 use crate::config::types::NostrSettings;
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
@@ -18,18 +18,34 @@ where
     serializer.serialize_str(secret.expose_secret())
 }
 
-/// Read `MOSTRO_NSEC_PRIVKEY` from the process environment, trim whitespace,
-/// and wrap in a [`SecretString`]. Returns `None` when unset or blank.
-pub fn read_nsec_env_var() -> Option<SecretString> {
-    let mut nsec_from_env = std::env::var(NSEC_ENV_VAR).ok()?;
-    let trimmed = nsec_from_env.trim();
+/// Read `name` from the process environment, trim whitespace, and wrap in a
+/// [`SecretString`], zeroizing the transient buffer. Returns `None` when the
+/// variable is unset or blank.
+fn read_secret_env_var(name: &str) -> Option<SecretString> {
+    let mut value_from_env = std::env::var(name).ok()?;
+    let trimmed = value_from_env.trim();
     if trimmed.is_empty() {
-        nsec_from_env.zeroize();
+        value_from_env.zeroize();
         return None;
     }
     let secret = SecretString::from(trimmed.to_owned());
-    nsec_from_env.zeroize();
+    value_from_env.zeroize();
     Some(secret)
+}
+
+/// Read `MOSTRO_NSEC_PRIVKEY` from the process environment, trim whitespace,
+/// and wrap in a [`SecretString`]. Returns `None` when unset or blank.
+pub fn read_nsec_env_var() -> Option<SecretString> {
+    read_secret_env_var(NSEC_ENV_VAR)
+}
+
+/// Read `MOSTRO_RPC_TOKEN` from the process environment, trim whitespace, and
+/// wrap in a [`SecretString`]. Returns `None` when unset or blank.
+///
+/// The admin RPC bearer token is env-only by design: `settings.toml` is the
+/// file operators paste into issues when asking for help.
+pub fn read_rpc_token_env_var() -> Option<SecretString> {
+    read_secret_env_var(RPC_TOKEN_ENV_VAR)
 }
 
 /// Parse a bech32 nsec into [`Keys`], exposing the secret only in this scope.

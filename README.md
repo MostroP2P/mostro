@@ -674,14 +674,26 @@ bitcoin_price_api_url = "https://api.yadio.io"
 ```toml
 [rpc]
 enabled = false              # Set to true to enable gRPC admin interface
-listen_address = "127.0.0.1"
+listen_address = "127.0.0.1" # IP literal, IPv6 bracketed; "localhost" is not resolved
 port = 50051
+allow_remote = false         # Required to bind a non-loopback address
 ```
 
 When enabled, exposes gRPC interface on `127.0.0.1:50051` for:
 - Admin order cancellation
 - Dispute settlement
 - Solver management
+
+Enabling it **requires** a bearer token in the `MOSTRO_RPC_TOKEN` environment
+variable (or `~/.mostro/.env`); the daemon refuses to start without one, and
+refuses a non-loopback bind unless `allow_remote = true`. Reaching this port is
+equivalent to holding the operator key — see the security notes in
+[docs/RPC.md](docs/RPC.md).
+
+```bash
+# ~/.mostro/.env
+MOSTRO_RPC_TOKEN=<output of: openssl rand -base64 32>
+```
 
 ---
 
@@ -794,18 +806,25 @@ For client documentation, see the respective client repositories.
 
 ### Admin Operations (RPC Interface)
 
-If RPC is enabled, use admin tools for dispute resolution:
+If RPC is enabled, use admin tools for dispute resolution. Every call must carry
+the bearer token; `-plaintext` is only safe over loopback:
 
 ```bash
+AUTH="authorization: Bearer $MOSTRO_RPC_TOKEN"
+
 # Cancel an order (admin override)
-grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/CancelOrder
+grpcurl -plaintext -H "$AUTH" -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/CancelOrder
 
 # Settle disputed order
-grpcurl -plaintext -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/SettleOrder
+grpcurl -plaintext -H "$AUTH" -d '{"order_id": "abc123"}' localhost:50051 mostro.admin.v1.AdminService/SettleOrder
 
 # Add dispute solver
-grpcurl -plaintext -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
+grpcurl -plaintext -H "$AUTH" -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.admin.v1.AdminService/AddSolver
 ```
+
+The shell expands `$AUTH` into `grpcurl`'s arguments, so any local user can read
+the token with `ps`. On a host you do not have to yourself, use the Rust client
+in [docs/RPC.md](docs/RPC.md) instead, which keeps the token in the environment.
 
 ---
 

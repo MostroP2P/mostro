@@ -77,7 +77,12 @@ const MAX_UNCONFIRMED_INBOX_PAUSE_SECS: i64 = 3 * 3600;
 /// Short enough that a lost ear is measured in seconds rather than the 60s
 /// timeout tick, long enough that it is not a source of traffic on its own.
 /// Hardcoded like the other maintenance intervals in this module.
-const INBOX_WATCHDOG_INTERVAL: u64 = 30;
+///
+/// Visible to `crate::inbox` because the two pacing knobs interact: the audit
+/// draws on the same per-relay budget as the event loop, so this interval is
+/// what decides how many doublings pass before `RESUBSCRIBE_MAX_BACKOFF` is
+/// the thing actually limiting retries.
+pub(crate) const INBOX_WATCHDOG_INTERVAL: u64 = 30;
 
 /// Audit the daemon's Nostr inbox and re-subscribe any relay that stopped
 /// serving it (see `crate::inbox`).

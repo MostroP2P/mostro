@@ -79,6 +79,13 @@ const RESUBSCRIBE_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 /// and the operator has to intervene. Retrying every five minutes keeps the
 /// door open for a config change on their side without generating traffic that
 /// looks like an attack.
+///
+/// This is a real ceiling because [`check_inbox_health`] draws on the same
+/// per-relay budget rather than re-sending on every pass: an audit every
+/// `INBOX_WATCHDOG_INTERVAL` would otherwise put a hard floor of thirty
+/// seconds under it. The doublings still start well below that interval, so a
+/// relay that merely lost the inbox is re-subscribed on the next pass and only
+/// a persistently refusing one reaches this figure.
 const RESUBSCRIBE_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Per-relay re-subscribe pacing.
@@ -165,15 +172,15 @@ impl InboxSubscription {
 /// Keeps the inbox subscription alive across relay-initiated closures.
 ///
 /// Lives in the event loop, which is the only consumer of the notification
-/// stream — hence the plain `&mut self` state rather than a lock.
+/// stream. All of its mutable state — acknowledgements and re-subscribe
+/// pacing — is in [`InboxHealth`], because [`check_inbox_health`] runs from a
+/// different task and has to see and share the very same facts.
 pub struct InboxKeeper {
     subscription: InboxSubscription,
-    /// Only holds relays that are currently failing; a relay that accepts the
-    /// REQ is dropped from the map, so the steady state is empty.
-    backoff: HashMap<RelayUrl, RelayBackoff>,
-    /// Where relay acknowledgements are recorded. The event loop is the only
-    /// place an `EOSE` can be observed, but the watchdog is what acts on it,
-    /// so the fact has to be shared rather than kept here.
+    /// Where relay acknowledgements and re-subscribe pacing are recorded. The
+    /// event loop is the only place an `EOSE` can be observed, but the
+    /// watchdog is what acts on it, so the facts have to be shared rather than
+    /// kept here.
     health: Option<Arc<InboxHealth>>,
 }
 
@@ -185,7 +192,6 @@ impl InboxKeeper {
     pub fn with_health(subscription: InboxSubscription, health: Option<Arc<InboxHealth>>) -> Self {
         Self {
             subscription,
-            backoff: HashMap::new(),
             health,
         }
     }
@@ -198,7 +204,7 @@ impl InboxKeeper {
     /// backoff. Everything else (`OK`, `NOTICE`, other subscriptions' frames)
     /// is not this module's business.
     pub async fn on_relay_message(
-        &mut self,
+        &self,
         client: &Client,
         relay_url: &RelayUrl,
         message: &RelayMessage<'_>,
@@ -241,23 +247,18 @@ impl InboxKeeper {
                 // it fail before is over, so the next failure deserves a prompt
                 // retry again.
                 if let Some(health) = &self.health {
-                    health.note_relay_acknowledged(relay_url);
-                }
-                if self.backoff.remove(relay_url).is_some() {
-                    info!("Inbox subscription re-established on relay {relay_url}");
+                    if health.note_relay_acknowledged(relay_url) {
+                        info!("Inbox subscription re-established on relay {relay_url}");
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    /// Re-issue the inbox REQ to a single relay, subject to backoff.
-    async fn resubscribe(&mut self, client: &Client, relay_url: &RelayUrl) {
-        if !self.allow_attempt(relay_url, Instant::now()) {
-            debug!("Skipping inbox re-subscribe on relay {relay_url}: backing off");
-            return;
-        }
-
+    /// Re-issue the inbox REQ to a single relay. Pacing is
+    /// [`resubscribe_relay`]'s job, so the watchdog cannot bypass it.
+    async fn resubscribe(&self, client: &Client, relay_url: &RelayUrl) {
         let relay = match client.relay(relay_url).await {
             Ok(Some(relay)) => relay,
             Ok(None) => {
@@ -271,31 +272,6 @@ impl InboxKeeper {
         };
 
         resubscribe_relay(&relay, &self.subscription, self.health.as_deref()).await;
-    }
-
-    /// Whether a re-subscribe to `relay` may go out at `now`, arming the next
-    /// delay when it may. The first failure for a relay always passes.
-    fn allow_attempt(&mut self, relay: &RelayUrl, now: Instant) -> bool {
-        match self.backoff.get_mut(relay) {
-            None => {
-                self.backoff.insert(
-                    relay.clone(),
-                    RelayBackoff {
-                        next_attempt_at: now + RESUBSCRIBE_INITIAL_BACKOFF,
-                        delay: RESUBSCRIBE_INITIAL_BACKOFF,
-                    },
-                );
-                true
-            }
-            Some(state) => {
-                if now < state.next_attempt_at {
-                    return false;
-                }
-                state.delay = (state.delay * 2).min(RESUBSCRIBE_MAX_BACKOFF);
-                state.next_attempt_at = now + state.delay;
-                true
-            }
-        }
     }
 }
 
@@ -317,23 +293,38 @@ fn is_provisional_closure(message: &str) -> bool {
     )
 }
 
-/// Re-send the inbox REQ to one relay.
+/// Re-send the inbox REQ to one relay, returning whether one actually went out.
 ///
 /// Shared by the event-loop keeper (reacting to a `CLOSED`) and the watchdog
 /// (finding an ear that went missing without one), so both recover a relay the
-/// same way.
+/// same way — and, just as importantly, pace it the same way. Backoff and
+/// acknowledgement bookkeeping are part of the operation rather than something
+/// callers remember to do:
 ///
-/// Invalidating the relay's acknowledgement is part of the operation, not
-/// something callers remember to do: from the moment a fresh REQ goes out, an
-/// earlier `EOSE` says nothing about whether the relay is serving *this* one.
-/// A relay that answers, then closes the subscription, then quietly ignores
-/// the replacement would otherwise keep its stale credit and read as healthy.
+/// - **Pacing.** Both callers draw on one per-relay budget in [`InboxHealth`].
+///   The watchdog would otherwise re-send unconditionally on every pass,
+///   putting a hard floor of `INBOX_WATCHDOG_INTERVAL` under a ceiling that
+///   claims to be [`RESUBSCRIBE_MAX_BACKOFF`]. Sharing it keeps a transient
+///   failure recovering on the very next audit while a relay that refuses the
+///   inbox on principle tapers to one REQ every five minutes.
+/// - **Acknowledgement.** From the moment a fresh REQ goes out, an earlier
+///   `EOSE` says nothing about whether the relay is serving *this* one. A
+///   relay that answers, then closes the subscription, then quietly ignores
+///   the replacement would otherwise keep its stale credit and read as
+///   healthy.
 async fn resubscribe_relay(
     relay: &Relay,
     subscription: &InboxSubscription,
     health: Option<&InboxHealth>,
-) {
+) -> bool {
     if let Some(health) = health {
+        if !health.allow_resubscribe(relay.url()) {
+            debug!(
+                "Skipping inbox re-subscribe on relay {}: backing off",
+                relay.url()
+            );
+            return false;
+        }
         health.note_relay_resubscribed(relay.url());
     }
 
@@ -355,6 +346,8 @@ async fn resubscribe_relay(
             relay.url()
         ),
     }
+
+    true
 }
 
 /// Whether the daemon can currently hear anything at all.
@@ -432,6 +425,11 @@ struct HealthState {
     /// connection says nothing about the current one — see
     /// [`InboxHealth::has_acknowledged_since`].
     acknowledged: HashMap<RelayUrl, i64>,
+    /// Re-subscribe pacing, drawn on by the event loop and the watchdog alike.
+    ///
+    /// Only holds relays that are currently failing; a relay that answers the
+    /// REQ is dropped from the map, so the steady state is empty.
+    backoff: HashMap<RelayUrl, RelayBackoff>,
 }
 
 impl HealthState {
@@ -470,6 +468,7 @@ impl InboxHealth {
                 installed_at,
                 windows: Vec::new(),
                 acknowledged: HashMap::new(),
+                backoff: HashMap::new(),
             }),
         }
     }
@@ -588,16 +587,55 @@ impl InboxHealth {
 
     /// Record that `relay` answered the inbox REQ (an `EOSE` for our
     /// subscription), which is the only evidence that it is really serving it.
-    pub fn note_relay_acknowledged(&self, relay: &RelayUrl) {
-        self.note_relay_acknowledged_at(relay, now_secs());
+    ///
+    /// Whatever was making the relay fail is over, so its pacing is reset too
+    /// and the next failure earns a prompt retry again. Returns whether the
+    /// relay was being backed off, which is what distinguishes a recovery
+    /// worth logging from the steady state.
+    pub fn note_relay_acknowledged(&self, relay: &RelayUrl) -> bool {
+        self.note_relay_acknowledged_at(relay, now_secs())
     }
 
-    fn note_relay_acknowledged_at(&self, relay: &RelayUrl, at: i64) {
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
-            .acknowledged
-            .insert(relay.clone(), at);
+    fn note_relay_acknowledged_at(&self, relay: &RelayUrl, at: i64) -> bool {
+        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        state.acknowledged.insert(relay.clone(), at);
+        state.backoff.remove(relay).is_some()
+    }
+
+    /// Whether a re-subscribe to `relay` may go out now, arming the next delay
+    /// when it may. The first failure for a relay always passes.
+    ///
+    /// This is the single pacing budget the event loop and the watchdog share.
+    /// Under the watchdog's 30-second cadence the doubling only starts to bite
+    /// once the delay outgrows the interval — so a relay that lost the inbox
+    /// once is re-subscribed on the very next pass, and only one that keeps
+    /// refusing tapers to [`RESUBSCRIBE_MAX_BACKOFF`].
+    pub fn allow_resubscribe(&self, relay: &RelayUrl) -> bool {
+        self.allow_resubscribe_at(relay, Instant::now())
+    }
+
+    fn allow_resubscribe_at(&self, relay: &RelayUrl, now: Instant) -> bool {
+        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        match state.backoff.get_mut(relay) {
+            None => {
+                state.backoff.insert(
+                    relay.clone(),
+                    RelayBackoff {
+                        next_attempt_at: now + RESUBSCRIBE_INITIAL_BACKOFF,
+                        delay: RESUBSCRIBE_INITIAL_BACKOFF,
+                    },
+                );
+                true
+            }
+            Some(pacing) => {
+                if now < pacing.next_attempt_at {
+                    return false;
+                }
+                pacing.delay = (pacing.delay * 2).min(RESUBSCRIBE_MAX_BACKOFF);
+                pacing.next_attempt_at = now + pacing.delay;
+                true
+            }
+        }
     }
 
     /// Forget `relay`'s acknowledgement, because the REQ has just been sent
@@ -729,8 +767,9 @@ async fn check_inbox_health_with(
             // failed to go out, a relay re-added after startup — or one that
             // took the REQ and never answered it.
             warn!("Relay {url} is connected but not serving the Mostro inbox; re-subscribing");
-            resubscribe_relay(relay, subscription, health.as_deref()).await;
-            retried += 1;
+            if resubscribe_relay(relay, subscription, health.as_deref()).await {
+                retried += 1;
+            }
         }
     }
 
@@ -775,8 +814,25 @@ mod tests {
         Keys::generate().public_key()
     }
 
-    fn keeper() -> InboxKeeper {
-        InboxKeeper::new(InboxSubscription::new(pubkey(), Kind::GiftWrap))
+    /// A keeper backed by its own health record: all of its state — pacing and
+    /// acknowledgements alike — now lives there, so tests need the handle too.
+    fn keeper() -> (InboxKeeper, Arc<InboxHealth>) {
+        let health = Arc::new(InboxHealth::at(T0));
+        let keeper = InboxKeeper::with_health(
+            InboxSubscription::new(pubkey(), Kind::GiftWrap),
+            Some(health.clone()),
+        );
+        (keeper, health)
+    }
+
+    /// Whether `health` is currently pacing re-subscribes to `url`.
+    fn backing_off(health: &InboxHealth, url: &RelayUrl) -> bool {
+        health
+            .state
+            .lock()
+            .expect("inbox health mutex poisoned")
+            .backoff
+            .contains_key(url)
     }
 
     fn relay_url(url: &str) -> RelayUrl {
@@ -847,46 +903,53 @@ mod tests {
 
     #[test]
     fn first_closure_from_a_relay_retries_immediately() {
-        let mut keeper = keeper();
+        let health = InboxHealth::at(T0);
         let relay = relay_url("ws://relay.example");
 
         assert!(
-            keeper.allow_attempt(&relay, Instant::now()),
+            health.allow_resubscribe_at(&relay, Instant::now()),
             "a first CLOSED must be answered at once: every delay is deaf time"
         );
     }
 
     #[test]
     fn repeat_closures_are_paced_and_back_off() {
-        let mut keeper = keeper();
+        let health = InboxHealth::at(T0);
         let relay = relay_url("ws://relay.example");
         let start = Instant::now();
 
-        assert!(keeper.allow_attempt(&relay, start));
+        assert!(health.allow_resubscribe_at(&relay, start));
         // A relay that closes again right away must not pull a second REQ.
-        assert!(!keeper.allow_attempt(&relay, start));
-        assert!(!keeper.allow_attempt(&relay, start + Duration::from_secs(1)));
+        assert!(!health.allow_resubscribe_at(&relay, start));
+        assert!(!health.allow_resubscribe_at(&relay, start + Duration::from_secs(1)));
 
         // Past the first delay it retries, and the next wait is longer.
-        assert!(keeper.allow_attempt(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF));
-        assert!(!keeper.allow_attempt(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF * 2));
-        assert!(keeper.allow_attempt(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF * 3));
+        assert!(health.allow_resubscribe_at(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF));
+        assert!(!health.allow_resubscribe_at(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF * 2));
+        assert!(health.allow_resubscribe_at(&relay, start + RESUBSCRIBE_INITIAL_BACKOFF * 3));
     }
 
     #[test]
     fn backoff_is_capped() {
-        let mut keeper = keeper();
+        let health = InboxHealth::at(T0);
         let relay = relay_url("ws://relay.example");
         let mut now = Instant::now();
 
         // Drive it well past the ceiling.
         for _ in 0..20 {
-            assert!(keeper.allow_attempt(&relay, now));
+            assert!(health.allow_resubscribe_at(&relay, now));
             now += RESUBSCRIBE_MAX_BACKOFF * 2;
         }
 
         assert_eq!(
-            keeper.backoff.get(&relay).expect("state kept").delay,
+            health
+                .state
+                .lock()
+                .unwrap()
+                .backoff
+                .get(&relay)
+                .expect("state kept")
+                .delay,
             RESUBSCRIBE_MAX_BACKOFF,
             "a hostile relay must still be retried every {RESUBSCRIBE_MAX_BACKOFF:?}"
         );
@@ -894,15 +957,87 @@ mod tests {
 
     #[test]
     fn backoff_is_per_relay() {
-        let mut keeper = keeper();
+        let health = InboxHealth::at(T0);
         let hostile = relay_url("ws://hostile.example");
         let healthy = relay_url("ws://healthy.example");
         let now = Instant::now();
 
-        assert!(keeper.allow_attempt(&hostile, now));
-        assert!(!keeper.allow_attempt(&hostile, now));
+        assert!(health.allow_resubscribe_at(&hostile, now));
+        assert!(!health.allow_resubscribe_at(&hostile, now));
         // One misbehaving relay must not delay recovery on another.
-        assert!(keeper.allow_attempt(&healthy, now));
+        assert!(health.allow_resubscribe_at(&healthy, now));
+    }
+
+    #[test]
+    fn an_acknowledgement_clears_the_pacing_for_the_next_failure() {
+        let health = InboxHealth::at(T0);
+        let relay = relay_url("ws://relay.example");
+        let now = Instant::now();
+
+        assert!(health.allow_resubscribe_at(&relay, now));
+        assert!(!health.allow_resubscribe_at(&relay, now));
+
+        assert!(
+            health.note_relay_acknowledged(&relay),
+            "clearing a live backoff entry is what marks a recovery"
+        );
+        assert!(
+            health.allow_resubscribe_at(&relay, now),
+            "a relay that answered starts over: the next failure is a fresh one"
+        );
+
+        // The steady state has nothing to clear, so nothing to report either.
+        health.note_relay_acknowledged(&relay);
+        assert!(!health.note_relay_acknowledged(&relay));
+    }
+
+    #[test]
+    fn the_watchdog_cadence_recovers_promptly_and_only_then_tapers() {
+        // The point of sharing one budget: an audit every
+        // `INBOX_WATCHDOG_INTERVAL` must still re-subscribe a relay that
+        // simply lost the inbox, while a relay that refuses it converges on
+        // the advertised ceiling instead of drawing a REQ every 30 seconds
+        // forever.
+        let health = InboxHealth::at(T0);
+        let relay = relay_url("ws://hostile.example");
+        let tick = Duration::from_secs(crate::scheduler::INBOX_WATCHDOG_INTERVAL);
+        let mut now = Instant::now();
+
+        assert!(
+            health.allow_resubscribe_at(&relay, now),
+            "the pass that first notices the loss must act on it"
+        );
+        for pass in 1..=3 {
+            now += tick;
+            assert!(
+                health.allow_resubscribe_at(&relay, now),
+                "pass {pass}: a delay still under the audit interval must not skip a retry"
+            );
+        }
+
+        // Once the doubling outgrows the interval, passes start being skipped.
+        let mut attempts = 0;
+        for _ in 0..40 {
+            now += tick;
+            if health.allow_resubscribe_at(&relay, now) {
+                attempts += 1;
+            }
+        }
+        assert!(
+            attempts < 40,
+            "a relay that keeps refusing must stop drawing a REQ on every pass"
+        );
+        assert_eq!(
+            health
+                .state
+                .lock()
+                .unwrap()
+                .backoff
+                .get(&relay)
+                .expect("state kept")
+                .delay,
+            RESUBSCRIBE_MAX_BACKOFF
+        );
     }
 
     // ───────────────────────── control-plane handling ─────────────────────────
@@ -910,12 +1045,11 @@ mod tests {
     #[tokio::test]
     async fn eose_for_the_inbox_clears_the_backoff() {
         let client = crate::util::mostro_nostr_client_options(None).build();
-        let mut keeper = keeper();
+        let (keeper, health) = keeper();
         let relay = relay_url("ws://relay.example");
-        let now = Instant::now();
 
-        assert!(keeper.allow_attempt(&relay, now));
-        assert!(keeper.backoff.contains_key(&relay));
+        assert!(health.allow_resubscribe(&relay));
+        assert!(backing_off(&health, &relay));
 
         let eose = RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
             keeper.subscription.id().clone(),
@@ -923,7 +1057,7 @@ mod tests {
         keeper.on_relay_message(&client, &relay, &eose).await;
 
         assert!(
-            !keeper.backoff.contains_key(&relay),
+            !backing_off(&health, &relay),
             "an accepted REQ must reset the pacing for the next failure"
         );
     }
@@ -961,7 +1095,7 @@ mod tests {
         let client = crate::util::mostro_nostr_client_options(None).build();
         let health = Arc::new(InboxHealth::at(T0));
         let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
-        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        let keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
         let relay = relay_url("ws://relay.example");
 
         health.note_relay_acknowledged(&relay);
@@ -975,8 +1109,8 @@ mod tests {
         }
 
         assert!(
-            keeper.backoff.is_empty(),
-            "a relay the SDK will re-REQ by itself must not be put on the keeper's backoff"
+            !backing_off(&health, &relay),
+            "a relay the SDK will re-REQ by itself must not be put on the shared backoff"
         );
         assert!(
             acked(&health, &relay),
@@ -986,26 +1120,40 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanent_closure_is_still_the_keepers_to_answer() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let (keeper, health) = keeper();
         let client = crate::util::mostro_nostr_client_options(None).build();
-        let mut keeper = keeper();
-        let relay = relay_url("ws://relay.example");
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+        health.note_relay_acknowledged(&url);
 
         let closed = RelayMessage::Closed {
             subscription_id: std::borrow::Cow::Owned(keeper.subscription.id().clone()),
             message: std::borrow::Cow::Borrowed("blocked: you are banned"),
         };
-        keeper.on_relay_message(&client, &relay, &closed).await;
+        keeper.on_relay_message(&client, &url, &closed).await;
 
         assert!(
-            keeper.backoff.contains_key(&relay),
+            backing_off(&health, &url),
             "a CLOSED the SDK removes the subscription for must still arm the keeper"
         );
+        assert!(
+            !acked(&health, &url),
+            "the replacement REQ has yet to be answered, so the old EOSE cannot vouch for it"
+        );
+
+        relay.shutdown();
     }
 
     #[tokio::test]
     async fn frames_for_other_subscriptions_are_ignored() {
         let client = crate::util::mostro_nostr_client_options(None).build();
-        let mut keeper = keeper();
+        let (keeper, health) = keeper();
         let relay = relay_url("ws://relay.example");
 
         // Mostro's price provider and NIP-33 queries share these relays; their
@@ -1017,7 +1165,7 @@ mod tests {
         keeper.on_relay_message(&client, &relay, &other).await;
 
         assert!(
-            keeper.backoff.is_empty(),
+            !backing_off(&health, &relay),
             "a CLOSED for another subscription must not be treated as an inbox failure"
         );
     }
@@ -1093,7 +1241,7 @@ mod tests {
         publisher.add_relay(url.clone()).await.expect("add_relay");
         publisher.connect().await;
 
-        let mut keeper = InboxKeeper::new(subscription.clone());
+        let keeper = InboxKeeper::new(subscription.clone());
         let wanted = wrap_for(mostro.public_key());
         let wanted_id = wanted.id;
         let mut published = false;
@@ -1512,7 +1660,7 @@ mod tests {
 
         let health = Arc::new(InboxHealth::at(T0));
         let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
-        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        let keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
 
         // The relay answered an earlier REQ.
         health.note_relay_acknowledged(&url);
@@ -1646,7 +1794,7 @@ mod tests {
         let client = crate::util::mostro_nostr_client_options(None).build();
         let health = Arc::new(InboxHealth::at(T0));
         let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
-        let mut keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        let keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
         let url = relay_url("ws://relay.example");
 
         assert!(!acked(&health, &url));
@@ -1708,17 +1856,34 @@ mod tests {
         client.connect().await;
         subscription.subscribe(&client).await.expect("subscribe");
 
+        let health = Arc::new(InboxHealth::at(T0));
+
         // However many rounds it runs, a relay that keeps closing the inbox
         // never makes the node look healthy — this is what keeps the timeout
         // machinery paused while trade messages are being lost.
         for round in 0..3 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(
-                check_inbox_health(&client, &subscription).await,
+                check_inbox_health_with(&client, &subscription, Some(health.clone())).await,
                 InboxStatus::Blind,
                 "round {round}: a relay that refuses every REQ must never read as listening"
             );
         }
+
+        // The audit draws on the same budget the event loop does, so a relay
+        // that refuses on principle is paced towards `RESUBSCRIBE_MAX_BACKOFF`
+        // instead of being handed a REQ on every pass, forever. Skipping the
+        // retry must not soften the verdict: the node is still deaf here.
+        assert!(
+            backing_off(&health, &url),
+            "repeated refusals must accumulate on the shared re-subscribe budget"
+        );
+        assert!(!health.allow_resubscribe(&url));
+        assert_eq!(
+            check_inbox_health_with(&client, &subscription, Some(health)).await,
+            InboxStatus::Blind,
+            "a pass that backs off instead of re-sending must still report the inbox deaf"
+        );
 
         relay.shutdown();
     }

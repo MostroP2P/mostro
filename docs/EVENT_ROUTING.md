@@ -18,8 +18,10 @@ The exceptions are `auth-required` and `rate-limited`, which the SDK only *marks
 
 Two mechanisms keep the subscription alive:
 
-- `InboxKeeper::on_relay_message` reacts to a `CLOSED` naming the inbox by re-sending the REQ to that relay, paced by a per-relay backoff (immediate first retry, doubling to a five-minute ceiling, cleared when the relay answers with `EOSE`).
+- `InboxKeeper::on_relay_message` reacts to a `CLOSED` naming the inbox by re-sending the REQ to that relay.
 - `check_inbox_health`, run every 30 seconds by `job_inbox_watchdog`, audits each connected read relay and re-subscribes any that is no longer serving the inbox. This covers the losses that produce no frame the loop can see: a notification channel that dropped messages under lag, a REQ that failed to go out, a relay added after startup.
+
+Both go through `resubscribe_relay`, which owns the pacing so neither can bypass it: one per-relay budget in `InboxHealth`, immediate first retry, doubling to a five-minute ceiling, reset when the relay answers with `EOSE`. Because the doublings start well below the 30-second audit interval, a relay that merely lost the inbox is re-subscribed on the next pass, while one that refuses it on principle converges on the five-minute figure rather than drawing a REQ every 30 seconds indefinitely.
 
 Health is judged by the subscription, never by traffic volume: an instance with no trades in flight is legitimately silent.
 

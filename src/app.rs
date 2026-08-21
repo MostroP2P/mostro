@@ -466,7 +466,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // The inbox identity is derived here rather than passed around (see
     // `crate::inbox`).
     let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
-    let mut keeper = InboxKeeper::new(subscription.clone());
+    let keeper = InboxKeeper::new(subscription.clone());
     let mut subscribed = false;
 
     loop {
@@ -547,7 +547,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let is_v2 = accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND;
     let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
-    let mut keeper = InboxKeeper::new(subscription.clone());
+    let keeper = InboxKeeper::new(subscription.clone());
     let mut subscribed = false;
 
     loop {

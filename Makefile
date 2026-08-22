@@ -66,3 +66,13 @@ docker-build-startos:
 	cd docker && \
 	docker compose build mostro-startos
 
+# ARGS is spliced into the shell command as plain text — only pass
+# hand-typed, trusted values (e.g. `make mutation-test ARGS="--file
+# src/foo.rs"`). Never build ARGS from PR-diff filenames or other
+# attacker-controlled input; that class of data must be turned into a
+# bash array and passed to `cargo mutants` directly instead (see the
+# PR job in .github/workflows/mutation.yml).
+mutation-test:
+	@set -o pipefail; \
+	CARGO_MUTANTS_JOBS=2 cargo mutants $(ARGS)
+

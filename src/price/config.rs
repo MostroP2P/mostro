@@ -20,6 +20,19 @@ pub struct PriceSettings {
     /// Serve a currency's last-known-good value up to this age; then refuse.
     #[serde(default = "default_max_price_staleness_seconds")]
     pub max_price_staleness_seconds: i64,
+    /// Nostr provider only: fraction of `max_price_staleness_seconds` a
+    /// trusted-node event's own `created_at` may consume before ingestion
+    /// refuses it (issue #860). The remainder is left as the store's own
+    /// serving budget, so total age is bounded at
+    /// `(1 + nostr_ingestion_budget_pct) × max_price_staleness_seconds`
+    /// instead of accepting an event up to the full TTL old and then
+    /// serving it for another full TTL (~2x). The provider floors the
+    /// scaled product at one second, so that bound only holds exactly when
+    /// `max_price_staleness_seconds * nostr_ingestion_budget_pct >= 1`;
+    /// below that the ingestion window is one second regardless of how
+    /// small the product is.
+    #[serde(default = "default_nostr_ingestion_budget_pct")]
+    pub nostr_ingestion_budget_pct: f64,
     /// Discard a source whose value deviates more than this percent from the
     /// median (only applies with ≥ 3 sources for a currency).
     #[serde(default = "default_outlier_threshold_pct")]
@@ -150,6 +163,15 @@ impl PriceSettings {
                 self.outlier_threshold_pct
             ));
         }
+        if !(self.nostr_ingestion_budget_pct.is_finite()
+            && self.nostr_ingestion_budget_pct > 0.0
+            && self.nostr_ingestion_budget_pct <= 1.0)
+        {
+            return Err(format!(
+                "price: nostr_ingestion_budget_pct must be in (0, 1], got {}",
+                self.nostr_ingestion_budget_pct
+            ));
+        }
         for (id, p) in &self.providers {
             p.validate(id)?;
         }
@@ -162,6 +184,9 @@ fn default_update_interval_seconds() -> u64 {
 }
 fn default_max_price_staleness_seconds() -> i64 {
     1800
+}
+fn default_nostr_ingestion_budget_pct() -> f64 {
+    0.5
 }
 fn default_outlier_threshold_pct() -> f64 {
     5.0
@@ -184,6 +209,7 @@ impl Default for PriceSettings {
         Self {
             update_interval_seconds: default_update_interval_seconds(),
             max_price_staleness_seconds: default_max_price_staleness_seconds(),
+            nostr_ingestion_budget_pct: default_nostr_ingestion_budget_pct(),
             outlier_threshold_pct: default_outlier_threshold_pct(),
             provider_timeout_seconds: default_provider_timeout_seconds(),
             provider_failure_threshold: default_provider_failure_threshold(),
@@ -203,6 +229,7 @@ mod tests {
         let cfg = PriceSettings::default();
         assert_eq!(cfg.update_interval_seconds, 300);
         assert_eq!(cfg.max_price_staleness_seconds, 1800);
+        assert_eq!(cfg.nostr_ingestion_budget_pct, 0.5);
         assert_eq!(cfg.outlier_threshold_pct, 5.0);
         assert_eq!(cfg.provider_timeout_seconds, 10);
         assert_eq!(cfg.provider_failure_threshold, 3);
@@ -294,6 +321,21 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
         assert!(with_pct(0.0).validate().is_err());
         assert!(with_pct(150.0).validate().is_err());
         with_pct(5.0).validate().unwrap();
+    }
+
+    #[test]
+    fn nostr_ingestion_budget_pct_out_of_range_is_rejected() {
+        let with_pct = |pct: f64| PriceSettings {
+            nostr_ingestion_budget_pct: pct,
+            ..Default::default()
+        };
+        assert!(with_pct(0.0).validate().is_err());
+        assert!(with_pct(-0.5).validate().is_err());
+        assert!(with_pct(1.5).validate().is_err());
+        // 1.0 is the inclusive upper boundary — full TTL as ingestion budget
+        // is wasteful (back to the old bug) but not itself invalid.
+        with_pct(1.0).validate().unwrap();
+        with_pct(0.5).validate().unwrap();
     }
 
     #[test]

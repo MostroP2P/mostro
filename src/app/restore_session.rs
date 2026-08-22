@@ -16,16 +16,6 @@ pub async fn restore_session_action(
     // Get trade key from the event rumor
     let trade_key = event.sender.to_string();
 
-    // Validate the master key format
-    if !master_key.chars().all(|c| c.is_ascii_hexdigit()) || master_key.len() != 64 {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
-    }
-
-    // Validate the trade key format
-    if !trade_key.chars().all(|c| c.is_ascii_hexdigit()) || trade_key.len() != 64 {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
-    }
-
     // No key in the log line — master_key is the user's persistent Nostr
     // identity, not a per-trade ephemeral one (AGENTS.md: scrub Nostr keys
     // from logs).

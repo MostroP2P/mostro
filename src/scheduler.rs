@@ -293,6 +293,16 @@ async fn job_retry_failed_payments(ctx: AppContext) {
     });
 }
 
+/// Floor of the payout-reconcile grace window, in seconds.
+///
+/// `LightningSettings::default()` has `payment_retries_interval = 0`, and a
+/// 1s grace would be narrower than the claim→register window it guards,
+/// re-opening the reconcile-vs-dispatch race the grace exists to close.
+/// `release::PAYOUT_QUEUE_HEARTBEAT` is derived from this so a claim queued
+/// for a send permit is always re-stamped before it becomes eligible for
+/// reconciliation — keep that relation in mind before lowering it.
+pub(crate) const MIN_GRACE_SECS: u32 = 30;
+
 /// Reconcile buyer payouts left in flight (`payout_payment_hash` set) against
 /// LND. Complements `job_retry_failed_payments`: that job only dispatches fresh
 /// payouts (marker NULL), while this one resolves the durable marker so a
@@ -309,11 +319,6 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
     // reconciled yet, so LND has surely registered it before we ever act on a
     // `None`/`Failed` lookup. Tied to the retry cadence — comfortably larger
     // than the sub-second claim→register window.
-    //
-    // Floor it: `LightningSettings::default()` has payment_retries_interval = 0,
-    // and a 1s grace would be narrower than the claim→register window it guards,
-    // re-opening the reconcile-vs-dispatch race the grace exists to close.
-    const MIN_GRACE_SECS: u32 = 30;
     let grace_secs = ctx
         .settings()
         .lightning

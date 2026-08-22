@@ -330,6 +330,19 @@ impl LndConnector {
                     "payment already dispatched for this hash".to_string(),
                 )));
             }
+            // The degraded paths must not be silent: an LND whose
+            // track_payment_v2 consistently exceeds the bound would leave
+            // this guard permanently disabled with no trace in the logs.
+            Err(_) => info!(
+                "Duplicate guard lookup for hash {} timed out after {}s; proceeding (LND rejects real duplicates)",
+                hash,
+                DUPLICATE_GUARD_LOOKUP_TIMEOUT.as_secs()
+            ),
+            Ok(Err(e)) => info!(
+                "Duplicate guard lookup for hash {} failed ({e}); proceeding",
+                hash
+            ),
+            // Failed / Unknown / no record: the normal go-ahead.
             _ => {}
         }
 

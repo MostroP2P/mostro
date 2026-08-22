@@ -784,14 +784,17 @@ mod tests {
             forged
         }
 
+        /// Drive `accept_event` over a v2 (kind-14) event with an explicit
+        /// gate, the shape both ordering tests below need.
         async fn accept(
             ctx: &AppContext,
             event: &Event,
             mostro: &Keys,
             gate: &SpamGate,
         ) -> Option<(Action, Message, UnwrappedMessage)> {
-            // Same constant the event loops derive `is_v2` from, so the test
-            // fails if it ever drifts from `Transport::Nip44Direct`'s kind.
+            // Same kind constant the event loops use to identify v2 before
+            // calling `gate_for`, so the test fails if it drifts from
+            // `Transport::Nip44Direct`'s kind.
             accept_event(
                 ctx,
                 event,
@@ -909,9 +912,16 @@ mod tests {
         #[test]
         fn gate_applies_to_v2_only() {
             assert!(gate_for(false).is_none(), "v1 must fail open");
-            // `SpamGate::global()` is `None` unless `install_spam_gate` ran, so
-            // the v2 arm can only be pinned against the installed state.
-            assert_eq!(gate_for(true).is_some(), SpamGate::global().is_some());
+            // Force the installed state rather than reading it: asserting
+            // against `SpamGate::global()` compares `gate_for` with itself and
+            // passes vacuously while nothing has installed yet. Install wins
+            // here or another test's already did; either way a second one is
+            // refused, not a panic.
+            let _ = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
+            assert!(
+                gate_for(true).is_some(),
+                "v2 must resolve the installed gate"
+            );
         }
     }
 

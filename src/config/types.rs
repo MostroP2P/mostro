@@ -446,11 +446,13 @@ pub struct LightningSettings {
     pub lnd_macaroon_file: String,
     /// LND gRPC host
     pub lnd_grpc_host: String,
-    /// Invoice expiration window in seconds
+    /// Minimum remaining lifetime, in seconds, a buyer payout invoice must
+    /// have to be accepted. Enforced in `lightning::invoice`.
     pub invoice_expiration_window: u32,
     /// Hold invoice CLTV delta
     pub hold_invoice_cltv_delta: u32,
-    /// Hold invoice expiration window in seconds
+    /// Lifetime, in seconds, of the hold invoice the seller pays. Distinct
+    /// from `invoice_expiration_window`, which governs the buyer's payout.
     pub hold_invoice_expiration_window: u32,
     /// Number of payment attempts
     pub payment_attempts: u32,

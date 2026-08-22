@@ -226,12 +226,13 @@ mod tests {
         assert!(guard.check_and_record(id, 1_000 + 61));
     }
 
+    /// The `OnceLock` is process-wide and other tests install it too, so this
+    /// one cannot claim the first install (same reason as
+    /// `PriceManager::install_global_accepts_once_then_refuses`). The contract
+    /// asserted below holds either way.
     #[test]
     fn install_global_then_second_install_is_rejected() {
-        // The OnceLock is process-wide, so this single test owns both the
-        // first (successful) install and the AlreadyInstalled rejection.
-        let first = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
-        assert!(first.is_ok(), "first install must succeed");
+        let _ = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
         assert!(
             SpamGate::global().is_some(),
             "global() must expose the installed gate"

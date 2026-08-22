@@ -154,7 +154,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `port` (u16): Listen port (Rust Default: 50051)
 - `allow_remote` (bool): Acknowledge a non-loopback bind (Rust Default: false)
 - `tls_cert_path` / `tls_key_path` (Option\<String\>): PEM material for TLS; required together (Rust Default: None)
-- Note: `enabled`, `listen_address` and `port` have a Rust Default implementation, but `settings.toml` must still include these keys. If a key is present but empty or omitted by tooling, the daemon falls back to the Rust Default value. The remaining fields are optional.
+- Note: `enabled`, `listen_address` and `port` are required in `settings.toml`. `RpcSettings` has a Rust `Default` implementation, but neither those fields nor `rpc` on `Settings` carry `#[serde(default)]`, so an omitted key makes `toml::from_str` (`fn init_configuration_file` in `src/config/util.rs`) fail with a missing-field error rather than fall back, and an empty value deserializes as that empty value. The remaining fields are optional.
 - The bearer token lives in the `MOSTRO_RPC_TOKEN` environment variable, never in `settings.toml`. `validate_rpc_settings` (`src/config/util.rs`) makes startup fatal when `enabled = true` and the token is missing or under 32 characters, when `listen_address` is not an address the server can bind, when a non-loopback address is bound without `allow_remote = true`, or when only one half of the TLS pair is configured. See `docs/RPC.md`.
 
 ## Global Variables

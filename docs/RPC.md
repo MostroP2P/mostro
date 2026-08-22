@@ -32,8 +32,9 @@ allow_remote = false
 `listen_address` must be an IP literal, with IPv6 bracketed: `127.0.0.1`,
 `[::1]` or `0.0.0.0`. Hostnames are never resolved, so `localhost` and
 unbracketed `::1` are refused at startup rather than accepted and then failed on
-at bind time — `validate_rpc_settings` and `RpcServer::bind` parse the address
-through the same function.
+at bind time: `fn validate_rpc_settings` in `src/config/util.rs` and `fn bind`
+for `RpcServer` in `src/rpc/server.rs` both resolve the address through
+`fn listen_socket_addr` in `src/rpc/server.rs`.
 
 The bearer token is **not** configured here. It is read from the `MOSTRO_RPC_TOKEN`
 environment variable, which the daemon also picks up from `<settings_dir>/.env`:

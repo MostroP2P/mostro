@@ -263,7 +263,14 @@ async fn extract_lnurl(address: &str) -> Result<Url, MostroError> {
             None => return Err(MostroInternalErr(ServiceError::LnAddressParseError)),
         };
         let base_url = if cfg!(test) {
-            format!("http://{domain}:8080")
+            // Overridable so test runs can dodge a port already taken on the
+            // host (e.g. cargo-mutants) without disturbing the 8080 default
+            // other tests assert on.
+            let port = std::env::var("MOSTRO_TEST_LN_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(8080);
+            format!("http://{domain}:{port}")
         } else {
             format!("https://{domain}")
         };
@@ -527,12 +534,19 @@ mod tests {
 
     #[tokio::test]
     async fn extract_lnurl_builds_wellknown_url_for_lightning_address() {
+        // cfg!(test) pins lightning addresses to the local test host form,
+        // on MOSTRO_TEST_LN_PORT (default 8080) so this stays correct under
+        // a port override (e.g. cargo-mutants dodging a taken 8080).
+        let port = std::env::var("MOSTRO_TEST_LN_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(8080);
         let extracted = extract_lnurl("alice@127.0.0.1")
             .await
             .expect("lightning address parses");
         assert_eq!(
             extracted.to_string(),
-            "http://127.0.0.1:8080/.well-known/lnurlp/alice"
+            format!("http://127.0.0.1:{port}/.well-known/lnurlp/alice")
         );
     }
 

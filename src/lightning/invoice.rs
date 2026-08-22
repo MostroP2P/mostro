@@ -323,7 +323,12 @@ mod tests {
             )
             .layer(tower_http::cors::CorsLayer::permissive());
 
-        let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+        // Must match lnurl.rs's MOSTRO_TEST_LN_PORT override (default 8080).
+        let port = std::env::var("MOSTRO_TEST_LN_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(8080);
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
 

@@ -160,7 +160,7 @@ The Cashu track defines a *different* success path — the release watcher in
 
 Kind 38383 (order) carries no pubkeys; kind 38384 (rating) is keyed by the rated
 user's pubkey and carries only rating aggregates; kind 38385 (info) carries
-node policy tags (e.g. `bond_policy_tags`, `bond_policy_tags` / info tags in `src/nip33.rs`). Nothing about
+node policy tags (e.g. `bond_policy_tags` from `src/nip33.rs`). Nothing about
 fiat accounts exists on any event and this feature must keep it that way.
 
 ### 3.5 Existing patterns we reuse
@@ -293,7 +293,8 @@ matters is only *which side is the buyer*):
 | `declare-payer` | buyer trade key | `WaitingPayment`, `WaitingBuyerInvoice`, `Active` | upsert declaration (last write wins) |
 | `declare-payer` | buyer | `FiatSent` or later | `cant-do not_allowed_by_status` (frozen) |
 | `payment-history` (push) | Mostro → seller | emitted inside `fiat_sent_action` after `fiat-sent-ok` | — |
-| `payment-history` (query) | seller trade key | `FiatSent`, `Dispute`, `SettledHoldInvoice`; `Success` returns `not_found` after the declaration is consumed | same object as push before success |
+| `payment-history` (query) | seller trade key | `FiatSent`, `Dispute`, `SettledHoldInvoice` | same object as push before success |
+| `payment-history` (query) | seller trade key | `Success` | `cant-do not_found` after the declaration is consumed |
 | success hook | daemon | `SettledHoldInvoice → Success` CAS | history += 1, declaration consumed |
 | prune | scheduler | order in a terminal non-success status | declaration deleted |
 
@@ -409,7 +410,7 @@ Buyer → Mostro:
 ]
 ```
 
-Mostro → buyer (ack) and Mostro → seller (forward), identical body:
+Mostro → buyer ack:
 
 ```json
 [
@@ -421,7 +422,17 @@ Mostro → buyer (ack) and Mostro → seller (forward), identical body:
 ]
 ```
 
-(The seller copy carries `request_id: null`.)
+Mostro → seller forward (unsolicited, so `request_id` is null):
+
+```json
+[
+  {"order": {"version": 2, "request_id": null, "trade_index": null,
+             "id": "4f1c…", "action": "payer-declared",
+             "payload": {"payer_declaration": {
+               "payment_hash": "9b0e…c1"}}}},
+  null, null
+]
+```
 
 Mostro → seller, pushed immediately after `fiat-sent-ok`:
 
@@ -705,15 +716,22 @@ After `order_updated.update(pool).await?` succeeds and before returning:
 
 ```rust
 if Settings::is_payer_history_enabled() {
-    if let Some(h) = payer::history::build_for_order(pool, ctx.keys(), &order_updated).await? {
-        enqueue_order_msg(None, Some(order_updated.id), Action::PaymentHistory,
-                          Some(Payload::PaymentHistory(h)), seller_pubkey, None).await;
+    match payer::history::build_for_order(pool, ctx.keys(), &order_updated).await {
+        Ok(Some(h)) => {
+            enqueue_order_msg(None, Some(order_updated.id), Action::PaymentHistory,
+                              Some(Payload::PaymentHistory(h)), seller_pubkey, None).await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("payer history push skipped for order {}: {e}",
+                                  order_updated.id),
     }
 }
 ```
 
 `build_for_order` returns `None` when there is no declaration (no push, see
-§6.5). The push is only queued after the local `FiatSent` transition is durable. Any DB error while building history after that point is logged and **must not** fail `fiat_sent_action`; wrap it in `if let Err(e) … tracing::warn!` rather than `?` once the transition is committed.
+§6.5). The push is only queued after the local `FiatSent` transition is durable;
+a history lookup failure after that point is logged and **must not** fail
+`fiat_sent_action`.
 
 ### 10.4 `payment_history_action` — the seller query (`src/app/payer/history.rs`)
 
@@ -726,9 +744,10 @@ pub async fn payment_history_action(ctx, msg, event, _my_keys) -> Result<(), Mos
     if order.get_seller_pubkey().ok() != Some(event.sender) {              // seller only, §11
         return Err(MostroCantDo(CantDoReason::InvalidPeer));
     }
-    if !matches!(order.get_order_status()?,
-        Status::FiatSent | Status::Dispute | Status::SettledHoldInvoice | Status::Success) {
-        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    match order.get_order_status()? {
+        Status::FiatSent | Status::Dispute | Status::SettledHoldInvoice => {}
+        Status::Success => return Err(MostroCantDo(CantDoReason::NotFound)),
+        _ => return Err(MostroCantDo(CantDoReason::NotAllowedByStatus)),
     }
     let history = build_for_order(ctx.pool(), ctx.keys(), &order).await?
         .ok_or(MostroCantDo(CantDoReason::NotFound))?;                     // buyer never declared

@@ -22,6 +22,7 @@ The copies belong to the user that ran the command, and `make docker-up` runs th
 
 - `MOSTRO_CONTAINER_USER`: uid/gid the `mostro` container runs as
   - `make docker-up` defaults it to the owner of `docker/config`, the account that can read the `0600` macaroon and write `mostro.db` there, and prints what it picked. A bare `docker compose up` falls back to `1000:1000`, the image's `mostrouser`.
+  - uid 0 is refused, whether derived or set explicitly: `make docker-up` stops rather than run the daemon as root, which is what a root-owned `docker/config` (left by a `sudo make docker-build`) would otherwise mean. Hand the directory to an unprivileged account, or set this variable to a non-zero uid/gid that can read it.
   - Set it to run as someone else — for instance uid/gid 1000 on a config directory you handed over with `chown -R 1000:1000`
   - Example: `export MOSTRO_CONTAINER_USER=$(id -u):$(id -g)`
 

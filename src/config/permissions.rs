@@ -243,14 +243,20 @@ fn create_temp_sibling(dir: &Path, file_name: &OsStr) -> Result<(PathBuf, fs::Fi
     let mut last_error = None;
 
     for attempt in 0..TEMP_NAME_ATTEMPTS {
-        let mut name = OsString::from(".");
-        name.push(file_name);
-        name.push(format!(".tmp-{}-{attempt}", std::process::id()));
-        let candidate = dir.join(name);
+        let candidate = dir.join(temp_sibling_name(file_name, attempt));
 
         match open_owner_only_new(&candidate) {
             Ok(file) => return Ok((candidate, file)),
-            Err(e) => last_error = Some(e),
+            // Only a taken name is worth another attempt. An unwritable or
+            // missing directory, or a full disk, fails the same way sixteen
+            // times over and would be reported as a name collision.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = Some(e),
+            Err(e) => {
+                return Err(MostroInternalErr(ServiceError::IOError(format!(
+                    "Could not create a temporary file in {}: {e}",
+                    dir.display()
+                ))))
+            }
         }
     }
 
@@ -261,6 +267,19 @@ fn create_temp_sibling(dir: &Path, file_name: &OsStr) -> Result<(PathBuf, fs::Fi
             .map(|e| e.to_string())
             .unwrap_or_else(|| "unknown error".to_string())
     ))))
+}
+
+/// The name `create_temp_sibling` tries for a given attempt: a dotfile next to
+/// the target, so a temporary left behind by a killed run is not mistaken for
+/// a settings file.
+///
+/// Shared with the tests, which seed one of these names to exercise the retry
+/// and would otherwise silently stop matching if the format changed here.
+fn temp_sibling_name(file_name: &OsStr, attempt: u32) -> OsString {
+    let mut name = OsString::from(".");
+    name.push(file_name);
+    name.push(format!(".tmp-{}-{attempt}", std::process::id()));
+    name
 }
 
 /// Open a brand-new file owner-only, failing if anything already occupies the
@@ -522,6 +541,21 @@ mod owner_only_tests {
         std::fs::write(env_file.join("occupied"), b"x").expect("occupy the directory");
         assert!(write_owner_only_atomic(&env_file, b"MOSTRO_NSEC_PRIVKEY=nsec1...\n").is_err());
     }
+
+    #[test]
+    fn a_failure_that_is_not_a_name_collision_is_reported_as_itself() {
+        let root = temp_root("atomic-missing-dir");
+        let env_file = root.join("absent").join(".env");
+        let err = write_owner_only_atomic(&env_file, b"MOSTRO_NSEC_PRIVKEY=nsec1...\n")
+            .expect_err("a missing directory must not be written to");
+        // Sixteen identical failures in a directory that does not exist only
+        // bury the cause, so the message must not blame a name collision.
+        let message = format!("{err:?}");
+        assert!(
+            !message.contains("attempts"),
+            "expected the underlying error, got {message}"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -605,7 +639,7 @@ mod symlink_tests {
         // What a run killed mid-write leaves behind. Writing through it would
         // be harmless here, but the same name could just as well be a symlink
         // another account planted, so the first free suffix is used instead.
-        let stale = root.join(format!(".env.tmp-{}-0", std::process::id()));
+        let stale = root.join(temp_sibling_name(OsStr::new(".env"), 0));
         std::fs::write(&stale, "stale").expect("seed stale temporary");
 
         write_owner_only_atomic(&env_file, b"MOSTRO_NSEC_PRIVKEY=nsec1...\n").expect("write");

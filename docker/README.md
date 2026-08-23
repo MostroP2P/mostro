@@ -37,7 +37,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    install -m 600 ../settings.tpl.toml config/settings.toml
    ```
 
-   Mode `0700` on `config` and `0600` on `settings.toml` because that directory ends up holding every secret this deployment has: `nsec_privkey` in `settings.toml`, the LND credentials in `config/lnd/`, and the `mostro.db` the daemon writes. `install -d -m 700` also tightens a `config` directory an earlier `mkdir -p` left at `0755` — this command is you deciding the mode. `make docker-up` will not decide it again: it only creates `config` when it is missing, so a directory you deliberately opened up to a group later on keeps that mode.
+   Mode `0700` on `config` and `0600` on `settings.toml` because that directory ends up holding every secret this deployment has: `nsec_privkey` in `settings.toml`, the LND credentials in `config/lnd/`, and the `mostro.db` the daemon writes. `install -d -m 700` also tightens a `config` directory an earlier `mkdir -p` left at `0755` — this command is you deciding the mode. Neither `make docker-build` nor `make docker-up` will decide it again: both only create `config` when it is missing, so a directory you deliberately opened up to a group later on keeps that mode. (`config/lnd` is the exception: `make docker-build` sets it to `0700` on every run, since nothing but the LND credentials it installs lives there.)
 
    _Don't forget to edit `lnd_grpc_host`, `nsec_privkey` and `relays` fields in the `config/settings.toml` file. Note that paths in `settings.toml` refer to paths **inside the container**, so use `/config/lnd/tls.cert` and `/config/lnd/admin.macaroon` for the LND certificate and macaroon files (these will be copied there by `make docker-build`)._
 
@@ -73,6 +73,8 @@ To build and run the Docker container using Docker Compose, follow these steps:
    ```
 
    A bare `docker compose up` does not derive anything and falls back to `1000:1000`, the image's `mostrouser`.
+
+   `make docker-up` refuses to start when that uid comes out as 0, which is what a `sudo make docker-build` leaves behind: the container would run as root, dropping the one privilege boundary the image has. Either run both targets as the account that owns `docker/config`, or hand the directory over with `sudo chown -R 1000:1000 config` (`docker compose up` then matches, since 1000 is the image default).
 
 4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set). This can be set before running `make docker-up`:
 
@@ -167,7 +169,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
    install -m 600 -o 1000 -g 1000 /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
    ```
 
-   The admin macaroon grants full control of your LND node — anyone who reads it can move the funds escrowed in Mostro's hold invoices — so it is installed owner-readable only, and `-o 1000 -g 1000` hands it to the container's user (as the `0700` directory from step 2 already was). Without that ownership, mode `0600` would leave mostrod unable to read the macaroon. (`-o`/`-g` require root; as a non-root user, drop them and run the steps as the account that owns the config dir.)
+   The admin macaroon grants full control of your LND node — anyone who reads it can move the funds escrowed in Mostro's hold invoices — so it is installed owner-readable only, and `-o 1000 -g 1000` hands it to the container's user (as the `0700` directory from step 2 already was). Without that ownership, mode `0600` would leave mostrod unable to read the macaroon. (`-o`/`-g` require root; as a non-root user, drop them, run the steps as the account that owns the config dir, and add `--user $(id -u):$(id -g)` to the `docker run` commands in step 6, so the container runs as that account rather than as the image default `1000:1000` — which could not read the `0600` macaroon you just installed.)
 
    (If LND is on another host, you only need the cert and macaroon copied here; point `lnd_grpc_host` at that host in step 5.)
 

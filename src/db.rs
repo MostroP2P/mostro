@@ -852,6 +852,13 @@ pub async fn cas_complete_pretrade_take(
 /// `maker_trade_pubkey` lands on the maker side fixed by the order kind:
 /// the seller of a sell order, the buyer of a buy order. Returns `false`
 /// when the CAS missed.
+///
+/// Caveat: surviving the row is not the same as surviving the flow. A take
+/// already in flight when the rotation commits keeps addressing the maker
+/// with the pre-rotation key it read at the top — `PayInvoice`,
+/// `WaitingSellerToPay` — because those messages are built from its own
+/// snapshot, not re-read after this write. The row ends up correct; the
+/// in-flight conversation does not. Tracked in #911.
 pub async fn cas_rotate_maker_trade_pubkey(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -862,13 +869,14 @@ pub async fn cas_rotate_maker_trade_pubkey(
         OrderKind::Sell => "seller_pubkey",
         OrderKind::Buy => "buyer_pubkey",
     };
+    // `creator_pubkey` tracks the maker's current trade key, so both
+    // columns take the same value: bind it once and reuse `?2`.
     let query = format!(
-        "UPDATE orders SET {maker_column} = ?2, creator_pubkey = ?3 \
+        "UPDATE orders SET {maker_column} = ?2, creator_pubkey = ?2 \
          WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
     );
     let result = sqlx::query(AssertSqlSafe(query.as_str()))
         .bind(order_id)
-        .bind(maker_trade_pubkey)
         .bind(maker_trade_pubkey)
         .execute(pool)
         .await

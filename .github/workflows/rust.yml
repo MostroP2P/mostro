@@ -2,7 +2,8 @@ name: Build and Test for all targets
 
 on:
   push:
-    tags: ['v*.*.*']          # run only when a tag like v1.2.3 is pushed
+    # Anchored filter pattern: only an exact vX.Y.Z tag push starts a run.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
 env:

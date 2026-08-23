@@ -119,10 +119,10 @@ File references are to this repository unless marked `$CORE`
 
 | Fact | Where |
 |---|---|
-| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/nip59.rs` (`UnwrappedMessage`), `src/app.rs:412-428` |
-| `users.pubkey` (PRIMARY KEY) is the master key. A `users` row is created **only** when `identity != sender`. | `migrations/20231005195154_users.sql`, `src/app.rs:186-198` |
-| `orders.master_buyer_pubkey` / `master_seller_pubkey` hold the identity keys; `buyer_pubkey` / `seller_pubkey` the trade keys. | `migrations/20221222153301_orders.sql`, `src/util.rs:630-646` |
-| **Full Privacy Mode is structural, not a flag**: the client never sends the identity key, so `identity == sender` and `master_*_pubkey == *_pubkey`. No `users` row, no trade-index continuity, reputation reads as zero, rating a full-privacy counterpart is a silent no-op. | `$CORE/src/order.rs:186-195` (doc comment), `src/util.rs:228-254`, `src/app/rate_user.rs:109-125`, `$CORE/src/order.rs:496-514` (`is_full_privacy_order`) |
+| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/nip59.rs` (`UnwrappedMessage`), `handle_message_action_no_ln` in `src/app.rs` |
+| `users.pubkey` (PRIMARY KEY) is the master key. A `users` row is created **only** when `identity != sender`. | `migrations/20231005195154_users.sql`, `handle_message_action_no_ln` in `src/app.rs` |
+| `orders.master_buyer_pubkey` / `master_seller_pubkey` hold the identity keys; `buyer_pubkey` / `seller_pubkey` the trade keys. | `migrations/20221222153301_orders.sql`, `Order` buyer/seller pubkey helpers in `src/util.rs` |
+| **Full Privacy Mode is structural, not a flag**: the client never sends the identity key, so `identity == sender` and `master_*_pubkey == *_pubkey`. No `users` row, no trade-index continuity, reputation reads as zero, rating a full-privacy counterpart is a silent no-op. | `Order` identity-key documentation in `$CORE/src/order.rs` (doc comment), `Order::is_full_privacy_order` usage in `src/util.rs`, `rate_user_action` in `src/app/rate_user.rs`, `Order::is_full_privacy_order` in `$CORE/src/order.rs` (`is_full_privacy_order`) |
 
 **Consequence:** in Full Privacy Mode Mostro has *no* cross-trade continuity
 for the buyer at all. The gist's "how Mostro identifies continuity between a
@@ -133,25 +133,25 @@ user's trade keys is an implementation detail" resolves, on this codebase, to:
 
 - The only counterparty data Mostro forwards today is a pubkey plus an optional
   reputation snapshot, via `Payload::Peer(Peer { pubkey, reputation })`
-  (`src/app/fiat_sent.rs:44-74`, `src/util.rs:2241-2316`).
+  (`fiat_sent_action` in `src/app/fiat_sent.rs`, `enqueue_order_msg` peer payload handling in `src/util.rs`).
 - There is **no** buyer→seller payment-info channel through Mostro.
-  `Action::SendDm` hits the `_` catch-all in `src/app.rs:263` and is ignored;
+  `Action::SendDm` hits the `_` catch-all in `handle_message_action_no_ln` in `src/app.rs` and is ignored;
   peer chat is a pure client feature (`$CORE/src/chat/`, protocol `chat.md`).
 - `orders.payment_method` is an unvalidated free-form string, public on the
-  kind-38383 event as the multi-value `pm` tag (`src/nip33.rs:490-502`).
+  kind-38383 event as the multi-value `pm` tag (`info_to_tags` / order tag generation in `src/nip33.rs`).
 - `Action::FiatSent` carries no payload except the optional `NextTrade`
-  (`src/app/fiat_sent.rs:8-93`).
+  (`fiat_sent_action` in `src/app/fiat_sent.rs`).
 
 ### 3.3 Where "trade completed successfully" is known
 
 There is **exactly one** writer of `Status::Success` for a normal trade:
-`payment_success` in `src/app/release.rs:1010-1070`. It performs a CAS
+`payment_success` in `src/app/release.rs`. It performs a CAS
 `UPDATE orders SET status=?, event_id=? WHERE id=? AND status='settled-hold-invoice'`
 and treats `rows_affected()==0` as "another task already finalised this order —
 do not repeat side effects". It is reached from the in-process payout watcher
-(`release.rs:830`), from crash-recovery reconciliation (`release.rs:1162`) and,
-via `do_payment`, from admin settle (`src/app/admin_settle.rs:243`) and the
-retry job (`src/scheduler.rs:236`).
+(`release` watcher in `src/app/release.rs`), from crash-recovery reconciliation (`payment_success` reconciliation in `src/app/release.rs`) and,
+via `do_payment`, from admin settle (`admin_settle_action` in `src/app/admin_settle.rs`) and the
+retry job (`scheduler` retry job in `src/scheduler.rs`).
 
 The Cashu track defines a *different* success path — the release watcher in
 `docs/cashu/03-track-b-release.md §5C` — which is not implemented yet. See §13.
@@ -160,20 +160,20 @@ The Cashu track defines a *different* success path — the release watcher in
 
 Kind 38383 (order) carries no pubkeys; kind 38384 (rating) is keyed by the rated
 user's pubkey and carries only rating aggregates; kind 38385 (info) carries
-node policy tags (e.g. `bond_policy_tags`, `src/nip33.rs:678`). Nothing about
+node policy tags (e.g. `bond_policy_tags`, `bond_policy_tags` / info tags in `src/nip33.rs`). Nothing about
 fiat accounts exists on any event and this feature must keep it that way.
 
 ### 3.5 Existing patterns we reuse
 
 | Pattern | Example |
 |---|---|
-| Party authorisation is open-coded per handler against `event.sender` | `src/app/fiat_sent.rs:25-27` (`InvalidPubkey`), `src/app/release.rs:237-239` (`InvalidPeer`) |
-| Post-success, order-scoped, once-only authorisation | `src/app/rate_user.rs:69-206` + `claim_order_rating_flag` CAS (`src/db.rs:1446-1473`) |
-| Opt-in feature section with `Option<…Settings>` and `#[serde(default)]` | `AntiAbuseBondSettings` (`src/config/types.rs:40`), `Settings.anti_abuse_bond` (`src/config/settings.rs:31`) |
+| Party authorisation is open-coded per handler against `event.sender` | `fiat_sent_action` buyer check in `src/app/fiat_sent.rs` (`InvalidPubkey`), `release_action` seller check in `src/app/release.rs` (`InvalidPeer`) |
+| Post-success, order-scoped, once-only authorisation | `rate_user_action` in `src/app/rate_user.rs` + `claim_order_rating_flag` CAS (`claim_order_rating_flag` in `src/db.rs`) |
+| Opt-in feature section with `Option<…Settings>` and `#[serde(default)]` | `AntiAbuseBondSettings` (`AntiAbuseBondSettings` in `src/config/types.rs`), `Settings.anti_abuse_bond` (`Settings.anti_abuse_bond` in `src/config/settings.rs`) |
 | Feature-owned module with its own `db.rs` | `src/app/bond/{mod,db,model,flow,…}.rs` |
 | Migration with a long `--` design header and per-column comments | `migrations/20260423120000_anti_abuse_bond.sql` |
-| Node policy advertised on the info event | `bond_policy_tags` (`src/nip33.rs:678`) |
-| Handler tests with in-memory sqlite + `TestContextBuilder` + `queued_actions_for(order_id)` | `src/app/fiat_sent.rs:95-311` |
+| Node policy advertised on the info event | `bond_policy_tags` (`bond_policy_tags` / info tags in `src/nip33.rs`) |
+| Handler tests with in-memory sqlite + `TestContextBuilder` + `queued_actions_for(order_id)` | `fiat_sent_action` tests in `src/app/fiat_sent.rs` |
 
 ---
 
@@ -233,14 +233,13 @@ code path.
 
 **D-9 · Additive protocol surface only.** New `Action` variants, new `Payload`
 variants, new `CantDoReason` variants. `SmallOrder` is **not** touched — it is
-`#[serde(deny_unknown_fields)]` and positional (`$CORE/src/order.rs:560-620`),
+`#[serde(deny_unknown_fields)]` and positional (`SmallOrder` in `$CORE/src/order.rs`),
 so any new field would break every existing client. `FiatSentOk` keeps its
 `Payload::Peer` unchanged.
 
 **D-10 · Off by default, inert when off.** With `[payer_history]` absent or
 `enabled = false`: the new actions answer `cant-do invalid_action`, `fiat-sent`
-is untouched, no table is written, no info tag is emitted beyond
-`payer_history_enabled = false`.
+is untouched, no table is written, and no payer-history info tags are emitted.
 
 **D-11 · Mostro never blocks on history.** The only enforcement knob is
 `require_declaration` (default `false`), which rejects `fiat-sent` when no
@@ -259,7 +258,7 @@ as an identifier elsewhere). Clients must agree on this exact prefix (§7).
 Sell-order flow (buyer is the taker; the maker-buyer flow is symmetric — what
 matters is only *which side is the buyer*):
 
-```
+```text
  Buyer (B)                      mostrod (M)                        Seller (S)
    |                               |                                  |
    |  take-sell / add-invoice ...  |   ... hold invoice paid ...      |
@@ -294,7 +293,7 @@ matters is only *which side is the buyer*):
 | `declare-payer` | buyer trade key | `WaitingPayment`, `WaitingBuyerInvoice`, `Active` | upsert declaration (last write wins) |
 | `declare-payer` | buyer | `FiatSent` or later | `cant-do not_allowed_by_status` (frozen) |
 | `payment-history` (push) | Mostro → seller | emitted inside `fiat_sent_action` after `fiat-sent-ok` | — |
-| `payment-history` (query) | seller trade key | `FiatSent`, `Dispute`, `SettledHoldInvoice`, `Success` | same object as push |
+| `payment-history` (query) | seller trade key | `FiatSent`, `Dispute`, `SettledHoldInvoice`; `Success` returns `not_found` after the declaration is consumed | same object as push before success |
 | success hook | daemon | `SettledHoldInvoice → Success` CAS | history += 1, declaration consumed |
 | prune | scheduler | order in a terminal non-success status | declaration deleted |
 
@@ -311,7 +310,7 @@ These require a `mostro-core` **minor** release (`0.15.0` or `0.14.6` per the
 project's versioning habit); `mostrod` PRs then bump the dependency. All
 additions follow the existing serde conventions: `Action` is `kebab-case`,
 `Payload` and `CantDoReason` are `snake_case`
-(`$CORE/src/message.rs:64`, `:682`, `$CORE/src/error.rs:26`).
+(`Action`, `Payload` and `CantDoReason` in `$CORE/src/message.rs` / `$CORE/src/error.rs`).
 
 ### 6.1 `Action` (`$CORE/src/message.rs`)
 
@@ -344,9 +343,6 @@ PaymentHistory(PaymentHistory),
 pub struct PayerDeclaration {
     /// sha256("mostro-payer-v1|" || canonical_payment_data), 64 lowercase hex.
     pub payment_hash: String,
-    /// Free-form label chosen by the client, ≤ 64 bytes (e.g. "SEPA", "CVU").
-    /// Informational; Mostro does not validate it against the order's `pm`.
-    pub payment_method: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -377,7 +373,7 @@ Wire keys: `payer_declaration`, `payment_history`.
 ### 6.3 `CantDoReason` (`$CORE/src/error.rs`)
 
 ```rust
-/// `payment_hash` is not 64 lowercase hex chars, or `payment_method` is empty / too long.
+/// `payment_hash` is not 64 lowercase hex chars.
 InvalidPaymentHash,
 /// `fiat-sent` refused because the node requires a prior `declare-payer`.
 PayerNotDeclared,
@@ -388,7 +384,7 @@ reused for everything else: `invalid_action` (feature off), `not_found` (order),
 `invalid_pubkey` (not the buyer), `invalid_peer` (not the seller),
 `not_allowed_by_status`, `invalid_payload`.
 
-### 6.4 `MessageKind::verify()` matrix (`$CORE/src/message.rs:809-913`)
+### 6.4 `MessageKind::verify()` matrix (`MessageKind::verify()` in `$CORE/src/message.rs`)
 
 The match is exhaustive on `Action`; add:
 
@@ -407,8 +403,7 @@ Buyer → Mostro:
   {"order": {"version": 2, "request_id": 981231, "trade_index": 7,
              "id": "4f1c…", "action": "declare-payer",
              "payload": {"payer_declaration": {
-               "payment_hash": "9b0e…c1",
-               "payment_method": "CVU"}}}},
+               "payment_hash": "9b0e…c1"}}}},
   "<trade-key signature>",
   ["<identity pubkey>", "<identity proof signature>"]
 ]
@@ -421,8 +416,7 @@ Mostro → buyer (ack) and Mostro → seller (forward), identical body:
   {"order": {"version": 2, "request_id": 981231, "trade_index": null,
              "id": "4f1c…", "action": "payer-declared",
              "payload": {"payer_declaration": {
-               "payment_hash": "9b0e…c1",
-               "payment_method": "CVU"}}}},
+               "payment_hash": "9b0e…c1"}}}},
   null, null
 ]
 ```
@@ -488,7 +482,7 @@ Summary of the contract:
 
 Examples (canonical → hashed):
 
-```
+```text
 AR|CVU|0000003100012345678901|27123456789
 EU|SEPA|DE89370400440532013000|ALICE SMITH
 BR|PIX|+5511999998888
@@ -552,14 +546,14 @@ pub fn payer_declaration_required() -> bool   // implies enabled
 
 ### 8.3 Info event (kind 38385)
 
-`info_to_tags` (`src/nip33.rs:572`) appends `payer_history_tags(settings)`:
+`info_to_tags` in `src/nip33.rs` appends `payer_history_tags(settings)`:
 
 | Tag | Value |
 |---|---|
-| `payer_history_enabled` | `"true"` / `"false"` (always emitted) |
+| `payer_history_enabled` | `"true"` (only when enabled) |
 | `payer_declaration_required` | `"true"` / `"false"` (only when enabled) |
 
-Clients use these to decide whether to show the declaration screen at all.
+When the feature is disabled or absent, `info_to_tags` emits no payer-history tags, preserving disabled-mode output byte-for-byte. Clients treat missing tags as disabled.
 
 ---
 
@@ -575,7 +569,6 @@ style (long `--` header explaining *why*, per-column comments). Three tables;
 CREATE TABLE IF NOT EXISTS order_payer_declarations (
   order_id        char(36)  PRIMARY KEY NOT NULL,  -- orders.id (uuid)
   payment_hash    char(64)  NOT NULL,              -- sha256 hex, lowercase
-  payment_method  varchar(64) NOT NULL,            -- client label, informational
   declared_at     integer   NOT NULL               -- unix secs of last upsert
 );
 
@@ -584,7 +577,6 @@ CREATE TABLE IF NOT EXISTS order_payer_declarations (
 CREATE TABLE IF NOT EXISTS payer_history (
   user_pubkey        char(64) NOT NULL,  -- orders.master_buyer_pubkey (reputation mode only)
   payment_hash       char(64) NOT NULL,
-  payment_method     varchar(64) NOT NULL, -- label seen on the most recent success
   first_success_at   integer  NOT NULL,
   last_success_at    integer  NOT NULL,
   successful_trades  integer  NOT NULL DEFAULT 0,
@@ -610,7 +602,7 @@ Notes
 - **Retention:** declarations are ephemeral (§10.5). History rows are kept
   indefinitely in the MVP; an admin RPC to purge a `user_pubkey` is listed in
   §18.
-- The existing migration reconciler (`src/db.rs:161-260`) only special-cases
+- The existing migration reconciler (`run_migrations` in `src/db.rs`) only special-cases
   `ADD COLUMN`; plain `CREATE TABLE IF NOT EXISTS` needs nothing extra.
 
 ---
@@ -626,9 +618,9 @@ New module `src/app/payer/` (`mod.rs`, `db.rs`, `declare.rs`, `history.rs`,
 
 ```rust
 pub struct PayerDeclarationRow { pub order_id: Uuid, pub payment_hash: String,
-                                 pub payment_method: String, pub declared_at: i64 }
+                                 pub declared_at: i64 }
 
-pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, method: &str, now: i64)
+pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, now: i64)
     -> Result<(), MostroError>;                         // INSERT … ON CONFLICT(order_id) DO UPDATE
 pub async fn find_declaration(pool, order_id: Uuid)
     -> Result<Option<PayerDeclarationRow>, MostroError>;
@@ -636,7 +628,7 @@ pub async fn take_declaration<'e, E: sqlx::Executor<'e>>(exec: E, order_id: Uuid
     -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING *  (idempotency token)
 pub async fn load_history(pool, user_pubkey: &str, hash: &str)
     -> Result<(u32 /*trades*/, u32 /*cps*/, Option<i64>, Option<i64>), MostroError>;
-pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, method, counterparty_id, now)
+pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, counterparty_id, now)
     -> Result<(), MostroError>;   // upsert payer_history + INSERT OR IGNORE counterparties
 pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroError>;
 ```
@@ -652,7 +644,7 @@ pub fn validate_payment_hash(h: &str) -> Result<(), MostroError> {
 
 ### 10.2 `declare_payer_action` (`src/app/payer/declare.rs`)
 
-Wired in `handle_message_action_no_ln` (`src/app.rs:207-268`) as
+Wired in `handle_message_action_no_ln` (`handle_message_action_no_ln` in `src/app.rs`) as
 `Action::DeclarePayer => declare_payer_action(ctx, msg, event, my_keys)`.
 
 ```rust
@@ -662,7 +654,7 @@ pub async fn declare_payer_action(ctx: &AppContext, msg: Message,
         return Err(MostroCantDo(CantDoReason::InvalidAction));            // D-10
     }
     let order = get_order(&msg, ctx.pool()).await?;                       // not_found
-    if order.get_buyer_pubkey().ok() != Some(event.sender) {              // same check as fiat_sent.rs:25
+    if order.get_buyer_pubkey().ok() != Some(event.sender) {              // same check as `fiat_sent_action` buyer check in `src/app/fiat_sent.rs`
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     let status = order.get_order_status()?;
@@ -674,11 +666,8 @@ pub async fn declare_payer_action(ctx: &AppContext, msg: Message,
         _ => return Err(MostroCantDo(CantDoReason::InvalidPayload)),
     };
     validate_payment_hash(&decl.payment_hash)?;
-    if decl.payment_method.is_empty() || decl.payment_method.len() > 64 {
-        return Err(MostroCantDo(CantDoReason::InvalidPaymentHash));
-    }
     db::upsert_declaration(ctx.pool(), order.id, &decl.payment_hash,
-                           &decl.payment_method, Timestamp::now().as_u64() as i64).await?;
+                           Timestamp::now().as_u64() as i64).await?;
 
     let request_id = msg.get_inner_message_kind().request_id;
     let payload = Some(Payload::PayerDeclaration(decl));
@@ -699,12 +688,11 @@ Design notes
   order whose taker has not paid — `get_seller_pubkey()` failing is not an
   error; the seller will get the hash with the `payment-history` push later.
 - No spam-gate change: the sender is already in the known-keys lane as a
-  party to a non-terminal order (`src/db.rs:40-80`).
+  party to a non-terminal order (`is_known_pubkey` in `src/db.rs`).
 
 ### 10.3 Push from `fiat_sent_action` and the optional gate
 
-In `src/app/fiat_sent.rs`, after the `Active` status check and the buyer
-check (`:19-27`) and **before** the status transition:
+In `src/app/fiat_sent.rs`, after the `Active` status check and the buyer check and **before** the status transition:
 
 ```rust
 if Settings::payer_declaration_required()
@@ -713,7 +701,7 @@ if Settings::payer_declaration_required()
 }
 ```
 
-After the two `FiatSentOk` enqueues (`:50-74`):
+After `order_updated.update(pool).await?` succeeds and before returning:
 
 ```rust
 if Settings::is_payer_history_enabled() {
@@ -725,9 +713,7 @@ if Settings::is_payer_history_enabled() {
 ```
 
 `build_for_order` returns `None` when there is no declaration (no push, see
-§6.5). Any DB error here is logged and **must not** fail `fiat_sent_action`
-after the status has already moved — wrap in `if let Err(e) … tracing::warn!`
-rather than `?` once the transition is committed.
+§6.5). The push is only queued after the local `FiatSent` transition is durable. Any DB error while building history after that point is logged and **must not** fail `fiat_sent_action`; wrap it in `if let Err(e) … tracing::warn!` rather than `?` once the transition is committed.
 
 ### 10.4 `payment_history_action` — the seller query (`src/app/payer/history.rs`)
 
@@ -754,8 +740,6 @@ pub async fn payment_history_action(ctx, msg, event, _my_keys) -> Result<(), Mos
 pub async fn build_for_order(pool, node_keys: &Keys, order: &Order)
     -> Result<Option<PaymentHistory>, MostroError> {
     let Some(decl) = db::find_declaration(pool, order.id).await? else { return Ok(None) };
-    // After Success the declaration is gone; fall back to the history row only
-    // when the order is already terminal-success (restore-session use case).
     let (normal_buyer_idkey, _) = order.is_full_privacy_order()?;
     let Some(user) = normal_buyer_idkey else {
         return Ok(Some(PaymentHistory::unavailable(decl.payment_hash)));   // D-4
@@ -778,42 +762,43 @@ question if client authors want otherwise.)
 
 ### 10.5 Success hook (`src/app/payer/success.rs`) — **D-5**
 
-Called from `payment_success` (`src/app/release.rs:1010`) **only** on the
-`rows_affected() == 1` branch, immediately after the CAS and before the
-`PurchaseCompleted` enqueue:
+Called from `payment_success` in `src/app/release.rs` **only** on the
+`rows_affected() == 1` branch, inside the Success transaction before commit and
+before the `PurchaseCompleted` enqueue:
 
 ```rust
-// release.rs, after the CAS succeeded:
+// release.rs, inside the same transaction that performs the Success CAS:
 if Settings::is_payer_history_enabled() {
-    if let Err(e) = payer::success::record_payer_success(pool, ctx.keys(), &order_updated).await {
-        tracing::warn!("payer history not recorded for order {}: {e}", order_updated.id);
-    }
+    payer::success::record_payer_success(&mut tx, ctx.keys(), &order_updated).await?;
 }
 ```
 
 ```rust
-pub async fn record_payer_success(pool, node_keys: &Keys, order: &Order) -> Result<(), MostroError> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+pub async fn record_payer_success(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    node_keys: &Keys,
+    order: &Order,
+) -> Result<(), MostroError> {
     // Idempotency token: the declaration row can be consumed exactly once.
-    let Some(decl) = db::take_declaration(&mut *tx, order.id).await? else {
-        return tx.commit().await.map_err(db_err);                     // nothing to do / already done
+    let Some(decl) = db::take_declaration(&mut **tx, order.id).await? else {
+        return Ok(());                                           // nothing to do / already done
     };
     if order.buyer_dispute || order.seller_dispute {                   // D-6
-        return tx.commit().await.map_err(db_err);                     // declaration discarded
+        return Ok(());                                           // declaration discarded
     }
     let (buyer_idkey, _) = order.is_full_privacy_order()?;
     let Some(user) = buyer_idkey else {
-        return tx.commit().await.map_err(db_err);                     // D-4: nothing stored
+        return Ok(());                                           // D-4: nothing stored
     };
     let seller_master = order.get_master_seller_pubkey()
         .map(|k| k.to_string()).unwrap_or_else(|_| order.seller_pubkey.clone().unwrap_or_default());
     let cp = counterparty_id(node_keys, &seller_master);               // D-7
-    db::bump_history(&mut *tx, &user, &decl.payment_hash, &decl.payment_method, &cp, now()).await?;
-    tx.commit().await.map_err(db_err)
+    db::bump_history(&mut **tx, &user, &decl.payment_hash, &cp, now()).await?;
+    Ok(())
 }
 
 pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
-    use bitcoin::hashes::{sha256, Hash, HashEngine};   // already a dependency (src/util.rs:3086)
+    use bitcoin::hashes::{sha256, Hash, HashEngine};   // already a dependency (`src/util.rs`)
     let mut eng = sha256::Hash::engine();
     eng.input(b"mostro-payer-history-cp-v1");
     eng.input(node_keys.secret_key().as_secret_bytes());
@@ -826,12 +811,11 @@ Why this is safe
 - `payment_success` may be reached twice (watcher + reconciler, §3.3). The
   CAS guarantees only one caller enters the `rows_affected()==1` branch, and
   `take_declaration` (DELETE … RETURNING) guarantees at most one increment
-  even if that invariant were ever broken.
-- It runs *after* the order is terminal, so a failure here never blocks a
-  payout or a notification — it is logged and the declaration is simply lost
-  (the buyer loses one history point; nothing worse).
+  even if that invariant were ever broken. Because the history write shares the
+  CAS transaction, a database failure rolls back the success transition and the
+  declaration remains retryable by the existing payment-success retry paths.
 - It does not touch `orders`, respecting the "no full-row writes after
-  success" rule documented at `release.rs:1027-1029`.
+  success" rule documented at `payment_success` in `src/app/release.rs`.
 - `CompletedByAdmin` / admin settle reach `Success` through the same
   `do_payment → payment_success` path and are covered; the dispute flags
   (D-6) decide whether they count.
@@ -847,14 +831,14 @@ DELETE FROM order_payer_declarations
  WHERE order_id IN (SELECT id FROM orders WHERE status IN (<TERMINAL_ORDER_STATUSES>))
 ```
 
-`TERMINAL_ORDER_STATUSES` already exists at `src/db.rs:27`. Success rows are
+`TERMINAL_ORDER_STATUSES` already exists at `TERMINAL_ORDER_STATUSES` in `src/db.rs`. Success rows are
 consumed in §10.5 before this job can see them, so the job only ever removes
 declarations from cancelled / expired / admin-cancelled orders. Range-order
 children are separate orders with separate declarations; nothing special.
 
 ### 10.7 Cashu dispatch
 
-`dispatch_cashu` (`src/app.rs:599`) currently rejects every action outside its
+`dispatch_cashu` in `src/app.rs` currently rejects every action outside its
 allow-list. `DeclarePayer` and `PaymentHistory` are **not** added there in the
 MVP (the Cashu release path does not exist yet); see §13.
 
@@ -953,7 +937,7 @@ Lightning-only; `Settings` validation SHOULD warn (not fail) at boot when both
 
 All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 (`create_test_pool`, `TestContextBuilder`, `queued_actions_for(order_id)` —
-`src/app/fiat_sent.rs:95-176`). Coverage target for the new module: ≥ 80 %.
+`fiat_sent_action` test scaffolding in `src/app/fiat_sent.rs`). Coverage target for the new module: ≥ 80 %.
 
 **`mostro-core`**
 - Round-trip serde for the three actions / two payloads / two reasons; exact
@@ -965,7 +949,7 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 - seller sends it → `invalid_pubkey`; non-party → `invalid_pubkey`.
 - each status in §5.1 (allowed vs `not_allowed_by_status`).
 - bad hash (wrong length, uppercase, non-hex) → `invalid_payment_hash`;
-  empty / 65-byte method → `invalid_payment_hash`; wrong payload → `invalid_payload`.
+  wrong payload → `invalid_payload`.
 - happy path: row upserted, `PayerDeclared` queued to buyer (with request_id)
   and seller (without); re-declaration overwrites and re-notifies.
 - maker-buyer order with no seller yet: only the buyer ack is queued.
@@ -994,16 +978,17 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 - `counterparty_id` is deterministic for a key and differs across keys.
 
 **`payment_success` wiring** (extend `src/app/release.rs` tests with the
-`PayoutStatusLookup` stub pattern, `release.rs:1074-1101`)
-- history recorded on the CAS-success branch only; the "already finalised"
-  branch records nothing.
+`PayoutStatusLookup` stub pattern, `payment_success` tests in `src/app/release.rs`)
+- history recorded in the same transaction as the CAS-success branch only; the
+  "already finalised" branch records nothing, and an injected history-write
+  failure leaves the order retryable rather than finalized without history.
 
 **Scheduler**
 - prune deletes declarations of cancelled/expired orders and leaves active
   ones.
 
 **Info event**
-- tags present/absent per config (`src/nip33.rs` tests next to
+- tags absent when disabled and present only when enabled (`src/nip33.rs` tests next to
   `bond_policy_tags`).
 
 ---
@@ -1036,8 +1021,8 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
       shows `successful_trades = 1`, `distinct_counterparties = 1`.
 - [ ] A full-privacy buyer yields `buyer_mode = full_privacy` and writes no
       history rows (DB asserted).
-- [ ] No new field appears on kinds 38383 / 38384; 38385 gains only the two
-      tags in §8.3 (`nip33` tests).
+- [ ] No new field appears on kinds 38383 / 38384; 38385 gains the §8.3
+      tags only when `[payer_history].enabled = true` (`nip33` tests).
 - [ ] `grep -rn "payment_hash" src/app/payer` shows no `tracing::` call that
       logs a hash at `info` or above.
 - [ ] `cargo clippy --all-targets --all-features` clean; `cargo fmt` clean.
@@ -1058,10 +1043,6 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
 3. **`require_declaration` granularity.** Global only in the MVP. Per-order
    (a maker flag on the 38383 event) would let sellers opt in individually
    but needs a new public tag; defer.
-4. **`payment_method` label.** Informational only. Should Mostro reject a
-   label that is not one of the order's `pm` entries (case-insensitive)? Cheap
-   consistency check vs. yet another way to get a `cant-do` for a free-form
-   string. Default: do not validate.
 
 ---
 

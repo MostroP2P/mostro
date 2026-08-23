@@ -74,6 +74,16 @@ pub async fn trade_pubkey_action(
         cas_rotate_maker_trade_pubkey(pool, order.id, kind, &event.sender.to_string()).await?;
     if !rotated {
         // The order left the pre-trade window while we were validating.
+        // Log it: this is the only trace the race leaves behind, and it is
+        // what tells us in production that a rotation and a take collided.
+        // `NotAllowedByStatus` matches the other CAS-miss sites
+        // (`take_sell.rs`, `show_hold_invoice`, `show_cashu_escrow_request`);
+        // the pre-check above keeps `InvalidOrderStatus`, the reason every
+        // pre-check in the repo reports for a status it can see up front.
+        tracing::info!(
+            "trade pubkey rotation: order {} left the pre-trade window before the CAS — refusing the rotation",
+            order.id
+        );
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
@@ -367,6 +377,11 @@ mod tests {
 
     /// #811: the confirmation must never precede the persist. A rotation
     /// the handler rejects announces nothing to the caller.
+    ///
+    /// This is the *pre-check* rejection: the status is already out of the
+    /// pre-trade window when the handler reads the order, so it never
+    /// reaches the CAS. The CAS-miss branch is covered by
+    /// `trade_pubkey_action_does_not_confirm_a_cas_miss` below.
     #[tokio::test]
     async fn trade_pubkey_action_does_not_confirm_a_rejected_rotation() {
         let ctx = setup_ctx().await;
@@ -398,6 +413,60 @@ mod tests {
             confirmations, 0,
             "a rejected rotation must not be confirmed"
         );
+    }
+
+    /// The other half of #811, and the only handler-level coverage of the
+    /// `!rotated` branch: the order is still pre-trade when the handler
+    /// reads it, so validation passes and the CAS runs — but a concurrent
+    /// writer has moved the row out of the pre-trade window in between, so
+    /// the guarded `UPDATE` matches nothing.
+    ///
+    /// That interleaving has no injection point between `get_order` and the
+    /// CAS, so a `BEFORE UPDATE` trigger stands in for the racing writer:
+    /// `RAISE(IGNORE)` skips the row, which is exactly what the handler sees
+    /// from a status guard that no longer matches — `rows_affected() == 0`.
+    /// The handler must reject and stay silent; the row must be untouched.
+    #[tokio::test]
+    async fn trade_pubkey_action_does_not_confirm_a_cas_miss() {
+        let ctx = setup_ctx().await;
+        let maker = Keys::generate();
+        let sender = Keys::generate().public_key();
+
+        let order = maker_order(OrderKind::Sell, Status::Pending, &maker);
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER rotation_loses_the_cas BEFORE UPDATE ON orders \
+             WHEN NEW.creator_pubkey <> OLD.creator_pubkey \
+             BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .execute(ctx.pool())
+        .await
+        .unwrap();
+
+        let event = trade_pubkey_event(sender, maker.public_key());
+        let result = trade_pubkey_action(&ctx, trade_pubkey_msg(order.id), &event).await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a CAS miss must be reported as NotAllowedByStatus: {result:?}"
+        );
+
+        // Nothing moved, and nothing was announced.
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.creator_pubkey, maker.public_key().to_string());
+        assert_eq!(after.seller_pubkey, Some(maker.public_key().to_string()));
+        // The queue is process-global; filter by this test's unique key.
+        let confirmations = crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, pk)| {
+                *pk == sender && m.get_inner_message_kind().action == Action::TradePubkey
+            })
+            .count();
+        assert_eq!(confirmations, 0, "a CAS miss must not be confirmed");
     }
 
     /// The rotation is a targeted write: a pre-trade order carrying a

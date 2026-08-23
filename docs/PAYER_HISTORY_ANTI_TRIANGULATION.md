@@ -73,8 +73,9 @@ The seller's client ends up showing two separate checks before release:
 1. **Sender match** — does the fiat sender shown by the seller's bank match
    the details the buyer declared? (Client-side, human-verified.)
 2. **Payment-account history** — how much successful history does *this
-   buyer* have with *this payment identity*? (Computed privately by
-   `mostrod`, returned as three aggregate numbers.)
+   buyer* have with *this payment identity*, and how experienced were the
+   counterparties behind it? (Computed privately by `mostrod`, returned as
+   four aggregate counters.)
 
 A sophisticated attacker can satisfy (1). They cannot cheaply satisfy (2).
 
@@ -85,7 +86,11 @@ A sophisticated attacker can satisfy (1). They cannot cheaply satisfy (2).
 ### Goals
 - Give the seller an aggregate, order-scoped history signal for the buyer's
   declared payment identity: `successful_trades`, `distinct_counterparties`,
-  `first_success_at`, `last_success_at`.
+  `experienced_counterparties`, `first_success_at`, `last_success_at`.
+- Harden the counterparty signal against Sybil farming: separately count the
+  counterparties that were already *experienced* on this node when they traded
+  with the buyer, under node-configurable thresholds (D-7) — a flat one-hop
+  signal, deliberately not recursive reputation.
 - Let the seller's client verify that the payment details it received from the
   buyer are the same ones the buyer committed to Mostro (hash consistency).
 - Build history **only** from trades that reach `Status::Success`.
@@ -217,12 +222,55 @@ solver is not clean evidence of a healthy buyer↔account relationship, and this
 removes the cheapest "farm history while disputing" path. Revisit with data
 (§17).
 
-**D-7 · Counterparties are stored as a keyed hash, not as pubkeys.**
+**D-7 · Counterparties are stored as a keyed hash, not as pubkeys, and carry
+a monotone "experienced" qualification snapshot.**
 `counterparty_id = sha256("mostro-payer-history-cp-v1" ‖ node_secret ‖ master_seller_pubkey)`
 where `node_secret` is the node's Nostr secret key bytes. The history tables
 alone cannot be joined back to `users`/`orders` without the node key, and a
 full-privacy seller (whose master key is a fresh trade key) simply counts as a
 new counterparty each time — which is the conservative direction.
+
+**Experienced counterparty.** A distinct counterparty counts as *experienced*
+for a `(buyer, payment_hash)` pair when, **at the moment a trade with that
+pair reaches `Success`**, the seller already had — counting only history that
+existed **before** that trade:
+
+- at least `experienced_min_trades` (`N`) successful, undisputed Mostro
+  trades; and
+- at least `experienced_min_days` (`D`) operating days since its first such
+  trade.
+
+Qualification is computed from the `orders` table (§10.1) — the seller's whole
+node-side record, including trades that predate this feature — not from the
+history tables, so sellers never need the feature enabled to qualify. The
+trade being recorded **never** counts toward its own counterparty's
+qualification, and — an explicit, documented anti-Sybil choice — trades the
+seller previously made **with the same buyer identity** do not count either:
+without that exclusion a two-key Sybil (a seller bot that only ever trades
+with the attacker's own buyer) qualifies at zero external cost; with it, the
+fake seller must build real history with third parties. Because qualification
+is therefore buyer-relative, the flag is stored on the
+`(user_pubkey, payment_hash, counterparty_id)` row (§9), which is buyer-scoped
+by construction. Full-privacy sellers never qualify: their master key is a
+fresh trade key, so their qualifying history is always zero — the same
+conservative direction as above.
+
+The flag is **monotone** and is evaluated only when a success is recorded. A
+counterparty stored with `experienced = 0` is upgraded to `1` only when a
+*subsequent* successful trade with the same `(buyer, payment_hash)` pair
+happens after the seller has crossed the thresholds; it is never flipped
+retroactively merely because the seller's record improved later, and it never
+flips back.
+
+`N` and `D` are **node policy, not protocol constants**: operators set them in
+`[payer_history]` (§8.1, defaults 5 and 30) and they are advertised on the
+info event (§8.3) so clients can explain the metric without hard-coding
+thresholds.
+
+This is deliberately a flat, one-hop signal. It is **not** recursive
+reputation: a counterparty's own `experienced_counterparties` value plays no
+part in its qualification, and no graph scoring, PageRank or Web-of-Trust
+weighting is applied.
 
 **D-8 · Push, then pull.** Mostro *pushes* the history to the seller right
 after `fiat-sent-ok`. A seller→Mostro *query* action exists for session
@@ -295,7 +343,7 @@ matters is only *which side is the buyer*):
 | `payment-history` (push) | Mostro → seller | emitted inside `fiat_sent_action` after `fiat-sent-ok` | — |
 | `payment-history` (query) | seller trade key | `FiatSent`, `Dispute`, `SettledHoldInvoice` | same object as push before success |
 | `payment-history` (query) | seller trade key | `Success` | `cant-do not_found` after the declaration is consumed |
-| success hook | daemon | `SettledHoldInvoice → Success` CAS | history += 1, declaration consumed |
+| success hook | daemon | `SettledHoldInvoice → Success` CAS | history += 1, counterparty qualification snapshot (D-7), declaration consumed |
 | prune | scheduler | order in a terminal non-success status | declaration deleted |
 
 `Active` is the normal declaration window. The two `Waiting*` statuses are
@@ -358,6 +406,11 @@ pub struct PaymentHistory {
     pub successful_trades: u32,
     /// Number of distinct sellers among those orders (keyed hash, see D-7).
     pub distinct_counterparties: u32,
+    /// How many of those distinct counterparties were already *experienced*
+    /// (D-7) at the time of their successful trade with this
+    /// (buyer, payment_hash) pair. Thresholds are node policy, advertised
+    /// on the info event (§8.3).
+    pub experienced_counterparties: u32,
     /// Unix seconds of the first / last successful trade; `None` when
     /// `successful_trades == 0`.
     pub first_success_at: Option<i64>,
@@ -445,6 +498,7 @@ Mostro → seller, pushed immediately after `fiat-sent-ok`:
                "buyer_mode": "reputation",
                "successful_trades": 47,
                "distinct_counterparties": 29,
+               "experienced_counterparties": 11,
                "first_success_at": 1762128000,
                "last_success_at": 1787654321}}}},
   null, null
@@ -460,6 +514,7 @@ Full-privacy buyer:
 ```json
 {"payment_history": {"payment_hash": "9b0e…c1", "buyer_mode": "full_privacy",
   "successful_trades": 0, "distinct_counterparties": 0,
+  "experienced_counterparties": 0,
   "first_success_at": null, "last_success_at": null}}
 ```
 
@@ -528,6 +583,13 @@ seller that sender verification is unavailable (gist §34).
 # # buyer sent `declare-payer` first. Leave false unless your market relies
 # # on sender-verifiable rails only.
 # require_declaration = false
+# # "Experienced counterparty" thresholds (D-7): a seller qualifies for a
+# # buyer's history when, at the moment a trade with that buyer succeeds, it
+# # already had >= experienced_min_trades successful, undisputed trades with
+# # OTHER buyers ...
+# experienced_min_trades = 5
+# # ... and its first such trade was >= experienced_min_days days ago.
+# experienced_min_days = 30
 ```
 
 ### 8.2 `src/config/types.rs`
@@ -543,16 +605,26 @@ pub struct PayerHistorySettings {
     /// Reject `fiat-sent` when no `declare-payer` was received for the order.
     #[serde(default)]
     pub require_declaration: bool,
+    /// "Experienced counterparty" thresholds (D-7). Node policy, advertised
+    /// on the info event; NOT part of the protocol.
+    #[serde(default = "default_experienced_min_trades")]
+    pub experienced_min_trades: u32,
+    #[serde(default = "default_experienced_min_days")]
+    pub experienced_min_days: u32,
 }
+
+const fn default_experienced_min_trades() -> u32 { 5 }
+const fn default_experienced_min_days() -> u32 { 30 }
 ```
 
 `Settings` gains `#[serde(default)] pub payer_history: Option<PayerHistorySettings>`
-(`src/config/settings.rs`, next to `anti_abuse_bond`) and two helpers mirroring
+(`src/config/settings.rs`, next to `anti_abuse_bond`) and three helpers mirroring
 `is_cashu_enabled()`:
 
 ```rust
 pub fn is_payer_history_enabled() -> bool
 pub fn payer_declaration_required() -> bool   // implies enabled
+pub fn payer_history_experience_thresholds() -> (u32, u32)   // (min_trades, min_days), defaults 5/30
 ```
 
 ### 8.3 Info event (kind 38385)
@@ -563,8 +635,10 @@ pub fn payer_declaration_required() -> bool   // implies enabled
 |---|---|
 | `payer_history_enabled` | `"true"` (only when enabled) |
 | `payer_declaration_required` | `"true"` / `"false"` (only when enabled) |
+| `payer_history_experienced_min_trades` | decimal string, e.g. `"5"` (only when enabled) |
+| `payer_history_experienced_min_days` | decimal string, e.g. `"30"` (only when enabled) |
 
-When the feature is disabled or absent, `info_to_tags` emits no payer-history tags, preserving disabled-mode output byte-for-byte. Clients treat missing tags as disabled.
+When the feature is disabled or absent, `info_to_tags` emits no payer-history tags, preserving disabled-mode output byte-for-byte. Clients treat missing tags as disabled, and read the threshold tags to explain the `experienced_counterparties` metric (D-7) without hard-coding node policy.
 
 ---
 
@@ -595,18 +669,23 @@ CREATE TABLE IF NOT EXISTS payer_history (
 );
 
 -- Distinct-counterparty set. counterparty_id is a keyed hash (D-7), never a pubkey.
+-- `experienced` is the D-7 qualification snapshot taken at success time; it may
+-- flip 0→1 on a LATER success with the same triple, never retroactively.
 CREATE TABLE IF NOT EXISTS payer_history_counterparties (
   user_pubkey        char(64) NOT NULL,
   payment_hash       char(64) NOT NULL,
   counterparty_id    char(64) NOT NULL,
   first_success_at   integer  NOT NULL,
+  experienced        integer  NOT NULL DEFAULT 0, -- 1 = counterparty qualified (D-7); monotone 0→1
   PRIMARY KEY (user_pubkey, payment_hash, counterparty_id)
 );
 ```
 
 Notes
-- `distinct_counterparties` is `COUNT(*)` on the third table; not denormalised
-  (the counterparty insert is `INSERT OR IGNORE`, so the count is exact).
+- `distinct_counterparties` is `COUNT(*)` on the third table and
+  `experienced_counterparties` is `COUNT(*) WHERE experienced = 1`; not
+  denormalised (the counterparty write is an upsert keyed by the triple, so
+  both counts are exact).
 - No foreign keys: `orders` rows outlive declarations, and the bond tables set
   the precedent of not declaring FKs.
 - Sizes are trivial (two 64-char keys per successful trade).
@@ -637,12 +716,59 @@ pub async fn find_declaration(pool, order_id: Uuid)
     -> Result<Option<PayerDeclarationRow>, MostroError>;
 pub async fn take_declaration<'e, E: sqlx::Executor<'e>>(exec: E, order_id: Uuid)
     -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING *  (idempotency token)
+
+pub struct HistoryCounters { pub successful_trades: u32,
+                             pub distinct_counterparties: u32,
+                             pub experienced_counterparties: u32,  // COUNT(*) WHERE experienced = 1
+                             pub first_success_at: Option<i64>,
+                             pub last_success_at: Option<i64> }
+
 pub async fn load_history(pool, user_pubkey: &str, hash: &str)
-    -> Result<(u32 /*trades*/, u32 /*cps*/, Option<i64>, Option<i64>), MostroError>;
-pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, counterparty_id, now)
-    -> Result<(), MostroError>;   // upsert payer_history + INSERT OR IGNORE counterparties
+    -> Result<HistoryCounters, MostroError>;
+pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, counterparty_id,
+                                 experienced: bool, now)
+    -> Result<(), MostroError>;   // upsert payer_history + counterparty upsert (SQL below)
+
+/// Counterparty qualification input (D-7). Reads `orders`, NOT the history
+/// tables: the seller's whole node-side record counts, including trades that
+/// predate this feature. Excludes `current_order` (already `Success` inside
+/// the CAS transaction — the trade being recorded never counts) and every
+/// trade with `buyer_pubkey` (only trades with OTHER buyers qualify — the
+/// documented anti-Sybil choice, D-7).
+pub struct SellerExperience { pub qualifying_trades: u32,
+                              pub first_qualifying_at: Option<i64> }
+pub async fn seller_experience<'e, E: sqlx::Executor<'e>>(exec: E,
+    seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Uuid)
+    -> Result<SellerExperience, MostroError>;
 pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroError>;
 ```
+
+`bump_history`'s counterparty write — the qualification flag is monotone
+(D-7): it can only ever go 0→1, on a later success, never back:
+
+```sql
+INSERT INTO payer_history_counterparties
+  (user_pubkey, payment_hash, counterparty_id, first_success_at, experienced)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT(user_pubkey, payment_hash, counterparty_id)
+DO UPDATE SET experienced = MAX(experienced, excluded.experienced);
+```
+
+`seller_experience`:
+
+```sql
+SELECT COUNT(*) AS n, MIN(created_at) AS first_at
+  FROM orders
+ WHERE master_seller_pubkey = ?1
+   AND status = 'success'
+   AND buyer_dispute = 0 AND seller_dispute = 0   -- "successful" means undisputed, as in D-6
+   AND id <> ?2                        -- the trade being recorded never counts (D-7)
+   AND master_buyer_pubkey <> ?3       -- trades with THIS buyer do not qualify (D-7)
+```
+
+`created_at` (order creation) is the only per-order timestamp available; it
+overstates a trade's age by the trade's own duration, which is acceptable for
+a days-granularity threshold and keeps the query to a single table.
 
 Validation helper, used by the handler *and* by `bump_history`:
 
@@ -761,23 +887,24 @@ pub async fn build_for_order(pool, node_keys: &Keys, order: &Order)
     let Some(decl) = db::find_declaration(pool, order.id).await? else { return Ok(None) };
     let (normal_buyer_idkey, _) = order.is_full_privacy_order()?;
     let Some(user) = normal_buyer_idkey else {
-        return Ok(Some(PaymentHistory::unavailable(decl.payment_hash)));   // D-4
+        return Ok(Some(PaymentHistory::unavailable(decl.payment_hash)));   // D-4: all counters zero
     };
-    let (trades, cps, first, last) = db::load_history(pool, &user, &decl.payment_hash).await?;
+    let h = db::load_history(pool, &user, &decl.payment_hash).await?;
     Ok(Some(PaymentHistory { payment_hash: decl.payment_hash, buyer_mode: BuyerMode::Reputation,
-        successful_trades: trades, distinct_counterparties: cps,
-        first_success_at: first, last_success_at: last }))
+        successful_trades: h.successful_trades,
+        distinct_counterparties: h.distinct_counterparties,
+        experienced_counterparties: h.experienced_counterparties,
+        first_success_at: h.first_success_at, last_success_at: h.last_success_at }))
 }
 ```
 
-`Status::Success` is allowed for the query so a seller restoring a session can
-still see what they saw at release time. Because the declaration row is consumed
-on success (§10.5), `build_for_order` must handle that case: when the order is
-`Success` and no declaration exists, answer `not_found` — the seller already
-received the push at `fiat-sent` time and the value would now include the
-trade just completed, which is a different (and confusing) number. Keep it
-simple: *post-success queries return `not_found`.* (Listed in §17 as an open
-question if client authors want otherwise.)
+A seller restoring a session might re-query in `Status::Success`, but the
+declaration row is consumed on success (§10.5), so the handler answers
+`not_found` — the seller already received the push at `fiat-sent` time and
+the value would now include the trade just completed, which is a different
+(and confusing) number. Keep it simple: *post-success queries return
+`not_found`.* (Listed in §17 as an open question if client authors want
+otherwise.)
 
 ### 10.5 Success hook (`src/app/payer/success.rs`) — **D-5**
 
@@ -812,7 +939,17 @@ pub async fn record_payer_success(
     let seller_master = order.get_master_seller_pubkey()
         .map(|k| k.to_string()).unwrap_or_else(|_| order.seller_pubkey.clone().unwrap_or_default());
     let cp = counterparty_id(node_keys, &seller_master);               // D-7
-    db::bump_history(&mut **tx, &user, &decl.payment_hash, &cp, now()).await?;
+    // D-7 qualification snapshot. The CAS has already flipped this order to
+    // Success *inside this transaction*, so the current trade must be excluded
+    // explicitly: it never counts toward its own counterparty's qualification.
+    // Only history that predates this trade — and only trades with OTHER
+    // buyers — qualifies.
+    let exp = db::seller_experience(&mut **tx, &seller_master, &user, order.id).await?;
+    let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
+    let experienced = exp.qualifying_trades >= min_trades
+        && exp.first_qualifying_at
+               .is_some_and(|t| now() - t >= i64::from(min_days) * 86_400);
+    db::bump_history(&mut **tx, &user, &decl.payment_hash, &cp, experienced, now()).await?;
     Ok(())
 }
 
@@ -834,7 +971,13 @@ Why this is safe
   CAS transaction, a database failure rolls back the success transition and the
   declaration remains retryable by the existing payment-success retry paths.
 - It does not touch `orders`, respecting the "no full-row writes after
-  success" rule documented at `payment_success` in `src/app/release.rs`.
+  success" rule documented at `payment_success` in `src/app/release.rs` —
+  `seller_experience` only *reads* `orders`, inside the same transaction.
+- The `experienced` flag is monotone (D-7): the counterparty upsert keeps
+  `experienced = MAX(experienced, excluded.experienced)` (§10.1), so a later
+  success can upgrade 0→1 but nothing downgrades 1→0, and rows from past
+  trades are never re-evaluated unless a new success lands — no retroactive
+  upgrades.
 - `CompletedByAdmin` / admin settle reach `Success` through the same
   `do_payment → payment_success` path and are covered; the dispute flags
   (D-6) decide whether they count.
@@ -869,9 +1012,9 @@ MVP (the Cashu release path does not exist yet); see §13.
 
 | Party | Learns | Never learns |
 |---|---|---|
-| Seller (via Mostro) | buyer's committed `payment_hash` for **this order**; aggregate counters for **this** (buyer, hash) pair; whether the buyer is in full-privacy mode (already visible today through `Peer.reputation == None`) | buyer identity key, other trade keys, other order ids, which sellers were the counterparties, any hash other than the one the buyer chose to commit to this order |
+| Seller (via Mostro) | buyer's committed `payment_hash` for **this order**; aggregate counters for **this** (buyer, hash) pair — including how many of the buyer's past counterparties met the node's experience policy (D-7), as a bare count; whether the buyer is in full-privacy mode (already visible today through `Peer.reputation == None`) | buyer identity key, other trade keys, other order ids, which sellers were the counterparties, any single counterparty's qualification status, any hash other than the one the buyer chose to commit to this order |
 | Buyer | nothing new about the seller | — |
-| Mostro node | `(master_buyer_pubkey, payment_hash)` association + counters; keyed counterparty hashes | plaintext payer details (D-2) |
+| Mostro node | `(master_buyer_pubkey, payment_hash)` association + counters; keyed counterparty hashes; per-counterparty qualification snapshots (derived from `orders`, which the node already holds) | plaintext payer details (D-2) |
 | Public relays | nothing | everything in this feature |
 
 ### 11.2 Why there is no oracle
@@ -889,13 +1032,18 @@ MVP (the Cashu release path does not exist yet); see §13.
 - There is no `same_user(a, b)` primitive and none is introduced (gist §12).
 - Counterparty identities are keyed hashes (D-7); even an exported DB does not
   list which sellers a buyer dealt with without the node secret.
+- The experienced count is computed from `orders` — data the node already
+  holds — and is returned only as an aggregate, never per counterparty. The
+  query takes no parameters, so a seller cannot turn it into an "is seller X
+  experienced?" probe about a third party; they only ever learn how many of
+  *this* buyer's past counterparties qualified.
 
 ### 11.3 Residual risks (accepted for the MVP)
 
 | Risk | Mitigation / status |
 |---|---|
 | Node DB compromise reveals `(identity key, payment_hash)` pairs. Hashes are brute-forceable by anyone who already knows the candidate account. | Same trust boundary as `master_*_pubkey` and `buyer_invoice` today. History is inherently a node-side function; a node that wants less retention can purge (§18). |
-| Buyer colludes with sellers to farm history. | Needs real successful trades with real sats, distinct counterparties and elapsed time (gist §32); tiers in §12 weight all three. |
+| Buyer colludes with sellers to farm history. | Needs real successful trades with real sats, distinct counterparties and elapsed time (gist §32); tiers in §12 weight all four. Qualifying as an *experienced* counterparty additionally requires N prior successes with **other** buyers over D days (D-7), so a closed two-party Sybil ring no longer counts. |
 | Victim happens to be a Mostro user with history on the same account. | Only a problem under hash-only history (§18); D-1 keys on the *buyer's* identity, so the victim's history is not attributed to the attacker. |
 | Buyer declares a hash but sends different plaintext to the seller. | Seller's client recomputes and flags mismatch (D-3); treated like a sender mismatch — recommend dispute. |
 | Buyer in full-privacy mode gets no history forever. | Deliberate (D-4). Sellers who care can prefer reputation-mode buyers; clients must word it as "unavailable", not "new". |
@@ -920,9 +1068,14 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
    plaintext from the buyer, recompute; if it differs, show a hard warning.
 2. On `payment-history` (push or reply), render two independent blocks:
    *Sender match* (manual confirmation) and *Payment-account history*.
-3. Never auto-release; never auto-refuse. The release screen shows both blocks
+3. In the history block, render `experienced_counterparties` alongside the raw
+   counters, e.g. *"N of the buyer's past counterparties were already
+   experienced on this node when they traded with them"*. Read the thresholds
+   from the info-event tags (§8.3) — they are node policy (D-7), do not
+   hard-code them.
+4. Never auto-release; never auto-refuse. The release screen shows both blocks
    above `[Release]` / `[Dispute]` (gist §22).
-4. If no `payment-history` arrived by the time fiat is reported sent and the
+5. If no `payment-history` arrived by the time fiat is reported sent and the
    node has the feature enabled, show *"Buyer did not declare a payment
    sender"* as its own warning.
 
@@ -930,10 +1083,14 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
 
 | Tier | Condition (all of) | Wording |
 |---|---|---|
-| 🟢 Established | `successful_trades ≥ 5`, `distinct_counterparties ≥ 3`, `first_success_at` ≥ 30 days ago | "Established payment account" |
+| 🟢 Established | `successful_trades ≥ 5`, `distinct_counterparties ≥ 3`, `experienced_counterparties ≥ 1`, `first_success_at` ≥ 30 days ago | "Established payment account" |
 | 🟡 Limited | `successful_trades ≥ 1` and not Established | "Limited payment history" |
 | 🔴 New | `successful_trades == 0` (`buyer_mode == reputation`) | "No previous successful trades with this account" |
 | ⚪ Unavailable | `buyer_mode == full_privacy` | "History unavailable (buyer trades in full-privacy mode)" |
+
+Requiring ≥ 1 experienced counterparty keeps a fresh Sybil cluster from
+reaching *Established* by trading only with itself: at least one counterparty
+must already have had real history with third parties at trade time (D-7).
 
 Forbidden wording: "verified owner", "verified account", "trusted account"
 (gist §33).
@@ -960,7 +1117,10 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 
 **`mostro-core`**
 - Round-trip serde for the three actions / two payloads / two reasons; exact
-  wire strings (`declare-payer`, `payer_declaration`, `invalid_payment_hash`).
+  wire strings (`declare-payer`, `payer_declaration`, `invalid_payment_hash`);
+  `PaymentHistory` round-trips with `experienced_counterparties` (older
+  clients simply ignore the unknown key — the struct has no
+  `deny_unknown_fields`).
 - `MessageKind::verify()` accepts / rejects the matrix in §6.4.
 
 **`declare_payer_action`**
@@ -995,6 +1155,20 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 - `buyer_dispute = 1` → declaration consumed, no history row.
 - full-privacy buyer → declaration consumed, no history row.
 - `counterparty_id` is deterministic for a key and differs across keys.
+- seller below the thresholds → counterparty row stored with `experienced = 0`
+  and `experienced_counterparties` reads 0; a seller with ≥ N qualifying
+  trades whose first qualifying trade is ≥ D days old → `experienced = 1`.
+- the trade being recorded never counts: a seller whose N-th qualifying trade
+  is the current one does NOT qualify (D-7).
+- buyer-relative exclusion: a seller whose prior successes were all with this
+  same buyer identity does NOT qualify, however many there were (D-7).
+- disputed past trades count neither toward N nor toward D.
+- upgrade path: a first success stores `experienced = 0`; once the seller has
+  crossed the thresholds with other buyers, a later success with the same
+  (buyer, hash, counterparty) triple flips the stored flag to 1, and the
+  `MAX()` upsert never flips it back.
+- no retroactivity: the seller crossing the thresholds *after* a trade leaves
+  previously stored rows at `experienced = 0` until another success lands.
 
 **`payment_success` wiring** (extend `src/app/release.rs` tests with the
 `PayoutStatusLookup` stub pattern, `payment_success` tests in `src/app/release.rs`)
@@ -1008,7 +1182,9 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 
 **Info event**
 - tags absent when disabled and present only when enabled (`src/nip33.rs` tests next to
-  `bond_policy_tags`).
+  `bond_policy_tags`), including the two threshold tags; `PayerHistorySettings`
+  defaults `experienced_min_trades = 5`, `experienced_min_days = 30` when the
+  keys are absent.
 
 ---
 
@@ -1037,7 +1213,14 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
 - [ ] With the feature on, the §5 flow works end-to-end against a test node:
       buyer declares, seller receives `payer-declared` and a `payment-history`
       push at `fiat-sent`, a second successful trade from the same account
-      shows `successful_trades = 1`, `distinct_counterparties = 1`.
+      shows `successful_trades = 1`, `distinct_counterparties = 1`,
+      `experienced_counterparties = 0` (the seller is below the thresholds).
+- [ ] Seeding the seller with ≥ `experienced_min_trades` undisputed successes
+      against *other* buyers, the oldest ≥ `experienced_min_days` days old,
+      makes the next success report `experienced_counterparties = 1`; a seller
+      whose prior successes were all with this same buyer stays at 0 (D-7),
+      and a seller who crosses the thresholds only *after* the trade stays at
+      0 until another success is recorded.
 - [ ] A full-privacy buyer yields `buyer_mode = full_privacy` and writes no
       history rows (DB asserted).
 - [ ] No new field appears on kinds 38383 / 38384; 38385 gains the §8.3
@@ -1087,12 +1270,14 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
 ## 19. Summary
 
 The mechanism combines **sender verification** (done by the seller, assisted by
-a hash forwarded through Mostro) with **payment-identity continuity** (three
-aggregate counters computed by Mostro from successful trades only). On this
-codebase it maps to: three additive `mostro-core` variants, one migration with
-three private tables, one new handler module, a ten-line hook on the single
-`Success` CAS, a prune job, two info-event tags and one protocol chapter —
-all behind a flag that is off by default and leaves the daemon byte-for-byte
-unchanged when disabled. A triangulation attacker can still make the sender
-match; they cannot cheaply make `successful_trades = 47,
-distinct_counterparties = 29, first_success_at = nine months ago`.
+a hash forwarded through Mostro) with **payment-identity continuity** (four
+aggregate counters computed by Mostro from successful trades only, one of them
+a buyer-relative "was this counterparty already experienced?" snapshot — D-7).
+On this codebase it maps to: three additive `mostro-core` variants, one
+migration with three private tables, one new handler module, a short hook on
+the single `Success` CAS, a prune job, four info-event tags and one protocol
+chapter — all behind a flag that is off by default and leaves the daemon
+byte-for-byte unchanged when disabled. A triangulation attacker can still make
+the sender match; they cannot cheaply make `successful_trades = 47,
+distinct_counterparties = 29, experienced_counterparties = 11,
+first_success_at = nine months ago`.

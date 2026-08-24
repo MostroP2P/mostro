@@ -544,6 +544,49 @@ mod tests {
         ));
     }
 
+    /// Inconsistent DB state: the initiating side's dispute flag is already set,
+    /// but there is no `disputes` row (so the early `DisputeAlreadyExists` guard
+    /// does not fire). `setup_dispute` must fail with `DisputeCreationError`, and
+    /// no dispute row may be created — the path introduced by #848.
+    #[tokio::test]
+    async fn dispute_action_returns_dispute_creation_error_when_flag_set_without_dispute_row() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Active);
+        order.buyer_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+
+        let event = create_event(buyer);
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroCantDo(CantDoReason::DisputeCreationError))
+            ),
+            "expected DisputeCreationError, got {result:?}"
+        );
+        assert!(
+            find_dispute_by_order_id(&pool, order.id).await.is_err(),
+            "no dispute row must be created when setup_dispute fails"
+        );
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            Status::Active.to_string(),
+            "order must not move to Dispute when setup_dispute fails"
+        );
+    }
+
     /// Full buyer-initiated flow on an `Active` order. All DB side effects
     /// (order flags/status, dispute row) and both queue notifications happen
     /// before the final Nostr publish, which fails offline (default client

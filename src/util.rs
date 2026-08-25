@@ -1,5 +1,6 @@
 use crate::config::constants::{
-    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_LIGHTNING_ADDRESS, DM_EVENT_KIND,
+    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_AUDIT_EXPIRATION_DAYS, DEV_FEE_LIGHTNING_ADDRESS,
+    DM_EVENT_KIND,
 };
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::*;
@@ -182,20 +183,28 @@ pub fn get_expiration_timestamp_for_kind(kind: u16) -> Option<i64> {
         }
     }
 
-    // Backward-compat fallback for known kinds only.
-    // Keep this list in sync with `ExpirationSettings::get_expiration_for_kind` in `src/config/types.rs`
-    // when adding/removing event kinds.
+    let max_expiration_days = Settings::get_mostro().max_expiration_days;
+    fallback_expiration_days_for_kind(kind, max_expiration_days)
+        .map(|days| now + Duration::days(days as i64).num_seconds())
+}
+
+/// Retention in days used when no `[expiration]` block is configured.
+///
+/// Backward-compat fallback for known kinds only. Keep this in sync with
+/// `ExpirationSettings::get_expiration_for_kind` in `src/config/types.rs`
+/// when adding/removing event kinds.
+fn fallback_expiration_days_for_kind(kind: u16, max_expiration_days: u32) -> Option<u32> {
     match kind {
-        NOSTR_ORDER_EVENT_KIND
-        | NOSTR_RATING_EVENT_KIND
-        | NOSTR_DISPUTE_EVENT_KIND
-        | DEV_FEE_AUDIT_EVENT_KIND => {
-            let mostro_settings = Settings::get_mostro();
-            Some(now + Duration::days(mostro_settings.max_expiration_days.into()).num_seconds())
+        // Fee audit events are a public payment record, not an order: they
+        // keep the same one-year retention as the configured path instead of
+        // the far shorter `max_expiration_days` order window.
+        DEV_FEE_AUDIT_EVENT_KIND => Some(DEV_FEE_AUDIT_EXPIRATION_DAYS),
+        NOSTR_ORDER_EVENT_KIND | NOSTR_RATING_EVENT_KIND | NOSTR_DISPUTE_EVENT_KIND => {
+            Some(max_expiration_days)
         }
         // Protocol-v2 direct messages: same 30-day default as
         // `ExpirationSettings::get_expiration_for_kind`.
-        DM_EVENT_KIND => Some(now + Duration::days(30).num_seconds()),
+        DM_EVENT_KIND => Some(30),
         _ => None,
     }
 }
@@ -3214,6 +3223,46 @@ mod tests {
         assert!(get_expiration_timestamp_for_kind(DM_EVENT_KIND).is_some());
         // Unknown kinds never get an expiration.
         assert!(get_expiration_timestamp_for_kind(12_345).is_none());
+    }
+
+    /// Dev fee audit events are a public payment record: they must carry a
+    /// one-year NIP-40 expiration, never the 15-day `max_expiration_days`
+    /// order window.
+    #[test]
+    fn dev_fee_audit_events_expire_after_one_year() {
+        init_globals();
+        let now = Timestamp::now().as_secs() as i64;
+        let audit_exp = get_expiration_timestamp_for_kind(DEV_FEE_AUDIT_EVENT_KIND)
+            .expect("fee audit events always expire");
+        let expected = now + Duration::days(DEV_FEE_AUDIT_EXPIRATION_DAYS.into()).num_seconds();
+        assert!(
+            (audit_exp - expected).abs() <= 2,
+            "fee audit events must expire ~365 days out, got {audit_exp} (expected {expected})"
+        );
+    }
+
+    /// The `[expiration]`-less fallback used to stamp fee audit events with
+    /// `max_expiration_days` (15 days). Orders still follow that window; fee
+    /// audits keep their full year.
+    #[test]
+    fn fallback_expiration_keeps_fee_audits_at_one_year() {
+        const MAX_EXPIRATION_DAYS: u32 = 15;
+        assert_eq!(
+            fallback_expiration_days_for_kind(DEV_FEE_AUDIT_EVENT_KIND, MAX_EXPIRATION_DAYS),
+            Some(DEV_FEE_AUDIT_EXPIRATION_DAYS)
+        );
+        assert_eq!(
+            fallback_expiration_days_for_kind(NOSTR_ORDER_EVENT_KIND, MAX_EXPIRATION_DAYS),
+            Some(MAX_EXPIRATION_DAYS)
+        );
+        assert_eq!(
+            fallback_expiration_days_for_kind(DM_EVENT_KIND, MAX_EXPIRATION_DAYS),
+            Some(30)
+        );
+        assert_eq!(
+            fallback_expiration_days_for_kind(12_345, MAX_EXPIRATION_DAYS),
+            None
+        );
     }
 
     // ───────────────────────── order tags & publication ─────────────────────────

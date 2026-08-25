@@ -13,6 +13,12 @@ pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.co
 /// This ensures events are NOT replaceable, maintaining complete audit history
 pub const DEV_FEE_AUDIT_EVENT_KIND: u16 = 8383;
 
+/// NIP-40 retention for dev fee audit events (kind 8383), in days.
+/// Audit events document fee payments for third-party verification, so they
+/// are kept for a full year — not for the much shorter order-expiration
+/// window (`max_expiration_days`).
+pub const DEV_FEE_AUDIT_EXPIRATION_DAYS: u32 = 365;
+
 /// Nostr event kind for protocol-v2 direct messages (NIP-44 direct transport)
 /// Kind 14 carries Mostro protocol messages as signed events with NIP-44
 /// encrypted content when `transport = "nip44"` (see docs/TRANSPORT_V2_SPEC.md)

@@ -1,6 +1,8 @@
 // File with the types for the configuration settings
 // Initialize the types for the configuration settings
-use crate::config::constants::{DEV_FEE_AUDIT_EVENT_KIND, DM_EVENT_KIND};
+use crate::config::constants::{
+    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_AUDIT_EXPIRATION_DAYS, DM_EVENT_KIND,
+};
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -229,9 +231,9 @@ impl ExpirationSettings {
             NOSTR_ORDER_EVENT_KIND => self.order_days.or(Some(30)), // orders
             NOSTR_RATING_EVENT_KIND => self.rating_days.or(Some(90)), // ratings
             NOSTR_DISPUTE_EVENT_KIND => self.dispute_days.or(Some(90)), // disputes
-            DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(365)), // fee audits
-            DM_EVENT_KIND => self.dm_days.or(Some(30)),             // protocol-v2 direct messages
-            _ => None, // unknown kinds don't get expiration
+            DEV_FEE_AUDIT_EVENT_KIND => self.fee_audit_days.or(Some(DEV_FEE_AUDIT_EXPIRATION_DAYS)), // fee audits
+            DM_EVENT_KIND => self.dm_days.or(Some(30)), // protocol-v2 direct messages
+            _ => None,                                  // unknown kinds don't get expiration
         }
     }
 }
@@ -258,6 +260,15 @@ mod tests {
         assert_eq!(
             settings.get_expiration_for_kind(NOSTR_RATING_EVENT_KIND),
             Some(90)
+        );
+    }
+
+    #[test]
+    fn fee_audit_kind_falls_back_to_one_year_when_unconfigured() {
+        let settings = ExpirationSettings::default();
+        assert_eq!(
+            settings.get_expiration_for_kind(DEV_FEE_AUDIT_EVENT_KIND),
+            Some(DEV_FEE_AUDIT_EXPIRATION_DAYS)
         );
     }
 

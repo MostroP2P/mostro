@@ -1,7 +1,7 @@
 use crate::app::context::AppContext;
+use crate::db::cas_rotate_maker_trade_pubkey;
 use crate::util::{enqueue_order_msg, get_order};
 
-use mostro_core::db::Crud;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 
@@ -14,6 +14,9 @@ use mostro_core::prelude::*;
 /// maker-side trade pubkey and `creator_pubkey` (which tracks the maker's
 /// current trade key) are set to `event.sender`. Anything else is rejected
 /// with [`ServiceError::InvalidPubkey`] and the order is left untouched.
+///
+/// The rotation is persisted with a status-guarded compare-and-swap and the
+/// confirmation is sent only once that write lands.
 pub async fn trade_pubkey_action(
     ctx: &AppContext,
     msg: Message,
@@ -23,7 +26,7 @@ pub async fn trade_pubkey_action(
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order
-    let mut order = get_order(&msg, pool).await?;
+    let order = get_order(&msg, pool).await?;
 
     // Phase 1.5: accept both `Pending` and `WaitingTakerBond` as
     // pre-trade entry points. The trade pubkey is a maker-only piece of
@@ -56,15 +59,37 @@ pub async fn trade_pubkey_action(
     if maker_master_key != event.identity {
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     }
-    match kind {
-        OrderKind::Sell => order.seller_pubkey = Some(event.sender.to_string()),
-        OrderKind::Buy => order.buyer_pubkey = Some(event.sender.to_string()),
+    // Persist through the pre-trade compare-and-swap (#866): it moves the
+    // maker-side trade pubkey and `creator_pubkey` — the maker is the order
+    // creator, and `creator_pubkey` must never move for anyone else — and
+    // nothing else, only while the order is still pre-trade.
+    //
+    // A full-row `Crud::update` here would write this handler's snapshot
+    // over whatever committed since the read at the top. The window is
+    // real: the post-bond resume keeps the order pre-trade across an LND
+    // `create_hold_invoice` round trip, so a rotation racing it could
+    // revert the committed take to `pending` with `hash`/`preimage`
+    // NULLed, orphaning a hold invoice the seller had already paid.
+    let rotated =
+        cas_rotate_maker_trade_pubkey(pool, order.id, kind, &event.sender.to_string()).await?;
+    if !rotated {
+        // The order left the pre-trade window while we were validating.
+        // Log it: this is the only trace the race leaves behind, and it is
+        // what tells us in production that a rotation and a take collided.
+        // `NotAllowedByStatus` matches the other CAS-miss sites
+        // (`take_sell.rs`, `show_hold_invoice`, `show_cashu_escrow_request`);
+        // the pre-check above keeps `InvalidOrderStatus`, the reason every
+        // pre-check in the repo reports for a status it can see up front.
+        tracing::info!(
+            "trade pubkey rotation: order {} left the pre-trade window before the CAS — refusing the rotation",
+            order.id
+        );
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
-    // The maker is the order creator: `creator_pubkey` tracks the maker's
-    // current trade key and must never move for anyone else.
-    order.creator_pubkey = event.sender.to_string();
 
-    // We a message to the seller
+    // Confirm only once the rotation is durable (#811): announcing it
+    // ahead of the write leaves the maker signing with a key the daemon
+    // never stored.
     enqueue_order_msg(
         request_id,
         Some(order.id),
@@ -75,11 +100,6 @@ pub async fn trade_pubkey_action(
     )
     .await;
 
-    order
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
     Ok(())
 }
 
@@ -87,6 +107,7 @@ pub async fn trade_pubkey_action(
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use mostro_core::db::Crud;
     use nostr_sdk::prelude::{Keys, PublicKey, Timestamp};
     use sqlx::SqlitePool;
     use std::sync::Arc;
@@ -352,5 +373,136 @@ mod tests {
         assert_eq!(after.creator_pubkey, maker.public_key().to_string());
         assert_eq!(after.buyer_pubkey, Some(maker.public_key().to_string()));
         assert_eq!(after.seller_pubkey, Some(taker.public_key().to_string()));
+    }
+
+    /// #811: the confirmation must never precede the persist. A rotation
+    /// the handler rejects announces nothing to the caller.
+    ///
+    /// This is the *pre-check* rejection: the status is already out of the
+    /// pre-trade window when the handler reads the order, so it never
+    /// reaches the CAS. The CAS-miss branch is covered by
+    /// `trade_pubkey_action_does_not_confirm_a_cas_miss` below.
+    #[tokio::test]
+    async fn trade_pubkey_action_does_not_confirm_a_rejected_rotation() {
+        let ctx = setup_ctx().await;
+        let maker = Keys::generate();
+        let sender = Keys::generate().public_key();
+
+        // Past the pre-trade window: the status gate rejects.
+        let order = maker_order(OrderKind::Sell, Status::WaitingPayment, &maker);
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = trade_pubkey_event(sender, maker.public_key());
+        let result = trade_pubkey_action(&ctx, trade_pubkey_msg(order.id), &event).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidOrderStatus))
+        ));
+        // The queue is process-global; filter by this test's unique key.
+        let confirmations = crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, pk)| {
+                *pk == sender && m.get_inner_message_kind().action == Action::TradePubkey
+            })
+            .count();
+        assert_eq!(
+            confirmations, 0,
+            "a rejected rotation must not be confirmed"
+        );
+    }
+
+    /// The other half of #811, and the only handler-level coverage of the
+    /// `!rotated` branch: the order is still pre-trade when the handler
+    /// reads it, so validation passes and the CAS runs — but a concurrent
+    /// writer has moved the row out of the pre-trade window in between, so
+    /// the guarded `UPDATE` matches nothing.
+    ///
+    /// That interleaving has no injection point between `get_order` and the
+    /// CAS, so a `BEFORE UPDATE` trigger stands in for the racing writer:
+    /// `RAISE(IGNORE)` skips the row, which is exactly what the handler sees
+    /// from a status guard that no longer matches — `rows_affected() == 0`.
+    /// The handler must reject and stay silent; the row must be untouched.
+    #[tokio::test]
+    async fn trade_pubkey_action_does_not_confirm_a_cas_miss() {
+        let ctx = setup_ctx().await;
+        let maker = Keys::generate();
+        let sender = Keys::generate().public_key();
+
+        let order = maker_order(OrderKind::Sell, Status::Pending, &maker);
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER rotation_loses_the_cas BEFORE UPDATE ON orders \
+             WHEN NEW.creator_pubkey <> OLD.creator_pubkey \
+             BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .execute(ctx.pool())
+        .await
+        .unwrap();
+
+        let event = trade_pubkey_event(sender, maker.public_key());
+        let result = trade_pubkey_action(&ctx, trade_pubkey_msg(order.id), &event).await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a CAS miss must be reported as NotAllowedByStatus: {result:?}"
+        );
+
+        // Nothing moved, and nothing was announced.
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.creator_pubkey, maker.public_key().to_string());
+        assert_eq!(after.seller_pubkey, Some(maker.public_key().to_string()));
+        // The queue is process-global; filter by this test's unique key.
+        let confirmations = crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, pk)| {
+                *pk == sender && m.get_inner_message_kind().action == Action::TradePubkey
+            })
+            .count();
+        assert_eq!(confirmations, 0, "a CAS miss must not be confirmed");
+    }
+
+    /// The rotation is a targeted write: a pre-trade order carrying a
+    /// promoted taker context and trade escrow material keeps both. The
+    /// full-row write this replaced would have NULLed them from the
+    /// handler's own snapshot whenever that snapshot was stale.
+    #[tokio::test]
+    async fn trade_pubkey_action_leaves_taker_context_and_escrow_material_untouched() {
+        let ctx = setup_ctx().await;
+        let maker = Keys::generate();
+        let taker = Keys::generate();
+        let new_trade_key = Keys::generate().public_key();
+
+        let mut order = maker_order(OrderKind::Sell, Status::WaitingTakerBond, &maker);
+        order.buyer_pubkey = Some(taker.public_key().to_string());
+        order.master_buyer_pubkey = Some(taker.public_key().to_string());
+        order.hash = Some("aa".repeat(32));
+        order.preimage = Some("bb".repeat(32));
+        order.taken_at = 1_700_000_000;
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = trade_pubkey_event(new_trade_key, maker.public_key());
+        let result = trade_pubkey_action(&ctx, trade_pubkey_msg(order.id), &event).await;
+        assert!(result.is_ok(), "maker rotation must succeed: {result:?}");
+
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.seller_pubkey, Some(new_trade_key.to_string()));
+        assert_eq!(after.creator_pubkey, new_trade_key.to_string());
+        assert_eq!(after.status, Status::WaitingTakerBond.to_string());
+        assert_eq!(after.buyer_pubkey, Some(taker.public_key().to_string()));
+        assert_eq!(
+            after.master_buyer_pubkey,
+            Some(taker.public_key().to_string())
+        );
+        assert_eq!(after.hash, Some("aa".repeat(32)));
+        assert_eq!(after.preimage, Some("bb".repeat(32)));
+        assert_eq!(after.taken_at, 1_700_000_000);
     }
 }

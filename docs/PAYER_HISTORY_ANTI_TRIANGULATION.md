@@ -255,17 +255,32 @@ by construction. Full-privacy sellers never qualify: their master key is a
 fresh trade key, so their qualifying history is always zero — the same
 conservative direction as above.
 
-The flag is **monotone** and is evaluated only when a success is recorded. A
-counterparty stored with `experienced = 0` is upgraded to `1` only when a
-*subsequent* successful trade with the same `(buyer, payment_hash)` pair
-happens after the seller has crossed the thresholds; it is never flipped
-retroactively merely because the seller's record improved later, and it never
-flips back.
+The flag is **monotone under a fixed threshold policy**; changes to `N` or `D`
+trigger a full recomputation. While `(N, D)` stay put, the flag is evaluated
+only when a success is recorded: a counterparty stored with `experienced = 0`
+is upgraded to `1` only when a *subsequent* successful trade with the same
+`(buyer, payment_hash)` pair happens after the seller has crossed the
+thresholds; it is never flipped retroactively merely because the seller's
+record improved later, and it never flips back.
 
 `N` and `D` are **node policy, not protocol constants**: operators set them in
 `[payer_history]` (§8.1, defaults 5 and 30) and they are advertised on the
 info event (§8.3) so clients can explain the metric without hard-coding
 thresholds.
+
+**Threshold changes re-evaluate every stored snapshot.** The `(N, D)` pair the
+snapshots were evaluated under is persisted next to them (§9). When the node
+boots with a different pair, `mostrod` recomputes `experienced` for **every**
+row from `orders` under the new policy and rewrites the stored pair (§10.7) —
+rows go 0→1 when thresholds are lowered and 1→0 when they are raised, no
+matter how the value was originally set. Without this, a threshold change
+would leave a mixed population — some rows scored under the old policy, some
+under the new — that the info-event tags (§8.3) advertise as if it were
+uniform, and no client could tell which rows meant what. The alternative of
+freezing `N` and `D` after first use was rejected: an operator must be able to
+tighten a policy that is not working. Monotonicity is therefore a property
+*within* a policy generation, not across policy changes; recomputation is the
+only moment a `1` can become a `0`.
 
 This is deliberately a flat, one-hop signal. It is **not** recursive
 reputation: a counterparty's own `experienced_counterparties` value plays no
@@ -590,6 +605,10 @@ seller that sender verification is unavailable (gist §34).
 # experienced_min_trades = 5
 # # ... and its first such trade was >= experienced_min_days days ago.
 # experienced_min_days = 30
+# # Changing either threshold re-evaluates EVERY stored snapshot under the new
+# # pair on the next restart (docs §10.7), so the advertised policy and the
+# # stored data never disagree. The change takes effect at restart, not on
+# # save.
 ```
 
 ### 8.2 `src/config/types.rs`
@@ -598,7 +617,7 @@ seller that sender verification is unavailable (gist §34).
 /// Payment-account history (anti-triangulation). Opt-in; when `enabled`
 /// is false every code path added by this feature is inert.
 /// See `docs/PAYER_HISTORY_ANTI_TRIANGULATION.md`.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PayerHistorySettings {
     #[serde(default)]
     pub enabled: bool,
@@ -615,6 +634,40 @@ pub struct PayerHistorySettings {
 
 const fn default_experienced_min_trades() -> u32 { 5 }
 const fn default_experienced_min_days() -> u32 { 30 }
+
+// `Default` is implemented by hand, NOT derived: `#[serde(default = "...")]`
+// only runs during deserialization, so a derived `Default` would silently
+// produce `experienced_min_trades = 0` / `experienced_min_days = 0` — a
+// policy where every counterparty qualifies as experienced. These helpers are
+// the single source of truth for both paths.
+impl Default for PayerHistorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_declaration: false,
+            experienced_min_trades: default_experienced_min_trades(),
+            experienced_min_days: default_experienced_min_days(),
+        }
+    }
+}
+```
+
+A unit test pins both construction paths to the same values (§14):
+
+```rust
+#[test]
+fn payer_history_defaults_match_documented_thresholds() {
+    // Arrange / Act
+    let from_default = PayerHistorySettings::default();
+    let from_serde: PayerHistorySettings = toml::from_str("").unwrap();
+
+    // Assert
+    assert_eq!(from_default.experienced_min_trades, 5);
+    assert_eq!(from_default.experienced_min_days, 30);
+    assert_eq!(from_serde.experienced_min_trades, 5);
+    assert_eq!(from_serde.experienced_min_days, 30);
+    assert!(!from_default.enabled);
+}
 ```
 
 `Settings` gains `#[serde(default)] pub payer_history: Option<PayerHistorySettings>`
@@ -645,7 +698,7 @@ When the feature is disabled or absent, `info_to_tags` emits no payer-history ta
 ## 9. Daemon — data model
 
 One migration, `migrations/2026MMDD120000_payer_history.sql`, in the house
-style (long `--` header explaining *why*, per-column comments). Three tables;
+style (long `--` header explaining *why*, per-column comments). Four tables;
 **no** change to `orders` or `users`.
 
 ```sql
@@ -669,15 +722,29 @@ CREATE TABLE IF NOT EXISTS payer_history (
 );
 
 -- Distinct-counterparty set. counterparty_id is a keyed hash (D-7), never a pubkey.
--- `experienced` is the D-7 qualification snapshot taken at success time; it may
--- flip 0→1 on a LATER success with the same triple, never retroactively.
+-- `experienced` is the D-7 qualification snapshot taken at success time; while
+-- the threshold policy is unchanged it may flip 0→1 on a LATER success with
+-- the same triple, never retroactively and never back. A change to (N, D)
+-- rewrites the whole column under the new policy (§10.7).
 CREATE TABLE IF NOT EXISTS payer_history_counterparties (
   user_pubkey        char(64) NOT NULL,
   payment_hash       char(64) NOT NULL,
   counterparty_id    char(64) NOT NULL,
   first_success_at   integer  NOT NULL,
-  experienced        integer  NOT NULL DEFAULT 0, -- 1 = counterparty qualified (D-7); monotone 0→1
+  last_success_at    integer  NOT NULL,              -- newest success with this triple; the instant §10.7 re-evaluates at
+  experienced        integer  NOT NULL DEFAULT 0,    -- 1 = counterparty qualified (D-7)
   PRIMARY KEY (user_pubkey, payment_hash, counterparty_id)
+);
+
+-- Threshold policy the `experienced` column was last evaluated under (D-7).
+-- Single row (id = 1). Its only purpose is to detect a configuration change
+-- across restarts so §10.7 can recompute instead of leaving a mixed
+-- population of old-policy and new-policy snapshots.
+CREATE TABLE IF NOT EXISTS payer_history_policy (
+  id                     integer PRIMARY KEY CHECK (id = 1),
+  experienced_min_trades integer NOT NULL,
+  experienced_min_days   integer NOT NULL,
+  evaluated_at           integer NOT NULL   -- unix secs of the last (re)evaluation
 );
 ```
 
@@ -686,6 +753,12 @@ Notes
   `experienced_counterparties` is `COUNT(*) WHERE experienced = 1`; not
   denormalised (the counterparty write is an upsert keyed by the triple, so
   both counts are exact).
+- `last_success_at` on the counterparty table exists only for §10.7: a
+  recomputation must re-evaluate each snapshot **at the instant it was last
+  taken**, and the `payer_history` row's `last_success_at` is per
+  `(user, hash)`, not per counterparty.
+- `payer_history_policy` holds node policy, not user data; it is never read on
+  the hot path and never leaves the node.
 - No foreign keys: `orders` rows outlive declarations, and the bond tables set
   the precedent of not declaring FKs.
 - Sizes are trivial (two 64-char keys per successful trade).
@@ -741,17 +814,29 @@ pub async fn seller_experience<'e, E: sqlx::Executor<'e>>(exec: E,
     seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Uuid)
     -> Result<SellerExperience, MostroError>;
 pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroError>;
+
+/// Threshold policy the stored `experienced` snapshots were evaluated under
+/// (D-7, §10.7). `None` when the feature has never run on this database.
+pub async fn load_experience_policy(pool) -> Result<Option<(u32, u32)>, MostroError>;
+pub async fn store_experience_policy<'e, E>(exec: E, min_trades: u32, min_days: u32, now: i64)
+    -> Result<(), MostroError>;
+/// Recompute the whole `experienced` column under `(min_trades, min_days)`.
+/// Runs in one transaction with `store_experience_policy`; see §10.7.
+pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32)
+    -> Result<u64, MostroError>;   // rows whose flag changed
 ```
 
-`bump_history`'s counterparty write — the qualification flag is monotone
-(D-7): it can only ever go 0→1, on a later success, never back:
+`bump_history`'s counterparty write — under a fixed threshold policy the
+qualification flag is monotone (D-7): it can only ever go 0→1, on a later
+success, never back. Only the recomputation of §10.7 may lower it.
 
 ```sql
 INSERT INTO payer_history_counterparties
-  (user_pubkey, payment_hash, counterparty_id, first_success_at, experienced)
-VALUES (?1, ?2, ?3, ?4, ?5)
+  (user_pubkey, payment_hash, counterparty_id, first_success_at, last_success_at, experienced)
+VALUES (?1, ?2, ?3, ?4, ?4, ?5)
 ON CONFLICT(user_pubkey, payment_hash, counterparty_id)
-DO UPDATE SET experienced = MAX(experienced, excluded.experienced);
+DO UPDATE SET last_success_at = excluded.last_success_at,
+              experienced     = MAX(experienced, excluded.experienced);
 ```
 
 `seller_experience`:
@@ -910,14 +995,66 @@ otherwise.)
 
 Called from `payment_success` in `src/app/release.rs` **only** on the
 `rows_affected() == 1` branch, inside the Success transaction before commit and
-before the `PurchaseCompleted` enqueue:
+before the `PurchaseCompleted` enqueue.
+
+**Wiring `payment_success`: build, commit, then publish.** Today
+`payment_success` calls `update_order_event(my_keys, Status::Success, order)`,
+which *builds and publishes* the kind-38383 revision, and only then runs the
+guarded `UPDATE`. Publishing before persisting is the house pattern and is
+safe today because the DB write is a single statement whose failure is
+converged by the orderbook reconciler (`update_order_event_if_quiescent` in
+`src/util.rs`). This hook breaks that assumption: the history write can fail
+*after* the `Success` event has reached the relays, so the transaction rolls
+back while every peer has already been told the trade succeeded. PH-4
+therefore splits build from publish:
 
 ```rust
-// release.rs, inside the same transaction that performs the Success CAS:
+// release.rs — build the Success revision, DO NOT publish it yet.
+let (order_updated, success_event) =
+    match build_order_event(my_keys, Status::Success, order).await {
+        Ok(built) => built,
+        Err(_) => return Ok(false),   // unchanged: keep the marker for reconciliation
+    };
+
+let mut tx = pool.begin().await.map_err(...)?;
+
+// The same guarded UPDATE as today, now inside the transaction.
+let result = sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
+    /* … binds unchanged … */
+    .execute(&mut *tx).await.map_err(...)?;
+
+if result.rows_affected() == 0 {
+    tx.rollback().await.ok();         // unchanged: another task finalized it, no notifications
+    return Ok(true);
+}
+
 if Settings::is_payer_history_enabled() {
     payer::success::record_payer_success(&mut tx, ctx.keys(), &order_updated).await?;
 }
+
+tx.commit().await.map_err(...)?;      // nothing is externally visible before this line
+
+// Only now: publish the orderbook revision and notify the buyer.
+publish_order_event(success_event, order_updated.id).await;
+enqueue_order_msg(None, Some(order_updated.id), Action::PurchaseCompleted, None, buyer_pubkey, None).await;
+enqueue_order_msg(request_id, Some(order_updated.id), Action::Rate, None, buyer_pubkey, None).await;
 ```
+
+`build_order_event` / `publish_order_event` are the two halves of the existing
+`update_order_event_stamped` (`src/util.rs`), split with no behavioural change
+for the other twenty-odd call sites: `update_order_event` becomes
+`build_order_event(...).await` followed immediately by `publish_order_event(...)`.
+The `created_at` stamp is still taken in the build half, so the monotonic
+orderbook registry and the reconciler's quiescence window keep working exactly
+as they do today; the only difference for `payment_success` is that a few
+milliseconds of database work now sit between the stamp and the send. A
+transactional outbox (persist the event in the same transaction, publish from
+a scheduler job) is the equivalent alternative and is deliberately deferred:
+it would touch every publisher in the daemon, not just this path.
+
+The invariant PH-4 must hold, and must test: **no failure before `tx.commit()`
+produces an externally visible `Success`** — not on the relays, not in the
+message queue.
 
 ```rust
 pub async fn record_payer_success(
@@ -969,15 +1106,19 @@ Why this is safe
   `take_declaration` (DELETE … RETURNING) guarantees at most one increment
   even if that invariant were ever broken. Because the history write shares the
   CAS transaction, a database failure rolls back the success transition and the
-  declaration remains retryable by the existing payment-success retry paths.
+  declaration remains retryable by the existing payment-success retry paths —
+  and, because the publish now happens after the commit, such a rollback is
+  invisible to peers and relays.
 - It does not touch `orders`, respecting the "no full-row writes after
   success" rule documented at `payment_success` in `src/app/release.rs` —
   `seller_experience` only *reads* `orders`, inside the same transaction.
-- The `experienced` flag is monotone (D-7): the counterparty upsert keeps
-  `experienced = MAX(experienced, excluded.experienced)` (§10.1), so a later
-  success can upgrade 0→1 but nothing downgrades 1→0, and rows from past
-  trades are never re-evaluated unless a new success lands — no retroactive
-  upgrades.
+- The `experienced` flag is monotone under a fixed threshold policy (D-7): the
+  counterparty upsert keeps `experienced = MAX(experienced, excluded.experienced)`
+  (§10.1), so a later success can upgrade 0→1 but nothing downgrades 1→0, and
+  rows from past trades are never re-evaluated unless a new success lands — no
+  retroactive upgrades. The one exception is an operator changing `N` or `D`,
+  which recomputes the whole column at boot (§10.7); the success path itself
+  never lowers a flag.
 - `CompletedByAdmin` / admin settle reach `Success` through the same
   `do_payment → payment_success` path and are covered; the dispute flags
   (D-6) decide whether they count.
@@ -998,7 +1139,73 @@ consumed in §10.5 before this job can see them, so the job only ever removes
 declarations from cancelled / expired / admin-cancelled orders. Range-order
 children are separate orders with separate declarations; nothing special.
 
-### 10.7 Cashu dispatch
+### 10.7 Threshold changes — full recomputation (**D-7**)
+
+`experienced` is a snapshot, so a change to `N` or `D` invalidates every stored
+snapshot at once. `mostrod` detects that at boot and rebuilds the column rather
+than leaving old-policy and new-policy rows side by side.
+
+Called once from startup (`src/main.rs`, right after `run_migrations`), only
+when the feature is enabled:
+
+```rust
+if Settings::is_payer_history_enabled() {
+    let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
+    match db::load_experience_policy(&pool).await? {
+        Some(stored) if stored == (min_trades, min_days) => {}          // unchanged: nothing to do
+        Some(_) | None => {
+            let changed = db::recompute_experienced(&pool, &my_keys, min_trades, min_days).await?;
+            tracing::info!(
+                "payer_history: experience thresholds now {min_trades}/{min_days}; \
+                 recomputed snapshots, {changed} row(s) changed"
+            );
+        }
+    }
+}
+```
+
+`recompute_experienced` runs in a single transaction:
+
+1. Build the `counterparty_id → master_seller_pubkey` map. The stored ids are
+   keyed hashes (D-7) and cannot be inverted, so the map is built *forward*:
+   scan the distinct `master_seller_pubkey` values in `orders` and hash each
+   one with `counterparty_id(node_keys, …)`. The node key is stable, so every
+   stored id that this node produced is covered; any id that does not appear
+   (a key rotation, an imported database) is left untouched and logged.
+2. For each `payer_history_counterparties` row, re-evaluate the D-7 predicate
+   **at `last_success_at`** — the instant the snapshot belongs to — using the
+   same `seller_experience` query as §10.5, with `created_at < last_success_at`
+   added and the current order exclusion dropped (the recorded trade is
+   already in the past). Because a seller's qualifying history only grows,
+   evaluating at the newest success with that triple reproduces exactly the
+   `MAX()` the success path would have accumulated under the new thresholds.
+3. `UPDATE … SET experienced = ?` for the rows whose value changed, then
+   `store_experience_policy(&mut *tx, min_trades, min_days, now())`.
+
+Properties this gives:
+
+- **Deterministic.** The result depends only on `orders`, the node key and
+  `(N, D)` — not on the order in which successes happened to be recorded, and
+  not on the previous value of the flag. Lowering thresholds upgrades stale
+  `0`s; raising them downgrades `1`s that no longer qualify.
+- **Atomic.** Policy row and column are rewritten together, so a crash
+  mid-recompute leaves the old policy recorded and the job runs again at the
+  next boot.
+- **Consistent with the info event.** §8.3 advertises `(N, D)`; after this job
+  every stored snapshot was evaluated under exactly the advertised pair, which
+  is what makes the tags meaningful to a client.
+- **Cheap and bounded.** It is one pass over the counterparty table plus one
+  aggregate per distinct `(seller, buyer)` pair, on a table that grows by one
+  row per successful trade, and it runs only when the operator edits the
+  config. It is not scheduled, not exposed as an action, and never runs on the
+  hot path.
+- **Not a privacy change.** Only data the node already holds is read; no new
+  column, no new counter and no new wire field.
+
+The first boot after PH-1 finds no policy row and therefore recomputes once
+(over an empty table), which also seeds `payer_history_policy`.
+
+### 10.8 Cashu dispatch
 
 `dispatch_cashu` in `src/app.rs` currently rejects every action outside its
 allow-list. `DeclarePayer` and `PaymentHistory` are **not** added there in the
@@ -1083,7 +1290,7 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
 
 | Tier | Condition (all of) | Wording |
 |---|---|---|
-| 🟢 Established | `successful_trades ≥ 5`, `distinct_counterparties ≥ 3`, `experienced_counterparties ≥ 1`, `first_success_at` ≥ 30 days ago | "Established payment account" |
+| 🟢 Established | `successful_trades ≥ 5`, `distinct_counterparties ≥ 3`, `experienced_counterparties ≥ 1`, `now - first_success_at ≥ 30 days` (i.e. `first_success_at ≤ now - 30 days`; the field is a Unix timestamp, so the comparison is on the *age*, not on the raw value) | "Established payment account" |
 | 🟡 Limited | `successful_trades ≥ 1` and not Established | "Limited payment history" |
 | 🔴 New | `successful_trades == 0` (`buyer_mode == reputation`) | "No previous successful trades with this account" |
 | ⚪ Unavailable | `buyer_mode == full_privacy` | "History unavailable (buyer trades in full-privacy mode)" |
@@ -1170,11 +1377,38 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 - no retroactivity: the seller crossing the thresholds *after* a trade leaves
   previously stored rows at `experienced = 0` until another success lands.
 
+**`recompute_experienced`** (§10.7)
+- unchanged `(N, D)` between boots → the job does not run and no row is
+  touched.
+- lowering `N` (or `D`) upgrades rows stored as `experienced = 0` that now
+  qualify; raising it downgrades rows stored as `1` that no longer do — the
+  1→0 direction is the one the success path can never produce.
+- re-evaluation happens at each row's `last_success_at`, not at "now": a
+  seller who qualified only *after* the last recorded success stays at `0`.
+- the recompute is idempotent — running it twice with the same `(N, D)`
+  changes nothing the second time — and independent of insertion order.
+- `payer_history_policy` is written in the same transaction: an injected
+  failure mid-recompute leaves both the old policy row and the old column
+  values, so the next boot retries.
+- a `counterparty_id` with no matching `master_seller_pubkey` in `orders`
+  (simulated key rotation) is left untouched and logged, not zeroed.
+- first boot on an empty database seeds the policy row without error.
+- feature disabled → the job never runs, even with a different `(N, D)` in the
+  config.
+
 **`payment_success` wiring** (extend `src/app/release.rs` tests with the
 `PayoutStatusLookup` stub pattern, `payment_success` tests in `src/app/release.rs`)
 - history recorded in the same transaction as the CAS-success branch only; the
   "already finalised" branch records nothing, and an injected history-write
   failure leaves the order retryable rather than finalized without history.
+- commit-then-publish: with the history write forced to fail, **no** kind-38383
+  `Success` revision is published and **no** `PurchaseCompleted` / `Rate`
+  message is enqueued; the order is still `SettledHoldInvoice` in the DB.
+- the happy path publishes exactly one `Success` revision, after the commit,
+  and the existing `payment_success` tests pass unmodified.
+- the `build_order_event` / `publish_order_event` split leaves every other
+  call site byte-identical: the existing `update_order_event` tests
+  (`src/util.rs`) pass unmodified.
 
 **Scheduler**
 - prune deletes declarations of cancelled/expired orders and leaves active
@@ -1182,9 +1416,14 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 
 **Info event**
 - tags absent when disabled and present only when enabled (`src/nip33.rs` tests next to
-  `bond_policy_tags`), including the two threshold tags; `PayerHistorySettings`
-  defaults `experienced_min_trades = 5`, `experienced_min_days = 30` when the
-  keys are absent.
+  `bond_policy_tags`), including the two threshold tags.
+
+**`PayerHistorySettings` defaults** (§8.2)
+- `PayerHistorySettings::default()` and deserialising an empty/absent
+  `[payer_history]` section both yield `experienced_min_trades = 5` and
+  `experienced_min_days = 30` — the manual `Default` impl exists precisely
+  because `#[derive(Default)]` would give `0`/`0`, i.e. "everyone is
+  experienced".
 
 ---
 
@@ -1196,8 +1435,8 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 | **PH-1** | `mostrod` | Bump `mostro-core`; config section + helpers (§8.1–8.2); migration + `src/app/payer/db.rs` with unit tests (§9, §10.1). Nothing wired. | PH-0 |
 | **PH-2** | `mostrod` | `declare_payer_action` + dispatch arm + tests (§10.2). | PH-1 |
 | **PH-3** | `mostrod` | `fiat_sent` gate + push, `payment_history_action` + dispatch arm, `build_for_order` (§10.3–10.4). | PH-2 |
-| **PH-4** | `mostrod` | `record_payer_success` + `payment_success` wiring + prune job (§10.5–10.6). | PH-1 (parallel with PH-2/3) |
-| **PH-5** | `mostrod` | Info-event tags (§8.3), `docs/README.md` link, `ORDERS_AND_ACTIONS.md` row, Cashu boot warning (§13). | PH-1 |
+| **PH-4** | `mostrod` | `build_order_event` / `publish_order_event` split in `src/util.rs` (no behaviour change), `record_payer_success` + commit-then-publish `payment_success` wiring + prune job (§10.5–10.6). | PH-1 (parallel with PH-2/3) |
+| **PH-5** | `mostrod` | Info-event tags (§8.3), threshold-change recomputation at boot (§10.7), `docs/README.md` link, `ORDERS_AND_ACTIONS.md` row, Cashu boot warning (§13). | PH-1 |
 | **PH-6** | `protocol` | New chapter `payer_declaration.md` (§6.5 examples, §7 canonicalisation registry with AR/EU/BR/… entries), `SUMMARY.md`, `message_suggestions_for_actions.md` reasons, `other_events.md` info tags. | PH-0 |
 
 Critical path: PH-0 → PH-1 → PH-2 → PH-3. PH-4, PH-5 and PH-6 run in parallel
@@ -1221,8 +1460,17 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
       whose prior successes were all with this same buyer stays at 0 (D-7),
       and a seller who crosses the thresholds only *after* the trade stays at
       0 until another success is recorded.
+- [ ] Editing `experienced_min_trades` / `experienced_min_days` and restarting
+      re-evaluates **every** stored snapshot under the new pair (§10.7): rows
+      go 0→1 when the thresholds are lowered and 1→0 when they are raised, the
+      log line reports the number of rows changed, `payer_history_policy`
+      matches the config, and a second restart with the same values is a
+      no-op.
 - [ ] A full-privacy buyer yields `buyer_mode = full_privacy` and writes no
       history rows (DB asserted).
+- [ ] With the payer-history write forced to fail, no `Success` revision
+      reaches the relays and no `PurchaseCompleted` / `Rate` message is
+      enqueued: the order stays `SettledHoldInvoice` and is retried (§10.5).
 - [ ] No new field appears on kinds 38383 / 38384; 38385 gains the §8.3
       tags only when `[payer_history].enabled = true` (`nip33` tests).
 - [ ] `grep -rn "payment_hash" src/app/payer` shows no `tracing::` call that
@@ -1245,6 +1493,12 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
 3. **`require_declaration` granularity.** Global only in the MVP. Per-order
    (a maker flag on the 38383 event) would let sellers opt in individually
    but needs a new public tag; defer.
+4. **Recomputation trigger.** §10.7 runs at boot, on detecting a changed
+   `(N, D)`. An operator who edits `settings.toml` without restarting keeps
+   serving old-policy snapshots under newly advertised tags until the next
+   restart. Options: hook it to the existing config-reload path, or add an
+   admin action. Default for the MVP: boot only, documented in
+   `settings.tpl.toml`.
 
 ---
 
@@ -1274,7 +1528,7 @@ a hash forwarded through Mostro) with **payment-identity continuity** (four
 aggregate counters computed by Mostro from successful trades only, one of them
 a buyer-relative "was this counterparty already experienced?" snapshot — D-7).
 On this codebase it maps to: three additive `mostro-core` variants, one
-migration with three private tables, one new handler module, a short hook on
+migration with four private tables, one new handler module, a short hook on
 the single `Success` CAS, a prune job, four info-event tags and one protocol
 chapter — all behind a flag that is off by default and leaves the daemon
 byte-for-byte unchanged when disabled. A triangulation attacker can still make

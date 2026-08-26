@@ -9,6 +9,7 @@ Quick links to architecture and feature guides.
 - Orders & Actions: ORDERS_AND_ACTIONS.md
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - Anti-Abuse Bond: ANTI_ABUSE_BOND.md (opt-in maker/taker Lightning bond; off by default)
+- Payment-Account History / Anti-Triangulation: PAYER_HISTORY_ANTI_TRIANGULATION.md (opt-in buyer payer declaration + private success history; off by default)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 

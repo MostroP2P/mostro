@@ -182,8 +182,8 @@ jobs:
           # than from a checkout of the whole history.
           tags="$(git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 'v*')"
           mapfile -t candidates < <(
-            sed 's#.*refs/tags/##' <<<"$tags" \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" \
+              | cut -d/ -f3 \
               | sort -rV \
               | head -n "$max_candidates"
           )

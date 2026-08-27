@@ -239,6 +239,29 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
+/// Host port the local LNURL test server listens on, and that `cfg!(test)`
+/// lightning addresses are resolved against.
+///
+/// Overridable via `MOSTRO_TEST_LN_PORT` so a run can dodge a port already
+/// taken on the host (`make mutation-test` sets 18080) without disturbing
+/// the 8080 default. One definition on purpose: the prod path, its own
+/// test, and the test server in `lightning::invoice` must agree, and three
+/// hand-copied parses would eventually not.
+///
+/// Not gated on `#[cfg(test)]`: the caller sits behind `cfg!(test)`, which
+/// is a runtime boolean, so both branches are compiled in every profile.
+///
+/// `0` is rejected along with unset and unparseable values: it parses as a
+/// valid `u16` but means "let the OS pick" to a listener, which would bind
+/// an arbitrary port while the URL built here still said `:0`.
+pub(crate) fn test_ln_port() -> u16 {
+    std::env::var("MOSTRO_TEST_LN_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(8080)
+}
+
 /// Parse a Lightning Address or bech32 LNURL into an http(s) [`Url`].
 ///
 /// - Lightning Address (`user@domain`) → well-known LNURL-pay endpoint URL
@@ -263,7 +286,7 @@ async fn extract_lnurl(address: &str) -> Result<Url, MostroError> {
             None => return Err(MostroInternalErr(ServiceError::LnAddressParseError)),
         };
         let base_url = if cfg!(test) {
-            format!("http://{domain}:8080")
+            format!("http://{domain}:{}", test_ln_port())
         } else {
             format!("https://{domain}")
         };
@@ -527,12 +550,15 @@ mod tests {
 
     #[tokio::test]
     async fn extract_lnurl_builds_wellknown_url_for_lightning_address() {
+        // cfg!(test) pins lightning addresses to the local test host form,
+        // so this assertion has to track the same override the code uses.
+        let port = super::test_ln_port();
         let extracted = extract_lnurl("alice@127.0.0.1")
             .await
             .expect("lightning address parses");
         assert_eq!(
             extracted.to_string(),
-            "http://127.0.0.1:8080/.well-known/lnurlp/alice"
+            format!("http://127.0.0.1:{port}/.well-known/lnurlp/alice")
         );
     }
 

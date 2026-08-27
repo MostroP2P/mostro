@@ -321,7 +321,7 @@ impl PriceManager {
 
         let now = Utc::now().timestamp();
         self.observe_warnings(&aggregates);
-        self.store.update(aggregates.clone(), now);
+        self.store_with_observation_time(aggregates.clone(), now);
         report.fresh_currencies = aggregates.len();
         report.contributors = contributors;
 
@@ -330,6 +330,49 @@ impl PriceManager {
         }
 
         report
+    }
+
+    /// Write the tick's aggregates, stamping relayed ones from when they
+    /// were **observed** rather than when we ingested them (issue #860).
+    ///
+    /// Without this the two staleness windows stack: the Nostr provider
+    /// accepts an event up to `max_price_staleness_seconds` old, and the
+    /// store would then serve it for another full window from `now` — total
+    /// age up to twice the configured TTL, against a setting whose name
+    /// implies one. Stamping `as_of` with the event's own `created_at`
+    /// bounds it at exactly one TTL, whatever age the event arrived with,
+    /// and needs no configuration.
+    ///
+    /// Two groups get the earlier stamp:
+    /// - currencies whose only surviving contributor is Nostr — a non-Nostr
+    ///   provider covering the currency drops Nostr's quote before
+    ///   aggregation (`restrict_nostr_to_fallback`), so a mixed contributor
+    ///   list containing Nostr cannot occur here;
+    /// - `nostr_anchor_dependent` ones, whose value embeds a relayed rate
+    ///   through a fiat-cross anchor even though `contributors` names only
+    ///   the cross provider (`aggregate.rs`) — the figure is no fresher
+    ///   than the anchor it was built from.
+    fn store_with_observation_time(&self, aggregates: HashMap<String, AggregateResult>, now: i64) {
+        let observed_at = self
+            .providers
+            .iter()
+            .find(|p| p.id == ProviderId::Nostr)
+            .and_then(|p| p.provider.last_observed_at());
+
+        // A future-dated or absent stamp falls through to the existing
+        // behaviour: never move `as_of` forward, that would *extend* the
+        // serving window rather than bound it.
+        let Some(observed_at) = observed_at.filter(|ts| *ts < now) else {
+            self.store.update(aggregates, now);
+            return;
+        };
+
+        let (relayed, direct): (HashMap<_, _>, HashMap<_, _>) = aggregates
+            .into_iter()
+            .partition(|(_, a)| a.contributors == [ProviderId::Nostr] || a.nostr_anchor_dependent);
+
+        self.store.update(direct, now);
+        self.store.update(relayed, observed_at);
     }
 
     /// Wall-clock budget for one provider's poll: `provider_timeout_seconds`
@@ -832,6 +875,9 @@ mod tests {
     struct ScriptedProvider {
         id: ProviderId,
         outcomes: std::sync::Mutex<Vec<Result<ProviderQuotes, ProviderError>>>,
+        /// Stands in for the Nostr provider's relayed-event `created_at`;
+        /// `None` reproduces every HTTP provider's default.
+        observed_at: Option<i64>,
     }
 
     impl ScriptedProvider {
@@ -839,7 +885,13 @@ mod tests {
             Self {
                 id,
                 outcomes: std::sync::Mutex::new(outcomes),
+                observed_at: None,
             }
+        }
+
+        fn observed_at(mut self, ts: i64) -> Self {
+            self.observed_at = Some(ts);
+            self
         }
     }
 
@@ -855,6 +907,10 @@ mod tests {
                 return Ok(ProviderQuotes::new());
             }
             q.remove(0)
+        }
+
+        fn last_observed_at(&self) -> Option<i64> {
+            self.observed_at
         }
     }
 
@@ -901,6 +957,109 @@ mod tests {
 
     fn manager_with(scripted: ScriptedProvider) -> PriceManager {
         manager_with_many(vec![scripted])
+    }
+
+    /// Regression for issue #860. A relayed rate must be stamped from when
+    /// the trusted node observed it, not from when we ingested it —
+    /// otherwise the provider's acceptance window and the store's serving
+    /// window stack, and a price outlives the configured TTL.
+    ///
+    /// One tick, two stamps: Yadio's USD is observed at fetch time and keeps
+    /// `now`; Nostr's ARS carries the age its event already had.
+    #[tokio::test]
+    async fn relayed_currency_is_stamped_from_observation_not_ingestion() {
+        const TTL: i64 = 1_800;
+        const EVENT_AGE: i64 = 900;
+
+        let tick_start = Utc::now().timestamp();
+        let observed_at = tick_start - EVENT_AGE;
+
+        let mut yadio_quotes = ProviderQuotes::new();
+        yadio_quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr_quotes = ProviderQuotes::new();
+        // Uncovered by Yadio, so it survives `restrict_nostr_to_fallback`.
+        nostr_quotes.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio_quotes)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr_quotes)])
+                .observed_at(observed_at),
+        ]);
+        manager.update_all().await;
+
+        // The relayed currency is bounded at exactly one TTL from
+        // observation: servable at the boundary, refused one second past it.
+        assert!(
+            manager.store.get("ARS", TTL, observed_at + TTL).is_ok(),
+            "relayed price must be servable up to one TTL after observation"
+        );
+        assert!(
+            manager
+                .store
+                .get("ARS", TTL, observed_at + TTL + 1)
+                .is_err(),
+            "relayed price must be refused past one TTL from observation"
+        );
+        // Pre-fix, `as_of = now` would have kept it alive until
+        // `observed_at + EVENT_AGE + TTL`. That window is now closed.
+        assert!(
+            manager
+                .store
+                .get("ARS", TTL, observed_at + EVENT_AGE + TTL)
+                .is_err(),
+            "the stacked ingestion + serving window must no longer be reachable"
+        );
+
+        // The directly-observed currency is untouched: still good for a full
+        // TTL measured from this tick.
+        assert!(
+            manager.store.get("USD", TTL, tick_start + TTL).is_ok(),
+            "an HTTP-sourced price must keep the full serving window"
+        );
+    }
+
+    /// A fiat-cross currency whose anchor came from Nostr is no fresher than
+    /// that anchor, even though `contributors` names only the cross provider
+    /// — so it must be backdated too. This is the case
+    /// `contributors == [Nostr]` alone does not catch.
+    #[tokio::test]
+    async fn nostr_anchor_dependent_currency_is_also_backdated() {
+        const TTL: i64 = 1_800;
+        const EVENT_AGE: i64 = 900;
+
+        let observed_at = Utc::now().timestamp() - EVENT_AGE;
+
+        // El Toque quotes CUP per USD; only Nostr supplies the USD anchor,
+        // so CUP resolves through a relayed rate.
+        let mut eltoque_quotes = ProviderQuotes::new();
+        eltoque_quotes.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let mut nostr_quotes = ProviderQuotes::new();
+        nostr_quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::ElToque, vec![Ok(eltoque_quotes)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr_quotes)])
+                .observed_at(observed_at),
+        ]);
+        manager.update_all().await;
+
+        assert!(
+            manager.store.get("CUP", TTL, observed_at + TTL).is_ok(),
+            "the cross currency must be servable up to one TTL from the anchor's observation"
+        );
+        assert!(
+            manager
+                .store
+                .get("CUP", TTL, observed_at + TTL + 1)
+                .is_err(),
+            "a cross currency built on a relayed anchor is no fresher than that anchor"
+        );
     }
 
     #[tokio::test]

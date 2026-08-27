@@ -91,6 +91,13 @@ pub(crate) const INBOX_WATCHDOG_INTERVAL: u64 = 30;
 /// consumer lags, and some ways of losing a subscription produce no frame at
 /// all. This job is the backstop, and the only thing that notices when *every*
 /// relay has gone quiet.
+///
+/// Every guarantee the inbox machinery makes is downstream of this loop still
+/// running, so each audit runs in a task of its own. A panic inside one is
+/// then a `JoinError` this loop can log and move past, instead of the silent
+/// end of the watchdog: with the loop gone the verdict would freeze at
+/// whatever it last was, and frozen at `Listening` means `job_cancel_orders`
+/// resumes slashing bonds against an inbox nobody is auditing any more.
 async fn job_inbox_watchdog(ctx: AppContext) {
     #[allow(deprecated)]
     let event_kind = ctx.settings().mostro.transport.event_kind();
@@ -101,7 +108,18 @@ async fn job_inbox_watchdog(ctx: AppContext) {
             // Sleep first: at startup the event loop has just subscribed, and a
             // REQ still in flight would look exactly like a missing one.
             tokio::time::sleep(tokio::time::Duration::from_secs(INBOX_WATCHDOG_INTERVAL)).await;
-            crate::inbox::check_inbox_health(ctx.nostr_client(), &subscription).await;
+
+            let client = ctx.nostr_client().clone();
+            let subscription = subscription.clone();
+            let audit = tokio::spawn(async move {
+                crate::inbox::check_inbox_health(&client, &subscription).await;
+            });
+            if let Err(e) = audit.await {
+                error!(
+                    "scheduler_inbox_watchdog: audit task ended abnormally ({e}); retrying in \
+                     {INBOX_WATCHDOG_INTERVAL}s"
+                );
+            }
         }
     });
 }

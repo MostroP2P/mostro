@@ -54,7 +54,7 @@
 //! daemon can tell whether Mostro is currently able to hear anything at all.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
@@ -476,6 +476,21 @@ impl InboxHealth {
         Self::at(now_secs())
     }
 
+    /// The shared state, recovering rather than propagating a poisoned lock.
+    ///
+    /// [`HealthState`] is plain data with no invariant a panic could leave
+    /// half-applied, and no user code runs under the guard — so poisoning
+    /// carries no information worth acting on. Propagating it would, though:
+    /// every consumer of this record is a maintenance job, and
+    /// [`Self::is_confirmed_listening`] is read by the timeout job on every
+    /// tick. A panic there kills that task for the life of the process, which
+    /// stops timeouts permanently — hold invoices ride to CLTV expiry and
+    /// bonds never resolve. Taking the data as it stands is strictly better
+    /// than that.
+    fn state(&self) -> MutexGuard<'_, HealthState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn at(installed_at: i64) -> Self {
         Self {
             state: Mutex::new(HealthState {
@@ -502,7 +517,7 @@ impl InboxHealth {
 
     /// Record the current observation, returning the resulting status.
     fn observe(&self, status: InboxStatus, now: i64) -> InboxStatus {
-        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        let mut state = self.state();
         let first_verdict = state.verdict.is_none();
         state.verdict = Some(status);
 
@@ -544,11 +559,7 @@ impl InboxHealth {
     /// known to be listening, which is the question a caller about to act on a
     /// user's silence should be asking. See [`Self::is_confirmed_listening`].
     pub fn is_blind(&self) -> bool {
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
-            .blind_now()
-            .is_some()
+        self.state().blind_now().is_some()
     }
 
     /// Whether an audit has actually confirmed that Mostro can hear.
@@ -560,11 +571,7 @@ impl InboxHealth {
     /// working inbox would otherwise look healthy and start cancelling orders
     /// and slashing bonds over messages it was never in a position to receive.
     pub fn is_confirmed_listening(&self) -> bool {
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
-            .verdict
-            == Some(InboxStatus::Listening)
+        self.state().verdict == Some(InboxStatus::Listening)
     }
 
     /// Seconds the inbox was deaf between `from` and now.
@@ -583,7 +590,7 @@ impl InboxHealth {
     }
 
     fn blind_seconds_between(&self, from: i64, to: i64) -> i64 {
-        let state = self.state.lock().expect("inbox health mutex poisoned");
+        let state = self.state();
         state.windows.iter().map(|w| w.overlap(from, to, to)).sum()
     }
 
@@ -595,7 +602,7 @@ impl InboxHealth {
     /// much downtime is in play this tick.
     pub fn max_blind_seconds(&self) -> i64 {
         let now = now_secs();
-        let state = self.state.lock().expect("inbox health mutex poisoned");
+        let state = self.state();
         state
             .windows
             .iter()
@@ -616,7 +623,7 @@ impl InboxHealth {
     }
 
     fn note_relay_acknowledged_at(&self, relay: &RelayUrl, at: i64) -> bool {
-        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        let mut state = self.state();
         state.acknowledged.insert(relay.clone(), at);
         state.backoff.remove(relay).is_some()
     }
@@ -634,7 +641,7 @@ impl InboxHealth {
     }
 
     fn allow_resubscribe_at(&self, relay: &RelayUrl, now: Instant) -> bool {
-        let mut state = self.state.lock().expect("inbox health mutex poisoned");
+        let mut state = self.state();
         match state.backoff.get_mut(relay) {
             None => {
                 state.backoff.insert(
@@ -667,11 +674,7 @@ impl InboxHealth {
     /// In both cases the audit has to judge the relay on the new evidence
     /// rather than on the old `EOSE`.
     pub fn note_relay_unacknowledged(&self, relay: &RelayUrl) {
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
-            .acknowledged
-            .remove(relay);
+        self.state().acknowledged.remove(relay);
     }
 
     /// Whether `relay` answered the inbox REQ *on its current connection*.
@@ -686,9 +689,7 @@ impl InboxHealth {
     /// The comparison is inclusive so that an `EOSE` landing in the same
     /// second as the connect still counts.
     pub fn has_acknowledged_since(&self, relay: &RelayUrl, connected_at: i64) -> bool {
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
+        self.state()
             .acknowledged
             .get(relay)
             .is_some_and(|&at| at >= connected_at)
@@ -697,9 +698,7 @@ impl InboxHealth {
     /// How long the current outage has been running, or zero if listening.
     pub fn blind_for_secs(&self) -> i64 {
         let now = now_secs();
-        self.state
-            .lock()
-            .expect("inbox health mutex poisoned")
+        self.state()
             .blind_now()
             .map(|w| (now - w.start).max(0))
             .unwrap_or(0)
@@ -713,7 +712,7 @@ impl InboxHealth {
     /// that is not coming.
     pub fn unconfirmed_for_secs(&self) -> i64 {
         let now = now_secs();
-        let state = self.state.lock().expect("inbox health mutex poisoned");
+        let state = self.state();
         if state.verdict == Some(InboxStatus::Listening) && state.blind_now().is_none() {
             return 0;
         }
@@ -853,12 +852,7 @@ mod tests {
 
     /// Whether `health` is currently pacing re-subscribes to `url`.
     fn backing_off(health: &InboxHealth, url: &RelayUrl) -> bool {
-        health
-            .state
-            .lock()
-            .expect("inbox health mutex poisoned")
-            .backoff
-            .contains_key(url)
+        health.state().backoff.contains_key(url)
     }
 
     fn relay_url(url: &str) -> RelayUrl {

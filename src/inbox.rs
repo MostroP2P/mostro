@@ -39,8 +39,11 @@
 //!
 //! Two reason prefixes are the exception. `auth-required` and `rate-limited`
 //! only *mark* the subscription, leaving it registered for the SDK to re-send
-//! by itself, so the keeper stands down on those and lets it: see
-//! [`is_provisional_closure`].
+//! by itself, so the keeper stands down on the REQ and lets it: see
+//! [`is_provisional_closure`]. It does not stand down on the *verdict* — the
+//! relay's acknowledgement is dropped either way, because a subscription the
+//! SDK left registered is not one a relay is answering, and the SDK does not
+//! always get around to re-sending it.
 //!
 //! Not every way of losing the ear announces itself with a frame, though: the
 //! notification channel silently drops messages when the consumer falls
@@ -215,21 +218,33 @@ impl InboxKeeper {
                 message,
             } if subscription_id.as_ref() == self.subscription.id() => {
                 if is_provisional_closure(message) {
-                    // Not the keeper's to answer: the SDK only *marks* these
-                    // two prefixes and re-sends the REQ itself — after the
-                    // NIP-42 round-trip for `auth-required`, on the next
-                    // reconnect for `rate-limited`. Re-issuing the REQ here
+                    // The REQ is not the keeper's to re-send: the SDK only
+                    // *marks* these two prefixes and re-sends it itself —
+                    // after the NIP-42 round-trip for `auth-required`, on the
+                    // next reconnect for `rate-limited`. Re-issuing it here
                     // would drop the entry the SDK is about to re-send, race
                     // its AUTH, and arm a backoff against a relay that is
                     // behaving exactly as the protocol says it should.
                     //
-                    // Whatever the SDK does not get to — a `rate-limited`
-                    // closure on a connection that never drops, an
-                    // `auth-required` one this node cannot answer because it
-                    // has no keys — is left to [`check_inbox_health`]: the
-                    // relay is not acknowledged, so the next audit re-sends
-                    // the REQ. That is the right pace for a relay that has
-                    // just asked to be left alone.
+                    // The *health verdict* is another matter, and must not
+                    // stand down with it. `MarkAsClosed` leaves the entry in
+                    // the SDK's subscription map, so the relay still reads as
+                    // registered; with its earlier `EOSE` also intact the
+                    // audit would count it as serving the inbox forever —
+                    // including in the two cases the SDK never gets to: a
+                    // `rate-limited` closure on a connection that never drops
+                    // (`Relay::resubscribe` only runs on reconnect, and there
+                    // is no retry timer), and an `auth-required` one whose
+                    // AUTH the relay then rejects (the ingester reports
+                    // `AuthenticationFailed` and returns without re-sending).
+                    // Dropping the credit costs nothing on the happy path —
+                    // the replacement REQ is answered and the credit comes
+                    // back one audit later at worst — and turns both dead ends
+                    // into a re-subscribe under the shared backoff instead of
+                    // silent deafness.
+                    if let Some(health) = &self.health {
+                        health.note_relay_unacknowledged(relay_url);
+                    }
                     info!(
                         "Relay {relay_url} closed the Mostro inbox subscription provisionally \
                          (\"{message}\"); recovery is the SDK's or the watchdog's"
@@ -325,7 +340,7 @@ async fn resubscribe_relay(
             );
             return false;
         }
-        health.note_relay_resubscribed(relay.url());
+        health.note_relay_unacknowledged(relay.url());
     }
 
     // A `CLOSED` does not always remove the subscription: rate-limited and
@@ -638,9 +653,16 @@ impl InboxHealth {
         }
     }
 
-    /// Forget `relay`'s acknowledgement, because the REQ has just been sent
-    /// again and has yet to be answered.
-    pub fn note_relay_resubscribed(&self, relay: &RelayUrl) {
+    /// Forget `relay`'s acknowledgement: whatever it said about serving the
+    /// inbox no longer applies.
+    ///
+    /// Two callers, one meaning. A fresh REQ has gone out and has yet to be
+    /// answered ([`resubscribe_relay`]); or the relay closed the subscription
+    /// provisionally, so the entry the SDK left registered is not evidence of
+    /// anything until the replacement REQ is answered ([`InboxKeeper::on_relay_message`]).
+    /// In both cases the audit has to judge the relay on the new evidence
+    /// rather than on the old `EOSE`.
+    pub fn note_relay_unacknowledged(&self, relay: &RelayUrl) {
         self.state
             .lock()
             .expect("inbox health mutex poisoned")
@@ -1113,9 +1135,66 @@ mod tests {
             "a relay the SDK will re-REQ by itself must not be put on the shared backoff"
         );
         assert!(
-            acked(&health, &relay),
-            "the subscription is still registered and still answered, so the credit stands"
+            !acked(&health, &relay),
+            "the relay stopped answering the REQ it acknowledged, so the credit cannot stand"
         );
+    }
+
+    /// The SDK does not always get around to re-sending a provisionally closed
+    /// subscription: `rate-limited` has no retry timer at all (only the next
+    /// reconnect, which never comes on a healthy connection), and an
+    /// `auth-required` whose AUTH the relay then rejects ends the ingester's
+    /// post-auth path without a `resubscribe()`. `MarkAsClosed` leaves the
+    /// entry registered throughout, so registration alone would report a relay
+    /// that stopped serving the inbox as healthy for the life of the
+    /// connection — the exact silent deafness this module exists to prevent.
+    #[tokio::test]
+    async fn a_provisional_closure_the_sdk_never_answers_is_caught_by_the_audit() {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        let relay = LocalRelay::builder().build();
+        relay.run().await.expect("run local relay");
+        let url = relay.url().await;
+
+        let subscription = InboxSubscription::new(pubkey(), Kind::GiftWrap);
+        let client = crate::util::mostro_nostr_client_options(None).build();
+        client.add_relay(url.clone()).await.expect("add_relay");
+        client.connect().await;
+        subscription.subscribe(&client).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let health = Arc::new(InboxHealth::at(T0));
+        let keeper = InboxKeeper::with_health(subscription.clone(), Some(health.clone()));
+        health.note_relay_acknowledged(&url);
+
+        assert_eq!(
+            check_inbox_health_with(&client, &subscription, Some(health.clone())).await,
+            InboxStatus::Listening,
+            "precondition: an answered REQ on a live connection is a healthy inbox"
+        );
+
+        let closed = RelayMessage::Closed {
+            subscription_id: std::borrow::Cow::Owned(subscription.id().clone()),
+            message: std::borrow::Cow::Borrowed("rate-limited: slow down"),
+        };
+        keeper.on_relay_message(&client, &url, &closed).await;
+
+        let sdk_relay = client
+            .relay(&url)
+            .await
+            .expect("relay lookup")
+            .expect("relay in pool");
+        assert!(
+            sdk_relay.subscription(subscription.id()).await.is_some(),
+            "precondition: the entry the SDK leaves registered is what used to vouch for the relay"
+        );
+        assert_eq!(
+            check_inbox_health_with(&client, &subscription, Some(health)).await,
+            InboxStatus::Blind,
+            "a relay that closed the inbox and has not answered since is not serving it"
+        );
+
+        relay.shutdown();
     }
 
     #[tokio::test]

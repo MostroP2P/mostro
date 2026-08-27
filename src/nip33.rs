@@ -28,6 +28,13 @@ fn create_event(
     tags.push(Tag::identifier(identifier));
 
     // Add NIP-40 expiration tag if configured and not already provided.
+    // One string comparison covers both construction paths: `Tag::kind()`
+    // returns the tag's serialized name (its first cell, `nostr` 0.45's
+    // `event/tag/mod.rs`), and both `Tag::expiration(..)` and the
+    // `Tag::custom("expiration", ..)` that `order_to_tags` actually builds
+    // put that literal there. No enum matching and no sdk-side name
+    // normalisation is involved, so neither path can slip past this and
+    // double-stamp an order event.
     let has_expiration_tag = tags
         .iter()
         .chain(extra_tags.iter())
@@ -1624,6 +1631,58 @@ mod tests {
         assert!(
             order.tags.iter().any(|t| t.kind() == "expiration"),
             "order events must carry an expiration tag"
+        );
+    }
+
+    #[test]
+    fn create_event_does_not_duplicate_a_caller_supplied_expiration_tag() {
+        // Order events (kind 38383) always get an auto expiration tag from
+        // config when one isn't already present. Pre-supplying a real NIP-40
+        // expiration tag must suppress the auto-add.
+        init_test_settings();
+        let keys = Keys::generate();
+        let extra_tags = Tags::from_list(vec![Tag::expiration(Timestamp::from(123_456_u64))]);
+
+        let order = super::new_order_event(&keys, "", "order-id".to_string(), extra_tags)
+            .expect("order event");
+
+        let expiration_tags = order
+            .tags
+            .iter()
+            .filter(|t| t.kind() == "expiration")
+            .count();
+        assert_eq!(
+            expiration_tags, 1,
+            "caller-supplied expiration tag must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn a_custom_named_expiration_tag_also_suppresses_the_auto_add() {
+        // `order_to_tags` builds the expiration tag by its custom name, so
+        // this is the shape every real order event reaches `create_event`
+        // with. It satisfies the same check as `Tag::expiration` because both
+        // serialise "expiration" into the tag's first cell — this pins that
+        // the custom-named path is covered, alongside the sibling test for
+        // the typed one.
+        init_test_settings();
+        let keys = Keys::generate();
+        let extra_tags =
+            Tags::from_list(vec![Tag::custom("expiration", vec!["123456".to_string()])]);
+
+        let order = super::new_order_event(&keys, "", "order-id".to_string(), extra_tags)
+            .expect("order event");
+
+        let expiration: Vec<&str> = order
+            .tags
+            .iter()
+            .filter(|t| t.kind() == "expiration")
+            .filter_map(|t| t.content())
+            .collect();
+        assert_eq!(
+            expiration,
+            vec!["123456"],
+            "the caller's tag must be the only expiration tag on the event"
         );
     }
 

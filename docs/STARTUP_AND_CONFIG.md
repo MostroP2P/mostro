@@ -114,10 +114,14 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
     is advisory — the daemon still starts — and tolerates `0640`, the mode LND
     itself writes the macaroon with, so reading it through the node's group
     stays supported.
-  - The same check runs over `settings.toml` and `<settings_dir>/.env` right after
-    the settings load, in both Lightning and Cashu mode: those two carry
-    `nsec_privkey`, which is the instance's identity regardless of which escrow
-    it uses. A missing `.env` is silent, since it is optional.
+  - The same check runs over `settings.toml`, `<settings_dir>/.env` and
+    `<settings_dir>/mostro.db` right after the settings load, in both Lightning and
+    Cashu mode: the first two carry `nsec_privkey`, which is the instance's identity
+    regardless of which escrow it uses, and the database holds the trade history, the
+    disputes and the hold-invoice preimages. SQLite creates the database under the
+    umask, so a settings directory that predates the `0700` default is where a `0644`
+    database comes from. A missing file is silent: `.env` is optional, and the database
+    does not exist yet on a first boot.
   - Only the mode bits are inspected: a POSIX ACL can grant a named user access
     without setting them, so a quiet startup is not proof that no other account
     can read the file.
@@ -236,14 +240,20 @@ There is **no** database password or separate global for SQLite; the daemon open
   `write_owner_only_atomic` stages the line in a fresh `O_EXCL` temporary beside the
   target and `rename`s it into place. `rename` never opens the destination, so a
   planted symlink is replaced rather than followed and its target keeps both its
-  contents and its mode. `.env` matters here as much as `settings.toml`: it carries the
-  same `nsec_privkey`, and in the wizard flow it is written first.
+  contents and its mode. The temporary is `fsync`ed before the rename and the directory
+  after it (`src/config/permissions.rs`, `fn sync_dir`), so the replacement is durable
+  and not merely atomic — a power loss right after an unflushed rename can leave the
+  directory entry pointing at the old file, which for `.env` means losing an
+  `nsec_privkey` the wizard reported as saved. A failed flush is logged and not
+  propagated: the contents are already in place. `.env` matters here as much as
+  `settings.toml`: it carries the same `nsec_privkey`, and in the wizard flow it is
+  written first.
 - It is not a check on startup as a whole. A `settings.toml` that already exists is read
   and loaded normally, symlink or not — `fn init_configuration_file` only reaches the
   creation path when it finds no settings file at all.
 - The guarantee covers the final entry, not the directory path leading to it. The
-  parents `fn create_settings_dir` has to invent are made with a recursive
-  `DirBuilder`, which resolves symlinked components on the way, so a settings directory
+  parents `fn create_settings_dir` has to invent are made with `fs::create_dir_all`,
+  which resolves symlinked components on the way, so a settings directory
   reached through a symlinked parent is created at whatever that link points to. This is
   deliberate: operators do symlink a config directory onto another volume, and planting
   such a link on the default `~/.mostro` path means write access to `$HOME`, which is a

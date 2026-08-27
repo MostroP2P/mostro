@@ -34,7 +34,8 @@ const TEMP_NAME_ATTEMPTS: u32 = 16;
 /// unreadable path is not a permissions problem, and the real failure is
 /// reported with far more context by whoever opens the file (for the macaroon,
 /// `LndConnector::new`). `<settings_dir>/.env` is optional and usually absent,
-/// so its being missing has to stay silent.
+/// and `mostro.db` does not exist yet on a first boot, so a missing file has
+/// to stay silent.
 pub fn warn_if_other_accessible(path: &Path, label: &str) {
     if path.as_os_str().is_empty() {
         return;
@@ -100,11 +101,11 @@ fn other_accessible_mode(_path: &Path) -> Option<u32> {
 /// An existing settings directory is returned as it is, so an operator who
 /// already set one up with deliberate group access keeps it.
 ///
-/// The parents are created with a recursive `DirBuilder`, which resolves
-/// symlinked components on the way. That is deliberate: symlinking a config
-/// directory onto another volume is a legitimate setup, and planting a link on
-/// the default `~/.mostro` path takes write access to `$HOME`, which already
-/// owns the account. A settings directory that is itself a symlink to an
+/// The parents are created with `fs::create_dir_all`, which resolves symlinked
+/// components on the way. That is deliberate: symlinking a config directory
+/// onto another volume is a legitimate setup, and planting a link on the
+/// default `~/.mostro` path takes write access to `$HOME`, which already owns
+/// the account. A settings directory that is itself a symlink to an
 /// existing directory never reaches here — the caller finds it and uses it.
 pub(crate) fn create_settings_dir(settings_dir: &Path) -> Result<(), MostroError> {
     if settings_dir.is_dir() {
@@ -196,6 +197,13 @@ pub(crate) fn create_owner_only(path: &Path, contents: &[u8]) -> Result<(), Most
 /// - The file at `path` is never observed half-written. A `.env` truncated by
 ///   a full disk would otherwise leave the daemon with no `nsec_privkey` at
 ///   all on the next boot.
+///
+/// The contents are `fsync`ed before the rename and the directory after it, so
+/// the replacement survives a crash and not only a process exit. Without the
+/// second one the rename is atomic but not durable: a power loss right after
+/// it can leave the directory entry still pointing at the old file, which for
+/// the wizard's `.env` means an `nsec_privkey` the operator was told was
+/// saved.
 pub(crate) fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<(), MostroError> {
     use std::io::Write;
 
@@ -228,8 +236,35 @@ pub(crate) fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<()
         ))));
     }
 
+    sync_dir(dir);
+
     Ok(())
 }
+
+/// Flush the directory entry the `rename` above just replaced.
+///
+/// `fsync` on a directory descriptor is the POSIX way to make a rename
+/// durable; the data blocks are already on disk from the `sync_all` on the
+/// temporary. Windows has no equivalent, and its rename does not need one.
+///
+/// Failures are logged rather than propagated. The new contents are in place
+/// and visible either way — only the durability of the directory entry is in
+/// question — so returning an error here would fail a write that succeeded and
+/// send the caller into a rollback path with nothing to roll back.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    match fs::File::open(dir).and_then(|dir_file| dir_file.sync_all()) {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(
+            "Wrote the file but could not flush {}: {e}. The contents are in place; only a \
+             crash before the filesystem catches up on its own could still lose them.",
+            dir.display()
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) {}
 
 /// Create an owner-only temporary file next to the target and return it with
 /// its path.

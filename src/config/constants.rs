@@ -30,6 +30,11 @@ pub const ENV_FILENAME: &str = ".env";
 /// Name of the settings file inside the settings directory.
 pub const SETTINGS_FILENAME: &str = "settings.toml";
 
+/// Name of the SQLite database inside the settings directory. The loader
+/// overrides `database.url` with it unconditionally, so this is the only path
+/// the daemon ever opens.
+pub const DB_FILENAME: &str = "mostro.db";
+
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";

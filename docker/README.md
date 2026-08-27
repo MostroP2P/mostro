@@ -64,7 +64,9 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-build
    ```
 
-   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The `config` root itself is set to `0700` as well, since `settings.toml` and `mostro.db` sit next to the credentials. The directories and files this command creates belong to the user who ran it; `mostro.db` is created later by the container and belongs to whoever the container runs as.
+   The admin macaroon grants full control of your LND node, so `make docker-build` writes it to `config/lnd/admin.macaroon` with mode `0600` (owner only) inside a `config/lnd` directory with mode `0700`. The `config` root is set to `0700` too when this command has to create it, and left alone when it is already there (step 2). The directories and files this command creates belong to the user who ran it; `mostro.db` is created later by the container and belongs to whoever the container runs as.
+
+   Under `sudo` there is one extra step, taken for you: `install` recreates its destination as the invoking user, so a plain `sudo make docker-build` would leave a `root:root` macaroon inside a `config` you had already handed to uid 1000, and the container would fail at the LND connection with nothing pointing at ownership. When it runs as root over a `config` that is not root-owned, the command derives `-o`/`-g` from that directory and installs `config/lnd` and both credentials as its owner. A `config` that is root-owned itself is left as it is: `make docker-up` refuses that case outright rather than run the daemon as root.
 
    `make docker-up` runs the container as the owner of `docker/config` and prints the uid/gid it picked. That is the account that can actually read the `0600` macaroon and write `mostro.db` there, whether the directory belongs to you (the usual case after `make docker-build`) or was handed to uid/gid 1000. To pick a different one, export the variable `compose.yml` reads in the same shell:
 
@@ -74,7 +76,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
    A bare `docker compose up` does not derive anything and falls back to `1000:1000`, the image's `mostrouser`.
 
-   `make docker-up` refuses to start when that uid comes out as 0, which is what a `sudo make docker-build` leaves behind: the container would run as root, dropping the one privilege boundary the image has. Either run both targets as the account that owns `docker/config`, or hand the directory over with `sudo chown -R 1000:1000 config` (`docker compose up` then matches, since 1000 is the image default).
+   `make docker-up` refuses to start when that uid comes out as root — both the numeric `0` and the name `root`, the two spellings compose accepts — which is what a `sudo make docker-build` on a fresh tree leaves behind: the container would run as root, dropping the one privilege boundary the image has. Either run both targets as the account that owns `docker/config`, or hand the directory over with `sudo chown -R 1000:1000 config` (`docker compose up` then matches, since the image's `mostrouser` is pinned to uid/gid 1000).
 
 4. [Optional] Set the `MOSTRO_RELAY_LOCAL_PORT` environment variable to the port you want to use for the local relay (defaults to 7000 if not set). This can be set before running `make docker-up`:
 
@@ -118,7 +120,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
    install -m 600 /path/to/your/admin.macaroon ~/mostro-config/lnd/admin.macaroon
    ```
 
-   Mode `0600` on the macaroon inside a `0700` directory means only their owner can reach the file, and the container runs as uid/gid 1000 by default. If your user is not uid 1000, run the container as yourself by adding `--user $(id -u):$(id -g)` to the `docker run` command in step 4 — that also lets it write `mostro.db` into your config directory.
+   Mode `0600` on the macaroon inside a `0700` directory means only their owner can reach the file, and the container runs as uid/gid 1000 by default (the image's `mostrouser`, pinned to those ids). If your user is not uid 1000, run the container as yourself by adding `--user $(id -u):$(id -g)` to the `docker run` command in step 4 — that also lets it write `mostro.db` into your config directory.
 
 3. Edit `~/mostro-config/settings.toml`: set `nsec_privkey`, `relays`, and for Docker set `lnd_cert_file` / `lnd_macaroon_file` to `/config/lnd/...`, `lnd_grpc_host` (e.g. `https://host.docker.internal:10009`), and `[database]` `url = "sqlite:///config/mostro.db"`.
 

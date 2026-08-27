@@ -3,7 +3,7 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::config::constants::{
-    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, SETTINGS_FILENAME,
+    DB_FILENAME, ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, SETTINGS_FILENAME,
 };
 use crate::config::permissions::{create_owner_only, create_settings_dir};
 use crate::config::secret::read_nsec_env_var;
@@ -15,8 +15,6 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
-
-const DB_FILENAME: &str = "mostro.db";
 
 /// Loads the optional `<settings_dir>/.env` file so that values placed there
 /// become available through `std::env::var`. Variables already set in the

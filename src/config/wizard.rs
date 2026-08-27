@@ -7,7 +7,7 @@ use nostr_sdk::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
-use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
+use super::constants::{DB_FILENAME, ENV_FILENAME, NSEC_ENV_VAR};
 use super::permissions::{create_owner_only, write_owner_only_atomic};
 use super::settings::Settings;
 use super::types::{
@@ -84,7 +84,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
 
     // Override database URL to use settings directory
     let mut settings = settings;
-    settings.database.url = format!("sqlite://{}", settings_dir.join("mostro.db").display());
+    settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());
 
     Ok(settings)
 }

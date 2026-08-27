@@ -24,7 +24,7 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 use crate::app::context::AppContext;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
-use crate::config::constants::{ENV_FILENAME, SETTINGS_FILENAME};
+use crate::config::constants::{DB_FILENAME, ENV_FILENAME, SETTINGS_FILENAME};
 use crate::config::{
     get_db_pool, permissions, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG,
     NOSTR_CLIENT,
@@ -68,12 +68,20 @@ async fn main() -> Result<()> {
     // that signs every event this instance publishes sits in one of these two
     // files. Both are what the deployment guides have operators create by hand
     // with `cp`, `curl` or an editor, all of which apply the umask, so a `0644`
-    // settings file is the normal accident. Checked in both Lightning and
-    // Cashu mode, unlike the macaroon further down, because the identity is
-    // not specific to either.
+    // settings file is the normal accident. `mostro.db` is the same directory
+    // and the same accident: SQLite creates it under the umask, and it holds
+    // the trade history, the disputes and the hold-invoice preimages. Checked
+    // in both Lightning and Cashu mode, unlike the macaroon further down,
+    // because none of the three is specific to either.
+    //
+    // The database is checked before it exists on a first boot, which is
+    // silent; a fresh install is not the case this catches. The one it does
+    // catch is the deployment that has been running on a `0755` settings
+    // directory since before any of this existed.
     for (name, label) in [
         (SETTINGS_FILENAME, "Mostro settings file"),
         (ENV_FILENAME, "Mostro env file"),
+        (DB_FILENAME, "Mostro database"),
     ] {
         permissions::warn_if_other_accessible(&settings_dir.join(name), label);
     }

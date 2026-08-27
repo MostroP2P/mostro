@@ -5,8 +5,8 @@ services:
       dockerfile: docker/Dockerfile
     volumes:
       - ./config:/config  # settings.toml and mostro.db
-    # The image's mostrouser is uid/gid 1000, so the default keeps the previous
-    # behaviour. Hosts whose user is not uid 1000 export
+    # The image pins mostrouser to uid/gid 1000, so the default keeps the
+    # previous behaviour. Hosts whose user is not uid 1000 export
     # MOSTRO_CONTAINER_USER=$(id -u):$(id -g) instead of handing ./config over
     # to uid 1000 — the LND macaroon is installed 0600, and the daemon also
     # needs to write mostro.db in the same directory.

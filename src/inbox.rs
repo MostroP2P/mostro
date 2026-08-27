@@ -587,8 +587,12 @@ impl InboxHealth {
         state.windows.iter().map(|w| w.overlap(from, to, to)).sum()
     }
 
-    /// Upper bound on what any order could be owed, for callers that need to
-    /// widen a query before applying the exact per-order figure.
+    /// Upper bound on what any order could be owed.
+    ///
+    /// No decision is taken on this figure — an order's credit is always the
+    /// downtime that overlaps its own wait ([`Self::blind_seconds_since`]).
+    /// It exists so the timeout job can tell an operator, in one line, how
+    /// much downtime is in play this tick.
     pub fn max_blind_seconds(&self) -> i64 {
         let now = now_secs();
         let state = self.state.lock().expect("inbox health mutex poisoned");
@@ -1572,6 +1576,44 @@ mod tests {
         assert!(
             late_at(T0 + 1_200),
             "and it must still expire once it has had its full 900s"
+        );
+    }
+
+    /// Regression: the credit is per order, so an order taken *after* an
+    /// outage ended must expire at its nominal deadline.
+    ///
+    /// The timeout job used to widen `find_order_by_seconds` by
+    /// [`InboxHealth::max_blind_seconds`], which narrows the selection rather
+    /// than widening it — every surviving row was already past
+    /// `deadline + max_blind_seconds`, the per-order check could never spare
+    /// anything, and what shipped was the global allowance this design
+    /// rejects. That allowance grows with every outage in the retention
+    /// window, so a node with flapping relays would postpone every deadline by
+    /// hours of unrelated downtime.
+    #[test]
+    fn an_order_taken_after_an_outage_is_not_credited_for_it() {
+        let health = InboxHealth::at(T0);
+        // One outage: [T0, T0+300].
+        health.observe(InboxStatus::Blind, T0);
+        health.observe(InboxStatus::Listening, T0 + 300);
+
+        let exp_seconds = 900i64;
+        let late_at = |taken_at: i64, now: i64| {
+            let owed = health.blind_seconds_between(taken_at, now);
+            (now - taken_at) >= exp_seconds + owed
+        };
+
+        // A: waited through the whole outage, owed all 300s.
+        assert!(!late_at(T0, T0 + 1_199));
+        assert!(late_at(T0, T0 + 1_200));
+
+        // B: taken after recovery, owed nothing — even though the node's total
+        // downtime is the same 300s the global allowance would have handed it.
+        assert_eq!(health.max_blind_seconds(), 300);
+        assert!(!late_at(T0 + 400, T0 + 1_299));
+        assert!(
+            late_at(T0 + 400, T0 + 1_300),
+            "an order that never lost a second must expire at its nominal deadline"
         );
     }
 

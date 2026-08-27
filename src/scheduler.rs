@@ -19,7 +19,6 @@ use nostr_sdk::prelude::EventBuilder;
 use nostr_sdk::prelude::{FinalizeEvent, Kind as NostrKind, Nip65Tag, Tag};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use util::{enqueue_order_msg, get_nostr_relays, send_dm, update_order_event};
@@ -576,34 +575,34 @@ async fn job_cancel_orders(ctx: AppContext) {
                 }
             }
 
-            // Compensation for inbox downtime is per order, and applied in two
-            // steps. The query widens its window by the most any order could
-            // be owed, so nothing eligible is missed; the exact figure — the
-            // downtime that overlaps *this* order's own wait — then decides.
-            // A single global allowance cannot do this: it would either
-            // under-credit an order that waited through the whole outage or
-            // hand the same credit to one taken long after it ended.
+            // Compensation for inbox downtime is per order, and this loop is
+            // the only place it is applied. `find_order_by_seconds` selects on
+            // the nominal deadline alone — deliberately over-selecting — and
+            // the exact figure, the downtime that overlaps *this* order's own
+            // wait, decides below. A single global allowance cannot do this:
+            // it would either under-credit an order that waited through the
+            // whole outage or hand the same credit to one taken long after it
+            // ended. Widening the query by the largest outage seen would do
+            // the latter, and narrowing it would put the rows this credit is
+            // meant to spare out of reach entirely.
             //
             // The credit is skipped once the pause bound is passed. By then
             // the outage is hours deep, so every waiting order would be owed
             // more than its deadline and none would ever be unwound — which is
             // the state this branch exists to escape. Nobody is punished for
             // it: `blameless` releases the bonds instead of settling them.
-            let max_grace = if blameless {
-                0
-            } else {
-                health.as_ref().map(|h| h.max_blind_seconds()).unwrap_or(0)
-            };
+            let max_grace = health
+                .as_ref()
+                .filter(|_| !blameless)
+                .map(|h| h.max_blind_seconds())
+                .unwrap_or(0);
             if max_grace > 0 {
                 info!(
                     "scheduler_timeout: up to {max_grace}s of inbox downtime is credited against order deadlines"
                 );
             }
 
-            if let Ok(older_orders_list) =
-                crate::db::find_order_by_seconds(pool, Duration::from_secs(max_grace.max(0) as u64))
-                    .await
-            {
+            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
                 for order in older_orders_list.into_iter() {
                     // The tick-start snapshot may be stale by the time this
                     // iteration is reached — re-read and re-confirm before

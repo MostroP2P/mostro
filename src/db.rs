@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::fs::{set_permissions, Permissions};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 // Constants for status filtering used across restore session functions
@@ -537,20 +536,19 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
 /// Orders whose waiting deadline has passed and are therefore candidates for
 /// the timeout job.
 ///
-/// `grace` widens the window by the **most** any order could be owed for time
-/// the daemon spent unable to receive anything (see
-/// [`crate::inbox::InboxHealth::max_blind_seconds`]), so that no order the
-/// caller may still have to spare is filtered out here. It deliberately
-/// over-selects: what a given order is actually owed depends on when it began
-/// waiting, which this query cannot express, so the caller applies the exact
-/// per-order figure to the rows returned.
-pub async fn find_order_by_seconds(
-    pool: &SqlitePool,
-    grace: Duration,
-) -> Result<Vec<Order>, MostroError> {
+/// The nominal deadline is the only thing this query knows about. Compensation
+/// for time the daemon spent unable to receive anything is **not** applied
+/// here: what an order is owed depends on which outages overlap its own wait,
+/// which this predicate cannot express. So the selection deliberately
+/// over-selects — every order past its wall-clock deadline — and the caller
+/// spares the ones it must, order by order (see `scheduler::job_cancel_orders`
+/// and [`crate::inbox::InboxHealth::blind_seconds_since`]). Narrowing the
+/// window here would put those rows out of reach and make the per-order credit
+/// unreachable.
+pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
-    let expire_time = Timestamp::now() - exp_seconds - grace.as_secs();
+    let expire_time = Timestamp::now() - exp_seconds;
     let order = sqlx::query_as::<_, Order>(
         r#"
           SELECT *
@@ -5042,7 +5040,7 @@ mod migration_and_query_tests {
         )
         .await;
 
-        let stale = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
+        let stale = find_order_by_seconds(&pool).await.unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].id, stale_id);
     }
@@ -5086,61 +5084,63 @@ mod migration_and_query_tests {
 
         let after = Order::by_id(&pool, id).await.unwrap().unwrap();
         assert!(after.taken_at > 0, "take must persist taken_at");
-        let stale = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
+        let stale = find_order_by_seconds(&pool).await.unwrap();
         assert!(
             stale.is_empty(),
             "a just-taken order must not be timeout-cancel eligible"
         );
     }
 
+    /// Regression: the query must select on the nominal deadline alone.
+    ///
+    /// It used to subtract the largest outage the node had seen from the
+    /// cut-off, which narrows the selection rather than widening it — every
+    /// surviving row was then already past `deadline + max_blind_seconds`, so
+    /// the scheduler's per-order credit could never spare anything and the
+    /// global allowance the design rejects was what actually shipped. An order
+    /// one second past its deadline has to reach the caller for the per-order
+    /// figure to have anything to decide about.
     #[tokio::test]
-    async fn find_order_by_seconds_grace_spares_orders_the_daemon_could_not_hear() {
+    async fn find_order_by_seconds_selects_on_the_nominal_deadline_alone() {
         init_test_settings();
         let pool = migrated_pool().await;
 
         let exp_seconds = Settings::get_mostro().expiration_seconds as i64;
-        // Taken one minute past the deadline: late by wall time, and the
-        // caller is about to say the node was deaf for longer than that.
-        let taken_at = Timestamp::now().as_secs() as i64 - exp_seconds - 60;
-        let order_id = Uuid::new_v4();
+        let now = Timestamp::now().as_secs() as i64;
+
+        // Barely late: one second past the wall-clock deadline.
+        let late_id = Uuid::new_v4();
         insert_order(
             &pool,
-            order_id,
+            late_id,
             "sell",
             "waiting-buyer-invoice",
             Some(HEX_KEY_A),
             Some(HEX_KEY_B),
             HEX_KEY_B,
-            taken_at,
+            now - exp_seconds - 1,
+        )
+        .await;
+        // Barely not late: one second short of it.
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "waiting-payment",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            now - exp_seconds + 1,
         )
         .await;
 
-        // No grace: the order is treated as late, which is what would cancel
-        // the escrow and slash the bond.
-        let without_grace = find_order_by_seconds(&pool, Duration::ZERO).await.unwrap();
-        assert_eq!(without_grace.len(), 1);
-        assert_eq!(without_grace[0].id, order_id);
-
-        // Owed more downtime than the order is late by: not late at all.
-        let with_grace = find_order_by_seconds(&pool, Duration::from_secs(300))
-            .await
-            .unwrap();
-        assert!(
-            with_grace.is_empty(),
-            "an order cannot be late for a window the daemon spent unable to listen"
-        );
-
-        // A grace smaller than the overshoot still selects it: the query only
-        // has to avoid filtering out rows the caller may spare, and the caller
-        // decides from each order's own downtime.
-        let smaller_grace = find_order_by_seconds(&pool, Duration::from_secs(30))
-            .await
-            .unwrap();
+        let stale = find_order_by_seconds(&pool).await.unwrap();
         assert_eq!(
-            smaller_grace.len(),
+            stale.len(),
             1,
-            "grace only postpones the deadline, it does not remove it"
+            "the cut-off is the nominal deadline, neither widened nor narrowed"
         );
+        assert_eq!(stale[0].id, late_id);
     }
 
     #[tokio::test]

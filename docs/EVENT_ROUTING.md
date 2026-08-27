@@ -37,7 +37,7 @@ The daemon and price clients are built with a `SignerAuthenticator` over the nod
 
 Because those messages are lost rather than delayed, order timeouts cannot be trusted while the inbox is down — a user who answered on time would look silent. `job_cancel_orders` therefore skips its tick entirely unless an audit has confirmed the daemon is listening (`InboxHealth::is_confirmed_listening`): no slash, no refund, no republish. Startup counts as unconfirmed, since the daemon subscribes before the watchdog's first pass.
 
-Once the inbox recovers, each order is credited the downtime **it** waited through. `InboxHealth` keeps the wall-clock windows during which the node was deaf; `blind_seconds_since(taken_at)` intersects them with the order's own wait. An order already waiting when a relay went quiet is owed all of that outage; one taken after it ended is owed nothing. The query widens its window by `max_blind_seconds` so no eligible order is missed, and the exact per-order figure decides.
+Once the inbox recovers, each order is credited the downtime **it** waited through. `InboxHealth` keeps the wall-clock windows during which the node was deaf; `blind_seconds_since(taken_at)` intersects them with the order's own wait. An order already waiting when a relay went quiet is owed all of that outage; one taken after it ended is owed nothing. `find_order_by_seconds` selects on the nominal deadline alone — the credit is applied only in the scheduler's loop, order by order, where it can only ever spare.
 
 The credit has to be per order rather than one global allowance: a single figure either under-credits an order that waited through the whole outage or hands the same credit to one taken long afterwards.
 

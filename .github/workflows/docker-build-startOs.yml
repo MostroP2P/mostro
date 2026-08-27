@@ -13,6 +13,11 @@ on:
         description: 'Image tag for manual runs (cannot be "latest" or a vX.Y.Z release tag; default: dev-<short-sha>)'
         required: false
         default: ''
+      dry_run:
+        description: 'Build without pushing and print the latest promotion target without writing it'
+        type: boolean
+        required: false
+        default: false
 
 # The images are pushed with the Docker Hub credentials and the layer cache
 # uses the runner's own token, so nothing here needs GITHUB_TOKEN beyond the
@@ -119,11 +124,14 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
-          push: true
+          # A dry run exercises the whole chain without writing to the registry.
+          push: ${{ !inputs.dry_run }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped per image: a single shared scope makes the two matrix jobs
+          # evict each other's cache on every run.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
   # `latest` is moved after both images exist, not while they are being built:
   # deciding at build time froze the answer for the length of a multi-arch
@@ -142,9 +150,11 @@ jobs:
   promote-latest:
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.dry_run
     concurrency:
-      group: docker-latest-promotion
+      # A dry run resolves the target without writing it, so it must stay out of
+      # the real queue: taking a slot there would cancel a pending promotion.
+      group: docker-latest-promotion${{ inputs.dry_run && '-dry-run' || '' }}
       cancel-in-progress: false
     steps:
       - name: Login to Docker Hub
@@ -154,29 +164,69 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Move latest to the highest published release
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+
+          # `latest` belongs to one of the newest releases. Walking the whole
+          # tag list costs two registry calls per tag and is also the path that
+          # ends with an old version being promoted.
+          max_candidates=5
+          images=(mostrop2p/mostro mostrop2p/mostro-startos)
+
+          # Assigned before the pipeline so `set -e` sees a failing ls-remote:
+          # inside a process substitution its status is lost and an unreachable
+          # remote would end the step on the "nothing to promote" path.
           # Only the tag list is needed, so it is read from the remote rather
           # than from a checkout of the whole history.
+          tags="$(git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 'v*')"
           mapfile -t candidates < <(
-            git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 'v*' \
-              | sed 's#.*refs/tags/##' \
+            sed 's#.*refs/tags/##' <<<"$tags" \
               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -rV
+              | sort -rV \
+              | head -n "$max_candidates"
           )
+
+          # A missing manifest is the only failure that means "not published
+          # yet". Reading a rate limit, a 5xx or an expired token as absence
+          # would skip the newest release and move `latest` back to an older
+          # one with the job green, which is a wrong publish rather than a
+          # recoverable no-op.
+          is_published() {
+            local ref="$1" out
+            if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown' <<<"$out"; then
+              return 1
+            fi
+            echo "::error::cannot tell whether $ref is published: $out"
+            exit 1
+          }
+
           for candidate in "${candidates[@]}"; do
             published=true
-            for image in mostrop2p/mostro mostrop2p/mostro-startos; do
-              docker buildx imagetools inspect "$image:$candidate" >/dev/null 2>&1 || {
+            for image in "${images[@]}"; do
+              is_published "$image:$candidate" || {
                 published=false
                 break
               }
             done
             [[ "$published" == true ]] || continue
-            for image in mostrop2p/mostro mostrop2p/mostro-startos; do
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "dry run: latest would move to $candidate"
+              exit 0
+            fi
+            for image in "${images[@]}"; do
               docker buildx imagetools create -t "$image:latest" "$image:$candidate"
             done
             echo "latest -> $candidate"
             exit 0
           done
-          echo "::warning::no published version tag found, leaving latest untouched"
+
+          # This job is the only thing that moves `latest`, and on a release it
+          # runs after its own images were pushed, so an empty result is a
+          # broken state and not a normal outcome.
+          echo "::error::no published version tag among the newest $max_candidates, latest left untouched"
+          exit 1

@@ -7,7 +7,7 @@ How Nostr events become actions and side effects.
 - Steps: POW check → signature verify → recency guard → NIP-59 unwrap → parse `mostro_core::Message` → inner verify → `check_trade_index` → dispatch.
 
 ## The Inbox Subscription
-- Source: `src/inbox.rs`
+- Source: `src/inbox/mod.rs` (subscription, keeper, watchdog audit) and `src/inbox/health.rs` (the health record the scheduler reads)
 - Every trade message reaches Mostro over a single long-lived subscription, sent by the event loop (`app::run` / `app::run_cashu`) right after it takes its notification stream — a receiver created after the REQ would miss the relay's `EOSE` — with a stable id (`InboxSubscription`) so that later frames can be attributed to it. Its filter is p-tagged to the node, restricted to the configured transport's event kind, and carries `limit(0)`: only live traffic is wanted.
 - `run` consumes the whole notification stream, not just events. `ClientNotification::Message` carries the relay control plane and goes to `InboxKeeper`; `ClientNotification::Shutdown` ends the loop.
 

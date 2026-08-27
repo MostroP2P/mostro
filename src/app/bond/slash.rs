@@ -60,7 +60,8 @@ use super::db::{
     find_range_root_order,
 };
 use super::flow::{
-    release_bond, release_bonds_for_order_or_warn, release_taker_bonds_for_order_or_warn,
+    release_bond, release_bonds_for_order, release_bonds_for_order_or_warn,
+    release_taker_bonds_for_order, release_taker_bonds_for_order_or_warn,
 };
 use super::math::compute_node_share;
 use super::model::Bond;
@@ -491,8 +492,23 @@ async fn release_on_timeout(pool: &Pool<Sqlite>, order_id: Uuid, republishes: bo
 /// evidence of abandonment, so every bond involved is released rather than
 /// settled — the republish-vs-cancel distinction is honoured exactly as in
 /// [`slash_or_release_on_timeout`].
-pub async fn release_on_timeout_without_slashing(pool: &Pool<Sqlite>, order: &Order) {
-    release_on_timeout(pool, order.id, order_republishes_on_timeout(order)).await;
+///
+/// Unlike [`release_on_timeout`] this **propagates** a failure, for the same
+/// reason [`slash_or_release_on_timeout`] returns a `Result`: the caller is
+/// about to persist the order out of `find_order_by_seconds`'s waiting-state
+/// eligibility window, so a swallowed error would leave the bond `Locked`
+/// with no later tick to look at it again. It also fires on *every* waiting
+/// order in one pass, hours into an outage — precisely when a DB under stress
+/// is most likely to fail.
+pub async fn release_on_timeout_without_slashing(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+) -> Result<(), MostroError> {
+    if order_republishes_on_timeout(order) {
+        release_taker_bonds_for_order(pool, order.id).await
+    } else {
+        release_bonds_for_order(pool, order.id).await
+    }
 }
 
 pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
@@ -2276,6 +2292,111 @@ mod tests {
         assert_eq!(
             read_bond_state(&pool, bond.id).await,
             BondState::Released.to_string()
+        );
+    }
+
+    // ── blameless unwind (inbox outage past the pause bound) ────────────────
+
+    #[tokio::test]
+    async fn blameless_timeout_release_frees_the_bonds_and_reports_success() {
+        // Buy order in WaitingBuyerInvoice: the maker is responsible, so the
+        // order dies rather than returning to the book and every bond is
+        // released. The caller needs the `Ok` before it may cancel/republish.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Buy,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+
+        release_on_timeout_without_slashing(&pool, &order)
+            .await
+            .expect("release succeeds against a healthy DB");
+
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Released.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn blameless_timeout_release_retains_the_maker_bond_on_a_republish() {
+        // Sell order in WaitingBuyerInvoice: the taker is responsible, the
+        // order goes back to the book, and the maker is still committed to it.
+        // Not slashing anyone does not change that distinction.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let maker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            maker_pk(),
+            BondRole::Maker,
+            BondState::Locked,
+        )
+        .await;
+        let taker_bond = insert_bond_with_role(
+            &pool,
+            order.id,
+            taker_pk(),
+            BondRole::Taker,
+            BondState::Locked,
+        )
+        .await;
+
+        release_on_timeout_without_slashing(&pool, &order)
+            .await
+            .expect("release succeeds against a healthy DB");
+
+        assert_eq!(
+            read_bond_state(&pool, taker_bond.id).await,
+            BondState::Released.to_string()
+        );
+        assert_eq!(
+            read_bond_state(&pool, maker_bond.id).await,
+            BondState::Locked.to_string(),
+            "the maker's commitment follows the order back to the book"
+        );
+    }
+
+    #[tokio::test]
+    async fn blameless_timeout_release_propagates_a_db_failure() {
+        // Regression: this used to funnel into the `_or_warn` helpers, whose
+        // documented contract is to swallow the error. The scheduler then fell
+        // through to cancel/republish, persisting the order out of
+        // `find_order_by_seconds`'s waiting-state eligibility window with the
+        // bond still `Locked` and no tick left that would ever look at it
+        // again. The failure has to reach the caller so it can stay eligible.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Buy,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE bonds")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            release_on_timeout_without_slashing(&pool, &order)
+                .await
+                .is_err(),
+            "a bond lookup failure must reach the caller, not just a log line"
         );
     }
 

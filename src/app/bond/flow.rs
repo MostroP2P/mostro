@@ -642,17 +642,25 @@ pub async fn release_bonds_for_order_or_warn(
     }
 }
 
-/// Like [`release_bonds_for_order_or_warn`] but **retains the maker's
-/// bond** — the waiting-timeout republish path (see [`release_active_bonds`]).
-/// The maker's `Locked` bond stays put because the order returns to the
-/// book with the maker still committed; only the abandoning taker side is
-/// released.
+/// Like [`release_bonds_for_order`] but **retains the maker's bond** — the
+/// waiting-timeout republish path (see [`release_active_bonds`]). The maker's
+/// `Locked` bond stays put because the order returns to the book with the
+/// maker still committed; only the abandoning taker side is released.
+pub async fn release_taker_bonds_for_order(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+) -> Result<(), MostroError> {
+    release_active_bonds(pool, order_id, true).await
+}
+
+/// Best-effort [`release_taker_bonds_for_order`], for the call sites that
+/// cannot act on the failure anyway (see [`release_bonds_for_order_or_warn`]).
 pub async fn release_taker_bonds_for_order_or_warn(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     context: &'static str,
 ) {
-    if let Err(e) = release_active_bonds(pool, order_id, true).await {
+    if let Err(e) = release_taker_bonds_for_order(pool, order_id).await {
         warn!("{context}: bond release failed for {}: {}", order_id, e);
     }
 }

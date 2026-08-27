@@ -725,7 +725,21 @@ async fn job_cancel_orders(ctx: AppContext) {
                         // CLTV expiry — but every bond is released rather than
                         // settled.
                         if blameless {
-                            bond::release_on_timeout_without_slashing(pool, &order).await;
+                            // Same exposure as the `Err` arm below, and the
+                            // same answer: the cancel/republish that follows
+                            // persists the order out of the waiting-state
+                            // eligibility window, so a dropped release would
+                            // leave the bond `Locked` with no tick that will
+                            // ever look at it again. Stay eligible and retry.
+                            if let Err(e) =
+                                bond::release_on_timeout_without_slashing(pool, &order).await
+                            {
+                                tracing::warn!(
+                                    "scheduler_timeout: blameless bond release failed for {} ({}); skipping cancel/republish so next tick retries",
+                                    order.id, e
+                                );
+                                continue;
+                            }
                         } else {
                             match bond::slash_or_release_on_timeout(
                                 pool,

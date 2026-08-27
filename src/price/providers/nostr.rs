@@ -214,6 +214,7 @@ impl NostrProvider {
     /// even though a usable redundant trusted node is right there. Split out
     /// from [`Self::fetch`] so the fallback behavior is unit-testable
     /// without a relay.
+    ///
     /// Returns the winning event alongside its quotes: the caller needs its
     /// `created_at` to stamp `as_of` from when the rate was observed rather
     /// than when we ingested it (issue #860).

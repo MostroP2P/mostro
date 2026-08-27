@@ -323,7 +323,10 @@ mod tests {
             )
             .layer(tower_http::cors::CorsLayer::permissive());
 
-        let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+        // Same source of truth as the code that builds the URL.
+        let listener = TcpListener::bind(("127.0.0.1", crate::lnurl::test_ln_port()))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
 

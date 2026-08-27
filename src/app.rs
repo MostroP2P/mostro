@@ -320,6 +320,17 @@ async fn handle_message_action(
     }
 }
 
+/// True when the inner rumor is missing a required signature. Full-privacy
+/// clients reuse the trade key as identity and send unsigned rumors; any
+/// other identity/sender split must carry a valid inner signature.
+fn missing_inner_signature(
+    identity: PublicKey,
+    sender: PublicKey,
+    signature: Option<Signature>,
+) -> bool {
+    identity != sender && signature.is_none()
+}
+
 /// Decode and fully validate one relay event into a dispatchable
 /// `(action, message, unwrapped)` triple, or `None` if it must be skipped
 /// (failed PoW, wrong kind, invalid event signature, spam-gate drop, decrypt
@@ -435,7 +446,7 @@ async fn accept_event(
     // unsigned rumors. Any other shape must carry a valid inner
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
-    if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+    if missing_inner_signature(unwrapped.identity, unwrapped.sender, unwrapped.signature) {
         tracing::warn!(
             "Missing inner signature: identity {} differs from trade key {}",
             unwrapped.identity,
@@ -527,6 +538,12 @@ fn is_stale(created_at: Timestamp) -> bool {
         .checked_sub_signed(chrono::Duration::seconds(10))
         .unwrap()
         .timestamp() as u64;
+    is_stale_since(created_at, since_time)
+}
+
+/// The comparison itself, with the cutoff passed in so its boundary can be
+/// hit exactly instead of racing the clock.
+fn is_stale_since(created_at: Timestamp, since_time: u64) -> bool {
     created_at.as_secs() < since_time
 }
 
@@ -829,6 +846,53 @@ mod tests {
     }
 
     #[test]
+    fn is_stale_since_rejects_events_older_than_the_cutoff() {
+        assert!(is_stale_since(Timestamp::from(99), 100));
+    }
+
+    #[test]
+    fn is_stale_since_accepts_events_exactly_at_the_cutoff() {
+        assert!(!is_stale_since(Timestamp::from(100), 100));
+    }
+
+    #[test]
+    fn is_stale_since_accepts_events_newer_than_the_cutoff() {
+        assert!(!is_stale_since(Timestamp::from(101), 100));
+    }
+
+    #[test]
+    fn is_stale_drops_an_hour_old_event_and_keeps_a_fresh_one() {
+        let now = Timestamp::now().as_secs();
+        assert!(is_stale(Timestamp::from(now - 3600)));
+        assert!(!is_stale(Timestamp::from(now)));
+    }
+
+    #[test]
+    fn missing_inner_signature_true_when_identity_and_sender_differ_unsigned() {
+        let identity = create_test_keys().public_key();
+        let sender = create_test_keys().public_key();
+        assert!(missing_inner_signature(identity, sender, None));
+    }
+
+    #[test]
+    fn missing_inner_signature_false_when_identity_equals_sender_unsigned() {
+        let same = create_test_keys().public_key();
+        assert!(!missing_inner_signature(same, same, None));
+    }
+
+    #[test]
+    fn missing_inner_signature_false_when_signed_even_if_identity_differs() {
+        let identity = create_test_keys().public_key();
+        let sender_keys = create_test_keys();
+        let sig = sender_keys.sign_schnorr([7u8; 32]);
+        assert!(!missing_inner_signature(
+            identity,
+            sender_keys.public_key(),
+            Some(sig)
+        ));
+    }
+
+    #[test]
     fn test_warning_msg_all_error_types() {
         let action = Action::NewOrder;
 
@@ -900,6 +964,9 @@ mod tests {
     /// to the daemon could censor a trade message by racing in a same-id,
     /// signature-tampered copy: the copy would be recorded and the genuine
     /// event dropped as a replay.
+    ///
+    /// It also holds the direct tests of `accept_event`'s other gates: the
+    /// accepted kind, the receiver, and the first-contact PoW lane.
     mod accept_event_ordering_tests {
         use super::*;
         use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
@@ -932,7 +999,7 @@ mod tests {
         }
 
         /// Drive `accept_event` over a v2 (kind-14) event with an explicit
-        /// gate, the shape both ordering tests below need.
+        /// gate, the shape most tests below need.
         async fn accept(
             ctx: &AppContext,
             event: &Event,
@@ -1009,6 +1076,140 @@ mod tests {
             )
             .await;
             assert!(accepted.is_none());
+        }
+
+        /// The first-contact lane: an unseen sender that clears
+        /// `pow_first_contact` is let through to the decrypt.
+        #[tokio::test]
+        async fn unknown_first_contact_sender_clearing_the_pow_bar_is_accepted() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+
+            // `accept` pins pow_first_contact = 0, trivially cleared, and a
+            // freshly generated trade key is never known to the gate.
+            assert!(
+                accept(&ctx, &v2_event(&mostro), &mostro, &gate)
+                    .await
+                    .is_some(),
+                "an unknown sender over the PoW bar must reach the decrypt"
+            );
+        }
+
+        /// The same lane refusing: only `pow_first_contact` differs, so the
+        /// toll is what decides, not the event or the gate.
+        #[tokio::test]
+        async fn unknown_first_contact_sender_below_the_pow_bar_is_dropped() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+
+            // u8::MAX demands more leading-zero bits than any real event id
+            // will ever have, so this fails deterministically.
+            let result = accept_event(
+                &ctx,
+                &v2_event(&mostro),
+                &mostro,
+                0,
+                u8::MAX,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                Some(&gate),
+            )
+            .await;
+
+            assert!(result.is_none());
+        }
+
+        fn wrap_test_message(
+            identity_keys: &Keys,
+            trade_keys: &Keys,
+            receiver: PublicKey,
+        ) -> Event {
+            // RestoreSession carries no payload, which keeps this helper free of
+            // a hand-built `Payload::Order`. The trade-index path it short-circuits
+            // is covered directly by `check_trade_index_tests`.
+            wrap_message_nip44(
+                &create_test_message(Action::RestoreSession, None),
+                identity_keys,
+                trade_keys,
+                receiver,
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event")
+        }
+
+        #[tokio::test]
+        async fn accepts_a_validly_wrapped_event_and_returns_the_action() {
+            let ctx = create_migrated_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event = wrap_test_message(&identity_keys, &trade_keys, receiver_keys.public_key());
+
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await;
+
+            let (action, _message, unwrapped) = result.expect("valid event should be accepted");
+            assert_eq!(action, Action::RestoreSession);
+            assert_eq!(unwrapped.sender, trade_keys.public_key());
+            assert_eq!(unwrapped.identity, identity_keys.public_key());
+        }
+
+        #[tokio::test]
+        async fn rejects_an_event_of_the_wrong_kind() {
+            let ctx = create_migrated_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let receiver_keys = create_test_keys();
+            let event = wrap_test_message(&identity_keys, &trade_keys, receiver_keys.public_key());
+
+            // The event is a real, validly-signed kind-14 event; accepted_kind is
+            // deliberately mismatched to exercise the kind-gate on its own.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &receiver_keys,
+                0,
+                0,
+                NostrKind::TextNote,
+                None,
+            )
+            .await;
+
+            assert!(result.is_none());
+        }
+
+        #[tokio::test]
+        async fn rejects_an_event_not_addressed_to_the_receiver() {
+            let ctx = create_migrated_ctx().await;
+            let identity_keys = create_test_keys();
+            let trade_keys = create_test_keys();
+            let intended_receiver = create_test_keys();
+            let eavesdropper = create_test_keys();
+            let event =
+                wrap_test_message(&identity_keys, &trade_keys, intended_receiver.public_key());
+
+            // The NIP-44 decrypt fails for a key it was not encrypted to.
+            let result = accept_event(
+                &ctx,
+                &event,
+                &eavesdropper,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await;
+
+            assert!(result.is_none());
         }
     }
 

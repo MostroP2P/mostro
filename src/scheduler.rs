@@ -385,10 +385,12 @@ pub(crate) async fn notify_users_canceled_order(
     // Neutral wording on purpose: this helper serves several closure paths
     // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
     // specific cause is logged by each caller, not here.
+    // Both trade keys in one line links the two counterparties of a trade
+    // to each other — the published order event carries no maker or taker
+    // pubkey, so that pairing is not otherwise derivable. The order id is
+    // the useful half and is kept.
     tracing::info!(
-        "Notifying maker {} and taker {} that order {} was not completed",
-        maker_pubkey.to_string(),
-        taker_pubkey.to_string(),
+        "Notifying maker and taker that order {} was not completed",
         old_order.id
     );
 

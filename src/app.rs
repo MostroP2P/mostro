@@ -414,10 +414,13 @@ async fn accept_event(
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
     if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+        // The identity and the trade key in one record is exactly the
+        // linkage the two-key design keeps to Mostro alone. `event.id` is
+        // already public on the relay and is what you need to chase a
+        // non-conforming client anyway.
         tracing::warn!(
-            "Missing inner signature: identity {} differs from trade key {}",
-            unwrapped.identity,
-            unwrapped.sender
+            "Missing inner signature on event {}: identity differs from trade key",
+            event.id
         );
         return None;
     }

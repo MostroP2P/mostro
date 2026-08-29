@@ -664,10 +664,11 @@ When enabled, exposes gRPC interface on `127.0.0.1:50051` for:
 - Solver management
 
 Enabling it **requires** a bearer token in the `MOSTRO_RPC_TOKEN` environment
-variable (or `~/.mostro/.env`); the daemon refuses to start without one, and
-refuses a non-loopback bind unless `allow_remote = true`. Reaching this port is
-equivalent to holding the operator key — see the security notes in
-[docs/RPC.md](docs/RPC.md).
+variable (or `~/.mostro/.env`); the daemon refuses to start without one — or
+with a hand-typed one: at least 32 characters and 16 distinct characters are
+enforced — and refuses a non-loopback bind unless `allow_remote = true`.
+Reaching this port is equivalent to holding the operator key — see the security
+notes in [docs/RPC.md](docs/RPC.md).
 
 ```bash
 # ~/.mostro/.env

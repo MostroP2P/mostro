@@ -20,7 +20,7 @@ Add the following section to your `settings.toml` (`enabled`, `listen_address` a
 enabled = true
 # RPC server listen address (required key; default="127.0.0.1")
 listen_address = "127.0.0.1"
-# RPC server port (required key; default=50051)
+# RPC server port (required key; default=50051; 0 is refused at startup)
 port = 50051
 # Optional: acknowledge a non-loopback bind (default=false)
 allow_remote = false
@@ -34,7 +34,9 @@ allow_remote = false
 unbracketed `::1` are refused at startup rather than accepted and then failed on
 at bind time: `fn validate_rpc_settings` in `src/config/util.rs` and `fn bind`
 for `RpcServer` in `src/rpc/server.rs` both resolve the address through
-`fn listen_socket_addr` in `src/rpc/server.rs`.
+`fn listen_socket_addr` in `src/config/util.rs`. `port` must not be 0: an
+ephemeral port changes on every restart, so no client could be configured
+against it.
 
 The bearer token is **not** configured here. It is read from the `MOSTRO_RPC_TOKEN`
 environment variable, which the daemon also picks up from `<settings_dir>/.env`:
@@ -46,7 +48,11 @@ MOSTRO_RPC_TOKEN=<output of: openssl rand -base64 32>
 
 `settings.toml` is the file operators paste into bug reports, so it never holds
 the credential. The daemon **refuses to start** when `enabled = true` and the
-variable is unset or shorter than 32 characters.
+variable is unset, shorter than 32 characters, or built from fewer than 16
+distinct characters. The last gate rejects hand-typed values such as a repeated
+word: the decision not to rate-limit authentication assumes a randomly
+generated token, so length alone is not enough. Anything produced by
+`openssl rand -base64 32` passes all three.
 
 ## Available Admin Operations
 
@@ -213,6 +219,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+The plaintext `http://` channel above is the loopback case. Against a server
+configured with `tls_cert_path`/`tls_key_path` — which the Security
+Considerations below require for any non-loopback exposure — the channel must
+speak TLS, or `connect` fails with a transport error that never mentions TLS:
+
+```rust
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+
+let tls = ClientTlsConfig::new()
+    .ca_certificate(Certificate::from_pem(std::fs::read("/etc/mostro/rpc-cert.pem")?))
+    .domain_name("mostro.example.com");
+let channel = Channel::from_static("https://mostro.example.com:50051")
+    .tls_config(tls)?
+    .connect()
+    .await?;
 ```
 
 ## Security Considerations

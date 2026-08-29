@@ -8,8 +8,10 @@
 //! authorization, so the transport has to be the gate.
 //!
 //! The authentication *decision* is deliberately not rate-limited.
-//! `MIN_RPC_TOKEN_LEN` keeps the search space far out of reach of online
-//! guessing, and tonic's [`Interceptor`] is synchronous while
+//! `MIN_RPC_TOKEN_LEN` and `MIN_RPC_TOKEN_DISTINCT_CHARS` — enforced at
+//! startup by `config::util::validate_rpc_settings` — keep the search space
+//! of accepted tokens far out of reach of online guessing, and tonic's
+//! [`Interceptor`] is synchronous while
 //! [`crate::rpc::rate_limiter::RateLimiter`] is async, so wiring one in would
 //! mean a second, parallel limiter for no security gain.
 //!

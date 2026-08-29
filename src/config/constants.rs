@@ -41,3 +41,11 @@ pub const RPC_TOKEN_ENV_VAR: &str = "MOSTRO_RPC_TOKEN";
 /// shortest base64 encoding of 24 random bytes, well past the point where
 /// online guessing against a single daemon is meaningful.
 pub const MIN_RPC_TOKEN_LEN: usize = 32;
+
+/// Minimum number of distinct characters in `MOSTRO_RPC_TOKEN`. The length
+/// floor alone is satisfied by `"a"` repeated 32 times, and the decision not
+/// to rate-limit authentication (`crate::rpc::auth`) leans on the token being
+/// randomly generated, not merely long. Random tokens clear this easily —
+/// `openssl rand -base64 32` yields ~30 distinct characters on average —
+/// while hand-typed passphrases do not.
+pub const MIN_RPC_TOKEN_DISTINCT_CHARS: usize = 16;

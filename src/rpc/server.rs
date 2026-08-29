@@ -3,43 +3,19 @@
 use crate::config::constants::RPC_TOKEN_ENV_VAR;
 use crate::config::secret::read_rpc_token_env_var;
 use crate::config::settings::Settings;
+use crate::config::util::listen_socket_addr;
 use crate::lightning::LndConnector;
 use crate::rpc::auth::BearerAuth;
 use crate::rpc::service::AdminServiceImpl;
 use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::info;
 
 use super::admin::admin_service_server::AdminServiceServer;
-
-/// Resolve `[rpc].listen_address` and `[rpc].port` into the address the server
-/// binds.
-///
-/// `SocketAddr` only parses IP literals, with IPv6 bracketed. Hostnames such as
-/// `localhost` and bare `::1` are therefore not bindable addresses, however
-/// natural they look in a config file.
-///
-/// `config::util::validate_rpc_settings` calls this too, so a `listen_address`
-/// that passes validation is guaranteed to be one `bind` can use: the two must
-/// never disagree, or the daemon accepts a config at startup and then dies on
-/// it.
-pub(crate) fn listen_socket_addr(
-    listen_address: &str,
-    port: u16,
-) -> Result<std::net::SocketAddr, String> {
-    format!("{listen_address}:{port}")
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| {
-            format!(
-                "Invalid address {listen_address:?}: {e}. Expected an IP literal, with IPv6 \
-                 bracketed — for example 127.0.0.1, [::1] or 0.0.0.0. Hostnames such as \
-                 \"localhost\" are not resolved."
-            )
-        })
-}
 
 /// RPC server for admin operations
 pub struct RpcServer {
@@ -101,7 +77,14 @@ impl RpcServer {
 
         let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client);
 
-        let mut builder = Server::builder();
+        // The admin surface is reachable off-host under `allow_remote`, and
+        // the interceptor rejects requests without closing connections, so the
+        // transport carries its own limits.
+        let mut builder = Server::builder()
+            .timeout(Duration::from_secs(30))
+            .max_concurrent_streams(Some(64))
+            .http2_keepalive_interval(Some(Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)));
         let transport = match &self.tls {
             Some((cert_path, key_path)) => {
                 let cert = std::fs::read(cert_path)
@@ -119,8 +102,12 @@ impl RpcServer {
 
         // Binds eagerly: an occupied port is a startup error, not a surprise
         // discovered later by whoever happens to read the logs.
-        let incoming =
-            TcpIncoming::bind(addr).map_err(|e| format!("Failed to bind {addr}: {e}"))?;
+        // `serve_with_incoming` ignores the builder's TCP settings, so the
+        // nodelay default `Server::serve` would have applied is set on the
+        // listener here — without it Nagle delays every small admin frame.
+        let incoming = TcpIncoming::bind(addr)
+            .map_err(|e| format!("Failed to bind {addr}: {e}"))?
+            .with_nodelay(Some(true));
         let bound = incoming
             .local_addr()
             .map_err(|e| format!("Failed to read the address bound to {addr}: {e}"))?;
@@ -198,9 +185,11 @@ mod tests {
         }
     }
 
-    // `MOSTRO_RPC_TOKEN` is process-wide state, so the tests that touch it run
-    // serially. Async-aware because the guard is held across awaits.
-    static RPC_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // `MOSTRO_RPC_TOKEN` is process-wide state, so the tests that touch it
+    // serialize on the crate-wide environment lock. One lock for the whole
+    // environment, not one per variable: two tests holding two different locks
+    // would still race glibc's `setenv` against `getenv` elsewhere.
+    use crate::config::util::ENV_LOCK;
 
     /// Sets `MOSTRO_RPC_TOKEN` for the duration of a test and restores the
     /// previous value on drop.
@@ -268,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_unparseable_address() {
         init_test_settings();
-        let _lock = RPC_TOKEN_LOCK.lock().await;
+        let _lock = ENV_LOCK.lock().await;
         let _token = RpcTokenGuard::set(&"t".repeat(32));
         // `localhost` and bare `::1` are in here on purpose: they read like
         // valid loopback spellings, and `config::util` rejects them for exactly
@@ -287,29 +276,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn listen_socket_addr_accepts_only_bindable_literals() {
-        for address in ["127.0.0.1", "[::1]", "0.0.0.0", "[::]"] {
-            assert!(
-                listen_socket_addr(address, 50051).is_ok(),
-                "{address} is a bindable literal"
-            );
-        }
-        for address in ["localhost", "::1", "::", "mostro.example.com", ""] {
-            assert!(
-                listen_socket_addr(address, 50051).is_err(),
-                "{address} is not a bindable literal"
-            );
-        }
-    }
-
     /// The startup invariant the daemon depends on: a listener that cannot be
     /// acquired is reported by `bind` itself, so `main` learns about it before
     /// it detaches anything or continues booting.
     #[tokio::test]
     async fn bind_surfaces_bind_failure_before_returning() {
         init_test_settings();
-        let _lock = RPC_TOKEN_LOCK.lock().await;
+        let _lock = ENV_LOCK.lock().await;
         let _token = RpcTokenGuard::set(&"t".repeat(32));
         // 8.8.8.8 is not a local interface, so the bind fails immediately.
         let server = server_at("8.8.8.8", 1);
@@ -324,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn bind_refuses_to_serve_without_a_token() {
         init_test_settings();
-        let _lock = RPC_TOKEN_LOCK.lock().await;
+        let _lock = ENV_LOCK.lock().await;
         let _token = RpcTokenGuard::unset();
         // 127.0.0.1:0 would otherwise bind successfully, so reaching the error
         // path proves the token check runs before anything starts listening.
@@ -340,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_malformed_tls_material() {
         init_test_settings();
-        let _lock = RPC_TOKEN_LOCK.lock().await;
+        let _lock = ENV_LOCK.lock().await;
         let _token = RpcTokenGuard::set(&"t".repeat(32));
         // Readable files that are not valid PEM: config validation accepts
         // them, so `bind` is the layer that has to catch this — and it must do
@@ -383,7 +356,7 @@ mod tests {
         use tonic::Request;
 
         init_test_settings();
-        let _lock = RPC_TOKEN_LOCK.lock().await;
+        let _lock = ENV_LOCK.lock().await;
         let token = "t".repeat(32);
         let _guard = RpcTokenGuard::set(&token);
 
@@ -428,6 +401,85 @@ mod tests {
             .get_version(GetVersionRequest {})
             .await
             .expect("an authenticated call must go through")
+            .into_inner()
+            .version;
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+
+        serving.abort();
+    }
+
+    /// The mirror image of `bind_rejects_malformed_tls_material`: valid PEM
+    /// must produce a server that actually speaks TLS. The regression this
+    /// pins is "reads as TLS is on while serving plaintext" — for example
+    /// dropping the `builder = builder.tls_config(...)` reassignment — which
+    /// every plaintext test in this file would miss, and which the client
+    /// below turns into a failed handshake instead of a green run.
+    #[tokio::test]
+    async fn served_rpc_over_tls_authenticates_the_token() {
+        use crate::rpc::admin::{admin_service_client::AdminServiceClient, GetVersionRequest};
+        use tonic::metadata::MetadataValue;
+        use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+        use tonic::Request;
+
+        init_test_settings();
+        let _lock = ENV_LOCK.lock().await;
+        let token = "t".repeat(32);
+        let _guard = RpcTokenGuard::set(&token);
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate a self-signed certificate");
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-tls-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, identity.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, identity.key_pair.serialize_pem()).expect("write key");
+
+        let server = RpcServer {
+            listen_address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: Some((
+                cert_path.to_string_lossy().into_owned(),
+                key_path.to_string_lossy().into_owned(),
+            )),
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let (bound, serving) = server
+            .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .expect("bind must succeed with valid TLS material");
+        let serving = tokio::spawn(serving);
+
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(identity.cert.pem()))
+            .domain_name("localhost");
+        let channel = Channel::from_shared(format!("https://{bound}"))
+            .expect("valid endpoint")
+            .tls_config(tls)
+            .expect("client TLS config")
+            .connect()
+            .await
+            .expect("the TLS handshake must succeed against the served certificate");
+
+        let status = AdminServiceClient::new(channel.clone())
+            .get_version(GetVersionRequest {})
+            .await
+            .expect_err("an anonymous call must be refused over TLS too");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        let credential: MetadataValue<_> = format!("Bearer {token}")
+            .parse()
+            .expect("token is a valid header value");
+        let mut authenticated =
+            AdminServiceClient::with_interceptor(channel, move |mut request: Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", credential.clone());
+                Ok(request)
+            });
+        let version = authenticated
+            .get_version(GetVersionRequest {})
+            .await
+            .expect("an authenticated TLS call must go through")
             .into_inner()
             .version;
         assert_eq!(version, env!("CARGO_PKG_VERSION"));

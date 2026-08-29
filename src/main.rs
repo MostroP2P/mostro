@@ -292,7 +292,13 @@ async fn main() -> Result<()> {
         // Only the accept loop is detached; it is already listening.
         tokio::spawn(async move {
             match rpc_serving.await {
-                Ok(()) => tracing::warn!("RPC server stopped"),
+                // The listener stream never ends, so this arm is unreachable
+                // today; treat it like any other loss of the admin API rather
+                // than letting `enabled = true` silently become false.
+                Ok(()) => {
+                    tracing::error!("RPC server stopped accepting connections");
+                    exit(1);
+                }
                 Err(e) => {
                     tracing::error!("RPC server error: {}", e);
                     exit(1);

@@ -95,6 +95,7 @@ zeroize = "1.8"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full", "test-util", "macros"] }
+rcgen = "0.13"
 axum = "0.8.4"
 tower-http = { version = "0.6.6", features = ["cors"] }
 bech32 = "0.11.0"

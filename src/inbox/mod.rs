@@ -180,6 +180,13 @@ impl InboxKeeper {
     /// confirming it accepted the REQ and is the signal used to clear the
     /// backoff. Everything else (`OK`, `NOTICE`, other subscriptions' frames)
     /// is not this module's business.
+    ///
+    /// Awaiting this inline in the event loop is safe: the re-subscribe
+    /// bottoms out in `send_client_msg`, a `try_send` onto the relay's
+    /// transport channel with `wait_until_sent: None` (nostr-sdk 0.45.1,
+    /// `relay/inner.rs`) — no network round-trip, no blocking send, only
+    /// short locks on the subscription map — so a slow or dead relay cannot
+    /// stall the loop that every trade message flows through.
     pub async fn on_relay_message(
         &self,
         client: &Client,
